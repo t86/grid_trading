@@ -2146,6 +2146,33 @@ def _normalize_runtime_open_order(payload: dict[str, Any]) -> dict[str, Any] | N
     }
 
 
+def _summarize_frozen_position_qty(open_orders: list[dict[str, Any]]) -> dict[str, float]:
+    frozen_long_qty = 0.0
+    frozen_short_qty = 0.0
+    for order in open_orders:
+        if not isinstance(order, dict):
+            continue
+        side = str(order.get("side", "")).upper().strip()
+        position_side = str(order.get("position_side", order.get("positionSide", "")) or "").upper().strip() or "BOTH"
+        remaining_qty = max(
+            _safe_float(order.get("orig_qty", order.get("origQty")))
+            - _safe_float(order.get("executed_qty", order.get("executedQty"))),
+            0.0,
+        )
+        if remaining_qty <= 0:
+            continue
+        reduce_only = _truthy(order.get("reduce_only", order.get("reduceOnly")))
+        if position_side == "LONG" and side == "SELL":
+            frozen_long_qty += remaining_qty
+        elif position_side == "SHORT" and side == "BUY":
+            frozen_short_qty += remaining_qty
+        elif reduce_only and position_side == "BOTH" and side == "SELL":
+            frozen_long_qty += remaining_qty
+        elif reduce_only and position_side == "BOTH" and side == "BUY":
+            frozen_short_qty += remaining_qty
+    return {"frozen_long_qty": frozen_long_qty, "frozen_short_qty": frozen_short_qty}
+
+
 def _build_local_runtime_snapshot(
     *,
     runner: dict[str, Any],
@@ -2214,6 +2241,7 @@ def _build_local_runtime_snapshot(
             continue
         seen_keys.add(dedupe_key)
         open_orders.append(normalized)
+    frozen_position = _summarize_frozen_position_qty(open_orders)
 
     leverage_raw = runner_config.get("leverage")
     try:
@@ -2236,6 +2264,14 @@ def _build_local_runtime_snapshot(
             "short_qty": short_qty,
             "entry_price": entry_price,
             "break_even_price": break_even_price,
+            "long_entry_price": long_avg_price,
+            "short_entry_price": short_avg_price,
+            "long_break_even_price": long_avg_price,
+            "short_break_even_price": short_avg_price,
+            "long_unrealized_pnl": 0.0,
+            "short_unrealized_pnl": 0.0,
+            "frozen_long_qty": frozen_position["frozen_long_qty"],
+            "frozen_short_qty": frozen_position["frozen_short_qty"],
             "unrealized_pnl": _safe_float(plan_report.get("unrealized_pnl")),
             "isolated": str(runner_config.get("margin_type", "")).upper().strip() == "ISOLATED",
             "leverage": leverage,
@@ -2346,13 +2382,17 @@ def _build_live_account_snapshot(
         short_position = extract_symbol_position(account_info, normalized_symbol, "SHORT")
         long_qty = abs(_safe_float(long_position.get("positionAmt")))
         short_qty = abs(_safe_float(short_position.get("positionAmt")))
+        long_entry_price = _safe_float(long_position.get("entryPrice"))
+        short_entry_price = _safe_float(short_position.get("entryPrice"))
+        long_break_even_price = _safe_float(long_position.get("breakEvenPrice"))
+        short_break_even_price = _safe_float(short_position.get("breakEvenPrice"))
         long_unrealized = _safe_float(long_position.get("unRealizedProfit", long_position.get("unrealizedProfit")))
         short_unrealized = _safe_float(short_position.get("unRealizedProfit", short_position.get("unrealizedProfit")))
         unrealized_pnl = long_unrealized + short_unrealized
         position_amt = long_qty - short_qty
         position = long_position if long_qty >= short_qty else short_position
-        entry_price = _safe_float(position.get("entryPrice"))
-        break_even_price = _safe_float(position.get("breakEvenPrice"))
+        entry_price = long_entry_price if long_qty >= short_qty else short_entry_price
+        break_even_price = long_break_even_price if long_qty >= short_qty else short_break_even_price
     else:
         position = extract_symbol_position(account_info, normalized_symbol)
         position_amt = _safe_float(position.get("positionAmt"))
@@ -2361,6 +2401,28 @@ def _build_live_account_snapshot(
         unrealized_pnl = _safe_float(position.get("unRealizedProfit", position.get("unrealizedProfit")))
         entry_price = _safe_float(position.get("entryPrice"))
         break_even_price = _safe_float(position.get("breakEvenPrice"))
+        long_entry_price = entry_price if position_amt > 0 else 0.0
+        short_entry_price = entry_price if position_amt < 0 else 0.0
+        long_break_even_price = break_even_price if position_amt > 0 else 0.0
+        short_break_even_price = break_even_price if position_amt < 0 else 0.0
+        long_unrealized = unrealized_pnl if position_amt > 0 else 0.0
+        short_unrealized = unrealized_pnl if position_amt < 0 else 0.0
+
+    normalized_open_orders = [
+        {
+            "order_id": item.get("orderId"),
+            "client_order_id": item.get("clientOrderId"),
+            "side": str(item.get("side", "")).upper().strip(),
+            "price": _safe_float(item.get("price")),
+            "orig_qty": _safe_float(item.get("origQty")),
+            "executed_qty": _safe_float(item.get("executedQty")),
+            "reduce_only": _truthy(item.get("reduceOnly")),
+            "position_side": str(item.get("positionSide", "BOTH")).upper().strip() or "BOTH",
+            "time": int(item.get("time", 0) or 0),
+        }
+        for item in open_orders
+    ]
+    frozen_position = _summarize_frozen_position_qty(normalized_open_orders)
 
     snapshot = {
         "source": "binance_futures_account",
@@ -2374,6 +2436,14 @@ def _build_live_account_snapshot(
             "short_qty": short_qty,
             "entry_price": entry_price,
             "break_even_price": break_even_price,
+            "long_entry_price": long_entry_price,
+            "short_entry_price": short_entry_price,
+            "long_break_even_price": long_break_even_price,
+            "short_break_even_price": short_break_even_price,
+            "long_unrealized_pnl": long_unrealized,
+            "short_unrealized_pnl": short_unrealized,
+            "frozen_long_qty": frozen_position["frozen_long_qty"],
+            "frozen_short_qty": frozen_position["frozen_short_qty"],
             "unrealized_pnl": unrealized_pnl,
             "isolated": _truthy(position.get("isolated")),
             "leverage": int(float(position.get("leverage", 0) or 0)) if str(position.get("leverage", "")).strip() else None,
@@ -2386,20 +2456,7 @@ def _build_live_account_snapshot(
             "USDT": _extract_futures_asset_snapshot(account_info, "USDT"),
             "BNB": _extract_futures_asset_snapshot(account_info, "BNB"),
         },
-        "open_orders": [
-            {
-                "order_id": item.get("orderId"),
-                "client_order_id": item.get("clientOrderId"),
-                "side": str(item.get("side", "")).upper().strip(),
-                "price": _safe_float(item.get("price")),
-                "orig_qty": _safe_float(item.get("origQty")),
-                "executed_qty": _safe_float(item.get("executedQty")),
-                "reduce_only": _truthy(item.get("reduceOnly")),
-                "position_side": str(item.get("positionSide", "BOTH")).upper().strip() or "BOTH",
-                "time": int(item.get("time", 0) or 0),
-            }
-            for item in open_orders
-        ],
+        "open_orders": normalized_open_orders,
     }
     with _MONITOR_CACHE_LOCK:
         _LIVE_ACCOUNT_CACHE[cache_key] = (time.time(), snapshot)

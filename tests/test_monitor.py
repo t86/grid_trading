@@ -1111,6 +1111,119 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(position["virtual_net_qty"], 0.0)
         self.assertEqual(snapshot["risk_controls"]["current_long_notional"], 0.0)
 
+    @patch("grid_optimizer.monitor._load_or_fetch_income_rows", return_value=([], {"source": "test"}))
+    @patch("grid_optimizer.monitor._load_or_fetch_trade_rows", return_value=([], {"source": "test"}))
+    @patch(
+        "grid_optimizer.monitor.fetch_futures_open_orders",
+        return_value=[
+            {
+                "orderId": 1,
+                "clientOrderId": "close-long",
+                "side": "SELL",
+                "price": "1.11",
+                "origQty": "4.5",
+                "executedQty": "1.0",
+                "reduceOnly": True,
+                "positionSide": "LONG",
+                "time": 123,
+            },
+            {
+                "orderId": 2,
+                "clientOrderId": "close-short",
+                "side": "BUY",
+                "price": "1.03",
+                "origQty": "3.0",
+                "executedQty": "0.25",
+                "reduceOnly": True,
+                "positionSide": "SHORT",
+                "time": 124,
+            },
+        ],
+    )
+    @patch("grid_optimizer.monitor.fetch_futures_position_mode", return_value={"dualSidePosition": True})
+    @patch("grid_optimizer.monitor.resolve_active_competition_board", return_value={})
+    @patch(
+        "grid_optimizer.monitor.fetch_futures_account_info_v3",
+        return_value={
+            "multiAssetsMargin": False,
+            "availableBalance": "1000",
+            "totalWalletBalance": "1000",
+            "positions": [
+                {
+                    "symbol": "DUALUSDT",
+                    "positionSide": "LONG",
+                    "positionAmt": "10",
+                    "entryPrice": "1.20",
+                    "breakEvenPrice": "1.21",
+                    "unRealizedProfit": "2.5",
+                    "isolated": False,
+                    "leverage": "5",
+                },
+                {
+                    "symbol": "DUALUSDT",
+                    "positionSide": "SHORT",
+                    "positionAmt": "-7",
+                    "entryPrice": "1.35",
+                    "breakEvenPrice": "1.34",
+                    "unRealizedProfit": "-1.5",
+                    "isolated": False,
+                    "leverage": "5",
+                },
+            ],
+        },
+    )
+    @patch("grid_optimizer.monitor.fetch_futures_klines", return_value=[])
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.monitor.fetch_futures_premium_index", return_value=[{"funding_rate": "0", "mark_price": "1.10"}])
+    @patch("grid_optimizer.monitor.fetch_futures_book_tickers", return_value=[{"bid_price": "1.09", "ask_price": "1.11"}])
+    def test_build_monitor_snapshot_exposes_dual_side_position_legs_and_frozen_qty(
+        self,
+        _mock_book,
+        _mock_premium,
+        _mock_credentials,
+        _mock_klines,
+        _mock_account,
+        _mock_competition,
+        _mock_position_mode,
+        _mock_open_orders,
+        _mock_trade_rows,
+        _mock_income_rows,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "dual_events.jsonl"
+            plan_path = root / "dual_plan.json"
+            submit_path = root / "dual_submit.json"
+            events_path.write_text("", encoding="utf-8")
+            plan_path.write_text("{}", encoding="utf-8")
+            submit_path.write_text("{}", encoding="utf-8")
+
+            snapshot = build_monitor_snapshot(
+                symbol="DUALUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={
+                    "configured": True,
+                    "is_running": False,
+                    "config": {"symbol": "DUALUSDT", "strategy_mode": "hedge_neutral"},
+                },
+            )
+
+        position = snapshot["position"]
+        self.assertFalse(position["one_way_mode"])
+        self.assertEqual(position["position_amt"], 3.0)
+        self.assertEqual(position["long_qty"], 10.0)
+        self.assertEqual(position["short_qty"], 7.0)
+        self.assertEqual(position["long_entry_price"], 1.20)
+        self.assertEqual(position["short_entry_price"], 1.35)
+        self.assertEqual(position["long_break_even_price"], 1.21)
+        self.assertEqual(position["short_break_even_price"], 1.34)
+        self.assertEqual(position["long_unrealized_pnl"], 2.5)
+        self.assertEqual(position["short_unrealized_pnl"], -1.5)
+        self.assertEqual(position["frozen_long_qty"], 3.5)
+        self.assertEqual(position["frozen_short_qty"], 2.75)
+
     def test_filter_rows_since_discards_older_trade_rows(self) -> None:
         floor = datetime(2026, 3, 29, 0, 0, tzinfo=timezone.utc)
         rows = [

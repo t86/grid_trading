@@ -27148,6 +27148,12 @@ MONITOR_PAGE = """<!doctype html>
       const longQty = isSyntheticNeutral ? (pos.virtual_long_qty || pos.long_qty || 0) : (pos.long_qty || 0);
       const shortQty = isSyntheticNeutral ? (pos.virtual_short_qty || pos.short_qty || 0) : (pos.short_qty || 0);
       const netQty = isSyntheticNeutral ? (pos.virtual_net_qty || pos.position_amt || 0) : (pos.position_amt || 0);
+      const accountDualSide = pos.one_way_mode === false;
+      const accountLongQty = Number(pos.long_qty || 0);
+      const accountShortQty = Number(pos.short_qty || 0);
+      const accountNetQty = Number(pos.position_amt || 0);
+      const frozenLongQty = Number(pos.frozen_long_qty || 0);
+      const frozenShortQty = Number(pos.frozen_short_qty || 0);
       const centerSource = risk.center_source || {};
       const isCustomGridCenter = String(centerSource.reason || "").startsWith("custom_grid_");
       const centerPriceText = fmtNum(centerSource.center_price || 0, 7);
@@ -27204,6 +27210,26 @@ MONITOR_PAGE = """<!doctype html>
       const statsWindowSub = competitionWindow.label
         ? `${competitionWindow.label} · 统计起点 ${fmtTs(competitionWindow.stats_start_at || competitionWindowStart)}`
         : "未匹配到交易赛窗口，默认按当前会话统计";
+      const currentPositionValue = accountDualSide
+        ? `净 ${fmtNum(accountNetQty, 0)}`
+        : (accountNetQty < 0 ? `空 ${fmtNum(Math.abs(accountNetQty), 0)}` : fmtNum(accountNetQty, 0));
+      const currentPositionSubParts = accountDualSide
+        ? [
+            `多仓 ${fmtNum(accountLongQty, 0)} @ ${fmtNum(pos.long_entry_price || 0, 7)} · 名义 ${fmtNum(accountLongQty * (market.mid_price || 0), 4)}`,
+            `空仓 ${fmtNum(accountShortQty, 0)} @ ${fmtNum(pos.short_entry_price || 0, 7)} · 名义 ${fmtNum(accountShortQty * (market.mid_price || 0), 4)}`,
+            `${centerLabelText}`,
+          ]
+        : [
+            `开仓均价: ${fmtNum(pos.entry_price || 0, 7)}`,
+            `${centerLabelText}`,
+            `持仓名义: ${fmtNum(Math.abs(accountNetQty) * (market.mid_price || 0), 4)}`,
+          ];
+      if (frozenLongQty > 0 || frozenShortQty > 0) {
+        currentPositionSubParts.push(
+          `冻结仓位: 多 ${fmtNum(frozenLongQty, 0)} / 空 ${fmtNum(frozenShortQty, 0)} · 冻结名义 ${fmtNum((frozenLongQty + frozenShortQty) * (market.mid_price || 0), 4)}`
+        );
+      }
+      currentPositionSubParts.push(`来源: ${liveAccount.fetched_at ? `账户实时(${fmtTs(liveAccount.fetched_at)})` : "runner快照"}`);
       const cards = [
         { label: "策略状态", value: strategyRunning ? "运行中" : "未活跃", cls: strategyRunning ? "good" : "warn", sub: strategyDetail },
         buildStrategyMachineCard(risk, runnerCfg),
@@ -27212,7 +27238,7 @@ MONITOR_PAGE = """<!doctype html>
         { label: "累计成交额", value: fmtNum(trade.gross_notional || 0, 4), cls: "", sub: `买入: ${fmtNum(trade.buy_notional || 0, 4)} · 卖出: ${fmtNum(trade.sell_notional || 0, 4)} · 来源: ${(audit.trade_source && audit.trade_source.source) || "--"}` },
         { label: "净收益估算", value: fmtMoney(trade.net_pnl_estimate || 0), cls: statusClass(trade.net_pnl_estimate || 0), sub: `已实现: ${fmtMoney(trade.realized_pnl || 0)} · 浮盈: ${fmtMoney(pos.unrealized_pnl || 0)}` },
         { label: "手续费 / 资金费", value: `${fmtMoney(-(trade.commission || 0))} / ${fmtMoney(income.funding_fee || 0)}`, cls: "", sub: `左侧为折算 USDT 后的累计手续费 · 原始资产: ${escapeHtml(JSON.stringify(trade.commission_raw_by_asset || {}))}` },
-        { label: "当前仓位", value: isNeutralMode ? `净 ${fmtNum(netQty, 0)}` : fmtNum(pos.position_amt || 0, 0), cls: "", sub: `${isNeutralMode ? `Long/Short: ${fmtNum(longQty, 0)} / ${fmtNum(shortQty, 0)} · ${centerLabelText} · 中价名义: ${fmtNum((longQty + shortQty) * (market.mid_price || 0), 4)}` : `开仓均价: ${fmtNum(pos.entry_price || 0, 7)} · ${centerLabelText} · 持仓名义: ${fmtNum(Math.abs(pos.position_amt || 0) * (market.mid_price || 0), 4)}`} · 来源: ${liveAccount.fetched_at ? `账户实时(${fmtTs(liveAccount.fetched_at)})` : "runner快照"}` },
+        { label: "当前仓位", value: currentPositionValue, cls: "", sub: currentPositionSubParts.join(" · ") },
         { label: "当前挂单数", value: fmtNum((data.open_orders || []).length, 0), cls: "", sub: `买/卖: ${fmtNum((data.open_orders || []).filter(x => x.side === "BUY").length, 0)} / ${fmtNum((data.open_orders || []).filter(x => x.side === "SELL").length, 0)} · 来源: ${liveAccount.fetched_at ? "账户实时" : "runner快照"}` },
         { label: "市场", value: `${fmtNum(market.bid_price || 0, 7)} / ${fmtNum(market.ask_price || 0, 7)}`, cls: "", sub: `中价: ${fmtNum(market.mid_price || 0, 7)} · Funding: ${fmtPct(market.funding_rate || 0)}` },
       ];
@@ -27318,6 +27344,7 @@ MONITOR_PAGE = """<!doctype html>
       const isTargetNeutral = strategyMode === "inventory_target_neutral";
       const isNeutralMode = isHedge || isSyntheticNeutral || isTargetNeutral;
       const modeLabel = isHedge ? "双向中性" : (isSyntheticNeutral ? "单向合成中性" : (isTargetNeutral ? "单向目标中性" : (isOneWayShort ? "单向做空" : "单向做多")));
+      const accountDualSide = pos.one_way_mode === false;
       const virtualLongQty = isSyntheticNeutral ? (pos.virtual_long_qty || pos.long_qty || 0) : (pos.long_qty || 0);
       const virtualShortQty = isSyntheticNeutral ? (pos.virtual_short_qty || pos.short_qty || 0) : (pos.short_qty || 0);
       const virtualNetQty = isSyntheticNeutral ? (pos.virtual_net_qty || pos.position_amt || 0) : (pos.position_amt || 0);
@@ -27336,6 +27363,14 @@ MONITOR_PAGE = """<!doctype html>
         ["净仓数量", fmtNum(virtualNetQty, 0)],
         ["Long 仓位", fmtNum(virtualLongQty, 0)],
         ["Short 仓位", fmtNum(virtualShortQty, 0)],
+        ["Long 开仓均价", accountDualSide ? fmtNum(pos.long_entry_price || 0, 7) : "--"],
+        ["Short 开仓均价", accountDualSide ? fmtNum(pos.short_entry_price || 0, 7) : "--"],
+        ["Long 保本价", accountDualSide ? fmtNum(pos.long_break_even_price || 0, 7) : "--"],
+        ["Short 保本价", accountDualSide ? fmtNum(pos.short_break_even_price || 0, 7) : "--"],
+        ["Long 浮动盈亏", accountDualSide ? fmtMoney(pos.long_unrealized_pnl || 0) : "--"],
+        ["Short 浮动盈亏", accountDualSide ? fmtMoney(pos.short_unrealized_pnl || 0) : "--"],
+        ["冻结 Long 仓位", fmtNum(pos.frozen_long_qty || 0, 0)],
+        ["冻结 Short 仓位", fmtNum(pos.frozen_short_qty || 0, 0)],
         ["交易所净仓", fmtNum(pos.position_amt || 0, 0)],
         [isCustomGridCenter ? "当前梯子参考价" : "当前中心价格", centerSource.center_price ? `${fmtNum(centerSource.center_price || 0, 7)}${centerSource.interval ? ` (${centerSource.interval})` : ""}` : "--"],
         ["开仓均价", fmtNum(pos.entry_price || 0, 7)],
