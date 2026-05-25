@@ -3492,6 +3492,8 @@ def _apply_best_quote_reduce_freeze(
     report["short_freeze_threshold_loss_ratio"] = short_freeze_threshold
     report["freeze_min_notional"] = freeze_min_notional
     report["freeze_confirm_cycles"] = freeze_confirm_cycles
+    actual_long_loss_ratio = long_loss_ratio
+    actual_short_loss_ratio = short_loss_ratio
     frozen_long_qty = _safe_float(report.get("frozen_long_qty"))
     frozen_short_qty = _safe_float(report.get("frozen_short_qty"))
     if isinstance(bq_ledger_report, dict) and bool(bq_ledger_report.get("initialized")):
@@ -3504,6 +3506,45 @@ def _apply_best_quote_reduce_freeze(
         managed_short_qty = max(_safe_float(current_short_qty) - frozen_short_qty, 0.0)
     managed_long_notional = managed_long_qty * _safe_float(mid_price)
     managed_short_notional = managed_short_qty * _safe_float(mid_price)
+    long_loss_ratio = 0.0
+    if _safe_float(current_long_avg_price) > 0:
+        long_loss_ratio = max(
+            (_safe_float(current_long_avg_price) - _safe_float(mid_price)) / _safe_float(current_long_avg_price),
+            0.0,
+        )
+    short_loss_ratio = 0.0
+    if _safe_float(current_short_avg_price) > 0:
+        short_loss_ratio = max(
+            (_safe_float(mid_price) - _safe_float(current_short_avg_price)) / _safe_float(current_short_avg_price),
+            0.0,
+        )
+    long_freeze_threshold, long_dynamic_extra, long_frozen_pressure = _dynamic_freeze_threshold("LONG", long_loss_ratio)
+    short_freeze_threshold, short_dynamic_extra, short_frozen_pressure = _dynamic_freeze_threshold(
+        "SHORT", short_loss_ratio
+    )
+    if hard_freeze_enabled:
+        long_freeze_threshold = max(_safe_float(report["hard_loss_ratio"]), long_freeze_threshold)
+        short_freeze_threshold = max(_safe_float(report["hard_loss_ratio"]), short_freeze_threshold)
+    freeze_threshold = max(long_freeze_threshold, short_freeze_threshold)
+    report["freeze_threshold_loss_ratio"] = freeze_threshold
+    report["long_freeze_threshold_loss_ratio"] = long_freeze_threshold
+    report["short_freeze_threshold_loss_ratio"] = short_freeze_threshold
+    report["actual_long_loss_ratio"] = actual_long_loss_ratio
+    report["actual_short_loss_ratio"] = actual_short_loss_ratio
+    report["managed_long_loss_ratio"] = long_loss_ratio
+    report["managed_short_loss_ratio"] = short_loss_ratio
+    report["dynamic_threshold"].update(
+        {
+            "long_loss_ratio": long_loss_ratio,
+            "short_loss_ratio": short_loss_ratio,
+            "actual_long_loss_ratio": actual_long_loss_ratio,
+            "actual_short_loss_ratio": actual_short_loss_ratio,
+            "long_frozen_pressure": long_frozen_pressure,
+            "short_frozen_pressure": short_frozen_pressure,
+            "long_extra_ratio": long_dynamic_extra,
+            "short_extra_ratio": short_dynamic_extra,
+        }
+    )
     protected_candidates: list[dict[str, Any]] = []
 
     def _side_freeze_threshold(side: str) -> float:
@@ -3674,6 +3715,8 @@ def _apply_best_quote_reduce_freeze(
             "frozen_notional_full": dynamic_threshold_frozen_full,
             "long_loss_ratio": long_loss_ratio,
             "short_loss_ratio": short_loss_ratio,
+            "actual_long_loss_ratio": actual_long_loss_ratio,
+            "actual_short_loss_ratio": actual_short_loss_ratio,
             "long_frozen_pressure": long_frozen_pressure,
             "short_frozen_pressure": short_frozen_pressure,
             "long_extra_ratio": long_dynamic_extra,

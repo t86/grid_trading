@@ -1252,6 +1252,50 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["dynamic_threshold"]["short_frozen_pressure"], 0.0)
         self.assertEqual(report["short_freeze_threshold_loss_ratio"], 0.01)
 
+    def test_best_quote_reduce_freeze_uses_managed_short_avg_for_freeze_decision(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_qty": 1000.0,
+                "short_lots": [{"qty": 1000.0, "entry_price": 0.6200}],
+            },
+            "best_quote_volume_ledger": {
+                "short_lots": [{"qty": 200.0, "price": 0.6520}],
+                "short_qty": 200.0,
+                "short_avg_price": 0.6520,
+                "initialized": True,
+            },
+        }
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=0.0,
+            current_short_qty=1200.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6200,
+            mid_price=0.6500,
+            bq_ledger_report=state["best_quote_volume_ledger"],
+        )
+
+        report = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [], "buy_orders": [{"role": "best_quote_reduce_short"}]},
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=10.0,
+            confirm_cycles=1,
+            current_long_qty=0.0,
+            current_short_qty=1200.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6200,
+            mid_price=0.6500,
+            bq_ledger_report=state["best_quote_volume_ledger"],
+        )
+
+        self.assertFalse(report["applied"])
+        self.assertGreater(report["actual_short_loss_ratio"], 0.04)
+        self.assertEqual(report["managed_short_loss_ratio"], 0.0)
+        self.assertEqual(report["managed_short_qty"], 200.0)
+
     def test_best_quote_reduce_freeze_hard_threshold_keeps_soft_loss_managed(self) -> None:
         state: dict[str, object] = {}
         report = _best_quote_reduce_freeze_report(
