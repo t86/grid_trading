@@ -2474,6 +2474,39 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["buy_orders"][0]["role"], "frozen_inventory_pair_release_short")
         self.assertEqual(plan["buy_orders"][0]["qty"], 60.0)
 
+    def test_best_quote_frozen_pair_release_waits_for_fill_confirmation_before_retry(self) -> None:
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        release = apply_best_quote_frozen_inventory_pair_release(
+            plan=plan,
+            report={
+                "frozen_long_qty": 100.0,
+                "frozen_short_qty": 100.0,
+                "ledger": {"long_entry_price": 1.0, "short_entry_price": 1.05},
+            },
+            bid_price=1.009,
+            ask_price=1.011,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            hedge_mode=True,
+            enabled=True,
+            stable_allowed=True,
+            max_notional=100.0,
+            min_side_notional=0.0,
+            min_profit_ratio=0.0,
+            max_slippage_ticks=2,
+            requested_qty=100.0,
+            request_id="req-pair",
+            awaiting_fill_confirmation=True,
+        )
+
+        self.assertFalse(release["active"])
+        self.assertIn("awaiting_fill_confirmation", release["blocked_reasons"])
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(plan["buy_orders"], [])
+
     def test_sync_best_quote_frozen_pair_release_deducts_only_confirmed_pair_qty(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
@@ -2520,6 +2553,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(directive["filled_long_qty"], 100.0)
         self.assertEqual(directive["filled_short_qty"], 40.0)
         self.assertEqual(directive["paired_released_qty"], 40.0)
+        self.assertFalse(directive["awaiting_fill_confirmation"])
 
         second = sync_best_quote_frozen_pair_release(
             state=state,

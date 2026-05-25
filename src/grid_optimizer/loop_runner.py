@@ -3263,6 +3263,7 @@ def sync_best_quote_frozen_pair_release(
                 "filled_short_qty": filled_short_qty,
                 "paired_released_qty": paired_total,
                 "repair_side": report["repair_side"],
+                "awaiting_fill_confirmation": False,
                 "applied_trade_fill_keys": applied_fill_keys[-10000:],
                 "updated_at": _utc_now().isoformat(),
             }
@@ -4132,6 +4133,7 @@ def apply_best_quote_frozen_inventory_pair_release(
     filled_long_qty: float = 0.0,
     filled_short_qty: float = 0.0,
     paired_released_qty: float = 0.0,
+    awaiting_fill_confirmation: bool = False,
 ) -> dict[str, Any]:
     ledger = dict(report.get("ledger") or {})
     release_report = {
@@ -4172,6 +4174,9 @@ def apply_best_quote_frozen_inventory_pair_release(
     missing_long_qty = max(filled_short - filled_long, 0.0)
     missing_short_qty = max(filled_long - filled_short, 0.0)
     repair_side = "long" if missing_long_qty > 1e-12 else "short" if missing_short_qty > 1e-12 else ""
+    if bool(awaiting_fill_confirmation) and not repair_side:
+        release_report["blocked_reasons"].append("awaiting_fill_confirmation")
+        return release_report
     offset_qty = min(frozen_long_qty, frozen_short_qty)
     safe_bid = max(_safe_float(bid_price), 0.0)
     safe_ask = max(_safe_float(ask_price), 0.0)
@@ -17560,6 +17565,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             filled_long_qty=_safe_float(best_quote_frozen_pair_release_directive.get("filled_long_qty")),
             filled_short_qty=_safe_float(best_quote_frozen_pair_release_directive.get("filled_short_qty")),
             paired_released_qty=_safe_float(best_quote_frozen_pair_release_directive.get("paired_released_qty")),
+            awaiting_fill_confirmation=bool(best_quote_frozen_pair_release_directive.get("awaiting_fill_confirmation")),
         )
         best_quote_frozen_pair_release.update(
             {
@@ -17595,6 +17601,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                     "last_submitted_orders": list(best_quote_frozen_pair_release.get("orders") or []),
                     "last_submitted_release_qty": _safe_float(best_quote_frozen_pair_release.get("release_qty")),
                     "last_repair_side": str(best_quote_frozen_pair_release.get("repair_side") or ""),
+                    "awaiting_fill_confirmation": True,
                 }
             )
             state["best_quote_frozen_inventory_pair_release"] = kept_directive
