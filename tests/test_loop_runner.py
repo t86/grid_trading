@@ -1202,7 +1202,8 @@ class LoopRunnerTests(unittest.TestCase):
             min_notional=10.0,
             confirm_cycles=1,
             dynamic_threshold_enabled=True,
-            dynamic_threshold_loss_ratio_scale=0.5,
+            dynamic_threshold_loss_ratio_scale=1.0,
+            dynamic_threshold_max_extra_ratio=0.01,
             dynamic_threshold_frozen_notional_start=0.0,
             dynamic_threshold_frozen_notional_full=500.0,
             current_long_qty=0.0,
@@ -1215,7 +1216,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(report["applied"])
         self.assertAlmostEqual(report["dynamic_threshold"]["short_loss_ratio"], 0.01212121212121215)
         self.assertEqual(report["dynamic_threshold"]["short_frozen_pressure"], 1.0)
-        self.assertAlmostEqual(report["short_freeze_threshold_loss_ratio"], 0.016060606060606075)
+        self.assertAlmostEqual(report["short_freeze_threshold_loss_ratio"], 0.02)
         self.assertNotIn("best_quote_reduce_freeze_confirmation", state)
 
     def test_best_quote_reduce_freeze_dynamic_threshold_waits_for_frozen_pressure(self) -> None:

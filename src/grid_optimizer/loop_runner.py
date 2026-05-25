@@ -3456,8 +3456,11 @@ def _apply_best_quote_reduce_freeze(
     def _dynamic_freeze_threshold(side: str, side_loss_ratio: float) -> tuple[float, float, float]:
         extra = 0.0
         pressure = _frozen_pressure(side)
-        if dynamic_threshold_active and side_loss_ratio > 0:
-            extra = max(side_loss_ratio, 0.0) * dynamic_threshold_scale * pressure
+        if dynamic_threshold_active and pressure > 0:
+            if dynamic_threshold_max_extra > 0:
+                extra = dynamic_threshold_max_extra * dynamic_threshold_scale * pressure
+            elif side_loss_ratio > 0:
+                extra = max(side_loss_ratio, 0.0) * dynamic_threshold_scale * pressure
             if dynamic_threshold_max_extra > 0:
                 extra = min(extra, dynamic_threshold_max_extra)
         return effective_threshold + extra, extra, pressure
