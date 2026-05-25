@@ -3197,9 +3197,15 @@ def sync_best_quote_frozen_pair_release(
             or ref.get("frozen_inventory_request_id")
             or ""
         ).strip()
-        if row_request_id != request_id:
-            continue
         role = str(row.get("role") or ref.get("role") or "").lower().strip()
+        if row_request_id != request_id:
+            legacy_pair_ref = (
+                not row_request_id
+                and role.startswith("frozen_inventory_pair_release_")
+                and str(ref.get("book") or "").lower().strip() == BQ_BOOK_FROZEN
+            )
+            if not legacy_pair_ref:
+                continue
         qty = max(_safe_float(row.get("qty")), 0.0)
         if qty <= 1e-12:
             continue
@@ -6630,6 +6636,12 @@ def update_best_quote_volume_order_refs(
     refs = state.get("best_quote_volume_order_refs")
     if not isinstance(refs, dict):
         refs = {}
+    pair_release_directive = state.get("best_quote_frozen_inventory_pair_release")
+    pair_release_request_id = (
+        str(pair_release_directive.get("request_id") or "").strip()
+        if isinstance(pair_release_directive, Mapping)
+        else ""
+    )
 
     for item in submit_report.get("placed_orders", []):
         if not isinstance(item, dict):
@@ -6639,16 +6651,20 @@ def update_best_quote_volume_order_refs(
         order_id = epoch_ms(response.get("orderId"))
         if order_id <= 0:
             continue
+        role = str(request.get("role", "")).strip()
+        frozen_request_id = str(request.get("frozen_inventory_request_id") or "").strip()
+        if not frozen_request_id and role.lower().startswith("frozen_inventory_pair_release_"):
+            frozen_request_id = pair_release_request_id
         refs[str(order_id)] = {
             "book": _best_quote_order_book_from_role(request.get("role")),
-            "role": str(request.get("role", "")).strip(),
+            "role": role,
             "side": str(request.get("side", "")).upper().strip(),
             "position_side": str(
                 request.get("position_side") or request.get("positionSide") or "BOTH"
             ).upper().strip()
             or "BOTH",
             "client_order_id": str(response.get("clientOrderId", "")).strip(),
-            "frozen_inventory_request_id": str(request.get("frozen_inventory_request_id") or "").strip(),
+            "frozen_inventory_request_id": frozen_request_id,
             "updated_at": _isoformat(_utc_now()),
         }
 

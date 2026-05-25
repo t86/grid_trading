@@ -383,6 +383,47 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(ref["book"], "frozen_bq")
         self.assertEqual(ref["role"], "frozen_inventory_manual_reduce_long")
 
+    def test_update_best_quote_volume_order_refs_preserves_pair_release_request_id(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "best_quote_frozen_inventory_pair_release": {
+                            "requested": True,
+                            "request_id": "req-pair",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            update_best_quote_volume_order_refs(
+                state_path=state_path,
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                submit_report={
+                    "placed_orders": [
+                        {
+                            "request": {
+                                "role": "frozen_inventory_pair_release_short",
+                                "side": "BUY",
+                                "position_side": "SHORT",
+                            },
+                            "response": {
+                                "orderId": 41974648,
+                                "clientOrderId": "gx-pharosu-frozenin-2-87716362",
+                            },
+                        }
+                    ]
+                },
+            )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        ref = state["best_quote_volume_order_refs"]["41974648"]
+        self.assertEqual(ref["book"], "frozen_bq")
+        self.assertEqual(ref["role"], "frozen_inventory_pair_release_short")
+        self.assertEqual(ref["frozen_inventory_request_id"], "req-pair")
+
     def test_isolated_frozen_position_drift_allows_reduce_only_with_normal_available_qty(self) -> None:
         allowed = _isolated_frozen_actions_tolerate_position_drift(
             {
@@ -2489,6 +2530,49 @@ class LoopRunnerTests(unittest.TestCase):
 
         frozen = state["best_quote_frozen_inventory"]
         self.assertEqual(second["new_paired_release_qty"], 60.0)
+        self.assertEqual(frozen["long_qty"], 0.0)
+        self.assertEqual(frozen["short_qty"], 0.0)
+        self.assertNotIn("best_quote_frozen_inventory_pair_release", state)
+
+    def test_sync_best_quote_frozen_pair_release_accepts_legacy_pair_refs_without_request_id(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [{"qty": 50.0, "entry_price": 1.0}],
+                "short_lots": [{"qty": 50.0, "entry_price": 1.05}],
+            },
+            "best_quote_frozen_inventory_pair_release": {
+                "requested": True,
+                "request_id": "req-pair",
+                "requested_qty": 50.0,
+            },
+            "best_quote_volume_order_refs": {
+                "11": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_pair_release_long",
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "frozen_inventory_request_id": "",
+                },
+                "12": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_pair_release_short",
+                    "side": "BUY",
+                    "position_side": "SHORT",
+                    "frozen_inventory_request_id": "",
+                },
+            },
+        }
+
+        synced = sync_best_quote_frozen_pair_release(
+            state=state,
+            observed_trade_rows=[
+                {"orderId": 11, "side": "SELL", "positionSide": "LONG", "qty": "50", "price": "1.009", "time": 1000},
+                {"orderId": 12, "side": "BUY", "positionSide": "SHORT", "qty": "50", "price": "1.011", "time": 1001},
+            ],
+        )
+
+        frozen = state["best_quote_frozen_inventory"]
+        self.assertEqual(synced["new_paired_release_qty"], 50.0)
         self.assertEqual(frozen["long_qty"], 0.0)
         self.assertEqual(frozen["short_qty"], 0.0)
         self.assertNotIn("best_quote_frozen_inventory_pair_release", state)
