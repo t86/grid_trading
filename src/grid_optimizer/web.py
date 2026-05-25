@@ -30264,6 +30264,10 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
         <div id="preflight_panel" class="detail-list"><div>刷新参数后显示 blocker、warning 和安全阀提示。</div></div>
       </div>
       <div class="detail-box">
+        <h2>启动前执行诊断</h2>
+        <div id="execution_preview_panel" class="detail-list"><div>刷新后显示预计是否会挂单、会被哪些参数卡住。</div></div>
+      </div>
+      <div class="detail-box">
         <h2>版本记录</h2>
         <div id="history_panel" class="detail-list"><div>保存后会记录版本；至少两版中央保存记录后可回滚。</div></div>
       </div>
@@ -30306,6 +30310,7 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
     const sectionsEl = document.getElementById("sections");
     const diffPanelEl = document.getElementById("diff_panel");
     const preflightPanelEl = document.getElementById("preflight_panel");
+    const executionPreviewPanelEl = document.getElementById("execution_preview_panel");
     const historyPanelEl = document.getElementById("history_panel");
     const presetPanelEl = document.getElementById("preset_panel");
     const runtimePanelEl = document.getElementById("runtime_panel");
@@ -30444,6 +30449,25 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
       rows.push(`<div>必需参数缺失：${esc(fmtList(boundary.required_missing_params))}</div>`);
       preflightPanelEl.innerHTML = rows.join("");
     }
+    function renderExecutionPreview(payload) {
+      const preview = payload.execution_preview || {};
+      const blockers = preview.blockers || [];
+      const warnings = preview.warnings || [];
+      const actions = preview.suggested_actions || [];
+      const tone = preview.status === "blocked" ? "bad" : preview.status === "warning" ? "warn" : "good";
+      const rows = [
+        `<div class="${tone}">诊断状态：${esc(preview.status || "--")} · ${preview.can_apply === false ? "不可启动" : "可保存/启动"}</div>`,
+        `<div class="${preview.will_place_orders ? "good" : "warn"}">预计挂单：${preview.will_place_orders ? "会进入刷量挂单" : "不会立即挂单或需先恢复状态"}</div>`,
+        `<div>${esc(preview.summary || "--")}</div>`,
+        `<div>运行模式：${esc(preview.state || "--")} / ${esc(preview.mode || "--")}</div>`,
+        `<div>预计新挂单额度：${esc(fmtValue(preview.estimated_new_order_capacity))}，best quote 需要：${esc(fmtValue(preview.estimated_order_slots_needed))}</div>`,
+        `<div>预计单轮预算：${esc(fmtValue(preview.estimated_cycle_notional))}</div>`,
+        `<div class="${blockers.length ? "bad" : "good"}">blocker：${esc(fmtList(blockers))}</div>`,
+        `<div class="${warnings.length ? "warn" : "good"}">warning：${esc(fmtList(warnings))}</div>`,
+      ];
+      actions.forEach((action) => rows.push(`<div class="warn">建议：${esc(action)}</div>`));
+      executionPreviewPanelEl.innerHTML = rows.join("");
+    }
     function renderHistory(payload) {
       const history = Array.isArray(payload.history) ? payload.history : [];
       if (!history.length) {
@@ -30560,6 +30584,7 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
       renderStatus(payload);
       renderSections(payload);
       renderPreflight(payload);
+      renderExecutionPreview(payload);
       renderHistory(payload);
       renderRuntime(payload);
       renderPresets(payload);
@@ -30580,7 +30605,15 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
       return config;
     }
     async function submitConfig(action) {
-      if (action === "apply" && !window.confirm("确认保存并重启当前 PHAROS 策略？")) return;
+      if (action === "apply") {
+        const preview = (latestPayload || {}).execution_preview || {};
+        if (preview.can_apply === false) {
+          metaEl.textContent = `启动前诊断阻断：${fmtList(preview.blockers || [])}`;
+          return;
+        }
+        const warningText = (preview.warnings || []).length ? `\n\n当前 warning：${fmtList(preview.warnings)}` : "";
+        if (!window.confirm(`确认保存并重启当前 PHAROS 策略？${warningText}`)) return;
+      }
       const {serverId, symbol, profile} = currentSelection();
       const config = currentConfigFromForm();
       const endpoint = action === "apply" ? "/api/central_strategy_workbench/apply" : "/api/central_strategy_workbench/save";
@@ -30596,6 +30629,7 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
       renderStatus(payload);
       renderSections(payload);
       renderPreflight(payload);
+      renderExecutionPreview(payload);
       renderHistory(payload);
       renderRuntime(payload);
       renderPresets(payload);

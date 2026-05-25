@@ -682,6 +682,151 @@ def build_pharos_recommendation_presets(
     ]
 
 
+def _unique_codes(values: list[str]) -> list[str]:
+    return sorted({str(value) for value in values if str(value or "").strip()})
+
+
+def build_execution_preview(
+    config: dict[str, Any],
+    runtime_summary: dict[str, Any] | None,
+    *,
+    startup_preflight: dict[str, Any] | None = None,
+    global_safety_preflight: dict[str, Any] | None = None,
+    profile_boundary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    config_dict = dict(config or {})
+    runtime = runtime_summary or {}
+    startup = startup_preflight or {}
+    global_safety = global_safety_preflight or {}
+    boundary = profile_boundary or {}
+    latest = runtime.get("latest") if isinstance(runtime.get("latest"), dict) else {}
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+    suggested_actions: list[str] = []
+
+    max_new_orders = _as_int(config_dict.get("max_new_orders"), 0)
+    max_total_notional = _as_float(config_dict.get("max_total_notional"), 0.0)
+    per_order_notional = _as_float(config_dict.get("per_order_notional"), 0.0)
+    cycle_budget = _as_float(config_dict.get("best_quote_maker_volume_cycle_budget_notional"), 0.0)
+    estimated_order_slots_needed = 2
+    estimated_new_order_capacity = max(max_new_orders, 0)
+    estimated_cycle_notional = cycle_budget if cycle_budget > 0 else per_order_notional * estimated_order_slots_needed
+    if max_total_notional > 0 and estimated_cycle_notional > max_total_notional:
+        estimated_cycle_notional = max_total_notional
+        warnings.append("cycle_budget_capped_by_max_total_notional")
+
+    if startup.get("can_start") is False:
+        blockers.extend(str(code) for code in startup.get("blocker_codes") or [])
+        if not blockers:
+            blockers.append("startup_preflight_blocked")
+        suggested_actions.append("先处理启动预检 blocker，再保存启动。")
+    warnings.extend(str(code) for code in startup.get("warning_codes") or [])
+
+    forbidden_active = boundary.get("forbidden_active_params") or []
+    if forbidden_active:
+        blockers.append("profile_forbidden_active_params")
+        suggested_actions.append("先清理禁止跨策略参数，避免其他策略模块接管当前 profile。")
+    required_missing = boundary.get("required_missing_params") or []
+    if required_missing:
+        warnings.append("profile_required_params_missing")
+        suggested_actions.append("先补齐当前 profile 必需参数；当前 schema 版本只提示，不直接阻断。")
+
+    for key in ("limiting_params", "stop_guard_params", "takeover_params"):
+        values = global_safety.get(key) or []
+        if values:
+            warnings.append(f"global_safety_{key}_active")
+
+    state = str(runtime.get("state") or "unknown")
+    mode = str(runtime.get("mode") or "unknown")
+    reason_codes = list(runtime.get("reason_codes") or [])
+    stale_orders = _as_int(latest.get("stale_order_count"))
+    missing_orders = _as_int(latest.get("missing_order_count"))
+    remaining_cumulative = _as_float(latest.get("remaining_cumulative_notional"), -1.0)
+    max_cumulative = _as_float(
+        latest.get("max_cumulative_notional"),
+        _as_float(config_dict.get("max_cumulative_notional"), 0.0),
+    )
+
+    if not bool(runtime.get("ok", False)):
+        warnings.append("runtime_data_missing")
+        suggested_actions.append("运行数据不足，只能按参数预检判断；启动前建议先刷新运行数据。")
+    if state == "repair":
+        warnings.append("runtime_repair_state")
+        suggested_actions.append("当前处于修仓状态，优先降低单笔或等待回到 normal/fast。")
+    elif state == "paused":
+        warnings.append("runtime_paused")
+        suggested_actions.append("当前被运行态暂停，先确认波动保护或停机安全阀。")
+    elif state == "degraded":
+        warnings.append("runtime_degraded_orders")
+    if stale_orders > 0 or missing_orders > 0:
+        warnings.append("runtime_degraded_orders")
+    if not bool(config_dict.get("cancel_stale", True)) and (stale_orders > 0 or missing_orders > 0):
+        warnings.append("cancel_stale_disabled_with_stale_orders")
+        suggested_actions.append("先开启 cancel_stale，清理 stale/missing 挂单。")
+    if max_new_orders < estimated_order_slots_needed:
+        warnings.append("max_new_orders_too_low_for_best_quote")
+        suggested_actions.append("best quote 至少保留 2 个新挂单额度。")
+    if max_total_notional <= 0:
+        warnings.append("max_total_notional_missing")
+        suggested_actions.append("补齐 max_total_notional，避免执行层按 0 或缺省值限制下单。")
+    if max_cumulative > 0 and remaining_cumulative <= 0:
+        blockers.append("max_cumulative_notional_exhausted")
+        suggested_actions.append("提高 max_cumulative_notional 或重置本轮目标后再启动。")
+    elif "near_cumulative_volume_limit" in reason_codes:
+        warnings.append("near_cumulative_volume_limit")
+        suggested_actions.append("剩余累计刷量额度偏低，20万/50万目标启动前要先确认上限足够。")
+
+    maker_quality = runtime.get("maker_quality") if isinstance(runtime.get("maker_quality"), dict) else {}
+    if maker_quality.get("source") == "missing":
+        warnings.append("maker_quality_missing")
+
+    blockers_unique = _unique_codes(blockers)
+    warnings_unique = _unique_codes(warnings)
+    can_apply = not blockers_unique
+    will_place_orders = (
+        can_apply
+        and state == "brush"
+        and estimated_new_order_capacity >= estimated_order_slots_needed
+        and max_total_notional > 0
+        and not (stale_orders > 0 or missing_orders > 0)
+    )
+    status = "blocked" if blockers_unique else "warning" if warnings_unique else "ready"
+    if will_place_orders:
+        summary = (
+            f"预计可刷量：{estimated_new_order_capacity} 个新挂单额度，"
+            f"单轮预算约 {round(estimated_cycle_notional, 4)} notional。"
+        )
+    elif blockers_unique:
+        summary = "暂不应启动：存在会阻断启动或刷量目标的 blocker。"
+    else:
+        summary = "可保存但预计不会立即进入刷量，需先处理 warning 或等待运行态恢复。"
+
+    return {
+        "status": status,
+        "can_apply": can_apply,
+        "will_place_orders": will_place_orders,
+        "state": state,
+        "mode": mode,
+        "summary": summary,
+        "blockers": blockers_unique,
+        "warnings": warnings_unique,
+        "suggested_actions": list(dict.fromkeys(suggested_actions)),
+        "estimated_new_order_capacity": estimated_new_order_capacity,
+        "estimated_order_slots_needed": estimated_order_slots_needed,
+        "estimated_cycle_notional": round(max(estimated_cycle_notional, 0.0), 8),
+        "inputs": {
+            "max_new_orders": max_new_orders,
+            "max_total_notional": max_total_notional,
+            "per_order_notional": per_order_notional,
+            "best_quote_maker_volume_cycle_budget_notional": cycle_budget,
+            "remaining_cumulative_notional": remaining_cumulative,
+            "stale_order_count": stale_orders,
+            "missing_order_count": missing_orders,
+        },
+    }
+
+
 def build_workbench_payload(
     server_id: Any,
     symbol: Any,
@@ -707,6 +852,13 @@ def build_workbench_payload(
     schema_report = _schema_report_for_config(config_dict)
     runtime_summary = build_pharos_runtime_summary(runtime_events or [], config_dict, error=runtime_error)
     recommendation_presets = build_pharos_recommendation_presets(config_dict, runtime_summary)
+    execution_preview = build_execution_preview(
+        config_dict,
+        runtime_summary,
+        startup_preflight=schema_report.get("startup_preflight") or {},
+        global_safety_preflight=schema_report.get("global_safety_preflight") or {},
+        profile_boundary=schema_report.get("profile_boundary") or {},
+    )
     return {
         "ok": True,
         "scope": target.scope_payload(),
@@ -729,6 +881,7 @@ def build_workbench_payload(
         "history_error": history_error,
         "can_rollback": len(history or []) >= 2,
         "runtime_summary": runtime_summary,
+        "execution_preview": execution_preview,
         "recommendation_presets": recommendation_presets,
         "raw_config": {str(key): _jsonable(value) for key, value in config_dict.items()},
         "source": f"ssh:{target.ssh_host}:{target.control_path}",

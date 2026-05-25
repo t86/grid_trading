@@ -13,6 +13,7 @@ from grid_optimizer.central_strategy_workbench import (
     REMOTE_RUNTIME_EVENTS_SCRIPT,
     REMOTE_WRITE_CONTROL_SCRIPT,
     apply_remote_workbench_config,
+    build_execution_preview,
     build_pharos_recommendation_presets,
     build_pharos_runtime_summary,
     build_workbench_payload,
@@ -546,6 +547,129 @@ class CentralStrategyWorkbenchTests(unittest.TestCase):
         self.assertEqual(summary["state"], "degraded")
         self.assertEqual(summary["mode"], "safe/watch")
         self.assertIn("stale_orders_present", summary["reason_codes"])
+
+    def test_build_execution_preview_reports_ready_brush_state(self) -> None:
+        preview = build_execution_preview(
+            {
+                "max_new_orders": 8,
+                "max_total_notional": 2500.0,
+                "max_cumulative_notional": 500000.0,
+                "best_quote_maker_volume_cycle_budget_notional": 120.0,
+                "per_order_notional": 20.0,
+                "cancel_stale": True,
+            },
+            {
+                "ok": True,
+                "state": "brush",
+                "mode": "normal/fast",
+                "reason_codes": [],
+                "latest": {
+                    "remaining_cumulative_notional": 300000.0,
+                    "open_order_count": 2,
+                    "stale_order_count": 0,
+                    "missing_order_count": 0,
+                },
+            },
+            startup_preflight={"can_start": True, "blocker_codes": [], "warning_codes": []},
+            global_safety_preflight={"limiting_params": [], "stop_guard_params": [], "takeover_params": []},
+            profile_boundary={"forbidden_active_params": []},
+        )
+
+        self.assertEqual(preview["status"], "ready")
+        self.assertTrue(preview["can_apply"])
+        self.assertTrue(preview["will_place_orders"])
+        self.assertEqual(preview["mode"], "normal/fast")
+        self.assertIn("预计可刷量", preview["summary"])
+        self.assertGreaterEqual(preview["estimated_new_order_capacity"], 2)
+
+    def test_build_execution_preview_blocks_when_preflight_blocks(self) -> None:
+        preview = build_execution_preview(
+            {"max_new_orders": 8, "max_total_notional": 2500.0, "cancel_stale": True},
+            {"ok": True, "state": "brush", "mode": "normal/fast", "latest": {}},
+            startup_preflight={"can_start": False, "blocker_codes": ["strict_unknown_params"], "warning_codes": []},
+            global_safety_preflight={},
+            profile_boundary={},
+        )
+
+        self.assertEqual(preview["status"], "blocked")
+        self.assertFalse(preview["can_apply"])
+        self.assertFalse(preview["will_place_orders"])
+        self.assertIn("strict_unknown_params", preview["blockers"])
+
+    def test_build_execution_preview_warns_for_stale_orders_and_cancel_stale_disabled(self) -> None:
+        preview = build_execution_preview(
+            {
+                "max_new_orders": 8,
+                "max_total_notional": 2500.0,
+                "best_quote_maker_volume_cycle_budget_notional": 120.0,
+                "per_order_notional": 20.0,
+                "cancel_stale": False,
+            },
+            {
+                "ok": True,
+                "state": "degraded",
+                "mode": "safe/watch",
+                "reason_codes": ["stale_orders_present", "missing_orders_present"],
+                "latest": {"stale_order_count": 1, "missing_order_count": 1, "remaining_cumulative_notional": 100000.0},
+            },
+            startup_preflight={"can_start": True, "blocker_codes": [], "warning_codes": []},
+            global_safety_preflight={},
+            profile_boundary={},
+        )
+
+        self.assertEqual(preview["status"], "warning")
+        self.assertTrue(preview["can_apply"])
+        self.assertFalse(preview["will_place_orders"])
+        self.assertIn("cancel_stale_disabled_with_stale_orders", preview["warnings"])
+        self.assertIn("先开启 cancel_stale", " ".join(preview["suggested_actions"]))
+
+    def test_build_execution_preview_blocks_when_cumulative_target_exhausted(self) -> None:
+        preview = build_execution_preview(
+            {"max_new_orders": 8, "max_total_notional": 2500.0, "max_cumulative_notional": 200000.0},
+            {
+                "ok": True,
+                "state": "brush",
+                "mode": "normal/fast",
+                "reason_codes": ["near_cumulative_volume_limit"],
+                "latest": {"remaining_cumulative_notional": 0.0},
+            },
+            startup_preflight={"can_start": True, "blocker_codes": [], "warning_codes": []},
+            global_safety_preflight={},
+            profile_boundary={},
+        )
+
+        self.assertEqual(preview["status"], "blocked")
+        self.assertFalse(preview["can_apply"])
+        self.assertIn("max_cumulative_notional_exhausted", preview["blockers"])
+
+    def test_build_workbench_payload_includes_execution_preview(self) -> None:
+        payload = build_workbench_payload(
+            "114",
+            "PHAROSUSDT",
+            "pharosusdt_hedge_best_quote_maker_volume_v1",
+            {
+                "symbol": "PHAROSUSDT",
+                "strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "required_position_mode": "hedge",
+                "max_new_orders": 8,
+                "max_total_notional": 2500.0,
+                "cancel_stale": True,
+                "best_quote_maker_volume_enabled": True,
+                "best_quote_maker_volume_cycle_budget_notional": 120.0,
+            },
+            runtime_events=[
+                {
+                    "ts": "2026-05-22T04:05:00+00:00",
+                    "cumulative_gross_notional": 1250.0,
+                    "actual_net_notional": 35.0,
+                    "open_order_count": 2,
+                },
+            ],
+        )
+
+        self.assertIn("execution_preview", payload)
+        self.assertIn(payload["execution_preview"]["status"], {"ready", "warning"})
 
     @patch("grid_optimizer.central_strategy_workbench.subprocess.run")
     def test_read_remote_runtime_events_uses_short_cache(self, mock_run) -> None:
