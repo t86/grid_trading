@@ -33,6 +33,7 @@ from grid_optimizer.loop_runner import (
     _custom_grid_levels_above_current,
     _generate_competition_inventory_grid_plan,
     _filter_futures_strategy_orders,
+    _preserve_frozen_inventory_manual_limit_open_orders,
     _elastic_volume_config,
     _elastic_volume_state_snapshot,
     _regime_budget_entry_reuse_tolerance,
@@ -2210,6 +2211,34 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(order["frozen_inventory_request_id"], "req-limit")
         self.assertNotIn("best_quote_frozen_inventory_manual_limit", state)
 
+    def test_best_quote_frozen_inventory_manual_limit_places_only_new_requested_qty(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_qty": 3456.0,
+                "short_manual_limit_isolated_qty": 1500.0,
+            },
+            "best_quote_frozen_inventory_manual_limit": {
+                "short": {"requested": True, "requested_qty": 500.0, "price": 0.629, "request_id": "req-500", "expires_at": "2099-01-01T00:00:00+00:00"}
+            },
+        }
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        report = apply_best_quote_frozen_inventory_manual_limit(
+            plan=plan,
+            state=state,
+            bid_price=0.6295,
+            ask_price=0.6296,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            hedge_mode=True,
+        )
+
+        self.assertTrue(report["placed_short"])
+        self.assertEqual(plan["buy_orders"][0]["qty"], 500.0)
+        self.assertEqual(state["best_quote_frozen_inventory"]["short_manual_limit_isolated_qty"], 1500.0)
+
     def test_best_quote_frozen_inventory_manual_limit_rejects_legacy_unauthorized_directive(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
@@ -3935,6 +3964,30 @@ class LoopRunnerTests(unittest.TestCase):
         result = _filter_futures_strategy_orders(open_orders, "BTCUSDC")
 
         self.assertEqual(result, [{"clientOrderId": "gx-btcusdc-001", "orderId": 1}])
+
+    def test_preserve_frozen_inventory_manual_limit_open_orders_keeps_existing_order(self) -> None:
+        open_orders = [
+            {
+                "clientOrderId": "gx-pharosu-frozenin-1-91969317",
+                "side": "BUY",
+                "type": "LIMIT",
+                "positionSide": "SHORT",
+                "price": "0.6290000",
+                "origQty": "1500",
+                "executedQty": "0",
+                "orderId": 46174496,
+            }
+        ]
+
+        desired = _preserve_frozen_inventory_manual_limit_open_orders(
+            existing_orders=open_orders,
+            desired_orders=[],
+        )
+
+        self.assertEqual(len(desired), 1)
+        self.assertEqual(desired[0]["role"], "frozen_inventory_manual_limit_short")
+        self.assertEqual(desired[0]["position_side"], "SHORT")
+        self.assertAlmostEqual(float(desired[0]["qty"]), 1500.0)
 
     def test_resolve_anti_chase_entry_guard_blocks_directional_entries(self) -> None:
         up_guard = resolve_anti_chase_entry_guard(

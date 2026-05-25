@@ -4044,8 +4044,8 @@ def apply_best_quote_frozen_inventory_manual_limit(
         frozen_qty = max(_safe_float(ledger.get(f"{side_key}_qty")), 0.0)
         isolated_key = f"{side_key}_manual_limit_isolated_qty"
         requested_qty = max(_safe_float(side_directive.get("requested_qty")), 0.0)
-        isolated_qty = min(max(_safe_float(ledger.get(isolated_key)), requested_qty), frozen_qty)
-        if isolated_qty <= 1e-12:
+        order_qty = min(requested_qty, frozen_qty)
+        if order_qty <= 1e-12:
             directive.pop(side_key, None)
             ledger[isolated_key] = 0.0
             limit_report["blocked_reasons"].append(f"{side_key}_isolated_qty_empty")
@@ -4057,7 +4057,7 @@ def apply_best_quote_frozen_inventory_manual_limit(
         if price <= 0:
             limit_report["blocked_reasons"].append(f"{side_key}_missing_price")
             return None
-        qty = _round_order_qty(isolated_qty, step_size)
+        qty = _round_order_qty(order_qty, step_size)
         if qty <= 0 or (min_qty is not None and qty + 1e-12 < _safe_float(min_qty)):
             limit_report["blocked_reasons"].append(f"{side_key}_below_min_qty")
             return None
@@ -4065,7 +4065,7 @@ def apply_best_quote_frozen_inventory_manual_limit(
         if safe_min_notional > 0 and notional + 1e-12 < safe_min_notional:
             limit_report["blocked_reasons"].append(f"{side_key}_below_min_notional")
             return None
-        ledger[isolated_key] = qty
+        ledger[isolated_key] = min(max(_safe_float(ledger.get(isolated_key)), qty), frozen_qty)
         return {
             "side": side,
             "price": price,
@@ -7308,6 +7308,48 @@ def _strategy_client_order_prefix(symbol: str) -> str:
 def _is_futures_strategy_order(order: dict[str, Any], symbol: str) -> bool:
     client_order_id = str(order.get("clientOrderId", "") or "")
     return client_order_id.startswith(_strategy_client_order_prefix(symbol))
+
+
+def _is_frozen_inventory_manual_limit_open_order(order: dict[str, Any]) -> bool:
+    client_order_id = str(order.get("clientOrderId", "") or "").lower()
+    return client_order_id.startswith("gx-") and "-frozenin-" in client_order_id
+
+
+def _preserve_frozen_inventory_manual_limit_open_orders(
+    *,
+    existing_orders: list[dict[str, Any]],
+    desired_orders: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    preserved = [dict(item) for item in desired_orders if isinstance(item, dict)]
+    for order in existing_orders:
+        if not isinstance(order, dict) or not _is_frozen_inventory_manual_limit_open_order(order):
+            continue
+        side = str(order.get("side", "")).upper().strip()
+        position_side = str(order.get("positionSide", order.get("position_side", "BOTH"))).upper().strip() or "BOTH"
+        if side == "SELL" and position_side in {"LONG", "BOTH"}:
+            side_key = "long"
+        elif side == "BUY" and position_side in {"SHORT", "BOTH"}:
+            side_key = "short"
+        else:
+            continue
+        price = _safe_float(order.get("price"))
+        qty = _safe_float(order.get("origQty", order.get("qty")))
+        if price <= 0 or qty <= 0:
+            continue
+        preserved.append(
+            {
+                "side": side,
+                "price": price,
+                "qty": qty,
+                "notional": price * qty,
+                "role": f"frozen_inventory_manual_limit_{side_key}",
+                "position_side": position_side,
+                "force_reduce_only": True,
+                "execution_type": "maker",
+                "manual_frozen_inventory_limit": True,
+            }
+        )
+    return preserved
 
 
 def _filter_futures_strategy_orders(open_orders: Iterable[Any], symbol: str) -> list[dict[str, Any]]:
@@ -18976,6 +19018,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 *plan["buy_orders"],
                 *plan["sell_orders"],
             ]
+    desired_orders = _preserve_frozen_inventory_manual_limit_open_orders(
+        existing_orders=open_orders_for_diff,
+        desired_orders=desired_orders,
+    )
     diff = diff_open_orders(existing_orders=open_orders_for_diff, desired_orders=desired_orders)
 
     state_now = _isoformat(_utc_now())
