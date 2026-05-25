@@ -3033,6 +3033,8 @@ class WebSecurityTests(unittest.TestCase):
                 "best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled": True,
                 "best_quote_maker_volume_reduce_freeze_dynamic_threshold_loss_ratio_scale": 0.35,
                 "best_quote_maker_volume_reduce_freeze_dynamic_threshold_max_extra_ratio": 0.02,
+                "best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_start": 500.0,
+                "best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_full": 3000.0,
                 "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.7,
                 "best_quote_maker_volume_frozen_pair_release_enabled": True,
                 "best_quote_maker_volume_frozen_pair_release_max_notional": 20.0,
@@ -3112,6 +3114,14 @@ class WebSecurityTests(unittest.TestCase):
             "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-max-extra-ratio"
         )
         self.assertEqual(command[dynamic_max_extra_index + 1], "0.02")
+        dynamic_start_index = command.index(
+            "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-frozen-notional-start"
+        )
+        self.assertEqual(command[dynamic_start_index + 1], "500.0")
+        dynamic_full_index = command.index(
+            "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-frozen-notional-full"
+        )
+        self.assertEqual(command[dynamic_full_index + 1], "3000.0")
         reduce_freeze_soft_index = command.index("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale")
         self.assertEqual(command[reduce_freeze_soft_index + 1], "0.7")
         self.assertIn("--best-quote-maker-volume-frozen-pair-release-enabled", command)

@@ -3366,6 +3366,8 @@ def _apply_best_quote_reduce_freeze(
     dynamic_threshold_enabled: bool = False,
     dynamic_threshold_loss_ratio_scale: float = 0.0,
     dynamic_threshold_max_extra_ratio: float = 0.0,
+    dynamic_threshold_frozen_notional_start: float = 0.0,
+    dynamic_threshold_frozen_notional_full: float = 0.0,
     current_long_qty: float,
     current_short_qty: float,
     current_long_avg_price: float,
@@ -3385,12 +3387,18 @@ def _apply_best_quote_reduce_freeze(
     report["stress_active"] = bool(stress_active)
     dynamic_threshold_scale = max(_safe_float(dynamic_threshold_loss_ratio_scale), 0.0)
     dynamic_threshold_max_extra = max(_safe_float(dynamic_threshold_max_extra_ratio), 0.0)
+    dynamic_threshold_frozen_start = max(_safe_float(dynamic_threshold_frozen_notional_start), 0.0)
+    dynamic_threshold_frozen_full = max(_safe_float(dynamic_threshold_frozen_notional_full), 0.0)
     dynamic_threshold_active = bool(dynamic_threshold_enabled) and dynamic_threshold_scale > 0
     report["dynamic_threshold"] = {
         "enabled": bool(dynamic_threshold_enabled),
         "active": dynamic_threshold_active,
         "loss_ratio_scale": dynamic_threshold_scale,
         "max_extra_ratio": dynamic_threshold_max_extra,
+        "frozen_notional_start": dynamic_threshold_frozen_start,
+        "frozen_notional_full": dynamic_threshold_frozen_full,
+        "long_frozen_pressure": 0.0,
+        "short_frozen_pressure": 0.0,
         "long_extra_ratio": 0.0,
         "short_extra_ratio": 0.0,
     }
@@ -3431,20 +3439,39 @@ def _apply_best_quote_reduce_freeze(
         effective_threshold = max(threshold, _safe_float(stress_loss_ratio))
     report["effective_threshold_loss_ratio"] = effective_threshold
     hard_freeze_enabled = _safe_float(report["hard_loss_ratio"]) > 0
-    def _dynamic_freeze_threshold(side_loss_ratio: float) -> tuple[float, float]:
+    def _frozen_pressure(side: str) -> float:
+        frozen_notional = (
+            _safe_float(report.get("frozen_long_notional"))
+            if str(side).upper() == "LONG"
+            else _safe_float(report.get("frozen_short_notional"))
+        )
+        if dynamic_threshold_frozen_full <= dynamic_threshold_frozen_start:
+            return 1.0 if frozen_notional > 0 else 0.0
+        raw_pressure = (
+            (frozen_notional - dynamic_threshold_frozen_start)
+            / (dynamic_threshold_frozen_full - dynamic_threshold_frozen_start)
+        )
+        return min(max(raw_pressure, 0.0), 1.0)
+
+    def _dynamic_freeze_threshold(side: str, side_loss_ratio: float) -> tuple[float, float, float]:
         extra = 0.0
+        pressure = _frozen_pressure(side)
         if dynamic_threshold_active and side_loss_ratio > 0:
-            extra = max(side_loss_ratio, 0.0) * dynamic_threshold_scale
+            extra = max(side_loss_ratio, 0.0) * dynamic_threshold_scale * pressure
             if dynamic_threshold_max_extra > 0:
                 extra = min(extra, dynamic_threshold_max_extra)
-        return effective_threshold + extra, extra
+        return effective_threshold + extra, extra, pressure
 
-    long_freeze_threshold, long_dynamic_extra = _dynamic_freeze_threshold(long_loss_ratio)
-    short_freeze_threshold, short_dynamic_extra = _dynamic_freeze_threshold(short_loss_ratio)
+    long_freeze_threshold, long_dynamic_extra, long_frozen_pressure = _dynamic_freeze_threshold("LONG", long_loss_ratio)
+    short_freeze_threshold, short_dynamic_extra, short_frozen_pressure = _dynamic_freeze_threshold(
+        "SHORT", short_loss_ratio
+    )
     report["dynamic_threshold"].update(
         {
             "long_loss_ratio": long_loss_ratio,
             "short_loss_ratio": short_loss_ratio,
+            "long_frozen_pressure": long_frozen_pressure,
+            "short_frozen_pressure": short_frozen_pressure,
             "long_extra_ratio": long_dynamic_extra,
             "short_extra_ratio": short_dynamic_extra,
         }
@@ -3643,8 +3670,12 @@ def _apply_best_quote_reduce_freeze(
             "active": dynamic_threshold_active,
             "loss_ratio_scale": dynamic_threshold_scale,
             "max_extra_ratio": dynamic_threshold_max_extra,
+            "frozen_notional_start": dynamic_threshold_frozen_start,
+            "frozen_notional_full": dynamic_threshold_frozen_full,
             "long_loss_ratio": long_loss_ratio,
             "short_loss_ratio": short_loss_ratio,
+            "long_frozen_pressure": long_frozen_pressure,
+            "short_frozen_pressure": short_frozen_pressure,
             "long_extra_ratio": long_dynamic_extra,
             "short_extra_ratio": short_dynamic_extra,
         }
@@ -16563,6 +16594,26 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             0.0,
         )
+        best_quote_reduce_freeze_dynamic_threshold_frozen_notional_start = max(
+            _safe_float(
+                getattr(
+                    effective_args,
+                    "best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_start",
+                    0.0,
+                )
+            ),
+            0.0,
+        )
+        best_quote_reduce_freeze_dynamic_threshold_frozen_notional_full = max(
+            _safe_float(
+                getattr(
+                    effective_args,
+                    "best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_full",
+                    0.0,
+                )
+            ),
+            0.0,
+        )
         best_quote_frozen_pair_release_enabled = bool(
             getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_enabled", False)
         )
@@ -16638,6 +16689,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 "dynamic_threshold_enabled": best_quote_reduce_freeze_dynamic_threshold_enabled,
                 "dynamic_threshold_loss_ratio_scale": best_quote_reduce_freeze_dynamic_threshold_loss_ratio_scale,
                 "dynamic_threshold_max_extra_ratio": best_quote_reduce_freeze_dynamic_threshold_max_extra_ratio,
+                "dynamic_threshold_frozen_notional_start": (
+                    best_quote_reduce_freeze_dynamic_threshold_frozen_notional_start
+                ),
+                "dynamic_threshold_frozen_notional_full": (
+                    best_quote_reduce_freeze_dynamic_threshold_frozen_notional_full
+                ),
                 "min_notional": best_quote_reduce_freeze_min_notional,
                 "soft_ratio_scale": best_quote_reduce_freeze_soft_scale,
                 "base_inventory_soft_ratio": float(
@@ -16687,6 +16744,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             dynamic_threshold_enabled=best_quote_reduce_freeze_dynamic_threshold_enabled,
             dynamic_threshold_loss_ratio_scale=best_quote_reduce_freeze_dynamic_threshold_loss_ratio_scale,
             dynamic_threshold_max_extra_ratio=best_quote_reduce_freeze_dynamic_threshold_max_extra_ratio,
+            dynamic_threshold_frozen_notional_start=(
+                best_quote_reduce_freeze_dynamic_threshold_frozen_notional_start
+            ),
+            dynamic_threshold_frozen_notional_full=(
+                best_quote_reduce_freeze_dynamic_threshold_frozen_notional_full
+            ),
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
             current_long_avg_price=current_long_avg_price,
@@ -19864,6 +19927,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
     )
+    parser.add_argument(
+        "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-frozen-notional-start",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-frozen-notional-full",
+        type=float,
+        default=0.0,
+    )
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale", type=float, default=0.70)
     parser.add_argument("--best-quote-maker-volume-frozen-total-cap-notional", type=float, default=0.0)
     parser.add_argument(
@@ -21070,6 +21143,8 @@ def main() -> None:
         or args.best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio < 0
         or args.best_quote_maker_volume_reduce_freeze_dynamic_threshold_loss_ratio_scale < 0
         or args.best_quote_maker_volume_reduce_freeze_dynamic_threshold_max_extra_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_start < 0
+        or args.best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_full < 0
         or args.best_quote_maker_volume_frozen_total_cap_notional < 0
     ):
         raise SystemExit("--best-quote-maker-volume-reduce-freeze values must be >= 0")
