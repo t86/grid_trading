@@ -1120,6 +1120,127 @@ class LoopRunnerTests(unittest.TestCase):
         ledger = state["best_quote_frozen_inventory"]
         self.assertEqual(ledger["short_qty"], 300.0)
 
+    def test_best_quote_reduce_freeze_band_budget_caps_same_band_freeze(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_lots": [
+                    {
+                        "qty": 100.0,
+                        "entry_price": 0.6600,
+                        "freeze_band_key": "short:-41",
+                    }
+                ],
+                "band_budgets": {
+                    "short:-41": {
+                        "side": "short",
+                        "band_key": "short:-41",
+                        "cumulative_frozen_qty": 100.0,
+                        "pair_released_qty": 0.0,
+                    }
+                },
+            },
+            "best_quote_volume_ledger": {
+                "short_lots": [{"qty": 300.0, "price": 0.6600}],
+                "short_qty": 300.0,
+                "short_avg_price": 0.6600,
+                "initialized": True,
+            },
+        }
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=0.0,
+            current_short_qty=400.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6600,
+            mid_price=0.6680,
+            bq_ledger_report=state["best_quote_volume_ledger"],
+        )
+
+        report = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [], "buy_orders": [{"role": "best_quote_reduce_short"}]},
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=10.0,
+            current_long_qty=0.0,
+            current_short_qty=400.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6600,
+            mid_price=0.6680,
+            bq_ledger_report=state["best_quote_volume_ledger"],
+            band_budget_enabled=True,
+            band_budget_price_ratio=0.01,
+            band_budget_base_notional=66.8,
+        )
+
+        self.assertFalse(report["applied"])
+        self.assertEqual(report["band_budget"]["short"]["blocked_reason"], "band_budget_exhausted")
+        self.assertEqual(state["best_quote_volume_ledger"]["short_qty"], 300.0)
+
+    def test_best_quote_frozen_pair_release_releases_short_from_highest_band_first(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [
+                    {
+                        "qty": 100.0,
+                        "entry_price": 0.6000,
+                        "freeze_band_key": "long:low",
+                    }
+                ],
+                "short_lots": [
+                    {
+                        "qty": 80.0,
+                        "entry_price": 0.6600,
+                        "freeze_band_key": "short:high",
+                    },
+                    {
+                        "qty": 80.0,
+                        "entry_price": 0.6400,
+                        "freeze_band_key": "short:low",
+                    },
+                ],
+                "band_budgets": {
+                    "long:low": {"side": "long", "band_key": "long:low", "pair_released_qty": 0.0},
+                    "short:high": {"side": "short", "band_key": "short:high", "pair_released_qty": 0.0},
+                    "short:low": {"side": "short", "band_key": "short:low", "pair_released_qty": 0.0},
+                },
+            },
+            "best_quote_volume_order_refs": {
+                "11": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_pair_release_long",
+                    "frozen_inventory_request_id": "req-1",
+                },
+                "12": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_pair_release_short",
+                    "frozen_inventory_request_id": "req-1",
+                },
+            },
+            "best_quote_frozen_inventory_pair_release": {
+                "request_id": "req-1",
+                "requested_qty": 100.0,
+            },
+        }
+
+        report = sync_best_quote_frozen_pair_release(
+            state=state,
+            observed_trade_rows=[
+                {"orderId": 11, "qty": "100", "time": 1, "id": 1},
+                {"orderId": 12, "qty": "100", "time": 1, "id": 2},
+            ],
+        )
+
+        self.assertTrue(report["completed"])
+        frozen = state["best_quote_frozen_inventory"]
+        self.assertEqual(frozen["short_qty"], 60.0)
+        self.assertEqual(len(frozen["short_lots"]), 1)
+        self.assertEqual(frozen["short_lots"][0]["freeze_band_key"], "short:low")
+        self.assertEqual(frozen["short_lots"][0]["qty"], 60.0)
+        self.assertEqual(frozen["band_budgets"]["short:high"]["pair_released_qty"], 80.0)
+        self.assertEqual(frozen["band_budgets"]["short:low"]["pair_released_qty"], 20.0)
+
     def test_best_quote_reduce_freeze_waits_for_confirm_cycles(self) -> None:
         state: dict[str, object] = {
             "best_quote_volume_ledger": {
