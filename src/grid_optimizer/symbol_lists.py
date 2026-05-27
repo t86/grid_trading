@@ -21,6 +21,7 @@ DEFAULT_SYMBOL_LISTS: dict[str, list[str]] = {
         "ORDIUSDC",
         "TRUMPUSDC",
         "AIGENSYNUSDT",
+        "OPGUSDT",
     ],
     "competition": [
         "PHAROSUSDT",
@@ -36,6 +37,7 @@ DEFAULT_SYMBOL_LISTS: dict[str, list[str]] = {
         "ORDIUSDC",
         "TRUMPUSDC",
         "AIGENSYNUSDT",
+        "OPGUSDT",
     ],
 }
 SUPPORTED_SYMBOL_LIST_TYPES = tuple(DEFAULT_SYMBOL_LISTS.keys())

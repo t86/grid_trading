@@ -41,6 +41,7 @@ class SymbolListsTests(unittest.TestCase):
             "ORDIUSDC",
             "TRUMPUSDC",
             "AIGENSYNUSDT",
+            "OPGUSDT",
         ):
             self.assertIn(symbol, loaded["monitor"])
             self.assertIn(symbol, loaded["competition"])

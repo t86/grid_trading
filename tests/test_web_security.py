@@ -4918,7 +4918,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("硬上限", MONITOR_PAGE)
 
     def test_monitor_page_default_monitor_symbols_include_current_sprint_symbols(self) -> None:
-        self.assertIn('const DEFAULT_MONITOR_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT"]', MONITOR_PAGE)
+        self.assertIn('const DEFAULT_MONITOR_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT", "OPGUSDT"]', MONITOR_PAGE)
 
     def test_monitor_page_reward_targets_render_current_segment_boundary(self) -> None:
         self.assertIn("zone_moves", MONITOR_PAGE)
@@ -4980,7 +4980,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("/api/symbol_lists", STRATEGIES_PAGE)
 
     def test_strategies_page_default_competition_symbols_include_current_sprint_symbols(self) -> None:
-        self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT"]', STRATEGIES_PAGE)
+        self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT", "OPGUSDT"]', STRATEGIES_PAGE)
 
     def test_monitor_page_ordiusdc_ping_pong_includes_adaptive_step_amplitude_controls(self) -> None:
         self.assertIn("adaptive_step_1m_amplitude_ratio: 0.00375", MONITOR_PAGE)

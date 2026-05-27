@@ -603,6 +603,26 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertEqual(board["activity_start_at"], "2026-05-19T18:00:00+08:00")
         self.assertEqual(board["activity_end_at"], "2026-06-09T07:59:00+08:00")
 
+    def test_resolve_active_competition_board_falls_back_to_hinted_opg_board(self) -> None:
+        board = resolve_active_competition_board(
+            "OPGUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 5, 27, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(board)
+        self.assertEqual(board["symbol"], "OPG")
+        self.assertEqual(board["market"], "futures")
+        self.assertEqual(board["activity_start_at"], "2026-05-26T10:00:00+08:00")
+        self.assertEqual(board["activity_end_at"], "2026-06-08T23:59:00+08:00")
+        self.assertEqual(len(board.get("segments", [])), 8)
+
+        with patch.object(competition_board, "_fetch_symbol_close_price_usdt", return_value=0.1):
+            targets = build_reward_volume_targets(board, now=datetime(2026, 5, 27, 0, 0, tzinfo=timezone.utc))
+        self.assertIsNotNone(targets)
+        self.assertEqual([item["rank"] for item in targets["tiers"]], [200, 50, 20])
+        self.assertAlmostEqual(targets["tiers"][0]["reward_value_usdt"], 250.0, places=8)
+
     def test_hinted_pharos_board_parses_reward_segments(self) -> None:
         board = resolve_active_competition_board(
             "PHAROSUSDT",

@@ -369,6 +369,13 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         url="https://www.binance.com/zh-CN/activity/trading-competition/futures-pharos-challenge?ref=YEK2JZJT",
     ),
     CompetitionSource(
+        slug="futures_opg",
+        symbol="OPG",
+        market="futures",
+        label="OPG 合约交易挑战赛",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/futures-opg-challenge",
+    ),
+    CompetitionSource(
         slug="futures_tradfi_week1",
         symbol="TRADFI",
         market="futures",
@@ -1539,6 +1546,45 @@ TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量达到 70 亿
 平分 60,000 PHAROS
 第 51 - 200 名
 平分 120,000 PHAROS
+""",
+            }
+        ]
+    },
+    "futures_opg": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 0,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "OPG",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/05/26 10:00 - 2026/06/08 23:59",
+                "activityEndAt": "2026-06-08T23:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/05/26 10:00 - 2026/06/08 23:59
+累计 OPG U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 1,250,000 OPG
+第 1 名
+187,500 OPG
+第 2 名
+150,000 OPG
+第 3 名
+87,500 OPG
+第 4 名
+50,000 OPG
+第 5 名
+25,000 OPG
+第 6 - 20 名
+平分 187,500 OPG
+第 21 - 50 名
+平分 187,500 OPG
+第 51 - 200 名
+平分 375,000 OPG
 """,
             }
         ]
