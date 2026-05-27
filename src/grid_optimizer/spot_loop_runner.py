@@ -2761,7 +2761,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             bid_price=bid_price,
             ask_price=ask_price,
             step_price=float(args.step_price),
-            buy_levels=max(_safe_int(getattr(args, "attack_buy_levels", 1)), 1),
+            buy_levels=max(_safe_int(getattr(args, "attack_buy_levels", 1)), 0),
             sell_levels=max(_safe_int(getattr(args, "attack_sell_levels", 1)), 1),
             first_order_multiplier=float(args.first_order_multiplier),
             per_order_notional=float(args.per_order_notional),
