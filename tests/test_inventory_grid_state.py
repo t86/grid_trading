@@ -2,8 +2,11 @@ import pytest
 
 from grid_optimizer.inventory_grid_state import (
     apply_inventory_grid_fill,
+    apply_synthetic_frozen_pair_release,
     build_forced_reduce_lot_plan,
+    freeze_inventory_grid_reduce_lots,
     new_inventory_grid_runtime,
+    synthetic_frozen_position_report,
 )
 
 
@@ -401,6 +404,163 @@ def test_forced_reduce_fill_consumes_same_most_adverse_lots_as_plan() -> None:
     assert [item["lot_id"] for item in plan["lots"]] == ["expensive"]
     assert runtime["position_lots"][0]["lot_id"] == "cheap"
     assert runtime["position_lots"][0]["qty"] == 100.0
+
+
+def test_synthetic_freeze_moves_adverse_reduce_lots_to_frozen_inventory() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "long_active"
+    runtime["position_lots"] = [
+        {"lot_id": "cheap", "side": "long", "qty": 100.0, "entry_price": 0.09, "opened_at_ms": 1, "source_role": "grid_entry"},
+        {"lot_id": "expensive", "side": "long", "qty": 100.0, "entry_price": 0.10, "opened_at_ms": 2, "source_role": "grid_entry"},
+    ]
+
+    result = freeze_inventory_grid_reduce_lots(
+        runtime=runtime,
+        reduce_price=0.08,
+        reduce_qty=100.0,
+        step_price=0.01,
+        freeze_time_ms=3000,
+        reason="threshold_reduce_loss",
+    )
+
+    assert result["applied"] is True
+    assert result["freeze_qty"] == 100.0
+    assert [item["lot_id"] for item in runtime["position_lots"]] == ["cheap"]
+    assert len(runtime["frozen_position_lots"]) == 1
+    frozen = runtime["frozen_position_lots"][0]
+    assert frozen["side"] == "long"
+    assert frozen["source_lot_id"] == "expensive"
+    assert frozen["qty"] == 100.0
+    assert frozen["entry_price"] == 0.10
+    assert frozen["frozen_at_ms"] == 3000
+
+    report = synthetic_frozen_position_report(runtime=runtime, mid_price=0.08)
+    assert report["long_qty"] == 100.0
+    assert report["long_notional"] == 8.0
+
+
+def test_synthetic_freeze_can_create_opposite_frozen_lots_for_pair_release() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "short_active"
+    runtime["frozen_position_lots"] = [
+        {"lot_id": "frozen_long", "source_lot_id": "long", "side": "long", "qty": 50.0, "entry_price": 0.10, "frozen_at_ms": 1, "freeze_reason": "threshold_reduce_loss"},
+    ]
+    runtime["position_lots"] = [
+        {"lot_id": "short", "side": "short", "qty": 80.0, "entry_price": 0.09, "opened_at_ms": 2, "source_role": "grid_entry"},
+    ]
+
+    result = freeze_inventory_grid_reduce_lots(
+        runtime=runtime,
+        reduce_price=0.11,
+        reduce_qty=40.0,
+        step_price=0.01,
+        freeze_time_ms=3000,
+        reason="threshold_reduce_loss",
+    )
+
+    assert result["applied"] is True
+    report = synthetic_frozen_position_report(runtime=runtime, mid_price=0.10)
+    assert report["long_qty"] == 50.0
+    assert report["short_qty"] == 40.0
+    assert report["pair_eligible_qty"] == 40.0
+
+
+def test_synthetic_frozen_pair_release_offsets_long_and_short_lots_without_orders() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["frozen_position_lots"] = [
+        {"lot_id": "frozen_long", "source_lot_id": "long", "side": "long", "qty": 60.0, "entry_price": 0.10, "frozen_at_ms": 1, "freeze_reason": "threshold_reduce_loss"},
+        {"lot_id": "frozen_short", "source_lot_id": "short", "side": "short", "qty": 40.0, "entry_price": 0.12, "frozen_at_ms": 2, "freeze_reason": "threshold_reduce_loss"},
+    ]
+
+    result = apply_synthetic_frozen_pair_release(
+        runtime=runtime,
+        release_qty=None,
+        release_time_ms=4000,
+        reason="pair_release",
+    )
+
+    assert result["applied"] is True
+    assert result["release_qty"] == 40.0
+    assert result["pair_release_pnl_quote"] == pytest.approx(0.8)
+    assert runtime["frozen_position_lots"] == [
+        {"lot_id": "frozen_long", "source_lot_id": "long", "side": "long", "qty": 20.0, "entry_price": 0.10, "frozen_at_ms": 1, "freeze_reason": "threshold_reduce_loss"},
+    ]
+    assert runtime["last_strategy_trade_time_ms"] == 4000
+
+
+def test_synthetic_frozen_release_fill_consumes_only_frozen_lots() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "long_active"
+    runtime["position_lots"] = [
+        {"lot_id": "active", "side": "long", "qty": 50.0, "entry_price": 0.09, "opened_at_ms": 1, "source_role": "grid_entry"},
+    ]
+    runtime["frozen_position_lots"] = [
+        {"lot_id": "frozen_1", "source_lot_id": "frozen_source", "side": "long", "qty": 100.0, "entry_price": 0.10, "frozen_at_ms": 2, "freeze_reason": "threshold_reduce_loss"},
+    ]
+
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="synthetic_frozen_release",
+        side="SELL",
+        price=0.101,
+        qty=100.0,
+        fill_time_ms=4000,
+        step_price=0.01,
+    )
+
+    assert runtime["position_lots"][0]["lot_id"] == "active"
+    assert runtime["position_lots"][0]["qty"] == 50.0
+    assert runtime["frozen_position_lots"] == []
+    assert runtime["direction_state"] == "long_active"
+
+
+def test_synthetic_frozen_manual_release_fill_consumes_frozen_lots() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "flat"
+    runtime["frozen_position_lots"] = [
+        {"lot_id": "frozen_1", "source_lot_id": "held", "side": "long", "qty": 100.0, "entry_price": 0.10, "frozen_at_ms": 2, "freeze_reason": "threshold_reduce_loss"},
+    ]
+
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="synthetic_frozen_manual_release",
+        side="SELL",
+        price=0.09,
+        qty=60.0,
+        fill_time_ms=4000,
+        step_price=0.01,
+    )
+
+    assert runtime["frozen_position_lots"][0]["qty"] == 40.0
+    assert runtime["last_strategy_trade_time_ms"] == 4000
+
+
+def test_synthetic_frozen_short_release_consumes_quote_backed_liability() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "flat"
+    runtime["frozen_position_lots"] = [
+        {"lot_id": "frozen_short", "source_lot_id": "sold_neutral_base", "side": "short", "qty": 100.0, "entry_price": 0.10, "frozen_at_ms": 2, "freeze_reason": "threshold_reduce_loss"},
+    ]
+
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="synthetic_frozen_release",
+        side="BUY",
+        price=0.099,
+        qty=100.0,
+        fill_time_ms=4000,
+        step_price=0.01,
+    )
+
+    assert runtime["position_lots"] == []
+    assert runtime["frozen_position_lots"] == []
+    assert runtime["direction_state"] == "flat"
 
 
 def test_tail_cleanup_closes_long_and_short_inventory_without_anchor_updates() -> None:

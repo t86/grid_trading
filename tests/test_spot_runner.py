@@ -299,6 +299,34 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("--spot-slow-trend-step-scale", command)
         self.assertIn("2.0", command)
 
+    def test_build_spot_runner_command_includes_synthetic_freeze_arguments(self) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "OPGUSDT",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "synthetic_freeze_enabled": True,
+                "synthetic_freeze_loss_ratio": 0.006,
+                "synthetic_freeze_min_notional": 20.0,
+                "synthetic_freeze_max_side_notional": 1000.0,
+                "synthetic_freeze_release_profit_ratio": 0.0015,
+                "synthetic_freeze_pair_release_enabled": True,
+            }
+        )
+
+        command = _build_spot_runner_command(config)
+
+        self.assertIn("--synthetic-freeze-enabled", command)
+        self.assertIn("--synthetic-freeze-loss-ratio", command)
+        self.assertIn("0.006", command)
+        self.assertIn("--synthetic-freeze-min-notional", command)
+        self.assertIn("20.0", command)
+        self.assertIn("--synthetic-freeze-max-side-notional", command)
+        self.assertIn("1000.0", command)
+        self.assertIn("--synthetic-freeze-release-profit-ratio", command)
+        self.assertIn("0.0015", command)
+        self.assertIn("--synthetic-freeze-pair-release-enabled", command)
+
     @patch("grid_optimizer.web.fetch_spot_open_orders")
     @patch("grid_optimizer.web.fetch_spot_account_info")
     @patch("grid_optimizer.web.load_binance_api_credentials")

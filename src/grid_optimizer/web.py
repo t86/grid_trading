@@ -8272,6 +8272,15 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "spot_slow_trend_step_5m_amplitude_ratio": 0.0,
     "spot_slow_trend_step_15m_amplitude_ratio": 0.0,
     "spot_slow_trend_step_scale": 1.0,
+    "synthetic_freeze_enabled": False,
+    "synthetic_freeze_loss_ratio": 0.0,
+    "synthetic_freeze_min_notional": 0.0,
+    "synthetic_freeze_max_side_notional": 0.0,
+    "synthetic_freeze_release_profit_ratio": 0.0,
+    "synthetic_freeze_pair_release_enabled": True,
+    "synthetic_freeze_manual_release_side": "",
+    "synthetic_freeze_manual_release_qty": 0.0,
+    "synthetic_freeze_manual_release_price": 0.0,
     "max_order_position_notional": 0.0,
     "max_position_notional": 0.0,
     "neutral_base_qty": 0.0,
@@ -14456,6 +14465,13 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--spot-slow-trend-step-5m-amplitude-ratio", config.get("spot_slow_trend_step_5m_amplitude_ratio")),
         ("--spot-slow-trend-step-15m-amplitude-ratio", config.get("spot_slow_trend_step_15m_amplitude_ratio")),
         ("--spot-slow-trend-step-scale", config.get("spot_slow_trend_step_scale")),
+        ("--synthetic-freeze-loss-ratio", config.get("synthetic_freeze_loss_ratio")),
+        ("--synthetic-freeze-min-notional", config.get("synthetic_freeze_min_notional")),
+        ("--synthetic-freeze-max-side-notional", config.get("synthetic_freeze_max_side_notional")),
+        ("--synthetic-freeze-release-profit-ratio", config.get("synthetic_freeze_release_profit_ratio")),
+        ("--synthetic-freeze-manual-release-side", config.get("synthetic_freeze_manual_release_side")),
+        ("--synthetic-freeze-manual-release-qty", config.get("synthetic_freeze_manual_release_qty")),
+        ("--synthetic-freeze-manual-release-price", config.get("synthetic_freeze_manual_release_price")),
         ("--run-start-time", config.get("run_start_time")),
         ("--run-end-time", config.get("run_end_time")),
         ("--runtime-guard-stats-start-time", config.get("runtime_guard_stats_start_time")),
@@ -14475,6 +14491,13 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         command.append("--spot-fast-stop-enabled")
     if _truthy(config.get("spot_slow_trend_step_enabled", False)):
         command.append("--spot-slow-trend-step-enabled")
+    if _truthy(config.get("synthetic_freeze_enabled", False)):
+        command.append("--synthetic-freeze-enabled")
+    command.append(
+        "--synthetic-freeze-pair-release-enabled"
+        if _truthy(config.get("synthetic_freeze_pair_release_enabled", True))
+        else "--no-synthetic-freeze-pair-release-enabled"
+    )
     command.append("--spot-fast-stop-down-only" if config.get("spot_fast_stop_down_only", True) else "--spot-fast-stop-any-direction")
     command.append("--elastic-volume-enabled" if config.get("elastic_volume_enabled", False) else "--no-elastic-volume-enabled")
     command.append("--cancel-stale" if config.get("cancel_stale", True) else "--no-cancel-stale")

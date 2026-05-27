@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .dry_run import _round_order_price, _round_order_qty
-from .inventory_grid_state import build_forced_reduce_lot_plan, select_grid_exit_lots
+from .inventory_grid_state import build_forced_reduce_lot_plan, select_grid_exit_lots, synthetic_frozen_position_report
 
 EPSILON = 1e-12
 
@@ -78,6 +78,8 @@ def _finalize_inventory_grid_plan(
     tail_cleanup_active: bool,
     min_qty: float | None,
     min_notional: float | None,
+    synthetic_freeze_candidate: dict[str, Any] | None = None,
+    synthetic_frozen_position: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     bootstrap_orders = _filter_orders_meeting_mins(bootstrap_orders, min_qty=min_qty, min_notional=min_notional)
     buy_orders = _filter_orders_meeting_mins(buy_orders, min_qty=min_qty, min_notional=min_notional)
@@ -90,6 +92,8 @@ def _finalize_inventory_grid_plan(
         "sell_orders": sell_orders,
         "forced_reduce_orders": forced_reduce_orders,
         "tail_cleanup_active": tail_cleanup_active,
+        "synthetic_freeze_candidate": synthetic_freeze_candidate or {"should_freeze": False},
+        "synthetic_frozen_position": synthetic_frozen_position or {},
     }
 
 
@@ -274,6 +278,221 @@ def _spot_maker_sell_price(*, price: float, ask_price: float, tick_size: float |
     return max(_round_order_price(price, tick_size, "SELL"), _round_order_price(best_ask, tick_size, "SELL"))
 
 
+def _synthetic_reduce_loss_stats(
+    *,
+    lot_plan: dict[str, Any],
+    reduce_price: float,
+    direction_state: str,
+) -> dict[str, Any]:
+    loss_quote = 0.0
+    cost_quote = 0.0
+    qty = 0.0
+    safe_reduce_price = max(_safe_float(reduce_price), 0.0)
+    for lot in list(lot_plan.get("lots") or []):
+        if not isinstance(lot, dict):
+            continue
+        lot_qty = max(_safe_float(lot.get("qty")), 0.0)
+        entry_price = max(_safe_float(lot.get("entry_price")), 0.0)
+        if lot_qty <= EPSILON or entry_price <= EPSILON:
+            continue
+        qty += lot_qty
+        cost_quote += entry_price * lot_qty
+        if direction_state == "long_active":
+            loss_quote += max(0.0, entry_price - safe_reduce_price) * lot_qty
+        elif direction_state == "short_active":
+            loss_quote += max(0.0, safe_reduce_price - entry_price) * lot_qty
+    return {
+        "qty": qty,
+        "cost_quote": cost_quote,
+        "loss_quote": loss_quote,
+        "loss_ratio": loss_quote / cost_quote if cost_quote > EPSILON else 0.0,
+    }
+
+
+def _cap_lot_plan_qty(*, lot_plan: dict[str, Any], max_qty: float) -> dict[str, Any]:
+    remaining = max(_safe_float(max_qty), 0.0)
+    capped_lots: list[dict[str, Any]] = []
+    for lot in list(lot_plan.get("lots") or []):
+        if remaining <= EPSILON:
+            break
+        if not isinstance(lot, dict):
+            continue
+        lot_qty = max(_safe_float(lot.get("qty")), 0.0)
+        take_qty = min(lot_qty, remaining)
+        if take_qty <= EPSILON:
+            continue
+        capped_lot = dict(lot)
+        capped_lot["qty"] = take_qty
+        capped_lots.append(capped_lot)
+        remaining -= take_qty
+
+    capped_plan = dict(lot_plan)
+    capped_plan["lots"] = capped_lots
+    return capped_plan
+
+
+def _synthetic_freeze_candidate(
+    *,
+    enabled: bool,
+    risk_state: str,
+    direction_state: str,
+    reduce_side: str,
+    reduce_price: float,
+    order_price: float,
+    lot_plan: dict[str, Any],
+    loss_ratio_threshold: float,
+    min_notional: float,
+    current_side_notional: float = 0.0,
+    max_side_notional: float = 0.0,
+    cap_price: float = 0.0,
+) -> dict[str, Any]:
+    original_qty = sum(
+        max(_safe_float(item.get("qty")), 0.0)
+        for item in list(lot_plan.get("lots") or [])
+        if isinstance(item, dict)
+    )
+    side_cap = max(_safe_float(max_side_notional), 0.0)
+    side_notional = max(_safe_float(current_side_notional), 0.0)
+    cap_remaining_notional = side_cap - side_notional if side_cap > EPSILON else 0.0
+    cap_remaining_notional = max(cap_remaining_notional, 0.0)
+    cap_unit_price = max(_safe_float(cap_price), _safe_float(reduce_price), 0.0)
+    capped_by_max_side_notional = False
+    if side_cap > EPSILON:
+        max_freeze_qty = cap_remaining_notional / max(cap_unit_price, EPSILON)
+        capped_by_max_side_notional = max_freeze_qty + EPSILON < original_qty
+        lot_plan = _cap_lot_plan_qty(lot_plan=lot_plan, max_qty=max_freeze_qty)
+
+    stats = _synthetic_reduce_loss_stats(
+        lot_plan=lot_plan,
+        reduce_price=reduce_price,
+        direction_state=direction_state,
+    )
+    qty = max(_safe_float(stats.get("qty")), 0.0)
+    notional = qty * max(_safe_float(reduce_price), 0.0)
+    loss_ratio = max(_safe_float(stats.get("loss_ratio")), 0.0)
+    should_freeze = (
+        bool(enabled)
+        and risk_state == "threshold_reduce_only"
+        and qty > EPSILON
+        and notional + EPSILON >= max(_safe_float(min_notional), 0.0)
+        and loss_ratio + EPSILON >= max(_safe_float(loss_ratio_threshold), 0.0)
+        and loss_ratio > EPSILON
+    )
+    reason = "threshold_reduce_loss" if should_freeze else "not_triggered"
+    if not should_freeze and side_cap > EPSILON and cap_remaining_notional <= EPSILON:
+        reason = "max_side_notional_reached"
+    return {
+        "should_freeze": should_freeze,
+        "reason": reason,
+        "side": str(reduce_side or "").upper(),
+        "qty": qty,
+        "reduce_price": max(_safe_float(reduce_price), 0.0),
+        "order_price": max(_safe_float(order_price), 0.0),
+        "notional": notional,
+        "loss_quote": max(_safe_float(stats.get("loss_quote")), 0.0),
+        "loss_ratio": loss_ratio,
+        "current_side_notional": side_notional,
+        "max_side_notional": side_cap,
+        "cap_remaining_notional": cap_remaining_notional,
+        "capped_by_max_side_notional": capped_by_max_side_notional,
+        "lots": list(lot_plan.get("lots") or []),
+    }
+
+
+def _weighted_entry_price(*, lots: list[dict[str, Any]]) -> float:
+    qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in lots)
+    if qty <= EPSILON:
+        return 0.0
+    cost = sum(max(_safe_float(item.get("entry_price")), 0.0) * max(_safe_float(item.get("qty")), 0.0) for item in lots)
+    return cost / qty if cost > 0 else 0.0
+
+
+def _synthetic_frozen_release_orders(
+    *,
+    runtime: dict[str, Any],
+    bid_price: float,
+    ask_price: float,
+    per_order_notional: float,
+    release_profit_ratio: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> list[dict[str, Any]]:
+    frozen_lots = [dict(item) for item in list(runtime.get("frozen_position_lots") or []) if isinstance(item, dict)]
+    if not frozen_lots:
+        return []
+
+    orders: list[dict[str, Any]] = []
+    profit_ratio = max(_safe_float(release_profit_ratio), 0.0)
+    long_lots = [item for item in frozen_lots if str(item.get("side", "") or "").strip().lower() == "long"]
+    short_lots = [item for item in frozen_lots if str(item.get("side", "") or "").strip().lower() == "short"]
+
+    long_entry = _weighted_entry_price(lots=long_lots)
+    sell_price = _round_order_price(ask_price, tick_size, "SELL")
+    if long_entry > EPSILON and sell_price + EPSILON >= long_entry * (1.0 + profit_ratio):
+        max_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in long_lots)
+        target_qty = max_qty
+        if per_order_notional > EPSILON:
+            target_qty = min(target_qty, _round_order_qty(per_order_notional / max(sell_price, EPSILON), step_size))
+        qty = _round_order_qty(target_qty, step_size)
+        if _order_meets_mins(qty=qty, price=sell_price, min_qty=min_qty, min_notional=min_notional):
+            orders.append(_build_order(side="SELL", price=sell_price, qty=qty, role="synthetic_frozen_release"))
+
+    short_entry = _weighted_entry_price(lots=short_lots)
+    buy_price = _round_order_price(bid_price, tick_size, "BUY")
+    if not orders and short_entry > EPSILON and buy_price <= short_entry * (1.0 - profit_ratio) + EPSILON:
+        max_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in short_lots)
+        target_qty = max_qty
+        if per_order_notional > EPSILON:
+            target_qty = min(target_qty, _round_order_qty(per_order_notional / max(buy_price, EPSILON), step_size))
+        qty = _round_order_qty(target_qty, step_size)
+        if _order_meets_mins(qty=qty, price=buy_price, min_qty=min_qty, min_notional=min_notional):
+            orders.append(_build_order(side="BUY", price=buy_price, qty=qty, role="synthetic_frozen_release"))
+
+    return orders
+
+
+def _synthetic_frozen_manual_release_orders(
+    *,
+    runtime: dict[str, Any],
+    bid_price: float,
+    ask_price: float,
+    manual_side: str | None,
+    manual_qty: float,
+    manual_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> list[dict[str, Any]]:
+    side_text = str(manual_side or "").strip().lower()
+    if side_text in {"long", "sell"}:
+        frozen_side = "long"
+        order_side = "SELL"
+        price = _round_order_price(manual_price if manual_price > EPSILON else ask_price, tick_size, "SELL")
+    elif side_text in {"short", "buy"}:
+        frozen_side = "short"
+        order_side = "BUY"
+        price = _round_order_price(manual_price if manual_price > EPSILON else bid_price, tick_size, "BUY")
+    else:
+        return []
+
+    frozen_lots = [
+        dict(item)
+        for item in list(runtime.get("frozen_position_lots") or [])
+        if isinstance(item, dict) and str(item.get("side", "") or "").strip().lower() == frozen_side
+    ]
+    frozen_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in frozen_lots)
+    target_qty = min(max(_safe_float(manual_qty), 0.0), frozen_qty)
+    if target_qty <= EPSILON or price <= EPSILON:
+        return []
+    qty = _round_order_qty(target_qty, step_size)
+    if not _order_meets_mins(qty=qty, price=price, min_qty=min_qty, min_notional=min_notional):
+        return []
+    return [_build_order(side=order_side, price=price, qty=qty, role="synthetic_frozen_manual_release")]
+
+
 def _bootstrap_orders(
     *,
     market_type: str,
@@ -440,6 +659,14 @@ def build_inventory_grid_orders(
     min_qty: float | None,
     min_notional: float | None,
     sell_levels: int = 1,
+    synthetic_freeze_enabled: bool = False,
+    synthetic_freeze_loss_ratio: float = 0.0,
+    synthetic_freeze_min_notional: float = 0.0,
+    synthetic_freeze_max_side_notional: float = 0.0,
+    synthetic_freeze_release_profit_ratio: float = 0.0,
+    synthetic_freeze_manual_release_side: str | None = None,
+    synthetic_freeze_manual_release_qty: float = 0.0,
+    synthetic_freeze_manual_release_price: float = 0.0,
 ) -> dict[str, Any]:
     market_type = str(runtime.get("market_type", "futures")).strip().lower()
     direction_state = str(runtime.get("direction_state", "flat")).strip().lower()
@@ -461,8 +688,72 @@ def build_inventory_grid_orders(
     buy_orders: list[dict[str, Any]] = []
     sell_orders: list[dict[str, Any]] = []
     forced_reduce_orders: list[dict[str, Any]] = []
+    synthetic_freeze_candidate: dict[str, Any] = {"should_freeze": False}
+    synthetic_frozen_position = synthetic_frozen_position_report(runtime=runtime, mid_price=mid_price) if synthetic_neutral else {}
+    synthetic_manual_release_orders = (
+        _synthetic_frozen_manual_release_orders(
+            runtime=runtime,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            manual_side=synthetic_freeze_manual_release_side,
+            manual_qty=synthetic_freeze_manual_release_qty,
+            manual_price=synthetic_freeze_manual_release_price,
+            tick_size=tick_size,
+            step_size=step_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+        )
+        if synthetic_neutral and synthetic_freeze_enabled
+        else []
+    )
+    synthetic_release_orders = (
+        _synthetic_frozen_release_orders(
+            runtime=runtime,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            per_order_notional=per_order_notional,
+            release_profit_ratio=synthetic_freeze_release_profit_ratio,
+            tick_size=tick_size,
+            step_size=step_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+        )
+        if synthetic_neutral and synthetic_freeze_enabled and not synthetic_manual_release_orders
+        else []
+    )
+    for order in synthetic_manual_release_orders + synthetic_release_orders:
+        if str(order.get("side", "")).upper() == "BUY":
+            buy_orders.append(order)
+        else:
+            sell_orders.append(order)
 
     if direction_state == "flat":
+        if synthetic_manual_release_orders or synthetic_release_orders:
+            return _finalize_inventory_grid_plan(
+                risk_state=runtime_risk_state,
+                bootstrap_orders=bootstrap_orders,
+                buy_orders=buy_orders,
+                sell_orders=sell_orders,
+                forced_reduce_orders=forced_reduce_orders,
+                tail_cleanup_active=False,
+                min_qty=min_qty,
+                min_notional=min_notional,
+                synthetic_freeze_candidate=synthetic_freeze_candidate,
+                synthetic_frozen_position=synthetic_frozen_position,
+            )
+        if synthetic_neutral and synthetic_freeze_enabled and _safe_float(synthetic_frozen_position.get("lot_count")) > EPSILON:
+            return _finalize_inventory_grid_plan(
+                risk_state=runtime_risk_state,
+                bootstrap_orders=bootstrap_orders,
+                buy_orders=buy_orders,
+                sell_orders=sell_orders,
+                forced_reduce_orders=forced_reduce_orders,
+                tail_cleanup_active=False,
+                min_qty=min_qty,
+                min_notional=min_notional,
+                synthetic_freeze_candidate=synthetic_freeze_candidate,
+                synthetic_frozen_position=synthetic_frozen_position,
+            )
         if recovery_mode != "live":
             return _finalize_inventory_grid_plan(
                 risk_state=runtime_risk_state,
@@ -473,6 +764,8 @@ def build_inventory_grid_orders(
                 tail_cleanup_active=False,
                 min_qty=min_qty,
                 min_notional=min_notional,
+                synthetic_freeze_candidate=synthetic_freeze_candidate,
+                synthetic_frozen_position=synthetic_frozen_position,
             )
         if market_type == "spot" and not synthetic_neutral:
             bootstrap_levels = 1 if warmup_notional > EPSILON else buy_levels
@@ -547,6 +840,8 @@ def build_inventory_grid_orders(
             tail_cleanup_active=False,
             min_qty=min_qty,
             min_notional=min_notional,
+            synthetic_freeze_candidate=synthetic_freeze_candidate,
+            synthetic_frozen_position=synthetic_frozen_position,
         )
 
     inventory_notional = _position_notional(runtime=runtime, mid_price=mid_price)
@@ -734,13 +1029,30 @@ def build_inventory_grid_orders(
                     reduce_qty=reduce_qty,
                     step_price=step_price,
                 )
+                synthetic_freeze_candidate = _synthetic_freeze_candidate(
+                    enabled=synthetic_neutral and synthetic_freeze_enabled,
+                    risk_state=risk_state,
+                    direction_state=direction_state,
+                    reduce_side="SELL",
+                    reduce_price=forced_reduce_price,
+                    order_price=forced_reduce_order_price,
+                    lot_plan=lot_plan,
+                    loss_ratio_threshold=synthetic_freeze_loss_ratio,
+                    min_notional=synthetic_freeze_min_notional,
+                    current_side_notional=_safe_float(synthetic_frozen_position.get("long_notional")),
+                    max_side_notional=synthetic_freeze_max_side_notional,
+                    cap_price=max(mid_price, forced_reduce_price),
+                )
                 if (
-                    risk_state == "hard_reduce_only"
-                    or _threshold_reduce_unlocks_without_credit(
-                        threshold_position_notional=threshold_position_notional,
-                        threshold_reduce_target_notional=threshold_reduce_target_notional,
+                    not bool(synthetic_freeze_candidate.get("should_freeze"))
+                    and (
+                        risk_state == "hard_reduce_only"
+                        or _threshold_reduce_unlocks_without_credit(
+                            threshold_position_notional=threshold_position_notional,
+                            threshold_reduce_target_notional=threshold_reduce_target_notional,
+                        )
+                        or int(runtime.get("pair_credit_steps", 0) or 0) >= int(lot_plan["forced_reduce_cost_steps"])
                     )
-                    or int(runtime.get("pair_credit_steps", 0) or 0) >= int(lot_plan["forced_reduce_cost_steps"])
                 ):
                     forced_qty = _round_order_qty(sum(max(_safe_float(item.get("qty")), 0.0) for item in lot_plan["lots"]), step_size)
                     if _order_meets_mins(
@@ -822,13 +1134,30 @@ def build_inventory_grid_orders(
                     reduce_qty=reduce_qty,
                     step_price=step_price,
                 )
+                synthetic_freeze_candidate = _synthetic_freeze_candidate(
+                    enabled=synthetic_neutral and synthetic_freeze_enabled,
+                    risk_state=risk_state,
+                    direction_state=direction_state,
+                    reduce_side="BUY",
+                    reduce_price=forced_reduce_price,
+                    order_price=forced_reduce_order_price,
+                    lot_plan=lot_plan,
+                    loss_ratio_threshold=synthetic_freeze_loss_ratio,
+                    min_notional=synthetic_freeze_min_notional,
+                    current_side_notional=_safe_float(synthetic_frozen_position.get("short_notional")),
+                    max_side_notional=synthetic_freeze_max_side_notional,
+                    cap_price=max(mid_price, forced_reduce_price),
+                )
                 if (
-                    risk_state == "hard_reduce_only"
-                    or _threshold_reduce_unlocks_without_credit(
-                        threshold_position_notional=threshold_position_notional,
-                        threshold_reduce_target_notional=threshold_reduce_target_notional,
+                    not bool(synthetic_freeze_candidate.get("should_freeze"))
+                    and (
+                        risk_state == "hard_reduce_only"
+                        or _threshold_reduce_unlocks_without_credit(
+                            threshold_position_notional=threshold_position_notional,
+                            threshold_reduce_target_notional=threshold_reduce_target_notional,
+                        )
+                        or int(runtime.get("pair_credit_steps", 0) or 0) >= int(lot_plan["forced_reduce_cost_steps"])
                     )
-                    or int(runtime.get("pair_credit_steps", 0) or 0) >= int(lot_plan["forced_reduce_cost_steps"])
                 ):
                     forced_qty = _round_order_qty(sum(max(_safe_float(item.get("qty")), 0.0) for item in lot_plan["lots"]), step_size)
                     if _order_meets_mins(
@@ -850,4 +1179,6 @@ def build_inventory_grid_orders(
         tail_cleanup_active=tail_cleanup_active,
         min_qty=min_qty,
         min_notional=min_notional,
+        synthetic_freeze_candidate=synthetic_freeze_candidate,
+        synthetic_frozen_position=synthetic_frozen_position,
     )

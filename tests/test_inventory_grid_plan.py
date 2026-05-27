@@ -340,6 +340,296 @@ def test_synthetic_neutral_long_exit_sell_stays_post_only_when_anchor_is_below_m
     assert all(order["price"] > 0.035234 for order in plan["sell_orders"])
 
 
+def test_synthetic_neutral_threshold_reduce_freezes_loss_instead_of_forcing_reduce() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 0.10
+    runtime["position_lots"] = [
+        {
+            "lot_id": "held",
+            "side": "long",
+            "qty": 4000.0,
+            "entry_price": 0.10,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.0799,
+        ask_price=0.0801,
+        step_price=0.0005,
+        per_order_notional=40.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=300.0,
+        threshold_reduce_target_notional=250.0,
+        max_order_position_notional=500.0,
+        max_position_notional=600.0,
+        max_short_order_position_notional=500.0,
+        max_short_position_notional=500.0,
+        buy_levels=3,
+        sell_levels=3,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+        synthetic_freeze_enabled=True,
+        synthetic_freeze_loss_ratio=0.001,
+        synthetic_freeze_min_notional=5.0,
+    )
+
+    assert plan["risk_state"] == "threshold_reduce_only"
+    assert plan["forced_reduce_orders"] == []
+    assert all(order["role"] != "forced_reduce" for order in plan["sell_orders"])
+    candidate = plan["synthetic_freeze_candidate"]
+    assert candidate["should_freeze"] is True
+    assert candidate["side"] == "SELL"
+    assert candidate["qty"] > 0
+    assert candidate["loss_ratio"] > 0.001
+
+
+def test_synthetic_neutral_threshold_reduce_keeps_forced_reduce_when_not_losing() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 0.10
+    runtime["position_lots"] = [
+        {
+            "lot_id": "held",
+            "side": "long",
+            "qty": 4000.0,
+            "entry_price": 0.07,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.0799,
+        ask_price=0.0801,
+        step_price=0.0005,
+        per_order_notional=40.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=300.0,
+        threshold_reduce_target_notional=250.0,
+        max_order_position_notional=500.0,
+        max_position_notional=600.0,
+        max_short_order_position_notional=500.0,
+        max_short_position_notional=500.0,
+        buy_levels=3,
+        sell_levels=3,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+        synthetic_freeze_enabled=True,
+        synthetic_freeze_loss_ratio=0.001,
+        synthetic_freeze_min_notional=5.0,
+    )
+
+    assert any(order["role"] == "forced_reduce" for order in plan["sell_orders"])
+    assert plan["synthetic_freeze_candidate"]["should_freeze"] is False
+
+
+def test_synthetic_neutral_threshold_reduce_continues_forced_reduce_when_freeze_side_cap_is_full() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 0.10
+    runtime["position_lots"] = [
+        {
+            "lot_id": "held",
+            "side": "long",
+            "qty": 4000.0,
+            "entry_price": 0.10,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+    runtime["frozen_position_lots"] = [
+        {
+            "lot_id": "already_frozen",
+            "source_lot_id": "old",
+            "side": "long",
+            "qty": 12500.0,
+            "entry_price": 0.10,
+            "frozen_at_ms": 1000,
+            "freeze_reason": "threshold_reduce_loss",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.0799,
+        ask_price=0.0801,
+        step_price=0.0005,
+        per_order_notional=40.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=300.0,
+        threshold_reduce_target_notional=250.0,
+        max_order_position_notional=500.0,
+        max_position_notional=600.0,
+        max_short_order_position_notional=500.0,
+        max_short_position_notional=500.0,
+        buy_levels=3,
+        sell_levels=3,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+        synthetic_freeze_enabled=True,
+        synthetic_freeze_loss_ratio=0.001,
+        synthetic_freeze_min_notional=5.0,
+        synthetic_freeze_max_side_notional=1000.0,
+    )
+
+    assert plan["synthetic_freeze_candidate"]["should_freeze"] is False
+    assert any(order["role"] == "forced_reduce" for order in plan["sell_orders"])
+
+
+def test_synthetic_frozen_long_releases_when_price_recovers() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "flat"
+    runtime["frozen_position_lots"] = [
+        {
+            "lot_id": "frozen_held",
+            "source_lot_id": "held",
+            "side": "long",
+            "qty": 4000.0,
+            "entry_price": 0.10,
+            "frozen_at_ms": 1000,
+            "freeze_reason": "threshold_reduce_loss",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.1009,
+        ask_price=0.1011,
+        step_price=0.0005,
+        per_order_notional=40.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=300.0,
+        threshold_reduce_target_notional=250.0,
+        max_order_position_notional=500.0,
+        max_position_notional=600.0,
+        max_short_order_position_notional=500.0,
+        max_short_position_notional=500.0,
+        buy_levels=3,
+        sell_levels=3,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+        synthetic_freeze_enabled=True,
+        synthetic_freeze_release_profit_ratio=0.0,
+    )
+
+    assert plan["bootstrap_orders"] == []
+    assert plan["buy_orders"] == []
+    assert [order["role"] for order in plan["sell_orders"]] == ["synthetic_frozen_release"]
+    assert plan["sell_orders"][0]["price"] == 0.1011
+    assert plan["synthetic_frozen_position"]["long_qty"] == 4000.0
+
+
+def test_synthetic_frozen_short_liability_releases_with_buy_when_price_recovers() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "flat"
+    runtime["frozen_position_lots"] = [
+        {
+            "lot_id": "frozen_short",
+            "source_lot_id": "sold_neutral_base",
+            "side": "short",
+            "qty": 4000.0,
+            "entry_price": 0.10,
+            "frozen_at_ms": 1000,
+            "freeze_reason": "threshold_reduce_loss",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.0999,
+        ask_price=0.1001,
+        step_price=0.0005,
+        per_order_notional=40.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=300.0,
+        threshold_reduce_target_notional=250.0,
+        max_order_position_notional=500.0,
+        max_position_notional=600.0,
+        max_short_order_position_notional=500.0,
+        max_short_position_notional=500.0,
+        buy_levels=3,
+        sell_levels=3,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+        synthetic_freeze_enabled=True,
+        synthetic_freeze_release_profit_ratio=0.0,
+    )
+
+    assert plan["bootstrap_orders"] == []
+    assert [order["role"] for order in plan["buy_orders"]] == ["synthetic_frozen_release"]
+    assert plan["sell_orders"] == []
+    assert plan["buy_orders"][0]["price"] == 0.0999
+    assert plan["synthetic_frozen_position"]["short_qty"] == 4000.0
+
+
+def test_synthetic_frozen_manual_release_ignores_recovery_threshold_for_requested_qty() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "flat"
+    runtime["frozen_position_lots"] = [
+        {
+            "lot_id": "frozen_held",
+            "source_lot_id": "held",
+            "side": "long",
+            "qty": 4000.0,
+            "entry_price": 0.10,
+            "frozen_at_ms": 1000,
+            "freeze_reason": "threshold_reduce_loss",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.0899,
+        ask_price=0.0901,
+        step_price=0.0005,
+        per_order_notional=40.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=300.0,
+        threshold_reduce_target_notional=250.0,
+        max_order_position_notional=500.0,
+        max_position_notional=600.0,
+        max_short_order_position_notional=500.0,
+        max_short_position_notional=500.0,
+        buy_levels=3,
+        sell_levels=3,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+        synthetic_freeze_enabled=True,
+        synthetic_freeze_release_profit_ratio=0.10,
+        synthetic_freeze_manual_release_side="long",
+        synthetic_freeze_manual_release_qty=100.0,
+    )
+
+    assert plan["bootstrap_orders"] == []
+    assert plan["buy_orders"] == []
+    assert [order["role"] for order in plan["sell_orders"]] == ["synthetic_frozen_manual_release"]
+    assert plan["sell_orders"][0]["qty"] == 100.0
+    assert plan["sell_orders"][0]["price"] == 0.0901
+
+
 def test_threshold_reduce_target_unlocks_forced_reduce_without_pair_credit() -> None:
     runtime = new_inventory_grid_runtime(market_type="spot")
     runtime["direction_state"] = "long_active"

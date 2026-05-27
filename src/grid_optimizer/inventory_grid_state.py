@@ -57,6 +57,15 @@ def _total_lot_qty(*, lots: list[dict[str, Any]]) -> float:
     return sum(max(float(lot.get("qty", 0.0) or 0.0), 0.0) for lot in lots)
 
 
+def _total_lot_qty_for_side(*, lots: list[dict[str, Any]], side: str) -> float:
+    normalized_side = str(side or "").strip().lower()
+    return sum(
+        max(float(lot.get("qty", 0.0) or 0.0), 0.0)
+        for lot in lots
+        if str(lot.get("side", "") or "").strip().lower() == normalized_side
+    )
+
+
 def _forced_reduce_lots(
     *,
     lots: list[dict[str, Any]],
@@ -90,9 +99,12 @@ def _forced_reduce_lots(
         selected.append(
             {
                 "lot_id": lot_id,
+                "side": str(lot.get("side", "") or ""),
                 "qty": take_qty,
                 "matched_qty": take_qty,
                 "entry_price": max(float(lot.get("entry_price", 0.0) or 0.0), 0.0),
+                "opened_at_ms": int(lot.get("opened_at_ms", 0) or 0),
+                "source_role": str(lot.get("source_role", "") or ""),
             }
         )
         remaining -= take_qty
@@ -197,6 +209,219 @@ def _forced_reduce_cost_steps(*, entry_price: float, reduce_price: float, step_p
     raise ValueError(f"unsupported direction_state for forced reduce cost: {direction_state}")
 
 
+def _reduce_loss_quote(*, entry_price: float, reduce_price: float, qty: float, direction_state: str) -> float:
+    if direction_state == "long_active":
+        return max(0.0, (float(entry_price) - float(reduce_price)) * float(qty))
+    if direction_state == "short_active":
+        return max(0.0, (float(reduce_price) - float(entry_price)) * float(qty))
+    raise ValueError(f"unsupported direction_state for reduce loss: {direction_state}")
+
+
+def synthetic_frozen_position_report(*, runtime: dict[str, Any], mid_price: float) -> dict[str, Any]:
+    frozen_lots = [dict(item) for item in list(runtime.get("frozen_position_lots") or []) if isinstance(item, dict)]
+    long_qty = _total_lot_qty_for_side(lots=frozen_lots, side="long")
+    short_qty = _total_lot_qty_for_side(lots=frozen_lots, side="short")
+    long_cost = sum(
+        max(float(item.get("entry_price", 0.0) or 0.0), 0.0) * max(float(item.get("qty", 0.0) or 0.0), 0.0)
+        for item in frozen_lots
+        if str(item.get("side", "") or "").strip().lower() == "long"
+    )
+    short_cost = sum(
+        max(float(item.get("entry_price", 0.0) or 0.0), 0.0) * max(float(item.get("qty", 0.0) or 0.0), 0.0)
+        for item in frozen_lots
+        if str(item.get("side", "") or "").strip().lower() == "short"
+    )
+    safe_mid = max(float(mid_price), 0.0)
+    return {
+        "long_qty": long_qty,
+        "short_qty": short_qty,
+        "long_notional": long_qty * safe_mid,
+        "short_notional": short_qty * safe_mid,
+        "long_cost": long_cost,
+        "short_cost": short_cost,
+        "pair_eligible_qty": min(long_qty, short_qty),
+        "lot_count": len(frozen_lots),
+    }
+
+
+def freeze_inventory_grid_reduce_lots(
+    *,
+    runtime: dict[str, Any],
+    reduce_price: float,
+    reduce_qty: float,
+    step_price: float,
+    freeze_time_ms: int,
+    reason: str,
+) -> dict[str, Any]:
+    if not bool(runtime.get("synthetic_neutral")):
+        return {"applied": False, "reason": "not_synthetic_neutral"}
+    direction_state = str(runtime.get("direction_state", "flat") or "flat").strip().lower()
+    if direction_state not in {"long_active", "short_active"}:
+        return {"applied": False, "reason": "not_active"}
+    if step_price <= 0:
+        raise ValueError("step_price must be positive")
+
+    frozen_side = "long" if direction_state == "long_active" else "short"
+    frozen_lots = [dict(item) for item in list(runtime.get("frozen_position_lots") or []) if isinstance(item, dict)]
+
+    lots = [dict(item) for item in list(runtime.get("position_lots") or []) if isinstance(item, dict)]
+    remaining_lots, matched = _forced_reduce_lots(
+        lots=lots,
+        direction_state=direction_state,
+        reduce_qty=reduce_qty,
+    )
+    freeze_qty = sum(max(float(item.get("matched_qty", 0.0) or 0.0), 0.0) for item in matched)
+    if freeze_qty <= EPSILON:
+        return {"applied": False, "reason": "nothing_to_freeze"}
+
+    reduce_price_float = max(float(reduce_price), 0.0)
+    loss_quote = sum(
+        _reduce_loss_quote(
+            entry_price=max(float(item.get("entry_price", 0.0) or 0.0), 0.0),
+            reduce_price=reduce_price_float,
+            qty=max(float(item.get("matched_qty", 0.0) or 0.0), 0.0),
+            direction_state=direction_state,
+        )
+        for item in matched
+    )
+    cost_quote = sum(
+        max(float(item.get("entry_price", 0.0) or 0.0), 0.0) * max(float(item.get("matched_qty", 0.0) or 0.0), 0.0)
+        for item in matched
+    )
+    freeze_time = int(freeze_time_ms)
+    frozen_lots.extend(
+        {
+            "lot_id": f"frozen_{str(item.get('lot_id') or 'lot')}_{freeze_time}_{idx}",
+            "source_lot_id": str(item.get("lot_id") or ""),
+            "side": frozen_side,
+            "qty": max(float(item.get("matched_qty", 0.0) or 0.0), 0.0),
+            "entry_price": max(float(item.get("entry_price", 0.0) or 0.0), 0.0),
+            "opened_at_ms": int(item.get("opened_at_ms", 0) or 0),
+            "source_role": str(item.get("source_role", "") or ""),
+            "frozen_at_ms": freeze_time,
+            "freeze_reason": str(reason or ""),
+        }
+        for idx, item in enumerate(matched, start=1)
+    )
+
+    runtime["position_lots"] = remaining_lots
+    runtime["frozen_position_lots"] = frozen_lots
+    if not remaining_lots:
+        runtime["direction_state"] = "flat"
+    return {
+        "applied": True,
+        "reason": str(reason or ""),
+        "side": frozen_side,
+        "freeze_qty": freeze_qty,
+        "freeze_notional": freeze_qty * reduce_price_float,
+        "loss_quote": loss_quote,
+        "loss_ratio": loss_quote / cost_quote if cost_quote > EPSILON else 0.0,
+        "frozen_lots": [dict(item) for item in matched],
+    }
+
+
+def _consume_frozen_lots_by_side(
+    *,
+    frozen_lots: list[dict[str, Any]],
+    frozen_side: str,
+    qty: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    normalized_side = str(frozen_side or "").strip().lower()
+    if normalized_side not in {"long", "short"}:
+        raise ValueError(f"unsupported frozen side: {frozen_side}")
+    side_lots = [item for item in frozen_lots if str(item.get("side", "") or "").strip().lower() == frozen_side]
+    if _total_lot_qty(lots=side_lots) + EPSILON < qty:
+        raise ValueError(f"insufficient frozen {frozen_side} quantity")
+
+    remaining = max(float(qty), 0.0)
+    new_frozen_lots: list[dict[str, Any]] = []
+    matched: list[dict[str, Any]] = []
+    for lot in frozen_lots:
+        if str(lot.get("side", "") or "").strip().lower() != frozen_side:
+            new_frozen_lots.append(lot)
+            continue
+        lot_qty = max(float(lot.get("qty", 0.0) or 0.0), 0.0)
+        if remaining <= EPSILON:
+            new_frozen_lots.append(lot)
+            continue
+        take_qty = min(lot_qty, remaining)
+        matched.append({**dict(lot), "matched_qty": take_qty})
+        left_qty = lot_qty - take_qty
+        if left_qty > EPSILON:
+            kept = dict(lot)
+            kept["qty"] = left_qty
+            new_frozen_lots.append(kept)
+        remaining -= take_qty
+    return new_frozen_lots, matched
+
+
+def _consume_synthetic_frozen_lots(
+    *,
+    runtime: dict[str, Any],
+    side: str,
+    qty: float,
+) -> None:
+    normalized_side = str(side or "").upper().strip()
+    frozen_side = "long" if normalized_side == "SELL" else "short" if normalized_side == "BUY" else ""
+    if frozen_side not in {"long", "short"}:
+        raise ValueError(f"unsupported synthetic frozen release side: {side}")
+    frozen_lots = [dict(item) for item in list(runtime.get("frozen_position_lots") or []) if isinstance(item, dict)]
+    new_frozen_lots, _ = _consume_frozen_lots_by_side(
+        frozen_lots=frozen_lots,
+        frozen_side=frozen_side,
+        qty=qty,
+    )
+    runtime["frozen_position_lots"] = new_frozen_lots
+
+
+def apply_synthetic_frozen_pair_release(
+    *,
+    runtime: dict[str, Any],
+    release_qty: float | None,
+    release_time_ms: int,
+    reason: str,
+) -> dict[str, Any]:
+    if not bool(runtime.get("synthetic_neutral")):
+        return {"applied": False, "reason": "not_synthetic_neutral"}
+    frozen_lots = [dict(item) for item in list(runtime.get("frozen_position_lots") or []) if isinstance(item, dict)]
+    eligible_qty = min(
+        _total_lot_qty_for_side(lots=frozen_lots, side="long"),
+        _total_lot_qty_for_side(lots=frozen_lots, side="short"),
+    )
+    target_qty = eligible_qty if release_qty is None or float(release_qty or 0.0) <= EPSILON else min(float(release_qty), eligible_qty)
+    if target_qty <= EPSILON:
+        return {"applied": False, "reason": "no_pair_eligible_qty", "release_qty": 0.0}
+
+    after_long, matched_long = _consume_frozen_lots_by_side(
+        frozen_lots=frozen_lots,
+        frozen_side="long",
+        qty=target_qty,
+    )
+    after_short, matched_short = _consume_frozen_lots_by_side(
+        frozen_lots=after_long,
+        frozen_side="short",
+        qty=target_qty,
+    )
+    long_cost = sum(
+        max(float(item.get("entry_price", 0.0) or 0.0), 0.0) * max(float(item.get("matched_qty", 0.0) or 0.0), 0.0)
+        for item in matched_long
+    )
+    short_cost = sum(
+        max(float(item.get("entry_price", 0.0) or 0.0), 0.0) * max(float(item.get("matched_qty", 0.0) or 0.0), 0.0)
+        for item in matched_short
+    )
+    runtime["frozen_position_lots"] = after_short
+    runtime["last_strategy_trade_time_ms"] = int(release_time_ms)
+    return {
+        "applied": True,
+        "reason": str(reason or ""),
+        "release_qty": target_qty,
+        "long_cost": long_cost,
+        "short_cost": short_cost,
+        "pair_release_pnl_quote": short_cost - long_cost,
+    }
+
+
 def apply_inventory_grid_fill(
     *,
     runtime: dict[str, Any],
@@ -212,6 +437,11 @@ def apply_inventory_grid_fill(
     fill_price = max(float(price), 0.0)
     fill_qty = max(float(qty), 0.0)
     if fill_price <= 0 or fill_qty <= EPSILON:
+        return
+
+    if normalized_role in {"synthetic_frozen_release", "synthetic_frozen_manual_release"}:
+        _consume_synthetic_frozen_lots(runtime=runtime, side=normalized_side, qty=fill_qty)
+        runtime["last_strategy_trade_time_ms"] = int(fill_time_ms)
         return
 
     market_type = str(runtime.get("market_type", "futures")).strip().lower()
@@ -393,7 +623,16 @@ def build_forced_reduce_lot_plan(
         take_qty = min(lot_qty, remaining)
         if take_qty <= EPSILON:
             continue
-        selected.append({"lot_id": str(lot.get("lot_id") or ""), "qty": take_qty})
+        selected.append(
+            {
+                "lot_id": str(lot.get("lot_id") or ""),
+                "side": str(lot.get("side", "") or ""),
+                "qty": take_qty,
+                "entry_price": max(float(lot.get("entry_price", 0.0) or 0.0), 0.0),
+                "opened_at_ms": int(lot.get("opened_at_ms", 0) or 0),
+                "source_role": str(lot.get("source_role", "") or ""),
+            }
+        )
         forced_reduce_cost_steps += _forced_reduce_cost_steps(
             entry_price=float(lot.get("entry_price", 0.0) or 0.0),
             reduce_price=reduce_price,

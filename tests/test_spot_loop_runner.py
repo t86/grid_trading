@@ -124,12 +124,37 @@ class SpotLoopRunnerTests(unittest.TestCase):
                 "30000",
                 "--max-short-position-notional",
                 "650",
+                "--synthetic-freeze-enabled",
+                "--synthetic-freeze-loss-ratio",
+                "0.0015",
+                "--synthetic-freeze-min-notional",
+                "12",
+                "--synthetic-freeze-max-side-notional",
+                "1000",
+                "--synthetic-freeze-release-profit-ratio",
+                "0.0002",
+                "--no-synthetic-freeze-pair-release-enabled",
+                "--synthetic-freeze-manual-release-side",
+                "short",
+                "--synthetic-freeze-manual-release-qty",
+                "3000",
+                "--synthetic-freeze-manual-release-price",
+                "0.031",
             ]
         )
 
         self.assertEqual(args.strategy_mode, "spot_competition_synthetic_neutral_grid")
         self.assertEqual(args.neutral_base_qty, 30000.0)
         self.assertEqual(args.max_short_position_notional, 650.0)
+        self.assertTrue(args.synthetic_freeze_enabled)
+        self.assertEqual(args.synthetic_freeze_loss_ratio, 0.0015)
+        self.assertEqual(args.synthetic_freeze_min_notional, 12.0)
+        self.assertEqual(args.synthetic_freeze_max_side_notional, 1000.0)
+        self.assertEqual(args.synthetic_freeze_release_profit_ratio, 0.0002)
+        self.assertFalse(args.synthetic_freeze_pair_release_enabled)
+        self.assertEqual(args.synthetic_freeze_manual_release_side, "short")
+        self.assertEqual(args.synthetic_freeze_manual_release_qty, 3000.0)
+        self.assertEqual(args.synthetic_freeze_manual_release_price, 0.031)
 
     def test_runtime_guard_does_not_auto_flatten_spot_competition_inventory_grid(self) -> None:
         self.assertFalse(_auto_flatten_on_runtime_guard("spot_competition_inventory_grid"))
@@ -501,6 +526,212 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(controls["synthetic_net_qty"], -1078.0)
         self.assertGreaterEqual(sum(1 for order in desired_orders if order["side"] == "BUY"), 1)
         self.assertGreaterEqual(sum(1 for order in desired_orders if order["side"] == "SELL"), 1)
+
+    def test_build_spot_competition_synthetic_neutral_grid_persists_frozen_reduce_lots(self) -> None:
+        runtime = new_inventory_grid_runtime(market_type="futures")
+        runtime["synthetic_neutral"] = True
+        runtime["direction_state"] = "long_active"
+        runtime["grid_anchor_price"] = 0.10
+        runtime["position_lots"] = [
+            {
+                "lot_id": "held",
+                "side": "long",
+                "qty": 4000.0,
+                "entry_price": 0.10,
+                "opened_at_ms": 1000,
+                "source_role": "grid_entry",
+            }
+        ]
+        state = {
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "known_orders": {},
+            "inventory_lots": [],
+            "spot_competition_synthetic_neutral_grid_runtime_cache": {
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "market_type": "futures",
+                "runtime": runtime,
+                "applied_trade_keys": [],
+            },
+        }
+
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state=state,
+            trades=[],
+            bid_price=0.0799,
+            ask_price=0.0801,
+            step_price=0.0005,
+            buy_levels=3,
+            sell_levels=3,
+            first_order_multiplier=1.0,
+            per_order_notional=40.0,
+            threshold_position_notional=300.0,
+            threshold_reduce_target_notional=250.0,
+            max_order_position_notional=500.0,
+            max_position_notional=600.0,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=100000.0,
+            max_short_position_notional=500.0,
+            actual_base_qty=104000.0,
+            synthetic_freeze_enabled=True,
+            synthetic_freeze_loss_ratio=0.001,
+            synthetic_freeze_min_notional=5.0,
+        )
+
+        self.assertFalse(any(order["role"] == "forced_reduce" for order in desired_orders))
+        cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
+        self.assertGreater(cached_runtime["frozen_position_lots"][0]["qty"], 0.0)
+        self.assertGreater(controls["synthetic_frozen_position"]["long_qty"], 0.0)
+        self.assertGreater(controls["synthetic_freeze_last"]["freeze_qty"], 0.0)
+
+    def test_build_spot_competition_synthetic_neutral_grid_caps_freeze_and_reduces_excess(self) -> None:
+        runtime = new_inventory_grid_runtime(market_type="futures")
+        runtime["synthetic_neutral"] = True
+        runtime["direction_state"] = "long_active"
+        runtime["grid_anchor_price"] = 0.10
+        runtime["position_lots"] = [
+            {
+                "lot_id": "held",
+                "side": "long",
+                "qty": 15000.0,
+                "entry_price": 0.10,
+                "opened_at_ms": 1000,
+                "source_role": "grid_entry",
+            }
+        ]
+        runtime["frozen_position_lots"] = [
+            {
+                "lot_id": "already_frozen",
+                "source_lot_id": "old",
+                "side": "long",
+                "qty": 11250.0,
+                "entry_price": 0.10,
+                "frozen_at_ms": 900,
+                "freeze_reason": "threshold_reduce_loss",
+            }
+        ]
+        state = {
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "known_orders": {},
+            "inventory_lots": [],
+            "spot_competition_synthetic_neutral_grid_runtime_cache": {
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "market_type": "futures",
+                "runtime": runtime,
+                "applied_trade_keys": [],
+            },
+        }
+
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state=state,
+            trades=[],
+            bid_price=0.0799,
+            ask_price=0.0801,
+            step_price=0.0005,
+            buy_levels=3,
+            sell_levels=3,
+            first_order_multiplier=1.0,
+            per_order_notional=40.0,
+            threshold_position_notional=300.0,
+            threshold_reduce_target_notional=250.0,
+            max_order_position_notional=500.0,
+            max_position_notional=3000.0,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=100000.0,
+            max_short_position_notional=500.0,
+            actual_base_qty=126250.0,
+            synthetic_freeze_enabled=True,
+            synthetic_freeze_loss_ratio=0.001,
+            synthetic_freeze_min_notional=5.0,
+            synthetic_freeze_max_side_notional=1000.0,
+        )
+
+        self.assertTrue(any(order["role"] == "forced_reduce" for order in desired_orders))
+        cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
+        frozen_qty = sum(
+            item["qty"]
+            for item in cached_runtime["frozen_position_lots"]
+            if item["side"] == "long"
+        )
+        self.assertLessEqual(frozen_qty * 0.08, 1000.0)
+        self.assertAlmostEqual(controls["synthetic_freeze_last"]["freeze_notional"], 100.0, places=4)
+
+    def test_build_spot_competition_synthetic_neutral_grid_pairs_opposite_frozen_lots(self) -> None:
+        runtime = new_inventory_grid_runtime(market_type="futures")
+        runtime["synthetic_neutral"] = True
+        runtime["direction_state"] = "flat"
+        runtime["frozen_position_lots"] = [
+            {
+                "lot_id": "frozen_long",
+                "source_lot_id": "long",
+                "side": "long",
+                "qty": 1000.0,
+                "entry_price": 0.10,
+                "frozen_at_ms": 1000,
+                "freeze_reason": "threshold_reduce_loss",
+            },
+            {
+                "lot_id": "frozen_short",
+                "source_lot_id": "short",
+                "side": "short",
+                "qty": 600.0,
+                "entry_price": 0.12,
+                "frozen_at_ms": 2000,
+                "freeze_reason": "threshold_reduce_loss",
+            },
+        ]
+        state = {
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "known_orders": {},
+            "inventory_lots": [],
+            "spot_competition_synthetic_neutral_grid_runtime_cache": {
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "market_type": "futures",
+                "runtime": runtime,
+                "applied_trade_keys": [],
+            },
+        }
+
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state=state,
+            trades=[],
+            bid_price=0.0999,
+            ask_price=0.1001,
+            step_price=0.0005,
+            buy_levels=3,
+            sell_levels=3,
+            first_order_multiplier=1.0,
+            per_order_notional=40.0,
+            threshold_position_notional=300.0,
+            threshold_reduce_target_notional=250.0,
+            max_order_position_notional=500.0,
+            max_position_notional=600.0,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=100000.0,
+            max_short_position_notional=500.0,
+            actual_base_qty=100400.0,
+            synthetic_freeze_enabled=True,
+            synthetic_freeze_pair_release_enabled=True,
+            synthetic_freeze_release_profit_ratio=0.01,
+        )
+
+        self.assertFalse(desired_orders)
+        cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
+        self.assertEqual(cached_runtime["frozen_position_lots"][0]["side"], "long")
+        self.assertAlmostEqual(cached_runtime["frozen_position_lots"][0]["qty"], 400.0)
+        self.assertAlmostEqual(controls["synthetic_pair_release_last"]["release_qty"], 600.0)
+        self.assertAlmostEqual(controls["synthetic_frozen_position"]["pair_eligible_qty"], 0.0)
 
     def test_build_spot_competition_inventory_grid_orders_ignores_unrelated_trades_when_flat(self) -> None:
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(

@@ -31,7 +31,13 @@ from .dry_run import _round_order_price, _round_order_qty
 from .runtime_guards import evaluate_runtime_guards, normalize_runtime_guard_config
 from .inventory_grid_plan import build_inventory_grid_orders
 from .inventory_grid_recovery import rebuild_inventory_grid_runtime
-from .inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
+from .inventory_grid_state import (
+    apply_inventory_grid_fill,
+    apply_synthetic_frozen_pair_release,
+    freeze_inventory_grid_reduce_lots,
+    new_inventory_grid_runtime,
+    synthetic_frozen_position_report,
+)
 from .semi_auto_plan import diff_open_orders
 from .spot_flatten_runner import load_live_spot_flatten_snapshot, spot_flatten_client_order_prefix
 from .trade_database import ensure_trade_database_schema, persist_cycle_snapshot, persist_trade_rows, trade_database_enabled
@@ -226,10 +232,26 @@ def _sum_inventory_cost(lots: list[dict[str, Any]]) -> float:
 
 
 def _competition_runtime_position_qty(runtime: dict[str, Any]) -> float:
-    lots = runtime.get("position_lots")
-    if not isinstance(lots, list):
-        return 0.0
-    return sum(max(_safe_float((lot or {}).get("qty")), 0.0) for lot in lots if isinstance(lot, dict))
+    total = 0.0
+    long_qty = 0.0
+    short_qty = 0.0
+    for key in ("position_lots", "frozen_position_lots"):
+        lots = runtime.get(key)
+        if not isinstance(lots, list):
+            continue
+        for lot in lots:
+            if not isinstance(lot, dict):
+                continue
+            qty = max(_safe_float(lot.get("qty")), 0.0)
+            total += qty
+            side = str(lot.get("side", "") or "").strip().lower()
+            if side == "short":
+                short_qty += qty
+            elif side == "long":
+                long_qty += qty
+    if bool(runtime.get("synthetic_neutral")) or short_qty > EPSILON:
+        return abs(long_qty - short_qty)
+    return total
 
 
 def _competition_runtime_trade_key(trade: dict[str, Any]) -> str:
@@ -299,6 +321,17 @@ def _store_cached_spot_competition_runtime(
         "runtime": cached_runtime,
         "applied_trade_keys": list(applied_trade_keys),
     }
+
+
+def _cached_spot_competition_applied_trade_keys(
+    *,
+    state: dict[str, Any],
+    synthetic_neutral: bool,
+) -> list[str]:
+    payload = state.get(_spot_competition_runtime_cache_key(synthetic_neutral=synthetic_neutral))
+    if not isinstance(payload, dict):
+        return []
+    return [str(item).strip() for item in list(payload.get("applied_trade_keys") or []) if str(item).strip()]
 
 
 def _apply_spot_competition_runtime_trade_delta(
@@ -1624,6 +1657,15 @@ def _build_spot_competition_inventory_grid_orders(
     slow_trend_step_5m_amplitude_ratio: float = 0.0,
     slow_trend_step_15m_amplitude_ratio: float = 0.0,
     slow_trend_step_scale: float = 1.0,
+    synthetic_freeze_enabled: bool = False,
+    synthetic_freeze_loss_ratio: float = 0.0,
+    synthetic_freeze_min_notional: float = 0.0,
+    synthetic_freeze_max_side_notional: float = 0.0,
+    synthetic_freeze_release_profit_ratio: float = 0.0,
+    synthetic_freeze_pair_release_enabled: bool = True,
+    synthetic_freeze_manual_release_side: str | None = None,
+    synthetic_freeze_manual_release_qty: float = 0.0,
+    synthetic_freeze_manual_release_price: float = 0.0,
     now: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     known_orders = state.get("known_orders")
@@ -1663,6 +1705,16 @@ def _build_spot_competition_inventory_grid_orders(
         runtime["neutral_base_qty"] = neutral_qty
         expected_direction_state = "long_active" if synthetic_net_qty > EPSILON else "short_active" if synthetic_net_qty < -EPSILON else "flat"
         runtime_direction_state = str(runtime.get("direction_state", "flat") or "flat").strip().lower()
+        frozen_report = synthetic_frozen_position_report(runtime=runtime, mid_price=mid_price)
+        frozen_net_qty = _safe_float(frozen_report.get("long_qty")) - _safe_float(frozen_report.get("short_qty"))
+        frozen_direction_state = "flat"
+        frozen_qty = 0.0
+        if _safe_float(frozen_report.get("long_qty")) > EPSILON and _safe_float(frozen_report.get("short_qty")) <= EPSILON:
+            frozen_direction_state = "long_active"
+            frozen_qty = _safe_float(frozen_report.get("long_qty"))
+        elif _safe_float(frozen_report.get("short_qty")) > EPSILON and _safe_float(frozen_report.get("long_qty")) <= EPSILON:
+            frozen_direction_state = "short_active"
+            frozen_qty = _safe_float(frozen_report.get("short_qty"))
         if current_position_qty <= EPSILON and runtime_direction_state != "flat":
             runtime = new_inventory_grid_runtime(market_type="futures")
             runtime["synthetic_neutral"] = True
@@ -1671,22 +1723,51 @@ def _build_spot_competition_inventory_grid_orders(
             runtime_direction_state != expected_direction_state
             or str(runtime.get("recovery_mode", "live") or "live").strip().lower() != "live"
         ):
-            runtime = new_inventory_grid_runtime(market_type="futures")
-            runtime["synthetic_neutral"] = True
-            runtime["neutral_base_qty"] = neutral_qty
-            runtime["direction_state"] = expected_direction_state
-            runtime["position_lots"] = [
-                {
-                    "lot_id": "synthetic_recovered",
-                    "side": "long" if expected_direction_state == "long_active" else "short",
-                    "qty": current_position_qty,
-                    "entry_price": (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0,
-                    "opened_at_ms": 0,
-                    "source_role": "synthetic_recovery",
-                }
-            ]
+            frozen_only_matches_expected = (
+                runtime_direction_state == "flat"
+                and (
+                    (
+                        frozen_direction_state == expected_direction_state
+                        and abs(frozen_qty - current_position_qty) <= EPSILON
+                    )
+                    or abs(frozen_net_qty - synthetic_net_qty) <= EPSILON
+                )
+            )
+            if not frozen_only_matches_expected:
+                runtime = new_inventory_grid_runtime(market_type="futures")
+                runtime["synthetic_neutral"] = True
+                runtime["neutral_base_qty"] = neutral_qty
+                runtime["direction_state"] = expected_direction_state
+                runtime["position_lots"] = [
+                    {
+                        "lot_id": "synthetic_recovered",
+                        "side": "long" if expected_direction_state == "long_active" else "short",
+                        "qty": current_position_qty,
+                        "entry_price": (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0,
+                        "opened_at_ms": 0,
+                        "source_role": "synthetic_recovery",
+                    }
+                ]
     if _safe_float(runtime.get("grid_anchor_price")) <= 0:
         runtime["grid_anchor_price"] = (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0
+    synthetic_pair_release_last: dict[str, Any] = {}
+    if synthetic_neutral and synthetic_freeze_enabled and synthetic_freeze_pair_release_enabled:
+        synthetic_pair_release_last = apply_synthetic_frozen_pair_release(
+            runtime=runtime,
+            release_qty=None,
+            release_time_ms=int((now or _utc_now()).timestamp() * 1000),
+            reason="pair_release",
+        )
+        if bool(synthetic_pair_release_last.get("applied")):
+            _store_cached_spot_competition_runtime(
+                state=state,
+                runtime=runtime,
+                applied_trade_keys=_cached_spot_competition_applied_trade_keys(
+                    state=state,
+                    synthetic_neutral=True,
+                ),
+                synthetic_neutral=True,
+            )
     slow_trend_step = _resolve_spot_slow_trend_step(
         symbol=str(symbol or state.get("symbol") or "").upper().strip(),
         base_step_price=step_price,
@@ -1701,33 +1782,72 @@ def _build_spot_competition_inventory_grid_orders(
     )
     effective_step_price = max(_safe_float(slow_trend_step.get("effective_step_price")), _safe_float(step_price))
 
-    plan = build_inventory_grid_orders(
-        runtime=runtime,
-        bid_price=bid_price,
-        ask_price=ask_price,
-        step_price=effective_step_price,
-        per_order_notional=per_order_notional,
-        first_order_multiplier=first_order_multiplier,
-        threshold_position_notional=threshold_position_notional,
-        threshold_reduce_target_notional=threshold_reduce_target_notional,
-        warmup_position_notional=warmup_position_notional,
-        require_non_loss_exit=require_non_loss_exit,
-        max_order_position_notional=max_order_position_notional,
-        max_position_notional=max_position_notional,
-        max_short_order_position_notional=max_short_position_notional,
-        max_short_position_notional=max_short_position_notional,
-        buy_levels=buy_levels,
-        sell_levels=sell_levels,
-        tick_size=tick_size,
-        step_size=step_size,
-        min_qty=min_qty,
-        min_notional=min_notional,
-    )
+    plan_kwargs = {
+        "runtime": runtime,
+        "bid_price": bid_price,
+        "ask_price": ask_price,
+        "step_price": effective_step_price,
+        "per_order_notional": per_order_notional,
+        "first_order_multiplier": first_order_multiplier,
+        "threshold_position_notional": threshold_position_notional,
+        "threshold_reduce_target_notional": threshold_reduce_target_notional,
+        "warmup_position_notional": warmup_position_notional,
+        "require_non_loss_exit": require_non_loss_exit,
+        "max_order_position_notional": max_order_position_notional,
+        "max_position_notional": max_position_notional,
+        "max_short_order_position_notional": max_short_position_notional,
+        "max_short_position_notional": max_short_position_notional,
+        "buy_levels": buy_levels,
+        "sell_levels": sell_levels,
+        "tick_size": tick_size,
+        "step_size": step_size,
+        "min_qty": min_qty,
+        "min_notional": min_notional,
+        "synthetic_freeze_enabled": bool(synthetic_neutral and synthetic_freeze_enabled),
+        "synthetic_freeze_loss_ratio": synthetic_freeze_loss_ratio,
+        "synthetic_freeze_min_notional": synthetic_freeze_min_notional,
+        "synthetic_freeze_max_side_notional": synthetic_freeze_max_side_notional,
+        "synthetic_freeze_release_profit_ratio": synthetic_freeze_release_profit_ratio,
+        "synthetic_freeze_manual_release_side": synthetic_freeze_manual_release_side,
+        "synthetic_freeze_manual_release_qty": synthetic_freeze_manual_release_qty,
+        "synthetic_freeze_manual_release_price": synthetic_freeze_manual_release_price,
+    }
+    plan = build_inventory_grid_orders(**plan_kwargs)
+    synthetic_freeze_last: dict[str, Any] = {}
+    freeze_candidate = plan.get("synthetic_freeze_candidate") if isinstance(plan.get("synthetic_freeze_candidate"), dict) else {}
+    if synthetic_neutral and bool(freeze_candidate.get("should_freeze")):
+        freeze_time = int((now or _utc_now()).timestamp() * 1000)
+        synthetic_freeze_last = freeze_inventory_grid_reduce_lots(
+            runtime=runtime,
+            reduce_price=_safe_float(freeze_candidate.get("reduce_price")),
+            reduce_qty=_safe_float(freeze_candidate.get("qty")),
+            step_price=effective_step_price,
+            freeze_time_ms=freeze_time,
+            reason=str(freeze_candidate.get("reason") or "threshold_reduce_loss"),
+        )
+        if synthetic_freeze_pair_release_enabled:
+            synthetic_pair_release_last = apply_synthetic_frozen_pair_release(
+                runtime=runtime,
+                release_qty=None,
+                release_time_ms=freeze_time,
+                reason="pair_release",
+            )
+        _store_cached_spot_competition_runtime(
+            state=state,
+            runtime=runtime,
+            applied_trade_keys=_cached_spot_competition_applied_trade_keys(
+                state=state,
+                synthetic_neutral=True,
+            ),
+            synthetic_neutral=True,
+        )
+        plan = build_inventory_grid_orders(**plan_kwargs)
     desired_orders = list(plan.get("bootstrap_orders") or []) + list(plan.get("buy_orders") or []) + list(plan.get("sell_orders") or [])
     reduce_target_notional = max(_safe_float(threshold_reduce_target_notional), 0.0)
     display_soft_limit = reduce_target_notional if reduce_target_notional > 0 else _safe_float(threshold_position_notional)
     current_long_notional = max(synthetic_net_qty, 0.0) * mid_price
     current_short_notional = max(-synthetic_net_qty, 0.0) * mid_price
+    synthetic_frozen_position = plan.get("synthetic_frozen_position") if isinstance(plan.get("synthetic_frozen_position"), dict) else {}
     controls = {
         "mode": "competition_synthetic_neutral_grid" if synthetic_neutral else "competition_inventory_grid",
         "buy_paused": False,
@@ -1761,6 +1881,18 @@ def _build_spot_competition_inventory_grid_orders(
         "synthetic_dust_notional": synthetic_dust_notional,
         "current_long_notional": current_long_notional,
         "current_short_notional": current_short_notional,
+        "synthetic_freeze_enabled": bool(synthetic_neutral and synthetic_freeze_enabled),
+        "synthetic_freeze_max_side_notional": max(_safe_float(synthetic_freeze_max_side_notional), 0.0),
+        "synthetic_freeze_pair_release_enabled": bool(synthetic_neutral and synthetic_freeze_enabled and synthetic_freeze_pair_release_enabled),
+        "synthetic_freeze_candidate": plan.get("synthetic_freeze_candidate", {}),
+        "synthetic_freeze_last": synthetic_freeze_last,
+        "synthetic_pair_release_last": synthetic_pair_release_last,
+        "synthetic_frozen_position": synthetic_frozen_position,
+        "synthetic_frozen_long_qty": _safe_float(synthetic_frozen_position.get("long_qty")),
+        "synthetic_frozen_short_qty": _safe_float(synthetic_frozen_position.get("short_qty")),
+        "synthetic_frozen_long_notional": _safe_float(synthetic_frozen_position.get("long_notional")),
+        "synthetic_frozen_short_notional": _safe_float(synthetic_frozen_position.get("short_notional")),
+        "synthetic_frozen_short_quote_reserve": _safe_float(synthetic_frozen_position.get("short_notional")),
         "max_short_position_notional": max(_safe_float(max_short_position_notional), 0.0),
     }
     return desired_orders, controls
@@ -2654,6 +2786,15 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             slow_trend_step_5m_amplitude_ratio=float(getattr(args, "spot_slow_trend_step_5m_amplitude_ratio", 0.0)),
             slow_trend_step_15m_amplitude_ratio=float(getattr(args, "spot_slow_trend_step_15m_amplitude_ratio", 0.0)),
             slow_trend_step_scale=float(getattr(args, "spot_slow_trend_step_scale", 1.0)),
+            synthetic_freeze_enabled=bool(getattr(args, "synthetic_freeze_enabled", False)),
+            synthetic_freeze_loss_ratio=float(getattr(args, "synthetic_freeze_loss_ratio", 0.0)),
+            synthetic_freeze_min_notional=float(getattr(args, "synthetic_freeze_min_notional", 0.0)),
+            synthetic_freeze_max_side_notional=float(getattr(args, "synthetic_freeze_max_side_notional", 0.0)),
+            synthetic_freeze_release_profit_ratio=float(getattr(args, "synthetic_freeze_release_profit_ratio", 0.0)),
+            synthetic_freeze_pair_release_enabled=bool(getattr(args, "synthetic_freeze_pair_release_enabled", True)),
+            synthetic_freeze_manual_release_side=getattr(args, "synthetic_freeze_manual_release_side", None),
+            synthetic_freeze_manual_release_qty=float(getattr(args, "synthetic_freeze_manual_release_qty", 0.0)),
+            synthetic_freeze_manual_release_price=float(getattr(args, "synthetic_freeze_manual_release_price", 0.0)),
         )
         current_long_notional_for_guard = _safe_float(controls.get("current_long_notional"))
         fast_stop_guard = _assess_spot_fast_stop_guard(
@@ -2833,6 +2974,18 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "synthetic_dust_notional": _safe_float(controls.get("synthetic_dust_notional")),
         "current_long_notional": _safe_float(controls.get("current_long_notional")),
         "current_short_notional": _safe_float(controls.get("current_short_notional")),
+        "synthetic_freeze_enabled": bool(controls.get("synthetic_freeze_enabled")),
+        "synthetic_freeze_max_side_notional": _safe_float(controls.get("synthetic_freeze_max_side_notional")),
+        "synthetic_freeze_pair_release_enabled": bool(controls.get("synthetic_freeze_pair_release_enabled")),
+        "synthetic_freeze_candidate": controls.get("synthetic_freeze_candidate", {}),
+        "synthetic_freeze_last": controls.get("synthetic_freeze_last", {}),
+        "synthetic_pair_release_last": controls.get("synthetic_pair_release_last", {}),
+        "synthetic_frozen_position": controls.get("synthetic_frozen_position", {}),
+        "synthetic_frozen_long_qty": _safe_float(controls.get("synthetic_frozen_long_qty")),
+        "synthetic_frozen_short_qty": _safe_float(controls.get("synthetic_frozen_short_qty")),
+        "synthetic_frozen_long_notional": _safe_float(controls.get("synthetic_frozen_long_notional")),
+        "synthetic_frozen_short_notional": _safe_float(controls.get("synthetic_frozen_short_notional")),
+        "synthetic_frozen_short_quote_reserve": _safe_float(controls.get("synthetic_frozen_short_quote_reserve")),
         "max_short_position_notional": _safe_float(controls.get("max_short_position_notional")),
         "inventory_avg_cost": inventory_avg_cost,
         "oldest_inventory_age_minutes": _oldest_inventory_age_minutes(state.get("inventory_lots") if isinstance(state.get("inventory_lots"), list) else []),
@@ -3004,6 +3157,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-position-notional", type=float, default=0.0)
     parser.add_argument("--neutral-base-qty", type=float, default=0.0)
     parser.add_argument("--max-short-position-notional", type=float, default=0.0)
+    parser.add_argument("--synthetic-freeze-enabled", action="store_true")
+    parser.add_argument("--synthetic-freeze-loss-ratio", type=float, default=0.0)
+    parser.add_argument("--synthetic-freeze-min-notional", type=float, default=0.0)
+    parser.add_argument("--synthetic-freeze-max-side-notional", type=float, default=0.0)
+    parser.add_argument("--synthetic-freeze-release-profit-ratio", type=float, default=0.0)
+    parser.add_argument("--synthetic-freeze-pair-release-enabled", dest="synthetic_freeze_pair_release_enabled", action="store_true")
+    parser.add_argument("--no-synthetic-freeze-pair-release-enabled", dest="synthetic_freeze_pair_release_enabled", action="store_false")
+    parser.set_defaults(synthetic_freeze_pair_release_enabled=True)
+    parser.add_argument("--synthetic-freeze-manual-release-side", type=str, default="")
+    parser.add_argument("--synthetic-freeze-manual-release-qty", type=float, default=0.0)
+    parser.add_argument("--synthetic-freeze-manual-release-price", type=float, default=0.0)
     parser.add_argument("--elastic-volume-enabled", dest="elastic_volume_enabled", action="store_true")
     parser.add_argument("--no-elastic-volume-enabled", dest="elastic_volume_enabled", action="store_false")
     parser.set_defaults(elastic_volume_enabled=False)
