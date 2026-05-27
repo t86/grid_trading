@@ -582,6 +582,58 @@ def test_synthetic_frozen_short_liability_releases_with_buy_when_price_recovers(
     assert plan["synthetic_frozen_position"]["short_qty"] == 4000.0
 
 
+def test_synthetic_frozen_short_keeps_bootstrap_orders_when_not_releasable() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "flat"
+    runtime["frozen_position_lots"] = [
+        {
+            "lot_id": "frozen_short",
+            "source_lot_id": "sold_neutral_base",
+            "side": "short",
+            "qty": 4000.0,
+            "entry_price": 0.10,
+            "frozen_at_ms": 1000,
+            "freeze_reason": "threshold_reduce_loss",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.1009,
+        ask_price=0.1011,
+        step_price=0.0005,
+        per_order_notional=40.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=300.0,
+        threshold_reduce_target_notional=250.0,
+        max_order_position_notional=500.0,
+        max_position_notional=600.0,
+        max_short_order_position_notional=500.0,
+        max_short_position_notional=500.0,
+        buy_levels=3,
+        sell_levels=3,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+        synthetic_freeze_enabled=True,
+        synthetic_freeze_release_profit_ratio=0.0,
+    )
+
+    assert [order["role"] for order in plan["bootstrap_orders"]] == [
+        "bootstrap_entry",
+        "grid_entry",
+        "grid_entry",
+        "bootstrap_entry",
+        "grid_entry",
+        "grid_entry",
+    ]
+    assert plan["buy_orders"] == []
+    assert plan["sell_orders"] == []
+    assert plan["synthetic_frozen_position"]["short_qty"] == 4000.0
+
+
 def test_synthetic_frozen_manual_release_ignores_recovery_threshold_for_requested_qty() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["synthetic_neutral"] = True

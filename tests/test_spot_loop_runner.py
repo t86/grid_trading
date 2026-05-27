@@ -726,7 +726,18 @@ class SpotLoopRunnerTests(unittest.TestCase):
             synthetic_freeze_release_profit_ratio=0.01,
         )
 
-        self.assertFalse(desired_orders)
+        self.assertEqual(
+            [order["role"] for order in desired_orders],
+            [
+                "bootstrap_entry",
+                "grid_entry",
+                "grid_entry",
+                "bootstrap_entry",
+                "grid_entry",
+                "grid_entry",
+            ],
+        )
+        self.assertNotIn("synthetic_frozen_release", [order["role"] for order in desired_orders])
         cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
         self.assertEqual(cached_runtime["frozen_position_lots"][0]["side"], "long")
         self.assertAlmostEqual(cached_runtime["frozen_position_lots"][0]["qty"], 400.0)

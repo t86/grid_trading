@@ -741,19 +741,6 @@ def build_inventory_grid_orders(
                 synthetic_freeze_candidate=synthetic_freeze_candidate,
                 synthetic_frozen_position=synthetic_frozen_position,
             )
-        if synthetic_neutral and synthetic_freeze_enabled and _safe_float(synthetic_frozen_position.get("lot_count")) > EPSILON:
-            return _finalize_inventory_grid_plan(
-                risk_state=runtime_risk_state,
-                bootstrap_orders=bootstrap_orders,
-                buy_orders=buy_orders,
-                sell_orders=sell_orders,
-                forced_reduce_orders=forced_reduce_orders,
-                tail_cleanup_active=False,
-                min_qty=min_qty,
-                min_notional=min_notional,
-                synthetic_freeze_candidate=synthetic_freeze_candidate,
-                synthetic_frozen_position=synthetic_frozen_position,
-            )
         if recovery_mode != "live":
             return _finalize_inventory_grid_plan(
                 risk_state=runtime_risk_state,
