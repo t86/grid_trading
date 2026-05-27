@@ -254,6 +254,40 @@ def _competition_runtime_position_qty(runtime: dict[str, Any]) -> float:
     return total
 
 
+def _competition_runtime_frozen_net_qty(runtime: dict[str, Any]) -> float:
+    long_qty = 0.0
+    short_qty = 0.0
+    lots = runtime.get("frozen_position_lots")
+    if not isinstance(lots, list):
+        return 0.0
+    for lot in lots:
+        if not isinstance(lot, dict):
+            continue
+        qty = max(_safe_float(lot.get("qty")), 0.0)
+        side = str(lot.get("side", "") or "").strip().lower()
+        if side == "short":
+            short_qty += qty
+        elif side == "long":
+            long_qty += qty
+    return long_qty - short_qty
+
+
+def _competition_runtime_matches_expected_position(
+    runtime: dict[str, Any],
+    *,
+    expected_position_qty: float,
+    synthetic_neutral: bool,
+) -> bool:
+    expected = max(float(expected_position_qty), 0.0)
+    runtime_qty = _competition_runtime_position_qty(runtime)
+    if abs(runtime_qty - expected) <= EPSILON:
+        return True
+    if not synthetic_neutral:
+        return False
+    frozen_net_qty = _competition_runtime_frozen_net_qty(runtime)
+    return abs(abs(frozen_net_qty) - expected) <= EPSILON
+
+
 def _competition_runtime_trade_key(trade: dict[str, Any]) -> str:
     return ":".join(
         (
@@ -414,7 +448,11 @@ def _resolve_spot_competition_runtime(
         cached_runtime["pair_credit_steps"] = 0
         cached_runtime["recovery_mode"] = "live"
         cached_runtime["recovery_errors"] = []
-        if cache_valid and abs(_competition_runtime_position_qty(cached_runtime) - expected_position_qty) <= EPSILON:
+        if cache_valid and _competition_runtime_matches_expected_position(
+            cached_runtime,
+            expected_position_qty=expected_position_qty,
+            synthetic_neutral=synthetic_neutral,
+        ):
             _store_cached_spot_competition_runtime(
                 state=state,
                 runtime=cached_runtime,
@@ -1691,7 +1729,8 @@ def _build_spot_competition_inventory_grid_orders(
         synthetic_dust_qty = synthetic_net_qty
         synthetic_dust_notional = abs(synthetic_net_qty) * mid_price
         synthetic_net_qty = 0.0
-    current_position_qty = abs(synthetic_net_qty) if synthetic_neutral else resolved_actual_base_qty
+    raw_synthetic_net_qty = synthetic_net_qty
+    current_position_qty = abs(raw_synthetic_net_qty) if synthetic_neutral else resolved_actual_base_qty
     runtime = _resolve_spot_competition_runtime(
         state=state,
         trades=trades,
@@ -1703,51 +1742,62 @@ def _build_spot_competition_inventory_grid_orders(
     if synthetic_neutral:
         runtime["synthetic_neutral"] = True
         runtime["neutral_base_qty"] = neutral_qty
-        expected_direction_state = "long_active" if synthetic_net_qty > EPSILON else "short_active" if synthetic_net_qty < -EPSILON else "flat"
-        runtime_direction_state = str(runtime.get("direction_state", "flat") or "flat").strip().lower()
+
+    def _isolate_synthetic_frozen_exposure() -> float:
+        if not synthetic_neutral:
+            return raw_synthetic_net_qty
         frozen_report = synthetic_frozen_position_report(runtime=runtime, mid_price=mid_price)
         frozen_net_qty = _safe_float(frozen_report.get("long_qty")) - _safe_float(frozen_report.get("short_qty"))
-        frozen_direction_state = "flat"
-        frozen_qty = 0.0
-        if _safe_float(frozen_report.get("long_qty")) > EPSILON and _safe_float(frozen_report.get("short_qty")) <= EPSILON:
-            frozen_direction_state = "long_active"
-            frozen_qty = _safe_float(frozen_report.get("long_qty"))
-        elif _safe_float(frozen_report.get("short_qty")) > EPSILON and _safe_float(frozen_report.get("long_qty")) <= EPSILON:
-            frozen_direction_state = "short_active"
-            frozen_qty = _safe_float(frozen_report.get("short_qty"))
-        if current_position_qty <= EPSILON and runtime_direction_state != "flat":
-            runtime = new_inventory_grid_runtime(market_type="futures")
-            runtime["synthetic_neutral"] = True
-            runtime["neutral_base_qty"] = neutral_qty
-        elif expected_direction_state != "flat" and (
+        active_net_qty = raw_synthetic_net_qty - frozen_net_qty
+        if _synthetic_residual_is_dust(
+            qty=abs(active_net_qty),
+            price=mid_price,
+            min_qty=min_qty,
+            min_notional=min_notional,
+        ):
+            active_net_qty = 0.0
+        expected_direction_state = (
+            "long_active" if active_net_qty > EPSILON else "short_active" if active_net_qty < -EPSILON else "flat"
+        )
+        runtime_direction_state = str(runtime.get("direction_state", "flat") or "flat").strip().lower()
+        active_position_qty = abs(active_net_qty)
+        if active_position_qty <= EPSILON:
+            if runtime_direction_state != "flat" or _sum_inventory_qty(list(runtime.get("position_lots") or [])) > EPSILON:
+                runtime["direction_state"] = "flat"
+                runtime["position_lots"] = []
+                runtime["recovery_mode"] = "live"
+            return 0.0
+        active_lot_qty = _sum_inventory_qty(list(runtime.get("position_lots") or []))
+        if (
             runtime_direction_state != expected_direction_state
             or str(runtime.get("recovery_mode", "live") or "live").strip().lower() != "live"
+            or abs(active_lot_qty - active_position_qty) > max(active_position_qty, 1.0) * 1e-9
         ):
-            frozen_only_matches_expected = (
-                runtime_direction_state == "flat"
-                and (
-                    (
-                        frozen_direction_state == expected_direction_state
-                        and abs(frozen_qty - current_position_qty) <= EPSILON
-                    )
-                    or abs(frozen_net_qty - synthetic_net_qty) <= EPSILON
-                )
-            )
-            if not frozen_only_matches_expected:
-                runtime = new_inventory_grid_runtime(market_type="futures")
-                runtime["synthetic_neutral"] = True
-                runtime["neutral_base_qty"] = neutral_qty
-                runtime["direction_state"] = expected_direction_state
-                runtime["position_lots"] = [
-                    {
-                        "lot_id": "synthetic_recovered",
-                        "side": "long" if expected_direction_state == "long_active" else "short",
-                        "qty": current_position_qty,
-                        "entry_price": (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0,
-                        "opened_at_ms": 0,
-                        "source_role": "synthetic_recovery",
-                    }
-                ]
+            runtime["direction_state"] = expected_direction_state
+            runtime["recovery_mode"] = "live"
+            runtime["position_lots"] = [
+                {
+                    "lot_id": "synthetic_recovered",
+                    "side": "long" if expected_direction_state == "long_active" else "short",
+                    "qty": active_position_qty,
+                    "entry_price": mid_price,
+                    "opened_at_ms": 0,
+                    "source_role": "synthetic_recovery",
+                }
+            ]
+        return active_net_qty
+
+    synthetic_net_qty = _isolate_synthetic_frozen_exposure()
+    if synthetic_neutral:
+        _store_cached_spot_competition_runtime(
+            state=state,
+            runtime=runtime,
+            applied_trade_keys=_cached_spot_competition_applied_trade_keys(
+                state=state,
+                synthetic_neutral=True,
+            ),
+            synthetic_neutral=True,
+        )
     if _safe_float(runtime.get("grid_anchor_price")) <= 0:
         runtime["grid_anchor_price"] = (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0
     synthetic_pair_release_last: dict[str, Any] = {}
@@ -1768,6 +1818,7 @@ def _build_spot_competition_inventory_grid_orders(
                 ),
                 synthetic_neutral=True,
             )
+        synthetic_net_qty = _isolate_synthetic_frozen_exposure()
     slow_trend_step = _resolve_spot_slow_trend_step(
         symbol=str(symbol or state.get("symbol") or "").upper().strip(),
         base_step_price=step_price,
@@ -1841,6 +1892,7 @@ def _build_spot_competition_inventory_grid_orders(
             ),
             synthetic_neutral=True,
         )
+        synthetic_net_qty = _isolate_synthetic_frozen_exposure()
         plan = build_inventory_grid_orders(**plan_kwargs)
     desired_orders = list(plan.get("bootstrap_orders") or []) + list(plan.get("buy_orders") or []) + list(plan.get("sell_orders") or [])
     reduce_target_notional = max(_safe_float(threshold_reduce_target_notional), 0.0)
