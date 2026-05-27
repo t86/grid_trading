@@ -7033,6 +7033,9 @@ def update_best_quote_volume_order_refs(
         if isinstance(pair_release_directive, Mapping)
         else ""
     )
+    pair_release_submitted_orders: list[dict[str, Any]] = []
+    pair_release_long_qty = 0.0
+    pair_release_short_qty = 0.0
 
     for item in submit_report.get("placed_orders", []):
         if not isinstance(item, dict):
@@ -7046,6 +7049,15 @@ def update_best_quote_volume_order_refs(
         frozen_request_id = str(request.get("frozen_inventory_request_id") or "").strip()
         if not frozen_request_id and role.lower().startswith("frozen_inventory_pair_release_"):
             frozen_request_id = pair_release_request_id
+        if _is_frozen_inventory_pair_release_order(request):
+            submitted_order = dict(request)
+            if frozen_request_id:
+                submitted_order["frozen_inventory_request_id"] = frozen_request_id
+            pair_release_submitted_orders.append(submitted_order)
+            if role.lower() == "frozen_inventory_pair_release_long":
+                pair_release_long_qty += max(_safe_float(request.get("qty")), 0.0)
+            elif role.lower() == "frozen_inventory_pair_release_short":
+                pair_release_short_qty += max(_safe_float(request.get("qty")), 0.0)
         refs[str(order_id)] = {
             "book": _best_quote_order_book_from_role(request.get("role")),
             "role": role,
@@ -7063,6 +7075,25 @@ def update_best_quote_volume_order_refs(
         refs = dict(list(refs.items())[-10000:])
 
     state["best_quote_volume_order_refs"] = refs
+    if pair_release_submitted_orders:
+        directive = dict(state.get("best_quote_frozen_inventory_pair_release") or {})
+        submitted_release_qty = (
+            min(pair_release_long_qty, pair_release_short_qty)
+            if pair_release_long_qty > 0 and pair_release_short_qty > 0
+            else max(pair_release_long_qty, pair_release_short_qty)
+        )
+        directive.update(
+            {
+                "requested": True,
+                "request_id": str(directive.get("request_id") or pair_release_request_id),
+                "last_submitted_at": _utc_now().isoformat(),
+                "last_submitted_orders": pair_release_submitted_orders,
+                "last_submitted_release_qty": submitted_release_qty,
+                "awaiting_fill_confirmation": True,
+                "updated_at": _utc_now().isoformat(),
+            }
+        )
+        state["best_quote_frozen_inventory_pair_release"] = directive
     try:
         state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
@@ -9013,6 +9044,13 @@ def isolate_frozen_pair_release_place_orders(actions: dict[str, Any]) -> dict[st
         "deferred_place_orders": deferred_orders,
     }
     return result
+
+
+def _runtime_guard_has_allowed_frozen_inventory_places(actions: Mapping[str, Any] | dict[str, Any]) -> bool:
+    if _safe_float((actions or {}).get("place_count")) <= 0:
+        return False
+    place_orders = [dict(item) for item in list((actions or {}).get("place_orders") or []) if isinstance(item, dict)]
+    return bool(place_orders) and all(_is_frozen_inventory_manual_order(item) for item in place_orders)
 
 
 def _has_pending_frozen_inventory_manual_directive(state: Mapping[str, Any] | dict[str, Any]) -> bool:
@@ -18088,11 +18126,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             kept_directive.update(
                 {
                     "requested": True,
-                    "last_submitted_at": _utc_now().isoformat(),
-                    "last_submitted_orders": list(best_quote_frozen_pair_release.get("orders") or []),
-                    "last_submitted_release_qty": _safe_float(best_quote_frozen_pair_release.get("release_qty")),
+                    "last_planned_at": _utc_now().isoformat(),
+                    "last_planned_orders": list(best_quote_frozen_pair_release.get("orders") or []),
+                    "last_planned_release_qty": _safe_float(best_quote_frozen_pair_release.get("release_qty")),
                     "last_repair_side": str(best_quote_frozen_pair_release.get("repair_side") or ""),
-                    "awaiting_fill_confirmation": True,
                 }
             )
             state["best_quote_frozen_inventory_pair_release"] = kept_directive
@@ -19892,30 +19929,42 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         validation["errors"] = [
             item for item in validation["errors"] if "plan contains no actions to execute" not in item
         ]
-        if validation["actions"].get("place_count", 0) > 0:
+        if _runtime_guard_has_allowed_frozen_inventory_places(validation["actions"]):
+            validation["ok"] = not validation["errors"]
+        elif validation["actions"].get("place_count", 0) > 0:
             validation["errors"].append(
                 "runtime_guard_loss_cooling_down blocks normal place orders; frozen inventory manual reduce-only orders allowed"
             )
+            validation["ok"] = (
+                validation["actions"].get("cancel_count", 0) > 0
+                or validation["actions"].get("place_count", 0) > 0
+            )
         else:
             validation["errors"].append("runtime_guard_loss_cooling_down blocks new place orders")
-        validation["ok"] = (
-            validation["actions"].get("cancel_count", 0) > 0
-            or validation["actions"].get("place_count", 0) > 0
-        )
+            validation["ok"] = (
+                validation["actions"].get("cancel_count", 0) > 0
+                or validation["actions"].get("place_count", 0) > 0
+            )
     if (validation["actions"].get("runtime_guard_manual_frozen_inventory_override") or {}).get("blocked"):
         validation["errors"] = [
             item for item in validation["errors"] if "plan contains no actions to execute" not in item
         ]
-        if validation["actions"].get("place_count", 0) > 0:
+        if _runtime_guard_has_allowed_frozen_inventory_places(validation["actions"]):
+            validation["ok"] = not validation["errors"]
+        elif validation["actions"].get("place_count", 0) > 0:
             validation["errors"].append(
                 "runtime_guard manual frozen-inventory override blocks normal place orders; frozen reduce-only orders allowed"
             )
+            validation["ok"] = (
+                validation["actions"].get("cancel_count", 0) > 0
+                or validation["actions"].get("place_count", 0) > 0
+            )
         else:
             validation["errors"].append("runtime_guard manual frozen-inventory override blocks new normal place orders")
-        validation["ok"] = (
-            validation["actions"].get("cancel_count", 0) > 0
-            or validation["actions"].get("place_count", 0) > 0
-        )
+            validation["ok"] = (
+                validation["actions"].get("cancel_count", 0) > 0
+                or validation["actions"].get("place_count", 0) > 0
+            )
 
     report = {
         "plan_json": str(args.plan_json),
@@ -20334,32 +20383,36 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         validation["errors"] = [
             item for item in validation["errors"] if "plan contains no actions to execute" not in item
         ]
-        if "runtime_guard_loss_cooling_down blocks new place orders" not in validation["errors"]:
+        if _runtime_guard_has_allowed_frozen_inventory_places(validation["actions"]):
+            validation["ok"] = not validation["errors"]
+        elif "runtime_guard_loss_cooling_down blocks new place orders" not in validation["errors"]:
             if validation["actions"].get("place_count", 0) > 0:
                 validation["errors"].append(
                     "runtime_guard_loss_cooling_down blocks normal place orders; frozen inventory manual reduce-only orders allowed"
                 )
             else:
                 validation["errors"].append("runtime_guard_loss_cooling_down blocks new place orders")
-        validation["ok"] = (
-            validation["actions"].get("cancel_count", 0) > 0
-            or validation["actions"].get("place_count", 0) > 0
-        )
+            validation["ok"] = (
+                validation["actions"].get("cancel_count", 0) > 0
+                or validation["actions"].get("place_count", 0) > 0
+            )
     if (validation["actions"].get("runtime_guard_manual_frozen_inventory_override") or {}).get("blocked"):
         validation["errors"] = [
             item for item in validation["errors"] if "plan contains no actions to execute" not in item
         ]
-        if "runtime_guard manual frozen-inventory override blocks new normal place orders" not in validation["errors"]:
+        if _runtime_guard_has_allowed_frozen_inventory_places(validation["actions"]):
+            validation["ok"] = not validation["errors"]
+        elif "runtime_guard manual frozen-inventory override blocks new normal place orders" not in validation["errors"]:
             if validation["actions"].get("place_count", 0) > 0:
                 validation["errors"].append(
                     "runtime_guard manual frozen-inventory override blocks normal place orders; frozen reduce-only orders allowed"
                 )
             else:
                 validation["errors"].append("runtime_guard manual frozen-inventory override blocks new normal place orders")
-        validation["ok"] = (
-            validation["actions"].get("cancel_count", 0) > 0
-            or validation["actions"].get("place_count", 0) > 0
-        )
+            validation["ok"] = (
+                validation["actions"].get("cancel_count", 0) > 0
+                or validation["actions"].get("place_count", 0) > 0
+            )
     configured_place_budget = int(getattr(args, "execution_place_budget_per_cycle", 0) or 0)
     max_new_order_budget = int(getattr(args, "max_new_orders", 0) or 0)
     effective_place_budget = (
