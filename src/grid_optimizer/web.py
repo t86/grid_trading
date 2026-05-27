@@ -14123,6 +14123,60 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("spot_slow_trend_step_scale", SPOT_RUNNER_DEFAULT_CONFIG["spot_slow_trend_step_scale"]),
         "spot_slow_trend_step_scale",
     )
+    synthetic_freeze_enabled = _safe_bool(
+        payload.get("synthetic_freeze_enabled", SPOT_RUNNER_DEFAULT_CONFIG["synthetic_freeze_enabled"]),
+        "synthetic_freeze_enabled",
+    )
+    synthetic_freeze_loss_ratio = _safe_float(
+        payload.get("synthetic_freeze_loss_ratio", SPOT_RUNNER_DEFAULT_CONFIG["synthetic_freeze_loss_ratio"]),
+        "synthetic_freeze_loss_ratio",
+    )
+    synthetic_freeze_min_notional = _safe_float(
+        payload.get("synthetic_freeze_min_notional", SPOT_RUNNER_DEFAULT_CONFIG["synthetic_freeze_min_notional"]),
+        "synthetic_freeze_min_notional",
+    )
+    synthetic_freeze_max_side_notional = _safe_float(
+        payload.get(
+            "synthetic_freeze_max_side_notional",
+            SPOT_RUNNER_DEFAULT_CONFIG["synthetic_freeze_max_side_notional"],
+        ),
+        "synthetic_freeze_max_side_notional",
+    )
+    synthetic_freeze_release_profit_ratio = _safe_float(
+        payload.get(
+            "synthetic_freeze_release_profit_ratio",
+            SPOT_RUNNER_DEFAULT_CONFIG["synthetic_freeze_release_profit_ratio"],
+        ),
+        "synthetic_freeze_release_profit_ratio",
+    )
+    synthetic_freeze_pair_release_enabled = _safe_bool(
+        payload.get(
+            "synthetic_freeze_pair_release_enabled",
+            SPOT_RUNNER_DEFAULT_CONFIG["synthetic_freeze_pair_release_enabled"],
+        ),
+        "synthetic_freeze_pair_release_enabled",
+    )
+    synthetic_freeze_manual_release_side = str(
+        payload.get(
+            "synthetic_freeze_manual_release_side",
+            SPOT_RUNNER_DEFAULT_CONFIG["synthetic_freeze_manual_release_side"],
+        )
+        or ""
+    ).strip()
+    synthetic_freeze_manual_release_qty = _safe_float(
+        payload.get(
+            "synthetic_freeze_manual_release_qty",
+            SPOT_RUNNER_DEFAULT_CONFIG["synthetic_freeze_manual_release_qty"],
+        ),
+        "synthetic_freeze_manual_release_qty",
+    )
+    synthetic_freeze_manual_release_price = _safe_float(
+        payload.get(
+            "synthetic_freeze_manual_release_price",
+            SPOT_RUNNER_DEFAULT_CONFIG["synthetic_freeze_manual_release_price"],
+        ),
+        "synthetic_freeze_manual_release_price",
+    )
     max_order_position_notional = _safe_float(
         payload.get("max_order_position_notional", SPOT_RUNNER_DEFAULT_CONFIG["max_order_position_notional"]),
         "max_order_position_notional",
@@ -14272,9 +14326,17 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_slow_trend_step_5m_amplitude_ratio": spot_slow_trend_step_5m_amplitude_ratio,
             "spot_slow_trend_step_15m_amplitude_ratio": spot_slow_trend_step_15m_amplitude_ratio,
             "spot_slow_trend_step_scale": spot_slow_trend_step_scale,
+            "synthetic_freeze_loss_ratio": synthetic_freeze_loss_ratio,
+            "synthetic_freeze_min_notional": synthetic_freeze_min_notional,
+            "synthetic_freeze_max_side_notional": synthetic_freeze_max_side_notional,
+            "synthetic_freeze_release_profit_ratio": synthetic_freeze_release_profit_ratio,
+            "synthetic_freeze_manual_release_qty": synthetic_freeze_manual_release_qty,
+            "synthetic_freeze_manual_release_price": synthetic_freeze_manual_release_price,
         }.items():
             if value < 0:
                 raise ValueError(f"{name} must be >= 0")
+        if synthetic_freeze_manual_release_side and synthetic_freeze_manual_release_side not in {"long", "short"}:
+            raise ValueError("synthetic_freeze_manual_release_side must be long or short")
         if spot_slow_trend_step_enabled and spot_slow_trend_step_scale <= 1.0:
             raise ValueError("spot_slow_trend_step_scale must be > 1 when enabled")
         if max_order_position_notional < 0:
@@ -14343,6 +14405,15 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_slow_trend_step_5m_amplitude_ratio": spot_slow_trend_step_5m_amplitude_ratio,
             "spot_slow_trend_step_15m_amplitude_ratio": spot_slow_trend_step_15m_amplitude_ratio,
             "spot_slow_trend_step_scale": spot_slow_trend_step_scale,
+            "synthetic_freeze_enabled": synthetic_freeze_enabled,
+            "synthetic_freeze_loss_ratio": synthetic_freeze_loss_ratio,
+            "synthetic_freeze_min_notional": synthetic_freeze_min_notional,
+            "synthetic_freeze_max_side_notional": synthetic_freeze_max_side_notional,
+            "synthetic_freeze_release_profit_ratio": synthetic_freeze_release_profit_ratio,
+            "synthetic_freeze_pair_release_enabled": synthetic_freeze_pair_release_enabled,
+            "synthetic_freeze_manual_release_side": synthetic_freeze_manual_release_side,
+            "synthetic_freeze_manual_release_qty": synthetic_freeze_manual_release_qty,
+            "synthetic_freeze_manual_release_price": synthetic_freeze_manual_release_price,
             "max_order_position_notional": max_order_position_notional,
             "max_position_notional": max_position_notional,
             "neutral_base_qty": neutral_base_qty,

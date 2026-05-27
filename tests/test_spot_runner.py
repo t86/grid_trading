@@ -327,6 +327,38 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("0.0015", command)
         self.assertIn("--synthetic-freeze-pair-release-enabled", command)
 
+    @patch("grid_optimizer.web._validate_market_symbol")
+    def test_normalize_spot_runner_payload_preserves_synthetic_freeze_arguments(
+        self, _mock_validate_symbol
+    ) -> None:
+        payload = _normalize_spot_runner_payload(
+            {
+                "symbol": "opgusdt",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "step_price": 0.0002,
+                "per_order_notional": 180,
+                "threshold_position_notional": 800,
+                "threshold_reduce_target_notional": 650,
+                "max_order_position_notional": 7000,
+                "max_position_notional": 8200,
+                "neutral_base_qty": 10000,
+                "max_short_position_notional": 320,
+                "synthetic_freeze_enabled": True,
+                "synthetic_freeze_loss_ratio": 0.006,
+                "synthetic_freeze_min_notional": 20,
+                "synthetic_freeze_max_side_notional": 1000,
+                "synthetic_freeze_release_profit_ratio": 0.0015,
+                "synthetic_freeze_pair_release_enabled": True,
+            }
+        )
+
+        self.assertTrue(payload["synthetic_freeze_enabled"])
+        self.assertEqual(payload["synthetic_freeze_loss_ratio"], 0.006)
+        self.assertEqual(payload["synthetic_freeze_min_notional"], 20.0)
+        self.assertEqual(payload["synthetic_freeze_max_side_notional"], 1000.0)
+        self.assertEqual(payload["synthetic_freeze_release_profit_ratio"], 0.0015)
+        self.assertTrue(payload["synthetic_freeze_pair_release_enabled"])
+
     @patch("grid_optimizer.web.fetch_spot_open_orders")
     @patch("grid_optimizer.web.fetch_spot_account_info")
     @patch("grid_optimizer.web.load_binance_api_credentials")
