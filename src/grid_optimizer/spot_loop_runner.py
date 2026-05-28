@@ -1224,6 +1224,37 @@ def _sync_synthetic_neutral_trades(
     return applied
 
 
+def _refresh_spot_trades_after_account_snapshot(
+    *,
+    state: dict[str, Any],
+    trades: list[dict[str, Any]],
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    trade_start_ms: int,
+    base_asset: str,
+    quote_asset: str,
+) -> tuple[list[dict[str, Any]], int]:
+    refreshed_trades = fetch_spot_user_trades(
+        symbol=symbol,
+        api_key=api_key,
+        api_secret=api_secret,
+        start_time_ms=trade_start_ms,
+        limit=1000,
+    )
+    current_keys = {_competition_runtime_trade_key(trade) for trade in list(trades or []) if isinstance(trade, dict)}
+    refreshed_keys = {_competition_runtime_trade_key(trade) for trade in list(refreshed_trades or []) if isinstance(trade, dict)}
+    if refreshed_keys == current_keys or not current_keys.issubset(refreshed_keys):
+        return trades, 0
+    applied = _sync_synthetic_neutral_trades(
+        state=state,
+        trades=refreshed_trades,
+        base_asset=base_asset,
+        quote_asset=quote_asset,
+    )
+    return refreshed_trades, applied
+
+
 def _build_static_desired_orders(
     *,
     cells: list[dict[str, Any]],
@@ -2816,6 +2847,18 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
     account_info = fetch_spot_account_info(api_key, api_secret)
     open_orders = fetch_spot_open_orders(symbol, api_key, api_secret)
     strategy_open_orders = _strategy_open_orders(open_orders, str(args.client_order_prefix))
+    if strategy_mode == "spot_competition_synthetic_neutral_grid":
+        trades, refreshed_applied_trades = _refresh_spot_trades_after_account_snapshot(
+            state=state,
+            trades=trades,
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            trade_start_ms=trade_start_ms,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+        )
+        applied_trades += refreshed_applied_trades
     metrics = state.get("metrics") if isinstance(state.get("metrics"), dict) else _new_metrics()
     trade_database_status: dict[str, Any] = {"enabled": trade_database_enabled(), "trade_inserted": 0, "income_inserted": 0}
     runtime_guard_config = normalize_runtime_guard_config(vars(args))

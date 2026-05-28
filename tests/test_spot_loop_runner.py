@@ -18,6 +18,7 @@ from grid_optimizer.spot_loop_runner import (
     _normalize_commission_quote,
     _resolve_spot_competition_runtime,
     _spot_order_meets_exchange_mins,
+    _refresh_spot_trades_after_account_snapshot,
     _sync_synthetic_neutral_trades,
     _sync_volume_shift_trades,
 )
@@ -1107,6 +1108,59 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(state["metrics"]["gross_notional"], 10.0)
         self.assertAlmostEqual(state["metrics"]["realized_pnl"], -0.01)
         self.assertIn("123", state["known_orders"])
+
+    def test_refresh_spot_trades_after_account_snapshot_applies_late_synthetic_fill(self) -> None:
+        state = {
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "seen_trade_ids": [1],
+            "known_orders": {
+                "123": {"side": "BUY", "role": "bootstrap_entry", "created_at_ms": 1},
+                "124": {"side": "BUY", "role": "grid_entry", "created_at_ms": 2},
+            },
+            "metrics": {},
+            "last_trade_time_ms": 1000,
+        }
+        first_trades = [
+            {
+                "id": 1,
+                "orderId": 123,
+                "price": "0.10",
+                "qty": "100",
+                "commission": "0",
+                "commissionAsset": "USDT",
+                "time": 1000,
+            }
+        ]
+        refreshed_trades = [
+            *first_trades,
+            {
+                "id": 2,
+                "orderId": 124,
+                "price": "0.10",
+                "qty": "50",
+                "commission": "0",
+                "commissionAsset": "USDT",
+                "time": 1100,
+            },
+        ]
+
+        with patch("grid_optimizer.spot_loop_runner.fetch_spot_user_trades", return_value=refreshed_trades):
+            trades, applied = _refresh_spot_trades_after_account_snapshot(
+                state=state,
+                trades=first_trades,
+                symbol="SPKUSDT",
+                api_key="key",
+                api_secret="secret",
+                trade_start_ms=900,
+                base_asset="SPK",
+                quote_asset="USDT",
+            )
+
+        self.assertEqual(trades, refreshed_trades)
+        self.assertEqual(applied, 1)
+        self.assertEqual(state["seen_trade_ids"], [1, 2])
+        self.assertEqual(state["last_trade_time_ms"], 1100)
+        self.assertAlmostEqual(state["metrics"]["gross_notional"], 5.0)
 
     def test_load_state_resets_foreign_spot_mode_state_for_competition_mode_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
