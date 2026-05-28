@@ -1912,19 +1912,6 @@ def _build_spot_competition_inventory_grid_orders(
                 return min(positives) if positives else mid_price
             return max(candidates)
 
-        def _active_net_qty_after_freeze() -> float:
-            refreshed = synthetic_frozen_position_report(runtime=runtime, mid_price=mid_price)
-            refreshed_frozen_net_qty = _safe_float(refreshed.get("long_qty")) - _safe_float(refreshed.get("short_qty"))
-            refreshed_active_net_qty = raw_synthetic_net_qty - refreshed_frozen_net_qty
-            if _synthetic_residual_is_dust(
-                qty=abs(refreshed_active_net_qty),
-                price=mid_price,
-                min_qty=min_qty,
-                min_notional=min_notional,
-            ):
-                return 0.0
-            return refreshed_active_net_qty
-
         def _prepare_unknown_cost_runtime(*, reason: str) -> None:
             runtime["direction_state"] = expected_direction_state
             runtime["risk_state"] = "normal"
@@ -1943,47 +1930,12 @@ def _build_spot_competition_inventory_grid_orders(
                 }
             ]
 
-        def _maybe_freeze_unknown_cost_runtime() -> bool:
-            if not synthetic_freeze_enabled or mid_price <= EPSILON:
-                return False
-            threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
-            if threshold_notional <= EPSILON:
-                return False
-            active_notional = active_position_qty * mid_price
-            if active_notional + EPSILON < threshold_notional:
-                return False
-            current_side_notional = _safe_float(
-                frozen_report.get("long_notional" if expected_direction_state == "long_active" else "short_notional")
-            )
-            side_cap = max(_safe_float(synthetic_freeze_max_side_notional), 0.0)
-            freeze_notional = active_notional
-            if side_cap > EPSILON:
-                freeze_notional = min(freeze_notional, max(side_cap - current_side_notional, 0.0))
-            if freeze_notional + EPSILON < max(_safe_float(synthetic_freeze_min_notional), 0.0):
-                return False
-            freeze_qty = min(active_position_qty, freeze_notional / mid_price)
-            freeze_qty = _round_order_qty(freeze_qty, step_size)
-            if freeze_qty <= EPSILON:
-                return False
-            reduce_price = ask_price if expected_direction_state == "long_active" else bid_price
-            result = freeze_inventory_grid_reduce_lots(
-                runtime=runtime,
-                reduce_price=reduce_price,
-                reduce_qty=freeze_qty,
-                step_price=step_price,
-                freeze_time_ms=int((now or _utc_now()).timestamp() * 1000),
-                reason="synthetic_cost_unknown",
-            )
-            return bool(result.get("applied"))
-
         def _handle_unknown_cost_runtime(*, reason: str) -> float:
             threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
             should_handle = bool(synthetic_freeze_enabled) and threshold_notional > EPSILON
             if should_handle:
                 _prepare_unknown_cost_runtime(reason=reason)
-                if active_position_qty * mid_price + EPSILON >= threshold_notional:
-                    _maybe_freeze_unknown_cost_runtime()
-                return _active_net_qty_after_freeze()
+                return active_net_qty
             runtime["direction_state"] = expected_direction_state
             runtime["risk_state"] = "hard_reduce_only"
             runtime["recovery_mode"] = "conservative_reduce_only"

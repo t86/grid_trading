@@ -446,6 +446,55 @@ def test_synthetic_neutral_threshold_reduce_freezes_lossy_lot_independently() ->
     assert plan["forced_reduce_orders"] == []
 
 
+def test_synthetic_neutral_hard_reduce_can_freeze_lossy_short_after_threshold() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "short_active"
+    runtime["grid_anchor_price"] = 1.00
+    runtime["position_lots"] = [
+        {
+            "lot_id": "short",
+            "side": "short",
+            "qty": 600.0,
+            "entry_price": 1.00,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=1.099,
+        ask_price=1.101,
+        step_price=0.001,
+        per_order_notional=40.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=500.0,
+        threshold_reduce_target_notional=400.0,
+        max_order_position_notional=2000.0,
+        max_position_notional=2000.0,
+        max_short_order_position_notional=2000.0,
+        max_short_position_notional=600.0,
+        buy_levels=3,
+        sell_levels=3,
+        tick_size=0.001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+        synthetic_freeze_enabled=True,
+        synthetic_freeze_loss_ratio=0.01,
+        synthetic_freeze_min_notional=5.0,
+    )
+
+    assert plan["risk_state"] == "hard_reduce_only"
+    candidate = plan["synthetic_freeze_candidate"]
+    assert candidate["should_freeze"] is True
+    assert candidate["side"] == "BUY"
+    assert candidate["qty"] > 0
+    assert candidate["loss_ratio"] > 0.01
+    assert plan["forced_reduce_orders"] == []
+
+
 def test_synthetic_neutral_threshold_reduce_keeps_forced_reduce_when_not_losing() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["synthetic_neutral"] = True

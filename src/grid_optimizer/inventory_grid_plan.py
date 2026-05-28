@@ -376,6 +376,8 @@ def _synthetic_freeze_candidate(
     lot_plan: dict[str, Any],
     loss_ratio_threshold: float,
     min_notional: float,
+    inventory_notional: float = 0.0,
+    threshold_position_notional: float = 0.0,
     current_side_notional: float = 0.0,
     max_side_notional: float = 0.0,
     cap_price: float = 0.0,
@@ -410,9 +412,15 @@ def _synthetic_freeze_candidate(
     qty = max(_safe_float(stats.get("qty")), 0.0)
     notional = qty * max(_safe_float(reduce_price), 0.0)
     loss_ratio = max(_safe_float(stats.get("loss_ratio")), 0.0)
+    normalized_risk_state = str(risk_state or "").strip().lower()
+    threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
+    threshold_reached = threshold_notional > EPSILON and max(_safe_float(inventory_notional), 0.0) + EPSILON >= threshold_notional
+    freeze_risk_allowed = normalized_risk_state == "threshold_reduce_only" or (
+        normalized_risk_state == "hard_reduce_only" and threshold_reached
+    )
     should_freeze = (
         bool(enabled)
-        and risk_state == "threshold_reduce_only"
+        and freeze_risk_allowed
         and qty > EPSILON
         and notional + EPSILON >= max(_safe_float(min_notional), 0.0)
         and loss_ratio + EPSILON >= max(_safe_float(loss_ratio_threshold), 0.0)
@@ -1079,6 +1087,8 @@ def build_inventory_grid_orders(
                     lot_plan=lot_plan,
                     loss_ratio_threshold=synthetic_freeze_loss_ratio,
                     min_notional=synthetic_freeze_min_notional,
+                    inventory_notional=inventory_notional,
+                    threshold_position_notional=threshold_position_notional,
                     current_side_notional=_safe_float(synthetic_frozen_position.get("long_notional")),
                     max_side_notional=synthetic_freeze_max_side_notional,
                     cap_price=max(mid_price, forced_reduce_price),
@@ -1190,6 +1200,8 @@ def build_inventory_grid_orders(
                     lot_plan=lot_plan,
                     loss_ratio_threshold=synthetic_freeze_loss_ratio,
                     min_notional=synthetic_freeze_min_notional,
+                    inventory_notional=inventory_notional,
+                    threshold_position_notional=threshold_position_notional,
                     current_side_notional=_safe_float(synthetic_frozen_position.get("short_notional")),
                     max_side_notional=synthetic_freeze_max_side_notional,
                     cap_price=max(mid_price, forced_reduce_price),
