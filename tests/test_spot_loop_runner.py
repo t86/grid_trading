@@ -1404,7 +1404,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(sell_orders[0]["price"], 111.0, places=8)
         self.assertAlmostEqual(sell_orders[0]["qty"], 0.9, places=8)
 
-    def test_synthetic_neutral_keeps_cost_unknown_when_recovery_lacks_trade_history(self) -> None:
+    def test_synthetic_neutral_resumes_with_unknown_cost_surplus_below_threshold(self) -> None:
         state = {
             "strategy_mode": "spot_competition_synthetic_neutral_grid",
             "known_orders": {},
@@ -1439,12 +1439,16 @@ class SpotLoopRunnerTests(unittest.TestCase):
         )
 
         cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
-        self.assertEqual(desired_orders, [])
-        self.assertEqual(cached_runtime["position_lots"], [])
-        self.assertEqual(cached_runtime["recovery_mode"], "conservative_reduce_only")
-        self.assertIn("missing_strategy_trade_history", cached_runtime["recovery_errors"])
+        roles = {str(order.get("role")) for order in desired_orders}
+        self.assertIn("grid_exit", roles)
+        self.assertIn("grid_entry", roles)
+        self.assertEqual(cached_runtime["direction_state"], "long_active")
+        self.assertEqual(cached_runtime["recovery_mode"], "live")
+        self.assertEqual(cached_runtime["position_lots"][0]["source_role"], "synthetic_recovery")
+        self.assertEqual(cached_runtime["recovery_errors"], [])
         self.assertTrue(controls["synthetic_cost_unknown"])
-        self.assertEqual(controls["recovery_mode"], "conservative_reduce_only")
+        self.assertEqual(controls["recovery_mode"], "live")
+        self.assertAlmostEqual(controls["synthetic_frozen_long_qty"], 0.0, places=6)
 
     def test_synthetic_neutral_freezes_unknown_cost_surplus_when_recovery_lacks_trade_history(self) -> None:
         state = {
@@ -1493,7 +1497,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(controls["synthetic_frozen_long_qty"], 7355.7, places=6)
         self.assertTrue(controls["synthetic_cost_unknown"])
 
-    def test_synthetic_neutral_treats_cached_synthetic_recovered_lot_as_cost_unknown(self) -> None:
+    def test_synthetic_neutral_resumes_cached_synthetic_recovered_lot_below_threshold(self) -> None:
         state = {
             "strategy_mode": "spot_competition_synthetic_neutral_grid",
             "known_orders": {},
@@ -1522,7 +1526,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
             },
         }
 
-        _, controls = _build_spot_competition_inventory_grid_orders(
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
             state=state,
             trades=[],
             bid_price=0.1886,
@@ -1550,10 +1554,14 @@ class SpotLoopRunnerTests(unittest.TestCase):
         )
 
         cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
-        self.assertEqual(cached_runtime["position_lots"], [])
-        self.assertEqual(cached_runtime["recovery_mode"], "conservative_reduce_only")
-        self.assertIn("synthetic_recovered_cost_unknown", cached_runtime["recovery_errors"])
+        roles = {str(order.get("role")) for order in desired_orders}
+        self.assertIn("grid_exit", roles)
+        self.assertIn("grid_entry", roles)
+        self.assertEqual(cached_runtime["position_lots"][0]["source_role"], "synthetic_recovery")
+        self.assertEqual(cached_runtime["recovery_mode"], "live")
+        self.assertEqual(cached_runtime["recovery_errors"], [])
         self.assertTrue(controls["synthetic_cost_unknown"])
+        self.assertEqual(controls["recovery_mode"], "live")
 
     def test_build_spot_competition_inventory_grid_orders_supports_multiple_buy_levels(self) -> None:
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(

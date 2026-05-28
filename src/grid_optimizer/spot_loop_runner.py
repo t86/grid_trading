@@ -1977,14 +1977,11 @@ def _build_spot_competition_inventory_grid_orders(
 
         def _handle_unknown_cost_runtime(*, reason: str) -> float:
             threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
-            should_handle = (
-                bool(synthetic_freeze_enabled)
-                and threshold_notional > EPSILON
-                and active_position_qty * mid_price + EPSILON >= threshold_notional
-            )
+            should_handle = bool(synthetic_freeze_enabled) and threshold_notional > EPSILON
             if should_handle:
                 _prepare_unknown_cost_runtime(reason=reason)
-                _maybe_freeze_unknown_cost_runtime()
+                if active_position_qty * mid_price + EPSILON >= threshold_notional:
+                    _maybe_freeze_unknown_cost_runtime()
                 return _active_net_qty_after_freeze()
             runtime["direction_state"] = expected_direction_state
             runtime["risk_state"] = "hard_reduce_only"
