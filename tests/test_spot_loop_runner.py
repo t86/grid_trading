@@ -14,6 +14,7 @@ from grid_optimizer.spot_loop_runner import (
     _auto_flatten_on_runtime_guard,
     _build_parser,
     _build_spot_competition_inventory_grid_orders,
+    _clamp_limit_maker_price_to_book,
     _load_state,
     _normalize_commission_quote,
     _resolve_spot_competition_runtime,
@@ -25,6 +26,28 @@ from grid_optimizer.spot_loop_runner import (
 
 
 class SpotLoopRunnerTests(unittest.TestCase):
+    def test_clamp_limit_maker_price_to_book_keeps_buy_post_only(self) -> None:
+        price = _clamp_limit_maker_price_to_book(
+            side="BUY",
+            price=0.6516,
+            bid_price=0.6507,
+            ask_price=0.6508,
+            tick_size=0.0001,
+        )
+
+        self.assertEqual(price, 0.6507)
+
+    def test_clamp_limit_maker_price_to_book_keeps_sell_post_only(self) -> None:
+        price = _clamp_limit_maker_price_to_book(
+            side="SELL",
+            price=0.6506,
+            bid_price=0.6507,
+            ask_price=0.6508,
+            tick_size=0.0001,
+        )
+
+        self.assertEqual(price, 0.6508)
+
     def test_parser_accepts_spot_competition_inventory_grid(self) -> None:
         args = _build_parser().parse_args(
             [

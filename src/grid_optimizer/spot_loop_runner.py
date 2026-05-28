@@ -2251,6 +2251,25 @@ def _spot_order_meets_exchange_mins(
     return True
 
 
+def _clamp_limit_maker_price_to_book(
+    *,
+    side: str,
+    price: float,
+    bid_price: float,
+    ask_price: float,
+    tick_size: float | None,
+) -> float:
+    normalized_side = str(side or "").upper().strip()
+    safe_price = max(_safe_float(price), 0.0)
+    safe_bid = max(_safe_float(bid_price), 0.0)
+    safe_ask = max(_safe_float(ask_price), 0.0)
+    if normalized_side == "BUY" and safe_ask > EPSILON and safe_price + EPSILON >= safe_ask:
+        return _round_order_price(safe_bid, tick_size, "BUY")
+    if normalized_side == "SELL" and safe_bid > EPSILON and safe_price <= safe_bid + EPSILON:
+        return _round_order_price(safe_ask, tick_size, "SELL")
+    return _round_order_price(safe_price, tick_size, normalized_side)
+
+
 def _synthetic_residual_is_dust(
     *,
     qty: float,
@@ -3184,12 +3203,32 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
     max_single_cycle_new_orders = max(_safe_int(getattr(args, "max_single_cycle_new_orders", 0)), 0)
     min_qty = symbol_info.get("min_qty")
     min_notional = symbol_info.get("min_notional")
+    tick_size = symbol_info.get("tick_size")
     for order in diff["missing_orders"]:
         if max_single_cycle_new_orders > 0 and placed_count >= max_single_cycle_new_orders:
             break
         side = str(order["side"]).upper().strip()
         qty = float(order["qty"])
         price = float(order["price"])
+        try:
+            latest_book_rows = fetch_spot_book_tickers(symbol=symbol)
+            if latest_book_rows:
+                latest_book = latest_book_rows[0]
+                price = _clamp_limit_maker_price_to_book(
+                    side=side,
+                    price=price,
+                    bid_price=_safe_float(latest_book.get("bid_price")),
+                    ask_price=_safe_float(latest_book.get("ask_price")),
+                    tick_size=tick_size,
+                )
+        except Exception:
+            price = _clamp_limit_maker_price_to_book(
+                side=side,
+                price=price,
+                bid_price=bid_price,
+                ask_price=ask_price,
+                tick_size=tick_size,
+            )
         notional = qty * price
         if not _spot_order_meets_exchange_mins(qty=qty, price=price, min_qty=min_qty, min_notional=min_notional):
             skipped_below_exchange_mins.append(f"{side} {price:.8f} x {qty:.8f}")
