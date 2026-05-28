@@ -3493,6 +3493,7 @@ def _transfer_best_quote_volume_to_frozen(
     band_budget_emergency_extra_ratio: float = 0.0,
     band_budget_recover_ratio: float = 0.0,
     band_budget_emergency_active: bool = False,
+    transfer_lots: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     normalized_side = str(side or "").lower().strip()
     ledger = dict(state.get("best_quote_volume_ledger") or {})
@@ -3544,7 +3545,39 @@ def _transfer_best_quote_volume_to_frozen(
                     "blocked_reason": "band_budget_exhausted" if allowed_qty <= 1e-12 else None,
                 }
             )
-    remaining_lots, consumed_lots, _ = _best_quote_volume_consume_fifo(source_lots, allowed_qty)
+    transfer_source_lots = (
+        _normalize_best_quote_volume_lots(transfer_lots)
+        if isinstance(transfer_lots, list)
+        else source_lots
+    )
+    _, consumed_lots, _ = _best_quote_volume_consume_fifo(transfer_source_lots, allowed_qty)
+
+    def _lot_key(lot: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (
+            round(max(_safe_float(lot.get("price", lot.get("entry_price"))), 0.0), 12),
+            str(lot.get("opened_at") or ""),
+            str(lot.get("order_id") or ""),
+            str(lot.get("client_order_id") or ""),
+            str(lot.get("source") or ""),
+        )
+
+    consumed_qty_by_key: dict[tuple[Any, ...], float] = {}
+    for lot in consumed_lots:
+        key = _lot_key(lot)
+        consumed_qty_by_key[key] = consumed_qty_by_key.get(key, 0.0) + max(_safe_float(lot.get("qty")), 0.0)
+
+    remaining_lots = []
+    for lot in source_lots:
+        qty_left = max(_safe_float(lot.get("qty")), 0.0)
+        key = _lot_key(lot)
+        consume_qty = min(qty_left, consumed_qty_by_key.get(key, 0.0))
+        if consume_qty > 1e-12:
+            consumed_qty_by_key[key] = max(consumed_qty_by_key.get(key, 0.0) - consume_qty, 0.0)
+            qty_left -= consume_qty
+        if qty_left > 1e-12:
+            kept_lot = dict(lot)
+            kept_lot["qty"] = qty_left
+            remaining_lots.append(kept_lot)
     transfer_qty = sum(_safe_float(item.get("qty")) for item in consumed_lots)
     now_iso = _utc_now().isoformat()
     frozen_lots = list(frozen.get(source_key) or [])
@@ -3554,7 +3587,7 @@ def _transfer_best_quote_volume_to_frozen(
             "entry_price": _safe_float(item.get("price")),
             "frozen_at": now_iso,
             "reason": reason,
-            "loss_ratio": max(_safe_float(loss_ratio), 0.0),
+            "loss_ratio": max(_safe_float(item.get("freeze_loss_ratio")) or _safe_float(loss_ratio), 0.0),
             "source": "bq_volume_ledger_transfer",
             "source_order_id": item.get("order_id"),
             "source_client_order_id": item.get("client_order_id"),
@@ -4009,6 +4042,35 @@ def _apply_best_quote_reduce_freeze(
     def _side_freeze_threshold(side: str) -> float:
         return long_freeze_threshold if str(side).upper() == "LONG" else short_freeze_threshold
 
+    def _managed_lot_candidates(side: str, side_threshold: float) -> tuple[list[dict[str, Any]], float, float, float]:
+        if not isinstance(bq_ledger_report, dict) or not bool(bq_ledger_report.get("initialized")):
+            return [], 0.0, 0.0, 0.0
+        ledger = dict(state.get("best_quote_volume_ledger") or {})
+        side_key = "long_lots" if str(side).upper() == "LONG" else "short_lots"
+        candidates: list[dict[str, Any]] = []
+        total_qty = 0.0
+        total_notional = 0.0
+        max_loss_ratio = 0.0
+        for raw_lot in _normalize_best_quote_volume_lots(ledger.get(side_key)):
+            qty = max(_safe_float(raw_lot.get("qty")), 0.0)
+            price = max(_safe_float(raw_lot.get("price", raw_lot.get("entry_price"))), 0.0)
+            if qty <= 1e-12 or price <= 0:
+                continue
+            if str(side).upper() == "LONG":
+                loss_ratio = max((price - _safe_float(mid_price)) / price, 0.0)
+            else:
+                loss_ratio = max((_safe_float(mid_price) - price) / price, 0.0)
+            notional = qty * _safe_float(mid_price)
+            if loss_ratio < side_threshold or notional <= 1e-12:
+                continue
+            lot = dict(raw_lot)
+            lot["freeze_loss_ratio"] = loss_ratio
+            candidates.append(lot)
+            total_qty += qty
+            total_notional += notional
+            max_loss_ratio = max(max_loss_ratio, loss_ratio)
+        return candidates, total_qty, total_notional, max_loss_ratio
+
     def _record_protected(side: str, qty: float, loss_ratio: float, notional: float, reduce_planned: bool) -> None:
         if not hard_freeze_enabled:
             return
@@ -4069,8 +4131,24 @@ def _apply_best_quote_reduce_freeze(
         }
         return count >= needed
 
-    _record_protected("LONG", managed_long_qty, long_loss_ratio, managed_long_notional, reduce_long_planned)
-    _record_protected("SHORT", managed_short_qty, short_loss_ratio, managed_short_notional, reduce_short_planned)
+    long_candidate_lots, long_candidate_qty, long_candidate_notional, long_candidate_loss_ratio = _managed_lot_candidates(
+        "LONG",
+        long_freeze_threshold,
+    )
+    short_candidate_lots, short_candidate_qty, short_candidate_notional, short_candidate_loss_ratio = _managed_lot_candidates(
+        "SHORT",
+        short_freeze_threshold,
+    )
+    use_lot_candidates = isinstance(bq_ledger_report, dict) and bool(bq_ledger_report.get("initialized"))
+    long_confirm_qty = long_candidate_qty if use_lot_candidates else managed_long_qty
+    long_confirm_notional = long_candidate_notional if use_lot_candidates else managed_long_notional
+    long_confirm_loss_ratio = long_candidate_loss_ratio if use_lot_candidates else long_loss_ratio
+    short_confirm_qty = short_candidate_qty if use_lot_candidates else managed_short_qty
+    short_confirm_notional = short_candidate_notional if use_lot_candidates else managed_short_notional
+    short_confirm_loss_ratio = short_candidate_loss_ratio if use_lot_candidates else short_loss_ratio
+
+    _record_protected("LONG", long_confirm_qty, long_confirm_loss_ratio, long_confirm_notional, reduce_long_planned)
+    _record_protected("SHORT", short_confirm_qty, short_confirm_loss_ratio, short_confirm_notional, reduce_short_planned)
     def _band_budget_emergency_active(side_loss_ratio: float, side_notional: float) -> bool:
         if not hard_freeze_enabled:
             return False
@@ -4084,20 +4162,21 @@ def _apply_best_quote_reduce_freeze(
         )
         return bool(loss_trigger or notional_trigger)
 
-    if _confirmed("LONG", managed_long_qty, long_loss_ratio, managed_long_notional, reduce_long_planned):
+    if _confirmed("LONG", long_confirm_qty, long_confirm_loss_ratio, long_confirm_notional, reduce_long_planned):
         transfer = _transfer_best_quote_volume_to_frozen(
             state=state,
             side="long",
-            qty=managed_long_qty,
+            qty=long_confirm_qty,
             reason=freeze_reason,
-            loss_ratio=long_loss_ratio,
+            loss_ratio=long_confirm_loss_ratio,
             mid_price=mid_price,
             band_budget_enabled=band_budget_enabled,
             band_budget_price_ratio=band_budget_price_ratio,
             band_budget_base_notional=band_budget_base_notional,
             band_budget_emergency_extra_ratio=band_budget_emergency_extra_ratio,
             band_budget_recover_ratio=band_budget_recover_ratio,
-            band_budget_emergency_active=_band_budget_emergency_active(long_loss_ratio, managed_long_notional),
+            band_budget_emergency_active=_band_budget_emergency_active(long_confirm_loss_ratio, long_confirm_notional),
+            transfer_lots=long_candidate_lots if use_lot_candidates else None,
         )
         band_budget_report["long"] = dict(transfer.get("band_budget") or {})
         if _safe_float(transfer.get("transferred_qty")) > 1e-12 or not bool(band_budget_enabled):
@@ -4105,34 +4184,35 @@ def _apply_best_quote_reduce_freeze(
                 {
                     "side": "LONG",
                     "reason": freeze_reason,
-                    "loss_ratio": long_loss_ratio,
+                    "loss_ratio": long_confirm_loss_ratio,
                     "effective_threshold_loss_ratio": effective_threshold,
                     "freeze_threshold_loss_ratio": long_freeze_threshold,
                     "confirm_cycles": freeze_confirm_cycles,
                     "hard_freeze_enabled": bool(hard_freeze_enabled),
                     "stress_active": bool(stress_active),
                     "qty": _safe_float(transfer.get("transferred_qty")),
-                    "requested_qty": managed_long_qty,
+                    "requested_qty": long_confirm_qty,
                     "shortfall_qty": _safe_float(transfer.get("shortfall_qty")),
                     "notional": _safe_float(transfer.get("transferred_qty")) * _safe_float(mid_price),
                     "transfer": transfer,
                 }
             )
         confirmations.pop("long", None)
-    if _confirmed("SHORT", managed_short_qty, short_loss_ratio, managed_short_notional, reduce_short_planned):
+    if _confirmed("SHORT", short_confirm_qty, short_confirm_loss_ratio, short_confirm_notional, reduce_short_planned):
         transfer = _transfer_best_quote_volume_to_frozen(
             state=state,
             side="short",
-            qty=managed_short_qty,
+            qty=short_confirm_qty,
             reason=freeze_reason,
-            loss_ratio=short_loss_ratio,
+            loss_ratio=short_confirm_loss_ratio,
             mid_price=mid_price,
             band_budget_enabled=band_budget_enabled,
             band_budget_price_ratio=band_budget_price_ratio,
             band_budget_base_notional=band_budget_base_notional,
             band_budget_emergency_extra_ratio=band_budget_emergency_extra_ratio,
             band_budget_recover_ratio=band_budget_recover_ratio,
-            band_budget_emergency_active=_band_budget_emergency_active(short_loss_ratio, managed_short_notional),
+            band_budget_emergency_active=_band_budget_emergency_active(short_confirm_loss_ratio, short_confirm_notional),
+            transfer_lots=short_candidate_lots if use_lot_candidates else None,
         )
         band_budget_report["short"] = dict(transfer.get("band_budget") or {})
         if _safe_float(transfer.get("transferred_qty")) > 1e-12 or not bool(band_budget_enabled):
@@ -4140,14 +4220,14 @@ def _apply_best_quote_reduce_freeze(
                 {
                     "side": "SHORT",
                     "reason": freeze_reason,
-                    "loss_ratio": short_loss_ratio,
+                    "loss_ratio": short_confirm_loss_ratio,
                     "effective_threshold_loss_ratio": effective_threshold,
                     "freeze_threshold_loss_ratio": short_freeze_threshold,
                     "confirm_cycles": freeze_confirm_cycles,
                     "hard_freeze_enabled": bool(hard_freeze_enabled),
                     "stress_active": bool(stress_active),
                     "qty": _safe_float(transfer.get("transferred_qty")),
-                    "requested_qty": managed_short_qty,
+                    "requested_qty": short_confirm_qty,
                     "shortfall_qty": _safe_float(transfer.get("shortfall_qty")),
                     "notional": _safe_float(transfer.get("transferred_qty")) * _safe_float(mid_price),
                     "transfer": transfer,

@@ -1704,7 +1704,119 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(len(ledger["long_lots"]), 2)
         self.assertEqual(ledger["long_lots"][0]["qty"], 100.0)
         self.assertEqual(ledger["long_lots"][1]["qty"], 50.0)
+
+    def test_best_quote_reduce_freeze_uses_lot_loss_not_aggregate_average(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_volume_ledger": {
+                "short_lots": [
+                    {"qty": 1000.0, "price": 1.0},
+                    {"qty": 100.0, "price": 0.95},
+                ],
+                "initialized": True,
+            },
+        }
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=0.0,
+            current_short_qty=1100.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.9954545454545455,
+            mid_price=0.965,
+            bq_ledger_report={
+                "initialized": True,
+                "short_qty": 1100.0,
+                "short_avg_price": 0.9954545454545455,
+                "short_unrealized_pnl": 33.5,
+            },
+        )
+
+        report = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [], "buy_orders": [{"role": "best_quote_reduce_short"}]},
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=50.0,
+            current_long_qty=0.0,
+            current_short_qty=1100.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.9954545454545455,
+            mid_price=0.965,
+            bq_ledger_report={
+                "initialized": True,
+                "short_qty": 1100.0,
+                "short_avg_price": 0.9954545454545455,
+                "short_unrealized_pnl": 33.5,
+            },
+        )
+
+        self.assertTrue(report["applied"])
+        ledger = state["best_quote_volume_ledger"]
+        frozen = state["best_quote_frozen_inventory"]
+        self.assertEqual(ledger["short_lots"], [{"qty": 1000.0, "price": 1.0}])
+        self.assertEqual(frozen["short_qty"], 100.0)
+        self.assertAlmostEqual(frozen["short_lots"][0]["entry_price"], 0.95)
+        self.assertAlmostEqual(frozen["short_lots"][0]["loss_ratio"], 0.015789473684210575)
         self.assertEqual(report["managed_long_qty"], 0.0)
+
+    def test_best_quote_reduce_freeze_evaluates_new_lot_independently_with_existing_frozen_lots(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [{"qty": 1000.0, "entry_price": 1.20}],
+            },
+            "best_quote_volume_ledger": {
+                "long_lots": [
+                    {"qty": 1000.0, "price": 1.0},
+                    {"qty": 100.0, "price": 1.20},
+                ],
+                "initialized": True,
+            },
+        }
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=2100.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.0952380952380953,
+            current_short_avg_price=0.0,
+            mid_price=1.18,
+            bq_ledger_report={
+                "initialized": True,
+                "long_qty": 1100.0,
+                "long_avg_price": 1.018181818181818,
+                "long_unrealized_pnl": 178.0,
+            },
+        )
+
+        report = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [{"role": "best_quote_reduce_long"}], "buy_orders": []},
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=50.0,
+            current_long_qty=2100.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.0952380952380953,
+            current_short_avg_price=0.0,
+            mid_price=1.18,
+            bq_ledger_report={
+                "initialized": True,
+                "long_qty": 1100.0,
+                "long_avg_price": 1.018181818181818,
+                "long_unrealized_pnl": 178.0,
+            },
+        )
+
+        self.assertTrue(report["applied"])
+        ledger = state["best_quote_volume_ledger"]
+        frozen = state["best_quote_frozen_inventory"]
+        self.assertEqual(ledger["long_lots"], [{"qty": 1000.0, "price": 1.0}])
+        self.assertEqual(frozen["long_qty"], 1100.0)
+        self.assertEqual(len(frozen["long_lots"]), 2)
+        self.assertEqual(frozen["long_lots"][0]["qty"], 1000.0)
+        self.assertEqual(frozen["long_lots"][1]["qty"], 100.0)
+        self.assertAlmostEqual(frozen["long_lots"][1]["entry_price"], 1.20)
+        self.assertAlmostEqual(frozen["long_lots"][1]["loss_ratio"], 0.016666666666666684)
 
     def test_best_quote_reduce_freeze_reports_frozen_side_offset(self) -> None:
         state: dict[str, object] = {
