@@ -14285,11 +14285,6 @@ def _validate_best_quote_frozen_inventory_principles(args: argparse.Namespace) -
             "--best-quote-maker-volume-reduce-freeze-enabled is active"
         )
     if bool(getattr(args, "best_quote_maker_volume_frozen_pair_release_enabled", False)):
-        if bool(getattr(args, "best_quote_maker_volume_frozen_pair_release_allow_loss", False)):
-            raise SystemExit(
-                "--best-quote-maker-volume-frozen-pair-release-allow-loss cannot be enabled; "
-                "frozen inventory may exit only by profitable pair release or explicit manual cleanup"
-            )
         if _safe_float(getattr(args, "best_quote_maker_volume_frozen_pair_release_min_profit_ratio", 0.0)) <= 0:
             raise SystemExit(
                 "--best-quote-maker-volume-frozen-pair-release-min-profit-ratio must be > 0 "

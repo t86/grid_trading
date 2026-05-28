@@ -13808,6 +13808,19 @@ class LoopRunnerTests(unittest.TestCase):
 
         _validate_best_quote_frozen_inventory_principles(args)
 
+    def test_best_quote_frozen_inventory_principles_allow_loss_pair_release(self) -> None:
+        args = Namespace(
+            best_quote_maker_volume_reduce_freeze_enabled=True,
+            best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled=False,
+            best_quote_maker_volume_allow_loss_reduce_only=False,
+            best_quote_maker_volume_take_profit_guard_enabled=True,
+            best_quote_maker_volume_frozen_pair_release_enabled=True,
+            best_quote_maker_volume_frozen_pair_release_allow_loss=True,
+            best_quote_maker_volume_frozen_pair_release_min_profit_ratio=0.00008,
+        )
+
+        _validate_best_quote_frozen_inventory_principles(args)
+
     def test_best_quote_frozen_inventory_principles_reject_side_dynamic_threshold(self) -> None:
         args = Namespace(
             best_quote_maker_volume_reduce_freeze_enabled=True,
@@ -13835,7 +13848,6 @@ class LoopRunnerTests(unittest.TestCase):
         cases = (
             {"best_quote_maker_volume_allow_loss_reduce_only": True},
             {"best_quote_maker_volume_take_profit_guard_enabled": False},
-            {"best_quote_maker_volume_frozen_pair_release_allow_loss": True},
             {"best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.0},
         )
 
