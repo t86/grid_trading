@@ -1959,7 +1959,11 @@ def _build_spot_competition_inventory_grid_orders(
 
         def _handle_unknown_cost_runtime(*, reason: str) -> float:
             threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
-            should_handle = bool(synthetic_freeze_enabled) and threshold_notional > EPSILON
+            reduce_target_notional = max(_safe_float(threshold_reduce_target_notional), 0.0)
+            should_handle = (
+                threshold_notional > EPSILON
+                and (bool(synthetic_freeze_enabled) or reduce_target_notional > EPSILON)
+            )
             if should_handle:
                 _prepare_unknown_cost_runtime(reason=reason)
                 return active_net_qty

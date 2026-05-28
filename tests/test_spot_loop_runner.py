@@ -478,9 +478,15 @@ class SpotLoopRunnerTests(unittest.TestCase):
             actual_base_qty=1450.0,
         )
 
-        self.assertEqual(desired_orders, [])
+        self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY"])
+        self.assertIn("grid_exit", {str(order.get("role")) for order in desired_orders})
+        self.assertIn("forced_reduce", {str(order.get("role")) for order in desired_orders})
         self.assertEqual(controls["direction_state"], "short_active")
-        self.assertEqual(controls["risk_state"], "hard_reduce_only")
+        self.assertEqual(controls["risk_state"], "threshold_reduce_only")
+        cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
+        self.assertEqual(cached_runtime["position_lots"][0]["source_role"], "synthetic_recovery")
+        self.assertEqual(cached_runtime["recovery_mode"], "live")
+        self.assertTrue(controls["synthetic_cost_unknown"])
 
     def test_slow_trend_step_guard_widens_synthetic_neutral_ladder(self) -> None:
         now = datetime(2026, 5, 15, 6, 15, tzinfo=timezone.utc)
