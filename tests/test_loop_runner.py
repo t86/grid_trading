@@ -2659,6 +2659,21 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(directive["requested_qty"], 100.0)
 
+    def test_best_quote_frozen_pair_release_auto_directive_rounds_requested_qty_to_step_size(self) -> None:
+        directive = _build_best_quote_frozen_pair_release_auto_directive(
+            report={
+                "frozen_pair_eligible_long_qty": 1000.0,
+                "frozen_pair_eligible_short_qty": 1000.0,
+            },
+            mid_price=0.1859,
+            max_notional=120.0,
+            step_size=1.0,
+            min_qty=1.0,
+            now=datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(directive["requested_qty"], 645.0)
+
     def test_best_quote_frozen_pair_release_places_paired_ioc_when_stable_and_profitable(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {

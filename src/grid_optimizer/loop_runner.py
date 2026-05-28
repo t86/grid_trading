@@ -4545,6 +4545,8 @@ def _build_best_quote_frozen_pair_release_auto_directive(
     report: Mapping[str, Any] | dict[str, Any],
     mid_price: float,
     max_notional: float,
+    step_size: float | None = None,
+    min_qty: float | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     safe_mid = max(_safe_float(mid_price), 0.0)
@@ -4563,7 +4565,9 @@ def _build_best_quote_frozen_pair_release_auto_directive(
     requested_qty = offset_qty
     if safe_max_notional > 0:
         requested_qty = min(requested_qty, safe_max_notional / safe_mid)
-    if requested_qty <= 1e-12:
+    requested_qty = _round_order_qty(requested_qty, step_size)
+    safe_min_qty = max(_safe_float(min_qty), 0.0) if min_qty is not None else 0.0
+    if requested_qty <= 1e-12 or (safe_min_qty > 0 and requested_qty + 1e-12 < safe_min_qty):
         return {}
     checked_at = (now or _utc_now()).astimezone(timezone.utc)
     return {
@@ -18156,6 +18160,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 report=best_quote_reduce_freeze,
                 mid_price=mid_price,
                 max_notional=best_quote_frozen_pair_release_max_notional,
+                step_size=symbol_info.get("step_size"),
+                min_qty=symbol_info.get("min_qty"),
             )
             if auto_directive:
                 best_quote_frozen_pair_release_directive = auto_directive
