@@ -303,7 +303,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(controls["current_short_notional"], 0.0)
         self.assertAlmostEqual(controls["max_short_position_notional"], 80.0)
 
-    def test_build_spot_competition_synthetic_neutral_grid_excludes_frozen_short_from_brushing_net(self) -> None:
+    def test_build_spot_competition_synthetic_neutral_grid_ignores_frozen_short_for_spot(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="futures")
         runtime["synthetic_neutral"] = True
         runtime["direction_state"] = "short_active"
@@ -365,14 +365,17 @@ class SpotLoopRunnerTests(unittest.TestCase):
             synthetic_freeze_release_profit_ratio=0.01,
         )
 
-        self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY", "SELL", "SELL"])
-        self.assertEqual(controls["direction_state"], "flat")
-        self.assertAlmostEqual(controls["synthetic_net_qty"], 0.0)
-        self.assertAlmostEqual(controls["current_short_notional"], 0.0)
-        self.assertAlmostEqual(controls["synthetic_frozen_short_qty"], 3000.0)
+        self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY"])
+        self.assertEqual([order["role"] for order in desired_orders], ["grid_exit", "forced_reduce"])
+        self.assertEqual(controls["direction_state"], "short_active")
+        self.assertEqual(controls["recovery_mode"], "live")
+        self.assertAlmostEqual(controls["synthetic_net_qty"], -3000.0)
+        self.assertGreater(controls["current_short_notional"], 0.0)
+        self.assertFalse(controls["synthetic_freeze_enabled"])
+        self.assertAlmostEqual(controls["synthetic_frozen_short_qty"], 0.0)
         cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
-        self.assertEqual(cached_runtime["position_lots"], [])
-        self.assertAlmostEqual(cached_runtime["frozen_position_lots"][0]["qty"], 3000.0)
+        self.assertAlmostEqual(cached_runtime["position_lots"][0]["qty"], 3000.0)
+        self.assertEqual(cached_runtime["frozen_position_lots"], [])
 
     def test_build_spot_competition_synthetic_neutral_grid_honors_zero_side_levels(self) -> None:
         desired_orders, _ = _build_spot_competition_inventory_grid_orders(
@@ -736,7 +739,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertTrue(controls["synthetic_cost_unknown"])
         self.assertEqual(controls["recovery_mode"], "conservative_reduce_only")
 
-    def test_build_spot_competition_synthetic_neutral_grid_persists_frozen_reduce_lots(self) -> None:
+    def test_build_spot_competition_synthetic_neutral_grid_reduces_instead_of_freezing_lots(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="futures")
         runtime["synthetic_neutral"] = True
         runtime["direction_state"] = "long_active"
@@ -790,11 +793,12 @@ class SpotLoopRunnerTests(unittest.TestCase):
             synthetic_freeze_min_notional=5.0,
         )
 
-        self.assertFalse(any(order["role"] == "forced_reduce" for order in desired_orders))
+        self.assertTrue(any(order["role"] == "forced_reduce" for order in desired_orders))
         cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
-        self.assertGreater(cached_runtime["frozen_position_lots"][0]["qty"], 0.0)
-        self.assertGreater(controls["synthetic_frozen_position"]["long_qty"], 0.0)
-        self.assertGreater(controls["synthetic_freeze_last"]["freeze_qty"], 0.0)
+        self.assertEqual(cached_runtime["frozen_position_lots"], [])
+        self.assertAlmostEqual(controls["synthetic_frozen_position"]["long_qty"], 0.0)
+        self.assertAlmostEqual(controls["synthetic_frozen_position"]["short_qty"], 0.0)
+        self.assertEqual(controls["synthetic_freeze_last"], {})
 
     def test_synthetic_neutral_runtime_tolerates_frozen_fill_float_dust(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="futures")
@@ -921,7 +925,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
         self.assertEqual(cached_runtime["recovery_mode"], "live")
         self.assertEqual(controls["recovery_mode"], "live")
-        self.assertAlmostEqual(cached_runtime["frozen_position_lots"][0]["qty"], 3841.22908)
+        self.assertEqual(cached_runtime["frozen_position_lots"], [])
 
     def test_synthetic_neutral_active_lot_tolerates_residual_dust_after_fill(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="futures")
@@ -1106,13 +1110,9 @@ class SpotLoopRunnerTests(unittest.TestCase):
 
         self.assertTrue(any(order["role"] == "forced_reduce" for order in desired_orders))
         cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
-        frozen_qty = sum(
-            item["qty"]
-            for item in cached_runtime["frozen_position_lots"]
-            if item["side"] == "long"
-        )
-        self.assertLessEqual(frozen_qty * 0.08, 1000.0)
-        self.assertAlmostEqual(controls["synthetic_freeze_last"]["freeze_notional"], 100.0, places=4)
+        self.assertEqual(cached_runtime["frozen_position_lots"], [])
+        self.assertEqual(controls["synthetic_freeze_last"], {})
+        self.assertAlmostEqual(controls["synthetic_frozen_long_qty"], 0.0)
 
     def test_build_spot_competition_synthetic_neutral_grid_pairs_opposite_frozen_lots(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="futures")
@@ -1177,23 +1177,13 @@ class SpotLoopRunnerTests(unittest.TestCase):
             synthetic_freeze_release_profit_ratio=0.01,
         )
 
-        self.assertEqual(
-            [order["role"] for order in desired_orders],
-            [
-                "bootstrap_entry",
-                "grid_entry",
-                "grid_entry",
-                "bootstrap_entry",
-                "grid_entry",
-                "grid_entry",
-            ],
-        )
+        self.assertEqual([order["role"] for order in desired_orders], ["grid_entry", "grid_entry", "grid_entry", "grid_exit"])
         self.assertNotIn("synthetic_frozen_release", [order["role"] for order in desired_orders])
         cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
-        self.assertEqual(cached_runtime["frozen_position_lots"][0]["side"], "long")
-        self.assertAlmostEqual(cached_runtime["frozen_position_lots"][0]["qty"], 400.0)
-        self.assertAlmostEqual(controls["synthetic_pair_release_last"]["release_qty"], 600.0)
-        self.assertAlmostEqual(controls["synthetic_frozen_position"]["pair_eligible_qty"], 0.0)
+        self.assertEqual(cached_runtime["frozen_position_lots"], [])
+        self.assertEqual(controls["synthetic_pair_release_last"], {})
+        self.assertAlmostEqual(controls["synthetic_frozen_position"]["long_qty"], 0.0)
+        self.assertAlmostEqual(controls["synthetic_frozen_position"]["short_qty"], 0.0)
 
     def test_build_spot_competition_inventory_grid_orders_ignores_unrelated_trades_when_flat(self) -> None:
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(
@@ -1575,13 +1565,13 @@ class SpotLoopRunnerTests(unittest.TestCase):
 
         cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
         roles = {str(order.get("role")) for order in desired_orders}
-        self.assertIn("grid_exit", roles)
+        self.assertIn("bootstrap_entry", roles)
         self.assertIn("grid_entry", roles)
-        self.assertEqual(cached_runtime["direction_state"], "long_active")
+        self.assertEqual(cached_runtime["direction_state"], "flat")
         self.assertEqual(cached_runtime["recovery_mode"], "live")
-        self.assertEqual(cached_runtime["position_lots"][0]["source_role"], "synthetic_recovery")
+        self.assertEqual(cached_runtime["position_lots"], [])
         self.assertEqual(cached_runtime["recovery_errors"], [])
-        self.assertTrue(controls["synthetic_cost_unknown"])
+        self.assertFalse(controls["synthetic_cost_unknown"])
         self.assertEqual(controls["recovery_mode"], "live")
         self.assertAlmostEqual(controls["synthetic_frozen_long_qty"], 0.0, places=6)
 

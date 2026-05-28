@@ -1821,6 +1821,13 @@ def _build_spot_competition_inventory_grid_orders(
     synthetic_freeze_manual_release_price: float = 0.0,
     now: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if synthetic_neutral:
+        synthetic_freeze_enabled = False
+        synthetic_freeze_pair_release_enabled = False
+        synthetic_freeze_manual_release_side = None
+        synthetic_freeze_manual_release_qty = 0.0
+        synthetic_freeze_manual_release_price = 0.0
+
     known_orders = state.get("known_orders")
     order_refs = known_orders if isinstance(known_orders, dict) else {}
     inventory_lots = state.get("inventory_lots")
@@ -1863,6 +1870,7 @@ def _build_spot_competition_inventory_grid_orders(
     if synthetic_neutral:
         runtime["synthetic_neutral"] = True
         runtime["neutral_base_qty"] = neutral_qty
+        runtime["frozen_position_lots"] = []
 
     def _isolate_synthetic_frozen_exposure() -> float:
         if not synthetic_neutral:
