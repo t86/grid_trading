@@ -1893,11 +1893,15 @@ def _build_spot_competition_inventory_grid_orders(
             runtime["recovery_errors"] = []
             runtime.pop("synthetic_cost_unknown", None)
             return 0.0
-        reduce_target_qty = 0.0
-        reduce_target_notional = max(_safe_float(threshold_reduce_target_notional), 0.0)
-        if reduce_target_notional > EPSILON and mid_price > EPSILON:
-            reduce_target_qty = reduce_target_notional / mid_price
-        near_flat_qty = max(position_qty_tolerance, reduce_target_qty)
+        resume_target_qty = 0.0
+        resume_target_notional = max(
+            _safe_float(threshold_position_notional),
+            _safe_float(threshold_reduce_target_notional),
+            0.0,
+        )
+        if resume_target_notional > EPSILON and mid_price > EPSILON:
+            resume_target_qty = resume_target_notional / mid_price
+        near_flat_qty = max(position_qty_tolerance, resume_target_qty)
         stale_active_without_lots = (
             active_lot_qty <= EPSILON
             and (

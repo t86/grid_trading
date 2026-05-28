@@ -380,7 +380,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
 
         self.assertEqual({order["side"] for order in desired_orders}, {"SELL"})
 
-    def test_synthetic_neutral_below_reduce_target_resumes_flat_ladder(self) -> None:
+    def test_synthetic_neutral_stale_recovery_below_soft_threshold_resumes_flat_ladder(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="futures")
         runtime["synthetic_neutral"] = True
         runtime["direction_state"] = "short_active"
@@ -434,6 +434,53 @@ class SpotLoopRunnerTests(unittest.TestCase):
         cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
         self.assertEqual(cached_runtime["direction_state"], "flat")
         self.assertEqual(cached_runtime["position_lots"], [])
+
+    def test_synthetic_neutral_stale_recovery_above_soft_threshold_stays_defensive(self) -> None:
+        runtime = new_inventory_grid_runtime(market_type="futures")
+        runtime["synthetic_neutral"] = True
+        runtime["direction_state"] = "short_active"
+        runtime["grid_anchor_price"] = 0.6736
+        runtime["risk_state"] = "hard_reduce_only"
+        runtime["recovery_mode"] = "conservative_reduce_only"
+        runtime["recovery_errors"] = ["position_qty_mismatch"]
+        runtime["position_lots"] = []
+        state = {
+            "known_orders": {},
+            "spot_competition_synthetic_neutral_grid_runtime_cache": {
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "market_type": "futures",
+                "runtime": runtime,
+                "applied_trade_keys": [],
+            },
+        }
+
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state=state,
+            trades=[],
+            bid_price=0.6507,
+            ask_price=0.6508,
+            step_price=0.001,
+            buy_levels=1,
+            sell_levels=1,
+            first_order_multiplier=1.0,
+            per_order_notional=40.0,
+            threshold_position_notional=120.0,
+            threshold_reduce_target_notional=40.0,
+            max_order_position_notional=300.0,
+            max_position_notional=360.0,
+            tick_size=0.0001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=1650.1,
+            max_short_position_notional=180.0,
+            actual_base_qty=1450.0,
+        )
+
+        self.assertEqual(desired_orders, [])
+        self.assertEqual(controls["direction_state"], "short_active")
+        self.assertEqual(controls["risk_state"], "hard_reduce_only")
 
     def test_slow_trend_step_guard_widens_synthetic_neutral_ladder(self) -> None:
         now = datetime(2026, 5, 15, 6, 15, tzinfo=timezone.utc)
