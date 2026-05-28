@@ -2493,6 +2493,75 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(state["best_quote_frozen_inventory"]["long_manual_limit_price"], 1.02)
         self.assertEqual(state["best_quote_frozen_inventory"]["long_manual_limit_request_id"], "req-limit")
 
+    def test_best_quote_frozen_inventory_manual_limit_does_not_reissue_after_submit(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "best_quote_frozen_inventory": {
+                            "long_qty": 50.0,
+                            "long_entry_price": 1.0,
+                            "long_manual_limit_isolated_qty": 12.0,
+                            "long_manual_limit_price": 1.02,
+                            "long_manual_limit_request_id": "req-limit",
+                        },
+                        "best_quote_frozen_inventory_manual_limit": {
+                            "long": {
+                                "requested": True,
+                                "requested_qty": 12.0,
+                                "price": 1.02,
+                                "request_id": "req-limit",
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            update_best_quote_volume_order_refs(
+                state_path=state_path,
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                submit_report={
+                    "placed_orders": [
+                        {
+                            "request": {
+                                "role": "frozen_inventory_manual_limit_long",
+                                "side": "SELL",
+                                "position_side": "LONG",
+                                "qty": 12.0,
+                                "submitted_price": 1.02,
+                                "frozen_inventory_request_id": "req-limit",
+                            },
+                            "response": {"orderId": 123, "clientOrderId": "gx-opgu-frozenin-1"},
+                        }
+                    ]
+                },
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        directive = state["best_quote_frozen_inventory_manual_limit"]["long"]
+        self.assertFalse(directive["requested"])
+        self.assertTrue(directive["submitted"])
+        self.assertEqual(directive["submitted_order_id"], "123")
+        self.assertEqual(state["best_quote_volume_order_refs"]["123"]["frozen_inventory_request_id"], "req-limit")
+
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+        report = apply_best_quote_frozen_inventory_manual_limit(
+            plan=plan,
+            state=state,
+            bid_price=1.01,
+            ask_price=1.011,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(plan["sell_orders"], [])
+
     def test_best_quote_frozen_inventory_manual_limit_places_only_new_requested_qty(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {

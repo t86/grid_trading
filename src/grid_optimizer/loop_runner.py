@@ -7120,6 +7120,10 @@ def update_best_quote_volume_order_refs(
     pair_release_submitted_orders: list[dict[str, Any]] = []
     pair_release_long_qty = 0.0
     pair_release_short_qty = 0.0
+    manual_limit_directive = state.get("best_quote_frozen_inventory_manual_limit")
+    manual_limit_directive = dict(manual_limit_directive) if isinstance(manual_limit_directive, Mapping) else {}
+    manual_limit_updated = False
+    now_iso = _isoformat(_utc_now())
 
     for item in submit_report.get("placed_orders", []):
         if not isinstance(item, dict):
@@ -7130,18 +7134,35 @@ def update_best_quote_volume_order_refs(
         if order_id <= 0:
             continue
         role = str(request.get("role", "")).strip()
+        role_lower = role.lower()
         frozen_request_id = str(request.get("frozen_inventory_request_id") or "").strip()
-        if not frozen_request_id and role.lower().startswith("frozen_inventory_pair_release_"):
+        if not frozen_request_id and role_lower.startswith("frozen_inventory_pair_release_"):
             frozen_request_id = pair_release_request_id
         if _is_frozen_inventory_pair_release_order(request):
             submitted_order = dict(request)
             if frozen_request_id:
                 submitted_order["frozen_inventory_request_id"] = frozen_request_id
             pair_release_submitted_orders.append(submitted_order)
-            if role.lower() == "frozen_inventory_pair_release_long":
+            if role_lower == "frozen_inventory_pair_release_long":
                 pair_release_long_qty += max(_safe_float(request.get("qty")), 0.0)
-            elif role.lower() == "frozen_inventory_pair_release_short":
+            elif role_lower == "frozen_inventory_pair_release_short":
                 pair_release_short_qty += max(_safe_float(request.get("qty")), 0.0)
+        if role_lower in {"frozen_inventory_manual_limit_long", "frozen_inventory_manual_limit_short"}:
+            side_key = "long" if role_lower.endswith("_long") else "short"
+            side_directive = dict(manual_limit_directive.get(side_key) or {})
+            if side_directive:
+                side_directive["requested"] = False
+                side_directive["submitted"] = True
+                side_directive["submitted_order_id"] = str(order_id)
+                side_directive["submitted_client_order_id"] = str(response.get("clientOrderId", "")).strip()
+                side_directive["submitted_qty"] = max(_safe_float(request.get("qty")), 0.0)
+                side_directive["submitted_price"] = max(
+                    _safe_float(request.get("submitted_price", request.get("price"))),
+                    0.0,
+                )
+                side_directive["submitted_at"] = now_iso
+                manual_limit_directive[side_key] = side_directive
+                manual_limit_updated = True
         refs[str(order_id)] = {
             "book": _best_quote_order_book_from_role(request.get("role")),
             "role": role,
@@ -7159,6 +7180,8 @@ def update_best_quote_volume_order_refs(
         refs = dict(list(refs.items())[-10000:])
 
     state["best_quote_volume_order_refs"] = refs
+    if manual_limit_updated:
+        state["best_quote_frozen_inventory_manual_limit"] = manual_limit_directive
     if pair_release_submitted_orders:
         directive = dict(state.get("best_quote_frozen_inventory_pair_release") or {})
         submitted_release_qty = (
@@ -20744,6 +20767,9 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                             "submitted_notional": _safe_float(prepared_order.get("submitted_notional")),
                             "attempt": attempt + 1,
                             "time_in_force": time_in_force,
+                            "frozen_inventory_request_id": str(
+                                order.get("frozen_inventory_request_id") or ""
+                            ).strip(),
                         },
                         "response": place_response,
                     }
