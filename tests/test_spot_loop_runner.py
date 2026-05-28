@@ -1388,6 +1388,53 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertTrue(controls["synthetic_cost_unknown"])
         self.assertEqual(controls["recovery_mode"], "conservative_reduce_only")
 
+    def test_synthetic_neutral_freezes_unknown_cost_surplus_when_recovery_lacks_trade_history(self) -> None:
+        state = {
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "known_orders": {},
+            "inventory_lots": [],
+        }
+
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state=state,
+            trades=[],
+            bid_price=0.1820,
+            ask_price=0.1821,
+            step_price=0.0002,
+            buy_levels=3,
+            sell_levels=3,
+            first_order_multiplier=1.0,
+            per_order_notional=180.0,
+            threshold_position_notional=600.0,
+            threshold_reduce_target_notional=500.0,
+            max_order_position_notional=7000.0,
+            max_position_notional=8200.0,
+            tick_size=0.0001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=10000.0,
+            actual_base_qty=17355.7,
+            max_short_position_notional=1200.0,
+            synthetic_freeze_enabled=True,
+            synthetic_freeze_loss_ratio=0.006,
+            synthetic_freeze_min_notional=20.0,
+            synthetic_freeze_max_side_notional=2000.0,
+        )
+
+        roles = {str(order.get("role")) for order in desired_orders}
+        cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
+        self.assertNotIn("forced_reduce", roles)
+        self.assertNotIn("synthetic_frozen_release", roles)
+        self.assertIn("bootstrap_entry", roles)
+        self.assertEqual(cached_runtime["position_lots"], [])
+        self.assertEqual(cached_runtime["direction_state"], "flat")
+        self.assertEqual(cached_runtime["recovery_mode"], "live")
+        self.assertAlmostEqual(controls["current_long_notional"], 0.0, places=6)
+        self.assertAlmostEqual(controls["synthetic_frozen_long_qty"], 7355.7, places=6)
+        self.assertTrue(controls["synthetic_cost_unknown"])
+
     def test_synthetic_neutral_treats_cached_synthetic_recovered_lot_as_cost_unknown(self) -> None:
         state = {
             "strategy_mode": "spot_competition_synthetic_neutral_grid",

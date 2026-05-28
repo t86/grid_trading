@@ -459,7 +459,13 @@ def _synthetic_frozen_release_orders(
     min_qty: float | None,
     min_notional: float | None,
 ) -> list[dict[str, Any]]:
-    frozen_lots = [dict(item) for item in list(runtime.get("frozen_position_lots") or []) if isinstance(item, dict)]
+    frozen_lots = [
+        dict(item)
+        for item in list(runtime.get("frozen_position_lots") or [])
+        if isinstance(item, dict)
+        and str(item.get("source_role", "") or "").strip() != "synthetic_recovery"
+        and str(item.get("freeze_reason", "") or "").strip() != "synthetic_cost_unknown"
+    ]
     if not frozen_lots:
         return []
 

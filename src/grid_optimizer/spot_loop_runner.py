@@ -1894,20 +1894,111 @@ def _build_spot_competition_inventory_grid_orders(
             or str(item.get("source_role") or "") == "synthetic_recovery"
             for item in position_lots
         )
-        if has_synthetic_recovered_lot:
+        active_lot_qty = _sum_inventory_qty(position_lots)
+
+        def _unknown_cost_entry_price() -> float:
+            candidates = [
+                max(_safe_float(item.get("entry_price")), 0.0)
+                for item in position_lots
+                if isinstance(item, dict) and _safe_float(item.get("entry_price")) > EPSILON
+            ]
+            anchor_price = max(_safe_float(runtime.get("grid_anchor_price")), 0.0)
+            if anchor_price > EPSILON:
+                candidates.append(anchor_price)
+            candidates.append(mid_price)
+            if expected_direction_state == "short_active":
+                positives = [price for price in candidates if price > EPSILON]
+                return min(positives) if positives else mid_price
+            return max(candidates)
+
+        def _active_net_qty_after_freeze() -> float:
+            refreshed = synthetic_frozen_position_report(runtime=runtime, mid_price=mid_price)
+            refreshed_frozen_net_qty = _safe_float(refreshed.get("long_qty")) - _safe_float(refreshed.get("short_qty"))
+            refreshed_active_net_qty = raw_synthetic_net_qty - refreshed_frozen_net_qty
+            if _synthetic_residual_is_dust(
+                qty=abs(refreshed_active_net_qty),
+                price=mid_price,
+                min_qty=min_qty,
+                min_notional=min_notional,
+            ):
+                return 0.0
+            return refreshed_active_net_qty
+
+        def _prepare_unknown_cost_runtime(*, reason: str) -> None:
+            runtime["direction_state"] = expected_direction_state
+            runtime["risk_state"] = "normal"
+            runtime["recovery_mode"] = "live"
+            runtime["recovery_errors"] = []
+            runtime["synthetic_cost_unknown"] = True
+            runtime["position_lots"] = [
+                {
+                    "lot_id": "synthetic_recovered",
+                    "side": "long" if expected_direction_state == "long_active" else "short",
+                    "qty": active_position_qty,
+                    "entry_price": _unknown_cost_entry_price(),
+                    "opened_at_ms": 0,
+                    "source_role": "synthetic_recovery",
+                    "recovery_reason": reason,
+                }
+            ]
+
+        def _maybe_freeze_unknown_cost_runtime() -> bool:
+            if not synthetic_freeze_enabled or mid_price <= EPSILON:
+                return False
+            threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
+            if threshold_notional <= EPSILON:
+                return False
+            active_notional = active_position_qty * mid_price
+            if active_notional + EPSILON < threshold_notional:
+                return False
+            current_side_notional = _safe_float(
+                frozen_report.get("long_notional" if expected_direction_state == "long_active" else "short_notional")
+            )
+            side_cap = max(_safe_float(synthetic_freeze_max_side_notional), 0.0)
+            freeze_notional = active_notional
+            if side_cap > EPSILON:
+                freeze_notional = min(freeze_notional, max(side_cap - current_side_notional, 0.0))
+            if freeze_notional + EPSILON < max(_safe_float(synthetic_freeze_min_notional), 0.0):
+                return False
+            freeze_qty = min(active_position_qty, freeze_notional / mid_price)
+            freeze_qty = _round_order_qty(freeze_qty, step_size)
+            if freeze_qty <= EPSILON:
+                return False
+            reduce_price = ask_price if expected_direction_state == "long_active" else bid_price
+            result = freeze_inventory_grid_reduce_lots(
+                runtime=runtime,
+                reduce_price=reduce_price,
+                reduce_qty=freeze_qty,
+                step_price=step_price,
+                freeze_time_ms=int((now or _utc_now()).timestamp() * 1000),
+                reason="synthetic_cost_unknown",
+            )
+            return bool(result.get("applied"))
+
+        def _handle_unknown_cost_runtime(*, reason: str) -> float:
+            threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
+            should_handle = (
+                bool(synthetic_freeze_enabled)
+                and threshold_notional > EPSILON
+                and active_position_qty * mid_price + EPSILON >= threshold_notional
+            )
+            if should_handle:
+                _prepare_unknown_cost_runtime(reason=reason)
+                _maybe_freeze_unknown_cost_runtime()
+                return _active_net_qty_after_freeze()
             runtime["direction_state"] = expected_direction_state
             runtime["risk_state"] = "hard_reduce_only"
             runtime["recovery_mode"] = "conservative_reduce_only"
-            runtime["recovery_errors"] = ["synthetic_recovered_cost_unknown"]
+            runtime["recovery_errors"] = [reason]
             runtime["position_lots"] = []
             runtime["synthetic_cost_unknown"] = True
             return active_net_qty
-        active_lot_qty = _sum_inventory_qty(position_lots)
+
+        if has_synthetic_recovered_lot:
+            return _handle_unknown_cost_runtime(reason="synthetic_recovered_cost_unknown")
         if recovery_mode != "live":
-            runtime["direction_state"] = expected_direction_state
-            runtime["position_lots"] = []
-            runtime["synthetic_cost_unknown"] = True
-            return active_net_qty
+            recovery_errors = [str(item) for item in list(runtime.get("recovery_errors") or []) if str(item)]
+            return _handle_unknown_cost_runtime(reason=recovery_errors[0] if recovery_errors else "synthetic_cost_unknown")
         if (
             runtime_direction_state != expected_direction_state
             or abs(active_lot_qty - active_position_qty) > max(active_position_qty, 1.0) * 1e-9
