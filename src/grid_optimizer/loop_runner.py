@@ -2487,6 +2487,20 @@ def _best_quote_trade_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> 
     return ""
 
 
+def _best_quote_frozen_manual_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> str:
+    client_order_id = str((row or {}).get("clientOrderId") or (row or {}).get("client_order_id") or "").strip()
+    parts = client_order_id.lower().split("-")
+    if len(parts) < 3 or parts[0] != "gx" or parts[2].strip() != "frozenin":
+        return ""
+    side = str((row or {}).get("side") or "").upper().strip()
+    position_side = str((row or {}).get("positionSide") or (row or {}).get("position_side") or "").upper().strip()
+    if side == "SELL" and position_side == "LONG":
+        return "frozen_inventory_manual_limit_long"
+    if side == "BUY" and position_side == "SHORT":
+        return "frozen_inventory_manual_limit_short"
+    return ""
+
+
 def _best_quote_trade_role_from_order_ref(
     row: Mapping[str, Any] | dict[str, Any],
     state: Mapping[str, Any] | dict[str, Any],
@@ -3441,9 +3455,12 @@ def sync_best_quote_frozen_manual_fills(
         order_id = str(row.get("orderId") or row.get("order_id") or "").strip()
         ref = order_refs.get(order_id) if order_id else None
         ref = ref if isinstance(ref, Mapping) else {}
-        if str(ref.get("book") or "").lower().strip() != BQ_BOOK_FROZEN:
-            continue
         role = str(row.get("role") or ref.get("role") or "").lower().strip()
+        if not role:
+            role = _best_quote_frozen_manual_role_from_row(row)
+        ref_book = str(ref.get("book") or "").lower().strip()
+        if ref_book != BQ_BOOK_FROZEN and not role.startswith("frozen_inventory_manual_"):
+            continue
         if role not in {
             "frozen_inventory_manual_reduce_long",
             "frozen_inventory_manual_reduce_short",

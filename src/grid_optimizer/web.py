@@ -6812,9 +6812,9 @@ def _render_running_status_page(symbol: str | None = None) -> str:
         <div class="rs-ledger-item">冻结多仓<strong>${fmtNum(ledger.long_qty, 6)} @ ${fmtNum(ledger.long_entry_price, 8)}</strong><span>${fmtNum(ledger.long_notional, 2)}U · ${escapeHtml(ledger.long_frozen_at || "--")}</span></div>
         <div class="rs-ledger-item">冻结空仓<strong>${fmtNum(ledger.short_qty, 6)} @ ${fmtNum(ledger.short_entry_price, 8)}</strong><span>${fmtNum(ledger.short_notional, 2)}U · ${escapeHtml(ledger.short_frozen_at || "--")}</span></div>
         <div class="rs-ledger-item">多空可抵扣<strong>${fmtNum(ledger.offset_qty, 6)}</strong><span>${fmtNum(ledger.offset_notional, 2)}U</span></div>
-        <div class="rs-ledger-item">限价隔离<strong>多 ${fmtNum(ledger.long_manual_limit_isolated_qty, 6)} / 空 ${fmtNum(ledger.short_manual_limit_isolated_qty, 6)}</strong><span>已限价挂单接管的冻结仓位不再参与对等释放。</span></div>
+        <div class="rs-ledger-item">maker 隔离<strong>多 ${fmtNum(ledger.long_manual_limit_isolated_qty, 6)} / 空 ${fmtNum(ledger.short_manual_limit_isolated_qty, 6)}</strong><span>已由 post-only 跟价单接管的冻结仓位不再参与对等释放。</span></div>
         <div class="rs-ledger-item">配对可用<strong>多 ${fmtNum(ledger.pair_eligible_long_qty, 6)} / 空 ${fmtNum(ledger.pair_eligible_short_qty, 6)}</strong><span>对等释放只使用未隔离冻结仓位。</span></div>
-        <div class="rs-ledger-item">处理状态<strong>${active ? "有冻结仓位" : "无冻结仓位"}</strong><span>清理/限价按钮会写入策略指令，由 runner 下 reduce-only 单处理。</span></div>
+        <div class="rs-ledger-item">处理状态<strong>${active ? "有冻结仓位" : "无冻结仓位"}</strong><span>清理会下 IOC reduce-only；maker 平仓会写入指令，由 runner 按买一/卖一 post-only 跟价。</span></div>
         <div class="rs-ledger-item">释放状态<strong>${escapeHtml(releaseStatus)}</strong><span>${escapeHtml(releaseReasons || stableText)}</span></div>
         <div class="rs-ledger-item">释放数量<strong>${fmtNum(release.release_qty, 6)}</strong><span>${fmtNum(release.release_notional, 2)}U · 上限 ${fmtNum(release.max_notional, 2)}U</span></div>
         <div class="rs-ledger-item">释放盈亏<strong>${escapeHtml(pnlText)}</strong><span>预估 pair PnL / 要求 buffer</span></div>
@@ -6990,7 +6990,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
         : (action === "cancel_limit_long" || action === "cancel_limit_short"
           ? "撤销冻结仓位限价平仓指令"
         : (action === "limit_long" || action === "limit_short"
-          ? "提交冻结仓位限价平仓指令"
+          ? "提交冻结仓位 maker 平仓指令"
           : (action === "reduce_long" || action === "reduce_short" ? "提交冻结仓位清理指令" : "更新冻结账本")));
       setDrawerStatus(`正在${actionLabel} ${card.symbol}...`);
       try {
@@ -7101,7 +7101,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       const ledger = frozenInventory(state.drawerCard);
       const qty = promptPositiveQty("限价平冻结多仓数量", ledger.pair_eligible_long_qty);
       if (qty === null) return;
-      const price = promptNumber("限价平冻结多仓价格（SELL LONG）", ledger.long_entry_price);
+      const price = promptNumber("maker 平冻结多仓价格上限（SELL LONG，post-only 会按卖一跟价）", ledger.long_entry_price);
       if (price === null || price <= 0) return;
       updateFrozenInventory("limit_long", { requested_qty: qty, price });
     });
@@ -7109,7 +7109,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       const ledger = frozenInventory(state.drawerCard);
       const qty = promptPositiveQty("限价平冻结空仓数量", ledger.pair_eligible_short_qty);
       if (qty === null) return;
-      const price = promptNumber("限价平冻结空仓价格（BUY SHORT）", ledger.short_entry_price);
+      const price = promptNumber("maker 平冻结空仓价格上限（BUY SHORT，post-only 会按买一跟价）", ledger.short_entry_price);
       if (price === null || price <= 0) return;
       updateFrozenInventory("limit_short", { requested_qty: qty, price });
     });
