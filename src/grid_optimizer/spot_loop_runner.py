@@ -390,6 +390,53 @@ def _cached_spot_competition_applied_trade_keys(
     return [str(item).strip() for item in list(payload.get("applied_trade_keys") or []) if str(item).strip()]
 
 
+def _apply_cached_conflicting_bootstrap_fill(
+    *,
+    runtime: dict[str, Any],
+    side: str,
+    price: float,
+    qty: float,
+    fill_time_ms: int,
+    step_price: float,
+) -> bool:
+    if str(runtime.get("market_type", "")).strip().lower() != "futures":
+        return False
+    current_state = str(runtime.get("direction_state", "flat") or "flat").strip().lower()
+    if current_state == "long_active":
+        close_side = "SELL"
+    elif current_state == "short_active":
+        close_side = "BUY"
+    else:
+        return False
+    if str(side).upper().strip() != close_side:
+        return False
+    available_qty = _sum_inventory_qty(list(runtime.get("position_lots") or []))
+    fill_qty = max(float(qty), 0.0)
+    close_qty = min(fill_qty, available_qty)
+    if close_qty > EPSILON:
+        apply_inventory_grid_fill(
+            runtime=runtime,
+            role="tail_cleanup",
+            side=close_side,
+            price=price,
+            qty=close_qty,
+            fill_time_ms=fill_time_ms,
+            step_price=step_price,
+        )
+    remainder_qty = fill_qty - close_qty
+    if remainder_qty > EPSILON:
+        apply_inventory_grid_fill(
+            runtime=runtime,
+            role="bootstrap_entry",
+            side=side,
+            price=price,
+            qty=remainder_qty,
+            fill_time_ms=fill_time_ms,
+            step_price=step_price,
+        )
+    return True
+
+
 def _apply_spot_competition_runtime_trade_delta(
     *,
     runtime: dict[str, Any],
@@ -407,17 +454,29 @@ def _apply_spot_competition_runtime_trade_delta(
     if not role or not side:
         return False
 
+    price = _safe_float(trade.get("price"))
+    qty = abs(_safe_float(trade.get("qty")))
+    fill_time_ms = int(trade.get("time", 0) or 0)
     try:
         apply_inventory_grid_fill(
             runtime=runtime,
             role=role,
             side=side,
-            price=_safe_float(trade.get("price")),
-            qty=abs(_safe_float(trade.get("qty"))),
-            fill_time_ms=int(trade.get("time", 0) or 0),
+            price=price,
+            qty=qty,
+            fill_time_ms=fill_time_ms,
             step_price=step_price,
         )
     except ValueError:
+        if role == "bootstrap_entry" and _apply_cached_conflicting_bootstrap_fill(
+            runtime=runtime,
+            side=side,
+            price=price,
+            qty=qty,
+            fill_time_ms=fill_time_ms,
+            step_price=step_price,
+        ):
+            return True
         return False
     return True
 
