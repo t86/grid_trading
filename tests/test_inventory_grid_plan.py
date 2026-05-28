@@ -1499,6 +1499,35 @@ def test_spot_flat_buy_levels_respect_opening_notional_cap() -> None:
     assert [item["price"] for item in plan["bootstrap_orders"]] == [100.0, 99.3]
 
 
+def test_synthetic_neutral_flat_sell_levels_respect_short_position_cap() -> None:
+    runtime = new_inventory_grid_runtime(market_type="spot")
+    runtime["synthetic_neutral"] = True
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=100.0,
+        ask_price=100.2,
+        step_price=0.7,
+        per_order_notional=80.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=50.0,
+        max_order_position_notional=1000.0,
+        max_position_notional=1000.0,
+        max_short_order_position_notional=1000.0,
+        max_short_position_notional=120.0,
+        buy_levels=3,
+        sell_levels=3,
+        tick_size=0.1,
+        step_size=0.001,
+        min_qty=0.001,
+        min_notional=5.0,
+    )
+
+    sell_orders = [item for item in plan["bootstrap_orders"] if item["side"] == "SELL"]
+    assert len(sell_orders) < 3
+    assert sum(item["qty"] for item in sell_orders) * 100.1 <= 120.0
+
+
 def test_max_order_position_notional_blocks_new_same_side_entries() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["direction_state"] = "long_active"

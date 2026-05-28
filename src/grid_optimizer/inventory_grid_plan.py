@@ -834,8 +834,15 @@ def build_inventory_grid_orders(
                 min_notional=min_notional,
             )
             max_short_qty = None
-            if short_order_limit_notional > EPSILON:
-                max_short_qty = short_order_limit_notional / max(mid_price, EPSILON)
+            flat_short_cap_notional = short_order_limit_notional
+            if short_position_limit_notional > EPSILON:
+                flat_short_cap_notional = (
+                    min(flat_short_cap_notional, short_position_limit_notional)
+                    if flat_short_cap_notional > EPSILON
+                    else short_position_limit_notional
+                )
+            if flat_short_cap_notional > EPSILON:
+                max_short_qty = flat_short_cap_notional / max(mid_price, EPSILON)
             bootstrap_orders.extend(
                 _build_sell_ladder_orders(
                     reference_price=ask_price,
@@ -1137,8 +1144,14 @@ def build_inventory_grid_orders(
             planned_closing_qty = exit_qty
 
         entry_allowed = risk_state == "normal" and (
-            short_order_limit_notional <= 0
-            or inventory_notional + max(_safe_float(per_order_notional), 0.0) <= short_order_limit_notional
+            (
+                short_order_limit_notional <= 0
+                or inventory_notional + max(_safe_float(per_order_notional), 0.0) <= short_order_limit_notional
+            )
+            and (
+                short_position_limit_notional <= 0
+                or inventory_notional + max(_safe_float(per_order_notional), 0.0) <= short_position_limit_notional
+            )
         )
         if entry_allowed:
             entry_price = _round_order_price(anchor_price + step_price, tick_size, "SELL")
