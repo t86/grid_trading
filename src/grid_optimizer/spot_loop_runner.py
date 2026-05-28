@@ -272,6 +272,11 @@ def _competition_runtime_frozen_net_qty(runtime: dict[str, Any]) -> float:
     return long_qty - short_qty
 
 
+def _competition_position_qty_matches(actual: float, expected: float) -> bool:
+    tolerance = max(EPSILON, max(abs(float(actual)), abs(float(expected)), 1.0) * 1e-9)
+    return abs(float(actual) - float(expected)) <= tolerance
+
+
 def _competition_runtime_matches_expected_position(
     runtime: dict[str, Any],
     *,
@@ -280,12 +285,12 @@ def _competition_runtime_matches_expected_position(
 ) -> bool:
     expected = max(float(expected_position_qty), 0.0)
     runtime_qty = _competition_runtime_position_qty(runtime)
-    if abs(runtime_qty - expected) <= EPSILON:
+    if _competition_position_qty_matches(runtime_qty, expected):
         return True
     if not synthetic_neutral:
         return False
     frozen_net_qty = _competition_runtime_frozen_net_qty(runtime)
-    return abs(abs(frozen_net_qty) - expected) <= EPSILON
+    return _competition_position_qty_matches(abs(frozen_net_qty), expected)
 
 
 def _competition_runtime_trade_key(trade: dict[str, Any]) -> str:
