@@ -550,7 +550,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
             ["1000:1:123"],
         )
 
-    def test_build_spot_competition_synthetic_neutral_grid_recovers_mismatched_live_short(self) -> None:
+    def test_build_spot_competition_synthetic_neutral_grid_keeps_mismatched_short_cost_unknown(self) -> None:
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(
             state={
                 "strategy_mode": "spot_competition_synthetic_neutral_grid",
@@ -593,10 +593,11 @@ class SpotLoopRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(controls["direction_state"], "short_active")
-        self.assertEqual(controls["risk_state"], "normal")
+        self.assertEqual(controls["risk_state"], "hard_reduce_only")
         self.assertAlmostEqual(controls["synthetic_net_qty"], -1078.0)
-        self.assertGreaterEqual(sum(1 for order in desired_orders if order["side"] == "BUY"), 1)
-        self.assertGreaterEqual(sum(1 for order in desired_orders if order["side"] == "SELL"), 1)
+        self.assertEqual(desired_orders, [])
+        self.assertTrue(controls["synthetic_cost_unknown"])
+        self.assertEqual(controls["recovery_mode"], "conservative_reduce_only")
 
     def test_build_spot_competition_synthetic_neutral_grid_persists_frozen_reduce_lots(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="futures")
@@ -1105,6 +1106,110 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(len(sell_orders), 1)
         self.assertAlmostEqual(sell_orders[0]["price"], 111.0, places=8)
         self.assertAlmostEqual(sell_orders[0]["qty"], 0.9, places=8)
+
+    def test_synthetic_neutral_keeps_cost_unknown_when_recovery_lacks_trade_history(self) -> None:
+        state = {
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "known_orders": {},
+            "inventory_lots": [],
+        }
+
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state=state,
+            trades=[],
+            bid_price=0.1886,
+            ask_price=0.1887,
+            step_price=0.0002,
+            buy_levels=3,
+            sell_levels=3,
+            first_order_multiplier=1.0,
+            per_order_notional=180.0,
+            threshold_position_notional=600.0,
+            threshold_reduce_target_notional=500.0,
+            max_order_position_notional=7000.0,
+            max_position_notional=8200.0,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=10000.0,
+            actual_base_qty=11320.0,
+            max_short_position_notional=1200.0,
+            synthetic_freeze_enabled=True,
+            synthetic_freeze_loss_ratio=0.006,
+            synthetic_freeze_min_notional=20.0,
+        )
+
+        cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
+        self.assertEqual(desired_orders, [])
+        self.assertEqual(cached_runtime["position_lots"], [])
+        self.assertEqual(cached_runtime["recovery_mode"], "conservative_reduce_only")
+        self.assertIn("missing_strategy_trade_history", cached_runtime["recovery_errors"])
+        self.assertTrue(controls["synthetic_cost_unknown"])
+        self.assertEqual(controls["recovery_mode"], "conservative_reduce_only")
+
+    def test_synthetic_neutral_treats_cached_synthetic_recovered_lot_as_cost_unknown(self) -> None:
+        state = {
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "known_orders": {},
+            "inventory_lots": [],
+            "spot_competition_synthetic_neutral_grid_runtime_cache": {
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "market_type": "futures",
+                "runtime": {
+                    "market_type": "futures",
+                    "direction_state": "long_active",
+                    "risk_state": "hard_reduce_only",
+                    "position_lots": [
+                        {
+                            "lot_id": "synthetic_recovered",
+                            "side": "long",
+                            "qty": 1320.0,
+                            "entry_price": 0.18865,
+                            "opened_at_ms": 0,
+                            "source_role": "synthetic_recovery",
+                        }
+                    ],
+                    "recovery_mode": "live",
+                    "recovery_errors": [],
+                },
+                "applied_trade_keys": [],
+            },
+        }
+
+        _, controls = _build_spot_competition_inventory_grid_orders(
+            state=state,
+            trades=[],
+            bid_price=0.1886,
+            ask_price=0.1887,
+            step_price=0.0002,
+            buy_levels=3,
+            sell_levels=3,
+            first_order_multiplier=1.0,
+            per_order_notional=180.0,
+            threshold_position_notional=600.0,
+            threshold_reduce_target_notional=500.0,
+            max_order_position_notional=7000.0,
+            max_position_notional=8200.0,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=10000.0,
+            actual_base_qty=11320.0,
+            max_short_position_notional=1200.0,
+            synthetic_freeze_enabled=True,
+            synthetic_freeze_loss_ratio=0.006,
+            synthetic_freeze_min_notional=20.0,
+        )
+
+        cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
+        self.assertEqual(cached_runtime["position_lots"], [])
+        self.assertEqual(cached_runtime["recovery_mode"], "conservative_reduce_only")
+        self.assertIn("synthetic_recovered_cost_unknown", cached_runtime["recovery_errors"])
+        self.assertTrue(controls["synthetic_cost_unknown"])
 
     def test_build_spot_competition_inventory_grid_orders_supports_multiple_buy_levels(self) -> None:
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(

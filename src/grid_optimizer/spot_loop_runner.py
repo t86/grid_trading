@@ -342,8 +342,9 @@ def _store_cached_spot_competition_runtime(
 ) -> None:
     cached_runtime = copy.deepcopy(runtime)
     cached_runtime["pair_credit_steps"] = 0
-    cached_runtime["recovery_mode"] = "live"
-    cached_runtime["recovery_errors"] = []
+    if str(cached_runtime.get("recovery_mode", "live") or "live").strip().lower() == "live":
+        cached_runtime["recovery_mode"] = "live"
+        cached_runtime["recovery_errors"] = []
     cache_key = _spot_competition_runtime_cache_key(synthetic_neutral=synthetic_neutral)
     state[cache_key] = {
         "strategy_mode": (
@@ -1760,6 +1761,7 @@ def _build_spot_competition_inventory_grid_orders(
             "long_active" if active_net_qty > EPSILON else "short_active" if active_net_qty < -EPSILON else "flat"
         )
         runtime_direction_state = str(runtime.get("direction_state", "flat") or "flat").strip().lower()
+        recovery_mode = str(runtime.get("recovery_mode", "live") or "live").strip().lower()
         active_position_qty = abs(active_net_qty)
         if active_position_qty <= EPSILON:
             if runtime_direction_state != "flat" or _sum_inventory_qty(list(runtime.get("position_lots") or [])) > EPSILON:
@@ -1767,10 +1769,28 @@ def _build_spot_competition_inventory_grid_orders(
                 runtime["position_lots"] = []
                 runtime["recovery_mode"] = "live"
             return 0.0
-        active_lot_qty = _sum_inventory_qty(list(runtime.get("position_lots") or []))
+        position_lots = [dict(item) for item in list(runtime.get("position_lots") or []) if isinstance(item, dict)]
+        has_synthetic_recovered_lot = any(
+            str(item.get("lot_id") or "") == "synthetic_recovered"
+            or str(item.get("source_role") or "") == "synthetic_recovery"
+            for item in position_lots
+        )
+        if has_synthetic_recovered_lot:
+            runtime["direction_state"] = expected_direction_state
+            runtime["risk_state"] = "hard_reduce_only"
+            runtime["recovery_mode"] = "conservative_reduce_only"
+            runtime["recovery_errors"] = ["synthetic_recovered_cost_unknown"]
+            runtime["position_lots"] = []
+            runtime["synthetic_cost_unknown"] = True
+            return active_net_qty
+        active_lot_qty = _sum_inventory_qty(position_lots)
+        if recovery_mode != "live":
+            runtime["direction_state"] = expected_direction_state
+            runtime["position_lots"] = []
+            runtime["synthetic_cost_unknown"] = True
+            return active_net_qty
         if (
             runtime_direction_state != expected_direction_state
-            or str(runtime.get("recovery_mode", "live") or "live").strip().lower() != "live"
             or abs(active_lot_qty - active_position_qty) > max(active_position_qty, 1.0) * 1e-9
         ):
             runtime["direction_state"] = expected_direction_state
@@ -1785,6 +1805,9 @@ def _build_spot_competition_inventory_grid_orders(
                     "source_role": "synthetic_recovery",
                 }
             ]
+            runtime["synthetic_cost_unknown"] = True
+        else:
+            runtime.pop("synthetic_cost_unknown", None)
         return active_net_qty
 
     synthetic_net_qty = _isolate_synthetic_frozen_exposure()
@@ -1919,6 +1942,9 @@ def _build_spot_competition_inventory_grid_orders(
         "slow_trend_step": slow_trend_step,
         "direction_state": str(runtime.get("direction_state", "flat") or "flat"),
         "risk_state": str(plan.get("risk_state", "normal") or "normal"),
+        "recovery_mode": str(runtime.get("recovery_mode", "live") or "live"),
+        "recovery_errors": list(runtime.get("recovery_errors") or []),
+        "synthetic_cost_unknown": bool(runtime.get("synthetic_cost_unknown")),
         "grid_anchor_price": _safe_float(runtime.get("grid_anchor_price")),
         "pair_credit_steps": _safe_int(runtime.get("pair_credit_steps")),
         "threshold_position_notional": _safe_float(threshold_position_notional),
