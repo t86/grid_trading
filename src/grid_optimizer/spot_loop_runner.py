@@ -1883,19 +1883,42 @@ def _build_spot_competition_inventory_grid_orders(
         runtime_direction_state = str(runtime.get("direction_state", "flat") or "flat").strip().lower()
         recovery_mode = str(runtime.get("recovery_mode", "live") or "live").strip().lower()
         active_position_qty = abs(active_net_qty)
-        if active_position_qty <= EPSILON:
-            if runtime_direction_state != "flat" or _sum_inventory_qty(list(runtime.get("position_lots") or [])) > EPSILON:
-                runtime["direction_state"] = "flat"
-                runtime["position_lots"] = []
-                runtime["recovery_mode"] = "live"
-            return 0.0
         position_lots = [dict(item) for item in list(runtime.get("position_lots") or []) if isinstance(item, dict)]
+        active_lot_qty = _sum_inventory_qty(position_lots)
+        if active_position_qty <= EPSILON:
+            runtime["direction_state"] = "flat"
+            runtime["position_lots"] = []
+            runtime["recovery_mode"] = "live"
+            runtime["risk_state"] = "normal"
+            runtime["recovery_errors"] = []
+            runtime.pop("synthetic_cost_unknown", None)
+            return 0.0
+        reduce_target_qty = 0.0
+        reduce_target_notional = max(_safe_float(threshold_reduce_target_notional), 0.0)
+        if reduce_target_notional > EPSILON and mid_price > EPSILON:
+            reduce_target_qty = reduce_target_notional / mid_price
+        near_flat_qty = max(position_qty_tolerance, reduce_target_qty)
+        stale_active_without_lots = (
+            active_lot_qty <= EPSILON
+            and (
+                runtime_direction_state in {"long_active", "short_active"}
+                or recovery_mode != "live"
+                or bool(runtime.get("synthetic_cost_unknown"))
+            )
+        )
+        if stale_active_without_lots and active_position_qty <= near_flat_qty:
+            runtime["direction_state"] = "flat"
+            runtime["position_lots"] = []
+            runtime["recovery_mode"] = "live"
+            runtime["risk_state"] = "normal"
+            runtime["recovery_errors"] = []
+            runtime.pop("synthetic_cost_unknown", None)
+            return 0.0
         has_synthetic_recovered_lot = any(
             str(item.get("lot_id") or "") == "synthetic_recovered"
             or str(item.get("source_role") or "") == "synthetic_recovery"
             for item in position_lots
         )
-        active_lot_qty = _sum_inventory_qty(position_lots)
 
         def _unknown_cost_entry_price() -> float:
             candidates = [
@@ -2006,6 +2029,15 @@ def _build_spot_competition_inventory_grid_orders(
                 synthetic_neutral=True,
             )
         synthetic_net_qty = _isolate_synthetic_frozen_exposure()
+        _store_cached_spot_competition_runtime(
+            state=state,
+            runtime=runtime,
+            applied_trade_keys=_cached_spot_competition_applied_trade_keys(
+                state=state,
+                synthetic_neutral=True,
+            ),
+            synthetic_neutral=True,
+        )
     slow_trend_step = _resolve_spot_slow_trend_step(
         symbol=str(symbol or state.get("symbol") or "").upper().strip(),
         base_step_price=step_price,

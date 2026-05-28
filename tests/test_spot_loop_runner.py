@@ -268,6 +268,10 @@ class SpotLoopRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY", "SELL", "SELL"])
+        self.assertLess(desired_orders[0]["price"], 0.099)
+        self.assertLess(desired_orders[1]["price"], desired_orders[0]["price"])
+        self.assertGreater(desired_orders[2]["price"], 0.101)
+        self.assertGreater(desired_orders[3]["price"], desired_orders[2]["price"])
         self.assertEqual(controls["mode"], "competition_synthetic_neutral_grid")
         self.assertEqual(controls["direction_state"], "flat")
         self.assertAlmostEqual(controls["neutral_base_qty"], 1000.0)
@@ -376,6 +380,61 @@ class SpotLoopRunnerTests(unittest.TestCase):
 
         self.assertEqual({order["side"] for order in desired_orders}, {"SELL"})
 
+    def test_synthetic_neutral_below_reduce_target_resumes_flat_ladder(self) -> None:
+        runtime = new_inventory_grid_runtime(market_type="futures")
+        runtime["synthetic_neutral"] = True
+        runtime["direction_state"] = "short_active"
+        runtime["grid_anchor_price"] = 0.0902
+        runtime["risk_state"] = "hard_reduce_only"
+        runtime["recovery_mode"] = "conservative_reduce_only"
+        runtime["recovery_errors"] = ["synthetic_cost_unknown"]
+        runtime["position_lots"] = []
+        state = {
+            "known_orders": {},
+            "spot_competition_synthetic_neutral_grid_runtime_cache": {
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "market_type": "futures",
+                "runtime": runtime,
+                "applied_trade_keys": [],
+            },
+        }
+
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state=state,
+            trades=[],
+            bid_price=0.0901,
+            ask_price=0.0902,
+            step_price=0.0001,
+            buy_levels=2,
+            sell_levels=2,
+            first_order_multiplier=1.0,
+            per_order_notional=20.0,
+            threshold_position_notional=120.0,
+            threshold_reduce_target_notional=40.0,
+            max_order_position_notional=160.0,
+            max_position_notional=240.0,
+            tick_size=0.0001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=8307.6,
+            max_short_position_notional=160.0,
+            actual_base_qty=7871.5,
+        )
+
+        self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY", "SELL", "SELL"])
+        self.assertLess(desired_orders[0]["price"], 0.0901)
+        self.assertLess(desired_orders[1]["price"], desired_orders[0]["price"])
+        self.assertGreater(desired_orders[2]["price"], 0.0902)
+        self.assertGreater(desired_orders[3]["price"], desired_orders[2]["price"])
+        self.assertEqual(controls["direction_state"], "flat")
+        self.assertEqual(controls["risk_state"], "normal")
+        self.assertAlmostEqual(controls["synthetic_net_qty"], 0.0)
+        cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
+        self.assertEqual(cached_runtime["direction_state"], "flat")
+        self.assertEqual(cached_runtime["position_lots"], [])
+
     def test_slow_trend_step_guard_widens_synthetic_neutral_ladder(self) -> None:
         now = datetime(2026, 5, 15, 6, 15, tzinfo=timezone.utc)
         candles = []
@@ -430,8 +489,8 @@ class SpotLoopRunnerTests(unittest.TestCase):
 
         buy_prices = [order["price"] for order in desired_orders if order["side"] == "BUY"]
         sell_prices = [order["price"] for order in desired_orders if order["side"] == "SELL"]
-        self.assertEqual(buy_prices, [682.7, 682.58, 682.46])
-        self.assertEqual(sell_prices, [682.8, 682.92, 683.04])
+        self.assertEqual(buy_prices, [682.58, 682.46, 682.34])
+        self.assertEqual(sell_prices, [682.92, 683.04, 683.16])
         self.assertAlmostEqual(controls["base_step_price"], 0.06)
         self.assertAlmostEqual(controls["effective_step_price"], 0.12)
         self.assertTrue(controls["slow_trend_step"]["active"])
