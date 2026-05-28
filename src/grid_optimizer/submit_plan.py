@@ -1081,6 +1081,10 @@ def apply_reduce_only_no_loss_guard_to_actions(
     for order in place_orders:
         side = str(order.get("side", "")).upper().strip()
         role = str(order.get("role", "") or "").strip().lower()
+        if role.startswith("frozen_inventory_pair_release_") or bool(order.get("frozen_inventory_pair_release")):
+            order["reduce_only_no_loss_guard"] = "bypassed_frozen_pair_release"
+            kept_place_orders.append(order)
+            continue
         if role in {"hard_loss_forced_reduce_long", "hard_loss_forced_reduce_short"}:
             kept_place_orders.append(order)
             continue
