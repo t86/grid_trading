@@ -340,6 +340,49 @@ def test_synthetic_neutral_long_exit_sell_stays_post_only_when_anchor_is_below_m
     assert all(order["price"] > 0.035234 for order in plan["sell_orders"])
 
 
+def test_synthetic_neutral_long_exit_sell_ignores_stale_anchor_above_market() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 0.6811
+    runtime["position_lots"] = [
+        {
+            "lot_id": "long",
+            "side": "long",
+            "qty": 106.1,
+            "entry_price": 0.6809,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.6582,
+        ask_price=0.6583,
+        step_price=0.0002,
+        per_order_notional=40.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=80.0,
+        threshold_reduce_target_notional=40.0,
+        max_order_position_notional=160.0,
+        max_position_notional=200.0,
+        max_short_order_position_notional=160.0,
+        max_short_position_notional=120.0,
+        buy_levels=1,
+        sell_levels=1,
+        tick_size=0.0001,
+        step_size=0.1,
+        min_qty=0.1,
+        min_notional=5.0,
+    )
+
+    grid_exit_sells = [order for order in plan["sell_orders"] if order["role"] == "grid_exit"]
+    assert grid_exit_sells
+    assert grid_exit_sells[0]["price"] == 0.6583
+    assert all(order["price"] >= 0.6583 for order in plan["sell_orders"])
+
+
 def test_synthetic_neutral_threshold_reduce_freezes_loss_instead_of_forcing_reduce() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["synthetic_neutral"] = True

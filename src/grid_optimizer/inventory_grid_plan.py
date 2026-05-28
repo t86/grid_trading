@@ -961,7 +961,7 @@ def build_inventory_grid_orders(
         planned_closing_qty = 0.0
         sell_reference_price = anchor_price
         if synthetic_neutral:
-            sell_reference_price = max(sell_reference_price, max(_safe_float(ask_price), 0.0) - max(float(step_price), 0.0))
+            sell_reference_price = max(_safe_float(ask_price), 0.0) - max(float(step_price), 0.0)
         elif market_type == "spot":
             sell_reference_price = max(sell_reference_price, max(_safe_float(ask_price), 0.0) - max(float(step_price), 0.0))
         raw_sell_orders: list[dict[str, Any]]
@@ -1144,7 +1144,7 @@ def build_inventory_grid_orders(
 
         exit_price = _round_order_price(anchor_price - step_price, tick_size, "BUY")
         if synthetic_neutral:
-            exit_price = _spot_maker_buy_price(price=exit_price, bid_price=bid_price, tick_size=tick_size)
+            exit_price = _round_order_price(bid_price, tick_size, "BUY")
         exit_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(exit_price, EPSILON), step_size)
         closeable_qty = _round_order_qty(max(held_qty, 0.0), step_size)
         exit_qty = min(exit_qty, closeable_qty)
