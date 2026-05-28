@@ -272,9 +272,24 @@ def _competition_runtime_frozen_net_qty(runtime: dict[str, Any]) -> float:
     return long_qty - short_qty
 
 
-def _competition_position_qty_matches(actual: float, expected: float) -> bool:
-    tolerance = max(EPSILON, max(abs(float(actual)), abs(float(expected)), 1.0) * 1e-9)
+def _competition_position_qty_matches(actual: float, expected: float, *, extra_tolerance: float = 0.0) -> bool:
+    tolerance = max(EPSILON, max(float(extra_tolerance), 0.0), max(abs(float(actual)), abs(float(expected)), 1.0) * 1e-9)
     return abs(float(actual) - float(expected)) <= tolerance
+
+
+def _synthetic_position_qty_tolerance(
+    *,
+    price: float,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> float:
+    tolerance = 0.0
+    if min_qty is not None:
+        tolerance = max(tolerance, max(float(min_qty), 0.0))
+    safe_price = max(_safe_float(price), 0.0)
+    if min_notional is not None and safe_price > EPSILON:
+        tolerance = max(tolerance, max(float(min_notional), 0.0) / safe_price)
+    return tolerance
 
 
 def _competition_runtime_matches_expected_position(
@@ -282,15 +297,16 @@ def _competition_runtime_matches_expected_position(
     *,
     expected_position_qty: float,
     synthetic_neutral: bool,
+    position_qty_tolerance: float = 0.0,
 ) -> bool:
     expected = max(float(expected_position_qty), 0.0)
     runtime_qty = _competition_runtime_position_qty(runtime)
-    if _competition_position_qty_matches(runtime_qty, expected):
+    if _competition_position_qty_matches(runtime_qty, expected, extra_tolerance=position_qty_tolerance):
         return True
     if not synthetic_neutral:
         return False
     frozen_net_qty = _competition_runtime_frozen_net_qty(runtime)
-    return _competition_position_qty_matches(abs(frozen_net_qty), expected)
+    return _competition_position_qty_matches(abs(frozen_net_qty), expected, extra_tolerance=position_qty_tolerance)
 
 
 def _competition_runtime_trade_key(trade: dict[str, Any]) -> str:
@@ -414,6 +430,7 @@ def _resolve_spot_competition_runtime(
     step_price: float,
     current_position_qty: float,
     synthetic_neutral: bool = False,
+    position_qty_tolerance: float = 0.0,
 ) -> dict[str, Any]:
     expected_position_qty = max(float(current_position_qty), 0.0)
     runtime_market_type = "futures" if synthetic_neutral else "spot"
@@ -458,6 +475,7 @@ def _resolve_spot_competition_runtime(
             cached_runtime,
             expected_position_qty=expected_position_qty,
             synthetic_neutral=synthetic_neutral,
+            position_qty_tolerance=position_qty_tolerance,
         ):
             _store_cached_spot_competition_runtime(
                 state=state,
@@ -1737,6 +1755,11 @@ def _build_spot_competition_inventory_grid_orders(
         synthetic_net_qty = 0.0
     raw_synthetic_net_qty = synthetic_net_qty
     current_position_qty = abs(raw_synthetic_net_qty) if synthetic_neutral else resolved_actual_base_qty
+    position_qty_tolerance = (
+        _synthetic_position_qty_tolerance(price=mid_price, min_qty=min_qty, min_notional=min_notional)
+        if synthetic_neutral
+        else 0.0
+    )
     runtime = _resolve_spot_competition_runtime(
         state=state,
         trades=trades,
@@ -1744,6 +1767,7 @@ def _build_spot_competition_inventory_grid_orders(
         step_price=step_price,
         current_position_qty=current_position_qty,
         synthetic_neutral=synthetic_neutral,
+        position_qty_tolerance=position_qty_tolerance,
     )
     if synthetic_neutral:
         runtime["synthetic_neutral"] = True
