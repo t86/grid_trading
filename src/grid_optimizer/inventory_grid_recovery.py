@@ -62,6 +62,7 @@ def rebuild_inventory_grid_runtime(
     order_refs: dict[str, dict[str, Any]],
     step_price: float,
     current_position_qty: float = 0.0,
+    allow_conflicting_bootstrap_fills: bool = False,
 ) -> dict[str, Any]:
     runtime = new_inventory_grid_runtime(market_type=market_type)
 
@@ -105,7 +106,9 @@ def rebuild_inventory_grid_runtime(
                     fill_time_ms=fill_time_ms,
                     step_price=step_price,
                 )
-                runtime["recovery_errors"] = ["conflicting_bootstrap_fills"]
+                if not allow_conflicting_bootstrap_fills:
+                    runtime["recovery_errors"] = ["conflicting_bootstrap_fills"]
+                replayed_any = True
                 continue
 
             apply_inventory_grid_fill(

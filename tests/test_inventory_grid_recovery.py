@@ -52,6 +52,28 @@ def test_rebuild_runtime_marks_conservative_mode_when_both_bootstrap_sides_fill(
     assert "conflicting_bootstrap_fills" in runtime["recovery_errors"]
 
 
+def test_rebuild_runtime_allows_conflicting_bootstrap_when_requested() -> None:
+    runtime = rebuild_inventory_grid_runtime(
+        market_type="futures",
+        trades=[
+            {"id": 1, "time": 1000, "price": "0.1000", "qty": "100", "side": "BUY", "orderId": 11},
+            {"id": 2, "time": 2000, "price": "0.1100", "qty": "50", "side": "SELL", "orderId": 12},
+        ],
+        order_refs={
+            "11": {"role": "bootstrap_entry", "side": "BUY"},
+            "12": {"role": "bootstrap_entry", "side": "SELL"},
+        },
+        step_price=0.01,
+        current_position_qty=50.0,
+        allow_conflicting_bootstrap_fills=True,
+    )
+
+    assert runtime["recovery_mode"] == "live"
+    assert runtime["recovery_errors"] == []
+    assert runtime["direction_state"] == "long_active"
+    assert runtime["position_lots"][0]["qty"] == 50.0
+
+
 def test_rebuild_runtime_marks_conservative_mode_when_order_ref_is_missing() -> None:
     runtime = rebuild_inventory_grid_runtime(
         market_type="futures",

@@ -550,6 +550,7 @@ def _resolve_spot_competition_runtime(
         order_refs=order_refs,
         step_price=step_price,
         current_position_qty=expected_position_qty,
+        allow_conflicting_bootstrap_fills=synthetic_neutral,
     )
     if str(runtime.get("recovery_mode", "live") or "live") == "live":
         _store_cached_spot_competition_runtime(
