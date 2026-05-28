@@ -2087,6 +2087,38 @@ def _build_spot_competition_inventory_grid_orders(
         "synthetic_freeze_manual_release_price": synthetic_freeze_manual_release_price,
     }
     plan = build_inventory_grid_orders(**plan_kwargs)
+    if synthetic_neutral and not (
+        list(plan.get("bootstrap_orders") or [])
+        or list(plan.get("buy_orders") or [])
+        or list(plan.get("sell_orders") or [])
+    ):
+        stale_recovery_mode = str(runtime.get("recovery_mode", "live") or "live").strip().lower() != "live"
+        stale_hard_reduce = str(plan.get("risk_state", "") or "").strip().lower() == "hard_reduce_only"
+        reduce_target_notional = max(_safe_float(threshold_reduce_target_notional), 0.0)
+        resume_notional = max(_safe_float(threshold_position_notional), reduce_target_notional, 0.0)
+        active_notional = abs(_safe_float(synthetic_net_qty)) * mid_price
+        if reduce_target_notional > EPSILON and (
+            stale_recovery_mode or stale_hard_reduce or bool(runtime.get("synthetic_cost_unknown"))
+        ) and (
+            resume_notional <= EPSILON or active_notional <= resume_notional + EPSILON
+        ):
+            runtime["direction_state"] = "flat"
+            runtime["position_lots"] = []
+            runtime["recovery_mode"] = "live"
+            runtime["risk_state"] = "normal"
+            runtime["recovery_errors"] = []
+            runtime.pop("synthetic_cost_unknown", None)
+            synthetic_net_qty = 0.0
+            _store_cached_spot_competition_runtime(
+                state=state,
+                runtime=runtime,
+                applied_trade_keys=_cached_spot_competition_applied_trade_keys(
+                    state=state,
+                    synthetic_neutral=True,
+                ),
+                synthetic_neutral=True,
+            )
+            plan = build_inventory_grid_orders(**plan_kwargs)
     synthetic_freeze_last: dict[str, Any] = {}
     freeze_candidate = plan.get("synthetic_freeze_candidate") if isinstance(plan.get("synthetic_freeze_candidate"), dict) else {}
     if synthetic_neutral and bool(freeze_candidate.get("should_freeze")):
