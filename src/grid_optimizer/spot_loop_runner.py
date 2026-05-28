@@ -2001,7 +2001,11 @@ def _build_spot_competition_inventory_grid_orders(
             return _handle_unknown_cost_runtime(reason=recovery_errors[0] if recovery_errors else "synthetic_cost_unknown")
         if (
             runtime_direction_state != expected_direction_state
-            or abs(active_lot_qty - active_position_qty) > max(active_position_qty, 1.0) * 1e-9
+            or not _competition_position_qty_matches(
+                active_lot_qty,
+                active_position_qty,
+                extra_tolerance=position_qty_tolerance,
+            )
         ):
             runtime["direction_state"] = expected_direction_state
             runtime["recovery_mode"] = "live"

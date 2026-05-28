@@ -788,6 +788,64 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(controls["recovery_mode"], "live")
         self.assertAlmostEqual(cached_runtime["frozen_position_lots"][0]["qty"], 3841.22908)
 
+    def test_synthetic_neutral_active_lot_tolerates_residual_dust_after_fill(self) -> None:
+        runtime = new_inventory_grid_runtime(market_type="futures")
+        runtime["synthetic_neutral"] = True
+        state = {
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "known_orders": {
+                "1": {"role": "bootstrap_entry", "side": "BUY"},
+            },
+            "spot_competition_synthetic_neutral_grid_runtime_cache": {
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "market_type": "futures",
+                "runtime": runtime,
+                "applied_trade_keys": [],
+            },
+        }
+
+        _desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state=state,
+            trades=[
+                {
+                    "time": 1000,
+                    "id": 10,
+                    "orderId": 1,
+                    "price": "0.1806",
+                    "qty": "1495.0",
+                }
+            ],
+            bid_price=0.1805,
+            ask_price=0.1807,
+            step_price=0.0002,
+            buy_levels=3,
+            sell_levels=3,
+            first_order_multiplier=1.5,
+            per_order_notional=180.0,
+            threshold_position_notional=600.0,
+            threshold_reduce_target_notional=500.0,
+            max_order_position_notional=7000.0,
+            max_position_notional=8200.0,
+            tick_size=0.0001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=10000.0,
+            max_short_position_notional=1200.0,
+            actual_base_qty=11495.72908,
+            synthetic_freeze_enabled=True,
+            synthetic_freeze_loss_ratio=0.01,
+            synthetic_freeze_min_notional=20.0,
+        )
+
+        cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
+        self.assertEqual(cached_runtime["recovery_mode"], "live")
+        self.assertFalse(cached_runtime.get("synthetic_cost_unknown"))
+        self.assertEqual(controls["recovery_mode"], "live")
+        self.assertAlmostEqual(cached_runtime["position_lots"][0]["qty"], 1495.0)
+        self.assertNotEqual(cached_runtime["position_lots"][0].get("lot_id"), "synthetic_recovered")
+
     def test_synthetic_neutral_runtime_replays_opposite_bootstrap_fill(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="futures")
         runtime["synthetic_neutral"] = True
