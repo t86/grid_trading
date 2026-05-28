@@ -1,13 +1,13 @@
 # PHAROS Frozen Inventory Ledger Experiment
 
-This document defines the PHAROSUSDT frozen inventory ledger experiment for the
-hedge best-quote maker-volume runner. It is a strategy experiment, not an
-exchange account mode change.
+This document defines the frozen inventory ledger experiment for hedge
+best-quote maker-volume runners. It is a strategy experiment, not an exchange
+account mode change.
 
 ## Scope
 
-The experiment is intended for `114` first. `150` should stay on the normal
-PHAROS Hedge BQ configuration unless explicitly moved into the experiment.
+The frozen strategy applies consistently to every symbol that runs hedge BQ with
+freeze enabled, including `PHAROSUSDT` and `OPGUSDT` on `114` and `150`.
 
 Production paths:
 
@@ -15,8 +15,7 @@ Production paths:
 - `150`: `/home/ubuntu/wangge_api2_repo` and `/home/ubuntu/wangge_api2`, runner
   `/usr/local/bin/grid-saved-runner-api2`
 
-The current experiment is for `PHAROSUSDT` with strategy mode
-`hedge_best_quote_maker_volume_v1`.
+The current experiment is for strategy mode `hedge_best_quote_maker_volume_v1`.
 
 ## Intent
 
@@ -30,15 +29,21 @@ The strategy is split into two conceptual layers:
 The desired behavior is:
 
 - keep BQ volume running when inventory is manageable;
-- when normal reduce starts to become expensive, stop chasing reduce orders;
-- isolate the losing inventory into a strategy ledger;
+- when volume-layer inventory repeatedly crosses the configured loss threshold
+  and normal reduce cannot solve it, isolate that losing inventory into a
+  strategy ledger;
 - remove the frozen inventory from BQ risk metrics and budget calculations;
-- allow later manual or strategy-directed cleanup without reopening the same
-  loss spiral.
+- normally exit frozen inventory only through profitable paired frozen
+  long/short release or explicit manual intervention.
 
 The ledger is a strategy accounting layer. It does not move positions to
 Binance isolated margin and does not create a separate exchange-side position.
 Exchange-side long/short position remains the actual source of truth.
+
+In a ranging market, the intended effect is balanced inventory loss buffering:
+highs may accumulate frozen shorts, lows may accumulate frozen longs, and the
+ledger can offset part of what would otherwise become hard loss. Frozen
+inventory must survive runner restarts, parameter reloads, and state resets.
 
 ## Independent Accounting Model
 
@@ -110,6 +115,17 @@ If the candidate side, managed quantity, effective threshold, or stress state
 changes before confirmation completes, the confirmation count restarts. This is
 intentional: it prevents a short-lived 1% touch, or rapidly changing managed
 inventory, from immediately creating a new frozen lot.
+
+Long and short entry conditions must be symmetric. The same configured
+threshold, minimum notional, and confirmation-cycle count must apply to both
+sides, with only the loss-ratio formula changing sign as shown above. The
+freeze-entry check must not raise or lower one side's threshold because that
+side already has frozen inventory; side-specific frozen-pressure dynamic
+thresholds are disabled for this strategy because they bias future freeze entry.
+
+`reduce_freeze` is legacy naming. This mechanism is a transfer from the normal
+BQ ledger into the frozen ledger; it is not a reduce order and not a cleanup
+exit.
 
 ## Ledger Fields
 

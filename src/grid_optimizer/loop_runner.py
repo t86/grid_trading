@@ -14185,6 +14185,38 @@ def _validate_multi_timeframe_bias_args(args: argparse.Namespace) -> None:
         )
 
 
+def _validate_best_quote_frozen_inventory_principles(args: argparse.Namespace) -> None:
+    if not bool(getattr(args, "best_quote_maker_volume_reduce_freeze_enabled", False)):
+        return
+    if bool(getattr(args, "best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled", False)):
+        raise SystemExit(
+            "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-enabled cannot be enabled; "
+            "frozen entry thresholds must stay symmetric and must not depend on existing side-specific "
+            "frozen inventory"
+        )
+    if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)):
+        raise SystemExit(
+            "--best-quote-maker-volume-allow-loss-reduce-only cannot be enabled with "
+            "--best-quote-maker-volume-reduce-freeze-enabled"
+        )
+    if not bool(getattr(args, "best_quote_maker_volume_take_profit_guard_enabled", True)):
+        raise SystemExit(
+            "--best-quote-maker-volume-take-profit-guard-enabled must stay enabled when "
+            "--best-quote-maker-volume-reduce-freeze-enabled is active"
+        )
+    if bool(getattr(args, "best_quote_maker_volume_frozen_pair_release_enabled", False)):
+        if bool(getattr(args, "best_quote_maker_volume_frozen_pair_release_allow_loss", False)):
+            raise SystemExit(
+                "--best-quote-maker-volume-frozen-pair-release-allow-loss cannot be enabled; "
+                "frozen inventory may exit only by profitable pair release or explicit manual cleanup"
+            )
+        if _safe_float(getattr(args, "best_quote_maker_volume_frozen_pair_release_min_profit_ratio", 0.0)) <= 0:
+            raise SystemExit(
+                "--best-quote-maker-volume-frozen-pair-release-min-profit-ratio must be > 0 "
+                "when frozen pair release is enabled"
+            )
+
+
 def _elastic_volume_config(args: argparse.Namespace) -> ElasticVolumeConfig:
     return ElasticVolumeConfig(
         enabled=bool(getattr(args, "elastic_volume_enabled", False)),
@@ -21933,6 +21965,7 @@ def main() -> None:
     if args.multi_timeframe_bias_scheduler_reduce_max_order_scale <= 0 or args.multi_timeframe_bias_scheduler_reduce_max_order_scale > 1:
         raise SystemExit("--multi-timeframe-bias-scheduler-reduce-max-order-scale must be within (0, 1]")
     _validate_multi_timeframe_bias_args(args)
+    _validate_best_quote_frozen_inventory_principles(args)
     if args.elastic_volume_enabled and str(args.elastic_volume_mode).strip() != "competition_elastic_volume_v1":
         raise SystemExit("--elastic-volume-mode must be competition_elastic_volume_v1")
     if args.adaptive_regime_router_enabled and str(args.adaptive_regime_router_mode).strip() != "profit_adaptive_v1":

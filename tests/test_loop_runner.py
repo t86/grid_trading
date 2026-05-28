@@ -21,6 +21,7 @@ from grid_optimizer.loop_runner import (
     AUTO_REGIME_PROFILE_LABELS,
     AUDIT_SYNC_MIN_INTERVAL_SECONDS,
     _build_parser,
+    _validate_best_quote_frozen_inventory_principles,
     _validate_multi_timeframe_bias_args,
     _should_sync_account_audit,
     _uses_entry_price_cost_basis,
@@ -13681,6 +13682,56 @@ class LoopRunnerTests(unittest.TestCase):
 
         with self.assertRaises(SystemExit):
             _validate_multi_timeframe_bias_args(args)
+
+    def test_best_quote_frozen_inventory_principles_allow_safe_config(self) -> None:
+        args = Namespace(
+            best_quote_maker_volume_reduce_freeze_enabled=True,
+            best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled=False,
+            best_quote_maker_volume_allow_loss_reduce_only=False,
+            best_quote_maker_volume_take_profit_guard_enabled=True,
+            best_quote_maker_volume_frozen_pair_release_enabled=True,
+            best_quote_maker_volume_frozen_pair_release_allow_loss=False,
+            best_quote_maker_volume_frozen_pair_release_min_profit_ratio=0.00008,
+        )
+
+        _validate_best_quote_frozen_inventory_principles(args)
+
+    def test_best_quote_frozen_inventory_principles_reject_side_dynamic_threshold(self) -> None:
+        args = Namespace(
+            best_quote_maker_volume_reduce_freeze_enabled=True,
+            best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled=True,
+            best_quote_maker_volume_allow_loss_reduce_only=False,
+            best_quote_maker_volume_take_profit_guard_enabled=True,
+            best_quote_maker_volume_frozen_pair_release_enabled=True,
+            best_quote_maker_volume_frozen_pair_release_allow_loss=False,
+            best_quote_maker_volume_frozen_pair_release_min_profit_ratio=0.00008,
+        )
+
+        with self.assertRaises(SystemExit):
+            _validate_best_quote_frozen_inventory_principles(args)
+
+    def test_best_quote_frozen_inventory_principles_reject_loss_exits(self) -> None:
+        base = {
+            "best_quote_maker_volume_reduce_freeze_enabled": True,
+            "best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled": False,
+            "best_quote_maker_volume_allow_loss_reduce_only": False,
+            "best_quote_maker_volume_take_profit_guard_enabled": True,
+            "best_quote_maker_volume_frozen_pair_release_enabled": True,
+            "best_quote_maker_volume_frozen_pair_release_allow_loss": False,
+            "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.00008,
+        }
+        cases = (
+            {"best_quote_maker_volume_allow_loss_reduce_only": True},
+            {"best_quote_maker_volume_take_profit_guard_enabled": False},
+            {"best_quote_maker_volume_frozen_pair_release_allow_loss": True},
+            {"best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.0},
+        )
+
+        for override in cases:
+            with self.subTest(override=override):
+                args = Namespace(**{**base, **override})
+                with self.assertRaises(SystemExit):
+                    _validate_best_quote_frozen_inventory_principles(args)
 
     def test_resolve_adaptive_step_uses_5m_amplitude_for_choppy_expansion(self) -> None:
         now = datetime(2026, 4, 30, 6, 0, tzinfo=timezone.utc)
