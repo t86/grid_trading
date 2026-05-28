@@ -331,6 +331,40 @@ def _cap_lot_plan_qty(*, lot_plan: dict[str, Any], max_qty: float) -> dict[str, 
     return capped_plan
 
 
+def _lossy_lot_plan(
+    *,
+    lot_plan: dict[str, Any],
+    reduce_price: float,
+    direction_state: str,
+    loss_ratio_threshold: float,
+) -> dict[str, Any]:
+    safe_reduce_price = max(_safe_float(reduce_price), 0.0)
+    threshold = max(_safe_float(loss_ratio_threshold), 0.0)
+    lossy_lots: list[dict[str, Any]] = []
+    for lot in list(lot_plan.get("lots") or []):
+        if not isinstance(lot, dict):
+            continue
+        qty = max(_safe_float(lot.get("qty")), 0.0)
+        entry_price = max(_safe_float(lot.get("entry_price")), 0.0)
+        if qty <= EPSILON or entry_price <= EPSILON:
+            continue
+        if direction_state == "long_active":
+            loss_ratio = max((entry_price - safe_reduce_price) / entry_price, 0.0)
+        elif direction_state == "short_active":
+            loss_ratio = max((safe_reduce_price - entry_price) / entry_price, 0.0)
+        else:
+            loss_ratio = 0.0
+        if loss_ratio + EPSILON < threshold or loss_ratio <= EPSILON:
+            continue
+        lossy_lot = dict(lot)
+        lossy_lot["freeze_loss_ratio"] = loss_ratio
+        lossy_lots.append(lossy_lot)
+
+    lossy_plan = dict(lot_plan)
+    lossy_plan["lots"] = lossy_lots
+    return lossy_plan
+
+
 def _synthetic_freeze_candidate(
     *,
     enabled: bool,
@@ -361,6 +395,12 @@ def _synthetic_freeze_candidate(
         max_freeze_qty = cap_remaining_notional / max(cap_unit_price, EPSILON)
         capped_by_max_side_notional = max_freeze_qty + EPSILON < original_qty
         lot_plan = _cap_lot_plan_qty(lot_plan=lot_plan, max_qty=max_freeze_qty)
+    lot_plan = _lossy_lot_plan(
+        lot_plan=lot_plan,
+        reduce_price=reduce_price,
+        direction_state=direction_state,
+        loss_ratio_threshold=loss_ratio_threshold,
+    )
 
     stats = _synthetic_reduce_loss_stats(
         lot_plan=lot_plan,
