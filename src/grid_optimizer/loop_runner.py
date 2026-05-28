@@ -14274,11 +14274,6 @@ def _validate_best_quote_frozen_inventory_principles(args: argparse.Namespace) -
             "frozen entry thresholds must stay symmetric and must not depend on existing side-specific "
             "frozen inventory"
         )
-    if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)):
-        raise SystemExit(
-            "--best-quote-maker-volume-allow-loss-reduce-only cannot be enabled with "
-            "--best-quote-maker-volume-reduce-freeze-enabled"
-        )
     if not bool(getattr(args, "best_quote_maker_volume_take_profit_guard_enabled", True)):
         raise SystemExit(
             "--best-quote-maker-volume-take-profit-guard-enabled must stay enabled when "
