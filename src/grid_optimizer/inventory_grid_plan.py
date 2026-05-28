@@ -1035,7 +1035,9 @@ def build_inventory_grid_orders(
                 )
             else:
                 buy_reference_price = anchor_price
-                if market_type == "spot":
+                if synthetic_neutral:
+                    buy_reference_price = max(_safe_float(bid_price), 0.0) + max(_safe_float(step_price), 0.0)
+                elif market_type == "spot":
                     buy_reference_price = _spot_long_entry_reference_price(
                         anchor_price=anchor_price,
                         bid_price=bid_price,
@@ -1166,7 +1168,7 @@ def build_inventory_grid_orders(
         if entry_allowed:
             entry_price = _round_order_price(anchor_price + step_price, tick_size, "SELL")
             if synthetic_neutral:
-                entry_price = _spot_maker_sell_price(price=entry_price, ask_price=ask_price, tick_size=tick_size)
+                entry_price = _round_order_price(ask_price, tick_size, "SELL")
             entry_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(entry_price, EPSILON), step_size)
             if entry_qty > 0 and (min_qty is None or entry_qty >= min_qty) and (
                 min_notional is None or entry_qty * entry_price >= min_notional
