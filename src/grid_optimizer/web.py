@@ -14969,6 +14969,267 @@ def _build_spot_runner_snapshot(symbol: str | None = None) -> dict[str, Any]:
         snapshot["warnings"].append(f"{type(exc).__name__}: {exc}")
     return snapshot
 
+
+def _spot_monitor_time_ms(value: Any) -> int:
+    if value is None or value == "":
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return 0
+    try:
+        return int(float(text))
+    except ValueError:
+        parsed = _parse_utc_datetime(text)
+        return int(parsed.timestamp() * 1000) if parsed is not None else 0
+
+
+def _spot_monitor_bucket_start(ts_ms: int, granularity: str) -> datetime | None:
+    if ts_ms <= 0:
+        return None
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+    if granularity == "day":
+        return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+
+def _spot_monitor_trade_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    raw_id = str(row.get("id") or row.get("orderId") or row.get("order_id") or "").strip()
+    if raw_id:
+        return ("id", raw_id)
+    return (
+        "fill",
+        _spot_monitor_time_ms(row.get("time") or row.get("ts")),
+        str(row.get("side") or "").upper().strip(),
+        str(row.get("price") or "").strip(),
+        str(row.get("qty") or row.get("quantity") or "").strip(),
+    )
+
+
+def _spot_monitor_trade_notional(row: dict[str, Any]) -> float:
+    explicit = _status_float(row.get("notional"))
+    if explicit > 0:
+        return explicit
+    return _status_float(row.get("price")) * _status_float(row.get("qty") if row.get("qty") is not None else row.get("quantity"))
+
+
+def _spot_monitor_trade_commission_quote(row: dict[str, Any]) -> float:
+    for key in ("commission_quote", "commission_usdt", "commission"):
+        value = abs(_status_float(row.get(key)))
+        if value > 0:
+            return value
+    return 0.0
+
+
+def _spot_monitor_event_equity_usdt(row: dict[str, Any]) -> tuple[float | None, str | None]:
+    for key in ("equity_usdt", "account_equity_usdt", "spot_equity_usdt"):
+        value = _status_float(row.get(key))
+        if value > 0:
+            return value, key
+    mid_price = _status_float(row.get("mid_price") or row.get("mark_price"))
+    quote_qty = _status_float(row.get("quote_free")) + _status_float(row.get("quote_locked"))
+    base_qty = (
+        _status_float(row.get("base_free"))
+        + _status_float(row.get("base_locked"))
+        + _status_float(row.get("inventory_qty"))
+    )
+    if mid_price > 0 and (quote_qty > 0 or base_qty > 0):
+        return quote_qty + base_qty * mid_price, "balances_mid_price"
+    inventory_cost = _status_float(row.get("inventory_cost_quote"))
+    net_pnl = _status_float(row.get("net_pnl_estimate"))
+    if inventory_cost > 0 or net_pnl:
+        return inventory_cost + net_pnl, "inventory_cost_plus_pnl"
+    return None, None
+
+
+def _empty_spot_monitor_bucket(bucket_start: datetime) -> dict[str, Any]:
+    return {
+        "bucket_start": bucket_start.isoformat(),
+        "gross_notional": 0.0,
+        "buy_notional": 0.0,
+        "sell_notional": 0.0,
+        "trade_count": 0,
+        "buy_count": 0,
+        "sell_count": 0,
+        "realized_pnl": 0.0,
+        "commission_quote": 0.0,
+        "net_realized": 0.0,
+        "equity_start_usdt": None,
+        "equity_end_usdt": None,
+        "equity_delta_usdt": None,
+        "equity_loss_usdt": None,
+        "loss_bps": None,
+        "equity_source": None,
+    }
+
+
+def _spot_monitor_rows(
+    *,
+    trades: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    granularity: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    buckets: dict[datetime, dict[str, Any]] = {}
+    equity_points: dict[datetime, list[tuple[int, float, str]]] = {}
+
+    def ensure_bucket(bucket_start: datetime) -> dict[str, Any]:
+        bucket = buckets.get(bucket_start)
+        if bucket is None:
+            bucket = _empty_spot_monitor_bucket(bucket_start)
+            buckets[bucket_start] = bucket
+        return bucket
+
+    seen_trades: set[tuple[Any, ...]] = set()
+    for trade in trades:
+        if not isinstance(trade, dict):
+            continue
+        key = _spot_monitor_trade_key(trade)
+        if key in seen_trades:
+            continue
+        seen_trades.add(key)
+        ts_ms = _spot_monitor_time_ms(trade.get("time") or trade.get("ts"))
+        bucket_start = _spot_monitor_bucket_start(ts_ms, granularity)
+        if bucket_start is None:
+            continue
+        bucket = ensure_bucket(bucket_start)
+        notional = _spot_monitor_trade_notional(trade)
+        side = str(trade.get("side") or "").upper().strip()
+        realized = _status_float(trade.get("realized_pnl") if trade.get("realized_pnl") is not None else trade.get("realizedPnl"))
+        commission = _spot_monitor_trade_commission_quote(trade)
+        bucket["gross_notional"] += notional
+        bucket["trade_count"] += 1
+        bucket["realized_pnl"] += realized
+        bucket["commission_quote"] += commission
+        bucket["net_realized"] += realized - commission
+        if side == "BUY":
+            bucket["buy_notional"] += notional
+            bucket["buy_count"] += 1
+        elif side == "SELL":
+            bucket["sell_notional"] += notional
+            bucket["sell_count"] += 1
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        ts_ms = _spot_monitor_time_ms(event.get("ts") or event.get("time"))
+        bucket_start = _spot_monitor_bucket_start(ts_ms, granularity)
+        if bucket_start is None:
+            continue
+        equity, source = _spot_monitor_event_equity_usdt(event)
+        if equity is None or source is None:
+            continue
+        ensure_bucket(bucket_start)
+        equity_points.setdefault(bucket_start, []).append((ts_ms, equity, source))
+
+    rows: list[dict[str, Any]] = []
+    for bucket_start in sorted(buckets.keys(), reverse=True):
+        bucket = dict(buckets[bucket_start])
+        points = sorted(equity_points.get(bucket_start) or [], key=lambda item: item[0])
+        if points:
+            start_equity = points[0][1]
+            end_equity = points[-1][1]
+            delta = end_equity - start_equity
+            bucket["equity_start_usdt"] = start_equity
+            bucket["equity_end_usdt"] = end_equity
+            bucket["equity_delta_usdt"] = delta
+            bucket["equity_loss_usdt"] = max(-delta, 0.0)
+            bucket["equity_source"] = points[-1][2]
+            gross = float(bucket["gross_notional"] or 0.0)
+            bucket["loss_bps"] = (bucket["equity_loss_usdt"] / gross * 10000.0) if gross > 0 else None
+        rows.append(bucket)
+    return rows[: max(int(limit), 1)]
+
+
+def _spot_monitor_symbol_payload(symbol: str, *, granularity: str, limit: int) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    config = _load_spot_runner_control_config(normalized_symbol)
+    normalized_symbol = str(config.get("symbol") or normalized_symbol).upper().strip()
+    state = _read_json_dict(Path(str(config.get("state_path") or ""))) or {}
+    metrics = state.get("metrics") if isinstance(state.get("metrics"), dict) else {}
+    trades = metrics.get("recent_trades") if isinstance(metrics.get("recent_trades"), list) else []
+    events = _tail_jsonl_dicts(Path(str(config.get("summary_jsonl") or "")), limit=5000)
+    runner = _read_spot_runner_process_for_symbol(normalized_symbol)
+    rows = _spot_monitor_rows(trades=trades, events=events, granularity=granularity, limit=limit)
+    return {
+        "symbol": normalized_symbol,
+        "is_running": bool(runner.get("is_running")),
+        "pid": runner.get("pid"),
+        "strategy_mode": str(config.get("strategy_mode") or ""),
+        "state_path": config.get("state_path"),
+        "summary_jsonl": config.get("summary_jsonl"),
+        "rows": rows,
+        "summary": {
+            "gross_notional": sum(float(row.get("gross_notional") or 0.0) for row in rows),
+            "equity_loss_usdt": sum(float(row.get("equity_loss_usdt") or 0.0) for row in rows),
+            "commission_quote": sum(float(row.get("commission_quote") or 0.0) for row in rows),
+            "trade_count": sum(int(row.get("trade_count") or 0) for row in rows),
+        },
+    }
+
+
+def _normalize_spot_monitor_granularity(value: Any) -> str:
+    granularity = str(value or "hour").strip().lower()
+    if granularity not in {"hour", "day"}:
+        raise ValueError("granularity must be hour or day")
+    return granularity
+
+
+def _normalize_spot_monitor_limit(value: Any) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return 24
+    return min(max(limit, 1), 90)
+
+
+def _build_spot_monitor_payload(
+    *,
+    symbols: list[str] | None = None,
+    granularity: str = "hour",
+    limit: int = 24,
+) -> dict[str, Any]:
+    normalized_granularity = _normalize_spot_monitor_granularity(granularity)
+    normalized_limit = _normalize_spot_monitor_limit(limit)
+    symbol_list = [str(item or "").upper().strip() for item in (symbols or []) if str(item or "").strip()]
+    if not symbol_list:
+        symbol_list = _running_status_spot_symbols()
+    if not symbol_list:
+        symbol_list = ["XAUTUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"]
+    seen: set[str] = set()
+    unique_symbols = []
+    for symbol in symbol_list:
+        if symbol not in seen:
+            seen.add(symbol)
+            unique_symbols.append(symbol)
+    symbol_payloads = [
+        _spot_monitor_symbol_payload(symbol, granularity=normalized_granularity, limit=normalized_limit)
+        for symbol in unique_symbols
+    ]
+    return {
+        "ok": True,
+        "granularity": normalized_granularity,
+        "limit": normalized_limit,
+        "symbols": symbol_payloads,
+        "summary": {
+            "symbol_count": len(symbol_payloads),
+            "gross_notional": sum(float(item["summary"].get("gross_notional") or 0.0) for item in symbol_payloads),
+            "equity_loss_usdt": sum(float(item["summary"].get("equity_loss_usdt") or 0.0) for item in symbol_payloads),
+            "commission_quote": sum(float(item["summary"].get("commission_quote") or 0.0) for item in symbol_payloads),
+            "trade_count": sum(int(item["summary"].get("trade_count") or 0) for item in symbol_payloads),
+        },
+    }
+
+
+def _run_spot_monitor_query(query: dict[str, list[str]]) -> dict[str, Any]:
+    raw_symbols = str(query.get("symbols", query.get("symbol", [""]))[0] or "")
+    symbols = [item.strip().upper() for item in raw_symbols.split(",") if item.strip()]
+    granularity = query.get("granularity", ["hour"])[0]
+    limit = _normalize_spot_monitor_limit(query.get("limit", ["24"])[0])
+    return _build_spot_monitor_payload(symbols=symbols, granularity=str(granularity), limit=limit)
+
+
 SERVER_HUB_PAGE = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -15534,6 +15795,7 @@ HTML_PAGE = """<!doctype html>
         <a href="/basis">打开现货/合约价差监控页</a>
         <a href="/monitor">打开实盘网格监控页</a>
         <a href="/spot_runner">打开现货执行台</a>
+        <a href="/spot_monitor">打开现货成交监控页</a>
         <a href="/strategies">打开策略总览页</a>
       </div>
     </section>
@@ -29628,6 +29890,152 @@ AI_SCHEDULER_RESULTS_PAGE = """<!doctype html>
 """
 
 
+SPOT_MONITOR_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>现货成交监控</title>
+  <style>
+    :root { color-scheme: light; --bg:#f6f7f8; --panel:#ffffff; --text:#172026; --muted:#66727c; --line:#d9e0e6; --good:#057a55; --bad:#b42318; --accent:#155eef; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family:"Avenir Next","PingFang SC","Microsoft YaHei",sans-serif; color:var(--text); background:var(--bg); }
+    header { padding:20px 24px 12px; border-bottom:1px solid var(--line); background:var(--panel); }
+    h1 { margin:0 0 12px; font-size:24px; letter-spacing:0; }
+    .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:end; }
+    label { display:grid; gap:5px; color:var(--muted); font-size:12px; }
+    input, select, button { height:34px; border:1px solid var(--line); border-radius:6px; padding:0 10px; background:#fff; color:var(--text); font:inherit; }
+    input { min-width:280px; }
+    button { background:var(--accent); color:#fff; border-color:var(--accent); cursor:pointer; }
+    main { padding:16px 24px 32px; display:grid; gap:14px; }
+    .metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px; }
+    .metric, section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
+    .label { color:var(--muted); font-size:12px; }
+    .value { margin-top:4px; font-size:22px; font-weight:700; }
+    .good { color:var(--good); }
+    .bad { color:var(--bad); }
+    .meta { color:var(--muted); font-size:13px; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { padding:8px 10px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }
+    th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align:left; }
+    th { color:var(--muted); font-weight:600; background:#f9fafb; }
+    .empty { padding:20px; color:var(--muted); text-align:center; }
+    @media (max-width: 720px) { header, main { padding-left:12px; padding-right:12px; } input { min-width:100%; } .table-wrap { overflow:auto; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>现货成交监控</h1>
+    <div class="toolbar">
+      <label>币种<input id="symbols" placeholder="留空自动读取本机现货 runner" value="" /></label>
+      <label>周期<select id="granularity"><option value="hour">按小时</option><option value="day">按天</option></select></label>
+      <label>行数<input id="limit" type="number" min="1" max="90" value="24" /></label>
+      <button id="refresh">刷新</button>
+      <a href="/spot_runner">现货执行台</a>
+      <a href="/spot_strategies">现货总览</a>
+    </div>
+  </header>
+  <main>
+    <div id="status" class="meta">等待刷新</div>
+    <div class="metrics" id="summary"></div>
+    <section>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>币种</th><th>周期开始</th><th>成交额</th><th>买入</th><th>卖出</th><th>权益变化</th><th>权益损耗</th><th>损耗bps</th><th>手续费</th><th>成交数</th><th>权益口径</th>
+            </tr>
+          </thead>
+          <tbody id="rows"><tr><td colspan="11" class="empty">暂无数据</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <script>
+    const symbolsEl = document.getElementById("symbols");
+    const granularityEl = document.getElementById("granularity");
+    const limitEl = document.getElementById("limit");
+    const refreshBtn = document.getElementById("refresh");
+    const statusEl = document.getElementById("status");
+    const summaryEl = document.getElementById("summary");
+    const rowsEl = document.getElementById("rows");
+    function fmtNum(value, digits = 2) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return "--";
+      return n.toLocaleString("en-US", { maximumFractionDigits: digits });
+    }
+    function fmtMoney(value) {
+      let n = Number(value);
+      if (!Number.isFinite(n)) return "--";
+      if (Math.abs(n) < 1e-9) n = 0;
+      return `${n > 0 ? "+" : ""}${fmtNum(n, 4)}U`;
+    }
+    function cls(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n === 0) return "";
+      return n > 0 ? "good" : "bad";
+    }
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+    }
+    function render(payload) {
+      const summary = payload.summary || {};
+      summaryEl.innerHTML = [
+        ["监控币种", fmtNum(summary.symbol_count || 0, 0), ""],
+        ["成交额", `${fmtNum(summary.gross_notional || 0, 2)}U`, ""],
+        ["权益损耗", fmtMoney(-(summary.equity_loss_usdt || 0)), "bad"],
+        ["手续费", fmtMoney(-(summary.commission_quote || 0)), "bad"],
+      ].map(([label, value, klass]) => `<div class="metric"><div class="label">${esc(label)}</div><div class="value ${klass}">${esc(value)}</div></div>`).join("");
+      const rows = [];
+      for (const item of payload.symbols || []) {
+        for (const row of item.rows || []) rows.push({ symbol:item.symbol, ...row });
+      }
+      if (!rows.length) {
+        rowsEl.innerHTML = '<tr><td colspan="11" class="empty">暂无现货成交或权益记录</td></tr>';
+        return;
+      }
+      rowsEl.innerHTML = rows.map(row => `
+        <tr>
+          <td>${esc(row.symbol)}</td>
+          <td>${esc(String(row.bucket_start || "").replace("+00:00", "Z"))}</td>
+          <td>${esc(fmtNum(row.gross_notional, 2))}</td>
+          <td>${esc(fmtNum(row.buy_notional, 2))}</td>
+          <td>${esc(fmtNum(row.sell_notional, 2))}</td>
+          <td class="${cls(row.equity_delta_usdt)}">${esc(fmtMoney(row.equity_delta_usdt))}</td>
+          <td class="bad">${esc(row.equity_loss_usdt === null || row.equity_loss_usdt === undefined ? "--" : fmtMoney(-row.equity_loss_usdt))}</td>
+          <td>${esc(row.loss_bps === null || row.loss_bps === undefined ? "--" : fmtNum(row.loss_bps, 2))}</td>
+          <td class="bad">${esc(fmtMoney(-(row.commission_quote || 0)))}</td>
+          <td>${esc(fmtNum(row.trade_count || 0, 0))}</td>
+          <td>${esc(row.equity_source || "--")}</td>
+        </tr>
+      `).join("");
+    }
+    async function load() {
+      statusEl.textContent = "正在刷新...";
+      const qs = new URLSearchParams({
+        symbols: symbolsEl.value,
+        granularity: granularityEl.value,
+        limit: limitEl.value || "24",
+      });
+      try {
+        const resp = await fetch(`/api/spot_monitor?${qs.toString()}`);
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        render(data);
+        statusEl.textContent = `最后刷新：${new Date().toLocaleString()}，权益列为折 U 估算口径`;
+      } catch (err) {
+        rowsEl.innerHTML = `<tr><td colspan="11" class="empty">加载失败：${esc(err)}</td></tr>`;
+        statusEl.textContent = `刷新失败：${err}`;
+      }
+    }
+    refreshBtn.addEventListener("click", load);
+    load();
+  </script>
+</body>
+</html>
+"""
+
+
 SPOT_RUNNER_PAGE = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -29776,6 +30184,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         <a href="/">返回测算页</a>
         <a href="/monitor">打开合约实盘监控</a>
         <a href="/basis">打开现货/合约价差监控</a>
+        <a href="/spot_monitor">打开现货成交监控</a>
         <a href="/spot_strategies">打开现货总览</a>
         <a href="/strategies">打开策略总览</a>
       </div>
@@ -30833,6 +31242,7 @@ SPOT_STRATEGIES_PAGE = """<!doctype html>
       <div class="links">
         <a href="/">返回测算页</a>
         <a href="/spot_runner">打开现货执行台</a>
+        <a href="/spot_monitor">打开现货成交监控</a>
         <a href="/monitor">打开合约实盘监控</a>
         <a href="/strategies">打开合约总览</a>
       </div>
@@ -36325,6 +36735,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path in {"/spot_runner", "/spot_runner.html"}:
             self._send_html(SPOT_RUNNER_PAGE, status=HTTPStatus.OK)
             return
+        if path in {"/spot_monitor", "/spot_monitor.html"}:
+            self._send_html(SPOT_MONITOR_PAGE, status=HTTPStatus.OK)
+            return
         if path in {"/spot_strategies", "/spot_strategies.html"}:
             self._send_html(SPOT_STRATEGIES_PAGE, status=HTTPStatus.OK)
             return
@@ -36475,6 +36888,17 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
                 return
             self._send_json({"ok": True, "snapshot": snapshot}, status=HTTPStatus.OK)
+            return
+        if path == "/api/spot_monitor":
+            try:
+                payload = _run_spot_monitor_query(query)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json(payload, status=HTTPStatus.OK)
             return
         if path == "/api/manual_trade/status":
             symbol = str(query.get("symbol", ["BTCUSDT"])[0]).upper().strip() or "BTCUSDT"
@@ -36772,6 +37196,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
             return
+        if path in {"/spot_monitor", "/spot_monitor.html"}:
+            body = SPOT_MONITOR_PAGE.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
         if path in {"/spot_strategies", "/spot_strategies.html"}:
             body = SPOT_STRATEGIES_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -36805,6 +37235,7 @@ class _Handler(BaseHTTPRequestHandler):
             or path == "/api/competition_board"
             or path == "/api/master_sprint_board"
             or path == "/api/spot_runner/status"
+            or path == "/api/spot_monitor"
             or path == "/api/spot_runner/save"
             or path == "/api/manual_trade/status"
         ):

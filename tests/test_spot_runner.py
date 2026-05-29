@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -9,8 +10,10 @@ from unittest.mock import MagicMock, patch
 import grid_optimizer.web as web
 from grid_optimizer.web import (
     SPOT_RUNNER_DEFAULT_CONFIG,
+    SPOT_MONITOR_PAGE,
     SPOT_RUNNER_PAGE,
     SPOT_STRATEGIES_PAGE,
+    _build_spot_monitor_payload,
     _build_spot_runner_snapshot,
     _build_spot_runner_command,
     _normalize_spot_runner_payload,
@@ -40,6 +43,151 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn('id="symbols_input"', SPOT_STRATEGIES_PAGE)
         self.assertIn("/api/spot_runner/status", SPOT_STRATEGIES_PAGE)
         self.assertIn('value="XAUTUSDT,SAHARAUSDT,NIGHTUSDT,CFGUSDT"', SPOT_STRATEGIES_PAGE)
+
+    def test_spot_monitor_page_contains_hour_day_controls(self) -> None:
+        self.assertIn("现货成交监控", SPOT_MONITOR_PAGE)
+        self.assertIn('id="granularity"', SPOT_MONITOR_PAGE)
+        self.assertIn('value="hour"', SPOT_MONITOR_PAGE)
+        self.assertIn('value="day"', SPOT_MONITOR_PAGE)
+        self.assertIn('placeholder="留空自动读取本机现货 runner"', SPOT_MONITOR_PAGE)
+        self.assertIn("/api/spot_monitor", SPOT_MONITOR_PAGE)
+
+    @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
+    def test_build_spot_monitor_payload_groups_hourly_volume_and_equity_loss(self, mock_runner) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            output_dir.mkdir()
+            state_path = output_dir / "tonusdt_spot_state.json"
+            events_path = output_dir / "tonusdt_spot_events.jsonl"
+            control_path = output_dir / "tonusdt_spot_loop_runner_control.json"
+            control_path.write_text(
+                json.dumps(
+                    {
+                        "symbol": "TONUSDT",
+                        "state_path": str(state_path),
+                        "summary_jsonl": str(events_path),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "metrics": {
+                            "recent_trades": [
+                                {
+                                    "id": "1",
+                                    "time": "2026-02-02T00:05:00+00:00",
+                                    "side": "BUY",
+                                    "price": 2.0,
+                                    "qty": 100.0,
+                                    "commission_quote": 0.1,
+                                    "realized_pnl": -0.1,
+                                },
+                                {
+                                    "id": "2",
+                                    "time": "2026-02-02T00:35:00+00:00",
+                                    "side": "SELL",
+                                    "price": 2.1,
+                                    "qty": 100.0,
+                                    "commission_quote": 0.1,
+                                    "realized_pnl": 9.9,
+                                },
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            events_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"ts": "2026-02-02T00:00:00+00:00", "equity_usdt": 1000.0}),
+                        json.dumps({"ts": "2026-02-02T00:59:00+00:00", "equity_usdt": 997.0}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mock_runner.return_value = {"configured": True, "is_running": True, "pid": 123, "config": {}}
+
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                payload = _build_spot_monitor_payload(symbols=["TONUSDT"], granularity="hour", limit=12)
+            finally:
+                os.chdir(previous_cwd)
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["granularity"], "hour")
+        self.assertEqual(payload["summary"]["symbol_count"], 1)
+        self.assertAlmostEqual(payload["summary"]["gross_notional"], 410.0)
+        self.assertAlmostEqual(payload["summary"]["equity_loss_usdt"], 3.0)
+        symbol_payload = payload["symbols"][0]
+        self.assertEqual(symbol_payload["symbol"], "TONUSDT")
+        row = symbol_payload["rows"][0]
+        self.assertEqual(row["bucket_start"], "2026-02-02T00:00:00+00:00")
+        self.assertAlmostEqual(row["gross_notional"], 410.0)
+        self.assertAlmostEqual(row["buy_notional"], 200.0)
+        self.assertAlmostEqual(row["sell_notional"], 210.0)
+        self.assertAlmostEqual(row["equity_start_usdt"], 1000.0)
+        self.assertAlmostEqual(row["equity_end_usdt"], 997.0)
+        self.assertAlmostEqual(row["equity_delta_usdt"], -3.0)
+        self.assertAlmostEqual(row["equity_loss_usdt"], 3.0)
+
+    @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
+    def test_build_spot_monitor_payload_groups_daily_rows(self, mock_runner) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            output_dir.mkdir()
+            state_path = output_dir / "tonusdt_spot_state.json"
+            events_path = output_dir / "tonusdt_spot_events.jsonl"
+            (output_dir / "tonusdt_spot_loop_runner_control.json").write_text(
+                json.dumps({"symbol": "TONUSDT", "state_path": str(state_path), "summary_jsonl": str(events_path)}),
+                encoding="utf-8",
+            )
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "metrics": {
+                            "recent_trades": [
+                                {"id": "1", "time": "2026-02-02T00:05:00+00:00", "side": "BUY", "price": 2.0, "qty": 100.0},
+                                {"id": "2", "time": "2026-02-03T00:05:00+00:00", "side": "SELL", "price": 2.1, "qty": 100.0},
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            events_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"ts": "2026-02-02T00:00:00+00:00", "equity_usdt": 1000.0}),
+                        json.dumps({"ts": "2026-02-02T23:59:00+00:00", "equity_usdt": 998.0}),
+                        json.dumps({"ts": "2026-02-03T00:00:00+00:00", "equity_usdt": 998.0}),
+                        json.dumps({"ts": "2026-02-03T23:59:00+00:00", "equity_usdt": 1001.0}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            mock_runner.return_value = {"configured": True, "is_running": False, "pid": None, "config": {}}
+
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                payload = _build_spot_monitor_payload(symbols=["TONUSDT"], granularity="day", limit=12)
+            finally:
+                os.chdir(previous_cwd)
+
+        rows = payload["symbols"][0]["rows"]
+        self.assertEqual([row["bucket_start"] for row in rows], ["2026-02-03T00:00:00+00:00", "2026-02-02T00:00:00+00:00"])
+        self.assertAlmostEqual(rows[0]["gross_notional"], 210.0)
+        self.assertAlmostEqual(rows[0]["equity_delta_usdt"], 3.0)
+        self.assertAlmostEqual(rows[1]["gross_notional"], 200.0)
+        self.assertAlmostEqual(rows[1]["equity_loss_usdt"], 2.0)
 
     @patch("grid_optimizer.web._validate_market_symbol")
     def test_normalize_spot_runner_payload_sets_defaults(self, _mock_validate_symbol) -> None:
