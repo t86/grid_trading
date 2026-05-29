@@ -22,6 +22,7 @@ from grid_optimizer.loop_runner import (
     AUDIT_SYNC_MIN_INTERVAL_SECONDS,
     _build_parser,
     _validate_best_quote_frozen_inventory_principles,
+    _best_quote_take_profit_guard_role_sets,
     _validate_multi_timeframe_bias_args,
     _should_sync_account_audit,
     _uses_entry_price_cost_basis,
@@ -11796,6 +11797,48 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(plan["sell_orders"][1]["price"], 1.022, places=8)
         self.assertAlmostEqual(plan["buy_orders"][0]["price"], 0.979, places=8)
 
+    def test_apply_take_profit_profit_guard_exempts_hedge_bq_reduce_short_when_allow_loss(self) -> None:
+        long_roles, short_roles = _best_quote_take_profit_guard_role_sets(
+            hedge_best_quote=True,
+            enabled=True,
+            allow_loss_reduce_only=True,
+        )
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.6400,
+                    "qty": 100.0,
+                    "notional": 64.0,
+                    "role": "best_quote_reduce_short",
+                },
+            ],
+            "sell_orders": [],
+        }
+
+        result = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=0.0,
+            current_short_qty=100.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6156,
+            current_long_notional=0.0,
+            current_short_notional=61.56,
+            pause_long_position_notional=500.0,
+            pause_short_position_notional=500.0,
+            min_profit_ratio=0.00008,
+            tick_size=0.0001,
+            bid_price=0.6399,
+            ask_price=0.6400,
+            extra_long_guard_roles=long_roles,
+            extra_short_guard_roles=short_roles,
+        )
+
+        self.assertTrue(result["short_active"])
+        self.assertEqual(result["adjusted_buy_orders"], 0)
+        self.assertAlmostEqual(plan["buy_orders"][0]["price"], 0.6400, places=8)
+
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
     @patch("grid_optimizer.loop_runner.assess_market_guard")
@@ -13956,6 +13999,26 @@ class LoopRunnerTests(unittest.TestCase):
         )
 
         _validate_best_quote_frozen_inventory_principles(args)
+
+    def test_best_quote_take_profit_guard_exempts_hedge_reduce_only_when_allow_loss(self) -> None:
+        long_roles, short_roles = _best_quote_take_profit_guard_role_sets(
+            hedge_best_quote=True,
+            enabled=True,
+            allow_loss_reduce_only=True,
+        )
+
+        self.assertEqual(long_roles, set())
+        self.assertEqual(short_roles, set())
+
+    def test_best_quote_take_profit_guard_keeps_non_hedge_entry_roles_when_allow_loss(self) -> None:
+        long_roles, short_roles = _best_quote_take_profit_guard_role_sets(
+            hedge_best_quote=False,
+            enabled=True,
+            allow_loss_reduce_only=True,
+        )
+
+        self.assertEqual(long_roles, {"best_quote_entry_short", "best_quote_reduce_long"})
+        self.assertEqual(short_roles, {"best_quote_entry_long", "best_quote_reduce_short"})
 
     def test_best_quote_frozen_inventory_principles_reject_side_dynamic_threshold(self) -> None:
         args = Namespace(
