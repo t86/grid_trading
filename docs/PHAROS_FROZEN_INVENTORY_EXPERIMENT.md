@@ -123,6 +123,13 @@ freeze-entry check must not raise or lower one side's threshold because that
 side already has frozen inventory; side-specific frozen-pressure dynamic
 thresholds are disabled for this strategy because they bias future freeze entry.
 
+`best_quote_maker_volume_frozen_total_cap_notional` is a cap on additional
+transfers into the frozen ledger. When frozen total notional reaches this cap,
+the runner must block new `reduce_freeze` transfers but must not block normal BQ
+maker-volume entry/reduce orders. Normal soft-threshold handling, take-profit
+orders, and hard-loss reduce logic remain responsible for managing the live BQ
+volume ledger.
+
 `reduce_freeze` is legacy naming. This mechanism is a transfer from the normal
 BQ ledger into the frozen ledger; it is not a reduce order and not a cleanup
 exit.

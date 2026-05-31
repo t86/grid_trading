@@ -3862,6 +3862,7 @@ def _apply_best_quote_reduce_freeze(
     band_budget_recover_ratio: float = 0.0,
     band_budget_emergency_loss_ratio_scale: float = 0.75,
     band_budget_emergency_notional_ratio: float = 0.85,
+    frozen_total_cap_notional: float = 0.0,
     current_long_qty: float,
     current_short_qty: float,
     current_long_avg_price: float,
@@ -3879,6 +3880,38 @@ def _apply_best_quote_reduce_freeze(
     report["hard_confirm_cycles"] = max(int(hard_confirm_cycles), 0)
     report["stress_loss_ratio"] = max(_safe_float(stress_loss_ratio), 0.0)
     report["stress_active"] = bool(stress_active)
+    safe_frozen_total_cap_notional = max(_safe_float(frozen_total_cap_notional), 0.0)
+    frozen_total_notional = _safe_float(report.get("frozen_long_notional")) + _safe_float(
+        report.get("frozen_short_notional")
+    )
+    frozen_total_cap_report = {
+        "enabled": safe_frozen_total_cap_notional > 0,
+        "active": False,
+        "cap_notional": safe_frozen_total_cap_notional,
+        "frozen_long_notional": _safe_float(report.get("frozen_long_notional")),
+        "frozen_short_notional": _safe_float(report.get("frozen_short_notional")),
+        "frozen_total_notional": frozen_total_notional,
+        "remaining_notional": (
+            max(safe_frozen_total_cap_notional - frozen_total_notional, 0.0)
+            if safe_frozen_total_cap_notional > 0
+            else 0.0
+        ),
+        "blocks_new_freeze": False,
+        "blocked_sides": [],
+        "reason": None,
+    }
+    if safe_frozen_total_cap_notional > 0 and frozen_total_notional >= safe_frozen_total_cap_notional - 1e-12:
+        frozen_total_cap_report.update(
+            {
+                "active": True,
+                "blocks_new_freeze": True,
+                "reason": (
+                    f"frozen_total_notional={_float(frozen_total_notional)} "
+                    f">= cap_notional={_float(safe_frozen_total_cap_notional)}"
+                ),
+            }
+        )
+    report["frozen_total_cap"] = frozen_total_cap_report
     dynamic_threshold_scale = max(_safe_float(dynamic_threshold_loss_ratio_scale), 0.0)
     dynamic_threshold_max_extra = max(_safe_float(dynamic_threshold_max_extra_ratio), 0.0)
     dynamic_threshold_frozen_start = max(_safe_float(dynamic_threshold_frozen_notional_start), 0.0)
@@ -4114,6 +4147,15 @@ def _apply_best_quote_reduce_freeze(
         if not reduce_planned or notional < freeze_min_notional or qty <= 1e-12 or loss_ratio < side_threshold:
             confirmations.pop(side_key, None)
             return False
+        if bool(frozen_total_cap_report.get("blocks_new_freeze")):
+            confirmations.pop(side_key, None)
+            blocked_sides = list(frozen_total_cap_report.get("blocked_sides") or [])
+            side_label = side.upper()
+            if side_label not in blocked_sides:
+                blocked_sides.append(side_label)
+            frozen_total_cap_report["blocked_sides"] = blocked_sides
+            report["frozen_total_cap"] = frozen_total_cap_report
+            return False
         needed = max(int(freeze_confirm_cycles), 1)
         if needed <= 1:
             confirmations.pop(side_key, None)
@@ -4306,6 +4348,7 @@ def _apply_best_quote_reduce_freeze(
             "short_extra_ratio": short_dynamic_extra,
         }
         report["band_budget"] = band_budget_report
+        report["frozen_total_cap"] = frozen_total_cap_report
         report["confirmations"] = dict(confirmations)
         report["min_notional"] = min_notional_value
         report["protected_candidates"] = protected_candidates
@@ -17726,6 +17769,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             band_budget_recover_ratio=best_quote_reduce_freeze_band_budget_recover_ratio,
             band_budget_emergency_loss_ratio_scale=best_quote_reduce_freeze_band_budget_emergency_loss_ratio_scale,
             band_budget_emergency_notional_ratio=best_quote_reduce_freeze_band_budget_emergency_notional_ratio,
+            frozen_total_cap_notional=best_quote_frozen_total_cap_notional,
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
             current_long_avg_price=current_long_avg_price,
@@ -18311,29 +18355,24 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "frozen_total_notional": 0.0,
             "blocked_buy_entry_orders": 0,
             "blocked_sell_entry_orders": 0,
+            "blocks_new_freeze": False,
+            "blocked_sides": [],
             "reason": None,
         }
         best_quote_frozen_total_cap["frozen_total_notional"] = (
             best_quote_frozen_total_cap["frozen_long_notional"]
             + best_quote_frozen_total_cap["frozen_short_notional"]
         )
-        if (
-            best_quote_frozen_total_cap["enabled"]
-            and best_quote_frozen_total_cap["frozen_total_notional"] >= best_quote_frozen_total_cap_notional - 1e-12
-        ):
-            original_buy_orders = list(plan.get("buy_orders") or [])
-            original_sell_orders = list(plan.get("sell_orders") or [])
-            plan["buy_orders"] = [
-                item for item in original_buy_orders if not (isinstance(item, dict) and _is_long_entry_order(item))
-            ]
-            plan["sell_orders"] = [
-                item for item in original_sell_orders if not (isinstance(item, dict) and _is_short_entry_order(item))
-            ]
+        if bool((best_quote_reduce_freeze.get("frozen_total_cap") or {}).get("active")):
             best_quote_frozen_total_cap.update(
                 {
                     "active": True,
-                    "blocked_buy_entry_orders": len(original_buy_orders) - len(plan["buy_orders"]),
-                    "blocked_sell_entry_orders": len(original_sell_orders) - len(plan["sell_orders"]),
+                    "blocked_buy_entry_orders": 0,
+                    "blocked_sell_entry_orders": 0,
+                    "blocks_new_freeze": True,
+                    "blocked_sides": list(
+                        (best_quote_reduce_freeze.get("frozen_total_cap") or {}).get("blocked_sides") or []
+                    ),
                     "reason": (
                         f"frozen_total_notional={_float(best_quote_frozen_total_cap['frozen_total_notional'])} "
                         f">= cap_notional={_float(best_quote_frozen_total_cap_notional)}"
