@@ -309,6 +309,42 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertTrue(all(not order.get("force_reduce_only") for order in short_entries))
         self.assertTrue(plan["metrics"]["loss_blocked_reduce_fallback"]["short_entry"])
 
+    def test_hedge_short_recover_adds_long_entry_when_reduce_short_would_lose(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_long_notional=1_200.0,
+                max_short_notional=1.0,
+                max_entry_orders_per_side=2,
+                inventory_soft_ratio=0.6,
+            ),
+            inputs=_inputs(
+                bid_price=0.1659,
+                ask_price=0.1660,
+                mid_price=0.16595,
+                current_long_qty=0.0,
+                current_short_qty=4_674.0,
+                current_short_avg_price=0.16336,
+                current_net_qty=0.0,
+                cycle_budget_notional=144.0,
+                tick_size=0.0001,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+                position_side_mode="hedge",
+            ),
+        )
+
+        self.assertEqual(plan["regime"], "inventory_recover")
+        buy_roles = [order["role"] for order in plan["buy_orders"]]
+        self.assertIn("best_quote_reduce_short", buy_roles)
+        self.assertIn("best_quote_entry_long", buy_roles)
+        long_entries = [order for order in plan["buy_orders"] if order["role"] == "best_quote_entry_long"]
+        self.assertTrue(long_entries)
+        self.assertTrue(all(order["position_side"] == "LONG" for order in long_entries))
+        self.assertTrue(all(not order.get("force_reduce_only") for order in long_entries))
+        self.assertTrue(plan["metrics"]["loss_blocked_reduce_fallback"]["long_entry"])
+
     def test_hedge_inventory_recover_biases_reduce_budget_to_heavy_side(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(

@@ -1051,22 +1051,54 @@ def build_best_quote_maker_volume_plan(
         and short_notional > 0
         and not allow_entry_short
     ):
-        _append_order(
-            buy_orders,
-            _build_order(
-                side="BUY",
-                price=_price_with_gap(bid, reduce_short_gap, -1),
-                notional=min(
-                    buy_side_notional * reduce_short_budget_scale,
-                    short_notional,
-                    _net_loss_reduce_cap(short_notional),
-                ),
-                role="best_quote_reduce_short",
-                inputs=inputs,
-                position_side=reduce_short_position_side,
-                force_reduce_only=True,
+        reduce_short_order = _build_order(
+            side="BUY",
+            price=_price_with_gap(bid, reduce_short_gap, -1),
+            notional=min(
+                buy_side_notional * reduce_short_budget_scale,
+                short_notional,
+                _net_loss_reduce_cap(short_notional),
             ),
+            role="best_quote_reduce_short",
+            inputs=inputs,
+            position_side=reduce_short_position_side,
+            force_reduce_only=True,
         )
+        _append_order(buy_orders, reduce_short_order)
+        reduce_short_price = _safe_float(reduce_short_order.get("price")) if reduce_short_order else 0.0
+        short_avg_price = _safe_float(inputs.current_short_avg_price)
+        if (
+            hedge_position_sides
+            and allow_entry_long
+            and reduce_short_price > 0
+            and short_avg_price > 0
+            and reduce_short_price > short_avg_price + 1e-12
+        ):
+            long_entry_notional = buy_side_notional * long_entry_budget_scale
+            if long_limit > 0:
+                long_entry_notional = min(
+                    long_entry_notional,
+                    max(long_limit - projected_long_entry_notional, 0.0),
+                )
+            long_entries = _build_entry_ladder(
+                side="BUY",
+                anchor_price=bid,
+                base_gap=gap,
+                total_notional=long_entry_notional,
+                slots=max_entry_orders_per_side,
+                role="best_quote_entry_long",
+                inputs=inputs,
+                position_side=long_entry_position_side,
+            )
+            if long_entries:
+                buy_orders.extend(long_entries)
+                loss_blocked_reduce_fallback_report.update(
+                    {
+                        "short_reduce": True,
+                        "long_entry": True,
+                        "reduce_short_price": reduce_short_price,
+                    }
+                )
     elif not inventory_bias_report["applied"] and allow_entry_long:
         long_entry_notional = buy_side_notional * long_entry_budget_scale
         if long_limit > 0:
