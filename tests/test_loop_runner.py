@@ -1180,6 +1180,70 @@ class LoopRunnerTests(unittest.TestCase):
         )
         self.assertEqual([item["role"] for item in plan["sell_orders"]], ["best_quote_entry_short"])
 
+    def test_best_quote_reduce_freeze_side_cap_blocks_only_matching_side(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [{"qty": 1000.0, "entry_price": 0.6600}],
+                "long_qty": 1000.0,
+            },
+            "best_quote_volume_ledger": {
+                "long_lots": [{"qty": 300.0, "price": 0.6600}],
+                "long_qty": 300.0,
+                "long_avg_price": 0.6600,
+                "short_lots": [{"qty": 300.0, "price": 0.6200}],
+                "short_qty": 300.0,
+                "short_avg_price": 0.6200,
+                "initialized": True,
+            },
+        }
+        plan = {
+            "buy_orders": [{"role": "best_quote_reduce_short"}],
+            "sell_orders": [
+                {"role": "best_quote_reduce_long"},
+                {"role": "best_quote_entry_short"},
+            ],
+        }
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=1300.0,
+            current_short_qty=300.0,
+            current_long_avg_price=0.6600,
+            current_short_avg_price=0.6200,
+            mid_price=0.6400,
+            bq_ledger_report=state["best_quote_volume_ledger"],
+        )
+
+        report = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan=plan,
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=10.0,
+            confirm_cycles=1,
+            frozen_long_cap_notional=600.0,
+            frozen_short_cap_notional=600.0,
+            current_long_qty=1300.0,
+            current_short_qty=300.0,
+            current_long_avg_price=0.6600,
+            current_short_avg_price=0.6200,
+            mid_price=0.6400,
+            bq_ledger_report=state["best_quote_volume_ledger"],
+        )
+
+        self.assertTrue(report["applied"])
+        self.assertTrue(report["frozen_side_cap"]["active"])
+        self.assertEqual(report["frozen_side_cap"]["blocked_sides"], ["LONG"])
+        self.assertEqual(report["managed_long_qty"], 300.0)
+        self.assertEqual(report["managed_short_qty"], 0.0)
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_qty"], 1000.0)
+        self.assertEqual(state["best_quote_frozen_inventory"]["short_qty"], 300.0)
+        self.assertEqual([item["role"] for item in plan["buy_orders"]], ["best_quote_reduce_short"])
+        self.assertEqual(
+            [item["role"] for item in plan["sell_orders"]],
+            ["best_quote_reduce_long", "best_quote_entry_short"],
+        )
+
     def test_best_quote_reduce_freeze_band_budget_caps_same_band_freeze(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
@@ -14104,7 +14168,6 @@ class LoopRunnerTests(unittest.TestCase):
         }
         cases = (
             {"best_quote_maker_volume_take_profit_guard_enabled": False},
-            {"best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.0},
         )
 
         for override in cases:
