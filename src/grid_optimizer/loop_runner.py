@@ -4195,7 +4195,7 @@ def _apply_best_quote_reduce_freeze(
     def _confirmed(side: str, qty: float, loss_ratio: float, notional: float, reduce_planned: bool) -> bool:
         side_key = side.lower()
         side_threshold = _side_freeze_threshold(side)
-        if not reduce_planned or notional < freeze_min_notional or qty <= 1e-12 or loss_ratio < side_threshold:
+        if notional < freeze_min_notional or qty <= 1e-12 or loss_ratio < side_threshold:
             confirmations.pop(side_key, None)
             return False
         if bool(frozen_total_cap_report.get("blocks_new_freeze")):
@@ -4240,6 +4240,7 @@ def _apply_best_quote_reduce_freeze(
             "freeze_threshold_loss_ratio": side_threshold,
             "hard_freeze_enabled": bool(hard_freeze_enabled),
             "stress_active": bool(stress_active),
+            "reduce_planned": bool(reduce_planned),
             "first_seen_at": previous.get("first_seen_at") if same_candidate else now_iso,
             "last_seen_at": now_iso,
         }

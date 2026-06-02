@@ -147,7 +147,96 @@ from grid_optimizer.semi_auto_plan import (
 from grid_optimizer.types import Candle
 
 
+def _bq_ledger_report_from_state(state: dict, *, mid_price: float) -> dict:
+    ledger = state["best_quote_volume_ledger"]
+    long_lots = list(ledger.get("long_lots") or [])
+    short_lots = list(ledger.get("short_lots") or [])
+    long_qty = sum(float(item.get("qty", 0.0)) for item in long_lots)
+    short_qty = sum(float(item.get("qty", 0.0)) for item in short_lots)
+    long_cost = sum(float(item.get("qty", 0.0)) * float(item.get("price", 0.0)) for item in long_lots)
+    short_cost = sum(float(item.get("qty", 0.0)) * float(item.get("price", 0.0)) for item in short_lots)
+    long_avg = long_cost / long_qty if long_qty else 0.0
+    short_avg = short_cost / short_qty if short_qty else 0.0
+    long_pnl = (mid_price - long_avg) * long_qty if long_qty else 0.0
+    short_pnl = (short_avg - mid_price) * short_qty if short_qty else 0.0
+    return {
+        "initialized": True,
+        "sync_ok": True,
+        "long_qty": long_qty,
+        "long_avg_price": long_avg,
+        "long_unrealized_pnl": long_pnl,
+        "short_qty": short_qty,
+        "short_avg_price": short_avg,
+        "short_unrealized_pnl": short_pnl,
+        "unrealized_pnl": long_pnl + short_pnl,
+    }
+
+
 class LoopRunnerTests(unittest.TestCase):
+    def test_best_quote_reduce_freeze_confirms_losing_long_without_reduce_order(self) -> None:
+        mid_price = 0.98
+        state = {
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [
+                    {
+                        "qty": 100.0,
+                        "price": 1.0,
+                        "order_id": 123,
+                        "client_order_id": "entry-long",
+                        "opened_at": "2026-06-02T00:00:00+00:00",
+                    }
+                ],
+                "short_lots": [],
+            },
+            "best_quote_frozen_inventory": {},
+        }
+        plan = {"buy_orders": [], "sell_orders": []}
+
+        def apply_once() -> dict:
+            ledger_report = _bq_ledger_report_from_state(state, mid_price=mid_price)
+            report = _best_quote_reduce_freeze_report(
+                state=state,
+                current_long_qty=100.0,
+                current_short_qty=0.0,
+                current_long_avg_price=1.0,
+                current_short_avg_price=0.0,
+                mid_price=mid_price,
+                bq_ledger_report=ledger_report,
+            )
+            return _apply_best_quote_reduce_freeze(
+                state=state,
+                plan=plan,
+                report=report,
+                enabled=True,
+                threshold_loss_ratio=0.01,
+                min_notional=10.0,
+                confirm_cycles=2,
+                frozen_total_cap_notional=9_000.0,
+                frozen_long_cap_notional=4_500.0,
+                frozen_short_cap_notional=4_500.0,
+                current_long_qty=100.0,
+                current_short_qty=0.0,
+                current_long_avg_price=1.0,
+                current_short_avg_price=0.0,
+                mid_price=mid_price,
+                bq_ledger_report=ledger_report,
+            )
+
+        first = apply_once()
+        self.assertEqual(first["confirmations"]["long"]["count"], 1)
+        self.assertFalse(first["confirmations"]["long"]["reduce_planned"])
+        self.assertEqual(state.get("best_quote_frozen_inventory", {}).get("long_qty", 0.0), 0.0)
+
+        second = apply_once()
+        self.assertEqual(second["events"][0]["side"], "LONG")
+        self.assertEqual(second["events"][0]["reason"], "reduce_loss_ratio_threshold")
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_qty"], 100.0)
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_lots"][0]["source"], "bq_volume_ledger_transfer")
+        self.assertEqual(state["best_quote_volume_ledger"]["long_lots"], [])
+        self.assertNotIn("best_quote_reduce_freeze_confirmation", state)
+
     def test_best_quote_entry_inventory_cap_guard_blocks_only_new_entries(self) -> None:
         plan = {
             "buy_orders": [
