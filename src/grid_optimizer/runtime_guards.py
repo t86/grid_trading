@@ -185,7 +185,7 @@ def summarize_futures_runtime_guard_inputs(
     seen_order_notional_keys: set[str] = set()
     normalized_bq_book_scope = str(bq_book_scope or "").lower().strip()
     bq_order_books: dict[str, str] = {}
-    if normalized_bq_book_scope and bq_order_refs_path is not None:
+    if bq_order_refs_path is not None:
         try:
             raw_state = json.loads(bq_order_refs_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -196,6 +196,18 @@ def summarize_futures_runtime_guard_inputs(
                 if not isinstance(ref, dict):
                     continue
                 bq_order_books[str(order_id)] = str(ref.get("book") or "unknown").lower().strip() or "unknown"
+
+    def _is_frozen_pair_release_trade(row: dict[str, Any]) -> bool:
+        client_order_id = str(
+            row.get("clientOrderId")
+            or row.get("client_order_id")
+            or row.get("origClientOrderId")
+            or ""
+        ).lower()
+        if "frozenin" in client_order_id:
+            return True
+        order_id = str(row.get("orderId") or row.get("order_id") or "").strip()
+        return bool(order_id and bq_order_books.get(order_id) == "frozen_bq")
 
     def _as_float(value: Any) -> float:
         try:
@@ -226,6 +238,8 @@ def summarize_futures_runtime_guard_inputs(
         else:
             cumulative_gross_notional += notional
         if trade_ts is None:
+            continue
+        if _is_frozen_pair_release_trade(row):
             continue
         realized_pnl = _as_float(row.get("realizedPnl"))
         commission = _as_float(row.get("commission"))

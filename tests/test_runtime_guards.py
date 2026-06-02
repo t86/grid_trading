@@ -163,6 +163,46 @@ class RuntimeGuardsTests(unittest.TestCase):
             self.assertEqual(gross, 100.0)
             self.assertEqual([event["order_id"] for event in pnl_events], [1])
 
+    def test_summarize_futures_runtime_guard_inputs_excludes_frozen_pair_release_pnl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summary_path = Path(tmp) / "opgusdt_hedge_bq_events.jsonl"
+            trade_path = Path(tmp) / "opgusdt_hedge_bq_trade_audit.jsonl"
+            rows = [
+                {
+                    "time": 1779570000000,
+                    "orderId": 1,
+                    "clientOrderId": "gx-opgu-bestquot-1-abc",
+                    "price": "1",
+                    "qty": "100",
+                    "quoteQty": "100",
+                    "realizedPnl": "-3",
+                    "commission": "0",
+                    "commissionAsset": "USDT",
+                },
+                {
+                    "time": 1779570001000,
+                    "orderId": 2,
+                    "clientOrderId": "gx-opgu-frozenin-1-abc",
+                    "price": "1",
+                    "qty": "200",
+                    "quoteQty": "200",
+                    "realizedPnl": "-9",
+                    "commission": "0",
+                    "commissionAsset": "USDT",
+                },
+            ]
+            trade_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+            gross, pnl_events, _ = summarize_futures_runtime_guard_inputs(
+                summary_path,
+                runtime_guard_stats_start_time="2026-05-23T00:00:00+00:00",
+                now=datetime(2026, 5, 23, 23, 30, tzinfo=timezone.utc),
+            )
+
+            self.assertEqual(gross, 300.0)
+            self.assertEqual([event["client_order_id"] for event in pnl_events], ["gx-opgu-bestquot-1-abc"])
+            self.assertAlmostEqual(sum(float(event["net_pnl"]) for event in pnl_events), -3.0)
+
     def test_evaluate_runtime_guards_returns_waiting_before_start(self) -> None:
         now = datetime(2026, 3, 30, 8, 0, tzinfo=timezone.utc)
         cfg = RuntimeGuardConfig(
