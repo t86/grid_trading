@@ -1086,6 +1086,106 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertAlmostEqual(bias["min_notional_gap_soft_ratio"], 0.5)
         self.assertLess(bias["notional_gap"], 120.0)
 
+    def test_frozen_v2_default_off_reports_without_changing_orders(self) -> None:
+        base_inputs = _inputs(
+            bid_price=1.0,
+            ask_price=1.01,
+            mid_price=1.005,
+            cycle_budget_notional=100.0,
+            tick_size=0.01,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            position_side_mode="hedge",
+            frozen_short_notional=750.0,
+            frozen_short_cap_notional=1_000.0,
+        )
+        without_frozen_v2 = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(enabled=True, max_entry_orders_per_side=1),
+            inputs=base_inputs,
+        )
+        with_frozen_v2_disabled = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_entry_orders_per_side=1,
+                frozen_v2_enabled=False,
+            ),
+            inputs=base_inputs,
+        )
+
+        self.assertEqual(with_frozen_v2_disabled["buy_orders"], without_frozen_v2["buy_orders"])
+        self.assertEqual(with_frozen_v2_disabled["sell_orders"], without_frozen_v2["sell_orders"])
+        self.assertFalse(with_frozen_v2_disabled["metrics"]["frozen_v2"]["enabled"])
+        self.assertFalse(with_frozen_v2_disabled["metrics"]["frozen_v2"]["applied"])
+        self.assertEqual(with_frozen_v2_disabled["metrics"]["frozen_v2"]["short_state"], "pressure")
+
+    def test_frozen_v2_short_pressure_biases_toward_long_recovery(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_entry_orders_per_side=1,
+                frozen_v2_enabled=True,
+                frozen_v2_pressure_ratio=0.60,
+                frozen_v2_danger_ratio=0.85,
+                frozen_v2_pressure_same_side_entry_scale=0.50,
+                frozen_v2_pressure_recovery_budget_share=0.30,
+            ),
+            inputs=_inputs(
+                bid_price=1.0,
+                ask_price=1.01,
+                mid_price=1.005,
+                cycle_budget_notional=100.0,
+                tick_size=0.01,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+                position_side_mode="hedge",
+                frozen_short_notional=700.0,
+                frozen_short_cap_notional=1_000.0,
+            ),
+        )
+
+        self.assertEqual(plan["regime"], "frozen_v2_recovery")
+        self.assertIn("frozen_v2_pressure", plan["reasons"])
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_entry_long")
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
+        self.assertGreater(plan["buy_orders"][0]["notional"], 75.0)
+        self.assertLess(plan["sell_orders"][0]["notional"], 30.0)
+        report = plan["metrics"]["frozen_v2"]
+        self.assertTrue(report["applied"])
+        self.assertEqual(report["short_state"], "pressure")
+        self.assertAlmostEqual(report["short_entry_budget_scale"], 0.5)
+        self.assertAlmostEqual(report["long_recovery_budget_share"], 0.3)
+
+    def test_frozen_v2_short_capped_blocks_short_entry(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_entry_orders_per_side=1,
+                frozen_v2_enabled=True,
+                frozen_v2_capped_same_side_entry_scale=0.0,
+                frozen_v2_capped_recovery_budget_share=0.70,
+            ),
+            inputs=_inputs(
+                bid_price=1.0,
+                ask_price=1.01,
+                mid_price=1.005,
+                cycle_budget_notional=100.0,
+                tick_size=0.01,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+                position_side_mode="hedge",
+                frozen_short_notional=1_050.0,
+                frozen_short_cap_notional=1_000.0,
+            ),
+        )
+
+        self.assertEqual([order["role"] for order in plan["buy_orders"]], ["best_quote_entry_long"])
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertGreaterEqual(plan["buy_orders"][0]["notional"], 120.0)
+        self.assertEqual(plan["metrics"]["frozen_v2"]["short_state"], "capped")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18175,6 +18175,33 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 same_side_entry_price_guard_gap_ticks=int(
                     getattr(effective_args, "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks", 0)
                 ),
+                frozen_v2_enabled=bool(
+                    getattr(effective_args, "best_quote_maker_volume_frozen_v2_enabled", False)
+                ),
+                frozen_v2_pressure_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_frozen_v2_pressure_ratio", 0.60)
+                ),
+                frozen_v2_danger_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_frozen_v2_danger_ratio", 0.85)
+                ),
+                frozen_v2_pressure_same_side_entry_scale=float(
+                    getattr(effective_args, "best_quote_maker_volume_frozen_v2_pressure_same_side_entry_scale", 0.50)
+                ),
+                frozen_v2_danger_same_side_entry_scale=float(
+                    getattr(effective_args, "best_quote_maker_volume_frozen_v2_danger_same_side_entry_scale", 0.20)
+                ),
+                frozen_v2_capped_same_side_entry_scale=float(
+                    getattr(effective_args, "best_quote_maker_volume_frozen_v2_capped_same_side_entry_scale", 0.0)
+                ),
+                frozen_v2_pressure_recovery_budget_share=float(
+                    getattr(effective_args, "best_quote_maker_volume_frozen_v2_pressure_recovery_budget_share", 0.30)
+                ),
+                frozen_v2_danger_recovery_budget_share=float(
+                    getattr(effective_args, "best_quote_maker_volume_frozen_v2_danger_recovery_budget_share", 0.50)
+                ),
+                frozen_v2_capped_recovery_budget_share=float(
+                    getattr(effective_args, "best_quote_maker_volume_frozen_v2_capped_recovery_budget_share", 0.70)
+                ),
             ),
             inputs=BestQuoteMakerVolumeInputs(
                 bid_price=bid_price,
@@ -18203,6 +18230,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 market_amplitude_5m=_adaptive_window_metric("window_5m", "amplitude_ratio"),
                 unrealized_pnl=unrealized_pnl,
                 recent_realized_pnl=_safe_float(elastic_metrics.get("net_pnl_15m")),
+                frozen_long_notional=_safe_float(best_quote_reduce_freeze.get("frozen_long_notional")),
+                frozen_short_notional=_safe_float(best_quote_reduce_freeze.get("frozen_short_notional")),
+                frozen_total_cap_notional=best_quote_frozen_total_cap_notional,
+                frozen_long_cap_notional=best_quote_frozen_long_cap_notional,
+                frozen_short_cap_notional=best_quote_frozen_short_cap_notional,
             ),
         )
         best_quote_take_profit_guard_enabled = bool(
@@ -21118,6 +21150,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-frozen-total-cap-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-frozen-long-cap-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-frozen-short-cap-notional", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-frozen-v2-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-frozen-v2-pressure-ratio", type=float, default=0.60)
+    parser.add_argument("--best-quote-maker-volume-frozen-v2-danger-ratio", type=float, default=0.85)
+    parser.add_argument("--best-quote-maker-volume-frozen-v2-pressure-same-side-entry-scale", type=float, default=0.50)
+    parser.add_argument("--best-quote-maker-volume-frozen-v2-danger-same-side-entry-scale", type=float, default=0.20)
+    parser.add_argument("--best-quote-maker-volume-frozen-v2-capped-same-side-entry-scale", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-frozen-v2-pressure-recovery-budget-share", type=float, default=0.30)
+    parser.add_argument("--best-quote-maker-volume-frozen-v2-danger-recovery-budget-share", type=float, default=0.50)
+    parser.add_argument("--best-quote-maker-volume-frozen-v2-capped-recovery-budget-share", type=float, default=0.70)
     parser.add_argument(
         "--best-quote-maker-volume-frozen-pair-release-enabled",
         action=argparse.BooleanOptionalAction,

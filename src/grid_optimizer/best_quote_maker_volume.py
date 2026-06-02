@@ -81,6 +81,15 @@ class BestQuoteMakerVolumeConfig:
     same_side_entry_price_guard_enabled: bool = False
     same_side_entry_price_guard_min_notional: float = 0.0
     same_side_entry_price_guard_gap_ticks: int = 0
+    frozen_v2_enabled: bool = False
+    frozen_v2_pressure_ratio: float = 0.60
+    frozen_v2_danger_ratio: float = 0.85
+    frozen_v2_pressure_same_side_entry_scale: float = 0.50
+    frozen_v2_danger_same_side_entry_scale: float = 0.20
+    frozen_v2_capped_same_side_entry_scale: float = 0.0
+    frozen_v2_pressure_recovery_budget_share: float = 0.30
+    frozen_v2_danger_recovery_budget_share: float = 0.50
+    frozen_v2_capped_recovery_budget_share: float = 0.70
 
 
 @dataclass(frozen=True)
@@ -111,6 +120,11 @@ class BestQuoteMakerVolumeInputs:
     market_amplitude_5m: float = 0.0
     unrealized_pnl: float = 0.0
     recent_realized_pnl: float = 0.0
+    frozen_long_notional: float = 0.0
+    frozen_short_notional: float = 0.0
+    frozen_total_cap_notional: float = 0.0
+    frozen_long_cap_notional: float = 0.0
+    frozen_short_cap_notional: float = 0.0
 
 
 def _safe_float(value: Any) -> float:
@@ -272,6 +286,32 @@ def _build_paired_reduce_orders_for_entries(
     return orders
 
 
+def _frozen_v2_side_state(*, frozen_notional: float, cap_notional: float, pressure_ratio: float, danger_ratio: float) -> str:
+    frozen_notional = max(_safe_float(frozen_notional), 0.0)
+    cap_notional = max(_safe_float(cap_notional), 0.0)
+    if cap_notional <= 0 or frozen_notional <= 0:
+        return "normal"
+    ratio = frozen_notional / cap_notional
+    if ratio >= 1.0:
+        return "capped"
+    if ratio >= danger_ratio:
+        return "danger"
+    if ratio >= pressure_ratio:
+        return "pressure"
+    return "normal"
+
+
+def _frozen_v2_state_scale(state: str, *, pressure: float, danger: float, capped: float) -> float:
+    normalized = str(state or "").strip().lower()
+    if normalized == "capped":
+        return _clamp(_safe_float(capped), 0.0, 1.0)
+    if normalized == "danger":
+        return _clamp(_safe_float(danger), 0.0, 1.0)
+    if normalized == "pressure":
+        return _clamp(_safe_float(pressure), 0.0, 1.0)
+    return 1.0
+
+
 def build_best_quote_maker_volume_plan(
     *,
     config: BestQuoteMakerVolumeConfig,
@@ -336,6 +376,65 @@ def build_best_quote_maker_volume_plan(
     long_inventory_ratio = long_notional / long_soft if long_soft > 0 else 0.0
     short_inventory_ratio = short_notional / short_soft if short_soft > 0 else 0.0
     inventory_ratio = max(long_inventory_ratio, short_inventory_ratio)
+    frozen_long_notional = max(_safe_float(inputs.frozen_long_notional), 0.0)
+    frozen_short_notional = max(_safe_float(inputs.frozen_short_notional), 0.0)
+    frozen_total_notional = frozen_long_notional + frozen_short_notional
+    frozen_total_cap_notional = max(_safe_float(inputs.frozen_total_cap_notional), 0.0)
+    frozen_long_cap_notional = max(
+        _safe_float(inputs.frozen_long_cap_notional) or frozen_total_cap_notional,
+        0.0,
+    )
+    frozen_short_cap_notional = max(
+        _safe_float(inputs.frozen_short_cap_notional) or frozen_total_cap_notional,
+        0.0,
+    )
+    frozen_v2_pressure_ratio = _clamp(_safe_float(config.frozen_v2_pressure_ratio), 0.0, 1.0)
+    frozen_v2_danger_ratio = _clamp(
+        max(_safe_float(config.frozen_v2_danger_ratio), frozen_v2_pressure_ratio),
+        frozen_v2_pressure_ratio,
+        1.0,
+    )
+    frozen_v2_long_state = _frozen_v2_side_state(
+        frozen_notional=frozen_long_notional,
+        cap_notional=frozen_long_cap_notional,
+        pressure_ratio=frozen_v2_pressure_ratio,
+        danger_ratio=frozen_v2_danger_ratio,
+    )
+    frozen_v2_short_state = _frozen_v2_side_state(
+        frozen_notional=frozen_short_notional,
+        cap_notional=frozen_short_cap_notional,
+        pressure_ratio=frozen_v2_pressure_ratio,
+        danger_ratio=frozen_v2_danger_ratio,
+    )
+    frozen_v2_total_ratio = (
+        frozen_total_notional / frozen_total_cap_notional
+        if frozen_total_cap_notional > 0
+        else 0.0
+    )
+    frozen_v2_report = {
+        "enabled": bool(config.frozen_v2_enabled),
+        "applied": False,
+        "reason": None,
+        "pressure_ratio": frozen_v2_pressure_ratio,
+        "danger_ratio": frozen_v2_danger_ratio,
+        "frozen_long_notional": frozen_long_notional,
+        "frozen_short_notional": frozen_short_notional,
+        "frozen_total_notional": frozen_total_notional,
+        "frozen_long_cap_notional": frozen_long_cap_notional,
+        "frozen_short_cap_notional": frozen_short_cap_notional,
+        "frozen_total_cap_notional": frozen_total_cap_notional,
+        "frozen_long_ratio": frozen_long_notional / frozen_long_cap_notional if frozen_long_cap_notional > 0 else 0.0,
+        "frozen_short_ratio": (
+            frozen_short_notional / frozen_short_cap_notional if frozen_short_cap_notional > 0 else 0.0
+        ),
+        "frozen_total_ratio": frozen_v2_total_ratio,
+        "long_state": frozen_v2_long_state,
+        "short_state": frozen_v2_short_state,
+        "long_entry_budget_scale": 1.0,
+        "short_entry_budget_scale": 1.0,
+        "long_recovery_budget_share": 0.0,
+        "short_recovery_budget_share": 0.0,
+    }
 
     reasons: list[str] = []
     regime = "normal"
@@ -833,6 +932,59 @@ def build_best_quote_maker_volume_plan(
         reduce_short_budget_scale,
         _clamp(_safe_float(trend_loss_reduce_guard_report["reduce_short_budget_scale"]), 0.0, 1.0),
     )
+    if config.frozen_v2_enabled and not hard_loss:
+        long_same_side_scale = _frozen_v2_state_scale(
+            frozen_v2_long_state,
+            pressure=config.frozen_v2_pressure_same_side_entry_scale,
+            danger=config.frozen_v2_danger_same_side_entry_scale,
+            capped=config.frozen_v2_capped_same_side_entry_scale,
+        )
+        short_same_side_scale = _frozen_v2_state_scale(
+            frozen_v2_short_state,
+            pressure=config.frozen_v2_pressure_same_side_entry_scale,
+            danger=config.frozen_v2_danger_same_side_entry_scale,
+            capped=config.frozen_v2_capped_same_side_entry_scale,
+        )
+        long_recovery_share = 0.0
+        short_recovery_share = 0.0
+        if frozen_v2_short_state == "capped":
+            long_recovery_share = _clamp(_safe_float(config.frozen_v2_capped_recovery_budget_share), 0.0, 1.0)
+        elif frozen_v2_short_state == "danger":
+            long_recovery_share = _clamp(_safe_float(config.frozen_v2_danger_recovery_budget_share), 0.0, 1.0)
+        elif frozen_v2_short_state == "pressure":
+            long_recovery_share = _clamp(_safe_float(config.frozen_v2_pressure_recovery_budget_share), 0.0, 1.0)
+        if frozen_v2_long_state == "capped":
+            short_recovery_share = _clamp(_safe_float(config.frozen_v2_capped_recovery_budget_share), 0.0, 1.0)
+        elif frozen_v2_long_state == "danger":
+            short_recovery_share = _clamp(_safe_float(config.frozen_v2_danger_recovery_budget_share), 0.0, 1.0)
+        elif frozen_v2_long_state == "pressure":
+            short_recovery_share = _clamp(_safe_float(config.frozen_v2_pressure_recovery_budget_share), 0.0, 1.0)
+        if long_same_side_scale < 1.0 or short_same_side_scale < 1.0 or long_recovery_share > 0 or short_recovery_share > 0:
+            reasons.append("frozen_v2_pressure")
+            if regime == "normal":
+                regime = "frozen_v2_recovery"
+            long_entry_budget_scale *= long_same_side_scale
+            short_entry_budget_scale *= short_same_side_scale
+            if frozen_v2_short_state == "capped" and short_same_side_scale <= 0:
+                allow_entry_short = False
+            if frozen_v2_long_state == "capped" and long_same_side_scale <= 0:
+                allow_entry_long = False
+            if allow_entry_long and long_recovery_share > 0:
+                buy_side_notional += cycle_budget * long_recovery_share
+            if allow_entry_short and short_recovery_share > 0:
+                sell_side_notional += cycle_budget * short_recovery_share
+            frozen_v2_report.update(
+                {
+                    "applied": True,
+                    "reason": "directional_frozen_pressure",
+                    "long_entry_budget_scale": long_same_side_scale,
+                    "short_entry_budget_scale": short_same_side_scale,
+                    "long_recovery_budget_share": long_recovery_share,
+                    "short_recovery_budget_share": short_recovery_share,
+                    "effective_buy_side_notional": buy_side_notional,
+                    "effective_sell_side_notional": sell_side_notional,
+                }
+            )
 
     def _net_loss_reduce_cap(side_notional: float) -> float:
         side_notional = max(_safe_float(side_notional), 0.0)
@@ -1352,6 +1504,7 @@ def build_best_quote_maker_volume_plan(
             "trend_entry_guard": trend_entry_guard_report,
             "trend_inventory_guard": trend_inventory_guard_report,
             "trend_loss_reduce_guard": trend_loss_reduce_guard_report,
+            "frozen_v2": frozen_v2_report,
             "net_loss_reduce": net_loss_reduce_report,
             "loss_blocked_reduce_fallback": loss_blocked_reduce_fallback_report,
             "same_side_entry_price_guard": same_side_entry_price_guard_report,
