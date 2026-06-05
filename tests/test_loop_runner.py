@@ -1211,6 +1211,109 @@ class LoopRunnerTests(unittest.TestCase):
         ledger = state["best_quote_frozen_inventory"]
         self.assertEqual(ledger["short_qty"], 300.0)
 
+    def test_best_quote_reduce_freeze_blocks_new_long_when_opposite_pair_would_lose(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_lots": [{"qty": 100.0, "entry_price": 0.9500}],
+            },
+            "best_quote_volume_ledger": {
+                "long_lots": [{"qty": 100.0, "price": 1.0000}],
+                "long_qty": 100.0,
+                "long_avg_price": 1.0000,
+                "short_lots": [],
+                "initialized": True,
+            },
+        }
+        ledger_report = _bq_ledger_report_from_state(state, mid_price=0.9800)
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=100.0,
+            current_short_qty=100.0,
+            current_long_avg_price=1.0000,
+            current_short_avg_price=0.9500,
+            mid_price=0.9800,
+            bq_ledger_report=ledger_report,
+        )
+
+        report = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [{"role": "best_quote_reduce_long"}], "buy_orders": []},
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=10.0,
+            confirm_cycles=1,
+            current_long_qty=100.0,
+            current_short_qty=100.0,
+            current_long_avg_price=1.0000,
+            current_short_avg_price=0.9500,
+            mid_price=0.9800,
+            bq_ledger_report=ledger_report,
+        )
+
+        self.assertFalse(report.get("applied", False))
+        self.assertEqual(state["best_quote_frozen_inventory"].get("long_qty", 0.0), 0.0)
+        self.assertEqual(state["best_quote_volume_ledger"]["long_lots"][0]["qty"], 100.0)
+        gate = report["freeze_entry_pair_gate"]["long"]
+        self.assertTrue(gate["active"])
+        self.assertEqual(gate["allowed_qty"], 0.0)
+        self.assertEqual(gate["blocked_reason"], "opposite_frozen_pair_not_profitable")
+
+    def test_best_quote_reduce_freeze_only_freezes_qty_that_can_pair_profitably(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_lots": [{"qty": 40.0, "entry_price": 1.0500}],
+            },
+            "best_quote_volume_ledger": {
+                "long_lots": [
+                    {"qty": 60.0, "price": 1.0000, "order_id": 1},
+                    {"qty": 60.0, "price": 1.1000, "order_id": 2},
+                ],
+                "long_qty": 120.0,
+                "long_avg_price": 1.0500,
+                "short_lots": [],
+                "initialized": True,
+            },
+        }
+        ledger_report = _bq_ledger_report_from_state(state, mid_price=0.9800)
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=120.0,
+            current_short_qty=40.0,
+            current_long_avg_price=1.0500,
+            current_short_avg_price=1.0500,
+            mid_price=0.9800,
+            bq_ledger_report=ledger_report,
+        )
+
+        report = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [{"role": "best_quote_reduce_long"}], "buy_orders": []},
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=10.0,
+            confirm_cycles=1,
+            current_long_qty=120.0,
+            current_short_qty=40.0,
+            current_long_avg_price=1.0500,
+            current_short_avg_price=1.0500,
+            mid_price=0.9800,
+            bq_ledger_report=ledger_report,
+        )
+
+        self.assertTrue(report["applied"])
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_qty"], 40.0)
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_lots"][0]["entry_price"], 1.0)
+        remaining_lots = state["best_quote_volume_ledger"]["long_lots"]
+        self.assertEqual(remaining_lots[0]["qty"], 20.0)
+        self.assertEqual(remaining_lots[1]["qty"], 60.0)
+        gate = report["freeze_entry_pair_gate"]["long"]
+        self.assertEqual(gate["allowed_qty"], 40.0)
+        self.assertEqual(gate["blocked_qty"], 80.0)
+        self.assertEqual(gate["blocked_reason"], "opposite_frozen_pair_capacity_limited")
+        self.assertAlmostEqual(gate["estimated_pair_pnl"], 2.0)
+
     def test_best_quote_reduce_freeze_total_cap_blocks_only_new_freeze(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
@@ -1279,9 +1382,9 @@ class LoopRunnerTests(unittest.TestCase):
                 "long_lots": [{"qty": 300.0, "price": 0.6600}],
                 "long_qty": 300.0,
                 "long_avg_price": 0.6600,
-                "short_lots": [{"qty": 300.0, "price": 0.6200}],
+                "short_lots": [{"qty": 300.0, "price": 0.7000}],
                 "short_qty": 300.0,
-                "short_avg_price": 0.6200,
+                "short_avg_price": 0.7000,
                 "initialized": True,
             },
         }
@@ -1297,8 +1400,8 @@ class LoopRunnerTests(unittest.TestCase):
             current_long_qty=1300.0,
             current_short_qty=300.0,
             current_long_avg_price=0.6600,
-            current_short_avg_price=0.6200,
-            mid_price=0.6400,
+            current_short_avg_price=0.7000,
+            mid_price=0.7200,
             bq_ledger_report=state["best_quote_volume_ledger"],
         )
 
@@ -1315,8 +1418,8 @@ class LoopRunnerTests(unittest.TestCase):
             current_long_qty=1300.0,
             current_short_qty=300.0,
             current_long_avg_price=0.6600,
-            current_short_avg_price=0.6200,
-            mid_price=0.6400,
+            current_short_avg_price=0.7000,
+            mid_price=0.7200,
             bq_ledger_report=state["best_quote_volume_ledger"],
         )
 

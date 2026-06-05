@@ -2635,6 +2635,111 @@ def _best_quote_volume_consume_fifo(
     return updated, consumed, realized_cost
 
 
+def _best_quote_freeze_entry_pair_gate(
+    *,
+    side: str,
+    candidate_lots: list[dict[str, Any]],
+    frozen: Mapping[str, Any] | dict[str, Any],
+    candidate_qty: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    normalized_side = str(side or "").lower().strip()
+    is_long = normalized_side == "long"
+    opposite_key = "short_lots" if is_long else "long_lots"
+    opposite_side = "short" if is_long else "long"
+    opposite_lots = _normalize_best_quote_volume_lots((frozen or {}).get(opposite_key))
+    opposite_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in opposite_lots)
+    safe_candidate_qty = max(_safe_float(candidate_qty), 0.0)
+    gate_report: dict[str, Any] = {
+        "enabled": True,
+        "active": opposite_qty > 1e-12,
+        "side": normalized_side.upper(),
+        "opposite_side": opposite_side.upper(),
+        "candidate_qty": safe_candidate_qty,
+        "opposite_frozen_qty": opposite_qty,
+        "allowed_qty": safe_candidate_qty,
+        "blocked_qty": 0.0,
+        "estimated_pair_pnl": 0.0,
+        "blocked_reason": None,
+        "rule": "allow_without_opposite_frozen_or_only_if_new_freeze_can_pair_profitably",
+    }
+    normalized_candidates = _normalize_best_quote_volume_lots(candidate_lots)
+    if safe_candidate_qty <= 1e-12:
+        gate_report.update({"allowed_qty": 0.0, "blocked_reason": "empty_candidate_qty"})
+        return [], gate_report
+    if opposite_qty <= 1e-12:
+        gate_report["active"] = False
+        gate_report["blocked_reason"] = "no_opposite_frozen_inventory"
+        return normalized_candidates, gate_report
+    if not normalized_candidates:
+        gate_report.update(
+            {
+                "allowed_qty": 0.0,
+                "blocked_qty": safe_candidate_qty,
+                "blocked_reason": "missing_candidate_lot_cost_basis",
+            }
+        )
+        return [], gate_report
+
+    candidate_work = sorted(
+        [dict(item) for item in normalized_candidates],
+        key=lambda item: max(_safe_float(item.get("price")), 0.0),
+        reverse=not is_long,
+    )
+    opposite_work = sorted(
+        [dict(item) for item in opposite_lots],
+        key=lambda item: max(_safe_float(item.get("price")), 0.0),
+        reverse=is_long,
+    )
+    allowed_lots: list[dict[str, Any]] = []
+    estimated_pair_pnl = 0.0
+    i = 0
+    j = 0
+    while i < len(candidate_work) and j < len(opposite_work):
+        candidate = candidate_work[i]
+        opposite = opposite_work[j]
+        candidate_price = max(_safe_float(candidate.get("price")), 0.0)
+        opposite_price = max(_safe_float(opposite.get("price")), 0.0)
+        pair_edge = (opposite_price - candidate_price) if is_long else (candidate_price - opposite_price)
+        if pair_edge <= 1e-12:
+            break
+        candidate_qty_left = max(_safe_float(candidate.get("qty")), 0.0)
+        opposite_qty_left = max(_safe_float(opposite.get("qty")), 0.0)
+        take_qty = min(candidate_qty_left, opposite_qty_left)
+        if take_qty <= 1e-12:
+            if candidate_qty_left <= 1e-12:
+                i += 1
+            if opposite_qty_left <= 1e-12:
+                j += 1
+            continue
+        allowed_lot = dict(candidate)
+        allowed_lot["qty"] = take_qty
+        allowed_lots.append(allowed_lot)
+        estimated_pair_pnl += pair_edge * take_qty
+        candidate["qty"] = candidate_qty_left - take_qty
+        opposite["qty"] = opposite_qty_left - take_qty
+        if _safe_float(candidate.get("qty")) <= 1e-12:
+            i += 1
+        if _safe_float(opposite.get("qty")) <= 1e-12:
+            j += 1
+
+    allowed_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in allowed_lots)
+    blocked_qty = max(safe_candidate_qty - allowed_qty, 0.0)
+    blocked_reason = None
+    if allowed_qty <= 1e-12:
+        blocked_reason = "opposite_frozen_pair_not_profitable"
+    elif blocked_qty > 1e-12:
+        blocked_reason = "opposite_frozen_pair_capacity_limited"
+    gate_report.update(
+        {
+            "allowed_qty": allowed_qty,
+            "blocked_qty": blocked_qty,
+            "estimated_pair_pnl": estimated_pair_pnl,
+            "blocked_reason": blocked_reason,
+        }
+    )
+    return allowed_lots, gate_report
+
+
 def _best_quote_freeze_band_info(*, side: str, price: float, band_ratio: float) -> dict[str, Any] | None:
     safe_price = max(_safe_float(price), 0.0)
     safe_ratio = max(_safe_float(band_ratio), 0.0)
@@ -4255,6 +4360,54 @@ def _apply_best_quote_reduce_freeze(
         short_freeze_threshold,
     )
     use_lot_candidates = isinstance(bq_ledger_report, dict) and bool(bq_ledger_report.get("initialized"))
+    freeze_pair_gate_report = {
+        "enabled": True,
+        "long": {
+            "enabled": True,
+            "active": False,
+            "side": "LONG",
+            "allowed_qty": long_candidate_qty if use_lot_candidates else 0.0,
+            "blocked_qty": 0.0,
+            "blocked_reason": "lot_candidates_unavailable" if not use_lot_candidates else None,
+        },
+        "short": {
+            "enabled": True,
+            "active": False,
+            "side": "SHORT",
+            "allowed_qty": short_candidate_qty if use_lot_candidates else 0.0,
+            "blocked_qty": 0.0,
+            "blocked_reason": "lot_candidates_unavailable" if not use_lot_candidates else None,
+        },
+    }
+    if use_lot_candidates:
+        frozen_inventory_for_gate = dict(state.get("best_quote_frozen_inventory") or {})
+        long_candidate_lots, long_gate = _best_quote_freeze_entry_pair_gate(
+            side="long",
+            candidate_lots=long_candidate_lots,
+            frozen=frozen_inventory_for_gate,
+            candidate_qty=long_candidate_qty,
+        )
+        short_candidate_lots, short_gate = _best_quote_freeze_entry_pair_gate(
+            side="short",
+            candidate_lots=short_candidate_lots,
+            frozen=frozen_inventory_for_gate,
+            candidate_qty=short_candidate_qty,
+        )
+        freeze_pair_gate_report["long"] = long_gate
+        freeze_pair_gate_report["short"] = short_gate
+        long_candidate_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in long_candidate_lots)
+        short_candidate_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in short_candidate_lots)
+        long_candidate_notional = long_candidate_qty * _safe_float(mid_price)
+        short_candidate_notional = short_candidate_qty * _safe_float(mid_price)
+        long_candidate_loss_ratio = max(
+            (max(_safe_float(item.get("freeze_loss_ratio")), 0.0) for item in long_candidate_lots),
+            default=0.0,
+        )
+        short_candidate_loss_ratio = max(
+            (max(_safe_float(item.get("freeze_loss_ratio")), 0.0) for item in short_candidate_lots),
+            default=0.0,
+        )
+    report["freeze_entry_pair_gate"] = freeze_pair_gate_report
     long_confirm_qty = long_candidate_qty if use_lot_candidates else managed_long_qty
     long_confirm_notional = long_candidate_notional if use_lot_candidates else managed_long_notional
     long_confirm_loss_ratio = long_candidate_loss_ratio if use_lot_candidates else long_loss_ratio
@@ -4406,6 +4559,7 @@ def _apply_best_quote_reduce_freeze(
         report["band_budget"] = band_budget_report
         report["frozen_total_cap"] = frozen_total_cap_report
         report["frozen_side_cap"] = frozen_side_cap_report
+        report["freeze_entry_pair_gate"] = freeze_pair_gate_report
         report["confirmations"] = dict(confirmations)
         report["min_notional"] = min_notional_value
         report["protected_candidates"] = protected_candidates
