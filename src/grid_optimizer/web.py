@@ -449,6 +449,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_reduce_freeze_stress_loss_ratio": 0.0,
             "best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio": 0.0,
             "best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio": 0.0,
+            "best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled": True,
             "best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled": False,
             "best_quote_maker_volume_reduce_freeze_dynamic_threshold_loss_ratio_scale": 0.0,
             "best_quote_maker_volume_reduce_freeze_dynamic_threshold_max_extra_ratio": 0.0,
@@ -551,6 +552,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_reduce_freeze_stress_loss_ratio": 0.015,
             "best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio": 0.0025,
             "best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio": 0.0035,
+            "best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled": True,
             "best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled": False,
             "best_quote_maker_volume_reduce_freeze_dynamic_threshold_loss_ratio_scale": 0.0,
             "best_quote_maker_volume_reduce_freeze_dynamic_threshold_max_extra_ratio": 0.0,
@@ -4085,6 +4087,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "best_quote_maker_volume_reduce_freeze_stress_loss_ratio": 0.0,
     "best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio": 0.0,
     "best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio": 0.0,
+    "best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled": True,
     "best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled": False,
     "best_quote_maker_volume_reduce_freeze_dynamic_threshold_loss_ratio_scale": 0.0,
     "best_quote_maker_volume_reduce_freeze_dynamic_threshold_max_extra_ratio": 0.0,
@@ -9593,6 +9596,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_inventory_cost_gate_enabled",
         "best_quote_maker_volume_net_loss_reduce_enabled",
         "best_quote_maker_volume_reduce_freeze_enabled",
+        "best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled",
         "best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled",
         "best_quote_maker_volume_reduce_freeze_band_budget_enabled",
         "best_quote_maker_volume_frozen_v2_enabled",
@@ -10611,6 +10615,9 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio", 0.0)),
         "--best-quote-maker-volume-reduce-freeze-stress-1m-amplitude-ratio",
         str(config.get("best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio", 0.0)),
+        "--best-quote-maker-volume-reduce-freeze-profitable-pair-gate-enabled"
+        if config.get("best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled", True)
+        else "--no-best-quote-maker-volume-reduce-freeze-profitable-pair-gate-enabled",
         "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-enabled"
         if config.get("best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled", False)
         else "--no-best-quote-maker-volume-reduce-freeze-dynamic-threshold-enabled",

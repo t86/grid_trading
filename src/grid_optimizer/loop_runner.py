@@ -3976,6 +3976,7 @@ def _apply_best_quote_reduce_freeze(
     current_short_avg_price: float,
     mid_price: float,
     bq_ledger_report: dict[str, Any] | None = None,
+    profitable_pair_gate_enabled: bool = True,
 ) -> dict[str, Any]:
     report = dict(report)
     report["enabled"] = bool(enabled)
@@ -3987,6 +3988,7 @@ def _apply_best_quote_reduce_freeze(
     report["hard_confirm_cycles"] = max(int(hard_confirm_cycles), 0)
     report["stress_loss_ratio"] = max(_safe_float(stress_loss_ratio), 0.0)
     report["stress_active"] = bool(stress_active)
+    report["profitable_pair_gate_enabled"] = bool(profitable_pair_gate_enabled)
     safe_frozen_total_cap_notional = max(_safe_float(frozen_total_cap_notional), 0.0)
     frozen_total_notional = _safe_float(report.get("frozen_long_notional")) + _safe_float(
         report.get("frozen_short_notional")
@@ -4379,7 +4381,7 @@ def _apply_best_quote_reduce_freeze(
             "blocked_reason": "lot_candidates_unavailable" if not use_lot_candidates else None,
         },
     }
-    if use_lot_candidates:
+    if use_lot_candidates and profitable_pair_gate_enabled:
         frozen_inventory_for_gate = dict(state.get("best_quote_frozen_inventory") or {})
         long_candidate_lots, long_gate = _best_quote_freeze_entry_pair_gate(
             side="long",
@@ -4407,6 +4409,11 @@ def _apply_best_quote_reduce_freeze(
             (max(_safe_float(item.get("freeze_loss_ratio")), 0.0) for item in short_candidate_lots),
             default=0.0,
         )
+    elif not profitable_pair_gate_enabled:
+        freeze_pair_gate_report["long"]["enabled"] = False
+        freeze_pair_gate_report["long"]["blocked_reason"] = "disabled"
+        freeze_pair_gate_report["short"]["enabled"] = False
+        freeze_pair_gate_report["short"]["blocked_reason"] = "disabled"
     report["freeze_entry_pair_gate"] = freeze_pair_gate_report
     long_confirm_qty = long_candidate_qty if use_lot_candidates else managed_long_qty
     long_confirm_notional = long_candidate_notional if use_lot_candidates else managed_long_notional
@@ -4540,6 +4547,7 @@ def _apply_best_quote_reduce_freeze(
         report["freeze_confirm_cycles"] = freeze_confirm_cycles
         report["stress_loss_ratio"] = max(_safe_float(stress_loss_ratio), 0.0)
         report["stress_active"] = bool(stress_active)
+        report["profitable_pair_gate_enabled"] = bool(profitable_pair_gate_enabled)
         report["dynamic_threshold"] = {
             "enabled": bool(dynamic_threshold_enabled),
             "active": dynamic_threshold_active,
@@ -17738,6 +17746,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             0.0,
         )
+        best_quote_reduce_freeze_profitable_pair_gate_enabled = bool(
+            getattr(effective_args, "best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled", True)
+        )
         best_quote_reduce_freeze_dynamic_threshold_enabled = bool(
             getattr(effective_args, "best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled", False)
         )
@@ -17905,6 +17916,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 "stress_loss_ratio": best_quote_reduce_freeze_stress_loss_ratio,
                 "stress_1m_abs_return_ratio": best_quote_reduce_freeze_stress_1m_abs_return_ratio,
                 "stress_1m_amplitude_ratio": best_quote_reduce_freeze_stress_1m_amplitude_ratio,
+                "profitable_pair_gate_enabled": best_quote_reduce_freeze_profitable_pair_gate_enabled,
                 "dynamic_threshold_enabled": best_quote_reduce_freeze_dynamic_threshold_enabled,
                 "dynamic_threshold_loss_ratio_scale": best_quote_reduce_freeze_dynamic_threshold_loss_ratio_scale,
                 "dynamic_threshold_max_extra_ratio": best_quote_reduce_freeze_dynamic_threshold_max_extra_ratio,
@@ -17984,6 +17996,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             frozen_total_cap_notional=best_quote_frozen_total_cap_notional,
             frozen_long_cap_notional=best_quote_frozen_long_cap_notional,
             frozen_short_cap_notional=best_quote_frozen_short_cap_notional,
+            profitable_pair_gate_enabled=best_quote_reduce_freeze_profitable_pair_gate_enabled,
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
             current_long_avg_price=current_long_avg_price,
@@ -21265,6 +21278,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-stress-loss-ratio", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-stress-1m-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-stress-1m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--best-quote-maker-volume-reduce-freeze-profitable-pair-gate-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument(
         "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-enabled",
         action=argparse.BooleanOptionalAction,

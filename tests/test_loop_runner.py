@@ -1314,6 +1314,54 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(gate["blocked_reason"], "opposite_frozen_pair_capacity_limited")
         self.assertAlmostEqual(gate["estimated_pair_pnl"], 2.0)
 
+    def test_best_quote_reduce_freeze_profitable_pair_gate_can_be_disabled(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_lots": [{"qty": 100.0, "entry_price": 0.9500}],
+            },
+            "best_quote_volume_ledger": {
+                "long_lots": [{"qty": 100.0, "price": 1.0000}],
+                "long_qty": 100.0,
+                "long_avg_price": 1.0000,
+                "short_lots": [],
+                "initialized": True,
+            },
+        }
+        ledger_report = _bq_ledger_report_from_state(state, mid_price=0.9800)
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=100.0,
+            current_short_qty=100.0,
+            current_long_avg_price=1.0000,
+            current_short_avg_price=0.9500,
+            mid_price=0.9800,
+            bq_ledger_report=ledger_report,
+        )
+
+        report = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [{"role": "best_quote_reduce_long"}], "buy_orders": []},
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=10.0,
+            confirm_cycles=1,
+            current_long_qty=100.0,
+            current_short_qty=100.0,
+            current_long_avg_price=1.0000,
+            current_short_avg_price=0.9500,
+            mid_price=0.9800,
+            bq_ledger_report=ledger_report,
+            profitable_pair_gate_enabled=False,
+        )
+
+        self.assertTrue(report["applied"])
+        self.assertFalse(report["profitable_pair_gate_enabled"])
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_qty"], 100.0)
+        gate = report["freeze_entry_pair_gate"]["long"]
+        self.assertFalse(gate["enabled"])
+        self.assertEqual(gate["blocked_reason"], "disabled")
+
     def test_best_quote_reduce_freeze_total_cap_blocks_only_new_freeze(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
