@@ -1721,6 +1721,7 @@ class WebSecurityTests(unittest.TestCase):
             "volatility_trigger_window": "1h",
             "volatility_trigger_amplitude_ratio": 0.04,
             "volatility_trigger_abs_return_ratio": 0.02,
+            "neutral_base_qty": 1000.0,
         }
         with (
             patch(
@@ -1741,6 +1742,7 @@ class WebSecurityTests(unittest.TestCase):
 
         mock_start.assert_called_once()
         self.assertTrue(mock_start.call_args.kwargs["spot"])
+        self.assertEqual(mock_start.call_args.args[0]["neutral_base_qty"], 1000.0)
         mock_futures_start.assert_not_called()
         status = mock_update.call_args.args[1]
         self.assertEqual(status["action"], "start")

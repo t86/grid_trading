@@ -7880,7 +7880,8 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
     symbol = str(normalized_config.get("symbol", "")).upper().strip()
     if not symbol or not normalized_config.get("volatility_trigger_enabled"):
         return
-    spot_runner = _volatility_trigger_uses_spot_runner(normalized_config)
+    spot_runner = _volatility_trigger_uses_spot_runner(config) or _volatility_trigger_uses_spot_runner(normalized_config)
+    runner_start_config = dict(config) if spot_runner else normalized_config
 
     checked_at_dt = datetime.now(timezone.utc)
     checked_at = checked_at_dt.isoformat()
@@ -7996,7 +7997,7 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                 status["volume_block"] = volume_gate
                 _update_volatility_trigger_status(symbol, status)
                 return
-            result = _start_volatility_runner_process(normalized_config, spot=spot_runner)
+            result = _start_volatility_runner_process(runner_start_config, spot=spot_runner)
             status["result"] = {
                 "started": bool(result.get("started")),
                 "already_running": bool(result.get("already_running")),
@@ -8083,7 +8084,7 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                     status["full_flatten_target_reached"] = False
                     status["escalation_reason"] = None
                     if not bool(runner.get("is_running")):
-                        resume_result = _start_volatility_runner_process(normalized_config, spot=spot_runner)
+                        resume_result = _start_volatility_runner_process(runner_start_config, spot=spot_runner)
                         resumed_runner = _read_volatility_runner_process(symbol, spot=spot_runner)
                         status["action"] = "start"
                         status["reason"] = "reduce_target_reached_resume_runner"
@@ -8128,7 +8129,7 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                     status["full_flatten_target_reached"] = False
                     status["escalation_reason"] = None
                     if not bool(runner.get("is_running")):
-                        resume_result = _start_volatility_runner_process(normalized_config, spot=spot_runner)
+                        resume_result = _start_volatility_runner_process(runner_start_config, spot=spot_runner)
                         resumed_runner = _read_volatility_runner_process(symbol, spot=spot_runner)
                         status["action"] = "start"
                         status["reason"] = (
