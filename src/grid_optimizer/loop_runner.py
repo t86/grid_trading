@@ -4876,6 +4876,7 @@ def apply_best_quote_frozen_inventory_pair_release(
     min_side_notional: float,
     min_profit_ratio: float,
     max_slippage_ticks: int,
+    execution_type: str = "aggressive",
     allow_loss: bool = False,
     requested_qty: float | None = None,
     request_id: str | None = None,
@@ -4965,9 +4966,16 @@ def apply_best_quote_frozen_inventory_pair_release(
         release_report["blocked_reasons"].append("below_min_qty")
         return release_report
 
+    release_execution_type = str(execution_type or "aggressive").strip().lower()
+    if release_execution_type not in {"aggressive", "maker"}:
+        release_execution_type = "aggressive"
     slippage = max(int(max_slippage_ticks), 0) * max(_safe_float(tick_size), 0.0)
-    sell_price = _round_order_price(max(safe_bid - slippage, 0.0), tick_size, "SELL")
-    buy_price = _round_order_price(max(safe_ask + slippage, 0.0), tick_size, "BUY")
+    if release_execution_type == "maker":
+        sell_price = _round_order_price(max(safe_ask + slippage, 0.0), tick_size, "SELL")
+        buy_price = _round_order_price(max(safe_bid - slippage, 0.0), tick_size, "BUY")
+    else:
+        sell_price = _round_order_price(max(safe_bid - slippage, 0.0), tick_size, "SELL")
+        buy_price = _round_order_price(max(safe_ask + slippage, 0.0), tick_size, "BUY")
     if sell_price <= 0 or buy_price <= 0:
         release_report["blocked_reasons"].append("missing_release_price")
         return release_report
@@ -5023,8 +5031,9 @@ def apply_best_quote_frozen_inventory_pair_release(
         "role": "frozen_inventory_pair_release_long",
         "position_side": "LONG" if hedge_mode else "BOTH",
         "force_reduce_only": True,
-        "execution_type": "aggressive",
-        "time_in_force": "IOC",
+        "execution_type": release_execution_type,
+        "time_in_force": "GTX" if release_execution_type == "maker" else "IOC",
+        "post_only": release_execution_type == "maker",
         "frozen_inventory_pair_release": True,
         "frozen_inventory_request_id": safe_request_id,
     }
@@ -5036,8 +5045,9 @@ def apply_best_quote_frozen_inventory_pair_release(
         "role": "frozen_inventory_pair_release_short",
         "position_side": "SHORT" if hedge_mode else "BOTH",
         "force_reduce_only": True,
-        "execution_type": "aggressive",
-        "time_in_force": "IOC",
+        "execution_type": release_execution_type,
+        "time_in_force": "GTX" if release_execution_type == "maker" else "IOC",
+        "post_only": release_execution_type == "maker",
         "frozen_inventory_pair_release": True,
         "frozen_inventory_request_id": safe_request_id,
     }
@@ -17872,6 +17882,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             int(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks", 2)),
             0,
         )
+        best_quote_frozen_pair_release_execution_type = str(
+            getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_execution_type", "aggressive")
+            or "aggressive"
+        ).strip().lower()
+        if best_quote_frozen_pair_release_execution_type not in {"aggressive", "maker"}:
+            best_quote_frozen_pair_release_execution_type = "aggressive"
         best_quote_frozen_pair_release_max_30s_abs_return_ratio = max(
             _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio", 0.0015)),
             0.0,
@@ -18555,6 +18571,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_side_notional=best_quote_frozen_pair_release_min_side_notional,
             min_profit_ratio=best_quote_frozen_pair_release_min_profit_ratio,
             max_slippage_ticks=best_quote_frozen_pair_release_max_slippage_ticks,
+            execution_type=best_quote_frozen_pair_release_execution_type,
             allow_loss=best_quote_frozen_pair_release_allow_loss,
             requested_qty=(
                 _safe_float(best_quote_frozen_pair_release_directive.get("requested_qty"))
@@ -18585,6 +18602,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 "min_profit_ratio": best_quote_frozen_pair_release_min_profit_ratio,
                 "allow_loss": best_quote_frozen_pair_release_allow_loss,
                 "max_slippage_ticks": best_quote_frozen_pair_release_max_slippage_ticks,
+                "execution_type": best_quote_frozen_pair_release_execution_type,
                 "max_30s_abs_return_ratio": best_quote_frozen_pair_release_max_30s_abs_return_ratio,
                 "max_1m_abs_return_ratio": best_quote_frozen_pair_release_max_1m_abs_return_ratio,
                 "max_1m_amplitude_ratio": best_quote_frozen_pair_release_max_1m_amplitude_ratio,
@@ -21346,6 +21364,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument("--best-quote-maker-volume-frozen-pair-release-max-slippage-ticks", type=int, default=2)
+    parser.add_argument(
+        "--best-quote-maker-volume-frozen-pair-release-execution-type",
+        choices=("aggressive", "maker"),
+        default="aggressive",
+    )
     parser.add_argument(
         "--best-quote-maker-volume-frozen-pair-release-max-30s-abs-return-ratio",
         type=float,

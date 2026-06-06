@@ -481,6 +481,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.0008,
             "best_quote_maker_volume_frozen_pair_release_allow_loss": False,
             "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks": 2,
+            "best_quote_maker_volume_frozen_pair_release_execution_type": "aggressive",
             "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio": 0.0015,
             "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio": 0.0025,
             "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio": 0.0035,
@@ -584,6 +585,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.0008,
             "best_quote_maker_volume_frozen_pair_release_allow_loss": False,
             "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks": 2,
+            "best_quote_maker_volume_frozen_pair_release_execution_type": "aggressive",
             "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio": 0.0015,
             "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio": 0.0025,
             "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio": 0.0035,
@@ -4119,6 +4121,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.0008,
     "best_quote_maker_volume_frozen_pair_release_allow_loss": False,
     "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks": 2,
+    "best_quote_maker_volume_frozen_pair_release_execution_type": "aggressive",
     "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio": 0.0015,
     "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio": 0.0025,
     "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio": 0.0035,
@@ -10251,6 +10254,13 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         pair_release_slippage_ticks = number("best_quote_maker_volume_frozen_pair_release_max_slippage_ticks")
         if pair_release_slippage_ticks is not None and pair_release_slippage_ticks < 0:
             errors.append("best_quote_maker_volume_frozen_pair_release_max_slippage_ticks 必须 >= 0")
+        pair_release_execution_type = str(
+            config.get("best_quote_maker_volume_frozen_pair_release_execution_type", "aggressive") or "aggressive"
+        ).strip().lower()
+        if pair_release_execution_type not in {"aggressive", "maker"}:
+            errors.append("best_quote_maker_volume_frozen_pair_release_execution_type 必须是 aggressive 或 maker")
+        else:
+            config["best_quote_maker_volume_frozen_pair_release_execution_type"] = pair_release_execution_type
         same_side_gap_ticks = number("best_quote_maker_volume_same_side_entry_price_guard_gap_ticks")
         if same_side_gap_ticks is not None and same_side_gap_ticks < 0:
             errors.append("best_quote_maker_volume_same_side_entry_price_guard_gap_ticks 必须 >= 0")
@@ -10685,6 +10695,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         else "--no-best-quote-maker-volume-frozen-pair-release-allow-loss",
         "--best-quote-maker-volume-frozen-pair-release-max-slippage-ticks",
         str(config.get("best_quote_maker_volume_frozen_pair_release_max_slippage_ticks", 2)),
+        "--best-quote-maker-volume-frozen-pair-release-execution-type",
+        str(config.get("best_quote_maker_volume_frozen_pair_release_execution_type", "aggressive")),
         "--best-quote-maker-volume-frozen-pair-release-max-30s-abs-return-ratio",
         str(config.get("best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio", 0.0015)),
         "--best-quote-maker-volume-frozen-pair-release-max-1m-abs-return-ratio",

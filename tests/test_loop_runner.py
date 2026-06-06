@@ -3159,6 +3159,46 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(sell_order["frozen_inventory_pair_release"])
         self.assertTrue(buy_order["frozen_inventory_pair_release"])
 
+    def test_best_quote_frozen_pair_release_places_paired_maker_when_configured(self) -> None:
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        release = apply_best_quote_frozen_inventory_pair_release(
+            plan=plan,
+            report={
+                "frozen_long_qty": 50.0,
+                "frozen_short_qty": 50.0,
+                "ledger": {"long_entry_price": 1.0, "short_entry_price": 1.05},
+            },
+            bid_price=1.009,
+            ask_price=1.011,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+            enabled=True,
+            stable_allowed=True,
+            max_notional=20.0,
+            min_side_notional=0.0,
+            min_profit_ratio=0.001,
+            max_slippage_ticks=0,
+            execution_type="maker",
+            request_id="req-pair",
+        )
+
+        self.assertTrue(release["active"])
+        self.assertGreater(release["estimated_pair_pnl"], release["required_profit"])
+        sell_order = plan["sell_orders"][0]
+        buy_order = plan["buy_orders"][0]
+        self.assertEqual(sell_order["execution_type"], "maker")
+        self.assertEqual(buy_order["execution_type"], "maker")
+        self.assertEqual(sell_order["time_in_force"], "GTX")
+        self.assertEqual(buy_order["time_in_force"], "GTX")
+        self.assertTrue(sell_order["post_only"])
+        self.assertTrue(buy_order["post_only"])
+        self.assertEqual(sell_order["price"], 1.011)
+        self.assertEqual(buy_order["price"], 1.009)
+
     def test_best_quote_frozen_pair_release_honors_requested_qty(self) -> None:
         plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
 
