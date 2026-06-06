@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,7 @@ from grid_optimizer.web import (
     _get_custom_runner_preset,
     _load_runner_control_config,
     _legacy_running_status_server_from_payload,
+    _iter_saved_runner_control_configs,
     _normalize_runner_control_payload,
     _normalize_runner_volatility_trigger_config,
     _parse_allowed_networks,
@@ -2070,6 +2072,35 @@ class WebSecurityTests(unittest.TestCase):
             self.assertEqual(config["summary_jsonl"], "output/katusdt_loop_events.jsonl")
         finally:
             control_path.unlink(missing_ok=True)
+
+    def test_iter_saved_runner_control_configs_ignores_spot_controls(self) -> None:
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            output_dir = cwd / "output"
+            output_dir.mkdir()
+            (output_dir / "xlmusdt_spot_loop_runner_control.json").write_text(
+                json.dumps(
+                    {
+                        "symbol": "XLMUSDT",
+                        "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                        "volatility_trigger_enabled": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (output_dir / "soonusdt_loop_runner_control.json").write_text(
+                json.dumps({"symbol": "SOONUSDT", "strategy_mode": "one_way_long"}),
+                encoding="utf-8",
+            )
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(cwd)
+                with patch("grid_optimizer.web.RUNNER_CONTROL_PATH", cwd / "missing_control.json"):
+                    configs = _iter_saved_runner_control_configs()
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertEqual([config["symbol"] for config in configs], ["SOONUSDT"])
 
     def test_symbol_runner_template_disables_legacy_mode(self) -> None:
         with patch.dict("os.environ", {"GRID_RUNNER_SERVICE_TEMPLATE": "grid-loop@{symbol}.service"}):

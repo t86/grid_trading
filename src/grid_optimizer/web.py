@@ -5255,11 +5255,19 @@ def _save_runner_control_config(config: dict[str, Any], *, symbol: str | None = 
     control_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _is_spot_runner_control_path(path: Path) -> bool:
+    return path.name.endswith("_spot_loop_runner_control.json")
+
+
 def _iter_saved_runner_control_configs() -> list[dict[str, Any]]:
     output_dir = Path("output")
     paths: list[Path] = []
     if output_dir.exists():
-        paths.extend(sorted(output_dir.glob("*_loop_runner_control.json")))
+        paths.extend(
+            path
+            for path in sorted(output_dir.glob("*_loop_runner_control.json"))
+            if not _is_spot_runner_control_path(path)
+        )
     if RUNNER_CONTROL_PATH.exists() and RUNNER_CONTROL_PATH not in paths:
         paths.append(RUNNER_CONTROL_PATH)
 
