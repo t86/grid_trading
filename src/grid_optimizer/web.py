@@ -7449,6 +7449,104 @@ def _volatility_trigger_status_from_stop(previous_status: dict[str, Any]) -> boo
     }
 
 
+def _volatility_trigger_uses_spot_runner(config: dict[str, Any]) -> bool:
+    market_type = str(config.get("market_type") or "").strip().lower()
+    strategy_mode = str(config.get("strategy_mode") or "").strip().lower()
+    return market_type == "spot" or strategy_mode.startswith("spot_")
+
+
+def _read_volatility_runner_process(symbol: str, *, spot: bool = False) -> dict[str, Any]:
+    if not spot:
+        return _read_runner_process_for_symbol(symbol)
+    runner = _read_spot_runner_process_for_symbol(symbol)
+    if runner.get("is_running"):
+        return runner
+    systemd_runner = _read_runner_process_for_symbol(symbol)
+    if systemd_runner.get("is_running"):
+        return systemd_runner
+    return runner
+
+
+def _start_volatility_runner_process(config: dict[str, Any], *, spot: bool = False) -> dict[str, Any]:
+    if not spot:
+        return _start_runner_process(config)
+    symbol = str(config.get("symbol", SPOT_RUNNER_DEFAULT_CONFIG["symbol"])).upper().strip() or "BTCUSDT"
+    _runner_start_safety_preflight(config, spot=True)
+    runner = _read_volatility_runner_process(symbol, spot=True)
+    if runner.get("is_running"):
+        return {"started": False, "already_running": True, "runner": runner, "symbol": symbol, "restarted": False}
+
+    _save_spot_runner_control_config(config, symbol=symbol)
+    _clear_volatility_trigger_status(symbol, reason="spot_runner_started")
+    service_name = _runner_service_name_for_symbol(symbol)
+    if service_name and _runner_service_available(symbol):
+        _run_systemctl(["reset-failed", service_name], check=False)
+        _run_systemctl(["start", service_name], check=True)
+        time.sleep(1.0)
+        return {
+            "started": True,
+            "already_running": False,
+            "restarted": False,
+            "runner": _read_volatility_runner_process(symbol, spot=True),
+            "service": service_name,
+            "symbol": symbol,
+        }
+    return _start_spot_runner_process(config)
+
+
+def _stop_volatility_runner_process(
+    symbol: str | None = None,
+    timeout_seconds: float = 10.0,
+    *,
+    spot: bool = False,
+    cancel_open_orders: bool = False,
+    close_all_positions: bool = False,
+    close_position_target_notional: float | None = None,
+    close_position_allow_loss: bool = False,
+    close_position_max_loss_ratio: float | None = None,
+) -> dict[str, Any]:
+    if not spot:
+        return _stop_runner_process(
+            symbol,
+            timeout_seconds=timeout_seconds,
+            cancel_open_orders=cancel_open_orders,
+            close_all_positions=close_all_positions,
+            close_position_target_notional=close_position_target_notional,
+            close_position_allow_loss=close_position_allow_loss,
+            close_position_max_loss_ratio=close_position_max_loss_ratio,
+        )
+    normalized_symbol = (
+        str(symbol or SPOT_RUNNER_DEFAULT_CONFIG["symbol"]).upper().strip()
+        or str(SPOT_RUNNER_DEFAULT_CONFIG["symbol"])
+    )
+    config = _load_spot_runner_control_config(normalized_symbol)
+    cleanup = _cancel_spot_strategy_orders(config) if cancel_open_orders else {"canceled": 0}
+    service_name = _runner_service_name_for_symbol(normalized_symbol)
+    if service_name and _runner_service_available(normalized_symbol):
+        active = _run_systemctl(["is-active", "--quiet", service_name], check=False).returncode == 0
+        if active:
+            _run_systemctl(["stop", service_name], check=True)
+            time.sleep(1.0)
+            stopped = True
+        else:
+            stopped = False
+        return {
+            "stopped": stopped,
+            "already_stopped": not stopped,
+            "runner": _read_volatility_runner_process(normalized_symbol, spot=True),
+            "service": service_name,
+            "symbol": normalized_symbol,
+            "post_stop_actions": {"spot_strategy_orders": cleanup},
+        }
+    stopped = _stop_spot_runner_process(
+        normalized_symbol,
+        timeout_seconds=timeout_seconds,
+        cancel_orders=cancel_open_orders,
+    )
+    stopped["post_stop_actions"] = {"spot_strategy_orders": stopped.get("cleanup", cleanup)}
+    return stopped
+
+
 def _volatility_reduce_was_effective(previous_status: dict[str, Any]) -> bool:
     if bool(previous_status.get("reduce_effective")) or bool(previous_status.get("reduce_flatten_started")):
         return True
@@ -7782,6 +7880,7 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
     symbol = str(normalized_config.get("symbol", "")).upper().strip()
     if not symbol or not normalized_config.get("volatility_trigger_enabled"):
         return
+    spot_runner = _volatility_trigger_uses_spot_runner(normalized_config)
 
     checked_at_dt = datetime.now(timezone.utc)
     checked_at = checked_at_dt.isoformat()
@@ -7793,7 +7892,7 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
     window_minutes = VOLATILITY_TRIGGER_WINDOW_MINUTES[window_key]
     current_amplitude_ratio = float(signal_profile.get("current_amplitude_ratio") or 0.0)
     current_return_ratio = float(signal_profile.get("current_return_ratio") or 0.0)
-    runner = _read_runner_process_for_symbol(symbol)
+    runner = _read_volatility_runner_process(symbol, spot=spot_runner)
     flatten = _read_flatten_process_for_symbol(symbol)
     previous_status = _runner_volatility_trigger_status(symbol) or {}
     reduce_target_notional = _volatility_reduce_target_notional(effective_config)
@@ -7897,7 +7996,7 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                 status["volume_block"] = volume_gate
                 _update_volatility_trigger_status(symbol, status)
                 return
-            result = _start_runner_process(normalized_config)
+            result = _start_volatility_runner_process(normalized_config, spot=spot_runner)
             status["result"] = {
                 "started": bool(result.get("started")),
                 "already_running": bool(result.get("already_running")),
@@ -7984,8 +8083,8 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                     status["full_flatten_target_reached"] = False
                     status["escalation_reason"] = None
                     if not bool(runner.get("is_running")):
-                        resume_result = _start_runner_process(normalized_config)
-                        resumed_runner = _read_runner_process_for_symbol(symbol)
+                        resume_result = _start_volatility_runner_process(normalized_config, spot=spot_runner)
+                        resumed_runner = _read_volatility_runner_process(symbol, spot=spot_runner)
                         status["action"] = "start"
                         status["reason"] = "reduce_target_reached_resume_runner"
                         status["runner_running"] = bool(resumed_runner.get("is_running"))
@@ -8029,8 +8128,8 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                     status["full_flatten_target_reached"] = False
                     status["escalation_reason"] = None
                     if not bool(runner.get("is_running")):
-                        resume_result = _start_runner_process(normalized_config)
-                        resumed_runner = _read_runner_process_for_symbol(symbol)
+                        resume_result = _start_volatility_runner_process(normalized_config, spot=spot_runner)
+                        resumed_runner = _read_volatility_runner_process(symbol, spot=spot_runner)
                         status["action"] = "start"
                         status["reason"] = (
                             "blocked_reduce_relax_still_blocked_resume_runner"
@@ -8073,8 +8172,9 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                 status["full_flatten_started_at"] = previous_status.get("full_flatten_started_at") or checked_at
                 status["full_flatten_target_reached"] = False
             _update_volatility_trigger_status(symbol, status)
-            result = _stop_runner_process(
+            result = _stop_volatility_runner_process(
                 symbol,
+                spot=spot_runner,
                 cancel_open_orders=bool(effective_config.get("volatility_trigger_stop_cancel_open_orders", True)),
                 close_all_positions=close_positions,
                 close_position_target_notional=target_notional,

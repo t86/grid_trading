@@ -1712,6 +1712,41 @@ class WebSecurityTests(unittest.TestCase):
         self.assertFalse(status["paused_by_trigger"])
         self.assertTrue(status["runner_running"])
 
+    def test_volatility_trigger_resumes_spot_runner_with_spot_start_path(self) -> None:
+        config = {
+            "market_type": "spot",
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "symbol": "XLMUSDT",
+            "volatility_trigger_enabled": True,
+            "volatility_trigger_window": "1h",
+            "volatility_trigger_amplitude_ratio": 0.04,
+            "volatility_trigger_abs_return_ratio": 0.02,
+        }
+        with (
+            patch(
+                "grid_optimizer.web.fetch_futures_window_price_stats",
+                return_value={"amplitude_ratio": 0.01, "return_ratio": 0.002},
+            ),
+            patch("grid_optimizer.web._read_volatility_runner_process", return_value={"is_running": False}),
+            patch("grid_optimizer.web._read_flatten_process_for_symbol", return_value={"is_running": False}),
+            patch(
+                "grid_optimizer.web._runner_volatility_trigger_status",
+                return_value={"paused_by_trigger": True, "phase": "full_flatten"},
+            ),
+            patch("grid_optimizer.web._start_volatility_runner_process", return_value={"started": True}) as mock_start,
+            patch("grid_optimizer.web._start_runner_process") as mock_futures_start,
+            patch("grid_optimizer.web._update_volatility_trigger_status") as mock_update,
+        ):
+            _reconcile_runner_volatility_trigger(config)
+
+        mock_start.assert_called_once()
+        self.assertTrue(mock_start.call_args.kwargs["spot"])
+        mock_futures_start.assert_not_called()
+        status = mock_update.call_args.args[1]
+        self.assertEqual(status["action"], "start")
+        self.assertEqual(status["reason"], "volatility_back_within_threshold")
+        self.assertFalse(status["paused_by_trigger"])
+
     def test_volatility_trigger_relaxes_blocked_reduce_after_timeout(self) -> None:
         config = {
             "symbol": "SOONUSDT",
