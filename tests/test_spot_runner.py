@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import grid_optimizer.web as web
+from grid_optimizer.spot_loop_runner import _build_parser as _build_spot_loop_parser
 from grid_optimizer.web import (
     SPOT_RUNNER_DEFAULT_CONFIG,
     SPOT_MONITOR_PAGE,
@@ -253,6 +254,8 @@ class SpotRunnerTests(unittest.TestCase):
                 "run_start_time": "2026-03-31T01:00:00+00:00",
                 "run_end_time": "2026-03-31T03:00:00+00:00",
                 "rolling_hourly_loss_limit": 250.0,
+                "rolling_hourly_loss_per_10k_limit": 40.0,
+                "rolling_hourly_loss_per_10k_min_notional": 10000.0,
                 "max_cumulative_notional": 100000.0,
             }
         )
@@ -263,7 +266,12 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("2026-03-31T01:00:00+00:00", command)
         self.assertIn("--run-end-time", command)
         self.assertIn("--rolling-hourly-loss-limit", command)
+        self.assertIn("--rolling-hourly-loss-per-10k-limit", command)
+        self.assertIn("--rolling-hourly-loss-per-10k-min-notional", command)
         self.assertIn("--max-cumulative-notional", command)
+        args = _build_spot_loop_parser().parse_args(command[3:])
+        self.assertEqual(args.rolling_hourly_loss_per_10k_limit, 40.0)
+        self.assertEqual(args.rolling_hourly_loss_per_10k_min_notional, 10000.0)
 
     @patch("grid_optimizer.web._validate_market_symbol")
     def test_normalize_spot_runner_payload_accepts_competition_inventory_grid(self, _mock_validate_symbol) -> None:

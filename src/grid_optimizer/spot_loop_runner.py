@@ -3549,6 +3549,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-end-time", type=str, default=None)
     parser.add_argument("--runtime-guard-stats-start-time", type=str, default=None)
     parser.add_argument("--rolling-hourly-loss-limit", type=float, default=None)
+    parser.add_argument("--rolling-hourly-loss-per-10k-limit", type=float, default=None)
+    parser.add_argument("--rolling-hourly-loss-per-10k-min-notional", type=float, default=None)
     parser.add_argument("--max-cumulative-notional", type=float, default=None)
     return parser
 
