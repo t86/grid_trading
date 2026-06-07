@@ -9707,6 +9707,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_take_profit_guard_enabled",
         "best_quote_maker_volume_inventory_cost_gate_enabled",
         "best_quote_maker_volume_net_loss_reduce_enabled",
+        "best_quote_maker_volume_suppress_short_reduce_enabled",
         "best_quote_maker_volume_reduce_freeze_enabled",
         "best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled",
         "best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled",
@@ -10705,6 +10706,9 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         "--best-quote-maker-volume-allow-loss-reduce-only"
         if config.get("best_quote_maker_volume_allow_loss_reduce_only", False)
         else "--no-best-quote-maker-volume-allow-loss-reduce-only",
+        "--best-quote-maker-volume-suppress-short-reduce-enabled"
+        if config.get("best_quote_maker_volume_suppress_short_reduce_enabled", False)
+        else "--no-best-quote-maker-volume-suppress-short-reduce-enabled",
         "--best-quote-maker-volume-net-loss-reduce-min-loss",
         str(config.get("best_quote_maker_volume_net_loss_reduce_min_loss", 0.0)),
         "--best-quote-maker-volume-net-loss-reduce-ratio",

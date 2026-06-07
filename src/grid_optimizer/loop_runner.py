@@ -18969,6 +18969,25 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             buy_levels=getattr(effective_args, "buy_levels", 0),
             sell_levels=getattr(effective_args, "sell_levels", 0),
         )
+        best_quote_short_reduce_suppression = {
+            "enabled": bool(getattr(effective_args, "best_quote_maker_volume_suppress_short_reduce_enabled", False)),
+            "dropped_buy_orders": 0,
+            "dropped_notional": 0.0,
+        }
+        if best_quote_short_reduce_suppression["enabled"]:
+            kept_buy_orders: list[dict[str, Any]] = []
+            dropped_buy_orders: list[dict[str, Any]] = []
+            for item in list(plan.get("buy_orders") or []):
+                if isinstance(item, dict) and _order_role(item) == "best_quote_reduce_short":
+                    dropped_buy_orders.append(dict(item))
+                else:
+                    kept_buy_orders.append(item)
+            if dropped_buy_orders:
+                plan["buy_orders"] = kept_buy_orders
+                best_quote_short_reduce_suppression["dropped_buy_orders"] = len(dropped_buy_orders)
+                best_quote_short_reduce_suppression["dropped_notional"] = sum(
+                    _safe_float(item.get("notional")) for item in dropped_buy_orders
+                )
         best_quote_maker_volume = {
             "enabled": bool(plan.get("enabled")),
             "regime": str(plan.get("regime") or ""),
@@ -18984,6 +19003,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "frozen_manual_limit": dict(best_quote_frozen_manual_limit),
             "frozen_pair_release": dict(best_quote_frozen_pair_release),
             "frozen_total_cap": dict(best_quote_frozen_total_cap),
+            "short_reduce_suppression": dict(best_quote_short_reduce_suppression),
         }
         inventory_tier = {
             "enabled": False,
@@ -21282,6 +21302,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-inventory-cost-gate-min-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--best-quote-maker-volume-allow-loss-reduce-only", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-suppress-short-reduce-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-min-loss", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-ratio", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-realized-credit-ratio", type=float, default=1.0)
