@@ -8,7 +8,10 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import grid_optimizer.web as web
-from grid_optimizer.spot_loop_runner import _build_parser as _build_spot_loop_parser
+from grid_optimizer.spot_loop_runner import (
+    _build_parser as _build_spot_loop_parser,
+    _build_spot_competition_inventory_grid_orders,
+)
 from grid_optimizer.web import (
     SPOT_RUNNER_DEFAULT_CONFIG,
     SPOT_MONITOR_PAGE,
@@ -885,6 +888,63 @@ class SpotRunnerTests(unittest.TestCase):
                 result = _start_spot_runner_process(config)
 
             self.assertTrue(result["started"])
+
+    def test_synthetic_neutral_cached_conservative_reduce_realigns_base_below_soft_threshold(self) -> None:
+        state = {
+            "symbol": "XLMUSDT",
+            "spot_competition_synthetic_neutral_grid_runtime_cache": {
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "market_type": "futures",
+                "runtime": {
+                    "market_type": "futures",
+                    "direction_state": "long_active",
+                    "risk_state": "hard_reduce_only",
+                    "recovery_mode": "conservative_reduce_only",
+                    "recovery_errors": ["position_qty_mismatch"],
+                    "synthetic_cost_unknown": True,
+                    "synthetic_neutral": True,
+                    "neutral_base_qty": 1142.0,
+                    "position_lots": [],
+                    "grid_anchor_price": 0.20315,
+                },
+                "applied_trade_keys": [],
+            },
+        }
+
+        desired, controls = _build_spot_competition_inventory_grid_orders(
+            state=state,
+            trades=[],
+            bid_price=0.2031,
+            ask_price=0.2032,
+            step_price=0.0001,
+            buy_levels=2,
+            sell_levels=2,
+            first_order_multiplier=1.0,
+            per_order_notional=30.0,
+            threshold_position_notional=60.0,
+            threshold_reduce_target_notional=0.0,
+            warmup_position_notional=0.0,
+            require_non_loss_exit=False,
+            max_order_position_notional=60.0,
+            max_position_notional=60.0,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=1142.0,
+            max_short_position_notional=60.0,
+            actual_base_qty=1340.0,
+            symbol="XLMUSDT",
+        )
+
+        forced_reduce = [item for item in desired if item.get("role") == "forced_reduce"]
+        self.assertTrue(forced_reduce)
+        self.assertEqual(forced_reduce[0]["side"], "SELL")
+        self.assertLess(forced_reduce[0]["notional"], 60.0)
+        self.assertEqual(controls["risk_state"], "hard_reduce_only")
+        self.assertEqual(controls["effective_buy_levels"], 0)
+        self.assertGreaterEqual(controls["effective_sell_levels"], 1)
 
 
 if __name__ == "__main__":

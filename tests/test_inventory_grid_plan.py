@@ -1742,6 +1742,52 @@ def test_max_order_position_notional_blocks_new_same_side_entries() -> None:
     assert plan["forced_reduce_orders"] == []
 
 
+def test_synthetic_neutral_hard_reduce_realigns_base_below_soft_threshold() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "long_active"
+    runtime["risk_state"] = "hard_reduce_only"
+    runtime["recovery_mode"] = "conservative_reduce_only"
+    runtime["grid_anchor_price"] = 0.20315
+    runtime["position_lots"] = [
+        {
+            "lot_id": "synthetic_recovered",
+            "side": "long",
+            "qty": 198.0,
+            "entry_price": 0.20315,
+            "opened_at_ms": 0,
+            "source_role": "synthetic_recovery",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.2031,
+        ask_price=0.2032,
+        step_price=0.0001,
+        per_order_notional=30.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=60.0,
+        threshold_reduce_target_notional=0.0,
+        max_order_position_notional=60.0,
+        max_position_notional=60.0,
+        buy_levels=2,
+        sell_levels=2,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+    )
+
+    assert plan["risk_state"] == "hard_reduce_only"
+    assert plan["buy_orders"] == []
+    forced_reduce = [item for item in plan["sell_orders"] if item["role"] == "forced_reduce"]
+    assert forced_reduce
+    assert forced_reduce[0]["side"] == "SELL"
+    assert forced_reduce[0]["notional"] < 60.0
+    assert forced_reduce[0] in plan["forced_reduce_orders"]
+
+
 def test_long_active_grid_orders_are_anchored_to_grid_price() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["direction_state"] = "long_active"

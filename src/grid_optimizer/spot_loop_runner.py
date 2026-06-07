@@ -1902,11 +1902,7 @@ def _build_spot_competition_inventory_grid_orders(
             runtime.pop("synthetic_cost_unknown", None)
             return 0.0
         resume_target_qty = 0.0
-        resume_target_notional = max(
-            _safe_float(threshold_position_notional),
-            _safe_float(threshold_reduce_target_notional),
-            0.0,
-        )
+        resume_target_notional = max(_safe_float(threshold_reduce_target_notional), 0.0)
         if resume_target_notional > EPSILON and mid_price > EPSILON:
             resume_target_qty = resume_target_notional / mid_price
         near_flat_qty = max(position_qty_tolerance, resume_target_qty)
@@ -1965,6 +1961,24 @@ def _build_spot_competition_inventory_grid_orders(
                 }
             ]
 
+        def _prepare_conservative_reduce_runtime(*, reason: str) -> None:
+            runtime["direction_state"] = expected_direction_state
+            runtime["risk_state"] = "hard_reduce_only"
+            runtime["recovery_mode"] = "conservative_reduce_only"
+            runtime["recovery_errors"] = [reason]
+            runtime["synthetic_cost_unknown"] = True
+            runtime["position_lots"] = [
+                {
+                    "lot_id": "synthetic_recovered",
+                    "side": "long" if expected_direction_state == "long_active" else "short",
+                    "qty": active_position_qty,
+                    "entry_price": _unknown_cost_entry_price(),
+                    "opened_at_ms": 0,
+                    "source_role": "synthetic_recovery",
+                    "recovery_reason": reason,
+                }
+            ]
+
         def _handle_unknown_cost_runtime(*, reason: str) -> float:
             threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
             reduce_target_notional = max(_safe_float(threshold_reduce_target_notional), 0.0)
@@ -1975,12 +1989,7 @@ def _build_spot_competition_inventory_grid_orders(
             if should_handle:
                 _prepare_unknown_cost_runtime(reason=reason)
                 return active_net_qty
-            runtime["direction_state"] = expected_direction_state
-            runtime["risk_state"] = "hard_reduce_only"
-            runtime["recovery_mode"] = "conservative_reduce_only"
-            runtime["recovery_errors"] = [reason]
-            runtime["position_lots"] = []
-            runtime["synthetic_cost_unknown"] = True
+            _prepare_conservative_reduce_runtime(reason=reason)
             return active_net_qty
 
         if has_synthetic_recovered_lot:

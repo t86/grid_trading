@@ -245,6 +245,35 @@ def _threshold_reduce_unlocks_without_credit(
     return threshold_notional > EPSILON and reduce_target_notional + EPSILON < threshold_notional
 
 
+def _base_reduce_target_notional(
+    *,
+    synthetic_neutral: bool,
+    risk_state: str,
+    threshold_position_notional: float,
+    threshold_reduce_target_notional: float | None,
+) -> float:
+    if synthetic_neutral and risk_state == "hard_reduce_only":
+        return max(_safe_float(threshold_reduce_target_notional), 0.0)
+    return _resolved_reduce_target_notional(
+        threshold_position_notional=threshold_position_notional,
+        threshold_reduce_target_notional=threshold_reduce_target_notional,
+    )
+
+
+def _forced_reduce_qty_from_lot_plan(
+    *,
+    lot_plan: dict[str, Any],
+    reduce_qty: float,
+    synthetic_neutral: bool,
+    risk_state: str,
+    step_size: float | None,
+) -> float:
+    lot_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in list(lot_plan.get("lots") or []))
+    if lot_qty <= EPSILON and synthetic_neutral and risk_state == "hard_reduce_only":
+        lot_qty = reduce_qty
+    return _round_order_qty(lot_qty, step_size)
+
+
 def _spot_long_entry_reference_price(
     *,
     anchor_price: float,
@@ -1063,7 +1092,9 @@ def build_inventory_grid_orders(
                 )
 
         if risk_state in {"threshold_reduce_only", "hard_reduce_only"}:
-            reduce_target_notional = _resolved_reduce_target_notional(
+            reduce_target_notional = _base_reduce_target_notional(
+                synthetic_neutral=synthetic_neutral,
+                risk_state=risk_state,
                 threshold_position_notional=threshold_position_notional,
                 threshold_reduce_target_notional=threshold_reduce_target_notional,
             )
@@ -1106,7 +1137,13 @@ def build_inventory_grid_orders(
                         or int(runtime.get("pair_credit_steps", 0) or 0) >= int(lot_plan["forced_reduce_cost_steps"])
                     )
                 ):
-                    forced_qty = _round_order_qty(sum(max(_safe_float(item.get("qty")), 0.0) for item in lot_plan["lots"]), step_size)
+                    forced_qty = _forced_reduce_qty_from_lot_plan(
+                        lot_plan=lot_plan,
+                        reduce_qty=reduce_qty,
+                        synthetic_neutral=synthetic_neutral,
+                        risk_state=risk_state,
+                        step_size=step_size,
+                    )
                     if _order_meets_mins(
                         qty=forced_qty,
                         price=forced_reduce_order_price,
@@ -1176,7 +1213,9 @@ def build_inventory_grid_orders(
                 sell_orders.append(_build_order(side="SELL", price=entry_price, qty=entry_qty, role="grid_entry"))
 
         if risk_state in {"threshold_reduce_only", "hard_reduce_only"}:
-            reduce_target_notional = _resolved_reduce_target_notional(
+            reduce_target_notional = _base_reduce_target_notional(
+                synthetic_neutral=synthetic_neutral,
+                risk_state=risk_state,
                 threshold_position_notional=threshold_position_notional,
                 threshold_reduce_target_notional=threshold_reduce_target_notional,
             )
@@ -1219,7 +1258,13 @@ def build_inventory_grid_orders(
                         or int(runtime.get("pair_credit_steps", 0) or 0) >= int(lot_plan["forced_reduce_cost_steps"])
                     )
                 ):
-                    forced_qty = _round_order_qty(sum(max(_safe_float(item.get("qty")), 0.0) for item in lot_plan["lots"]), step_size)
+                    forced_qty = _forced_reduce_qty_from_lot_plan(
+                        lot_plan=lot_plan,
+                        reduce_qty=reduce_qty,
+                        synthetic_neutral=synthetic_neutral,
+                        risk_state=risk_state,
+                        step_size=step_size,
+                    )
                     if _order_meets_mins(
                         qty=forced_qty,
                         price=forced_reduce_order_price,
