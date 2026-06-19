@@ -20727,6 +20727,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         )
         and not current_strategy_open_orders
+        and not allow_hedge_best_quote_flat_dust_position_mismatch
         and (
             expected_exchange_long_qty > 1e-12
             or expected_exchange_short_qty > 1e-12

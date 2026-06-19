@@ -8633,6 +8633,12 @@ class LoopRunnerTests(unittest.TestCase):
                 maker_retries=0,
                 recv_window=5000,
                 state_path=str(state_path),
+                market_stream=SimpleNamespace(snapshot=lambda max_age_seconds: {
+                    "bid_price": 0.6102,
+                    "ask_price": 0.6104,
+                    "mark_price": 0.6103,
+                    "funding_rate": 0.0001,
+                }),
             )
             plan_report = {
                 "symbol": "OPGUSDT",
@@ -8867,6 +8873,12 @@ class LoopRunnerTests(unittest.TestCase):
                 maker_retries=0,
                 recv_window=5000,
                 state_path=str(state_path),
+                market_stream=SimpleNamespace(snapshot=lambda max_age_seconds: {
+                    "bid_price": 0.6102,
+                    "ask_price": 0.6104,
+                    "mark_price": 0.6103,
+                    "funding_rate": 0.0001,
+                }),
             )
             plan_report = {
                 "symbol": "PHAROSUSDT",
@@ -8970,6 +8982,12 @@ class LoopRunnerTests(unittest.TestCase):
                 maker_retries=0,
                 recv_window=5000,
                 state_path=str(state_path),
+                market_stream=SimpleNamespace(snapshot=lambda max_age_seconds: {
+                    "bid_price": 0.6102,
+                    "ask_price": 0.6104,
+                    "mark_price": 0.6103,
+                    "funding_rate": 0.0001,
+                }),
             )
             plan_report = {
                 "symbol": "PHAROSUSDT",
@@ -8981,6 +8999,109 @@ class LoopRunnerTests(unittest.TestCase):
                 "current_long_qty": 0.0,
                 "current_short_qty": 0.0,
                 "actual_net_qty": 0.0,
+                "dual_side_position": True,
+                "state_path": str(state_path),
+                "best_quote_maker_volume": {"volume_ledger": {"initialized": True}},
+                "symbol_info": {"tick_size": 0.0001, "step_size": 1.0, "min_qty": 1.0, "min_notional": 5.0},
+            }
+
+            report = execute_plan_report(args, plan_report)
+
+            self.assertTrue(report["executed"])
+            self.assertTrue(report["position_reconcile"]["hedge_best_quote_flat_dust_position_mismatch_allowed"])
+        mock_post_order.assert_called_once()
+        mock_change_leverage.assert_called_once()
+        mock_update_refs.assert_called_once()
+        mock_update_inventory_grid_refs.assert_called_once()
+
+    @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
+    @patch("grid_optimizer.loop_runner.post_futures_order")
+    @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_allows_hedge_best_quote_expected_flat_dust_position(
+        self,
+        mock_validate_plan_report,
+        mock_book_tickers,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_change_leverage,
+        mock_post_order,
+        mock_update_inventory_grid_refs,
+        mock_update_refs,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 1,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [
+                    {
+                        "role": "best_quote_entry_short",
+                        "side": "SELL",
+                        "qty": 16.0,
+                        "price": 0.611,
+                        "position_side": "SHORT",
+                    }
+                ],
+            },
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.6102", "ask_price": "0.6104"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": True}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "PHAROSUSDT", "positionSide": "LONG", "positionAmt": "1", "entryPrice": "0.61"},
+                {"symbol": "PHAROSUSDT", "positionSide": "SHORT", "positionAmt": "0", "entryPrice": "0"},
+            ],
+        }
+        mock_open_orders.return_value = []
+
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "pharos_state.json"
+            state_path.write_text(json.dumps({"best_quote_volume_ledger": {"initialized": True}}), encoding="utf-8")
+            args = Namespace(
+                symbol="PHAROSUSDT",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                max_new_orders=20,
+                max_total_notional=1450.0,
+                cancel_stale=False,
+                max_plan_age_seconds=30,
+                max_mid_drift_steps=20.0,
+                plan_json="output/pharosusdt_hedge_bq_latest_plan.json",
+                apply=True,
+                margin_type="KEEP",
+                leverage=10,
+                maker_retries=0,
+                recv_window=5000,
+                state_path=str(state_path),
+                market_stream=SimpleNamespace(snapshot=lambda max_age_seconds: {
+                    "bid_price": 0.6102,
+                    "ask_price": 0.6104,
+                    "mark_price": 0.6103,
+                    "funding_rate": 0.0001,
+                }),
+            )
+            plan_report = {
+                "symbol": "PHAROSUSDT",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "effective_strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+                "mid_price": 0.6103,
+                "step_price": 0.00025,
+                "open_order_count": 0,
+                "current_long_qty": 1.0,
+                "current_short_qty": 0.0,
+                "actual_net_qty": 1.0,
                 "dual_side_position": True,
                 "state_path": str(state_path),
                 "best_quote_maker_volume": {"volume_ledger": {"initialized": True}},
