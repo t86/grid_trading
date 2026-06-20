@@ -2747,6 +2747,8 @@ def _best_quote_freeze_band_info(*, side: str, price: float, band_ratio: float) 
     if normalized_side not in {"long", "short"} or safe_price <= 0 or safe_ratio <= 0:
         return None
     band_index = math.floor(math.log(safe_price) / math.log1p(safe_ratio))
+    if band_index < 0:
+        return None
     lower_price = math.exp(math.log1p(safe_ratio) * band_index)
     upper_price = math.exp(math.log1p(safe_ratio) * (band_index + 1))
     return {
