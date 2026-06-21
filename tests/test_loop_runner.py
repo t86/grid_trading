@@ -49,6 +49,7 @@ from grid_optimizer.loop_runner import (
     _resolve_hard_loss_reduce_target_notional,
     _best_quote_reduce_freeze_report,
     _apply_best_quote_reduce_freeze,
+    _transfer_best_quote_volume_to_frozen,
     _cap_best_quote_reduce_orders_to_managed_inventory,
     reconcile_best_quote_volume_ledger_surplus,
     sync_best_quote_volume_ledger,
@@ -1485,28 +1486,31 @@ class LoopRunnerTests(unittest.TestCase):
         )
 
     def test_best_quote_reduce_freeze_band_budget_caps_same_band_freeze(self) -> None:
+        # A band whose CURRENTLY-active frozen qty already fills the budget blocks further
+        # freezing in that band. Prices are kept inside the freezable band range (>= ~0.909)
+        # so the band gate accepts them; budget_qty = 105 / 1.05 = 100 == active 100 -> full.
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
                 "short_lots": [
                     {
                         "qty": 100.0,
-                        "entry_price": 0.6600,
-                        "freeze_band_key": "short:-41",
+                        "entry_price": 1.00,
+                        "freeze_band_key": "short:0",
                     }
                 ],
                 "band_budgets": {
-                    "short:-41": {
+                    "short:0": {
                         "side": "short",
-                        "band_key": "short:-41",
+                        "band_key": "short:0",
                         "cumulative_frozen_qty": 100.0,
                         "pair_released_qty": 0.0,
                     }
                 },
             },
             "best_quote_volume_ledger": {
-                "short_lots": [{"qty": 300.0, "price": 0.6600}],
+                "short_lots": [{"qty": 300.0, "price": 1.00}],
                 "short_qty": 300.0,
-                "short_avg_price": 0.6600,
+                "short_avg_price": 1.00,
                 "initialized": True,
             },
         }
@@ -1515,8 +1519,8 @@ class LoopRunnerTests(unittest.TestCase):
             current_long_qty=0.0,
             current_short_qty=400.0,
             current_long_avg_price=0.0,
-            current_short_avg_price=0.6600,
-            mid_price=0.6680,
+            current_short_avg_price=1.00,
+            mid_price=1.05,
             bq_ledger_report=state["best_quote_volume_ledger"],
         )
 
@@ -1530,17 +1534,72 @@ class LoopRunnerTests(unittest.TestCase):
             current_long_qty=0.0,
             current_short_qty=400.0,
             current_long_avg_price=0.0,
-            current_short_avg_price=0.6600,
-            mid_price=0.6680,
+            current_short_avg_price=1.00,
+            mid_price=1.05,
             bq_ledger_report=state["best_quote_volume_ledger"],
             band_budget_enabled=True,
-            band_budget_price_ratio=0.01,
-            band_budget_base_notional=66.8,
+            band_budget_price_ratio=0.1,
+            band_budget_base_notional=105.0,
         )
 
         self.assertFalse(report["applied"])
         self.assertEqual(report["band_budget"]["short"]["blocked_reason"], "band_budget_exhausted")
         self.assertEqual(state["best_quote_volume_ledger"]["short_qty"], 300.0)
+
+    def test_best_quote_freeze_band_budget_revolves_with_active_qty(self) -> None:
+        # Regression: band budget is occupied by the qty CURRENTLY frozen in the band
+        # (active_frozen_qty), not the cumulative-ever-frozen counter. A band whose
+        # cumulative counter is (nearly) full but whose active frozen lots have dropped --
+        # because lots were released/closed through a path that never credited
+        # pair_released_qty -- must free its budget and allow freezing again, instead of
+        # locking out forever after one fill cycle. Prices are kept inside the freezable
+        # band range (>= ~0.909) so the band gate does not reject them.
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_lots": [
+                    {"qty": 20.0, "entry_price": 1.00, "freeze_band_key": "short:0"}
+                ],
+                "band_budgets": {
+                    "short:0": {
+                        "side": "short",
+                        "band_key": "short:0",
+                        # cumulative counter is nearly full ...
+                        "cumulative_frozen_qty": 285.0,
+                        # ... and pair_released_qty was never credited (closed via other path)
+                        "pair_released_qty": 0.0,
+                    }
+                },
+            },
+            "best_quote_volume_ledger": {
+                "short_lots": [{"qty": 300.0, "price": 1.00}],
+                "short_qty": 300.0,
+                "short_avg_price": 1.00,
+                "initialized": True,
+            },
+        }
+
+        transfer = _transfer_best_quote_volume_to_frozen(
+            state=state,
+            side="short",
+            qty=50.0,
+            reason="reduce_loss_ratio_threshold",
+            loss_ratio=0.05,
+            mid_price=1.05,
+            band_budget_enabled=True,
+            band_budget_price_ratio=0.1,
+            band_budget_base_notional=300.0,
+        )
+
+        budget = transfer["band_budget"]
+        # budget_qty = 300 / 1.05 ~= 285.7; occupied tracks active 20 (NOT cumulative 285).
+        # Under the old cumulative logic remaining would be ~0.7 -> exhausted; now ~265 free.
+        self.assertEqual(budget["band_key"], "short:0")
+        self.assertEqual(budget["active_frozen_qty"], 20.0)
+        self.assertEqual(budget["effective_used_qty"], 20.0)
+        self.assertAlmostEqual(budget["remaining_budget_qty"], 300.0 / 1.05 - 20.0, places=6)
+        self.assertIsNone(budget["blocked_reason"])
+        # the requested 50 fits in the freed budget and is actually frozen
+        self.assertAlmostEqual(transfer["transferred_qty"], 50.0, places=6)
 
     def test_best_quote_frozen_pair_release_releases_short_from_highest_band_first(self) -> None:
         state: dict[str, object] = {

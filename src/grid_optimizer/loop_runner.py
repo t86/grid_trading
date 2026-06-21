@@ -2784,11 +2784,14 @@ def _refresh_best_quote_freeze_band_budgets(frozen: dict[str, Any]) -> dict[str,
         record = dict(raw)
         record["band_key"] = str(record.get("band_key") or band_key)
         record["active_frozen_qty"] = active_qty_by_band.get(band_key, 0.0)
-        record["effective_used_qty"] = max(
-            _safe_float(record.get("cumulative_frozen_qty"))
-            - _safe_float(record.get("pair_released_qty")) * _safe_float(record.get("budget_recover_ratio")),
-            0.0,
-        )
+        # Band budget is occupied by the qty CURRENTLY frozen in this band (active_frozen_qty,
+        # derived from the live frozen lots), not a cumulative-ever-frozen counter. Releasing or
+        # closing a frozen lot through ANY path drops active_frozen_qty and frees the budget, so a
+        # band revolves instead of locking out forever after one fill cycle.
+        record["effective_used_qty"] = max(_safe_float(record.get("active_frozen_qty")), 0.0)
+        _budget_qty = _safe_float(record.get("budget_qty"))
+        if _budget_qty > 0:
+            record["remaining_budget_qty"] = max(_budget_qty - record["effective_used_qty"], 0.0)
         normalized_budgets[band_key] = record
     if normalized_budgets:
         frozen["band_budgets"] = normalized_budgets
@@ -3649,7 +3652,12 @@ def _transfer_best_quote_volume_to_frozen(
             emergency_extra_ratio = max(_safe_float(band_budget_emergency_extra_ratio), 0.0) if band_budget_emergency_active else 0.0
             cumulative_qty = max(_safe_float(band_record.get("cumulative_frozen_qty")), 0.0)
             released_qty = max(_safe_float(band_record.get("pair_released_qty")), 0.0)
-            effective_used_qty = max(cumulative_qty - released_qty * recover_ratio, 0.0)
+            # Occupied budget = qty CURRENTLY frozen in this band, so releasing/closing a frozen
+            # lot (via any path, not only pair-release) frees the band to freeze again. The
+            # cumulative/released counters are retained only for reporting. recover_ratio is no
+            # longer needed to recover budget because active_frozen_qty already reflects releases.
+            active_frozen_qty = max(_safe_float(band_record.get("active_frozen_qty")), 0.0)
+            effective_used_qty = active_frozen_qty
             budget_qty = (base_notional * (1.0 + emergency_extra_ratio)) / safe_mid
             remaining_budget_qty = max(budget_qty - effective_used_qty, 0.0)
             allowed_qty = min(requested_qty, remaining_budget_qty)
@@ -3663,6 +3671,7 @@ def _transfer_best_quote_volume_to_frozen(
                     "budget_qty": budget_qty,
                     "cumulative_frozen_qty": cumulative_qty,
                     "pair_released_qty": released_qty,
+                    "active_frozen_qty": active_frozen_qty,
                     "effective_used_qty": effective_used_qty,
                     "remaining_budget_qty": remaining_budget_qty,
                     "allowed_qty": allowed_qty,
