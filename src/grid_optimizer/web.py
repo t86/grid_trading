@@ -4116,6 +4116,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "best_quote_maker_volume_frozen_v2_danger_recovery_budget_share": 0.50,
     "best_quote_maker_volume_frozen_v2_capped_recovery_budget_share": 0.70,
     "best_quote_maker_volume_frozen_pair_release_enabled": False,
+    "best_quote_maker_volume_frozen_single_leg_take_profit_enabled": False,
     "best_quote_maker_volume_frozen_pair_release_max_notional": 20.0,
     "best_quote_maker_volume_frozen_pair_release_min_side_notional": 100.0,
     "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.0008,
@@ -9714,6 +9715,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_reduce_freeze_band_budget_enabled",
         "best_quote_maker_volume_frozen_v2_enabled",
         "best_quote_maker_volume_frozen_pair_release_enabled",
+        "best_quote_maker_volume_frozen_single_leg_take_profit_enabled",
         "best_quote_maker_volume_frozen_pair_release_allow_loss",
         "best_quote_maker_volume_same_side_entry_price_guard_enabled",
         "best_quote_maker_volume_dynamic_tick_enabled",
@@ -10797,6 +10799,9 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         "--best-quote-maker-volume-frozen-pair-release-enabled"
         if config.get("best_quote_maker_volume_frozen_pair_release_enabled", False)
         else "--no-best-quote-maker-volume-frozen-pair-release-enabled",
+        "--best-quote-maker-volume-frozen-single-leg-take-profit-enabled"
+        if config.get("best_quote_maker_volume_frozen_single_leg_take_profit_enabled", False)
+        else "--no-best-quote-maker-volume-frozen-single-leg-take-profit-enabled",
         "--best-quote-maker-volume-frozen-pair-release-max-notional",
         str(config.get("best_quote_maker_volume_frozen_pair_release_max_notional", 20.0)),
         "--best-quote-maker-volume-frozen-pair-release-min-side-notional",
