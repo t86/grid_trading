@@ -21510,6 +21510,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
+    parser.add_argument(
+        "--best-quote-maker-volume-frozen-single-leg-take-profit-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--best-quote-maker-volume-frozen-pair-release-max-notional", type=float, default=20.0)
     parser.add_argument("--best-quote-maker-volume-frozen-pair-release-min-side-notional", type=float, default=100.0)
     parser.add_argument("--best-quote-maker-volume-frozen-pair-release-min-profit-ratio", type=float, default=0.0008)
