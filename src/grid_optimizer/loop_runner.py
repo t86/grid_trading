@@ -4607,6 +4607,119 @@ def _frozen_inventory_directive_authorized(
     return True, "authorized"
 
 
+def _frozen_inventory_weighted_entry(ledger: Mapping[str, Any], side_key: str) -> float:
+    lots = ledger.get(f"{side_key}_lots")
+    if isinstance(lots, list):
+        total_qty = 0.0
+        total_cost = 0.0
+        for lot in lots:
+            if not isinstance(lot, Mapping):
+                continue
+            qty = max(_safe_float(lot.get("qty")), 0.0)
+            entry = max(_safe_float(lot.get("entry_price", lot.get("price"))), 0.0)
+            if qty > 1e-12 and entry > 0.0:
+                total_qty += qty
+                total_cost += qty * entry
+        if total_qty > 1e-12:
+            return total_cost / total_qty
+    return max(_safe_float(ledger.get(f"{side_key}_entry_price")), 0.0)
+
+
+def _frozen_inventory_worst_entry(ledger: Mapping[str, Any], side_key: str) -> float:
+    """Entry of the least-profitable lot on a side: the lowest entry for a short book
+    (closest to being underwater), the highest entry for a long book. Returns 0.0 when no
+    per-lot detail is available so callers can fall back to a stricter guard."""
+    lots = ledger.get(f"{side_key}_lots")
+    entries: list[float] = []
+    if isinstance(lots, list):
+        for lot in lots:
+            if not isinstance(lot, Mapping):
+                continue
+            qty = max(_safe_float(lot.get("qty")), 0.0)
+            entry = max(_safe_float(lot.get("entry_price", lot.get("price"))), 0.0)
+            if qty > 1e-12 and entry > 0.0:
+                entries.append(entry)
+    if not entries:
+        return 0.0
+    return min(entries) if side_key == "short" else max(entries)
+
+
+def arm_best_quote_frozen_single_leg_take_profit(
+    *,
+    state: dict[str, Any],
+    bid_price: float,
+    ask_price: float,
+    min_profit_ratio: float,
+    now: datetime | None = None,
+) -> dict[str, float]:
+    """Auto-arm a manual_reduce directive to take profit on frozen inventory whose OWN
+    profit versus its frozen entry has reached ``min_profit_ratio`` -- WITHOUT needing an
+    opposite-side frozen lot to pair against (which is what frozen_pair_release requires).
+
+    A frozen SHORT can be closed for >= r profit when it can be bought back at ask <=
+    entry*(1-r); a frozen LONG when it can be sold at bid >= entry*(1+r). The directive is
+    handed to the existing, tested apply_best_quote_frozen_inventory_manual_reduce path, so
+    order placement, fill handling and ledger/budget restore all reuse vetted code. Returns
+    the per-side qty it armed (empty when nothing qualifies). A side that already has a
+    pending manual_reduce directive is left untouched.
+    """
+    r = max(_safe_float(min_profit_ratio), 0.0)
+    if r <= 0.0:
+        return {}
+    ledger = state.get("best_quote_frozen_inventory")
+    if not isinstance(ledger, Mapping):
+        return {}
+    existing = dict(state.get("best_quote_frozen_inventory_manual_reduce") or {})
+    safe_bid = max(_safe_float(bid_price), 0.0)
+    safe_ask = max(_safe_float(ask_price), 0.0)
+    armed: dict[str, float] = {}
+
+    short_qty = max(_safe_float(ledger.get("short_qty")), 0.0)
+    short_entry = _frozen_inventory_weighted_entry(ledger, "short")
+    short_worst_entry = _frozen_inventory_worst_entry(ledger, "short")
+    if (
+        short_qty > 1e-12
+        and short_entry > 0.0
+        and safe_ask > 0.0
+        and not bool((existing.get("short") or {}).get("requested"))
+        # whole frozen short book is at least r profitable on average ...
+        and (short_entry - safe_ask) / short_entry >= r
+        # ... and even the least-profitable lot is not underwater, so closing the FIFO
+        # aggregate never realizes a loss on any individual lot.
+        and short_worst_entry > safe_ask
+    ):
+        armed["short"] = short_qty
+
+    long_qty = max(_safe_float(ledger.get("long_qty")), 0.0)
+    long_entry = _frozen_inventory_weighted_entry(ledger, "long")
+    long_worst_entry = _frozen_inventory_worst_entry(ledger, "long")
+    if (
+        long_qty > 1e-12
+        and long_entry > 0.0
+        and safe_bid > 0.0
+        and not bool((existing.get("long") or {}).get("requested"))
+        and (safe_bid - long_entry) / long_entry >= r
+        and 0.0 < long_worst_entry < safe_bid
+    ):
+        armed["long"] = long_qty
+
+    if not armed:
+        return {}
+    checked_at = (now or _utc_now()).astimezone(timezone.utc)
+    directive = dict(existing)
+    for side_key, qty in armed.items():
+        directive[side_key] = {
+            "requested": True,
+            "requested_qty": qty,
+            "source": "auto_single_leg_take_profit",
+            "request_id": f"auto-tp-{side_key}-{int(checked_at.timestamp() * 1000)}",
+            "requested_at": checked_at.isoformat(),
+            "expires_at": (checked_at + timedelta(minutes=10)).isoformat(),
+        }
+    state["best_quote_frozen_inventory_manual_reduce"] = directive
+    return armed
+
+
 def apply_best_quote_frozen_inventory_manual_reduce(
     *,
     plan: dict[str, Any],
@@ -18474,6 +18587,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             configured_quote_offset_ticks=int(getattr(effective_args, "best_quote_maker_volume_quote_offset_ticks", 0)),
             min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
         )
+        if bool(
+            getattr(effective_args, "best_quote_maker_volume_frozen_single_leg_take_profit_enabled", False)
+        ):
+            arm_best_quote_frozen_single_leg_take_profit(
+                state=state,
+                bid_price=bid_price,
+                ask_price=ask_price,
+                min_profit_ratio=best_quote_frozen_pair_release_min_profit_ratio,
+            )
         best_quote_frozen_manual_reduce = apply_best_quote_frozen_inventory_manual_reduce(
             plan=plan,
             state=state,

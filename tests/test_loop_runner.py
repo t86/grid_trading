@@ -50,6 +50,7 @@ from grid_optimizer.loop_runner import (
     _best_quote_reduce_freeze_report,
     _apply_best_quote_reduce_freeze,
     _transfer_best_quote_volume_to_frozen,
+    arm_best_quote_frozen_single_leg_take_profit,
     _cap_best_quote_reduce_orders_to_managed_inventory,
     reconcile_best_quote_volume_ledger_surplus,
     sync_best_quote_volume_ledger,
@@ -1600,6 +1601,76 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertIsNone(budget["blocked_reason"])
         # the requested 50 fits in the freed budget and is actually frozen
         self.assertAlmostEqual(transfer["transferred_qty"], 50.0, places=6)
+
+    def test_arm_frozen_single_leg_take_profit_short_at_profit(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_qty": 100.0,
+                "short_lots": [{"qty": 100.0, "entry_price": 1.04, "freeze_band_key": "short:0"}],
+            },
+        }
+        # buy back at ask 0.98 vs entry 1.04 -> (1.04-0.98)/1.04 = 5.77% >= 5%
+        armed = arm_best_quote_frozen_single_leg_take_profit(
+            state=state, bid_price=0.979, ask_price=0.980, min_profit_ratio=0.05,
+        )
+        self.assertEqual(armed, {"short": 100.0})
+        directive = state["best_quote_frozen_inventory_manual_reduce"]["short"]
+        self.assertTrue(directive["requested"])
+        self.assertEqual(directive["requested_qty"], 100.0)
+        self.assertTrue(directive.get("request_id"))
+        self.assertTrue(directive.get("expires_at"))
+
+    def test_arm_frozen_single_leg_take_profit_below_threshold_noop(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_qty": 100.0,
+                "short_lots": [{"qty": 100.0, "entry_price": 1.00, "freeze_band_key": "short:0"}],
+            },
+        }
+        # (1.00-0.98)/1.00 = 2% < 5% -> nothing armed, no directive created
+        armed = arm_best_quote_frozen_single_leg_take_profit(
+            state=state, bid_price=0.979, ask_price=0.980, min_profit_ratio=0.05,
+        )
+        self.assertEqual(armed, {})
+        self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
+
+    def test_arm_frozen_single_leg_take_profit_skips_pending_side(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_qty": 100.0,
+                "short_lots": [{"qty": 100.0, "entry_price": 1.04, "freeze_band_key": "short:0"}],
+            },
+            "best_quote_frozen_inventory_manual_reduce": {
+                "short": {"requested": True, "requested_qty": 50.0}
+            },
+        }
+        armed = arm_best_quote_frozen_single_leg_take_profit(
+            state=state, bid_price=0.979, ask_price=0.980, min_profit_ratio=0.05,
+        )
+        # short already has a pending directive -> left untouched
+        self.assertEqual(armed, {})
+        self.assertEqual(
+            state["best_quote_frozen_inventory_manual_reduce"]["short"]["requested_qty"], 50.0
+        )
+
+    def test_arm_frozen_single_leg_take_profit_blocks_underwater_lot(self) -> None:
+        # weighted entry 1.075 -> (1.075-0.98)/1.075 = 8.8% >= 5%, BUT the 0.95 lot is
+        # underwater at ask 0.98, so closing the FIFO book would realize a loss on it.
+        # The worst-entry guard must block the arm entirely.
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_qty": 100.0,
+                "short_lots": [
+                    {"qty": 50.0, "entry_price": 1.20, "freeze_band_key": "short:1"},
+                    {"qty": 50.0, "entry_price": 0.95, "freeze_band_key": "short:-1"},
+                ],
+            },
+        }
+        armed = arm_best_quote_frozen_single_leg_take_profit(
+            state=state, bid_price=0.979, ask_price=0.980, min_profit_ratio=0.05,
+        )
+        self.assertEqual(armed, {})
+        self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
 
     def test_best_quote_frozen_pair_release_releases_short_from_highest_band_first(self) -> None:
         state: dict[str, object] = {
