@@ -2905,6 +2905,23 @@ class WebSecurityTests(unittest.TestCase):
             index = command.index(flag)
             self.assertEqual(command[index + 1], value)
 
+    def test_build_runner_command_includes_max_consecutive_errors_default(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "REUSDT",
+                "strategy_profile": "reusdt_daily_75k_nofreeze_volume_v8",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "step_price": 0.0004,
+                "buy_levels": 3,
+                "sell_levels": 3,
+                "per_order_notional": 15.0,
+                "base_position_notional": 0.0,
+            }
+        )
+
+        index = command.index("--max-consecutive-errors")
+        self.assertEqual(command[index + 1], "20")
+
     def test_build_runner_command_can_disable_take_profit(self) -> None:
         command = _build_runner_command(
             {

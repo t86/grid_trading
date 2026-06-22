@@ -10967,6 +10967,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("max_new_orders", 20)),
         "--max-total-notional",
         str(config.get("max_total_notional", 1000.0)),
+        "--max-consecutive-errors",
+        str(int(config.get("max_consecutive_errors", 20) or 20)),
         "--sleep-seconds",
         str(config.get("sleep_seconds", 15.0)),
         "--startup-jitter-seconds",
