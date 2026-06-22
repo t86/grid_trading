@@ -2966,6 +2966,8 @@ def reconcile_best_quote_volume_ledger_surplus(
     current_short_qty: float,
     current_long_avg_price: float,
     current_short_avg_price: float,
+    current_long_entry_price: float = 0.0,
+    current_short_entry_price: float = 0.0,
     mid_price: float,
     normal_open_order_count: int = 0,
     position_reconcile_confirm_cycles: int = 2,
@@ -3006,6 +3008,22 @@ def reconcile_best_quote_volume_ledger_surplus(
         return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
 
     frozen_long_qty, frozen_short_qty = _best_quote_frozen_inventory_qtys(state)
+    def _frozen_cost(side: str) -> float:
+        lots = frozen.get(f"{side}_lots")
+        if isinstance(lots, list):
+            cost = 0.0
+            for lot in lots:
+                if not isinstance(lot, Mapping):
+                    continue
+                qty = max(_safe_float(lot.get("qty")), 0.0)
+                price = max(_safe_float(lot.get("entry_price", lot.get("price"))), 0.0)
+                cost += qty * price
+            if cost > 0:
+                return cost
+        qty = max(_safe_float(frozen.get(f"{side}_qty")), 0.0)
+        price = max(_safe_float(frozen.get(f"{side}_entry_price")), 0.0)
+        return qty * price
+
     target_long_qty = max(_safe_float(current_long_qty) - max(frozen_long_qty, 0.0), 0.0)
     target_short_qty = max(_safe_float(current_short_qty) - max(frozen_short_qty, 0.0), 0.0)
     current_ledger_long_qty, current_ledger_long_avg = _best_quote_volume_book_from_lots(long_lots)
@@ -3054,13 +3072,28 @@ def reconcile_best_quote_volume_ledger_surplus(
             current_qty: float,
             current_avg: float,
             exchange_avg: float,
+            exchange_entry_avg: float,
+            exchange_total_qty: float,
+            frozen_cost: float,
             side: str,
         ) -> tuple[list[dict[str, Any]], float, float]:
             drift = target_qty - current_qty
             added_qty = 0.0
             removed_qty = 0.0
             if drift > 1e-9:
-                price = max(current_avg, _safe_float(exchange_avg), _safe_float(mid_price), 0.0)
+                entry_avg = max(_safe_float(exchange_entry_avg), 0.0)
+                price = 0.0
+                if entry_avg > 0:
+                    target_cost = max(_safe_float(exchange_total_qty), 0.0) * entry_avg - max(_safe_float(frozen_cost), 0.0)
+                    current_cost = sum(
+                        max(_safe_float(lot.get("qty")), 0.0) * max(_safe_float(lot.get("price")), 0.0)
+                        for lot in lots
+                    )
+                    residual_price = (target_cost - current_cost) / drift
+                    if residual_price > 0:
+                        price = residual_price
+                if price <= 0:
+                    price = max(entry_avg, _safe_float(exchange_avg), _safe_float(mid_price), 0.0)
                 if price > 0:
                     lots = list(lots) + [
                         {
@@ -3083,6 +3116,9 @@ def reconcile_best_quote_volume_ledger_surplus(
             current_qty=current_ledger_long_qty,
             current_avg=current_ledger_long_avg,
             exchange_avg=current_long_avg_price,
+            exchange_entry_avg=current_long_entry_price,
+            exchange_total_qty=current_long_qty,
+            frozen_cost=_frozen_cost("long"),
             side="LONG",
         )
         short_lots, added_short_qty, reconciled_removed_short_qty = _reconcile_lots_to_target(
@@ -3091,6 +3127,9 @@ def reconcile_best_quote_volume_ledger_surplus(
             current_qty=current_ledger_short_qty,
             current_avg=current_ledger_short_avg,
             exchange_avg=current_short_avg_price,
+            exchange_entry_avg=current_short_entry_price,
+            exchange_total_qty=current_short_qty,
+            frozen_cost=_frozen_cost("short"),
             side="SHORT",
         )
         ledger["position_reconcile_pending_count"] = 0
@@ -15861,6 +15900,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_avg_price = max(actual_cost_basis_price, 0.0)
     exchange_long_avg_price = current_long_avg_price
     exchange_short_avg_price = current_short_avg_price
+    exchange_long_entry_price = max(_safe_float(long_position.get("entryPrice")), 0.0) if uses_exchange_hedge_positions else 0.0
+    exchange_short_entry_price = max(_safe_float(short_position.get("entryPrice")), 0.0) if uses_exchange_hedge_positions else 0.0
 
     if _is_best_quote_maker_volume_mode(requested_strategy_mode):
         strategy_open_orders = _filter_futures_strategy_orders(open_orders, symbol)
@@ -15903,6 +15944,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_qty=current_short_qty,
             current_long_avg_price=current_long_avg_price,
             current_short_avg_price=current_short_avg_price,
+            current_long_entry_price=exchange_long_entry_price,
+            current_short_entry_price=exchange_short_entry_price,
             mid_price=mid_price,
             normal_open_order_count=sum(
                 1
