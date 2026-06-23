@@ -5946,6 +5946,22 @@ def resolve_exposure_escalation_buy_pause(
     return report
 
 
+def _short_hard_loss_reduce_freeze_block_reason(reduce_freeze_report: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(reduce_freeze_report, Mapping) or not bool(reduce_freeze_report.get("enabled")):
+        return None
+    for event in list(reduce_freeze_report.get("events") or []):
+        if not isinstance(event, Mapping):
+            continue
+        if str(event.get("side") or "").upper().strip() != "SHORT":
+            continue
+        if max(_safe_float(event.get("qty")), _safe_float(event.get("transferred_qty")), 0.0) > 1e-12:
+            return "short_reduce_freeze_applied"
+    confirmations = reduce_freeze_report.get("confirmations")
+    if isinstance(confirmations, Mapping) and isinstance(confirmations.get("short"), Mapping):
+        return "short_reduce_freeze_confirming"
+    return None
+
+
 def apply_hard_loss_forced_reduce(
     *,
     plan: dict[str, Any],
@@ -5964,6 +5980,7 @@ def apply_hard_loss_forced_reduce(
     min_notional: float | None,
     reason: str | None = None,
     strategy_mode: str = "one_way_long",
+    reduce_freeze_report: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_side = str(side or "").upper().strip()
     position_side = (
@@ -5991,6 +6008,16 @@ def apply_hard_loss_forced_reduce(
     if normalized_side not in {"BUY", "SELL"}:
         report["blocked_reason"] = "invalid_side"
         return report
+    if normalized_side == "BUY":
+        freeze_block_reason = _short_hard_loss_reduce_freeze_block_reason(reduce_freeze_report)
+        if freeze_block_reason:
+            report["blocked_reason"] = freeze_block_reason
+            report["reduce_freeze_gate"] = {
+                "enabled": True,
+                "blocked": True,
+                "reason": freeze_block_reason,
+            }
+            return report
 
     safe_current_qty = max(_safe_float(current_qty), 0.0)
     safe_current_notional = max(_safe_float(current_notional), 0.0)
@@ -19958,10 +19985,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         hard_unrealized = _safe_float((selected_hard_candidate or {}).get("unrealized"))
         hard_cost_basis = _safe_float((selected_hard_candidate or {}).get("cost_basis"))
         hard_loss_active = selected_hard_candidate in active_candidates
+        hard_loss_freeze_block_reason = (
+            _short_hard_loss_reduce_freeze_block_reason(best_quote_reduce_freeze)
+            if hard_side == "BUY"
+            else None
+        )
+        hard_loss_can_reduce = hard_loss_active and not bool(hard_loss_freeze_block_reason)
         hard_loss_forced_reduce_episode = resolve_hard_loss_forced_reduce_episode(
             state=state,
             enabled=True,
-            triggered=bool(hard_side) and hard_loss_active,
+            triggered=bool(hard_side) and hard_loss_can_reduce,
             side=hard_side,
             current_notional=hard_notional,
             target_notional=hard_target_notional,
@@ -19992,9 +20025,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 else "hard_unrealized_loss_limit" if hard_loss_active else "hard_loss_not_triggered"
             ),
             strategy_mode=strategy_mode,
+            reduce_freeze_report=best_quote_reduce_freeze,
         )
         hard_loss_forced_reduce["unrealized_pnl"] = hard_unrealized
         hard_loss_forced_reduce["cost_basis_price"] = hard_cost_basis
+        if hard_loss_freeze_block_reason:
+            hard_loss_forced_reduce["reason"] = hard_loss_freeze_block_reason
 
     volatility_entry_pause["window_1m_thresholds"] = {
         "abs_return_ratio": getattr(effective_args, "volatility_entry_pause_1m_abs_return_ratio", None),

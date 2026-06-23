@@ -6181,6 +6181,126 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(order["position_side"], "LONG")
         self.assertEqual(order["time_in_force"], "IOC")
 
+    def test_apply_hard_loss_forced_reduce_waits_for_short_reduce_freeze_event(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": [], "forced_reduce_orders": []}
+
+        report = apply_hard_loss_forced_reduce(
+            plan=plan,
+            enabled=True,
+            active=True,
+            side="BUY",
+            current_qty=300.0,
+            current_notional=258.0,
+            target_notional=55.0,
+            max_order_notional=15.0,
+            bid_price=0.8599,
+            ask_price=0.8600,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            reason="hard_unrealized_loss_limit",
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            reduce_freeze_report={
+                "enabled": True,
+                "events": [{"side": "SHORT", "qty": 120.0}],
+                "confirmations": {},
+            },
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report["blocked_reason"], "short_reduce_freeze_applied")
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(plan["forced_reduce_orders"], [])
+
+    def test_apply_hard_loss_forced_reduce_waits_for_short_reduce_freeze_confirmation(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": [], "forced_reduce_orders": []}
+
+        report = apply_hard_loss_forced_reduce(
+            plan=plan,
+            enabled=True,
+            active=True,
+            side="BUY",
+            current_qty=300.0,
+            current_notional=258.0,
+            target_notional=55.0,
+            max_order_notional=15.0,
+            bid_price=0.8599,
+            ask_price=0.8600,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            reason="hard_unrealized_loss_limit",
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            reduce_freeze_report={
+                "enabled": True,
+                "events": [],
+                "confirmations": {"short": {"count": 1, "required_count": 2}},
+            },
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report["blocked_reason"], "short_reduce_freeze_confirming")
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(plan["forced_reduce_orders"], [])
+
+    def test_apply_hard_loss_forced_reduce_keeps_long_ungated_by_short_reduce_freeze(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": [], "forced_reduce_orders": []}
+
+        report = apply_hard_loss_forced_reduce(
+            plan=plan,
+            enabled=True,
+            active=True,
+            side="SELL",
+            current_qty=300.0,
+            current_notional=258.0,
+            target_notional=55.0,
+            max_order_notional=15.0,
+            bid_price=0.8599,
+            ask_price=0.8600,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            reason="hard_unrealized_loss_limit",
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            reduce_freeze_report={
+                "enabled": True,
+                "events": [{"side": "SHORT", "qty": 120.0}],
+                "confirmations": {"short": {"count": 1, "required_count": 2}},
+            },
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(plan["sell_orders"][0]["role"], "hard_loss_forced_reduce_long")
+
+    def test_apply_hard_loss_forced_reduce_allows_short_when_reduce_freeze_not_satisfied(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": [], "forced_reduce_orders": []}
+
+        report = apply_hard_loss_forced_reduce(
+            plan=plan,
+            enabled=True,
+            active=True,
+            side="BUY",
+            current_qty=300.0,
+            current_notional=258.0,
+            target_notional=55.0,
+            max_order_notional=15.0,
+            bid_price=0.8599,
+            ask_price=0.8600,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            reason="hard_unrealized_loss_limit",
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            reduce_freeze_report={"enabled": True, "events": [], "confirmations": {}},
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(plan["buy_orders"][0]["role"], "hard_loss_forced_reduce_short")
+
     def test_resolve_hard_loss_reduce_target_notional_prefers_explicit_target(self) -> None:
         self.assertAlmostEqual(
             _resolve_hard_loss_reduce_target_notional(
