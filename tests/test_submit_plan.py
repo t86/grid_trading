@@ -320,6 +320,69 @@ class SubmitPlanTests(unittest.TestCase):
         dropped = guarded["reduce_only_no_loss_guard"]["dropped_orders"][0]
         self.assertEqual(dropped["role"], "best_quote_reduce_short")
 
+    def test_reduce_only_no_loss_guard_keeps_authorized_frozen_manual_reduce(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.8587,
+                    "qty": 169.0,
+                    "notional": 145.1203,
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "position_side": "LONG",
+                    "force_reduce_only": True,
+                    "execution_type": "aggressive",
+                    "time_in_force": "IOC",
+                    "manual_frozen_inventory_reduce": True,
+                    "frozen_inventory_request_id": "manual-runtime-long-tp-1782187671811",
+                },
+                {
+                    "side": "BUY",
+                    "price": 0.8586,
+                    "qty": 20.0,
+                    "notional": 17.172,
+                    "role": "best_quote_reduce_short",
+                    "position_side": "SHORT",
+                    "force_reduce_only": True,
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+        }
+
+        guarded = apply_reduce_only_no_loss_guard_to_actions(
+            actions=actions,
+            plan_report={
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "take_profit_guard": {
+                    "enabled": True,
+                    "effective_min_profit_ratio": 0.0,
+                    "long_floor_price": 0.9159,
+                    "short_ceiling_price": 0.823,
+                },
+                "current_long_avg_price": 0.9159,
+                "current_short_avg_price": 0.823,
+            },
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            live_bid_price=0.8586,
+            live_ask_price=0.8587,
+            tick_size=0.0001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertEqual(guarded["place_orders"][0]["role"], "frozen_inventory_manual_reduce_long")
+        self.assertEqual(
+            guarded["place_orders"][0]["reduce_only_no_loss_guard"],
+            "bypassed_frozen_inventory_manual_reduce",
+        )
+        dropped = guarded["reduce_only_no_loss_guard"]["dropped_orders"][0]
+        self.assertEqual(dropped["role"], "best_quote_reduce_short")
+        self.assertEqual(dropped["reduce_only_no_loss_drop_reason"], "short_reduce_above_no_loss_ceiling")
+
     def test_reduce_only_no_loss_guard_can_be_disabled_for_volume_mode(self) -> None:
         actions = {
             "place_orders": [

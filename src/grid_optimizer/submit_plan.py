@@ -498,6 +498,21 @@ def _reduce_only_cap_side(
     return None
 
 
+def _authorized_frozen_manual_no_loss_bypass(order: dict[str, Any]) -> str | None:
+    role = str(order.get("role", "") or "").strip().lower()
+    manual_reduce = role.startswith("frozen_inventory_manual_reduce_") or bool(
+        order.get("manual_frozen_inventory_reduce")
+    )
+    manual_limit = role.startswith("frozen_inventory_manual_limit_") or bool(
+        order.get("manual_frozen_inventory_limit")
+    )
+    if not (manual_reduce or manual_limit):
+        return None
+    if not str(order.get("frozen_inventory_request_id", "") or "").strip():
+        return None
+    return "manual_reduce" if manual_reduce else "manual_limit"
+
+
 def cap_reduce_only_place_orders_to_position(
     *,
     actions: dict[str, Any],
@@ -1083,6 +1098,11 @@ def apply_reduce_only_no_loss_guard_to_actions(
         role = str(order.get("role", "") or "").strip().lower()
         if role.startswith("frozen_inventory_pair_release_") or bool(order.get("frozen_inventory_pair_release")):
             order["reduce_only_no_loss_guard"] = "bypassed_frozen_pair_release"
+            kept_place_orders.append(order)
+            continue
+        frozen_manual_bypass = _authorized_frozen_manual_no_loss_bypass(order)
+        if frozen_manual_bypass is not None:
+            order["reduce_only_no_loss_guard"] = f"bypassed_frozen_inventory_{frozen_manual_bypass}"
             kept_place_orders.append(order)
             continue
         if role in {"hard_loss_forced_reduce_long", "hard_loss_forced_reduce_short"}:
