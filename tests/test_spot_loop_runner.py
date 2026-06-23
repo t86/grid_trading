@@ -14,8 +14,12 @@ from grid_optimizer.spot_loop_runner import (
     _auto_flatten_on_runtime_guard,
     _build_parser,
     _build_spot_competition_inventory_grid_orders,
+    _check_spot_freeze_hedge_gate,
     _clamp_limit_maker_price_to_book,
     _load_state,
+    _make_spot_freeze_contract_callback,
+    _make_spot_freeze_spot_market_callback,
+    _maybe_run_spot_freeze,
     _normalize_commission_quote,
     _resolve_spot_competition_runtime,
     _spot_order_meets_exchange_mins,
@@ -23,9 +27,194 @@ from grid_optimizer.spot_loop_runner import (
     _sync_synthetic_neutral_trades,
     _sync_volume_shift_trades,
 )
+from grid_optimizer.spot_freeze_manager import new_ledger
 
 
 class SpotLoopRunnerTests(unittest.TestCase):
+    def _synthetic_args(self, extra: list[str] | None = None):
+        argv = [
+            "--symbol",
+            "WLDUSDT",
+            "--strategy-mode",
+            "spot_competition_synthetic_neutral_grid",
+            "--total-quote-budget",
+            "1500",
+            "--client-order-prefix",
+            "spotgrid",
+            "--state-path",
+            "/tmp/spot-state.json",
+            "--summary-jsonl",
+            "/tmp/spot-summary.jsonl",
+            "--step-price",
+            "0.01",
+            "--per-order-notional",
+            "10",
+            "--neutral-base-qty",
+            "100",
+            "--max-short-position-notional",
+            "500",
+            "--max-position-notional",
+            "500",
+        ]
+        if extra:
+            argv.extend(extra)
+        return _build_parser().parse_args(argv)
+
+    def test_parser_spot_freeze_defaults_disabled(self) -> None:
+        args = self._synthetic_args()
+
+        self.assertFalse(args.spot_freeze_enabled)
+        self.assertEqual(args.spot_freeze_base_hedge_qty, 0.0)
+        self.assertEqual(args.spot_freeze_release_profit_ratio, 0.05)
+
+    def test_spot_freeze_gate_rejects_non_hedge_mode(self) -> None:
+        gate = _check_spot_freeze_hedge_gate(
+            symbol="WLDUSDT",
+            position_mode={"dualSidePosition": False},
+            position_risk=[],
+            base_hedge_qty=100.0,
+            tolerance_qty=0.01,
+        )
+
+        self.assertFalse(gate["ok"])
+        self.assertEqual(gate["reason"], "not_hedge_mode")
+
+    def test_spot_freeze_gate_rejects_existing_long_position(self) -> None:
+        gate = _check_spot_freeze_hedge_gate(
+            symbol="WLDUSDT",
+            position_mode={"dualSidePosition": True},
+            position_risk=[
+                {"symbol": "WLDUSDT", "positionSide": "LONG", "positionAmt": "0.5"},
+                {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-100"},
+            ],
+            base_hedge_qty=100.0,
+            tolerance_qty=0.01,
+        )
+
+        self.assertFalse(gate["ok"])
+        self.assertEqual(gate["reason"], "long_position_not_zero")
+
+    def test_spot_freeze_gate_rejects_short_position_not_matching_base_hedge(self) -> None:
+        gate = _check_spot_freeze_hedge_gate(
+            symbol="WLDUSDT",
+            position_mode={"dualSidePosition": True},
+            position_risk=[
+                {"symbol": "WLDUSDT", "positionSide": "LONG", "positionAmt": "0"},
+                {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-95"},
+            ],
+            base_hedge_qty=100.0,
+            tolerance_qty=0.01,
+        )
+
+        self.assertFalse(gate["ok"])
+        self.assertEqual(gate["reason"], "short_position_base_mismatch")
+
+    def test_spot_freeze_contract_wrapper_uses_position_side_short_without_reduce_kwargs(self) -> None:
+        with patch("grid_optimizer.spot_loop_runner.post_futures_market_order", return_value={"executedQty": "2"}) as mock_post:
+            callback = _make_spot_freeze_contract_callback(symbol="WLDUSDT", api_key="key", api_secret="secret")
+            result = callback(side="BUY", qty=2.0, position_side="SHORT")
+
+        self.assertEqual(result["executedQty"], "2")
+        kwargs = mock_post.call_args.kwargs
+        self.assertEqual(kwargs["symbol"], "WLDUSDT")
+        self.assertEqual(kwargs["side"], "BUY")
+        self.assertEqual(kwargs["quantity"], 2.0)
+        self.assertEqual(kwargs["position_side"], "SHORT")
+        self.assertNotIn("reduce_only", kwargs)
+        self.assertNotIn("reduceOnly", kwargs)
+
+    def test_spot_freeze_spot_market_wrapper_uses_market_order_with_price_zero(self) -> None:
+        with patch("grid_optimizer.spot_loop_runner.post_spot_order", return_value={"executedQty": "2"}) as mock_post:
+            callback = _make_spot_freeze_spot_market_callback(symbol="WLDUSDT", api_key="key", api_secret="secret")
+            result = callback(side="SELL", qty=2.0)
+
+        self.assertEqual(result["executedQty"], "2")
+        kwargs = mock_post.call_args.kwargs
+        self.assertEqual(kwargs["symbol"], "WLDUSDT")
+        self.assertEqual(kwargs["side"], "SELL")
+        self.assertEqual(kwargs["quantity"], 2.0)
+        self.assertEqual(kwargs["price"], 0.0)
+        self.assertEqual(kwargs["order_type"], "MARKET")
+
+    def test_spot_freeze_defaults_disabled_and_does_not_call_cycle(self) -> None:
+        args = self._synthetic_args()
+        state = {"spot_frozen_ledger": new_ledger()}
+        controls = {"actual_base_qty": 120.0, "neutral_base_qty": 100.0, "_runtime": {}}
+
+        with patch("grid_optimizer.spot_loop_runner.fetch_futures_position_mode", side_effect=AssertionError("should not fetch")):
+            with patch("grid_optimizer.spot_loop_runner.freeze_cycle", side_effect=AssertionError("should not call")):
+                _maybe_run_spot_freeze(
+                    args=args,
+                    state=state,
+                    controls=controls,
+                    symbol="WLDUSDT",
+                    mid_price=10.0,
+                    symbol_info={"step_size": 0.001},
+                    api_key="key",
+                    api_secret="secret",
+                    now=datetime(2026, 6, 23, tzinfo=timezone.utc),
+                )
+
+        self.assertFalse(controls["spot_freeze_enabled"])
+
+    def test_spot_freeze_enabled_calls_cycle_with_short_position_qty(self) -> None:
+        args = self._synthetic_args(
+            [
+                "--spot-freeze-enabled",
+                "--spot-freeze-base-hedge-qty",
+                "100",
+                "--spot-freeze-deviation-notional",
+                "50",
+                "--spot-freeze-min-loss-ratio",
+                "0.01",
+                "--spot-freeze-max-per-cycle-notional",
+                "100",
+                "--spot-freeze-total-cap-notional",
+                "500",
+            ]
+        )
+        state = {"spot_frozen_ledger": new_ledger()}
+        controls = {
+            "actual_base_qty": 120.0,
+            "neutral_base_qty": 100.0,
+            "_runtime": {
+                "recovery_mode": "live",
+                "synthetic_cost_unknown": False,
+                "position_lots": [{"lot_id": "L1", "side": "long", "qty": 20.0, "entry_price": 12.0}],
+            },
+        }
+
+        with patch("grid_optimizer.spot_loop_runner.fetch_futures_position_mode", return_value={"dualSidePosition": True}):
+            with patch(
+                "grid_optimizer.spot_loop_runner.fetch_futures_position_risk_v3",
+                return_value=[
+                    {"symbol": "WLDUSDT", "positionSide": "LONG", "positionAmt": "0"},
+                    {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-100"},
+                ],
+            ):
+                with patch(
+                    "grid_optimizer.spot_loop_runner.freeze_cycle",
+                    return_value={"ledger": new_ledger(), "actions": [{"type": "freeze"}], "reconcile_ok": True, "alerts": []},
+                ) as mock_cycle:
+                    _maybe_run_spot_freeze(
+                        args=args,
+                        state=state,
+                        controls=controls,
+                        symbol="WLDUSDT",
+                        mid_price=10.0,
+                        symbol_info={"step_size": 0.001},
+                        api_key="key",
+                        api_secret="secret",
+                        now=datetime(2026, 6, 23, tzinfo=timezone.utc),
+                    )
+
+        kwargs = mock_cycle.call_args.kwargs
+        self.assertEqual(kwargs["contract_short_qty"], 100.0)
+        self.assertEqual(kwargs["base_hedge_qty"], 100.0)
+        self.assertTrue(kwargs["loss_ratio_usable"])
+        self.assertEqual(kwargs["config"].deviation_notional, 50.0)
+        self.assertEqual(controls["spot_freeze_actions"], [{"type": "freeze"}])
+
     def test_clamp_limit_maker_price_to_book_keeps_buy_post_only(self) -> None:
         price = _clamp_limit_maker_price_to_book(
             side="BUY",
