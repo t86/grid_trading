@@ -158,6 +158,7 @@ EXECUTION_LEVERAGE_CHANGE_CACHE_TTL_SECONDS = 10 * 60.0
 ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS = 30.0
 OPEN_ORDER_STREAM_MAX_AGE_SECONDS = 30.0
 PROTECTIVE_SYNTHETIC_DRIFT_MIN_NOTIONAL = 100.0
+BEST_QUOTE_FROZEN_RELEASE_RETAIN_NOTIONAL = 1.0
 PROTECTIVE_OPEN_ORDER_DIFF_LIMIT = 10
 PROTECTIVE_OPEN_ORDER_DIFF_CONFIRM_CHECKS = 2
 POSITION_MODE_CACHE_TTL_SECONDS = 10 * 60.0
@@ -4686,6 +4687,22 @@ def _frozen_inventory_worst_entry(ledger: Mapping[str, Any], side_key: str) -> f
     return min(entries) if side_key == "short" else max(entries)
 
 
+def _frozen_inventory_releasable_qty_after_retain(
+    frozen_qty: float,
+    reference_price: float,
+    *,
+    retain_notional: float = BEST_QUOTE_FROZEN_RELEASE_RETAIN_NOTIONAL,
+) -> float:
+    safe_qty = max(_safe_float(frozen_qty), 0.0)
+    safe_retain = max(_safe_float(retain_notional), 0.0)
+    if safe_qty <= 1e-12 or safe_retain <= 0:
+        return safe_qty
+    safe_price = max(_safe_float(reference_price), 0.0)
+    if safe_price <= 0:
+        return 0.0
+    return max(safe_qty - (safe_retain / safe_price), 0.0)
+
+
 def arm_best_quote_frozen_single_leg_take_profit(
     *,
     state: dict[str, Any],
@@ -4730,7 +4747,9 @@ def arm_best_quote_frozen_single_leg_take_profit(
         # aggregate never realizes a loss on any individual lot.
         and short_worst_entry > safe_ask
     ):
-        armed["short"] = short_qty
+        release_qty = _frozen_inventory_releasable_qty_after_retain(short_qty, safe_ask)
+        if release_qty > 1e-12:
+            armed["short"] = release_qty
 
     long_qty = max(_safe_float(ledger.get("long_qty")), 0.0)
     long_entry = _frozen_inventory_weighted_entry(ledger, "long")
@@ -4743,7 +4762,9 @@ def arm_best_quote_frozen_single_leg_take_profit(
         and (safe_bid - long_entry) / long_entry >= r
         and 0.0 < long_worst_entry < safe_bid
     ):
-        armed["long"] = long_qty
+        release_qty = _frozen_inventory_releasable_qty_after_retain(long_qty, safe_bid)
+        if release_qty > 1e-12:
+            armed["long"] = release_qty
 
     if not armed:
         return {}
@@ -4815,6 +4836,13 @@ def apply_best_quote_frozen_inventory_manual_reduce(
         if price <= 0:
             reduce_report["blocked_reasons"].append(f"{side_key}_missing_price")
             return None
+        if str(side_directive.get("source") or "") == "auto_single_leg_take_profit":
+            retained_qty = _frozen_inventory_releasable_qty_after_retain(frozen_qty, price)
+            requested_qty = min(requested_qty if requested_qty > 0 else frozen_qty, retained_qty)
+            if requested_qty <= 1e-12:
+                directive.pop(side_key, None)
+                reduce_report["blocked_reasons"].append(f"{side_key}_retain_notional_floor")
+                return None
         qty = _round_order_qty(min(frozen_qty, requested_qty) if requested_qty > 0 else frozen_qty, step_size)
         if qty <= 0 or (min_qty is not None and qty < _safe_float(min_qty)):
             reduce_report["blocked_reasons"].append(f"{side_key}_below_min_qty")
@@ -5006,8 +5034,10 @@ def _build_best_quote_frozen_pair_release_auto_directive(
     offset_qty = min(frozen_long_qty, frozen_short_qty)
     if offset_qty <= 1e-12 or safe_mid <= 0:
         return {}
+    releasable_long_qty = _frozen_inventory_releasable_qty_after_retain(frozen_long_qty, safe_mid)
+    releasable_short_qty = _frozen_inventory_releasable_qty_after_retain(frozen_short_qty, safe_mid)
     safe_max_notional = max(_safe_float(max_notional), 0.0)
-    requested_qty = offset_qty
+    requested_qty = min(offset_qty, releasable_long_qty, releasable_short_qty)
     if safe_max_notional > 0:
         requested_qty = min(requested_qty, safe_max_notional / safe_mid)
     requested_qty = _round_order_qty(requested_qty, step_size)
@@ -5062,6 +5092,7 @@ def apply_best_quote_frozen_inventory_pair_release(
         "blocked_reasons": [],
         "release_qty": 0.0,
         "release_notional": 0.0,
+        "retain_notional": BEST_QUOTE_FROZEN_RELEASE_RETAIN_NOTIONAL,
         "min_side_notional": max(_safe_float(min_side_notional), 0.0),
         "frozen_long_notional": 0.0,
         "frozen_short_notional": 0.0,
@@ -5126,6 +5157,12 @@ def apply_best_quote_frozen_inventory_pair_release(
     safe_requested_qty = max(_safe_float(requested_qty), 0.0) if requested_qty is not None else 0.0
     if safe_requested_qty > 0 and not repair_side:
         max_qty = min(max_qty, max(safe_requested_qty - paired_released, 0.0))
+    if not repair_side:
+        max_qty = min(
+            max_qty,
+            _frozen_inventory_releasable_qty_after_retain(frozen_long_qty, mid_price),
+            _frozen_inventory_releasable_qty_after_retain(frozen_short_qty, mid_price),
+        )
     qty = _round_order_qty(max_qty, step_size)
     safe_min_qty = max(_safe_float(min_qty), 0.0) if min_qty is not None else 0.0
     if qty <= 0 or (safe_min_qty > 0 and qty + 1e-12 < safe_min_qty):

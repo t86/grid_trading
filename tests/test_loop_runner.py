@@ -1614,12 +1614,41 @@ class LoopRunnerTests(unittest.TestCase):
         armed = arm_best_quote_frozen_single_leg_take_profit(
             state=state, bid_price=0.979, ask_price=0.980, min_profit_ratio=0.05,
         )
-        self.assertEqual(armed, {"short": 100.0})
+        expected_qty = 100.0 - (1.0 / 0.980)
+        self.assertAlmostEqual(armed["short"], expected_qty, places=9)
         directive = state["best_quote_frozen_inventory_manual_reduce"]["short"]
         self.assertTrue(directive["requested"])
-        self.assertEqual(directive["requested_qty"], 100.0)
+        self.assertAlmostEqual(directive["requested_qty"], expected_qty, places=9)
         self.assertTrue(directive.get("request_id"))
         self.assertTrue(directive.get("expires_at"))
+
+    def test_arm_frozen_single_leg_take_profit_long_retains_one_usd(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 10.0,
+                "long_lots": [{"qty": 10.0, "entry_price": 0.82, "freeze_band_key": "long:0"}],
+            },
+        }
+        armed = arm_best_quote_frozen_single_leg_take_profit(
+            state=state, bid_price=0.861, ask_price=0.862, min_profit_ratio=0.05,
+        )
+        expected_qty = 10.0 - (1.0 / 0.861)
+        self.assertAlmostEqual(armed["long"], expected_qty, places=9)
+        directive = state["best_quote_frozen_inventory_manual_reduce"]["long"]
+        self.assertAlmostEqual(directive["requested_qty"], expected_qty, places=9)
+
+    def test_arm_frozen_single_leg_take_profit_keeps_small_long_frozen(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 1.0,
+                "long_lots": [{"qty": 1.0, "entry_price": 0.82, "freeze_band_key": "long:0"}],
+            },
+        }
+        armed = arm_best_quote_frozen_single_leg_take_profit(
+            state=state, bid_price=0.861, ask_price=0.862, min_profit_ratio=0.05,
+        )
+        self.assertEqual(armed, {})
+        self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
 
     def test_arm_frozen_single_leg_take_profit_below_threshold_noop(self) -> None:
         state: dict[str, object] = {
@@ -1653,6 +1682,73 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(
             state["best_quote_frozen_inventory_manual_reduce"]["short"]["requested_qty"], 50.0
         )
+
+    def test_best_quote_frozen_pair_release_retains_one_usd_per_side(self) -> None:
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+        report = {
+            "frozen_long_qty": 7.0,
+            "frozen_short_qty": 20.0,
+            "ledger": {
+                "long_lots": [{"qty": 7.0, "entry_price": 0.6, "freeze_band_key": "long:0"}],
+                "short_lots": [{"qty": 20.0, "entry_price": 1.4, "freeze_band_key": "short:0"}],
+            },
+        }
+        release = apply_best_quote_frozen_inventory_pair_release(
+            plan=plan,
+            report=report,
+            bid_price=1.0,
+            ask_price=1.0,
+            tick_size=None,
+            step_size=None,
+            min_qty=None,
+            min_notional=None,
+            hedge_mode=True,
+            enabled=True,
+            stable_allowed=True,
+            max_notional=100.0,
+            min_side_notional=0.0,
+            min_profit_ratio=0.0,
+            max_slippage_ticks=0,
+            requested_qty=7.0,
+            request_id="req-1",
+        )
+        self.assertTrue(release["active"])
+        self.assertAlmostEqual(release["release_qty"], 6.0, places=9)
+        self.assertAlmostEqual(plan["sell_orders"][0]["qty"], 6.0, places=9)
+        self.assertAlmostEqual(plan["buy_orders"][0]["qty"], 6.0, places=9)
+
+    def test_auto_single_leg_manual_reduce_directive_retains_one_usd(self) -> None:
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 10.0,
+                "long_lots": [{"qty": 10.0, "entry_price": 0.82, "freeze_band_key": "long:0"}],
+            },
+            "best_quote_frozen_inventory_manual_reduce": {
+                "long": {
+                    "requested": True,
+                    "requested_qty": 10.0,
+                    "source": "auto_single_leg_take_profit",
+                    "request_id": "auto-tp-long",
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+                }
+            },
+        }
+        report = apply_best_quote_frozen_inventory_manual_reduce(
+            plan=plan,
+            state=state,
+            report={},
+            bid_price=0.861,
+            ask_price=0.862,
+            tick_size=None,
+            step_size=None,
+            min_qty=None,
+            min_notional=None,
+            hedge_mode=True,
+        )
+        expected_qty = 10.0 - (1.0 / 0.861)
+        self.assertTrue(report["active"])
+        self.assertAlmostEqual(plan["sell_orders"][0]["qty"], expected_qty, places=9)
 
     def test_arm_frozen_single_leg_take_profit_blocks_underwater_lot(self) -> None:
         # weighted entry 1.075 -> (1.075-0.98)/1.075 = 8.8% >= 5%, BUT the 0.95 lot is
@@ -3239,7 +3335,7 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertTrue(release["active"])
         self.assertEqual(report["frozen_pair_eligible_long_qty"], 70.0)
-        self.assertEqual(release["release_qty"], 70.0)
+        self.assertEqual(release["release_qty"], 69.0)
 
     def test_best_quote_frozen_pair_release_auto_directive_uses_pair_eligible_qty(self) -> None:
         directive = _build_best_quote_frozen_pair_release_auto_directive(
@@ -3254,7 +3350,7 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertTrue(directive["requested"])
         self.assertEqual(directive["source"], "auto_frozen_pair_release")
-        self.assertEqual(directive["requested_qty"], 100.0)
+        self.assertAlmostEqual(directive["requested_qty"], 100.0 - (1.0 / 0.62), places=9)
         self.assertTrue(directive["request_id"].startswith("auto-pair-"))
         self.assertIn("expires_at", directive)
 
