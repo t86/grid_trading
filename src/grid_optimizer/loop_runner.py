@@ -5249,6 +5249,8 @@ def _cap_best_quote_reduce_orders_to_managed_inventory(
         "managed_short_qty": managed_short_qty,
         "frozen_long_qty": frozen_long_qty,
         "frozen_short_qty": frozen_short_qty,
+        "position_long_qty": max(_safe_float(report.get("position_long_qty")), 0.0),
+        "position_short_qty": max(_safe_float(report.get("position_short_qty")), 0.0),
         "trimmed_long_orders": 0,
         "trimmed_short_orders": 0,
         "dropped_long_orders": 0,
@@ -5260,6 +5262,20 @@ def _cap_best_quote_reduce_orders_to_managed_inventory(
 
     safe_min_qty = max(_safe_float(min_qty), 0.0) if min_qty is not None else 0.0
     safe_min_notional = max(_safe_float(min_notional), 0.0) if min_notional is not None else 0.0
+    position_long_qty = _safe_float(report.get("position_long_qty"))
+    position_short_qty = _safe_float(report.get("position_short_qty"))
+    exchange_available_long_qty = (
+        max(position_long_qty - frozen_long_qty, 0.0)
+        if "position_long_qty" in report
+        else managed_long_qty
+    )
+    exchange_available_short_qty = (
+        max(position_short_qty - frozen_short_qty, 0.0)
+        if "position_short_qty" in report
+        else managed_short_qty
+    )
+    cap_report["exchange_available_long_qty"] = exchange_available_long_qty
+    cap_report["exchange_available_short_qty"] = exchange_available_short_qty
 
     def _is_manual_frozen_reduce(order: dict[str, Any]) -> bool:
         role = _order_role(order)
@@ -5312,7 +5328,7 @@ def _cap_best_quote_reduce_orders_to_managed_inventory(
             trimmed["frozen_inventory_managed_qty_capped"] = True
         return trimmed, max(available_qty - qty, 0.0), bool(qty + 1e-12 < original_qty)
 
-    long_available = managed_long_qty
+    long_available = min(managed_long_qty, exchange_available_long_qty)
     sell_orders: list[dict[str, Any]] = []
     for raw_order in [item for item in plan.get("sell_orders", []) if isinstance(item, dict)]:
         order = dict(raw_order)
@@ -5332,7 +5348,7 @@ def _cap_best_quote_reduce_orders_to_managed_inventory(
         sell_orders.append(trimmed)
     plan["sell_orders"] = sell_orders
 
-    short_available = managed_short_qty
+    short_available = min(managed_short_qty, exchange_available_short_qty)
     buy_orders: list[dict[str, Any]] = []
     for raw_order in [item for item in plan.get("buy_orders", []) if isinstance(item, dict)]:
         order = dict(raw_order)
