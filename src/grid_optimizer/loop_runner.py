@@ -4836,7 +4836,10 @@ def apply_best_quote_frozen_inventory_manual_reduce(
             reduce_report["blocked_reasons"].append(f"{side_key}_frozen_qty_empty")
             return None
         side = "SELL" if is_long else "BUY"
+        safe_tick = max(_safe_float(tick_size), 0.0)
         raw_price = bid_price if is_long else ask_price
+        if safe_tick > 0:
+            raw_price = raw_price - safe_tick if is_long else raw_price + safe_tick
         price = _round_order_price(max(_safe_float(raw_price), 0.0), tick_size, side)
         if price <= 0:
             reduce_report["blocked_reasons"].append(f"{side_key}_missing_price")

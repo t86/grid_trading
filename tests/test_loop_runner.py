@@ -3116,6 +3116,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(order["force_reduce_only"])
         self.assertEqual(order["execution_type"], "aggressive")
         self.assertEqual(order["time_in_force"], "IOC")
+        self.assertEqual(order["price"], 0.979)
 
     def test_best_quote_frozen_inventory_manual_reduce_honors_requested_qty(self) -> None:
         state: dict[str, object] = {
