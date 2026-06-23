@@ -2338,6 +2338,8 @@ def _best_quote_order_book_from_role(role: Any) -> str:
         "best_quote_reduce_long",
         "best_quote_entry_short",
         "best_quote_reduce_short",
+        "hard_loss_forced_reduce_long",
+        "hard_loss_forced_reduce_short",
     }:
         return BQ_BOOK_NORMAL
     if (
@@ -2554,9 +2556,12 @@ def _best_quote_trade_book_from_order_ref(
     if ref is None:
         return BQ_BOOK_UNKNOWN
     book = str(ref.get("book") or "").lower().strip()
+    role_book = _best_quote_order_book_from_role(ref.get("role"))
+    if book == BQ_BOOK_UNKNOWN and role_book == BQ_BOOK_NORMAL:
+        return BQ_BOOK_NORMAL
     if book in {BQ_BOOK_NORMAL, BQ_BOOK_FROZEN, BQ_BOOK_UNKNOWN}:
         return book
-    return _best_quote_order_book_from_role(ref.get("role"))
+    return role_book
 
 
 def _best_quote_trade_fill_key(row: Mapping[str, Any] | dict[str, Any]) -> str:

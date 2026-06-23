@@ -2688,6 +2688,58 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(ledger["last_applied_trade_count"], 1)
         self.assertAlmostEqual(ledger["realized_pnl"], -0.0126, places=6)
 
+    def test_best_quote_volume_ledger_counts_hardloss_order_ref_with_unknown_book(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_volume_order_refs": {
+                "41046161": {
+                    "book": "unknown",
+                    "role": "hard_loss_forced_reduce_short",
+                    "side": "BUY",
+                    "position_side": "SHORT",
+                    "client_order_id": "gx-pharosu-hardloss-1-44382315",
+                }
+            },
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [],
+                "short_lots": [{"qty": 100.0, "price": 0.63, "source": "trade_fill"}],
+                "last_trade_time_ms": 1000,
+                "last_trade_keys_at_time": [],
+            },
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[]):
+            snapshot = sync_best_quote_volume_ledger(
+                state=state,
+                symbol="PHAROSUSDT",
+                api_key="",
+                api_secret="",
+                recv_window=5000,
+                current_long_qty=0.0,
+                current_short_qty=91.0,
+                current_long_avg_price=0.0,
+                current_short_avg_price=0.63,
+                mid_price=0.632,
+                observed_trade_rows=[
+                    {
+                        "time": 2000,
+                        "orderId": 41046161,
+                        "side": "BUY",
+                        "positionSide": "SHORT",
+                        "qty": "9",
+                        "price": "0.6314",
+                        "quoteQty": "5.6826",
+                    }
+                ],
+            )
+
+        self.assertEqual(snapshot["short_qty"], 91.0)
+        ledger = state["best_quote_volume_ledger"]
+        self.assertEqual(ledger["last_applied_trade_count"], 1)
+        self.assertEqual(ledger["last_unknown_trade_count"], 0)
+        self.assertAlmostEqual(ledger["realized_pnl"], -0.0126, places=6)
+
     def test_best_quote_volume_ledger_uses_order_ref_when_trade_row_lacks_client_id(self) -> None:
         state: dict[str, object] = {
             "best_quote_volume_order_refs": {
