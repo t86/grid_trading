@@ -1,6 +1,8 @@
 from grid_optimizer.spot_freeze_manager import (
     compute_deviation_loss,
     expected_short_position_now,
+    freeze_cycle,
+    FreezeConfig,
     ledger_totals,
     new_ledger,
     pending_signed_short_delta,
@@ -168,3 +170,197 @@ def test_compute_deviation_loss_rejects_missing_lots_or_zero_cost() -> None:
     assert result.loss_ratio == 0.0
     assert result.cost_avg == 0.0
     assert result.reason == "invalid_cost"
+
+
+class OrderRecorder:
+    def __init__(self, *, fail_contract: bool = False) -> None:
+        self.fail_contract = fail_contract
+        self.spot_orders: list[dict] = []
+        self.contract_orders: list[dict] = []
+
+    def spot(self, **kwargs: object) -> dict[str, str]:
+        self.spot_orders.append(dict(kwargs))
+        qty = float(kwargs["qty"])
+        return {"executedQty": str(qty), "cummulativeQuoteQty": str(qty * 10.0)}
+
+    def contract(self, **kwargs: object) -> dict[str, str]:
+        self.contract_orders.append(dict(kwargs))
+        if self.fail_contract:
+            raise RuntimeError("contract rejected")
+        return {"executedQty": str(kwargs["qty"])}
+
+
+def enabled_config(**overrides: object) -> FreezeConfig:
+    values = {
+        "enabled": True,
+        "deviation_notional": 50.0,
+        "min_loss_ratio": 0.05,
+        "max_per_cycle_notional": 100.0,
+        "total_cap_notional": 1000.0,
+    }
+    values.update(overrides)
+    return FreezeConfig(**values)
+
+
+def run_cycle(
+    *,
+    ledger: dict | None = None,
+    spot_inventory_qty: float = 120.0,
+    contract_short_qty: float = 100.0,
+    loss_ratio_usable: bool = True,
+    deviation_loss_ratio: float = 0.10,
+    config: FreezeConfig | None = None,
+    recorder: OrderRecorder | None = None,
+    dry_run: bool = False,
+) -> tuple[dict, OrderRecorder]:
+    rec = recorder or OrderRecorder()
+    result = freeze_cycle(
+        symbol="WLDUSDT",
+        neutral_base_qty=100.0,
+        spot_inventory_qty=spot_inventory_qty,
+        mid_price=10.0,
+        mark_price=10.0,
+        ledger=ledger or new_ledger(),
+        contract_short_qty=contract_short_qty,
+        base_hedge_qty=100.0,
+        deviation_loss_ratio=deviation_loss_ratio,
+        loss_ratio_usable=loss_ratio_usable,
+        config=config or enabled_config(),
+        qty_step=0.001,
+        tolerance_qty=0.01,
+        now="2026-06-23T12:00:00Z",
+        place_spot=rec.spot,
+        place_contract=rec.contract,
+        dry_run=dry_run,
+    )
+    return result, rec
+
+
+def test_freeze_long_deviation_sells_spot_and_buys_short_position_side() -> None:
+    result, rec = run_cycle()
+
+    assert rec.spot_orders[0]["side"] == "SELL"
+    assert rec.contract_orders[0]["side"] == "BUY"
+    assert rec.contract_orders[0]["position_side"] == "SHORT"
+    assert "reduce_only" not in rec.contract_orders[0]
+    assert "reduceOnly" not in rec.contract_orders[0]
+    assert result["ledger"]["long_lots"][0]["qty"] == 10.0
+    assert result["ledger"]["long_lots"][0]["cost_price"] == 10.0
+    assert result["ledger"]["long_lots"][0]["hedge_pending"] is False
+    assert result["ledger"]["pending_contract_actions"] == []
+
+
+def test_freeze_short_deviation_buys_spot_and_sells_short_position_side() -> None:
+    result, rec = run_cycle(spot_inventory_qty=80.0)
+
+    assert rec.spot_orders[0]["side"] == "BUY"
+    assert rec.contract_orders[0]["side"] == "SELL"
+    assert rec.contract_orders[0]["position_side"] == "SHORT"
+    assert result["ledger"]["short_lots"][0]["qty"] == 10.0
+
+
+def test_freeze_skips_when_loss_ratio_unusable() -> None:
+    result, rec = run_cycle(loss_ratio_usable=False)
+
+    assert rec.spot_orders == []
+    assert rec.contract_orders == []
+    assert result["ledger"]["long_lots"] == []
+    assert "cost_not_usable" in result["alerts"]
+
+
+def test_freeze_skips_when_deviation_or_loss_below_threshold() -> None:
+    result, rec = run_cycle(spot_inventory_qty=102.0)
+
+    assert rec.spot_orders == []
+    assert rec.contract_orders == []
+    assert result["actions"] == []
+
+    result, rec = run_cycle(deviation_loss_ratio=0.01)
+
+    assert rec.spot_orders == []
+    assert rec.contract_orders == []
+    assert result["actions"] == []
+
+
+def test_freeze_respects_total_cap_across_long_and_short_lots() -> None:
+    ledger = new_ledger()
+    ledger["long_lots"] = [{"lot_id": "L1", "qty": 40.0, "cost_price": 10.0, "frozen_at": "t", "frozen_mid": 10.0, "hedge_pending": False}]
+    ledger["short_lots"] = [{"lot_id": "S1", "qty": 60.0, "cost_price": 10.0, "frozen_at": "t", "frozen_mid": 10.0, "hedge_pending": False}]
+    ledger_totals(ledger)
+
+    result, rec = run_cycle(ledger=ledger, contract_short_qty=120.0, config=enabled_config(total_cap_notional=1000.0))
+
+    assert rec.spot_orders == []
+    assert rec.contract_orders == []
+    assert "total_cap_reached" in result["alerts"]
+
+
+def test_freeze_contract_failure_records_pending_and_marks_lot_pending() -> None:
+    result, rec = run_cycle(recorder=OrderRecorder(fail_contract=True))
+
+    assert rec.spot_orders[0]["side"] == "SELL"
+    assert rec.contract_orders[0]["side"] == "BUY"
+    assert result["ledger"]["pending_contract_actions"][0]["side"] == "BUY"
+    assert result["ledger"]["pending_contract_actions"][0]["position_side"] == "SHORT"
+    assert result["ledger"]["long_lots"][0]["hedge_pending"] is True
+    assert "contract_failed" in result["alerts"]
+
+
+def test_pending_actions_are_repaired_before_new_freeze() -> None:
+    ledger = new_ledger()
+    ledger["long_lots"] = [{"lot_id": "L1", "qty": 10.0, "cost_price": 10.0, "frozen_at": "t", "frozen_mid": 10.0, "hedge_pending": True}]
+    ledger["pending_contract_actions"] = [
+        {"side": "BUY", "position_side": "SHORT", "qty": 10.0, "reason": "freeze_long_hedge", "lot_id": "L1"}
+    ]
+    ledger_totals(ledger)
+
+    result, rec = run_cycle(ledger=ledger, contract_short_qty=100.0, spot_inventory_qty=100.0)
+
+    assert rec.contract_orders == [{"symbol": "WLDUSDT", "side": "BUY", "qty": 10.0, "position_side": "SHORT"}]
+    assert rec.spot_orders == []
+    assert result["ledger"]["pending_contract_actions"] == []
+    assert result["ledger"]["long_lots"][0]["hedge_pending"] is False
+
+
+def test_pending_repair_failure_keeps_pending_and_blocks_new_freeze() -> None:
+    ledger = new_ledger()
+    ledger["long_lots"] = [{"lot_id": "L1", "qty": 10.0, "cost_price": 10.0, "frozen_at": "t", "frozen_mid": 10.0, "hedge_pending": True}]
+    ledger["pending_contract_actions"] = [
+        {"side": "BUY", "position_side": "SHORT", "qty": 10.0, "reason": "freeze_long_hedge", "lot_id": "L1"}
+    ]
+    ledger_totals(ledger)
+
+    result, rec = run_cycle(ledger=ledger, contract_short_qty=100.0, recorder=OrderRecorder(fail_contract=True))
+
+    assert len(rec.contract_orders) == 1
+    assert rec.spot_orders == []
+    assert result["ledger"]["pending_contract_actions"]
+    assert result["ledger"]["long_lots"][0]["hedge_pending"] is True
+    assert "pending_contract_failed" in result["alerts"]
+
+
+def test_reconcile_drift_blocks_all_orders() -> None:
+    result, rec = run_cycle(contract_short_qty=99.0)
+
+    assert result["reconcile_ok"] is False
+    assert rec.spot_orders == []
+    assert rec.contract_orders == []
+    assert "reconcile_drift" in result["alerts"][0]
+
+
+def test_dry_run_records_actions_without_calling_callbacks() -> None:
+    result, rec = run_cycle(dry_run=True)
+
+    assert rec.spot_orders == []
+    assert rec.contract_orders == []
+    assert result["actions"][0]["type"] == "freeze_dry_run"
+    assert result["ledger"]["long_lots"] == []
+
+
+def test_contract_callback_kwargs_have_short_position_side_and_no_reduce_kwargs() -> None:
+    _result, rec = run_cycle()
+
+    for kwargs in rec.contract_orders:
+        assert kwargs["position_side"] == "SHORT"
+        assert "reduce_only" not in kwargs
+        assert "reduceOnly" not in kwargs
