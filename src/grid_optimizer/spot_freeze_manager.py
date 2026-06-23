@@ -229,6 +229,118 @@ def _repair_pending_actions(
     ledger["pending_contract_actions"] = remaining
 
 
+def _consume_fifo_lots(lots: list[dict[str, Any]], qty: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    remaining = max(_safe_float(qty), 0.0)
+    kept: list[dict[str, Any]] = []
+    consumed: list[dict[str, Any]] = []
+    for lot in lots:
+        lot_qty = max(_safe_float(lot.get("qty")), 0.0)
+        if remaining <= EPSILON:
+            kept.append(dict(lot))
+            continue
+        take_qty = min(lot_qty, remaining)
+        if take_qty > EPSILON:
+            consumed_lot = dict(lot)
+            consumed_lot["qty"] = take_qty
+            consumed.append(consumed_lot)
+        left_qty = lot_qty - take_qty
+        if left_qty > EPSILON:
+            kept_lot = dict(lot)
+            kept_lot["qty"] = left_qty
+            kept.append(kept_lot)
+        remaining -= take_qty
+    return kept, consumed
+
+
+def _paired_realized_pnl(long_lots: list[dict[str, Any]], short_lots: list[dict[str, Any]]) -> float:
+    long_idx = 0
+    short_idx = 0
+    long_left = _safe_float(long_lots[0].get("qty")) if long_lots else 0.0
+    short_left = _safe_float(short_lots[0].get("qty")) if short_lots else 0.0
+    pnl = 0.0
+    while long_idx < len(long_lots) and short_idx < len(short_lots):
+        qty = min(long_left, short_left)
+        if qty <= EPSILON:
+            break
+        long_cost = _safe_float(long_lots[long_idx].get("cost_price"))
+        short_cost = _safe_float(short_lots[short_idx].get("cost_price"))
+        pnl += (short_cost - long_cost) * qty
+        long_left -= qty
+        short_left -= qty
+        if long_left <= EPSILON:
+            long_idx += 1
+            long_left = _safe_float(long_lots[long_idx].get("qty")) if long_idx < len(long_lots) else 0.0
+        if short_left <= EPSILON:
+            short_idx += 1
+            short_left = _safe_float(short_lots[short_idx].get("qty")) if short_idx < len(short_lots) else 0.0
+    return pnl
+
+
+def _apply_pair_release(ledger: dict[str, Any], actions: list[dict[str, Any]]) -> None:
+    long_qty, short_qty = ledger_totals(ledger)
+    pair_qty = min(long_qty, short_qty)
+    if pair_qty <= EPSILON:
+        return
+    new_longs, consumed_longs = _consume_fifo_lots(ledger.get("long_lots", []), pair_qty)
+    new_shorts, consumed_shorts = _consume_fifo_lots(ledger.get("short_lots", []), pair_qty)
+    ledger["long_lots"] = new_longs
+    ledger["short_lots"] = new_shorts
+    ledger_totals(ledger)
+    actions.append(
+        {
+            "type": "pair_release",
+            "qty": pair_qty,
+            "realized_pnl": _paired_realized_pnl(consumed_longs, consumed_shorts),
+        }
+    )
+
+
+def _apply_profit_release(
+    *,
+    symbol: str,
+    ledger: dict[str, Any],
+    mark_price: float,
+    release_profit_ratio: float,
+    place_contract: Any,
+    dry_run: bool,
+    actions: list[dict[str, Any]],
+    alerts: list[str],
+) -> None:
+    mark = _safe_float(mark_price)
+    threshold = max(_safe_float(release_profit_ratio), 0.0)
+    for lot_key, contract_side, side_name in (
+        ("long_lots", "SELL", "long"),
+        ("short_lots", "BUY", "short"),
+    ):
+        kept: list[dict[str, Any]] = []
+        for lot in ledger.get(lot_key, []):
+            qty = max(_safe_float(lot.get("qty")), 0.0)
+            cost = _safe_float(lot.get("cost_price"))
+            if bool(lot.get("hedge_pending")) or qty <= EPSILON or cost <= EPSILON:
+                kept.append(dict(lot))
+                continue
+            if side_name == "long":
+                profit_ratio = (mark - cost) / cost
+            else:
+                profit_ratio = (cost - mark) / cost
+            if profit_ratio + EPSILON < threshold:
+                kept.append(dict(lot))
+                continue
+            if dry_run:
+                kept.append(dict(lot))
+                actions.append({"type": "profit_release_dry_run", "side": side_name, "qty": qty, "profit_ratio": profit_ratio})
+                continue
+            try:
+                place_contract(symbol=symbol, side=contract_side, qty=qty, position_side="SHORT")
+            except Exception:
+                kept.append(dict(lot))
+                alerts.append("profit_release_contract_failed")
+                continue
+            actions.append({"type": "profit_release", "side": side_name, "qty": qty, "profit_ratio": profit_ratio})
+        ledger[lot_key] = kept
+    ledger_totals(ledger)
+
+
 def freeze_cycle(
     *,
     symbol: str,
@@ -249,8 +361,6 @@ def freeze_cycle(
     place_contract: Any,
     dry_run: bool,
 ) -> dict[str, Any]:
-    del mark_price
-
     working = _ensure_ledger(ledger)
     actions: list[dict[str, Any]] = []
     alerts: list[str] = []
@@ -277,6 +387,20 @@ def freeze_cycle(
     if not config.enabled:
         ledger_totals(working)
         return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
+
+    if config.pair_release_enabled:
+        _apply_pair_release(working, actions)
+    if config.profit_release_enabled:
+        _apply_profit_release(
+            symbol=symbol,
+            ledger=working,
+            mark_price=mark_price,
+            release_profit_ratio=config.release_profit_ratio,
+            place_contract=place_contract,
+            dry_run=dry_run,
+            actions=actions,
+            alerts=alerts,
+        )
 
     deviation_qty_signed = _safe_float(spot_inventory_qty) - _safe_float(neutral_base_qty)
     mid = max(_safe_float(mid_price), 0.0)

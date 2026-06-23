@@ -206,6 +206,7 @@ def run_cycle(
     *,
     ledger: dict | None = None,
     spot_inventory_qty: float = 120.0,
+    mark_price: float = 10.0,
     contract_short_qty: float = 100.0,
     loss_ratio_usable: bool = True,
     deviation_loss_ratio: float = 0.10,
@@ -219,7 +220,7 @@ def run_cycle(
         neutral_base_qty=100.0,
         spot_inventory_qty=spot_inventory_qty,
         mid_price=10.0,
-        mark_price=10.0,
+        mark_price=mark_price,
         ledger=ledger or new_ledger(),
         contract_short_qty=contract_short_qty,
         base_hedge_qty=100.0,
@@ -364,3 +365,102 @@ def test_contract_callback_kwargs_have_short_position_side_and_no_reduce_kwargs(
         assert kwargs["position_side"] == "SHORT"
         assert "reduce_only" not in kwargs
         assert "reduceOnly" not in kwargs
+
+
+def test_pair_release_removes_equal_long_and_short_lots_without_contract_order() -> None:
+    ledger = new_ledger()
+    ledger["long_lots"] = [{"lot_id": "L1", "qty": 10.0, "cost_price": 8.0, "frozen_at": "t", "frozen_mid": 9.0, "hedge_pending": False}]
+    ledger["short_lots"] = [{"lot_id": "S1", "qty": 6.0, "cost_price": 11.0, "frozen_at": "t", "frozen_mid": 10.0, "hedge_pending": False}]
+    ledger_totals(ledger)
+
+    result, rec = run_cycle(
+        ledger=ledger,
+        spot_inventory_qty=100.0,
+        contract_short_qty=96.0,
+        config=enabled_config(pair_release_enabled=True),
+    )
+
+    assert rec.spot_orders == []
+    assert rec.contract_orders == []
+    assert result["ledger"]["frozen_long_qty"] == 4.0
+    assert result["ledger"]["frozen_short_qty"] == 0.0
+    assert result["actions"][0]["type"] == "pair_release"
+
+
+def test_pair_release_fifo_partial_lot_accounting() -> None:
+    ledger = new_ledger()
+    ledger["long_lots"] = [
+        {"lot_id": "L1", "qty": 5.0, "cost_price": 8.0, "frozen_at": "t", "frozen_mid": 9.0, "hedge_pending": False},
+        {"lot_id": "L2", "qty": 7.0, "cost_price": 9.0, "frozen_at": "t", "frozen_mid": 9.0, "hedge_pending": False},
+    ]
+    ledger["short_lots"] = [{"lot_id": "S1", "qty": 8.0, "cost_price": 11.0, "frozen_at": "t", "frozen_mid": 10.0, "hedge_pending": False}]
+    ledger_totals(ledger)
+
+    result, rec = run_cycle(
+        ledger=ledger,
+        spot_inventory_qty=100.0,
+        contract_short_qty=96.0,
+        config=enabled_config(pair_release_enabled=True),
+    )
+
+    assert rec.contract_orders == []
+    assert result["ledger"]["long_lots"] == [
+        {"lot_id": "L2", "qty": 4.0, "cost_price": 9.0, "frozen_at": "t", "frozen_mid": 9.0, "hedge_pending": False}
+    ]
+    assert result["ledger"]["short_lots"] == []
+
+
+def test_profit_release_long_sells_short_position_then_removes_lot() -> None:
+    ledger = new_ledger()
+    ledger["long_lots"] = [{"lot_id": "L1", "qty": 10.0, "cost_price": 10.0, "frozen_at": "t", "frozen_mid": 9.0, "hedge_pending": False}]
+    ledger_totals(ledger)
+
+    result, rec = run_cycle(
+        ledger=ledger,
+        spot_inventory_qty=100.0,
+        contract_short_qty=90.0,
+        mark_price=11.0,
+        config=enabled_config(profit_release_enabled=True, release_profit_ratio=0.05),
+    )
+
+    assert rec.contract_orders == [{"symbol": "WLDUSDT", "side": "SELL", "qty": 10.0, "position_side": "SHORT"}]
+    assert result["ledger"]["long_lots"] == []
+    assert result["ledger"]["pending_contract_actions"] == []
+
+
+def test_profit_release_short_buys_short_position_then_removes_lot() -> None:
+    ledger = new_ledger()
+    ledger["short_lots"] = [{"lot_id": "S1", "qty": 10.0, "cost_price": 10.0, "frozen_at": "t", "frozen_mid": 11.0, "hedge_pending": False}]
+    ledger_totals(ledger)
+
+    result, rec = run_cycle(
+        ledger=ledger,
+        spot_inventory_qty=100.0,
+        contract_short_qty=110.0,
+        mark_price=9.0,
+        config=enabled_config(profit_release_enabled=True, release_profit_ratio=0.05),
+    )
+
+    assert rec.contract_orders == [{"symbol": "WLDUSDT", "side": "BUY", "qty": 10.0, "position_side": "SHORT"}]
+    assert result["ledger"]["short_lots"] == []
+    assert result["ledger"]["pending_contract_actions"] == []
+
+
+def test_profit_release_contract_failure_keeps_lot_and_does_not_create_pending() -> None:
+    ledger = new_ledger()
+    ledger["long_lots"] = [{"lot_id": "L1", "qty": 10.0, "cost_price": 10.0, "frozen_at": "t", "frozen_mid": 9.0, "hedge_pending": False}]
+    ledger_totals(ledger)
+
+    result, rec = run_cycle(
+        ledger=ledger,
+        spot_inventory_qty=100.0,
+        contract_short_qty=90.0,
+        mark_price=11.0,
+        config=enabled_config(profit_release_enabled=True, release_profit_ratio=0.05),
+        recorder=OrderRecorder(fail_contract=True),
+    )
+
+    assert rec.contract_orders == [{"symbol": "WLDUSDT", "side": "SELL", "qty": 10.0, "position_side": "SHORT"}]
+    assert result["ledger"]["long_lots"][0]["lot_id"] == "L1"
+    assert result["ledger"]["pending_contract_actions"] == []
+    assert "profit_release_contract_failed" in result["alerts"]
