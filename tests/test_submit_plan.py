@@ -1984,6 +1984,28 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertIsNone(prepared)
         self.assertEqual(skipped["reason"], "submitted_notional_below_min_notional")
 
+    def test_prepare_order_request_crosses_frozen_manual_reduce_from_live_book(self) -> None:
+        prepared, skipped = prepare_post_only_order_request(
+            order={
+                "role": "frozen_inventory_manual_reduce_long",
+                "qty": 169.0,
+                "price": 0.8675,
+                "manual_frozen_inventory_reduce": True,
+                "frozen_inventory_request_id": "manual-runtime-long-tp-1782188116744",
+            },
+            side="SELL",
+            live_bid_price=0.8668,
+            live_ask_price=0.8669,
+            tick_size=0.0001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+            post_only=False,
+        )
+
+        self.assertIsNone(skipped)
+        self.assertAlmostEqual(prepared["submitted_price"], 0.8658, places=8)
+
 
 if __name__ == "__main__":
     unittest.main()

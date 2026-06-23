@@ -34,6 +34,7 @@ MIN_ORDER_QTY_BUMP_ROLES = {
     "entry_short",
     "grid_entry",
 }
+FROZEN_MANUAL_REDUCE_IOC_CROSS_TICKS = 10
 
 
 def _float(value: float) -> str:
@@ -344,6 +345,22 @@ def prepare_post_only_order_request(
         )
     elif tick_size and tick_size > 0:
         submit_price = _round_order_price(desired_price, tick_size, normalized_side)
+        if _authorized_frozen_manual_no_loss_bypass(order) == "manual_reduce":
+            cross_distance = tick_size * FROZEN_MANUAL_REDUCE_IOC_CROSS_TICKS
+            if normalized_side == "SELL" and live_bid_price > 0:
+                crossed_price = _round_order_price(
+                    max(live_bid_price - cross_distance, 0.0),
+                    tick_size,
+                    normalized_side,
+                )
+                submit_price = min(submit_price, crossed_price)
+            elif normalized_side == "BUY" and live_ask_price > 0:
+                crossed_price = _round_order_price(
+                    live_ask_price + cross_distance,
+                    tick_size,
+                    normalized_side,
+                )
+                submit_price = max(submit_price, crossed_price)
     else:
         submit_price = desired_price
     submit_notional = qty * submit_price
