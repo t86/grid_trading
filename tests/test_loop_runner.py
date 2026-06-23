@@ -49,6 +49,7 @@ from grid_optimizer.loop_runner import (
     _resolve_hard_loss_reduce_target_notional,
     _best_quote_reduce_freeze_report,
     _apply_best_quote_reduce_freeze,
+    _best_quote_take_profit_guard_cost_basis,
     _transfer_best_quote_volume_to_frozen,
     arm_best_quote_frozen_single_leg_take_profit,
     _cap_best_quote_reduce_orders_to_managed_inventory,
@@ -14794,6 +14795,37 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(long_roles, {"best_quote_entry_short", "best_quote_reduce_long"})
         self.assertEqual(short_roles, {"best_quote_entry_long", "best_quote_reduce_short"})
+
+    def test_best_quote_guard_cost_basis_pairs_managed_with_exchange_when_both_present(self) -> None:
+        # Frozen-isolated mode: managed short avg (42 lots) is 0.86, but the
+        # exchange settles realizedPnl on the whole 171-lot position avg 0.84.
+        # The guard must see BOTH so the no-loss ceiling clamps to the stricter
+        # (lower) exchange basis and stops "looks-flat-but-actually-loses" cover.
+        managed_basis, exchange_basis = _best_quote_take_profit_guard_cost_basis(
+            managed_avg_price=0.86,
+            exchange_avg_price=0.84,
+        )
+
+        self.assertAlmostEqual(managed_basis, 0.86, places=8)
+        self.assertAlmostEqual(exchange_basis, 0.84, places=8)
+
+    def test_best_quote_guard_cost_basis_falls_back_to_managed_when_exchange_missing(self) -> None:
+        managed_basis, exchange_basis = _best_quote_take_profit_guard_cost_basis(
+            managed_avg_price=0.86,
+            exchange_avg_price=0.0,
+        )
+
+        self.assertAlmostEqual(managed_basis, 0.86, places=8)
+        self.assertEqual(exchange_basis, 0.0)
+
+    def test_best_quote_guard_cost_basis_falls_back_to_exchange_when_managed_missing(self) -> None:
+        managed_basis, exchange_basis = _best_quote_take_profit_guard_cost_basis(
+            managed_avg_price=0.0,
+            exchange_avg_price=0.84,
+        )
+
+        self.assertAlmostEqual(managed_basis, 0.84, places=8)
+        self.assertEqual(exchange_basis, 0.0)
 
     def test_best_quote_frozen_inventory_principles_reject_side_dynamic_threshold(self) -> None:
         args = Namespace(

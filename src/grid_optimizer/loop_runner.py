@@ -10512,6 +10512,32 @@ def _best_quote_take_profit_guard_role_sets(
     return long_roles, short_roles
 
 
+def _best_quote_take_profit_guard_cost_basis(
+    *,
+    managed_avg_price: float,
+    exchange_avg_price: float,
+) -> tuple[float, float]:
+    """Pick the (current, synthetic) cost-basis pair for the take-profit guard.
+
+    Under frozen-inventory isolation the managed avg price only covers the
+    movable (non-frozen) lots, while Binance settles realizedPnl on the whole
+    merged position avg price. Feeding the guard both lets it clamp the no-loss
+    floor/ceiling to the stricter of the two (long floor = max, short ceiling =
+    min), so a normal reduce can never look flat on the managed book while
+    actually losing against the exchange position. Either input may be 0 when a
+    side is empty or its basis is unavailable; in that case we fall back to the
+    other so a missing 0 is never treated as a real (and impossibly cheap)
+    cost basis.
+    """
+    managed = max(_safe_float(managed_avg_price), 0.0)
+    exchange = max(_safe_float(exchange_avg_price), 0.0)
+    if managed > 0 and exchange > 0:
+        return managed, exchange
+    if managed > 0:
+        return managed, 0.0
+    return exchange, 0.0
+
+
 def apply_take_profit_profit_guard(
     *,
     plan: dict[str, Any],
@@ -18617,12 +18643,27 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 getattr(effective_args, "best_quote_maker_volume_allow_loss_reduce_only", False)
             ),
         )
+        # Under frozen isolation current_*_avg_price is the managed-only basis;
+        # also feed the whole-position exchange basis so the no-loss guard clamps
+        # to the stricter of the two and a normal reduce can never settle at a
+        # loss against the merged Binance position while looking flat on the
+        # managed book.
+        guard_long_current_avg, guard_long_synthetic_avg = _best_quote_take_profit_guard_cost_basis(
+            managed_avg_price=current_long_avg_price,
+            exchange_avg_price=exchange_long_avg_price,
+        )
+        guard_short_current_avg, guard_short_synthetic_avg = _best_quote_take_profit_guard_cost_basis(
+            managed_avg_price=current_short_avg_price,
+            exchange_avg_price=exchange_short_avg_price,
+        )
         take_profit_guard = apply_take_profit_profit_guard(
             plan=plan,
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
-            current_long_avg_price=current_long_avg_price,
-            current_short_avg_price=current_short_avg_price,
+            current_long_avg_price=guard_long_current_avg,
+            current_short_avg_price=guard_short_current_avg,
+            synthetic_long_avg_price=guard_long_synthetic_avg,
+            synthetic_short_avg_price=guard_short_synthetic_avg,
             current_long_notional=current_long_notional,
             current_short_notional=current_short_notional,
             pause_long_position_notional=effective_args.pause_buy_position_notional,
