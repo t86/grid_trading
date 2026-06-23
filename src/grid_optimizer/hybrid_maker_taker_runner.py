@@ -95,6 +95,7 @@ def execute_hybrid_roundtrip(
     cancel: Callable[..., None],
     place_taker: Callable[..., dict[str, Any]],
     poll_interval: float = 0.0,
+    maker_offset_ticks: int = 1,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """一次混合自回转:双边挂 Maker → 先成交边撤另一边 + Taker 反向平。
@@ -120,8 +121,13 @@ def execute_hybrid_roundtrip(
     # 1) 双边挂 LIMIT_MAKER(post-only)。任一边被拒(-2010 立即成交)→ 撤已挂的、回报 maker_rejected。
     placed: dict[str, str] = {}
     try:
-        placed["BUY"] = place_maker(side="BUY", price=_quantize(bid, tick_size), qty=qty)
-        placed["SELL"] = place_maker(side="SELL", price=_quantize(ask, tick_size), qty=qty)
+        # 退 maker_offset_ticks 档挂单:买价压低、卖价抬高,保证 post-only 不会立即成交被拒
+        # (超窄价差盘口如 WLD 价差仅 1 tick 时,贴 bid/ask 挂常被 -2010 拒)
+        offset = max(maker_offset_ticks, 0) * tick_size
+        buy_price = _quantize(bid - offset, tick_size)
+        sell_price = _quantize(ask + offset, tick_size, up=True)
+        placed["BUY"] = place_maker(side="BUY", price=buy_price, qty=qty)
+        placed["SELL"] = place_maker(side="SELL", price=sell_price, qty=qty)
     except Exception as exc:
         for coid in placed.values():
             try:
@@ -269,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="紧价差护栏:价差宽于此则等待收窄(0=不限,XAUT 盘口好可 0)")
     parser.add_argument("--poll-interval", type=float, default=0.3, help="Maker 挂单成交轮询间隔(秒)")
     parser.add_argument("--poll-max-cycles", type=int, default=10, help="每回合最多轮询多少次,耗尽未成交则追价重挂")
+    parser.add_argument("--maker-offset-ticks", type=int, default=1, help="Maker 挂单退几档(买压低/卖抬高),避免超窄价差被-2010拒;0=贴盘口")
     parser.add_argument("--maker-fee-bps", type=float, default=4.0, help="Maker 净费率(返佣后),磨损上报用")
     parser.add_argument("--taker-fee-bps", type=float, default=5.4, help="Taker 净费率(返佣后),磨损上报用")
     parser.add_argument("--max-total-loss-usdt", type=float, default=400.0,
@@ -357,6 +364,7 @@ def main(argv: list[str] | None = None) -> int:
             rt = execute_hybrid_roundtrip(
                 symbol=symbol, notional=notional, book=book, qty_step=qty_step, tick_size=tick_size,
                 poll_max_cycles=args.poll_max_cycles, poll_interval=args.poll_interval,
+                maker_offset_ticks=args.maker_offset_ticks,
                 place_maker=place_maker, query=query, cancel=cancel, place_taker=place_taker,
                 dry_run=not args.apply,
             )
