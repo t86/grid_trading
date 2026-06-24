@@ -3016,7 +3016,7 @@ def _build_spot_freeze_maker_order(
         max_contract_short_notional = max(_safe_float(getattr(args, "max_short_position_notional", 0.0)), 0.0)
         if max_contract_short_notional > EPSILON:
             max_contract_short_qty = max_contract_short_notional / mid
-            short_capacity_qty = max(max_contract_short_qty - max(_safe_float(available_short_qty), 0.0), 0.0)
+            short_capacity_qty = max(max_contract_short_qty - max(_safe_float(short_qty), 0.0), 0.0)
             if short_capacity_qty <= EPSILON:
                 return None, "short_hedge_capacity_exhausted"
             max_qty = min(max_qty, short_capacity_qty)

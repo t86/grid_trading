@@ -453,7 +453,7 @@ def freeze_cycle(
         max_contract_short_notional = max(_safe_float(config.max_contract_short_notional), 0.0)
         if max_contract_short_notional > EPSILON:
             max_contract_short_qty = max_contract_short_notional / mid
-            short_capacity_qty = max(max_contract_short_qty - max(_safe_float(available_short_qty), 0.0), 0.0)
+            short_capacity_qty = max(max_contract_short_qty - max(_safe_float(short_qty), 0.0), 0.0)
             short_capacity_exhausted = short_capacity_qty <= EPSILON
             max_qty = min(max_qty, short_capacity_qty)
     per_cycle_cap = max(_safe_float(config.max_per_cycle_notional), 0.0)

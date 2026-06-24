@@ -294,6 +294,48 @@ def test_freeze_short_deviation_respects_contract_short_limit() -> None:
     assert "short_hedge_capacity_exhausted" in result["alerts"]
 
 
+def test_freeze_short_deviation_contract_cap_counts_frozen_short_not_base_hedge() -> None:
+    rec = OrderRecorder()
+
+    result = freeze_cycle(
+        symbol="XPLUSDT",
+        neutral_base_qty=4800.0,
+        spot_inventory_qty=4121.8,
+        mid_price=0.08875,
+        mark_price=0.08875,
+        ledger=new_ledger(),
+        contract_short_qty=4800.0,
+        base_hedge_qty=4800.0,
+        deviation_loss_ratio=0.10,
+        loss_ratio_usable=True,
+        config=enabled_config(
+            deviation_notional=50.0,
+            min_loss_ratio=0.0,
+            max_per_cycle_notional=60.0,
+            total_cap_notional=240.0,
+            max_contract_short_notional=240.0,
+        ),
+        qty_step=0.1,
+        tolerance_qty=0.01,
+        now="2026-06-24T12:00:00Z",
+        place_spot=rec.spot,
+        place_contract=rec.contract,
+        dry_run=False,
+    )
+
+    assert rec.spot_orders == [{"symbol": "XPLUSDT", "side": "BUY", "qty": 676.0}]
+    assert rec.contract_orders == [
+        {
+            "symbol": "XPLUSDT",
+            "side": "SELL",
+            "position_side": "SHORT",
+            "qty": 676.0,
+        }
+    ]
+    assert result["ledger"]["short_lots"][0]["qty"] == 676.0
+    assert result["alerts"] == []
+
+
 def test_freeze_skips_when_loss_ratio_unusable() -> None:
     result, rec = run_cycle(loss_ratio_usable=False)
 
