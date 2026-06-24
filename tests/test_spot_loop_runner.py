@@ -2323,6 +2323,32 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(controls["risk_state"], "spot_freeze_hedge_gate_failed")
         self.assertEqual(controls["pause_reasons"], ["existing_reason", "spot_freeze_hedge_gate_failed"])
 
+    def test_spot_freeze_runtime_block_clears_orders_when_capacity_is_exhausted(self) -> None:
+        for skip_reason in ("total_cap_reached", "short_hedge_capacity_exhausted"):
+            with self.subTest(skip_reason=skip_reason):
+                controls = {
+                    "spot_freeze_enabled": True,
+                    "spot_freeze_skip_reason": skip_reason,
+                    "pause_reasons": ["existing_reason"],
+                }
+                desired_orders = [
+                    {"side": "BUY", "price": 10.0, "qty": 1.0},
+                    {"side": "SELL", "price": 10.1, "qty": 1.0},
+                ]
+
+                filtered = _apply_spot_freeze_runtime_hedge_block(
+                    strategy_mode="spot_competition_synthetic_neutral_grid",
+                    desired_orders=desired_orders,
+                    controls=controls,
+                )
+
+                expected_reason = f"spot_freeze_{skip_reason}"
+                self.assertEqual(filtered, [])
+                self.assertTrue(controls["spot_freeze_runtime_blocked"])
+                self.assertTrue(controls["buy_paused"])
+                self.assertEqual(controls["risk_state"], expected_reason)
+                self.assertEqual(controls["pause_reasons"], ["existing_reason", expected_reason])
+
     def test_spot_freeze_runtime_hedge_block_keeps_orders_when_gate_ok(self) -> None:
         controls = {
             "spot_freeze_enabled": True,

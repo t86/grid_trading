@@ -1474,16 +1474,19 @@ def _apply_spot_freeze_runtime_hedge_block(
         return desired_orders
     if not bool(controls.get("spot_freeze_enabled")):
         return desired_orders
-    if str(controls.get("spot_freeze_skip_reason", "") or "") != "hedge_gate_failed":
+    skip_reason = str(controls.get("spot_freeze_skip_reason", "") or "").strip()
+    blocking_reasons = {"hedge_gate_failed", "total_cap_reached", "short_hedge_capacity_exhausted"}
+    if skip_reason not in blocking_reasons:
         return desired_orders
 
     controls["spot_freeze_runtime_blocked"] = True
     controls["buy_paused"] = True
     pause_reasons = list(controls.get("pause_reasons") or [])
-    if "spot_freeze_hedge_gate_failed" not in pause_reasons:
-        pause_reasons.append("spot_freeze_hedge_gate_failed")
+    reason = f"spot_freeze_{skip_reason}"
+    if reason not in pause_reasons:
+        pause_reasons.append(reason)
     controls["pause_reasons"] = pause_reasons
-    controls["risk_state"] = "spot_freeze_hedge_gate_failed"
+    controls["risk_state"] = reason
     return []
 
 
