@@ -950,6 +950,30 @@ def _build_spot_app_loss_guard(
     }
 
 
+def _spot_app_loss_mark_price(*, metrics: dict[str, Any], bid_price: float, ask_price: float) -> float:
+    bid = max(_safe_float(bid_price), 0.0)
+    ask = max(_safe_float(ask_price), 0.0)
+    if bid <= EPSILON:
+        return ask
+    if ask <= EPSILON:
+        return bid
+    buy_qty = max(_safe_float(metrics.get("buy_qty")), 0.0)
+    sell_qty = max(_safe_float(metrics.get("sell_qty")), 0.0)
+    if buy_qty <= EPSILON and sell_qty <= EPSILON and isinstance(metrics.get("recent_trades"), list):
+        for row in metrics.get("recent_trades") or []:
+            if not isinstance(row, dict):
+                continue
+            qty = max(_safe_float(row.get("qty")), 0.0)
+            side = str(row.get("side", "") or "").upper().strip()
+            if side == "BUY":
+                buy_qty += qty
+            elif side == "SELL":
+                sell_qty += qty
+    if buy_qty > sell_qty + EPSILON:
+        return bid
+    return (bid + ask) / 2.0
+
+
 def _spot_app_loss_reduce_side(controls: dict[str, Any], position_qty: float, app_position_qty: float | None = None) -> str:
     if app_position_qty is not None and _safe_float(app_position_qty) > EPSILON:
         return "SELL"
@@ -3782,12 +3806,13 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         controls["fast_stop_guard"] = fast_stop_guard
     quote_free, base_free = _available_new_funds(account_info, base_asset, quote_asset)
     app_loss_position_qty = _total_base_balance(account_info, base_asset)
+    app_loss_mark_price = _spot_app_loss_mark_price(metrics=metrics, bid_price=bid_price, ask_price=ask_price)
     desired_orders = _apply_spot_app_loss_guard_to_orders(
         desired_orders=desired_orders,
         controls=controls,
         metrics=metrics,
         position_qty=app_loss_position_qty,
-        latest_price=mid_price,
+        latest_price=app_loss_mark_price,
         enabled=bool(getattr(args, "spot_app_loss_guard_enabled", False)),
         min_notional=float(getattr(args, "spot_app_loss_min_notional", 10000.0)),
         soft_per_10k=float(getattr(args, "spot_app_loss_per_10k_soft", 0.0)),

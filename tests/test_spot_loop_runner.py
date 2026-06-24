@@ -27,6 +27,7 @@ from grid_optimizer.spot_loop_runner import (
     _resolve_spot_competition_runtime,
     _run_cycle,
     _spot_order_meets_exchange_mins,
+    _spot_app_loss_mark_price,
     _refresh_spot_trades_after_account_snapshot,
     _sync_synthetic_neutral_trades,
     _sync_volume_shift_trades,
@@ -119,6 +120,41 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(guard["app_loss"], 100.0)
         self.assertAlmostEqual(guard["app_loss_per_10k"], 100.0 / 1400.0 * 10000.0)
         self.assertEqual(guard["state"], "blocked")
+
+    def test_spot_app_loss_mark_price_uses_bid_for_window_long(self) -> None:
+        price = _spot_app_loss_mark_price(
+            metrics={"buy_qty": 100.0, "sell_qty": 90.0},
+            bid_price=0.0868,
+            ask_price=0.0869,
+        )
+
+        self.assertEqual(price, 0.0868)
+
+    def test_spot_app_loss_mark_price_falls_back_to_mid_without_window_long(self) -> None:
+        price = _spot_app_loss_mark_price(
+            metrics={"buy_qty": 100.0, "sell_qty": 100.0},
+            bid_price=0.0868,
+            ask_price=0.0869,
+        )
+
+        self.assertAlmostEqual(price, 0.08685)
+
+    def test_spot_app_loss_mark_price_uses_recent_trade_window_long(self) -> None:
+        price = _spot_app_loss_mark_price(
+            metrics={
+                "buy_qty": 0.0,
+                "sell_qty": 0.0,
+                "app_loss_window_aligned": False,
+                "recent_trades": [
+                    {"side": "BUY", "qty": 100.0, "notional": 10.0},
+                    {"side": "SELL", "qty": 90.0, "notional": 9.0},
+                ],
+            },
+            bid_price=0.0868,
+            ask_price=0.0869,
+        )
+
+        self.assertEqual(price, 0.0868)
 
     def test_spot_app_loss_guard_uses_window_net_qty_not_account_base_balance(self) -> None:
         guard = _build_spot_app_loss_guard(
