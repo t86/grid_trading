@@ -42,6 +42,15 @@ APP 万U损耗 = APP 损耗 / (买入成交额 + 卖出成交额) * 10000
 
 结论：这次 XPL 的高损耗不是 taker 造成的，实际成交全部是 maker；核心问题是旧的合成中性恢复把 APP 窗口做成净多仓，价格低于窗口盈亏平衡价后，APP 直接把未卖出的持仓按当前价格计损。
 
+2026-06-25 06:09 CST 复核：
+
+- 生产代码：`2df88c8`
+- 114/150 的 `XPLUSDT` runner 均为 stopped/inactive，现货挂单 `open_orders=0`
+- 114 当前 XPL APP gate 因价格回升已允许：`app_loss_per_10k=0`，`maker_ratio=1.0`，`bid_break_even_buffer_ticks>40`，`truncated=false`
+- 114 当前保存配置仍禁止恢复：`spot_freeze_total_cap_notional=60` 小于 `max_short_position_notional=240`，启动前会被 preflight 拒绝
+
+结论：现在阻塞 XPL 恢复的不是 APP 窗口价格，而是冻结仓位配置不自洽。这个状态应保持为安全停机，直到用户明确同意 canary，并把冻结参数改成自洽的小窗口。
+
 ## 2026-06-24 MEGA 完整审计结论
 
 使用分页审计 `2026-06-17T00:00:00Z` 起的 `MEGAUSDT` APP 窗口后：
@@ -71,9 +80,11 @@ APP 万U损耗 = APP 损耗 / (买入成交额 + 卖出成交额) * 10000
 - 低于 neutral 的净空偏离只能用 maker BUY 慢慢回补。BUY reduce 单必须按当前 bid 侧参考，不能保留高于 bid 的 BUY 单；高于 bid 的 BUY 会变成吃单或在高价回补，直接放大 APP 损耗。
 - 如果设置了 `spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks`，启动后 runner 也会持续检查同一 bid-buffer。APP 损耗仍为 0 但 bid 到 break-even 的距离已经低于门槛时，runner 必须阻断扩多型 BUY；若 `actual_base_qty < neutral_base_qty`，仍只允许按 bid 上限 maker BUY 回补到 neutral，避免为了低损耗把组合长期卡在净空偏离。
 - 交易赛现货启用 APP loss guard/recovery 时，启动门禁必须配置正数 `spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks`。没有 bid-buffer 门槛的配置只能事后发现损耗，不能保证低于万一。
-- runner 还会逐张预测 BUY 成交后的 APP break-even。当前 bid-buffer 虽然达标，但某张 BUY 一旦成交会把 buffer 打到门槛以下时，该 BUY 不应挂出；不能等成交后下一轮才发现 APP 万U损耗重新变高。`actual_base_qty < neutral_base_qty` 时，回补到 neutral 以内的 maker BUY 是例外，代价是 break-even 可能短期被抬高；超出 neutral 的扩多 BUY 只整单保留或整单丢弃，巡航态不把普通 grid 单半截改成 reduce 单。
+- runner 还会逐张预测 BUY 成交后的 APP break-even。当前 bid-buffer 虽然达标，但某张 BUY 一旦成交会把 buffer 打到门槛以下时，该 BUY 不应挂出；不能等成交后下一轮才发现 APP 万U损耗重新变高。`actual_base_qty < neutral_base_qty` 且冻结短侧容量未耗尽时，回补到 neutral 以内的 maker BUY 是例外，代价是 break-even 可能短期被抬高；超出 neutral 的扩多 BUY 只整单保留或整单丢弃，巡航态不把普通 grid 单半截改成 reduce 单。
 - APP loss guard 进入 hard blocked 时不能只做 reduce-only 继续跑。若触发 `preactive_loss_cap_hit`、`bid_break_even_buffer_below_min` 或 `app_loss_per_10k >= hard_per_10k`，runner 必须清空本轮 desired orders、无视 `cancel_stale=false` 撤掉已有策略挂单、写入 `stop_triggered=true` 的 summary，并以退出码 `2` 结束，让 systemd 的 `RestartPreventExitStatus=2` 生效。
-- 如果 `spot_freeze_skip_reason=short_hedge_capacity_exhausted`，说明冻结仓位没有合约 SHORT 容量继续抵消这段净空现货偏离；不要指望冻结自动生效，必须先低价 maker BUY 补回 neutral。
+- 如果 `spot_freeze_skip_reason=total_cap_reached` 或 `short_hedge_capacity_exhausted`，runner 必须 fail-closed：清空本轮订单、写入 `spot_freeze_runtime_blocked=true` 和对应 `risk_state`，不能继续裸跑普通 grid 单。
+- `short_hedge_capacity_exhausted` 不再允许自动裸买现货补回 neutral。若短侧冻结容量耗尽，必须先停下来人工确认：要么提高 `spot_freeze_total_cap_notional` 与 `max_short_position_notional`，要么把两者同步缩小到同一个小 canary 容量；不能一边写大 short cap，一边给很小 total cap。
+- 交易赛现货低损恢复要求 `spot_freeze_total_cap_notional >= max_short_position_notional`。如果只想允许 60U 小 canary，应该同时设置 `spot_freeze_total_cap_notional=60` 和 `max_short_position_notional=60`，而不是 `60/240`。
 - 当 `actual_base_qty` 已回到 `neutral_base_qty`，且 APP 万U损耗仍低于 soft/hard 门槛时，runner 应退出 `recovery_reduce_only` 回到 `cruise`/`observe`。如果 `reduce_side=""` 仍卡在 recovery 状态，属于恢复空转，应停下来排查，不能扩大目标。
 - 如果当前 ask 明显低于 break-even，成交速度慢是正确结果；为了速度在低价卖出，会直接锁定 APP 损耗。
 - 冻结仓位没有明确启用并通过小窗口验证前，不允许把旧的 40 万目标直接恢复到生产。
@@ -110,5 +121,6 @@ PYTHONPATH=src python -m grid_optimizer.spot_app_loss_audit --symbol XPLUSDT --s
 `grid_optimizer.run_saved_runner` 会在执行真实 runner 前调用同一审计命令；门禁非 0 时直接退出，不会启动 spot runner。Web 保存现货 runner 配置时也必须保留这一组 `spot_app_loss_prestart_gate_` 字段。systemd unit 必须安装 `RestartPreventExitStatus=2`，确保 gate 拒绝不是 `Restart=always` 的可重试失败；否则会反复审计 Binance，并可能在门禁临界变好时自动启动。
 - 确认当前盘口到 break-even 的 tick 距离；若距离过大，只能接受低速挂 break-even maker SELL，不能为了速度降价卖。
 - 使用小观察额度恢复，不直接使用原 40 万目标。
+- XPL 类似 114 当前状态的第一轮 maker canary 候选只能是自洽小窗口，例如 `per_order_notional=20`、`max_single_cycle_new_orders=1`、`spot_freeze_deviation_notional=60`、`spot_freeze_max_per_cycle_notional=20`、`spot_freeze_total_cap_notional=60`、`max_short_position_notional=60`，并把 `max_cumulative_notional` 只提高约 `1000` 到 `2000` USDT。该配置在 2026-06-25 06:09 CST 的 no-apply 单周期中通过 preflight，并构造 `LIMIT_MAKER BUY@bid` 的 `spot_freeze_maker` 候选单约 `20` USDT，但仍不得在未获用户授权时启动。注意：60/60 只用于验证 maker 不吃单与 APP 不破万一，不保证补满当前约 `63` USDT 的净空偏离；若目标是补回 neutral，`spot_freeze_total_cap_notional` 和 `max_short_position_notional` 需要同步提高到不小于实际偏离名义，例如 80/80 或 100/100。
 - 启动后先观察一个小窗口，确认 APP 万U损耗低于 `1` 或转正，再扩大目标。
 - 若 APP 万U损耗继续高于 `1`，立即停机、撤单，并把控制文件改回 `apply=false`。
