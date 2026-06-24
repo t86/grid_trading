@@ -18,6 +18,7 @@ from .data import (
     delete_spot_order,
     fetch_futures_position_mode,
     fetch_futures_position_risk_v3,
+    fetch_futures_symbol_config,
     fetch_spot_account_info,
     fetch_spot_agg_trades,
     fetch_spot_book_tickers,
@@ -2342,6 +2343,13 @@ def _spot_freeze_default_controls(enabled: bool) -> dict[str, Any]:
     }
 
 
+def _spot_freeze_common_qty_step(symbol: str, symbol_info: dict[str, Any]) -> float:
+    spot_step = max(_safe_float(symbol_info.get("step_size")), 0.0)
+    futures_info = fetch_futures_symbol_config(symbol)
+    futures_step = max(_safe_float(futures_info.get("step_size")), 0.0) if isinstance(futures_info, dict) else 0.0
+    return max(spot_step, futures_step)
+
+
 def _maybe_run_spot_freeze(
     *,
     args: argparse.Namespace,
@@ -2377,6 +2385,11 @@ def _maybe_run_spot_freeze(
     if not bool(gate.get("ok")):
         controls["spot_freeze_alerts"] = [str(gate.get("reason") or "gate_failed")]
         return
+    try:
+        qty_step = _spot_freeze_common_qty_step(symbol, symbol_info)
+    except Exception:
+        controls["spot_freeze_alerts"] = ["futures_symbol_config_failed"]
+        return
 
     neutral_base_qty = _safe_float(controls.get("neutral_base_qty", getattr(args, "neutral_base_qty", 0.0)))
     spot_inventory_qty = _safe_float(controls.get("actual_base_qty", neutral_base_qty))
@@ -2405,7 +2418,7 @@ def _maybe_run_spot_freeze(
             profit_release_enabled=bool(getattr(args, "spot_freeze_profit_release_enabled", False)),
             release_profit_ratio=max(_safe_float(getattr(args, "spot_freeze_release_profit_ratio", 0.05)), 0.0),
         ),
-        qty_step=_safe_float(symbol_info.get("step_size")),
+        qty_step=qty_step,
         tolerance_qty=tolerance_qty,
         now=now.isoformat(),
         place_spot=_make_spot_freeze_spot_market_callback(symbol=symbol, api_key=api_key, api_secret=api_secret),

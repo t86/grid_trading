@@ -192,21 +192,22 @@ class SpotLoopRunnerTests(unittest.TestCase):
                     {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-100"},
                 ],
             ):
-                with patch(
-                    "grid_optimizer.spot_loop_runner.freeze_cycle",
-                    return_value={"ledger": new_ledger(), "actions": [{"type": "freeze"}], "reconcile_ok": True, "alerts": []},
-                ) as mock_cycle:
-                    _maybe_run_spot_freeze(
-                        args=args,
-                        state=state,
-                        controls=controls,
-                        symbol="WLDUSDT",
-                        mid_price=10.0,
-                        symbol_info={"step_size": 0.001},
-                        api_key="key",
-                        api_secret="secret",
-                        now=datetime(2026, 6, 23, tzinfo=timezone.utc),
-                    )
+                with patch("grid_optimizer.spot_loop_runner.fetch_futures_symbol_config", return_value={"step_size": 0.001}):
+                    with patch(
+                        "grid_optimizer.spot_loop_runner.freeze_cycle",
+                        return_value={"ledger": new_ledger(), "actions": [{"type": "freeze"}], "reconcile_ok": True, "alerts": []},
+                    ) as mock_cycle:
+                        _maybe_run_spot_freeze(
+                            args=args,
+                            state=state,
+                            controls=controls,
+                            symbol="WLDUSDT",
+                            mid_price=10.0,
+                            symbol_info={"step_size": 0.001},
+                            api_key="key",
+                            api_secret="secret",
+                            now=datetime(2026, 6, 23, tzinfo=timezone.utc),
+                        )
 
         kwargs = mock_cycle.call_args.kwargs
         self.assertEqual(kwargs["contract_short_qty"], 100.0)
@@ -214,6 +215,59 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertTrue(kwargs["loss_ratio_usable"])
         self.assertEqual(kwargs["config"].deviation_notional, 50.0)
         self.assertEqual(controls["spot_freeze_actions"], [{"type": "freeze"}])
+
+    def test_spot_freeze_uses_contract_qty_step_when_coarser_than_spot(self) -> None:
+        args = self._synthetic_args(
+            [
+                "--spot-freeze-enabled",
+                "--spot-freeze-base-hedge-qty",
+                "0",
+                "--spot-freeze-deviation-notional",
+                "5",
+                "--spot-freeze-min-loss-ratio",
+                "0.0001",
+                "--spot-freeze-max-per-cycle-notional",
+                "25",
+                "--spot-freeze-total-cap-notional",
+                "110",
+            ]
+        )
+        state = {"spot_frozen_ledger": new_ledger()}
+        controls = {
+            "actual_base_qty": 560.8,
+            "neutral_base_qty": 1000.0,
+            "_runtime": {
+                "recovery_mode": "live",
+                "position_lots": [{"lot_id": "S1", "side": "short", "qty": 439.2, "entry_price": 10.0}],
+            },
+        }
+
+        with patch("grid_optimizer.spot_loop_runner.fetch_futures_position_mode", return_value={"dualSidePosition": True}):
+            with patch(
+                "grid_optimizer.spot_loop_runner.fetch_futures_position_risk_v3",
+                return_value=[
+                    {"symbol": "MEGAUSDT", "positionSide": "LONG", "positionAmt": "0"},
+                    {"symbol": "MEGAUSDT", "positionSide": "SHORT", "positionAmt": "0"},
+                ],
+            ):
+                with patch("grid_optimizer.spot_loop_runner.fetch_futures_symbol_config", return_value={"step_size": 1.0}):
+                    with patch(
+                        "grid_optimizer.spot_loop_runner.freeze_cycle",
+                        return_value={"ledger": new_ledger(), "actions": [], "reconcile_ok": True, "alerts": []},
+                    ) as mock_cycle:
+                        _maybe_run_spot_freeze(
+                            args=args,
+                            state=state,
+                            controls=controls,
+                            symbol="MEGAUSDT",
+                            mid_price=10.0,
+                            symbol_info={"step_size": 0.1},
+                            api_key="key",
+                            api_secret="secret",
+                            now=datetime(2026, 6, 23, tzinfo=timezone.utc),
+                        )
+
+        self.assertEqual(mock_cycle.call_args.kwargs["qty_step"], 1.0)
 
     def test_spot_freeze_enabled_accepts_ledger_adjusted_short_position_qty(self) -> None:
         args = self._synthetic_args(
@@ -254,21 +308,22 @@ class SpotLoopRunnerTests(unittest.TestCase):
                     {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-90"},
                 ],
             ):
-                with patch(
-                    "grid_optimizer.spot_loop_runner.freeze_cycle",
-                    return_value={"ledger": ledger, "actions": [], "reconcile_ok": True, "alerts": []},
-                ) as mock_cycle:
-                    _maybe_run_spot_freeze(
-                        args=args,
-                        state=state,
-                        controls=controls,
-                        symbol="WLDUSDT",
-                        mid_price=10.0,
-                        symbol_info={"step_size": 0.001},
-                        api_key="key",
-                        api_secret="secret",
-                        now=datetime(2026, 6, 23, tzinfo=timezone.utc),
-                    )
+                with patch("grid_optimizer.spot_loop_runner.fetch_futures_symbol_config", return_value={"step_size": 0.001}):
+                    with patch(
+                        "grid_optimizer.spot_loop_runner.freeze_cycle",
+                        return_value={"ledger": ledger, "actions": [], "reconcile_ok": True, "alerts": []},
+                    ) as mock_cycle:
+                        _maybe_run_spot_freeze(
+                            args=args,
+                            state=state,
+                            controls=controls,
+                            symbol="WLDUSDT",
+                            mid_price=10.0,
+                            symbol_info={"step_size": 0.001},
+                            api_key="key",
+                            api_secret="secret",
+                            now=datetime(2026, 6, 23, tzinfo=timezone.utc),
+                        )
 
         kwargs = mock_cycle.call_args.kwargs
         self.assertEqual(kwargs["contract_short_qty"], 90.0)
