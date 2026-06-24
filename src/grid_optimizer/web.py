@@ -8615,6 +8615,13 @@ def _spot_freeze_threshold_effectively_disables_config(config: dict[str, Any]) -
     return capacity > 0.0 and threshold >= capacity * 1000.0
 
 
+def _spot_freeze_short_capacity_requirement_config(config: dict[str, Any]) -> float:
+    return max(
+        max(_safe_optional_float(config.get("spot_freeze_deviation_notional")) or 0.0, 0.0),
+        max(_safe_optional_float(config.get("spot_freeze_max_per_cycle_notional")) or 0.0, 0.0),
+    )
+
+
 def _spot_freeze_position_side_qty_config(
     position_risk: list[dict[str, Any]],
     symbol: str,
@@ -8817,6 +8824,19 @@ def _runner_start_safety_preflight(
             and (_safe_optional_float(config.get("max_short_position_notional")) or 0.0) <= 0.0
         ):
             reasons.append("交易赛现货低损恢复必须设置正数 max_short_position_notional 作为短侧冻结容量")
+        if (
+            competition_spot_recovery
+            and _truthy(config.get("spot_freeze_enabled", False))
+            and _truthy(config.get("spot_freeze_maker_execution_enabled", False))
+            and (_safe_optional_float(config.get("max_short_position_notional")) or 0.0) > 0.0
+        ):
+            short_capacity = max(_safe_optional_float(config.get("max_short_position_notional")) or 0.0, 0.0)
+            required_short_capacity = _spot_freeze_short_capacity_requirement_config(config)
+            if required_short_capacity > 0.0 and short_capacity + 1e-12 < required_short_capacity:
+                reasons.append(
+                    "max_short_position_notional 小于 spot_freeze 首次冻结所需短侧容量，"
+                    "短偏离发生时可能补不回 neutral"
+                )
         if (
             strategy_mode == "spot_competition_synthetic_neutral_grid"
             and _truthy(config.get("spot_freeze_enabled", False))
