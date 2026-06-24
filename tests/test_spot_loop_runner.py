@@ -369,7 +369,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertTrue(controls["buy_paused"])
         self.assertIn("spot_app_loss_guard_blocked", controls["pause_reasons"])
 
-    def test_spot_app_loss_guard_uses_app_window_position_when_neutral_dust_is_below_exchange_min(self) -> None:
+    def test_spot_app_loss_guard_does_not_sell_neutral_dust_below_exchange_min(self) -> None:
         controls = {"actual_base_qty": 4802.8, "neutral_base_qty": 4800.0}
         desired_orders = [
             {"side": "BUY", "role": "grid_entry", "price": 0.0880, "qty": 681.0},
@@ -400,12 +400,12 @@ class SpotLoopRunnerTests(unittest.TestCase):
             available_base_free=4802.8,
         )
 
-        self.assertEqual([order["side"] for order in filtered], ["SELL"])
-        self.assertEqual(filtered[0]["role"], "spot_app_loss_reduce")
-        self.assertAlmostEqual(filtered[0]["price"], 0.0884)
+        self.assertEqual(filtered, [])
         self.assertEqual(controls["spot_app_loss_guard"]["state"], "blocked")
         self.assertEqual(controls["spot_app_loss_guard"]["reduce_side"], "SELL")
-        self.assertEqual(controls["spot_app_loss_guard"]["injected_order_count"], 1)
+        self.assertAlmostEqual(controls["spot_app_loss_guard"]["reduce_deviation_qty"], 2.8)
+        self.assertEqual(controls["spot_app_loss_guard"]["capped_order_count"], 0)
+        self.assertEqual(controls["spot_app_loss_guard"]["injected_order_count"], 0)
 
     def test_spot_app_loss_guard_keeps_non_loss_reduce_orders_for_app_window_position(self) -> None:
         controls = {"actual_base_qty": 5483.8, "neutral_base_qty": 4800.0}
@@ -436,10 +436,10 @@ class SpotLoopRunnerTests(unittest.TestCase):
             available_base_free=5483.8,
         )
 
-        self.assertEqual([order["side"] for order in filtered], ["SELL", "SELL"])
+        self.assertEqual([order["side"] for order in filtered], ["SELL"])
         self.assertAlmostEqual(filtered[0]["qty"], 681.0)
-        self.assertAlmostEqual(filtered[1]["qty"], 680.2)
-        self.assertEqual(controls["spot_app_loss_guard"]["capped_order_count"], 2)
+        self.assertEqual(controls["spot_app_loss_guard"]["capped_order_count"], 1)
+        self.assertAlmostEqual(controls["spot_app_loss_guard"]["reduce_deviation_qty"], 683.8)
 
     def test_spot_app_loss_guard_replaces_lossy_reduce_order_with_break_even_sell(self) -> None:
         controls = {"actual_base_qty": 5483.8, "neutral_base_qty": 4800.0}
@@ -475,7 +475,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(controls["spot_app_loss_guard"]["capped_order_count"], 0)
         self.assertEqual(controls["spot_app_loss_guard"]["injected_order_count"], 1)
 
-    def test_spot_app_loss_guard_sells_app_window_position_when_neutral_deviation_is_zero(self) -> None:
+    def test_spot_app_loss_guard_does_not_sell_when_neutral_deviation_is_zero(self) -> None:
         controls = {"actual_base_qty": 4800.0, "neutral_base_qty": 4800.0}
         desired_orders = [
             {"side": "BUY", "role": "grid_entry", "price": 0.0868, "qty": 690.0},
@@ -504,11 +504,10 @@ class SpotLoopRunnerTests(unittest.TestCase):
             available_base_free=4800.0,
         )
 
-        self.assertEqual([order["side"] for order in filtered], ["SELL"])
-        self.assertEqual(filtered[0]["role"], "spot_app_loss_reduce")
-        self.assertAlmostEqual(filtered[0]["price"], 0.0884)
-        self.assertGreater(filtered[0]["qty"], 0)
-        self.assertAlmostEqual(controls["spot_app_loss_guard"]["reduce_deviation_qty"], 4802.8)
+        self.assertEqual(filtered, [])
+        self.assertEqual(controls["spot_app_loss_guard"]["reduce_side"], "")
+        self.assertEqual(controls["spot_app_loss_guard"]["reduce_deviation_qty"], 0.0)
+        self.assertEqual(controls["spot_app_loss_guard"]["injected_order_count"], 0)
 
     def test_spot_app_loss_guard_injects_maker_sell_when_long_deviation_has_no_reduce_order(self) -> None:
         controls = {"actual_base_qty": 140.0, "neutral_base_qty": 100.0}
@@ -539,7 +538,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(filtered[0]["qty"], 10.0)
         self.assertEqual(controls["spot_app_loss_guard"]["injected_order_count"], 1)
 
-    def test_spot_app_loss_guard_sells_when_app_window_is_long_even_below_neutral(self) -> None:
+    def test_spot_app_loss_guard_does_not_sell_when_actual_base_is_below_neutral(self) -> None:
         controls = {"actual_base_qty": 4121.8, "neutral_base_qty": 4800.0}
         desired_orders = [
             {"side": "BUY", "role": "grid_exit", "price": 0.0867, "qty": 691.2},
@@ -568,11 +567,11 @@ class SpotLoopRunnerTests(unittest.TestCase):
             available_base_free=4121.8,
         )
 
-        self.assertEqual([order["side"] for order in filtered], ["SELL"])
+        self.assertEqual([order["side"] for order in filtered], ["BUY"])
         self.assertEqual(filtered[0]["role"], "spot_app_loss_reduce")
-        self.assertAlmostEqual(filtered[0]["price"], 0.0884)
-        self.assertEqual(controls["spot_app_loss_guard"]["reduce_side"], "SELL")
-        self.assertTrue(controls["buy_paused"])
+        self.assertAlmostEqual(filtered[0]["price"], 0.0867)
+        self.assertEqual(controls["spot_app_loss_guard"]["reduce_side"], "BUY")
+        self.assertFalse(controls.get("buy_paused", False))
 
     def test_spot_app_loss_recovery_reduce_only_unwinds_positive_app_window_long(self) -> None:
         controls = {"actual_base_qty": 4121.8, "neutral_base_qty": 4800.0}
@@ -606,15 +605,15 @@ class SpotLoopRunnerTests(unittest.TestCase):
             available_base_free=4121.8,
         )
 
-        self.assertEqual([order["side"] for order in filtered], ["SELL"])
+        self.assertEqual([order["side"] for order in filtered], ["BUY"])
         self.assertEqual(filtered[0]["role"], "spot_app_loss_reduce")
-        self.assertAlmostEqual(filtered[0]["price"], 0.0893)
+        self.assertAlmostEqual(filtered[0]["price"], 0.0891)
         self.assertEqual(controls["spot_app_loss_guard"]["state"], "recovery_reduce_only")
-        self.assertEqual(controls["spot_app_loss_guard"]["reduce_side"], "SELL")
-        self.assertEqual(controls["spot_app_loss_guard"]["capped_order_count"], 0)
-        self.assertEqual(controls["spot_app_loss_guard"]["injected_order_count"], 1)
+        self.assertEqual(controls["spot_app_loss_guard"]["reduce_side"], "BUY")
+        self.assertEqual(controls["spot_app_loss_guard"]["capped_order_count"], 1)
+        self.assertEqual(controls["spot_app_loss_guard"]["injected_order_count"], 0)
         self.assertAlmostEqual(controls["spot_app_loss_guard"]["app_loss_per_10k"], 0.0)
-        self.assertTrue(controls["buy_paused"])
+        self.assertFalse(controls.get("buy_paused", False))
         self.assertIn("spot_app_loss_guard_recovery_reduce_only", controls["pause_reasons"])
 
     def test_spot_app_loss_guard_injects_maker_buy_when_short_deviation_has_no_app_long_exposure(self) -> None:
@@ -3412,9 +3411,9 @@ class SpotLoopRunnerTests(unittest.TestCase):
         guard = summary["spot_app_loss_guard"]
         self.assertEqual(guard["window_source"], "recent_trades")
         self.assertEqual(guard["state"], "blocked")
-        self.assertEqual(guard["reduce_side"], "SELL")
-        self.assertEqual(summary["active_buy_orders"], 0)
-        self.assertEqual(summary["active_sell_orders"], 1)
+        self.assertEqual(guard["reduce_side"], "BUY")
+        self.assertEqual(summary["active_buy_orders"], 1)
+        self.assertEqual(summary["active_sell_orders"], 0)
         self.assertAlmostEqual(guard["latest_price"], 0.0868)
         self.assertGreaterEqual(summary["spot_app_loss_per_10k"], 1.0)
 

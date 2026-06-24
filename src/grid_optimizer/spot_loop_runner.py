@@ -1036,8 +1036,6 @@ def _spot_app_loss_mark_price(*, metrics: dict[str, Any], bid_price: float, ask_
 
 
 def _spot_app_loss_reduce_side(controls: dict[str, Any], position_qty: float, app_position_qty: float | None = None) -> str:
-    if app_position_qty is not None and _safe_float(app_position_qty) > EPSILON:
-        return "SELL"
     neutral_base_qty = max(_safe_float(controls.get("neutral_base_qty")), 0.0)
     if neutral_base_qty > EPSILON or "synthetic_net_qty" in controls:
         deviation_qty = _safe_float(controls.get("actual_base_qty")) - neutral_base_qty
@@ -1046,20 +1044,22 @@ def _spot_app_loss_reduce_side(controls: dict[str, Any], position_qty: float, ap
         if deviation_qty < -EPSILON:
             return "BUY"
         return ""
+    if app_position_qty is not None and _safe_float(app_position_qty) > EPSILON:
+        return "SELL"
     if _safe_float(position_qty) > EPSILON:
         return "SELL"
     return ""
 
 
 def _spot_app_loss_deviation_qty(controls: dict[str, Any], position_qty: float) -> float:
+    neutral_base_qty = max(_safe_float(controls.get("neutral_base_qty")), 0.0)
+    if neutral_base_qty > EPSILON or "synthetic_net_qty" in controls:
+        return abs(_safe_float(controls.get("actual_base_qty")) - neutral_base_qty)
     guard = controls.get("spot_app_loss_guard")
     if isinstance(guard, dict):
         app_position_qty = max(_safe_float(guard.get("position_qty")), 0.0)
         if app_position_qty > EPSILON:
             return app_position_qty
-    neutral_base_qty = max(_safe_float(controls.get("neutral_base_qty")), 0.0)
-    if neutral_base_qty > EPSILON or "synthetic_net_qty" in controls:
-        return abs(_safe_float(controls.get("actual_base_qty")) - neutral_base_qty)
     return max(_safe_float(position_qty), 0.0)
 
 
@@ -1257,7 +1257,9 @@ def _apply_spot_app_loss_guard_to_orders(
         if reason not in pause_reasons:
             pause_reasons.append(reason)
         controls["pause_reasons"] = pause_reasons
-        if any(str(order.get("side", "") or "").upper().strip() == "BUY" for order in desired_orders if order not in kept_orders):
+        desired_buy_count = sum(1 for order in desired_orders if str(order.get("side", "") or "").upper().strip() == "BUY")
+        kept_buy_count = sum(1 for order in kept_orders if str(order.get("side", "") or "").upper().strip() == "BUY")
+        if desired_buy_count > kept_buy_count:
             controls["buy_paused"] = True
     return kept_orders
 
