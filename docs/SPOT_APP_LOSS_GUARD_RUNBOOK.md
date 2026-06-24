@@ -13,6 +13,8 @@ APP 万U损耗 = APP 损耗 / (买入成交额 + 卖出成交额) * 10000
 
 这个口径不包含 BNB 手续费抵扣，也不使用 runner 的库存批次成本。只要窗口内买入多于卖出，剩余持仓会直接按当前价格计值；价格低于窗口盈亏平衡价时，即使全部成交都是 maker，APP 仍会显示损耗。
 
+`grid_optimizer.spot_app_loss_audit` 必须完整分页读取 `myTrades`。如果审计输出 `truncated=true`，该结果只能用于提示风险，不能用于判断 APP 损耗已经达标，也不能作为恢复依据。
+
 ## 114 XPL 停机快照
 
 2026-06-24 22:04 CST，114 的 `XPLUSDT` 已按高损耗风险停机：
@@ -39,6 +41,20 @@ APP 万U损耗 = APP 损耗 / (买入成交额 + 卖出成交额) * 10000
 - APP 万U损耗：`12.542878`
 
 结论：这次 XPL 的高损耗不是 taker 造成的，实际成交全部是 maker；核心问题是旧的合成中性恢复把 APP 窗口做成净多仓，价格低于窗口盈亏平衡价后，APP 直接把未卖出的持仓按当前价格计损。
+
+## 2026-06-24 MEGA 完整审计结论
+
+使用分页审计 `2026-06-17T00:00:00Z` 起的 `MEGAUSDT` APP 窗口后：
+
+- 114：`trade_count=7031`，`maker_count=5744`，总成交额约 `1,016,307.52` USDT，窗口净持仓 `-8162.9` MEGA，APP 万U损耗 `0.0`，`truncated=false`。
+- 150：`trade_count=6842`，`maker_count=5569`，总成交额约 `1,024,389.69` USDT，窗口净持仓 `15148.7` MEGA，APP 损耗约 `245.36` USDT，APP 万U损耗约 `2.395`，窗口 break-even 约 `0.06655678`，当时 ask 约 `0.05037`，安全 maker SELL 距离约 `1617` tick，`truncated=false`。
+
+结论：
+
+- MEGA 的高损耗不是手续费口径问题，而是 APP 窗口净持仓和成交价差问题。
+- `take` 成交显著拉低 maker 占比，两台 maker_ratio 都只有约 `81%`；但 maker-only 子集也可能留下净多或净空，不能把“全 maker”当作低损耗保证。
+- 150 当前不能恢复扩多；只能等价格回到 break-even 附近，或启用 `spot_app_loss_recovery_reduce_only_enabled=true` 后只做 maker SELL 减 APP 窗口暴露。
+- 若安全 maker SELL 离 ask 超过 `2` tick，不应为了速度降价卖出；降价会把 APP 损耗锁死。
 
 ## 冻结仓位边界
 
