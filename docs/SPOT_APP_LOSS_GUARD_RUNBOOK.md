@@ -48,6 +48,7 @@ APP 万U损耗 = APP 损耗 / (买入成交额 + 卖出成交额) * 10000
 
 - APP 损耗 guard 触发且 APP 窗口净多时，只允许 SELL 方向减 APP 窗口暴露。
 - APP 窗口净多时，runner 的 guard 用 bid 估算持仓价值，不用 mid；这样不会因为半个 spread 的乐观估值低估 APP 万U损耗。
+- 如果 `reset_state=true` 或 `known_orders` 丢失，runner 不能把 APP 窗口当作空白窗口。APP guard 必须从 Binance 原始 `myTrades` fallback 重建买卖数量和成交额，再决定是否允许恢复。
 - 减仓 SELL 的价格必须不低于窗口盈亏平衡价，并向上按 tick 取整。例如当前 XPL 窗口 break-even 约 `0.08835`，合法 maker SELL 价至少是 `0.0884`。
 - 减仓数量按 APP 窗口净持仓计算，不按 `actual_base_qty - neutral_base_qty` 单独计算。
 - 如果当前 ask 明显低于 break-even，成交速度慢是正确结果；为了速度在低价卖出，会直接锁定 APP 损耗。

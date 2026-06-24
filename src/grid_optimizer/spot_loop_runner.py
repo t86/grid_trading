@@ -841,6 +841,46 @@ def _runtime_guard_events_from_metrics(metrics: dict[str, Any]) -> list[dict[str
     return events
 
 
+def _spot_app_loss_metrics_with_trade_fallback(*, metrics: dict[str, Any], trades: list[dict[str, Any]]) -> dict[str, Any]:
+    if (
+        _safe_float(metrics.get("buy_notional")) + _safe_float(metrics.get("sell_notional")) > EPSILON
+        or _safe_float(metrics.get("buy_qty")) + _safe_float(metrics.get("sell_qty")) > EPSILON
+        or not isinstance(trades, list)
+    ):
+        return metrics
+    recent: list[dict[str, Any]] = []
+    for trade in trades:
+        if not isinstance(trade, dict):
+            continue
+        qty = max(_safe_float(trade.get("qty")), 0.0)
+        price = max(_safe_float(trade.get("price")), 0.0)
+        notional = max(_safe_float(trade.get("quoteQty")), 0.0)
+        if notional <= EPSILON:
+            notional = qty * price
+        side = "BUY" if _truthy(trade.get("isBuyer")) else "SELL"
+        if qty <= EPSILON or notional <= EPSILON:
+            continue
+        recent.append(
+            {
+                "id": _safe_int(trade.get("id")),
+                "orderId": _safe_int(trade.get("orderId")),
+                "time": _safe_int(trade.get("time")),
+                "side": side,
+                "price": price,
+                "qty": qty,
+                "notional": notional,
+                "maker": bool(trade.get("isMaker")),
+                "role": "app_loss_trade_fallback",
+            }
+        )
+    if not recent:
+        return metrics
+    fallback = dict(metrics)
+    fallback["app_loss_window_aligned"] = False
+    fallback["recent_trades"] = recent[-2000:]
+    return fallback
+
+
 def _build_spot_app_loss_guard(
     *,
     enabled: bool,
@@ -3617,6 +3657,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         )
         applied_trades += refreshed_applied_trades
     metrics = state.get("metrics") if isinstance(state.get("metrics"), dict) else _new_metrics()
+    app_loss_metrics = _spot_app_loss_metrics_with_trade_fallback(metrics=metrics, trades=trades)
     trade_database_status: dict[str, Any] = {"enabled": trade_database_enabled(), "trade_inserted": 0, "income_inserted": 0}
     runtime_guard_config = normalize_runtime_guard_config(vars(args))
     runtime_guard_result = evaluate_runtime_guards(
@@ -3806,11 +3847,11 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         controls["fast_stop_guard"] = fast_stop_guard
     quote_free, base_free = _available_new_funds(account_info, base_asset, quote_asset)
     app_loss_position_qty = _total_base_balance(account_info, base_asset)
-    app_loss_mark_price = _spot_app_loss_mark_price(metrics=metrics, bid_price=bid_price, ask_price=ask_price)
+    app_loss_mark_price = _spot_app_loss_mark_price(metrics=app_loss_metrics, bid_price=bid_price, ask_price=ask_price)
     desired_orders = _apply_spot_app_loss_guard_to_orders(
         desired_orders=desired_orders,
         controls=controls,
-        metrics=metrics,
+        metrics=app_loss_metrics,
         position_qty=app_loss_position_qty,
         latest_price=app_loss_mark_price,
         enabled=bool(getattr(args, "spot_app_loss_guard_enabled", False)),
