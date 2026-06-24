@@ -283,6 +283,28 @@ def _forced_reduce_qty_from_lot_plan(
     return _round_order_qty(lot_qty, step_size)
 
 
+def _cap_synthetic_hard_reduce_qty(
+    *,
+    qty: float,
+    price: float,
+    per_order_notional: float,
+    already_planned_qty: float = 0.0,
+    synthetic_neutral: bool,
+    risk_state: str,
+    step_size: float | None,
+) -> float:
+    capped_qty = max(_safe_float(qty), 0.0)
+    if not synthetic_neutral or str(risk_state or "").strip().lower() != "hard_reduce_only":
+        return capped_qty
+    safe_price = max(_safe_float(price), 0.0)
+    max_notional = max(_safe_float(per_order_notional), 0.0)
+    if safe_price <= EPSILON or max_notional <= EPSILON:
+        return capped_qty
+    planned_notional = max(_safe_float(already_planned_qty), 0.0) * safe_price
+    remaining_notional = max(max_notional - planned_notional, 0.0)
+    return min(capped_qty, _round_order_qty(remaining_notional / safe_price, step_size))
+
+
 def _spot_long_entry_reference_price(
     *,
     anchor_price: float,
@@ -780,6 +802,7 @@ def build_inventory_grid_orders(
     buy_orders: list[dict[str, Any]] = []
     sell_orders: list[dict[str, Any]] = []
     forced_reduce_orders: list[dict[str, Any]] = []
+    planned_qty_counts_for_hard_reduce_cap = recovery_mode == "live" and not bool(runtime.get("synthetic_cost_unknown"))
     synthetic_freeze_candidate: dict[str, Any] = {"should_freeze": False}
     synthetic_frozen_position = synthetic_frozen_position_report(runtime=runtime, mid_price=mid_price) if synthetic_neutral else {}
     synthetic_manual_release_orders = (
@@ -1154,6 +1177,15 @@ def build_inventory_grid_orders(
                         risk_state=risk_state,
                         step_size=step_size,
                     )
+                    forced_qty = _cap_synthetic_hard_reduce_qty(
+                        qty=forced_qty,
+                        price=forced_reduce_order_price,
+                        per_order_notional=per_order_notional,
+                        already_planned_qty=planned_closing_qty if planned_qty_counts_for_hard_reduce_cap else 0.0,
+                        synthetic_neutral=synthetic_neutral,
+                        risk_state=risk_state,
+                        step_size=step_size,
+                    )
                     if _order_meets_mins(
                         qty=forced_qty,
                         price=forced_reduce_order_price,
@@ -1271,6 +1303,15 @@ def build_inventory_grid_orders(
                     forced_qty = _forced_reduce_qty_from_lot_plan(
                         lot_plan=lot_plan,
                         reduce_qty=reduce_qty,
+                        synthetic_neutral=synthetic_neutral,
+                        risk_state=risk_state,
+                        step_size=step_size,
+                    )
+                    forced_qty = _cap_synthetic_hard_reduce_qty(
+                        qty=forced_qty,
+                        price=forced_reduce_order_price,
+                        per_order_notional=per_order_notional,
+                        already_planned_qty=planned_closing_qty if planned_qty_counts_for_hard_reduce_cap else 0.0,
                         synthetic_neutral=synthetic_neutral,
                         risk_state=risk_state,
                         step_size=step_size,

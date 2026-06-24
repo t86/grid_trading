@@ -164,6 +164,48 @@ def test_synthetic_neutral_flat_warmup_places_top_of_book_maker_orders() -> None
     assert [order["price"] for order in plan["bootstrap_orders"] if order["side"] == "SELL"] == [0.0881, 0.0882]
 
 
+def test_synthetic_neutral_hard_reduce_caps_initial_recovery_to_one_order_notional() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "short_active"
+    runtime["risk_state"] = "normal"
+    runtime["grid_anchor_price"] = 0.08805
+    runtime["position_lots"] = [
+        {
+            "lot_id": "synthetic_recovered",
+            "side": "short",
+            "qty": 4800.0,
+            "entry_price": 0.08805,
+            "opened_at_ms": 0,
+            "source_role": "synthetic_recovery",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.0880,
+        ask_price=0.0881,
+        step_price=0.0001,
+        per_order_notional=60.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=180.0,
+        threshold_reduce_target_notional=25.0,
+        max_order_position_notional=180.0,
+        max_position_notional=240.0,
+        max_short_order_position_notional=180.0,
+        max_short_position_notional=240.0,
+        buy_levels=3,
+        sell_levels=3,
+        tick_size=0.0001,
+        step_size=0.1,
+        min_qty=0.1,
+        min_notional=5.0,
+    )
+
+    buy_notional = sum(order["notional"] for order in plan["buy_orders"])
+    assert buy_notional <= 60.0
+
+
 def test_conservative_flat_runtime_does_not_bootstrap() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["recovery_mode"] = "conservative_reduce_only"
