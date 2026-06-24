@@ -967,6 +967,11 @@ def _spot_app_loss_reduce_side(controls: dict[str, Any], position_qty: float, ap
 
 
 def _spot_app_loss_deviation_qty(controls: dict[str, Any], position_qty: float) -> float:
+    guard = controls.get("spot_app_loss_guard")
+    if isinstance(guard, dict):
+        app_position_qty = max(_safe_float(guard.get("position_qty")), 0.0)
+        if app_position_qty > EPSILON:
+            return app_position_qty
     neutral_base_qty = max(_safe_float(controls.get("neutral_base_qty")), 0.0)
     if neutral_base_qty > EPSILON or "synthetic_net_qty" in controls:
         return abs(_safe_float(controls.get("actual_base_qty")) - neutral_base_qty)
@@ -1054,10 +1059,9 @@ def _build_spot_app_loss_maker_reduce_order(
     if normalized_side not in {"BUY", "SELL"} or price <= EPSILON or notional_cap <= EPSILON:
         return None
 
-    neutral_base_qty = max(_safe_float(controls.get("neutral_base_qty")), 0.0)
     if "neutral_base_qty" not in controls and "synthetic_net_qty" not in controls:
         return None
-    deviation_qty = abs(_safe_float(controls.get("actual_base_qty")) - neutral_base_qty)
+    deviation_qty = _spot_app_loss_deviation_qty(controls, 0.0)
     if normalized_side == "BUY":
         if available_quote_free is not None:
             notional_cap = min(notional_cap, max(_safe_float(available_quote_free), 0.0))
