@@ -69,6 +69,7 @@ from .console_overview import _fetch_remote_json
 from .console_registry import load_console_registry
 from .master_sprint import MASTER_SPRINT_PAGE, build_master_sprint_snapshot
 from .spot_app_loss_audit import main as spot_app_loss_audit_main
+from .spot_freeze_manager import expected_short_position_now, new_ledger
 from .data import (
     cache_file_path,
     delete_futures_order,
@@ -79,6 +80,7 @@ from .data import (
     fetch_futures_order,
     fetch_futures_open_orders,
     fetch_futures_position_mode,
+    fetch_futures_position_risk_v3,
     fetch_spot_account_info,
     fetch_spot_order,
     fetch_spot_latest_price,
@@ -8611,6 +8613,71 @@ def _spot_freeze_threshold_effectively_disables_config(config: dict[str, Any]) -
     return capacity > 0.0 and threshold >= capacity * 1000.0
 
 
+def _spot_freeze_position_side_qty_config(
+    position_risk: list[dict[str, Any]],
+    symbol: str,
+    position_side: str,
+) -> float:
+    wanted_symbol = str(symbol or "").upper().strip()
+    wanted_side = str(position_side or "").upper().strip()
+    for row in position_risk:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("symbol", "") or "").upper().strip() != wanted_symbol:
+            continue
+        if str(row.get("positionSide", row.get("position_side", "")) or "").upper().strip() != wanted_side:
+            continue
+        return abs(_safe_optional_float(row.get("positionAmt", row.get("position_amt"))) or 0.0)
+    return 0.0
+
+
+def _spot_freeze_expected_short_qty_config(config: dict[str, Any]) -> float:
+    base_hedge_qty = max(_safe_optional_float(config.get("spot_freeze_base_hedge_qty")) or 0.0, 0.0)
+    state_path_text = str(config.get("state_path", "") or "").strip()
+    ledger = new_ledger()
+    if state_path_text:
+        state = _read_json_dict(Path(state_path_text)) or {}
+        candidate = state.get("spot_frozen_ledger") if isinstance(state, dict) else None
+        if isinstance(candidate, dict):
+            ledger = candidate
+    return max(expected_short_position_now(base_hedge_qty, ledger), 0.0)
+
+
+def _spot_freeze_live_hedge_preflight_reason(config: dict[str, Any], *, symbol: str) -> str | None:
+    base_hedge_qty = max(_safe_optional_float(config.get("spot_freeze_base_hedge_qty")) or 0.0, 0.0)
+    if base_hedge_qty <= 0.0:
+        return "交易赛现货低损恢复必须设置 spot_freeze_base_hedge_qty > 0"
+    if _truthy(config.get("spot_freeze_dry_run", False)):
+        return "交易赛现货低损恢复不能使用 spot_freeze_dry_run=true"
+
+    credentials = load_binance_api_credentials()
+    if not credentials:
+        return "spot_freeze 启动前底仓校验需要 Binance API credentials"
+    api_key, api_secret = credentials
+
+    try:
+        position_mode = fetch_futures_position_mode(api_key, api_secret)
+        position_risk = fetch_futures_position_risk_v3(api_key, api_secret, symbol=symbol)
+    except Exception as exc:
+        return f"spot_freeze 启动前底仓校验失败：{exc}"
+
+    if not isinstance(position_mode, dict) or not _truthy(position_mode.get("dualSidePosition")):
+        return "spot_freeze 启动前底仓校验失败：合约账户不是 hedge mode"
+    risk_rows = position_risk if isinstance(position_risk, list) else []
+    tolerance_qty = max(_safe_optional_float(config.get("spot_freeze_tolerance_qty")) or 0.0, 0.0)
+    long_qty = _spot_freeze_position_side_qty_config(risk_rows, symbol, "LONG")
+    if long_qty > tolerance_qty + 1e-12:
+        return f"spot_freeze 启动前底仓校验失败：合约 LONG 仓位 {long_qty:g} 未归零"
+    short_qty = _spot_freeze_position_side_qty_config(risk_rows, symbol, "SHORT")
+    expected_short_qty = _spot_freeze_expected_short_qty_config(config)
+    if abs(short_qty - expected_short_qty) > tolerance_qty + 1e-12:
+        return (
+            "spot_freeze 启动前底仓校验失败："
+            f"合约 SHORT 仓位 {short_qty:g} 与应有底仓 {expected_short_qty:g} 不匹配"
+        )
+    return None
+
+
 def _runner_start_safety_preflight(
     config: dict[str, Any],
     *,
@@ -8712,6 +8779,15 @@ def _runner_start_safety_preflight(
             and _spot_freeze_threshold_effectively_disables_config(config)
         ):
             reasons.append("spot_freeze_deviation_notional 过大，当前冻结仓位配置实际不会触发")
+        if (
+            competition_spot_recovery
+            and not reasons
+            and _truthy(config.get("spot_freeze_enabled", False))
+            and _truthy(config.get("spot_freeze_maker_execution_enabled", False))
+        ):
+            live_hedge_reason = _spot_freeze_live_hedge_preflight_reason(config, symbol=symbol)
+            if live_hedge_reason:
+                reasons.append(live_hedge_reason)
 
     if reasons:
         raise ValueError(

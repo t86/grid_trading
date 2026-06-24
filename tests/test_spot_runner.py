@@ -664,6 +664,138 @@ class SpotRunnerTests(unittest.TestCase):
 
         self.assertIn("spot_freeze_maker_execution_enabled", str(raised.exception))
 
+    def test_start_spot_runner_process_requires_live_spot_freeze_base_hedge(
+        self,
+    ) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "XPLUSDT",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "spot_app_loss_guard_enabled": True,
+                "spot_app_loss_recovery_reduce_only_enabled": True,
+                "spot_app_loss_prestart_gate_enabled": True,
+                "spot_freeze_enabled": True,
+                "spot_freeze_maker_execution_enabled": True,
+                "spot_freeze_deviation_notional": 50.0,
+                "spot_freeze_total_cap_notional": 900.0,
+                "spot_freeze_max_per_cycle_notional": 180.0,
+                "per_order_notional": 60.0,
+            }
+        )
+
+        with self.assertRaises(ValueError) as raised:
+            _start_spot_runner_process(config)
+
+        self.assertIn("spot_freeze_base_hedge_qty", str(raised.exception))
+
+    def test_start_spot_runner_process_rejects_missing_live_spot_freeze_short_hedge(
+        self,
+    ) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "XPLUSDT",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "spot_app_loss_guard_enabled": True,
+                "spot_app_loss_recovery_reduce_only_enabled": True,
+                "spot_app_loss_prestart_gate_enabled": True,
+                "spot_freeze_enabled": True,
+                "spot_freeze_maker_execution_enabled": True,
+                "spot_freeze_base_hedge_qty": 4800.0,
+                "spot_freeze_tolerance_qty": 0.2,
+                "spot_freeze_deviation_notional": 50.0,
+                "spot_freeze_total_cap_notional": 900.0,
+                "spot_freeze_max_per_cycle_notional": 180.0,
+                "per_order_notional": 60.0,
+            }
+        )
+
+        with patch("grid_optimizer.web.load_binance_api_credentials", return_value=("key", "secret")), patch(
+            "grid_optimizer.web.fetch_futures_position_mode", return_value={"dualSidePosition": True}
+        ), patch("grid_optimizer.web.fetch_futures_position_risk_v3", return_value=[]):
+            with self.assertRaises(ValueError) as raised:
+                _start_spot_runner_process(config)
+
+        self.assertIn("合约 SHORT 仓位 0 与应有底仓 4800 不匹配", str(raised.exception))
+
+    @patch("grid_optimizer.web.time.sleep")
+    @patch("grid_optimizer.web.subprocess.Popen")
+    @patch("grid_optimizer.web._build_spot_runner_command")
+    @patch("grid_optimizer.web._save_spot_runner_control_config")
+    @patch("grid_optimizer.web._cancel_spot_strategy_orders")
+    @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
+    @patch("grid_optimizer.web.spot_app_loss_audit_main", return_value=2)
+    def test_start_spot_runner_process_allows_matching_live_spot_freeze_hedge_until_app_gate(
+        self,
+        mock_app_loss_audit_main,
+        mock_read_runner,
+        mock_cancel_orders,
+        mock_save_config,
+        mock_build_command,
+        mock_popen,
+        _mock_sleep,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            log_path = tmp_path / "spot_runner.log"
+            pid_path = tmp_path / "spot_runner.pid"
+            state_path = tmp_path / "spot_state.json"
+            state_path.write_text(
+                json.dumps({"spot_frozen_ledger": {"long_lots": [], "short_lots": []}}),
+                encoding="utf-8",
+            )
+
+            config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+            config.update(
+                {
+                    "symbol": "XPLUSDT",
+                    "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                    "spot_app_loss_guard_enabled": True,
+                    "spot_app_loss_recovery_reduce_only_enabled": True,
+                    "spot_app_loss_prestart_gate_enabled": True,
+                    "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
+                    "spot_freeze_enabled": True,
+                    "spot_freeze_maker_execution_enabled": True,
+                    "spot_freeze_base_hedge_qty": 4800.0,
+                    "spot_freeze_tolerance_qty": 0.2,
+                    "spot_freeze_deviation_notional": 50.0,
+                    "spot_freeze_total_cap_notional": 900.0,
+                    "spot_freeze_max_per_cycle_notional": 180.0,
+                    "per_order_notional": 60.0,
+                    "reset_state": False,
+                    "state_path": str(state_path),
+                    "summary_jsonl": str(tmp_path / "spot_events.jsonl"),
+                }
+            )
+            runner = {"configured": False, "pid": None, "is_running": False, "args": None, "config": {}}
+            mock_read_runner.return_value = runner
+            mock_build_command.return_value = ["python3", "-m", "grid_optimizer.spot_loop_runner"]
+            mock_popen.return_value = MagicMock(pid=4321)
+
+            with patch("grid_optimizer.web.load_binance_api_credentials", return_value=("key", "secret")), patch(
+                "grid_optimizer.web.fetch_futures_position_mode", return_value={"dualSidePosition": True}
+            ), patch(
+                "grid_optimizer.web.fetch_futures_position_risk_v3",
+                return_value=[
+                    {"symbol": "XPLUSDT", "positionSide": "SHORT", "positionAmt": "-4800"},
+                    {"symbol": "XPLUSDT", "positionSide": "LONG", "positionAmt": "0"},
+                ],
+            ), patch("grid_optimizer.web._spot_runner_log_path", return_value=log_path), patch(
+                "grid_optimizer.web._spot_runner_pid_path", return_value=pid_path
+            ):
+                result = _start_spot_runner_process(config)
+
+        self.assertFalse(result["started"])
+        self.assertEqual(result["reason"], "spot_app_loss_prestart_gate_rejected")
+        self.assertEqual(result["gate_code"], 2)
+        self.assertEqual(result["runner"], runner)
+        mock_app_loss_audit_main.assert_called_once()
+        mock_cancel_orders.assert_not_called()
+        mock_save_config.assert_not_called()
+        mock_build_command.assert_not_called()
+        mock_popen.assert_not_called()
+
     def test_build_spot_runner_command_includes_competition_inventory_grid_arguments(self) -> None:
         config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
         config.update(

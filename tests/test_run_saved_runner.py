@@ -232,6 +232,69 @@ class RunSavedRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.run_saved_runner._should_use_spot_runner", return_value=True)
     @patch("grid_optimizer.run_saved_runner._build_spot_runner_command")
     @patch("grid_optimizer.run_saved_runner._load_spot_runner_control_config")
+    @patch("grid_optimizer.run_saved_runner.spot_app_loss_audit_main", return_value=2)
+    def test_main_allows_matching_live_freeze_hedge_until_app_loss_gate(
+        self,
+        mock_app_loss_audit_main,
+        mock_load_spot_runner_control_config,
+        mock_build_spot_runner_command,
+        _mock_should_use_spot_runner,
+        mock_execvpe,
+        _mock_write_pid,
+        _mock_atexit_register,
+        _mock_getcwd,
+        _mock_chdir,
+    ) -> None:
+        mock_load_spot_runner_control_config.return_value = {
+            "symbol": "XPLUSDT",
+            "market_type": "spot",
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "spot_app_loss_guard_enabled": True,
+            "spot_app_loss_recovery_reduce_only_enabled": True,
+            "spot_app_loss_prestart_gate_enabled": True,
+            "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
+            "spot_app_loss_prestart_gate_max_loss_per_10k": 1.0,
+            "spot_app_loss_prestart_gate_max_safe_sell_gap_ticks": 2.0,
+            "spot_app_loss_prestart_gate_min_maker_ratio": 0.99,
+            "spot_app_loss_prestart_gate_min_gross_notional": 5000.0,
+            "spot_freeze_enabled": True,
+            "spot_freeze_maker_execution_enabled": True,
+            "spot_freeze_base_hedge_qty": 4800.0,
+            "spot_freeze_tolerance_qty": 0.2,
+            "spot_freeze_deviation_notional": 50.0,
+            "spot_freeze_total_cap_notional": 900.0,
+            "spot_freeze_max_per_cycle_notional": 180.0,
+            "per_order_notional": 60.0,
+            "summary_jsonl": "",
+        }
+
+        with patch("grid_optimizer.web.load_binance_api_credentials", return_value=("key", "secret")), patch(
+            "grid_optimizer.web.fetch_futures_position_mode", return_value={"dualSidePosition": True}
+        ), patch(
+            "grid_optimizer.web.fetch_futures_position_risk_v3",
+            return_value=[
+                {"symbol": "XPLUSDT", "positionSide": "SHORT", "positionAmt": "-4800"},
+                {"symbol": "XPLUSDT", "positionSide": "LONG", "positionAmt": "0"},
+            ],
+        ), patch.dict("os.environ", {}, clear=True), patch.object(
+            sys, "argv", ["run_saved_runner.py", "--symbol", "xplusdt"]
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                run_saved_runner.main()
+
+        self.assertEqual(raised.exception.code, 2)
+        mock_app_loss_audit_main.assert_called_once()
+        mock_build_spot_runner_command.assert_not_called()
+        mock_execvpe.assert_not_called()
+
+    @patch("grid_optimizer.run_saved_runner.os.chdir")
+    @patch("grid_optimizer.run_saved_runner.os.getcwd", return_value="/repo")
+    @patch("grid_optimizer.run_saved_runner.atexit.register")
+    @patch("grid_optimizer.run_saved_runner._write_pid")
+    @patch("grid_optimizer.run_saved_runner.os.execvpe")
+    @patch("grid_optimizer.run_saved_runner._should_use_spot_runner", return_value=True)
+    @patch("grid_optimizer.run_saved_runner._build_spot_runner_command")
+    @patch("grid_optimizer.run_saved_runner._load_spot_runner_control_config")
     @patch("grid_optimizer.run_saved_runner.spot_app_loss_audit_main", return_value=0)
     def test_main_blocks_spot_runner_when_freeze_preflight_rejects_app_loss_recovery(
         self,
