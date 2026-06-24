@@ -1475,7 +1475,12 @@ def _apply_spot_freeze_runtime_hedge_block(
     if not bool(controls.get("spot_freeze_enabled")):
         return desired_orders
     skip_reason = str(controls.get("spot_freeze_skip_reason", "") or "").strip()
-    blocking_reasons = {"hedge_gate_failed", "total_cap_reached", "short_hedge_capacity_exhausted"}
+    blocking_reasons = {
+        "hedge_gate_failed",
+        "pending_contract_unrepaired",
+        "total_cap_reached",
+        "short_hedge_capacity_exhausted",
+    }
     if skip_reason not in blocking_reasons:
         return desired_orders
 
@@ -3347,7 +3352,11 @@ def _maybe_run_spot_freeze(
         controls["spot_freeze_frozen_long_qty"] = _safe_float(ledger_result.get("frozen_long_qty")) if isinstance(ledger_result, dict) else 0.0
         controls["spot_freeze_frozen_short_qty"] = _safe_float(ledger_result.get("frozen_short_qty")) if isinstance(ledger_result, dict) else 0.0
         controls["spot_freeze_pending_contract_actions"] = list(ledger_result.get("pending_contract_actions") or []) if isinstance(ledger_result, dict) else []
-        controls["spot_freeze_skip_reason"] = "pending_contract_repair"
+        controls["spot_freeze_skip_reason"] = (
+            "pending_contract_unrepaired"
+            if controls["spot_freeze_pending_contract_actions"]
+            else "pending_contract_repair"
+        )
         return
 
     runtime = controls.get("_runtime") if isinstance(controls.get("_runtime"), dict) else {}

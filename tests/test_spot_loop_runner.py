@@ -1857,6 +1857,73 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(controls["spot_freeze_actions"][0]["type"], "pending_repaired")
         self.assertEqual(controls["spot_freeze_pending_contract_actions"], [])
 
+    def test_spot_freeze_pending_contract_dry_run_fails_closed(self) -> None:
+        args = self._synthetic_args(
+            [
+                "--apply",
+                "--spot-freeze-enabled",
+                "--spot-freeze-dry-run",
+                "--spot-freeze-maker-execution-enabled",
+                "--spot-freeze-base-hedge-qty",
+                "100",
+                "--spot-freeze-deviation-notional",
+                "50",
+                "--spot-freeze-max-per-cycle-notional",
+                "100",
+                "--spot-freeze-total-cap-notional",
+                "500",
+            ]
+        )
+        ledger = new_ledger()
+        ledger["long_lots"] = [
+            {"lot_id": "spot_freeze_maker_1", "qty": 10.0, "cost_price": 10.0, "hedge_pending": True}
+        ]
+        ledger["pending_contract_actions"] = [
+            {"side": "BUY", "position_side": "SHORT", "qty": 10.0, "reason": "freeze_long_hedge", "lot_id": "spot_freeze_maker_1"}
+        ]
+        state = {"spot_frozen_ledger": ledger}
+        controls = {"actual_base_qty": 100.0, "neutral_base_qty": 100.0, "_runtime": {"recovery_mode": "live"}}
+
+        with patch("grid_optimizer.spot_loop_runner.fetch_futures_position_mode", return_value={"dualSidePosition": True}):
+            with patch(
+                "grid_optimizer.spot_loop_runner.fetch_futures_position_risk_v3",
+                return_value=[
+                    {"symbol": "WLDUSDT", "positionSide": "LONG", "positionAmt": "0"},
+                    {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-100"},
+                ],
+            ):
+                with patch("grid_optimizer.spot_loop_runner.fetch_futures_symbol_config", return_value={"step_size": 0.001}):
+                    _maybe_run_spot_freeze(
+                        args=args,
+                        state=state,
+                        controls=controls,
+                        symbol="WLDUSDT",
+                        bid_price=9.99,
+                        ask_price=10.01,
+                        mid_price=10.0,
+                        symbol_info={"tick_size": 0.01, "step_size": 0.001, "min_qty": 0.001, "min_notional": 5.0},
+                        api_key="key",
+                        api_secret="secret",
+                        now=datetime(2026, 6, 23, tzinfo=timezone.utc),
+                    )
+
+        desired_orders = [
+            {"side": "BUY", "price": 9.99, "qty": 1.0},
+            {"side": "SELL", "price": 10.01, "qty": 1.0},
+        ]
+        filtered = _apply_spot_freeze_runtime_hedge_block(
+            strategy_mode="spot_competition_synthetic_neutral_grid",
+            desired_orders=desired_orders,
+            controls=controls,
+        )
+
+        self.assertEqual(controls["spot_freeze_skip_reason"], "pending_contract_unrepaired")
+        self.assertEqual(controls["spot_freeze_actions"][0]["type"], "pending_repair_dry_run")
+        self.assertEqual(len(controls["spot_freeze_pending_contract_actions"]), 1)
+        self.assertEqual(filtered, [])
+        self.assertTrue(controls["spot_freeze_runtime_blocked"])
+        self.assertEqual(controls["risk_state"], "spot_freeze_pending_contract_unrepaired")
+
     def test_spot_freeze_uses_contract_qty_step_when_coarser_than_spot(self) -> None:
         args = self._synthetic_args(
             [
