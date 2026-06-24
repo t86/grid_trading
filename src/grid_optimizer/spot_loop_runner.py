@@ -894,13 +894,25 @@ def _build_spot_app_loss_guard(
     raw_loss = buy_notional - sell_notional - position_value
     app_loss = max(raw_loss, 0.0)
     app_loss_per_10k = app_loss / gross_notional * 10000.0 if gross_notional > EPSILON else 0.0
-    active = bool(enabled) and bool(window_aligned) and gross_notional + EPSILON >= max(_safe_float(min_notional), 0.0)
+    safe_min_notional = max(_safe_float(min_notional), 0.0)
     hard = max(_safe_float(hard_per_10k), 0.0)
     soft = max(_safe_float(soft_per_10k), 0.0)
+    volume_active = gross_notional + EPSILON >= safe_min_notional
+    preactive_loss_cap = hard * safe_min_notional / 10000.0 if hard > EPSILON and safe_min_notional > EPSILON else 0.0
+    preactive_loss_cap_hit = (
+        bool(enabled)
+        and bool(window_aligned)
+        and not volume_active
+        and preactive_loss_cap > EPSILON
+        and app_loss + EPSILON >= preactive_loss_cap
+    )
+    active = bool(enabled) and bool(window_aligned) and (volume_active or preactive_loss_cap_hit)
     if not enabled:
         state = "disabled"
     elif not window_aligned:
         state = "insufficient_window"
+    elif preactive_loss_cap_hit:
+        state = "blocked"
     elif not active:
         state = "warming_up"
     elif hard > EPSILON and app_loss_per_10k + EPSILON >= hard:
@@ -925,9 +937,11 @@ def _build_spot_app_loss_guard(
         "raw_app_loss": raw_loss,
         "app_loss": app_loss,
         "app_loss_per_10k": app_loss_per_10k,
-        "min_notional": max(_safe_float(min_notional), 0.0),
+        "min_notional": safe_min_notional,
         "soft_per_10k": soft,
         "hard_per_10k": hard,
+        "preactive_loss_cap": preactive_loss_cap,
+        "preactive_loss_cap_hit": preactive_loss_cap_hit,
         "active": active,
         "state": state,
         "action": "observe",
@@ -948,6 +962,59 @@ def _spot_app_loss_reduce_side(controls: dict[str, Any], position_qty: float) ->
     if _safe_float(position_qty) > EPSILON:
         return "SELL"
     return ""
+
+
+def _spot_app_loss_deviation_qty(controls: dict[str, Any], position_qty: float) -> float:
+    neutral_base_qty = max(_safe_float(controls.get("neutral_base_qty")), 0.0)
+    if neutral_base_qty > EPSILON or "synthetic_net_qty" in controls:
+        return abs(_safe_float(controls.get("actual_base_qty")) - neutral_base_qty)
+    return max(_safe_float(position_qty), 0.0)
+
+
+def _cap_spot_app_loss_reduce_orders(
+    *,
+    orders: list[dict[str, Any]],
+    controls: dict[str, Any],
+    reduce_side: str,
+    position_qty: float,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    available_quote_free: float | None,
+    available_base_free: float | None,
+) -> list[dict[str, Any]]:
+    normalized_side = str(reduce_side or "").upper().strip()
+    if normalized_side not in {"BUY", "SELL"}:
+        return []
+    remaining_qty = _spot_app_loss_deviation_qty(controls, position_qty)
+    if normalized_side == "SELL" and available_base_free is not None:
+        remaining_qty = min(remaining_qty, max(_safe_float(available_base_free), 0.0))
+    remaining_quote = None
+    if normalized_side == "BUY" and available_quote_free is not None:
+        remaining_quote = max(_safe_float(available_quote_free), 0.0)
+    capped_orders: list[dict[str, Any]] = []
+    for order in orders:
+        if str(order.get("side", "") or "").upper().strip() != normalized_side:
+            continue
+        if remaining_qty <= EPSILON:
+            break
+        price = max(_safe_float(order.get("price")), 0.0)
+        if price <= EPSILON:
+            continue
+        raw_qty = min(max(_safe_float(order.get("qty")), 0.0), remaining_qty)
+        if remaining_quote is not None:
+            raw_qty = min(raw_qty, remaining_quote / price if price > EPSILON else 0.0)
+        qty = _round_order_qty(raw_qty, step_size)
+        if not _spot_order_meets_exchange_mins(qty=qty, price=price, min_qty=min_qty, min_notional=min_notional):
+            break
+        capped = dict(order)
+        capped["qty"] = qty
+        capped["notional"] = qty * price
+        capped_orders.append(capped)
+        remaining_qty = max(remaining_qty - qty, 0.0)
+        if remaining_quote is not None:
+            remaining_quote = max(remaining_quote - qty * price, 0.0)
+    return capped_orders
 
 
 def _build_spot_app_loss_maker_reduce_order(
@@ -1024,16 +1091,24 @@ def _apply_spot_app_loss_guard_to_orders(
         return desired_orders
 
     reduce_side = _spot_app_loss_reduce_side(controls, position_qty)
-    kept_orders = [
-        order
-        for order in desired_orders
-        if reduce_side and str(order.get("side", "") or "").upper().strip() == reduce_side
-    ]
+    kept_orders = _cap_spot_app_loss_reduce_orders(
+        orders=desired_orders,
+        controls=controls,
+        reduce_side=reduce_side,
+        position_qty=position_qty,
+        step_size=step_size,
+        min_qty=min_qty,
+        min_notional=exchange_min_notional,
+        available_quote_free=available_quote_free,
+        available_base_free=available_base_free,
+    )
     dropped_count = len(desired_orders) - len(kept_orders)
     guard["action"] = "reduce_only"
     guard["reduce_side"] = reduce_side
     guard["dropped_order_count"] = dropped_count
     guard["injected_order_count"] = 0
+    guard["capped_order_count"] = len(kept_orders)
+    guard["reduce_deviation_qty"] = _spot_app_loss_deviation_qty(controls, position_qty) if reduce_side else 0.0
     if not kept_orders and reduce_side:
         reduce_order = _build_spot_app_loss_maker_reduce_order(
             controls=controls,
