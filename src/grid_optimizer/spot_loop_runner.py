@@ -1091,8 +1091,11 @@ def _cap_spot_app_loss_reduce_orders(
         return []
     remaining_qty = _spot_app_loss_deviation_qty(controls, position_qty)
     min_sell_price = 0.0
+    max_buy_price = 0.0
     if normalized_side == "SELL":
         min_sell_price = max(_spot_app_loss_break_even_price(controls), _safe_float(maker_reference_price))
+    elif normalized_side == "BUY":
+        max_buy_price = _safe_float(maker_reference_price)
     if normalized_side == "SELL" and available_base_free is not None:
         remaining_qty = min(remaining_qty, max(_safe_float(available_base_free), 0.0))
     remaining_quote = None
@@ -1108,6 +1111,8 @@ def _cap_spot_app_loss_reduce_orders(
         if price <= EPSILON:
             continue
         if normalized_side == "SELL" and min_sell_price > EPSILON and price + EPSILON < min_sell_price:
+            continue
+        if normalized_side == "BUY" and max_buy_price > EPSILON and price > max_buy_price + EPSILON:
             continue
         raw_qty = min(max(_safe_float(order.get("qty")), 0.0), remaining_qty)
         if remaining_quote is not None:
@@ -1188,6 +1193,8 @@ def _apply_spot_app_loss_guard_to_orders(
     hard_per_10k: float,
     maker_reduce_notional: float = 0.0,
     maker_reference_price: float | None = None,
+    maker_buy_reference_price: float | None = None,
+    maker_sell_reference_price: float | None = None,
     tick_size: float | None = None,
     step_size: float | None = None,
     min_qty: float | None = None,
@@ -1210,12 +1217,16 @@ def _apply_spot_app_loss_guard_to_orders(
         return desired_orders
 
     reduce_side = _spot_app_loss_reduce_side(controls, position_qty, app_position_qty=guard.get("position_qty"))
+    if reduce_side == "BUY":
+        reduce_reference_price = maker_buy_reference_price if maker_buy_reference_price is not None else maker_reference_price
+    else:
+        reduce_reference_price = maker_sell_reference_price if maker_sell_reference_price is not None else maker_reference_price
     kept_orders = _cap_spot_app_loss_reduce_orders(
         orders=desired_orders,
         controls=controls,
         reduce_side=reduce_side,
         position_qty=position_qty,
-        maker_reference_price=maker_reference_price,
+        maker_reference_price=reduce_reference_price,
         step_size=step_size,
         min_qty=min_qty,
         min_notional=exchange_min_notional,
@@ -1233,7 +1244,7 @@ def _apply_spot_app_loss_guard_to_orders(
         reduce_order = _build_spot_app_loss_maker_reduce_order(
             controls=controls,
             latest_price=latest_price,
-            maker_reference_price=maker_reference_price,
+            maker_reference_price=reduce_reference_price,
             reduce_side=reduce_side,
             maker_reduce_notional=maker_reduce_notional,
             tick_size=tick_size,
@@ -4234,7 +4245,8 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         soft_per_10k=float(getattr(args, "spot_app_loss_per_10k_soft", 0.0)),
         hard_per_10k=float(getattr(args, "spot_app_loss_per_10k_hard", 0.0)),
         maker_reduce_notional=float(getattr(args, "per_order_notional", 0.0)),
-        maker_reference_price=ask_price,
+        maker_buy_reference_price=bid_price,
+        maker_sell_reference_price=ask_price,
         tick_size=symbol_info.get("tick_size"),
         step_size=symbol_info.get("step_size"),
         min_qty=symbol_info.get("min_qty"),
