@@ -28,6 +28,7 @@ from grid_optimizer.spot_loop_runner import (
     _refresh_spot_trades_after_account_snapshot,
     _sync_synthetic_neutral_trades,
     _sync_volume_shift_trades,
+    _runtime_guard_events_from_metrics,
 )
 from grid_optimizer.spot_freeze_manager import new_ledger
 
@@ -68,6 +69,24 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertFalse(args.spot_freeze_enabled)
         self.assertEqual(args.spot_freeze_base_hedge_qty, 0.0)
         self.assertEqual(args.spot_freeze_release_profit_ratio, 0.05)
+
+    def test_runtime_guard_events_use_spot_realized_pnl_as_net_pnl(self) -> None:
+        events = _runtime_guard_events_from_metrics(
+            {
+                "recent_trades": [
+                    {
+                        "time": 1779570000000,
+                        "realized_pnl": -0.12,
+                        "commission_quote": 0.12,
+                        "notional": 200.0,
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["net_pnl"], -0.12)
+        self.assertEqual(events[0]["gross_notional"], 200.0)
 
     def test_spot_freeze_gate_rejects_non_hedge_mode(self) -> None:
         gate = _check_spot_freeze_hedge_gate(

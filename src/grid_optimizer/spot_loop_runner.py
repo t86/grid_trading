@@ -822,8 +822,10 @@ def _runtime_guard_events_from_metrics(metrics: dict[str, Any]) -> list[dict[str
         events.append(
             {
                 "ts": datetime.fromtimestamp(trade_time_ms / 1000.0, tz=timezone.utc).isoformat(),
+                "net_pnl": realized_pnl,
                 "realized_pnl": realized_pnl,
                 "commission_quote": commission_quote,
+                "gross_notional": _safe_float(row.get("notional")),
                 "recycle_loss_abs": recycle_loss_abs,
             }
         )
