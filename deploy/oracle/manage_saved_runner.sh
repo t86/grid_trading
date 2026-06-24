@@ -64,7 +64,7 @@ load_exchange_env() {
   fi
   if [ -z "${BINANCE_API_KEY:-}" ] || [ -z "${BINANCE_API_SECRET:-}" ]; then
     echo "BINANCE_API_KEY / BINANCE_API_SECRET are missing. Set them in env or $GRID_API_ENV_FILE" >&2
-    exit 1
+    return 1
   fi
 }
 
@@ -118,6 +118,32 @@ print_systemd_status() {
   fi
 }
 
+cancel_spot_strategy_orders_if_configured() {
+  local control_path
+  control_path="$APP_DIR/output/${SYMBOL_SLUG}_spot_loop_runner_control.json"
+  if [ ! -f "$control_path" ]; then
+    return 0
+  fi
+  if ! load_exchange_env; then
+    echo "warning: skipped spot strategy order cleanup because Binance API env is unavailable" >&2
+    return 0
+  fi
+  (
+    cd "$APP_DIR"
+    PYTHONPATH="$PYTHONPATH_VALUE" "$PYTHON_BIN" - "$SYMBOL" <<'PY'
+import json
+import sys
+
+from grid_optimizer.web import _cancel_spot_strategy_orders, _load_spot_runner_control_config
+
+symbol = str(sys.argv[1] or "").upper().strip()
+config = _load_spot_runner_control_config(symbol)
+result = _cancel_spot_strategy_orders(config)
+print("spot_strategy_order_cleanup=" + json.dumps(result, ensure_ascii=False, sort_keys=True))
+PY
+  ) || echo "warning: spot strategy order cleanup failed; continuing runner stop" >&2
+}
+
 systemd_runner_action() {
   local service
   service="$(runner_service_name)"
@@ -126,10 +152,13 @@ systemd_runner_action() {
       run_systemctl start "$service"
       ;;
     restart)
+      cancel_spot_strategy_orders_if_configured
       run_systemctl restart "$service"
       ;;
     stop)
+      cancel_spot_strategy_orders_if_configured
       run_systemctl stop "$service"
+      cancel_spot_strategy_orders_if_configured
       ;;
     status)
       ;;
@@ -148,6 +177,7 @@ find_matching_pids() {
 
 stop_runner() {
   local pids
+  cancel_spot_strategy_orders_if_configured
   pids="$(find_matching_pids || true)"
   if [ -n "$pids" ]; then
     while IFS= read -r pid; do
@@ -163,6 +193,7 @@ stop_runner() {
   if [ -f "$PID_PATH" ]; then
     rm -f "$PID_PATH"
   fi
+  cancel_spot_strategy_orders_if_configured
 }
 
 print_status() {

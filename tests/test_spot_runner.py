@@ -56,6 +56,50 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn('placeholder="留空自动读取本机现货 runner"', SPOT_MONITOR_PAGE)
         self.assertIn("/api/spot_monitor", SPOT_MONITOR_PAGE)
 
+    @patch("grid_optimizer.web.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.web.delete_spot_order")
+    @patch("grid_optimizer.web.fetch_spot_open_orders")
+    def test_cancel_spot_strategy_orders_only_cancels_matching_prefix(
+        self,
+        mock_open_orders,
+        mock_delete_order,
+        _mock_credentials,
+    ) -> None:
+        mock_open_orders.return_value = [
+            {"orderId": 1, "clientOrderId": "sgxpl114_ord_s_1"},
+            {"orderId": 2, "clientOrderId": "manual_xpl_order"},
+            {"orderId": 3, "clientOrderId": "sgxpl150_ord_s_1"},
+            {"orderId": 4, "clientOrderId": ""},
+        ]
+
+        result = web._cancel_spot_strategy_orders(
+            {"symbol": "XPLUSDT", "client_order_prefix": "sgxpl114"}
+        )
+
+        self.assertEqual(result, {"canceled": 1, "errors": []})
+        mock_open_orders.assert_called_once_with("XPLUSDT", "key", "secret")
+        mock_delete_order.assert_called_once()
+        self.assertEqual(mock_delete_order.call_args.kwargs["symbol"], "XPLUSDT")
+        self.assertEqual(mock_delete_order.call_args.kwargs["order_id"], 1)
+
+    @patch("grid_optimizer.web.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.web.delete_spot_order", side_effect=RuntimeError("boom"))
+    @patch("grid_optimizer.web.fetch_spot_open_orders")
+    def test_cancel_spot_strategy_orders_records_cancel_errors(
+        self,
+        mock_open_orders,
+        _mock_delete_order,
+        _mock_credentials,
+    ) -> None:
+        mock_open_orders.return_value = [{"orderId": 1, "clientOrderId": "sgxpl114_ord_s_1"}]
+
+        result = web._cancel_spot_strategy_orders(
+            {"symbol": "XPLUSDT", "client_order_prefix": "sgxpl114"}
+        )
+
+        self.assertEqual(result["canceled"], 0)
+        self.assertEqual(result["errors"], ["RuntimeError: boom"])
+
     @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
     def test_build_spot_monitor_payload_groups_hourly_volume_and_equity_loss(self, mock_runner) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

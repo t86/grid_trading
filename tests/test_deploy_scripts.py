@@ -10,6 +10,38 @@ def test_default_update_wrapper_installs_real_script_instead_of_self_recursing()
     assert 'install -m 755 "${APP_DIR}/deploy/oracle/grid-web-update.sh" "${UPDATE_WRAPPER_PATH}"' in script
 
 
+def test_saved_runner_stop_cancels_spot_strategy_orders_before_systemd_stop() -> None:
+    script = Path("deploy/oracle/manage_saved_runner.sh").read_text(encoding="utf-8")
+
+    assert "cancel_spot_strategy_orders_if_configured" in script
+    assert 'control_path="$APP_DIR/output/${SYMBOL_SLUG}_spot_loop_runner_control.json"' in script
+    assert 'if [ ! -f "$control_path" ]; then' in script
+    assert "load_exchange_env" in script
+    assert "_cancel_spot_strategy_orders(config)" in script
+    assert (
+        "cancel_spot_strategy_orders_if_configured\n"
+        '      run_systemctl stop "$service"\n'
+        "      cancel_spot_strategy_orders_if_configured"
+    ) in script
+    assert "cancel_spot_strategy_orders_if_configured\n      run_systemctl restart" in script
+
+
+def test_saved_runner_fallback_stop_cancels_spot_strategy_orders_around_process_kill() -> None:
+    script = Path("deploy/oracle/manage_saved_runner.sh").read_text(encoding="utf-8")
+
+    assert (
+        "stop_runner() {\n"
+        "  local pids\n"
+        "  cancel_spot_strategy_orders_if_configured"
+    ) in script
+    assert (
+        '    rm -f "$PID_PATH"\n'
+        "  fi\n"
+        "  cancel_spot_strategy_orders_if_configured\n"
+        "}"
+    ) in script
+
+
 def test_disk_pressure_watchdog_has_safe_cleanup_and_alerts() -> None:
     script = Path("deploy/oracle/disk_pressure_watchdog.sh").read_text(encoding="utf-8")
 
