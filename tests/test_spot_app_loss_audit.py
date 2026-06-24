@@ -69,6 +69,31 @@ class SpotAppLossAuditTests(unittest.TestCase):
         self.assertEqual(result["app_loss"], 0.0)
         self.assertEqual(result["safe_maker_sell_price"], 0.0)
 
+    def test_compute_spot_app_loss_treats_tiny_net_qty_as_flat(self) -> None:
+        result = compute_spot_app_loss_audit(
+            trades=[
+                {"isBuyer": True, "isMaker": True, "price": "0.08845", "qty": "41413.6", "quoteQty": "3662.9036"},
+                {
+                    "isBuyer": False,
+                    "isMaker": True,
+                    "price": "0.08830",
+                    "qty": "41413.59999999999",
+                    "quoteQty": "3656.88436",
+                },
+            ],
+            bid_price=0.0914,
+            ask_price=0.0915,
+            tick_size=0.0001,
+        )
+
+        self.assertEqual(result["net_qty"], 0.0)
+        self.assertEqual(result["holding_qty"], 0.0)
+        self.assertEqual(result["mark_source"], "mid")
+        self.assertEqual(result["break_even_price"], 0.0)
+        self.assertEqual(result["safe_maker_sell_gap_ticks"], 0.0)
+        gate = evaluate_spot_app_loss_recovery_gate(result, max_app_loss_per_10k=1.0, min_bid_break_even_buffer_ticks=3.0)
+        self.assertEqual(gate["reasons"], ["app_loss_per_10k_above_limit"])
+
     def test_recovery_gate_allows_small_observation_when_loss_and_gap_are_good(self) -> None:
         audit = compute_spot_app_loss_audit(
             trades=[

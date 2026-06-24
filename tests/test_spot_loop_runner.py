@@ -181,6 +181,31 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(guard["app_loss"], 146.56831, places=5)
         self.assertEqual(guard["window_source"], "metrics")
 
+    def test_spot_app_loss_guard_treats_tiny_window_net_qty_as_flat(self) -> None:
+        guard = _build_spot_app_loss_guard(
+            enabled=True,
+            metrics={
+                "buy_notional": 3662.9036000000006,
+                "sell_notional": 3656.8843600000014,
+                "buy_qty": 41413.6,
+                "sell_qty": 41413.59999999999,
+            },
+            position_qty=0.0,
+            latest_price=0.0914,
+            min_notional=5000.0,
+            soft_per_10k=0.6,
+            hard_per_10k=1.0,
+            tick_size=0.0001,
+            min_bid_break_even_buffer_ticks=3.0,
+        )
+
+        self.assertEqual(guard["position_qty"], 0.0)
+        self.assertEqual(guard["position_value"], 0.0)
+        self.assertEqual(guard["break_even_price"], 0.0)
+        self.assertEqual(guard["bid_break_even_buffer_ticks"], 0.0)
+        self.assertFalse(guard["bid_break_even_buffer_below_min"])
+        self.assertEqual(guard["state"], "blocked")
+
     def test_spot_app_loss_guard_uses_recent_trades_when_legacy_window_misaligned(self) -> None:
         guard = _build_spot_app_loss_guard(
             enabled=True,

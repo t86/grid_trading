@@ -80,6 +80,11 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
+def _qty_zero_tolerance(*quantities: float) -> float:
+    total_qty = sum(abs(_safe_float(value)) for value in quantities)
+    return max(EPSILON, total_qty * 1e-12)
+
+
 def _safe_int(value: Any) -> int:
     try:
         return int(value)
@@ -940,7 +945,13 @@ def _build_spot_app_loss_guard(
         window_aligned = False
 
     gross_notional = buy_notional + sell_notional
-    holding_qty = max(buy_qty - sell_qty, 0.0) if window_aligned and (buy_qty > EPSILON or sell_qty > EPSILON) else max(_safe_float(position_qty), 0.0)
+    if window_aligned and (buy_qty > EPSILON or sell_qty > EPSILON):
+        window_net_qty = buy_qty - sell_qty
+        if abs(window_net_qty) <= _qty_zero_tolerance(buy_qty, sell_qty):
+            window_net_qty = 0.0
+        holding_qty = max(window_net_qty, 0.0)
+    else:
+        holding_qty = max(_safe_float(position_qty), 0.0)
     mark_price = max(_safe_float(latest_price), 0.0)
     position_value = holding_qty * mark_price
     raw_loss = buy_notional - sell_notional - position_value

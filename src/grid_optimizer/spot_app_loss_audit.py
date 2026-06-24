@@ -17,6 +17,11 @@ EPSILON = 1e-12
 MAX_SPOT_MY_TRADES_WINDOW_MS = 24 * 60 * 60 * 1000
 
 
+def _qty_zero_tolerance(*quantities: float) -> float:
+    total_qty = sum(abs(_safe_float(value)) for value in quantities)
+    return max(EPSILON, total_qty * 1e-12)
+
+
 def _safe_float(value: Any) -> float:
     try:
         number = float(value)
@@ -208,6 +213,8 @@ def compute_spot_app_loss_audit(
 
     gross_notional = buy_notional + sell_notional
     net_qty = buy_qty - sell_qty
+    if abs(net_qty) <= _qty_zero_tolerance(buy_qty, sell_qty):
+        net_qty = 0.0
     safe_bid = max(_safe_float(bid_price), 0.0)
     safe_ask = max(_safe_float(ask_price), 0.0)
     mid_price = (safe_bid + safe_ask) / 2.0 if safe_bid > EPSILON and safe_ask > EPSILON else max(safe_bid, safe_ask)

@@ -8811,6 +8811,13 @@ def _runner_start_safety_preflight(
         if competition_spot_recovery and not _truthy(config.get("spot_freeze_maker_execution_enabled", False)):
             reasons.append("交易赛现货低损恢复必须启用 spot_freeze_maker_execution_enabled")
         if (
+            competition_spot_recovery
+            and _truthy(config.get("spot_freeze_enabled", False))
+            and _truthy(config.get("spot_freeze_maker_execution_enabled", False))
+            and (_safe_optional_float(config.get("max_short_position_notional")) or 0.0) <= 0.0
+        ):
+            reasons.append("交易赛现货低损恢复必须设置正数 max_short_position_notional 作为短侧冻结容量")
+        if (
             strategy_mode == "spot_competition_synthetic_neutral_grid"
             and _truthy(config.get("spot_freeze_enabled", False))
             and _spot_freeze_threshold_effectively_disables_config(config)

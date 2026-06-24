@@ -269,6 +269,7 @@ class RunSavedRunnerTests(unittest.TestCase):
             "spot_freeze_deviation_notional": 50.0,
             "spot_freeze_total_cap_notional": 900.0,
             "spot_freeze_max_per_cycle_notional": 180.0,
+            "max_short_position_notional": 900.0,
             "per_order_notional": 60.0,
             "summary_jsonl": "",
         }
