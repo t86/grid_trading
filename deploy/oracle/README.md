@@ -175,6 +175,12 @@ ssh <host> '/usr/local/bin/grid-saved-runner-api2 restart SOONUSDT'
 ssh <host> '/usr/local/bin/grid-saved-runner-api2 status SOONUSDT'
 ```
 
+Spot competition runners with APP-loss prestart gate must use the tracked
+systemd unit from `deploy/oracle/install_runner_systemd.sh`. Gate rejection exits
+with status `2`, and the unit must include `RestartPreventExitStatus=2`; this
+prevents `Restart=always` from turning a rejected low-loss gate into an
+automatic Binance audit loop or a later unattended start.
+
 ## 4.3) Web Health Watchdog
 
 For hosts where `grid-web` may stay `active` but stop answering local HTTP requests, install the

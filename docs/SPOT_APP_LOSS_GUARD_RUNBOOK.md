@@ -67,7 +67,10 @@ APP 万U损耗 = APP 损耗 / (买入成交额 + 卖出成交额) * 10000
 - 如果 `reset_state=true` 或 `known_orders` 丢失，runner 不能把 APP 窗口当作空白窗口。APP guard 必须从 Binance 原始 `myTrades` fallback 重建买卖数量和成交额，再决定是否允许恢复。
 - 减仓 SELL 的价格必须不低于窗口盈亏平衡价，并向上按 tick 取整。例如当前 XPL 窗口 break-even 约 `0.08835`，合法 maker SELL 价至少是 `0.0884`。
 - 如果启用 `spot_app_loss_recovery_reduce_only_enabled=true`，即使启动前审计因价格恢复而放行，只要 APP 窗口仍是净多，runner 也只能先做恢复减仓：删除 BUY，删除低于 `max(ask, break-even)` 的 SELL，并补一张 `LIMIT_MAKER` SELL。
-- 减仓数量按 APP 窗口净持仓计算，不按 `actual_base_qty - neutral_base_qty` 单独计算。
+- synthetic neutral 下不能只看 APP 窗口净持仓。减偏离方向和数量必须以 `actual_base_qty - neutral_base_qty` 为边界：高于 neutral 才能 SELL，低于 neutral 只能 BUY，不能卖穿 neutral 底仓。
+- 低于 neutral 的净空偏离只能用 maker BUY 慢慢回补。BUY reduce 单必须按当前 bid 侧参考，不能保留高于 bid 的 BUY 单；高于 bid 的 BUY 会变成吃单或在高价回补，直接放大 APP 损耗。
+- 如果 `spot_freeze_skip_reason=short_hedge_capacity_exhausted`，说明冻结仓位没有合约 SHORT 容量继续抵消这段净空现货偏离；不要指望冻结自动生效，必须先低价 maker BUY 补回 neutral。
+- 当 `actual_base_qty` 已回到 `neutral_base_qty`，且 APP 万U损耗仍低于 soft/hard 门槛时，runner 应退出 `recovery_reduce_only` 回到 `cruise`/`observe`。如果 `reduce_side=""` 仍卡在 recovery 状态，属于恢复空转，应停下来排查，不能扩大目标。
 - 如果当前 ask 明显低于 break-even，成交速度慢是正确结果；为了速度在低价卖出，会直接锁定 APP 损耗。
 - 冻结仓位没有明确启用并通过小窗口验证前，不允许把旧的 40 万目标直接恢复到生产。
 
@@ -100,7 +103,7 @@ PYTHONPATH=src python -m grid_optimizer.spot_app_loss_audit --symbol XPLUSDT --s
 }
 ```
 
-`grid_optimizer.run_saved_runner` 会在执行真实 runner 前调用同一审计命令；门禁非 0 时直接退出，不会启动 spot runner。Web 保存现货 runner 配置时也必须保留这一组 `spot_app_loss_prestart_gate_` 字段。
+`grid_optimizer.run_saved_runner` 会在执行真实 runner 前调用同一审计命令；门禁非 0 时直接退出，不会启动 spot runner。Web 保存现货 runner 配置时也必须保留这一组 `spot_app_loss_prestart_gate_` 字段。systemd unit 必须安装 `RestartPreventExitStatus=2`，确保 gate 拒绝不是 `Restart=always` 的可重试失败；否则会反复审计 Binance，并可能在门禁临界变好时自动启动。
 - 确认当前盘口到 break-even 的 tick 距离；若距离过大，只能接受低速挂 break-even maker SELL，不能为了速度降价卖。
 - 使用小观察额度恢复，不直接使用原 40 万目标。
 - 启动后先观察一个小窗口，确认 APP 万U损耗低于 `1` 或转正，再扩大目标。
