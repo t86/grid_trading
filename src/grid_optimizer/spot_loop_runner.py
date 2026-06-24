@@ -890,6 +890,7 @@ def _build_spot_app_loss_guard(
     min_notional: float,
     soft_per_10k: float,
     hard_per_10k: float,
+    recovery_reduce_only_enabled: bool = False,
 ) -> dict[str, Any]:
     buy_notional = max(_safe_float(metrics.get("buy_notional")), 0.0)
     sell_notional = max(_safe_float(metrics.get("sell_notional")), 0.0)
@@ -947,6 +948,14 @@ def _build_spot_app_loss_guard(
         and app_loss + EPSILON >= preactive_loss_cap
     )
     active = bool(enabled) and bool(window_aligned) and (volume_active or preactive_loss_cap_hit)
+    recovery_reduce_only = (
+        bool(enabled)
+        and bool(recovery_reduce_only_enabled)
+        and bool(window_aligned)
+        and gross_notional > EPSILON
+        and holding_qty > EPSILON
+        and app_loss_per_10k <= hard + EPSILON
+    )
     if not enabled:
         state = "disabled"
     elif not window_aligned:
@@ -959,6 +968,8 @@ def _build_spot_app_loss_guard(
         state = "blocked"
     elif soft > EPSILON and app_loss_per_10k + EPSILON >= soft:
         state = "defensive"
+    elif recovery_reduce_only:
+        state = "recovery_reduce_only"
     else:
         state = "cruise"
     return {
@@ -982,6 +993,7 @@ def _build_spot_app_loss_guard(
         "hard_per_10k": hard,
         "preactive_loss_cap": preactive_loss_cap,
         "preactive_loss_cap_hit": preactive_loss_cap_hit,
+        "recovery_reduce_only_enabled": bool(recovery_reduce_only_enabled),
         "active": active,
         "state": state,
         "action": "observe",
@@ -1058,6 +1070,7 @@ def _cap_spot_app_loss_reduce_orders(
     controls: dict[str, Any],
     reduce_side: str,
     position_qty: float,
+    maker_reference_price: float | None,
     step_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
@@ -1068,7 +1081,9 @@ def _cap_spot_app_loss_reduce_orders(
     if normalized_side not in {"BUY", "SELL"}:
         return []
     remaining_qty = _spot_app_loss_deviation_qty(controls, position_qty)
-    min_sell_price = _spot_app_loss_break_even_price(controls) if normalized_side == "SELL" else 0.0
+    min_sell_price = 0.0
+    if normalized_side == "SELL":
+        min_sell_price = max(_spot_app_loss_break_even_price(controls), _safe_float(maker_reference_price))
     if normalized_side == "SELL" and available_base_free is not None:
         remaining_qty = min(remaining_qty, max(_safe_float(available_base_free), 0.0))
     remaining_quote = None
@@ -1105,6 +1120,7 @@ def _build_spot_app_loss_maker_reduce_order(
     *,
     controls: dict[str, Any],
     latest_price: float,
+    maker_reference_price: float | None = None,
     reduce_side: str,
     maker_reduce_notional: float,
     tick_size: float | None,
@@ -1115,7 +1131,7 @@ def _build_spot_app_loss_maker_reduce_order(
     available_base_free: float | None,
 ) -> dict[str, Any] | None:
     normalized_side = str(reduce_side or "").upper().strip()
-    price = max(_safe_float(latest_price), 0.0)
+    price = max(_safe_float(maker_reference_price if maker_reference_price is not None else latest_price), 0.0)
     if normalized_side == "SELL":
         price = max(price, _spot_app_loss_break_even_price(controls))
     price = _round_order_price(price, tick_size, normalized_side)
@@ -1154,10 +1170,12 @@ def _apply_spot_app_loss_guard_to_orders(
     position_qty: float,
     latest_price: float,
     enabled: bool,
+    recovery_reduce_only_enabled: bool = False,
     min_notional: float,
     soft_per_10k: float,
     hard_per_10k: float,
     maker_reduce_notional: float = 0.0,
+    maker_reference_price: float | None = None,
     tick_size: float | None = None,
     step_size: float | None = None,
     min_qty: float | None = None,
@@ -1173,9 +1191,10 @@ def _apply_spot_app_loss_guard_to_orders(
         min_notional=min_notional,
         soft_per_10k=soft_per_10k,
         hard_per_10k=hard_per_10k,
+        recovery_reduce_only_enabled=recovery_reduce_only_enabled,
     )
     controls["spot_app_loss_guard"] = guard
-    if guard["state"] not in {"defensive", "blocked"}:
+    if guard["state"] not in {"defensive", "blocked", "recovery_reduce_only"}:
         return desired_orders
 
     reduce_side = _spot_app_loss_reduce_side(controls, position_qty, app_position_qty=guard.get("position_qty"))
@@ -1184,6 +1203,7 @@ def _apply_spot_app_loss_guard_to_orders(
         controls=controls,
         reduce_side=reduce_side,
         position_qty=position_qty,
+        maker_reference_price=maker_reference_price,
         step_size=step_size,
         min_qty=min_qty,
         min_notional=exchange_min_notional,
@@ -1201,6 +1221,7 @@ def _apply_spot_app_loss_guard_to_orders(
         reduce_order = _build_spot_app_loss_maker_reduce_order(
             controls=controls,
             latest_price=latest_price,
+            maker_reference_price=maker_reference_price,
             reduce_side=reduce_side,
             maker_reduce_notional=maker_reduce_notional,
             tick_size=tick_size,
@@ -1215,7 +1236,12 @@ def _apply_spot_app_loss_guard_to_orders(
             guard["injected_order_count"] = 1
     if dropped_count > 0:
         pause_reasons = list(controls.get("pause_reasons") or [])
-        reason = "spot_app_loss_guard_blocked" if guard["state"] == "blocked" else "spot_app_loss_guard_defensive"
+        if guard["state"] == "blocked":
+            reason = "spot_app_loss_guard_blocked"
+        elif guard["state"] == "recovery_reduce_only":
+            reason = "spot_app_loss_guard_recovery_reduce_only"
+        else:
+            reason = "spot_app_loss_guard_defensive"
         if reason not in pause_reasons:
             pause_reasons.append(reason)
         controls["pause_reasons"] = pause_reasons
@@ -3855,10 +3881,12 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         position_qty=app_loss_position_qty,
         latest_price=app_loss_mark_price,
         enabled=bool(getattr(args, "spot_app_loss_guard_enabled", False)),
+        recovery_reduce_only_enabled=bool(getattr(args, "spot_app_loss_recovery_reduce_only_enabled", False)),
         min_notional=float(getattr(args, "spot_app_loss_min_notional", 10000.0)),
         soft_per_10k=float(getattr(args, "spot_app_loss_per_10k_soft", 0.0)),
         hard_per_10k=float(getattr(args, "spot_app_loss_per_10k_hard", 0.0)),
         maker_reduce_notional=float(getattr(args, "per_order_notional", 0.0)),
+        maker_reference_price=ask_price,
         tick_size=symbol_info.get("tick_size"),
         step_size=symbol_info.get("step_size"),
         min_qty=symbol_info.get("min_qty"),
@@ -4248,6 +4276,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spot-fast-stop-reduce-target-notional", type=float, default=0.0)
     parser.add_argument("--spot-fast-stop-min-base-buffer-qty", type=float, default=0.0)
     parser.add_argument("--spot-app-loss-guard-enabled", action="store_true")
+    parser.add_argument("--spot-app-loss-recovery-reduce-only-enabled", action="store_true")
     parser.add_argument("--spot-app-loss-min-notional", type=float, default=10000.0)
     parser.add_argument("--spot-app-loss-per-10k-soft", type=float, default=0.0)
     parser.add_argument("--spot-app-loss-per-10k-hard", type=float, default=0.0)

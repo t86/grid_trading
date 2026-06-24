@@ -17,7 +17,7 @@ APP 万U损耗 = APP 损耗 / (买入成交额 + 卖出成交额) * 10000
 
 2026-06-24 22:04 CST，114 的 `XPLUSDT` 已按高损耗风险停机：
 
-- 生产代码：`f3cd083`
+- 生产代码：`2615084`
 - systemd：`grid-loop@XPLUSDT.service` 为 `disabled` / `inactive`
 - 交易所挂单：`open_orders=0`
 - 控制文件：`output/xplusdt_spot_loop_runner_control.json` 中 `apply=false`
@@ -50,6 +50,7 @@ APP 万U损耗 = APP 损耗 / (买入成交额 + 卖出成交额) * 10000
 - APP 窗口净多时，runner 的 guard 用 bid 估算持仓价值，不用 mid；这样不会因为半个 spread 的乐观估值低估 APP 万U损耗。
 - 如果 `reset_state=true` 或 `known_orders` 丢失，runner 不能把 APP 窗口当作空白窗口。APP guard 必须从 Binance 原始 `myTrades` fallback 重建买卖数量和成交额，再决定是否允许恢复。
 - 减仓 SELL 的价格必须不低于窗口盈亏平衡价，并向上按 tick 取整。例如当前 XPL 窗口 break-even 约 `0.08835`，合法 maker SELL 价至少是 `0.0884`。
+- 如果启用 `spot_app_loss_recovery_reduce_only_enabled=true`，即使启动前审计因价格恢复而放行，只要 APP 窗口仍是净多，runner 也只能先做恢复减仓：删除 BUY，删除低于 `max(ask, break-even)` 的 SELL，并补一张 `LIMIT_MAKER` SELL。
 - 减仓数量按 APP 窗口净持仓计算，不按 `actual_base_qty - neutral_base_qty` 单独计算。
 - 如果当前 ask 明显低于 break-even，成交速度慢是正确结果；为了速度在低价卖出，会直接锁定 APP 损耗。
 - 冻结仓位没有明确启用并通过小窗口验证前，不允许把旧的 40 万目标直接恢复到生产。
@@ -76,7 +77,8 @@ PYTHONPATH=src python -m grid_optimizer.spot_app_loss_audit --symbol XPLUSDT --s
   "spot_app_loss_prestart_gate_max_loss_per_10k": 1.0,
   "spot_app_loss_prestart_gate_max_safe_sell_gap_ticks": 2.0,
   "spot_app_loss_prestart_gate_min_maker_ratio": 0.99,
-  "spot_app_loss_prestart_gate_min_gross_notional": 5000.0
+  "spot_app_loss_prestart_gate_min_gross_notional": 5000.0,
+  "spot_app_loss_recovery_reduce_only_enabled": true
 }
 ```
 

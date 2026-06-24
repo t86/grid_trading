@@ -286,6 +286,7 @@ class SpotRunnerTests(unittest.TestCase):
                 "spot_app_loss_min_notional": 5000.0,
                 "spot_app_loss_per_10k_soft": 1.0,
                 "spot_app_loss_per_10k_hard": 1.5,
+                "spot_app_loss_recovery_reduce_only_enabled": True,
             }
         )
 
@@ -295,8 +296,10 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("--spot-app-loss-min-notional", command)
         self.assertIn("--spot-app-loss-per-10k-soft", command)
         self.assertIn("--spot-app-loss-per-10k-hard", command)
+        self.assertIn("--spot-app-loss-recovery-reduce-only-enabled", command)
         args = _build_spot_loop_parser().parse_args(command[3:])
         self.assertTrue(args.spot_app_loss_guard_enabled)
+        self.assertTrue(args.spot_app_loss_recovery_reduce_only_enabled)
         self.assertEqual(args.spot_app_loss_min_notional, 5000.0)
         self.assertEqual(args.spot_app_loss_per_10k_soft, 1.0)
         self.assertEqual(args.spot_app_loss_per_10k_hard, 1.5)
@@ -679,10 +682,12 @@ class SpotRunnerTests(unittest.TestCase):
                 "spot_app_loss_min_notional": 5000,
                 "spot_app_loss_per_10k_soft": 1.0,
                 "spot_app_loss_per_10k_hard": 1.5,
+                "spot_app_loss_recovery_reduce_only_enabled": True,
             }
         )
 
         self.assertTrue(payload["spot_app_loss_guard_enabled"])
+        self.assertTrue(payload["spot_app_loss_recovery_reduce_only_enabled"])
         self.assertEqual(payload["spot_app_loss_min_notional"], 5000.0)
         self.assertEqual(payload["spot_app_loss_per_10k_soft"], 1.0)
         self.assertEqual(payload["spot_app_loss_per_10k_hard"], 1.5)
