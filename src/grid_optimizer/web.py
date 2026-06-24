@@ -8415,6 +8415,10 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "spot_fast_stop_exit_position_notional": 0.0,
     "spot_fast_stop_reduce_target_notional": 0.0,
     "spot_fast_stop_min_base_buffer_qty": 0.0,
+    "spot_app_loss_guard_enabled": False,
+    "spot_app_loss_min_notional": 10000.0,
+    "spot_app_loss_per_10k_soft": 0.0,
+    "spot_app_loss_per_10k_hard": 0.0,
     "spot_slow_trend_step_enabled": False,
     "spot_slow_trend_step_5m_return_ratio": 0.0,
     "spot_slow_trend_step_15m_return_ratio": 0.0,
@@ -8431,6 +8435,7 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "synthetic_freeze_manual_release_qty": 0.0,
     "synthetic_freeze_manual_release_price": 0.0,
     "spot_freeze_enabled": False,
+    "spot_freeze_dry_run": False,
     "spot_freeze_base_hedge_qty": 0.0,
     "spot_freeze_tolerance_qty": 0.0,
     "spot_freeze_deviation_notional": 0.0,
@@ -14305,6 +14310,22 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         ),
         "spot_fast_stop_min_base_buffer_qty",
     )
+    spot_app_loss_guard_enabled = _safe_bool(
+        payload.get("spot_app_loss_guard_enabled", SPOT_RUNNER_DEFAULT_CONFIG["spot_app_loss_guard_enabled"]),
+        "spot_app_loss_guard_enabled",
+    )
+    spot_app_loss_min_notional = _safe_float(
+        payload.get("spot_app_loss_min_notional", SPOT_RUNNER_DEFAULT_CONFIG["spot_app_loss_min_notional"]),
+        "spot_app_loss_min_notional",
+    )
+    spot_app_loss_per_10k_soft = _safe_float(
+        payload.get("spot_app_loss_per_10k_soft", SPOT_RUNNER_DEFAULT_CONFIG["spot_app_loss_per_10k_soft"]),
+        "spot_app_loss_per_10k_soft",
+    )
+    spot_app_loss_per_10k_hard = _safe_float(
+        payload.get("spot_app_loss_per_10k_hard", SPOT_RUNNER_DEFAULT_CONFIG["spot_app_loss_per_10k_hard"]),
+        "spot_app_loss_per_10k_hard",
+    )
     spot_slow_trend_step_enabled = _safe_bool(
         payload.get("spot_slow_trend_step_enabled", SPOT_RUNNER_DEFAULT_CONFIG["spot_slow_trend_step_enabled"]),
         "spot_slow_trend_step_enabled",
@@ -14398,6 +14419,10 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
     spot_freeze_enabled = _safe_bool(
         payload.get("spot_freeze_enabled", SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_enabled"]),
         "spot_freeze_enabled",
+    )
+    spot_freeze_dry_run = _safe_bool(
+        payload.get("spot_freeze_dry_run", SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_dry_run"]),
+        "spot_freeze_dry_run",
     )
     spot_freeze_base_hedge_qty = _safe_float(
         payload.get("spot_freeze_base_hedge_qty", SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_base_hedge_qty"]),
@@ -14585,6 +14610,9 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_fast_stop_exit_position_notional": spot_fast_stop_exit_position_notional,
             "spot_fast_stop_reduce_target_notional": spot_fast_stop_reduce_target_notional,
             "spot_fast_stop_min_base_buffer_qty": spot_fast_stop_min_base_buffer_qty,
+            "spot_app_loss_min_notional": spot_app_loss_min_notional,
+            "spot_app_loss_per_10k_soft": spot_app_loss_per_10k_soft,
+            "spot_app_loss_per_10k_hard": spot_app_loss_per_10k_hard,
             "spot_slow_trend_step_5m_return_ratio": spot_slow_trend_step_5m_return_ratio,
             "spot_slow_trend_step_15m_return_ratio": spot_slow_trend_step_15m_return_ratio,
             "spot_slow_trend_step_5m_amplitude_ratio": spot_slow_trend_step_5m_amplitude_ratio,
@@ -14670,6 +14698,10 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_fast_stop_exit_position_notional": spot_fast_stop_exit_position_notional,
             "spot_fast_stop_reduce_target_notional": spot_fast_stop_reduce_target_notional,
             "spot_fast_stop_min_base_buffer_qty": spot_fast_stop_min_base_buffer_qty,
+            "spot_app_loss_guard_enabled": spot_app_loss_guard_enabled,
+            "spot_app_loss_min_notional": spot_app_loss_min_notional,
+            "spot_app_loss_per_10k_soft": spot_app_loss_per_10k_soft,
+            "spot_app_loss_per_10k_hard": spot_app_loss_per_10k_hard,
             "spot_slow_trend_step_enabled": spot_slow_trend_step_enabled,
             "spot_slow_trend_step_5m_return_ratio": spot_slow_trend_step_5m_return_ratio,
             "spot_slow_trend_step_15m_return_ratio": spot_slow_trend_step_15m_return_ratio,
@@ -14686,6 +14718,7 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "synthetic_freeze_manual_release_qty": synthetic_freeze_manual_release_qty,
             "synthetic_freeze_manual_release_price": synthetic_freeze_manual_release_price,
             "spot_freeze_enabled": spot_freeze_enabled,
+            "spot_freeze_dry_run": spot_freeze_dry_run,
             "spot_freeze_base_hedge_qty": spot_freeze_base_hedge_qty,
             "spot_freeze_tolerance_qty": spot_freeze_tolerance_qty,
             "spot_freeze_deviation_notional": spot_freeze_deviation_notional,
@@ -14812,6 +14845,9 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--spot-fast-stop-exit-position-notional", config.get("spot_fast_stop_exit_position_notional")),
         ("--spot-fast-stop-reduce-target-notional", config.get("spot_fast_stop_reduce_target_notional")),
         ("--spot-fast-stop-min-base-buffer-qty", config.get("spot_fast_stop_min_base_buffer_qty")),
+        ("--spot-app-loss-min-notional", config.get("spot_app_loss_min_notional")),
+        ("--spot-app-loss-per-10k-soft", config.get("spot_app_loss_per_10k_soft")),
+        ("--spot-app-loss-per-10k-hard", config.get("spot_app_loss_per_10k_hard")),
         ("--spot-slow-trend-step-5m-return-ratio", config.get("spot_slow_trend_step_5m_return_ratio")),
         ("--spot-slow-trend-step-15m-return-ratio", config.get("spot_slow_trend_step_15m_return_ratio")),
         ("--spot-slow-trend-step-5m-amplitude-ratio", config.get("spot_slow_trend_step_5m_amplitude_ratio")),
@@ -14848,12 +14884,16 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         command.append("--spot-taker-exit-enabled")
     if _truthy(config.get("spot_fast_stop_enabled", False)):
         command.append("--spot-fast-stop-enabled")
+    if _truthy(config.get("spot_app_loss_guard_enabled", False)):
+        command.append("--spot-app-loss-guard-enabled")
     if _truthy(config.get("spot_slow_trend_step_enabled", False)):
         command.append("--spot-slow-trend-step-enabled")
     if _truthy(config.get("synthetic_freeze_enabled", False)):
         command.append("--synthetic-freeze-enabled")
     if _truthy(config.get("spot_freeze_enabled", False)):
         command.append("--spot-freeze-enabled")
+    if _truthy(config.get("spot_freeze_dry_run", False)):
+        command.append("--spot-freeze-dry-run")
     if _truthy(config.get("spot_freeze_pair_release_enabled", False)):
         command.append("--spot-freeze-pair-release-enabled")
     if _truthy(config.get("spot_freeze_profit_release_enabled", False)):
@@ -14975,6 +15015,7 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "synthetic_freeze_manual_release_qty",
             "synthetic_freeze_manual_release_price",
             "spot_freeze_enabled",
+            "spot_freeze_dry_run",
             "spot_freeze_base_hedge_qty",
             "spot_freeze_tolerance_qty",
             "spot_freeze_deviation_notional",

@@ -13,6 +13,7 @@ from grid_optimizer.spot_loop_runner import (
     _assess_spot_fast_stop_guard,
     _auto_flatten_on_runtime_guard,
     _build_parser,
+    _build_spot_app_loss_guard,
     _build_spot_competition_inventory_grid_orders,
     _check_spot_freeze_hedge_gate,
     _clamp_limit_maker_price_to_book,
@@ -22,6 +23,7 @@ from grid_optimizer.spot_loop_runner import (
     _make_spot_freeze_spot_market_callback,
     _maybe_run_spot_freeze,
     _normalize_commission_quote,
+    _apply_spot_app_loss_guard_to_orders,
     _resolve_spot_competition_runtime,
     _run_cycle,
     _spot_order_meets_exchange_mins,
@@ -67,6 +69,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         args = self._synthetic_args()
 
         self.assertFalse(args.spot_freeze_enabled)
+        self.assertFalse(args.spot_freeze_dry_run)
         self.assertEqual(args.spot_freeze_base_hedge_qty, 0.0)
         self.assertEqual(args.spot_freeze_release_profit_ratio, 0.05)
 
@@ -87,6 +90,156 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["net_pnl"], -0.12)
         self.assertEqual(events[0]["gross_notional"], 200.0)
+
+    def test_spot_app_loss_guard_uses_binance_app_formula_without_offsets(self) -> None:
+        guard = _build_spot_app_loss_guard(
+            enabled=True,
+            metrics={
+                "buy_notional": 1000.0,
+                "sell_notional": 400.0,
+                "buy_qty": 120.0,
+                "sell_qty": 20.0,
+                "commission_quote": 50.0,
+                "realized_pnl": 999.0,
+            },
+            position_qty=100.0,
+            latest_price=5.0,
+            min_notional=10.0,
+            soft_per_10k=1.0,
+            hard_per_10k=2.0,
+        )
+
+        self.assertEqual(guard["formula"], "buy_notional-sell_notional-position_qty*latest_price")
+        self.assertAlmostEqual(guard["buy_notional"], 1000.0)
+        self.assertAlmostEqual(guard["sell_notional"], 400.0)
+        self.assertEqual(guard["window_source"], "metrics")
+        self.assertTrue(guard["window_aligned"])
+        self.assertAlmostEqual(guard["position_value"], 500.0)
+        self.assertAlmostEqual(guard["app_loss"], 100.0)
+        self.assertAlmostEqual(guard["app_loss_per_10k"], 100.0 / 1400.0 * 10000.0)
+        self.assertEqual(guard["state"], "blocked")
+
+    def test_spot_app_loss_guard_uses_window_net_qty_not_account_base_balance(self) -> None:
+        guard = _build_spot_app_loss_guard(
+            enabled=True,
+            metrics={
+                "buy_notional": 486987.18507,
+                "sell_notional": 486236.63072,
+                "buy_qty": 8643120.7,
+                "sell_qty": 8632348.7,
+            },
+            position_qty=1_000_000.0,
+            latest_price=0.05607,
+            min_notional=10.0,
+            soft_per_10k=1.0,
+            hard_per_10k=2.0,
+        )
+
+        self.assertAlmostEqual(guard["position_qty"], 10772.0)
+        self.assertAlmostEqual(guard["position_value"], 603.98604, places=5)
+        self.assertAlmostEqual(guard["app_loss"], 146.56831, places=5)
+        self.assertEqual(guard["window_source"], "metrics")
+
+    def test_spot_app_loss_guard_uses_recent_trades_when_legacy_window_misaligned(self) -> None:
+        guard = _build_spot_app_loss_guard(
+            enabled=True,
+            metrics={
+                "buy_notional": 100000.0,
+                "sell_notional": 99900.0,
+                "buy_qty": 1.0,
+                "sell_qty": 0.0,
+                "app_loss_window_aligned": False,
+                "recent_trades": [
+                    {"side": "BUY", "qty": 100.0, "notional": 1000.0},
+                    {"side": "SELL", "qty": 90.0, "notional": 950.0},
+                ],
+            },
+            position_qty=1000.0,
+            latest_price=4.0,
+            min_notional=10.0,
+            soft_per_10k=1.0,
+            hard_per_10k=2.0,
+        )
+
+        self.assertEqual(guard["window_source"], "recent_trades")
+        self.assertTrue(guard["window_aligned"])
+        self.assertAlmostEqual(guard["buy_notional"], 1000.0)
+        self.assertAlmostEqual(guard["sell_notional"], 950.0)
+        self.assertAlmostEqual(guard["position_qty"], 10.0)
+        self.assertAlmostEqual(guard["app_loss"], 10.0)
+
+    def test_spot_app_loss_guard_does_not_reduce_when_window_unaligned(self) -> None:
+        controls = {"actual_base_qty": 120.0, "neutral_base_qty": 100.0}
+        desired_orders = [
+            {"side": "BUY", "role": "grid_entry", "price": 1.0, "qty": 10.0},
+            {"side": "SELL", "role": "forced_reduce", "price": 1.1, "qty": 10.0},
+        ]
+
+        filtered = _apply_spot_app_loss_guard_to_orders(
+            desired_orders=desired_orders,
+            controls=controls,
+            metrics={
+                "buy_notional": 1000.0,
+                "sell_notional": 850.0,
+                "app_loss_window_aligned": False,
+            },
+            position_qty=120.0,
+            latest_price=1.0,
+            enabled=True,
+            min_notional=10.0,
+            soft_per_10k=1.0,
+            hard_per_10k=2.0,
+        )
+
+        self.assertEqual(filtered, desired_orders)
+        self.assertEqual(controls["spot_app_loss_guard"]["state"], "insufficient_window")
+        self.assertFalse(controls["spot_app_loss_guard"]["window_aligned"])
+
+    def test_load_state_marks_legacy_app_loss_window_unaligned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "symbol": "MEGAUSDT",
+                        "strategy_mode": "spot_synthetic_neutral",
+                        "metrics": {"buy_notional": 1000.0, "sell_notional": 900.0},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = _load_state(path, "MEGAUSDT", "spot_synthetic_neutral", 3)
+
+        self.assertFalse(state["metrics"]["app_loss_window_aligned"])
+        self.assertEqual(state["metrics"]["buy_qty"], 0.0)
+        self.assertEqual(state["metrics"]["sell_qty"], 0.0)
+
+    def test_spot_app_loss_guard_keeps_only_reduce_orders_when_long_deviation_blocks(self) -> None:
+        controls = {"actual_base_qty": 120.0, "neutral_base_qty": 100.0}
+        desired_orders = [
+            {"side": "BUY", "role": "grid_entry", "price": 1.0, "qty": 10.0},
+            {"side": "SELL", "role": "forced_reduce", "price": 1.1, "qty": 10.0},
+        ]
+
+        filtered = _apply_spot_app_loss_guard_to_orders(
+            desired_orders=desired_orders,
+            controls=controls,
+            metrics={"buy_notional": 1000.0, "sell_notional": 850.0, "buy_qty": 1000.0, "sell_qty": 900.0},
+            position_qty=120.0,
+            latest_price=1.0,
+            enabled=True,
+            min_notional=10.0,
+            soft_per_10k=1.0,
+            hard_per_10k=2.0,
+        )
+
+        self.assertEqual([order["side"] for order in filtered], ["SELL"])
+        self.assertEqual(controls["spot_app_loss_guard"]["state"], "blocked")
+        self.assertEqual(controls["spot_app_loss_guard"]["action"], "reduce_only")
+        self.assertEqual(controls["spot_app_loss_guard"]["dropped_order_count"], 1)
+        self.assertTrue(controls["buy_paused"])
+        self.assertIn("spot_app_loss_guard_blocked", controls["pause_reasons"])
 
     def test_spot_freeze_gate_rejects_non_hedge_mode(self) -> None:
         gate = _check_spot_freeze_hedge_gate(
@@ -177,6 +330,9 @@ class SpotLoopRunnerTests(unittest.TestCase):
                 )
 
         self.assertFalse(controls["spot_freeze_enabled"])
+        self.assertEqual(controls["spot_freeze_skip_reason"], "disabled")
+        self.assertAlmostEqual(controls["spot_freeze_deviation_qty"], 20.0)
+        self.assertAlmostEqual(controls["spot_freeze_deviation_notional"], 200.0)
 
     def test_spot_freeze_enabled_calls_cycle_with_short_position_qty(self) -> None:
         args = self._synthetic_args(
@@ -236,6 +392,69 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertTrue(kwargs["loss_ratio_usable"])
         self.assertEqual(kwargs["config"].deviation_notional, 50.0)
         self.assertEqual(controls["spot_freeze_actions"], [{"type": "freeze"}])
+
+    def test_spot_freeze_dry_run_overrides_apply_for_safe_diagnostics(self) -> None:
+        args = self._synthetic_args(
+            [
+                "--apply",
+                "--spot-freeze-enabled",
+                "--spot-freeze-dry-run",
+                "--spot-freeze-base-hedge-qty",
+                "100",
+                "--spot-freeze-deviation-notional",
+                "50",
+                "--spot-freeze-min-loss-ratio",
+                "0.01",
+                "--spot-freeze-max-per-cycle-notional",
+                "100",
+                "--spot-freeze-total-cap-notional",
+                "500",
+            ]
+        )
+        state = {"spot_frozen_ledger": new_ledger()}
+        controls = {
+            "actual_base_qty": 120.0,
+            "neutral_base_qty": 100.0,
+            "_runtime": {
+                "recovery_mode": "live",
+                "synthetic_cost_unknown": False,
+                "position_lots": [{"lot_id": "L1", "side": "long", "qty": 20.0, "entry_price": 12.0}],
+            },
+        }
+
+        with patch("grid_optimizer.spot_loop_runner.fetch_futures_position_mode", return_value={"dualSidePosition": True}):
+            with patch(
+                "grid_optimizer.spot_loop_runner.fetch_futures_position_risk_v3",
+                return_value=[
+                    {"symbol": "WLDUSDT", "positionSide": "LONG", "positionAmt": "0"},
+                    {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-100"},
+                ],
+            ):
+                with patch("grid_optimizer.spot_loop_runner.fetch_futures_symbol_config", return_value={"step_size": 0.001}):
+                    with patch(
+                        "grid_optimizer.spot_loop_runner.freeze_cycle",
+                        return_value={
+                            "ledger": new_ledger(),
+                            "actions": [{"type": "freeze_dry_run", "side": "long", "qty": 10.0}],
+                            "reconcile_ok": True,
+                            "alerts": [],
+                        },
+                    ) as mock_cycle:
+                        _maybe_run_spot_freeze(
+                            args=args,
+                            state=state,
+                            controls=controls,
+                            symbol="WLDUSDT",
+                            mid_price=10.0,
+                            symbol_info={"step_size": 0.001},
+                            api_key="key",
+                            api_secret="secret",
+                            now=datetime(2026, 6, 23, tzinfo=timezone.utc),
+                        )
+
+        self.assertTrue(mock_cycle.call_args.kwargs["dry_run"])
+        self.assertTrue(controls["spot_freeze_dry_run"])
+        self.assertEqual(controls["spot_freeze_actions"][0]["type"], "freeze_dry_run")
 
     def test_spot_freeze_uses_contract_qty_step_when_coarser_than_spot(self) -> None:
         args = self._synthetic_args(
@@ -697,6 +916,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(controls["synthetic_net_qty"], -3000.0)
         self.assertGreater(controls["current_short_notional"], 0.0)
         self.assertFalse(controls["synthetic_freeze_enabled"])
+        self.assertEqual(controls["synthetic_freeze_disabled_reason"], "spot_synthetic_neutral_uses_spot_freeze")
         self.assertAlmostEqual(controls["synthetic_frozen_short_qty"], 0.0)
         cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
         self.assertAlmostEqual(cached_runtime["position_lots"][0]["qty"], 3000.0)

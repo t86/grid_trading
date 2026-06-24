@@ -276,6 +276,31 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertEqual(args.rolling_hourly_loss_per_10k_limit, 40.0)
         self.assertEqual(args.rolling_hourly_loss_per_10k_min_notional, 10000.0)
 
+    def test_build_spot_runner_command_includes_spot_app_loss_guard_arguments(self) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "MEGAUSDT",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "spot_app_loss_guard_enabled": True,
+                "spot_app_loss_min_notional": 5000.0,
+                "spot_app_loss_per_10k_soft": 1.0,
+                "spot_app_loss_per_10k_hard": 1.5,
+            }
+        )
+
+        command = _build_spot_runner_command(config)
+
+        self.assertIn("--spot-app-loss-guard-enabled", command)
+        self.assertIn("--spot-app-loss-min-notional", command)
+        self.assertIn("--spot-app-loss-per-10k-soft", command)
+        self.assertIn("--spot-app-loss-per-10k-hard", command)
+        args = _build_spot_loop_parser().parse_args(command[3:])
+        self.assertTrue(args.spot_app_loss_guard_enabled)
+        self.assertEqual(args.spot_app_loss_min_notional, 5000.0)
+        self.assertEqual(args.spot_app_loss_per_10k_soft, 1.0)
+        self.assertEqual(args.spot_app_loss_per_10k_hard, 1.5)
+
     @patch("grid_optimizer.web._validate_market_symbol")
     def test_normalize_spot_runner_payload_accepts_competition_inventory_grid(self, _mock_validate_symbol) -> None:
         payload = _normalize_spot_runner_payload(
@@ -493,6 +518,7 @@ class SpotRunnerTests(unittest.TestCase):
                 "symbol": "MEGAUSDT",
                 "strategy_mode": "spot_competition_synthetic_neutral_grid",
                 "spot_freeze_enabled": True,
+                "spot_freeze_dry_run": True,
                 "spot_freeze_base_hedge_qty": 100.0,
                 "spot_freeze_tolerance_qty": 0.01,
                 "spot_freeze_deviation_notional": 50.0,
@@ -508,6 +534,7 @@ class SpotRunnerTests(unittest.TestCase):
         command = _build_spot_runner_command(config)
 
         self.assertIn("--spot-freeze-enabled", command)
+        self.assertIn("--spot-freeze-dry-run", command)
         self.assertIn("--spot-freeze-base-hedge-qty", command)
         self.assertIn("100.0", command)
         self.assertIn("--spot-freeze-tolerance-qty", command)
@@ -572,6 +599,7 @@ class SpotRunnerTests(unittest.TestCase):
                 "neutral_base_qty": 10000,
                 "max_short_position_notional": 320,
                 "spot_freeze_enabled": True,
+                "spot_freeze_dry_run": True,
                 "spot_freeze_base_hedge_qty": 10000,
                 "spot_freeze_tolerance_qty": 0.01,
                 "spot_freeze_deviation_notional": 50,
@@ -585,6 +613,7 @@ class SpotRunnerTests(unittest.TestCase):
         )
 
         self.assertTrue(payload["spot_freeze_enabled"])
+        self.assertTrue(payload["spot_freeze_dry_run"])
         self.assertEqual(payload["spot_freeze_base_hedge_qty"], 10000.0)
         self.assertEqual(payload["spot_freeze_tolerance_qty"], 0.01)
         self.assertEqual(payload["spot_freeze_deviation_notional"], 50.0)
@@ -594,6 +623,34 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertTrue(payload["spot_freeze_pair_release_enabled"])
         self.assertTrue(payload["spot_freeze_profit_release_enabled"])
         self.assertEqual(payload["spot_freeze_release_profit_ratio"], 0.02)
+
+    @patch("grid_optimizer.web._validate_market_symbol")
+    def test_normalize_spot_runner_payload_preserves_spot_app_loss_guard_arguments(
+        self, _mock_validate_symbol
+    ) -> None:
+        payload = _normalize_spot_runner_payload(
+            {
+                "symbol": "megausdt",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "step_price": 0.00003,
+                "per_order_notional": 120,
+                "threshold_position_notional": 800,
+                "threshold_reduce_target_notional": 650,
+                "max_order_position_notional": 7000,
+                "max_position_notional": 8200,
+                "neutral_base_qty": 10000,
+                "max_short_position_notional": 320,
+                "spot_app_loss_guard_enabled": True,
+                "spot_app_loss_min_notional": 5000,
+                "spot_app_loss_per_10k_soft": 1.0,
+                "spot_app_loss_per_10k_hard": 1.5,
+            }
+        )
+
+        self.assertTrue(payload["spot_app_loss_guard_enabled"])
+        self.assertEqual(payload["spot_app_loss_min_notional"], 5000.0)
+        self.assertEqual(payload["spot_app_loss_per_10k_soft"], 1.0)
+        self.assertEqual(payload["spot_app_loss_per_10k_hard"], 1.5)
 
     @patch("grid_optimizer.web.fetch_spot_open_orders")
     @patch("grid_optimizer.web.fetch_spot_account_info")

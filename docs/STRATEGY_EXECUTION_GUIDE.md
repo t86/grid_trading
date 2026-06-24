@@ -498,6 +498,33 @@
 
 ## 额外说明
 
+### Binance APP 现货损耗口径
+
+复核 APP `交易分析` 里的现货交易对损耗时，默认使用和 APP 一致的交易对口径：
+
+`损耗 = 买入总额 - 卖出总额 - 当前持仓数量 * 最新价`
+
+`万U损耗 = 损耗 / (买入总额 + 卖出总额) * 10000`
+
+注意：
+
+- 这里的持仓只指该现货交易对剩余 base 持仓，按同一时刻最新价估值。
+- 手续费在 APP 中单独展示；不要把 BNB 手续费、USDT 手续费或 BNB 余额变化回加到这个损耗公式里。
+- 合约对冲浮盈亏是另一条风险/资产口径，不能用来抵消现货交易分析损耗。
+- 汇报时如果需要同时说明总资产影响，应分开列 `APP交易分析口径`、`手续费/BNB口径` 和 `合约对冲盈亏口径`。
+
+### 现货 synthetic neutral 冻结仓位排查准则
+
+MEGA 2026-06-24 暴露出一个关键问题：配置里看起来“开了冻结”，不代表冻结仓位真的参与了保护。以后 XPL、HYPER 或其它现货交易赛上线前必须逐项确认：
+
+- `synthetic_freeze_enabled` 在 `spot_competition_synthetic_neutral_grid` 下不会直接生效；现货 synthetic neutral 只应看 `spot_freeze_*`。
+- `spot_freeze_enabled=true` 只是入口开关，还必须检查 `spot_freeze_deviation_notional` 是否是实盘可触发阈值。MEGA 当时被设成 `1000000000`，等于永不触发。
+- `spot_freeze` 依赖 runtime `position_lots` 成本源。若 runtime 为空、或 `synthetic_cost_unknown=true`，即使偏离达到阈值，也只能得到 `cost_not_usable` / `insufficient_lots`，不会真正冻结。
+- 未确认成本源、阈值和合约 hedge 对账前，只能用 `spot_freeze_dry_run=true` 观察 `spot_freeze_skip_reason`、`spot_freeze_deviation_notional`、`spot_freeze_deviation_loss_ratio` 和 `spot_freeze_actions`，禁止直接让冻结逻辑下现货市价单。
+- 当前 `spot_freeze` 的现货执行腿是 `MARKET`，不是 maker。目标是尽量 make 时，正式启用自动冻结前必须先完成 maker 化或保持 dry-run，只把 APP 损耗 guard 用作减偏离方向的 maker 过滤。
+- APP 损耗 guard 必须确认 `window_aligned=true`。旧 state 如果只有买卖金额没有买卖数量，应先从同一窗口的 `recent_trades` 回算；无法同源回算时只诊断，不得拦单。
+- 实盘汇报必须同时列：APP 口径损耗/万、maker/taker 笔数、`spot_freeze_skip_reason`、`window_source/window_aligned`、当前偏离名义、冻结 ledger 是否为空。
+
 ### `autotune_symbol_enabled`
 
 如果开启，启动前 web 端会按币种最小 tick、盘口 spread、最小成交额去修正：
