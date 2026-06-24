@@ -1877,17 +1877,41 @@ def _record_spot_freeze_maker_fill(
 
 
 def _spot_freeze_open_maker_orders(open_orders: list[dict[str, Any]], state: dict[str, Any]) -> list[dict[str, Any]]:
-    known_orders = state.get("known_orders") if isinstance(state.get("known_orders"), dict) else {}
+    if not isinstance(state.get("known_orders"), dict):
+        state["known_orders"] = {}
+    known_orders = state["known_orders"]
     matched: list[dict[str, Any]] = []
     for order in list(open_orders or []):
         if not isinstance(order, dict):
             continue
         order_id = str(_safe_int(order.get("orderId", order.get("order_id"))))
-        meta = known_orders.get(order_id) if isinstance(known_orders, dict) else None
+        meta = known_orders.get(order_id)
         client_order_id = str(order.get("clientOrderId", order.get("client_order_id", "")) or "")
-        if (isinstance(meta, dict) and str(meta.get("role", "") or "").strip() == SPOT_FREEZE_MAKER_ROLE) or (
-            SPOT_FREEZE_MAKER_ROLE in client_order_id or "spot_freeze_" in client_order_id
-        ):
+        matched_by_meta = isinstance(meta, dict) and str(meta.get("role", "") or "").strip() == SPOT_FREEZE_MAKER_ROLE
+        matched_by_client_id = SPOT_FREEZE_MAKER_ROLE in client_order_id or "spot_freeze_" in client_order_id
+        if matched_by_meta or matched_by_client_id:
+            side = str(order.get("side", "") or "").upper().strip()
+            if "spot_freeze_short" in client_order_id:
+                tag = "spot_freeze_short"
+            elif "spot_freeze_long" in client_order_id:
+                tag = "spot_freeze_long"
+            elif side == "BUY":
+                tag = "spot_freeze_short"
+            elif side == "SELL":
+                tag = "spot_freeze_long"
+            else:
+                tag = ""
+            if matched_by_client_id and not isinstance(meta, dict) and order_id != "0" and tag:
+                known_orders[order_id] = {
+                    "cell_idx": 0,
+                    "side": side,
+                    "client_order_id": client_order_id,
+                    "created_at_ms": _safe_int(
+                        order.get("time", order.get("workingTime", order.get("transactTime", order.get("updateTime", 0))))
+                    ),
+                    "role": SPOT_FREEZE_MAKER_ROLE,
+                    "tag": tag,
+                }
             matched.append(order)
     return matched
 
@@ -4133,6 +4157,12 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         start_time_ms=trade_start_ms,
         limit=1000,
     )
+    open_orders: list[dict[str, Any]] | None = None
+    strategy_open_orders: list[dict[str, Any]] = []
+    if strategy_mode == "spot_competition_synthetic_neutral_grid":
+        open_orders = fetch_spot_open_orders(symbol, api_key, api_secret)
+        strategy_open_orders = _strategy_open_orders(open_orders, str(args.client_order_prefix))
+        _spot_freeze_open_maker_orders(strategy_open_orders, state)
     if strategy_mode == "spot_one_way_long":
         applied_trades = _sync_static_trades(
             state=state,
@@ -4193,8 +4223,9 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         controls = {}
 
     account_info = fetch_spot_account_info(api_key, api_secret)
-    open_orders = fetch_spot_open_orders(symbol, api_key, api_secret)
-    strategy_open_orders = _strategy_open_orders(open_orders, str(args.client_order_prefix))
+    if open_orders is None:
+        open_orders = fetch_spot_open_orders(symbol, api_key, api_secret)
+        strategy_open_orders = _strategy_open_orders(open_orders, str(args.client_order_prefix))
     if strategy_mode == "spot_competition_synthetic_neutral_grid":
         trades, refreshed_applied_trades = _refresh_spot_trades_after_account_snapshot(
             state=state,

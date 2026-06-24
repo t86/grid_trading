@@ -31,6 +31,7 @@ from grid_optimizer.spot_loop_runner import (
     _spot_order_meets_exchange_mins,
     _spot_app_loss_mark_price,
     _spot_app_loss_metrics_with_trade_fallback,
+    _spot_freeze_open_maker_orders,
     _refresh_spot_trades_after_account_snapshot,
     _sync_synthetic_neutral_trades,
     _sync_volume_shift_trades,
@@ -2213,6 +2214,62 @@ class SpotLoopRunnerTests(unittest.TestCase):
         )
         self.assertEqual(ledger["frozen_short_qty"], 3.5)
 
+    def test_spot_freeze_open_maker_orders_recovers_known_order_from_client_id(self) -> None:
+        state = {
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "known_orders": {},
+            "spot_frozen_ledger": new_ledger(),
+        }
+
+        matched = _spot_freeze_open_maker_orders(
+            [
+                {
+                    "orderId": 7002,
+                    "clientOrderId": "sgxpl114_spot_freeze_short_b_123456",
+                    "side": "BUY",
+                    "price": "0.0887",
+                    "origQty": "676.0",
+                }
+            ],
+            state,
+        )
+
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(
+            state["known_orders"]["7002"],
+            {
+                "cell_idx": 0,
+                "side": "BUY",
+                "client_order_id": "sgxpl114_spot_freeze_short_b_123456",
+                "created_at_ms": 0,
+                "role": "spot_freeze_maker",
+                "tag": "spot_freeze_short",
+            },
+        )
+
+    def test_spot_freeze_open_maker_orders_does_not_default_unknown_direction_to_long(self) -> None:
+        state = {
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "known_orders": {},
+            "spot_frozen_ledger": new_ledger(),
+        }
+
+        matched = _spot_freeze_open_maker_orders(
+            [
+                {
+                    "orderId": 7003,
+                    "clientOrderId": "sgxpl114_spot_freeze_maker_x_123456",
+                    "side": "",
+                    "price": "0.0887",
+                    "origQty": "676.0",
+                }
+            ],
+            state,
+        )
+
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(state["known_orders"], {})
+
     def test_sync_synthetic_neutral_spot_freeze_maker_fill_is_ledger_idempotent(self) -> None:
         ledger = new_ledger()
         ledger["long_lots"] = [{"lot_id": "spot_freeze_maker_9001", "qty": 3.5, "cost_price": 10.0}]
@@ -3918,6 +3975,86 @@ class SpotLoopRunnerTests(unittest.TestCase):
             saved = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["spot_frozen_ledger"]["frozen_short_qty"], 5.0)
             self.assertEqual(saved["spot_frozen_ledger"]["short_lots"], [{"lot_id": "spot_freeze_1", "qty": 5.0}])
+
+    def test_run_cycle_recovers_spot_freeze_open_order_before_trade_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            summary_path = Path(tmpdir) / "events.jsonl"
+            args = self._synthetic_args(
+                [
+                    "--state-path",
+                    str(state_path),
+                    "--summary-jsonl",
+                    str(summary_path),
+                    "--no-cancel-stale",
+                ]
+            )
+            symbol_info = {
+                "base_asset": "WLD",
+                "quote_asset": "USDT",
+                "tick_size": 0.01,
+                "step_size": 0.001,
+                "min_qty": 0.001,
+                "min_notional": 5.0,
+            }
+            trades = [
+                {
+                    "id": 9002,
+                    "orderId": 7002,
+                    "time": 1782306000000,
+                    "price": "10.0",
+                    "qty": "3.5",
+                    "commission": "0",
+                    "commissionAsset": "BNB",
+                    "isMaker": True,
+                }
+            ]
+            open_orders = [
+                {
+                    "orderId": 7002,
+                    "clientOrderId": "spotgrid_spot_freeze_short_b_123456",
+                    "side": "BUY",
+                    "price": "10.0",
+                    "origQty": "5.0",
+                    "executedQty": "3.5",
+                    "status": "PARTIALLY_FILLED",
+                }
+            ]
+
+            with patch("grid_optimizer.spot_loop_runner.fetch_spot_book_tickers", return_value=[{"bid_price": "9.99", "ask_price": "10.01"}]):
+                with patch("grid_optimizer.spot_loop_runner.fetch_spot_user_trades", return_value=trades):
+                    with patch(
+                        "grid_optimizer.spot_loop_runner.fetch_spot_account_info",
+                        return_value={
+                            "balances": [
+                                {"asset": "WLD", "free": "96.5", "locked": "3.5"},
+                                {"asset": "USDT", "free": "1000", "locked": "0"},
+                            ]
+                        },
+                    ):
+                        with patch("grid_optimizer.spot_loop_runner.fetch_spot_open_orders", return_value=open_orders):
+                            with patch(
+                                "grid_optimizer.spot_loop_runner._build_spot_competition_inventory_grid_orders",
+                                return_value=([], {"actual_base_qty": 100.0, "neutral_base_qty": 100.0, "_runtime": {}}),
+                            ):
+                                summary = _run_cycle(args, symbol_info, api_key="key", api_secret="secret")
+
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            ledger = saved["spot_frozen_ledger"]
+            self.assertEqual(summary["applied_trades"], 1)
+            self.assertEqual(ledger["short_lots"][0]["lot_id"], "spot_freeze_maker_9002")
+            self.assertEqual(
+                ledger["pending_contract_actions"],
+                [
+                    {
+                        "side": "SELL",
+                        "position_side": "SHORT",
+                        "qty": 3.5,
+                        "reason": "freeze_short_hedge",
+                        "lot_id": "spot_freeze_maker_9002",
+                    }
+                ],
+            )
 
     def test_run_cycle_app_loss_guard_uses_raw_trades_when_known_orders_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
