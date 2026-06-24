@@ -765,6 +765,38 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("spot_freeze", str(raised.exception))
 
     @patch("grid_optimizer.web._spot_freeze_live_hedge_preflight_reason", return_value=None)
+    def test_spot_runner_preflight_rejects_undersized_spot_freeze_total_cap(
+        self,
+        _mock_live_hedge,
+    ) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "XPLUSDT",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "spot_app_loss_guard_enabled": True,
+                "spot_app_loss_recovery_reduce_only_enabled": True,
+                "spot_app_loss_prestart_gate_enabled": True,
+                "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
+                "runtime_guard_stats_start_time": "2026-06-24T19:57:00+08:00",
+                "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks": 3.0,
+                "spot_freeze_enabled": True,
+                "spot_freeze_maker_execution_enabled": True,
+                "spot_freeze_base_hedge_qty": 4800.0,
+                "spot_freeze_deviation_notional": 60.0,
+                "spot_freeze_total_cap_notional": 60.0,
+                "spot_freeze_max_per_cycle_notional": 20.0,
+                "max_short_position_notional": 240.0,
+            }
+        )
+
+        with self.assertRaises(ValueError) as raised:
+            web._runner_start_safety_preflight(config, spot=True)
+
+        self.assertIn("spot_freeze_total_cap_notional", str(raised.exception))
+        self.assertIn("max_short_position_notional", str(raised.exception))
+
+    @patch("grid_optimizer.web._spot_freeze_live_hedge_preflight_reason", return_value=None)
     def test_spot_runner_preflight_rejects_stale_app_loss_state_metrics(
         self,
         _mock_live_hedge,

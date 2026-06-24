@@ -8837,6 +8837,12 @@ def _runner_start_safety_preflight(
                     "max_short_position_notional 小于 spot_freeze 首次冻结所需短侧容量，"
                     "短偏离发生时可能补不回 neutral"
                 )
+            total_cap = max(_safe_optional_float(config.get("spot_freeze_total_cap_notional")) or 0.0, 0.0)
+            if total_cap + 1e-12 < short_capacity:
+                reasons.append(
+                    "spot_freeze_total_cap_notional 小于 max_short_position_notional，"
+                    "冻结总容量不足会导致短偏离刚开始恢复就 total_cap_reached"
+                )
         if (
             strategy_mode == "spot_competition_synthetic_neutral_grid"
             and _truthy(config.get("spot_freeze_enabled", False))
