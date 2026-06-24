@@ -45,7 +45,14 @@ from .inventory_grid_state import (
 from .semi_auto_plan import diff_open_orders
 from .submit_plan import _ignore_noop_error
 from .spot_flatten_runner import load_live_spot_flatten_snapshot, spot_flatten_client_order_prefix
-from .spot_freeze_manager import FreezeConfig, compute_deviation_loss, expected_short_position_now, freeze_cycle, new_ledger
+from .spot_freeze_manager import (
+    DeviationLossResult,
+    FreezeConfig,
+    compute_deviation_loss,
+    expected_short_position_now,
+    freeze_cycle,
+    new_ledger,
+)
 from .trade_database import ensure_trade_database_schema, persist_cycle_snapshot, persist_trade_rows, trade_database_enabled
 
 STATE_VERSION = 2
@@ -2762,6 +2769,8 @@ def _make_spot_freeze_contract_callback(*, symbol: str, api_key: str, api_secret
 def _spot_freeze_default_controls(enabled: bool) -> dict[str, Any]:
     return {
         "spot_freeze_enabled": bool(enabled),
+        "spot_freeze_effective_enabled": bool(enabled),
+        "spot_freeze_config_reason": "enabled" if enabled else "disabled",
         "spot_freeze_dry_run": False,
         "spot_freeze_market_execution_enabled": False,
         "spot_freeze_reconcile_ok": None,
@@ -2787,6 +2796,54 @@ def _spot_freeze_common_qty_step(symbol: str, symbol_info: dict[str, Any]) -> fl
     futures_info = fetch_futures_symbol_config(symbol)
     futures_step = max(_safe_float(futures_info.get("step_size")), 0.0) if isinstance(futures_info, dict) else 0.0
     return max(spot_step, futures_step)
+
+
+def _spot_freeze_threshold_effectively_disables(args: argparse.Namespace, deviation_threshold: float) -> bool:
+    threshold = max(_safe_float(deviation_threshold), 0.0)
+    if threshold <= EPSILON:
+        return False
+    capacity = max(
+        max(_safe_float(getattr(args, "spot_freeze_total_cap_notional", 0.0)), 0.0),
+        max(_safe_float(getattr(args, "spot_freeze_max_per_cycle_notional", 0.0)), 0.0),
+        max(_safe_float(getattr(args, "max_position_notional", 0.0)), 0.0),
+        max(_safe_float(getattr(args, "max_short_position_notional", 0.0)), 0.0),
+        max(_safe_float(getattr(args, "threshold_position_notional", 0.0)), 0.0),
+        max(_safe_float(getattr(args, "max_order_position_notional", 0.0)), 0.0),
+        max(_safe_float(getattr(args, "per_order_notional", 0.0)), 0.0),
+    )
+    return capacity > EPSILON and threshold >= capacity * 1000.0
+
+
+def _spot_freeze_app_loss_deviation_loss(
+    *,
+    controls: dict[str, Any],
+    mid_price: float,
+    deviation_side: str,
+    deviation_qty: float,
+) -> DeviationLossResult | None:
+    if str(deviation_side or "").strip().lower() != "long":
+        return None
+    guard = controls.get("spot_app_loss_guard")
+    if not isinstance(guard, dict):
+        return None
+    if str(guard.get("window_source", "") or "").strip() != "metrics":
+        return None
+    if not bool(guard.get("window_aligned")):
+        return None
+    buy_qty = max(_safe_float(guard.get("buy_qty")), 0.0)
+    sell_qty = max(_safe_float(guard.get("sell_qty")), 0.0)
+    app_position_qty = max(_safe_float(guard.get("position_qty")), 0.0)
+    required_qty = max(_safe_float(deviation_qty), 0.0)
+    if buy_qty <= sell_qty + EPSILON or app_position_qty + EPSILON < required_qty or required_qty <= EPSILON:
+        return None
+    cost_basis = max(_safe_float(guard.get("buy_notional")) - _safe_float(guard.get("sell_notional")), 0.0)
+    if cost_basis <= EPSILON:
+        return None
+    cost_avg = cost_basis / app_position_qty
+    if cost_avg <= EPSILON:
+        return None
+    loss_ratio = max(cost_avg - max(_safe_float(mid_price), 0.0), 0.0) / cost_avg
+    return DeviationLossResult(usable=True, loss_ratio=loss_ratio, cost_avg=cost_avg, reason="app_loss_guard")
 
 
 def _maybe_run_spot_freeze(
@@ -2817,6 +2874,11 @@ def _maybe_run_spot_freeze(
     controls["spot_freeze_deviation_side"] = deviation_side
     controls["spot_freeze_deviation_notional"] = deviation_notional
     controls["spot_freeze_deviation_threshold_notional"] = deviation_threshold
+    threshold_disables = enabled and _spot_freeze_threshold_effectively_disables(args, deviation_threshold)
+    controls["spot_freeze_effective_enabled"] = bool(enabled and not threshold_disables)
+    controls["spot_freeze_config_reason"] = (
+        "deviation_threshold_disables" if threshold_disables else "enabled" if enabled else "disabled"
+    )
     if not enabled:
         return
 
@@ -2848,10 +2910,22 @@ def _maybe_run_spot_freeze(
 
     runtime = controls.get("_runtime") if isinstance(controls.get("_runtime"), dict) else {}
     loss = compute_deviation_loss(runtime, neutral_base_qty, mid_price, deviation_side, deviation_qty)
+    loss_source = "runtime"
+    if not loss.usable:
+        fallback_loss = _spot_freeze_app_loss_deviation_loss(
+            controls=controls,
+            mid_price=mid_price,
+            deviation_side=deviation_side,
+            deviation_qty=deviation_qty,
+        )
+        if fallback_loss is not None:
+            loss = fallback_loss
+            loss_source = "app_loss_guard"
     controls["spot_freeze_loss_ratio_usable"] = bool(loss.usable)
     controls["spot_freeze_deviation_loss_ratio"] = _safe_float(loss.loss_ratio)
     controls["spot_freeze_deviation_cost_avg"] = _safe_float(loss.cost_avg)
     controls["spot_freeze_deviation_loss_reason"] = str(loss.reason or "")
+    controls["spot_freeze_deviation_loss_source"] = loss_source
     min_loss_ratio = max(_safe_float(getattr(args, "spot_freeze_min_loss_ratio", 0.0)), 0.0)
     if deviation_notional <= deviation_threshold + EPSILON:
         controls["spot_freeze_skip_reason"] = "below_deviation_threshold"
@@ -4093,6 +4167,8 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "synthetic_frozen_short_quote_reserve": _safe_float(controls.get("synthetic_frozen_short_quote_reserve")),
         "max_short_position_notional": _safe_float(controls.get("max_short_position_notional")),
         "spot_freeze_enabled": bool(controls.get("spot_freeze_enabled")),
+        "spot_freeze_effective_enabled": bool(controls.get("spot_freeze_effective_enabled")),
+        "spot_freeze_config_reason": str(controls.get("spot_freeze_config_reason", "") or ""),
         "spot_freeze_dry_run": bool(controls.get("spot_freeze_dry_run")),
         "spot_freeze_market_execution_enabled": bool(controls.get("spot_freeze_market_execution_enabled")),
         "spot_freeze_reconcile_ok": controls.get("spot_freeze_reconcile_ok"),
@@ -4109,6 +4185,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "spot_freeze_deviation_loss_ratio": _safe_float(controls.get("spot_freeze_deviation_loss_ratio")),
         "spot_freeze_deviation_cost_avg": _safe_float(controls.get("spot_freeze_deviation_cost_avg")),
         "spot_freeze_deviation_loss_reason": str(controls.get("spot_freeze_deviation_loss_reason", "") or ""),
+        "spot_freeze_deviation_loss_source": str(controls.get("spot_freeze_deviation_loss_source", "") or ""),
         "spot_freeze_skip_reason": str(controls.get("spot_freeze_skip_reason", "") or ""),
         "spot_freeze_gate": controls.get("spot_freeze_gate", {}),
         "spot_app_loss_guard": controls.get("spot_app_loss_guard", {}),
