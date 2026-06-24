@@ -792,6 +792,107 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(controls["spot_app_loss_guard"]["capped_order_count"], 1)
         self.assertIn("spot_app_loss_guard_bid_buffer_below_min", controls["pause_reasons"])
 
+    def test_spot_app_loss_guard_drops_buy_that_would_project_bid_buffer_too_low(self) -> None:
+        controls = {"actual_base_qty": 100.0, "neutral_base_qty": 100.0}
+        desired_orders = [
+            {"side": "BUY", "role": "grid_entry", "price": 1.04, "qty": 100.0},
+            {"side": "SELL", "role": "grid_exit", "price": 1.05, "qty": 10.0},
+        ]
+
+        filtered = _apply_spot_app_loss_guard_to_orders(
+            desired_orders=desired_orders,
+            controls=controls,
+            metrics={"buy_notional": 1000.0, "sell_notional": 900.0, "buy_qty": 1000.0, "sell_qty": 900.0},
+            position_qty=100.0,
+            latest_price=1.04,
+            maker_buy_reference_price=1.04,
+            maker_sell_reference_price=1.05,
+            enabled=True,
+            recovery_reduce_only_enabled=True,
+            min_notional=10.0,
+            soft_per_10k=1.0,
+            hard_per_10k=2.0,
+            maker_reduce_notional=10.0,
+            tick_size=0.01,
+            step_size=0.1,
+            min_qty=0.1,
+            exchange_min_notional=5.0,
+            available_quote_free=1000.0,
+            available_base_free=100.0,
+            min_bid_break_even_buffer_ticks=3.0,
+        )
+
+        self.assertEqual([order["side"] for order in filtered], ["SELL"])
+        self.assertEqual(controls["spot_app_loss_guard"]["state"], "cruise")
+        self.assertEqual(controls["spot_app_loss_guard"]["projected_bid_buffer_dropped_buy_count"], 1)
+        self.assertIn("spot_app_loss_guard_projected_bid_buffer_below_min", controls["pause_reasons"])
+
+    def test_spot_app_loss_guard_drops_oversized_short_recovery_buy_in_cruise(self) -> None:
+        controls = {"actual_base_qty": 80.0, "neutral_base_qty": 100.0}
+        desired_orders = [
+            {"side": "BUY", "role": "grid_entry", "price": 1.04, "qty": 100.0},
+        ]
+
+        filtered = _apply_spot_app_loss_guard_to_orders(
+            desired_orders=desired_orders,
+            controls=controls,
+            metrics={"buy_notional": 1000.0, "sell_notional": 900.0, "buy_qty": 1000.0, "sell_qty": 900.0},
+            position_qty=80.0,
+            latest_price=1.04,
+            maker_buy_reference_price=1.04,
+            maker_sell_reference_price=1.05,
+            enabled=True,
+            recovery_reduce_only_enabled=False,
+            min_notional=10.0,
+            soft_per_10k=1.0,
+            hard_per_10k=2.0,
+            maker_reduce_notional=10.0,
+            tick_size=0.01,
+            step_size=0.1,
+            min_qty=0.1,
+            exchange_min_notional=5.0,
+            available_quote_free=1000.0,
+            available_base_free=80.0,
+            min_bid_break_even_buffer_ticks=3.0,
+        )
+
+        self.assertEqual(filtered, [])
+        self.assertEqual(controls["spot_app_loss_guard"]["projected_bid_buffer_dropped_buy_count"], 1)
+        self.assertIn("spot_app_loss_guard_projected_bid_buffer_below_min", controls["pause_reasons"])
+
+    def test_spot_app_loss_guard_keeps_short_recovery_buy_within_neutral_in_cruise(self) -> None:
+        controls = {"actual_base_qty": 80.0, "neutral_base_qty": 100.0}
+        desired_orders = [
+            {"side": "BUY", "role": "grid_entry", "price": 1.04, "qty": 20.0},
+        ]
+
+        filtered = _apply_spot_app_loss_guard_to_orders(
+            desired_orders=desired_orders,
+            controls=controls,
+            metrics={"buy_notional": 1000.0, "sell_notional": 900.0, "buy_qty": 1000.0, "sell_qty": 900.0},
+            position_qty=80.0,
+            latest_price=1.04,
+            maker_buy_reference_price=1.04,
+            maker_sell_reference_price=1.05,
+            enabled=True,
+            recovery_reduce_only_enabled=False,
+            min_notional=10.0,
+            soft_per_10k=1.0,
+            hard_per_10k=2.0,
+            maker_reduce_notional=10.0,
+            tick_size=0.01,
+            step_size=0.1,
+            min_qty=0.1,
+            exchange_min_notional=5.0,
+            available_quote_free=1000.0,
+            available_base_free=80.0,
+            min_bid_break_even_buffer_ticks=3.0,
+        )
+
+        self.assertEqual([order["side"] for order in filtered], ["BUY"])
+        self.assertEqual(filtered[0]["role"], "grid_entry")
+        self.assertEqual(controls["spot_app_loss_guard"]["projected_bid_buffer_dropped_buy_count"], 0)
+
     def test_spot_app_loss_guard_injects_buy_at_buy_reference(self) -> None:
         controls = {"actual_base_qty": 80.0, "neutral_base_qty": 100.0}
 

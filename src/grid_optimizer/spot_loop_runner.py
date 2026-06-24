@@ -1163,6 +1163,85 @@ def _cap_spot_app_loss_reduce_orders(
     return capped_orders
 
 
+def _drop_spot_app_loss_projected_bid_buffer_buy_orders(
+    *,
+    orders: list[dict[str, Any]],
+    controls: dict[str, Any],
+    guard: dict[str, Any],
+    tick_size: float | None,
+) -> list[dict[str, Any]]:
+    min_bid_buffer = max(_safe_float(guard.get("min_bid_break_even_buffer_ticks")), 0.0)
+    tick = max(_safe_float(tick_size), 0.0)
+    mark_price = max(_safe_float(guard.get("latest_price")), 0.0)
+    if (
+        min_bid_buffer <= EPSILON
+        or tick <= EPSILON
+        or mark_price <= EPSILON
+        or not bool(guard.get("enabled"))
+        or not bool(guard.get("window_aligned"))
+        or _safe_float(guard.get("gross_notional")) + EPSILON < _safe_float(guard.get("min_notional"))
+        or bool(guard.get("bid_break_even_buffer_below_min"))
+        or str(guard.get("state", "") or "").strip().lower() in {"defensive", "blocked", "recovery_reduce_only"}
+    ):
+        guard["projected_bid_buffer_dropped_buy_count"] = 0
+        return orders
+    neutral_base_qty = max(_safe_float(controls.get("neutral_base_qty")), 0.0)
+    recovery_budget_qty = 0.0
+    if neutral_base_qty > EPSILON or "synthetic_net_qty" in controls:
+        recovery_budget_qty = max(neutral_base_qty - _safe_float(controls.get("actual_base_qty")), 0.0)
+
+    buy_notional = max(_safe_float(guard.get("buy_notional")), 0.0)
+    sell_notional = max(_safe_float(guard.get("sell_notional")), 0.0)
+    buy_qty = max(_safe_float(guard.get("buy_qty")), 0.0)
+    sell_qty = max(_safe_float(guard.get("sell_qty")), 0.0)
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    for order in orders:
+        if str(order.get("side", "") or "").upper().strip() != "BUY":
+            kept.append(order)
+            continue
+        price = max(_safe_float(order.get("price")), 0.0)
+        qty = max(_safe_float(order.get("qty")), 0.0)
+        notional = max(_safe_float(order.get("notional")), 0.0)
+        if notional <= EPSILON:
+            notional = price * qty
+        projected_qty = buy_qty + qty - sell_qty
+        projected_notional = buy_notional + notional - sell_notional
+        projected_break_even = projected_notional / projected_qty if projected_qty > EPSILON else 0.0
+        projected_buffer = (mark_price - projected_break_even) / tick if projected_break_even > EPSILON else min_bid_buffer
+        if recovery_budget_qty > EPSILON:
+            if qty <= recovery_budget_qty + EPSILON:
+                kept.append(order)
+                recovery_budget_qty = max(recovery_budget_qty - qty, 0.0)
+                buy_qty += qty
+                buy_notional += notional
+                continue
+            if projected_buffer + EPSILON >= min_bid_buffer:
+                kept.append(order)
+                recovery_budget_qty = 0.0
+                buy_qty += qty
+                buy_notional += notional
+                continue
+            recovery_budget_qty = 0.0
+            dropped += 1
+            continue
+        if projected_buffer + EPSILON < min_bid_buffer:
+            dropped += 1
+            continue
+        kept.append(order)
+        buy_qty += qty
+        buy_notional += notional
+    guard["projected_bid_buffer_dropped_buy_count"] = dropped
+    if dropped > 0:
+        pause_reasons = list(controls.get("pause_reasons") or [])
+        reason = "spot_app_loss_guard_projected_bid_buffer_below_min"
+        if reason not in pause_reasons:
+            pause_reasons.append(reason)
+        controls["pause_reasons"] = pause_reasons
+        controls["buy_paused"] = True
+    return kept
+
+
 def _build_spot_app_loss_maker_reduce_order(
     *,
     controls: dict[str, Any],
@@ -1246,19 +1325,28 @@ def _apply_spot_app_loss_guard_to_orders(
         min_bid_break_even_buffer_ticks=min_bid_break_even_buffer_ticks,
     )
     controls["spot_app_loss_guard"] = guard
+    reduce_side = ""
+    if guard["state"] == "recovery_reduce_only":
+        reduce_side = _spot_app_loss_reduce_side(controls, position_qty, app_position_qty=guard.get("position_qty"))
+        if not reduce_side:
+            guard["state"] = "cruise"
+            guard["action"] = "observe"
+            guard["reduce_side"] = ""
+            guard["dropped_order_count"] = 0
+            guard["injected_order_count"] = 0
+            guard["capped_order_count"] = 0
+            guard["reduce_deviation_qty"] = 0.0
+    desired_orders = _drop_spot_app_loss_projected_bid_buffer_buy_orders(
+        orders=desired_orders,
+        controls=controls,
+        guard=guard,
+        tick_size=tick_size,
+    )
     if guard["state"] not in {"defensive", "blocked", "recovery_reduce_only"}:
         return desired_orders
 
-    reduce_side = _spot_app_loss_reduce_side(controls, position_qty, app_position_qty=guard.get("position_qty"))
-    if guard["state"] == "recovery_reduce_only" and not reduce_side:
-        guard["state"] = "cruise"
-        guard["action"] = "observe"
-        guard["reduce_side"] = ""
-        guard["dropped_order_count"] = 0
-        guard["injected_order_count"] = 0
-        guard["capped_order_count"] = 0
-        guard["reduce_deviation_qty"] = 0.0
-        return desired_orders
+    if not reduce_side:
+        reduce_side = _spot_app_loss_reduce_side(controls, position_qty, app_position_qty=guard.get("position_qty"))
     if reduce_side == "BUY":
         reduce_reference_price = maker_buy_reference_price if maker_buy_reference_price is not None else maker_reference_price
     else:
