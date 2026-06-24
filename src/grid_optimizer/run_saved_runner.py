@@ -13,6 +13,7 @@ from .web import (
     _build_spot_runner_command,
     _load_runner_control_config,
     _load_spot_runner_control_config,
+    _runner_start_safety_preflight,
     _runner_control_path,
     _spot_runner_control_path,
 )
@@ -149,6 +150,7 @@ def main() -> None:
     atexit.register(_cleanup_pid, pid_path)
     if _should_use_spot_runner(symbol):
         config = _load_spot_runner_control_config(symbol)
+        _runner_start_safety_preflight(config, spot=True)
         gate_code = _run_spot_app_loss_prestart_gate(config)
         if gate_code != 0:
             raise SystemExit(gate_code)

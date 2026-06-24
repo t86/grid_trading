@@ -8594,6 +8594,23 @@ def _safe_optional_float(value: Any) -> float | None:
         return None
 
 
+def _spot_freeze_threshold_effectively_disables_config(config: dict[str, Any]) -> bool:
+    threshold = _safe_optional_float(config.get("spot_freeze_deviation_notional")) or 0.0
+    threshold = max(threshold, 0.0)
+    if threshold <= 0.0:
+        return False
+    capacity = max(
+        max(_safe_optional_float(config.get("spot_freeze_total_cap_notional")) or 0.0, 0.0),
+        max(_safe_optional_float(config.get("spot_freeze_max_per_cycle_notional")) or 0.0, 0.0),
+        max(_safe_optional_float(config.get("max_position_notional")) or 0.0, 0.0),
+        max(_safe_optional_float(config.get("max_short_position_notional")) or 0.0, 0.0),
+        max(_safe_optional_float(config.get("threshold_position_notional")) or 0.0, 0.0),
+        max(_safe_optional_float(config.get("max_order_position_notional")) or 0.0, 0.0),
+        max(_safe_optional_float(config.get("per_order_notional")) or 0.0, 0.0),
+    )
+    return capacity > 0.0 and threshold >= capacity * 1000.0
+
+
 def _runner_start_safety_preflight(
     config: dict[str, Any],
     *,
@@ -8679,12 +8696,22 @@ def _runner_start_safety_preflight(
         app_loss_recovery = _truthy(config.get("spot_app_loss_guard_enabled", False)) or _truthy(
             config.get("spot_app_loss_recovery_reduce_only_enabled", False)
         )
+        competition_spot_recovery = strategy_mode == "spot_competition_synthetic_neutral_grid" and app_loss_recovery
         if (
-            strategy_mode == "spot_competition_synthetic_neutral_grid"
-            and app_loss_recovery
+            competition_spot_recovery
             and not _truthy(config.get("spot_app_loss_prestart_gate_enabled", False))
         ):
             reasons.append("交易赛现货启用 APP loss guard/recovery 时必须启用 spot_app_loss_prestart_gate_enabled")
+        if competition_spot_recovery and not _truthy(config.get("spot_freeze_enabled", False)):
+            reasons.append("交易赛现货启用 APP loss guard/recovery 时必须启用 spot_freeze_enabled")
+        if competition_spot_recovery and not _truthy(config.get("spot_freeze_maker_execution_enabled", False)):
+            reasons.append("交易赛现货低损恢复必须启用 spot_freeze_maker_execution_enabled")
+        if (
+            strategy_mode == "spot_competition_synthetic_neutral_grid"
+            and _truthy(config.get("spot_freeze_enabled", False))
+            and _spot_freeze_threshold_effectively_disables_config(config)
+        ):
+            reasons.append("spot_freeze_deviation_notional 过大，当前冻结仓位配置实际不会触发")
 
     if reasons:
         raise ValueError(

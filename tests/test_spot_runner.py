@@ -581,6 +581,89 @@ class SpotRunnerTests(unittest.TestCase):
 
         self.assertIn("spot_app_loss_prestart_gate_enabled", str(raised.exception))
 
+    @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
+    def test_start_spot_runner_process_requires_spot_freeze_for_app_loss_recovery(
+        self,
+        mock_read_runner,
+    ) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "XPLUSDT",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "spot_app_loss_guard_enabled": True,
+                "spot_app_loss_recovery_reduce_only_enabled": True,
+                "spot_app_loss_prestart_gate_enabled": True,
+                "spot_freeze_enabled": False,
+            }
+        )
+        mock_read_runner.return_value = {"configured": False, "pid": None, "is_running": False, "args": None, "config": {}}
+
+        with self.assertRaises(ValueError) as raised:
+            _start_spot_runner_process(config)
+
+        self.assertIn("spot_freeze_enabled", str(raised.exception))
+
+    @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
+    def test_start_spot_runner_process_rejects_ineffective_spot_freeze_config(
+        self,
+        mock_read_runner,
+    ) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "MEGAUSDT",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "spot_app_loss_guard_enabled": True,
+                "spot_app_loss_recovery_reduce_only_enabled": True,
+                "spot_app_loss_prestart_gate_enabled": True,
+                "spot_freeze_enabled": True,
+                "spot_freeze_maker_execution_enabled": True,
+                "spot_freeze_deviation_notional": 1_000_000_000.0,
+                "spot_freeze_total_cap_notional": 900.0,
+                "spot_freeze_max_per_cycle_notional": 180.0,
+                "max_position_notional": 700.0,
+                "max_short_position_notional": 700.0,
+                "threshold_position_notional": 520.0,
+                "max_order_position_notional": 700.0,
+                "per_order_notional": 300.0,
+            }
+        )
+        mock_read_runner.return_value = {"configured": False, "pid": None, "is_running": False, "args": None, "config": {}}
+
+        with self.assertRaises(ValueError) as raised:
+            _start_spot_runner_process(config)
+
+        self.assertIn("spot_freeze_deviation_notional", str(raised.exception))
+
+    @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
+    def test_start_spot_runner_process_requires_spot_freeze_maker_execution(
+        self,
+        mock_read_runner,
+    ) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "XPLUSDT",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "spot_app_loss_guard_enabled": True,
+                "spot_app_loss_recovery_reduce_only_enabled": True,
+                "spot_app_loss_prestart_gate_enabled": True,
+                "spot_freeze_enabled": True,
+                "spot_freeze_maker_execution_enabled": False,
+                "spot_freeze_deviation_notional": 50.0,
+                "spot_freeze_total_cap_notional": 900.0,
+                "spot_freeze_max_per_cycle_notional": 180.0,
+                "per_order_notional": 60.0,
+            }
+        )
+        mock_read_runner.return_value = {"configured": False, "pid": None, "is_running": False, "args": None, "config": {}}
+
+        with self.assertRaises(ValueError) as raised:
+            _start_spot_runner_process(config)
+
+        self.assertIn("spot_freeze_maker_execution_enabled", str(raised.exception))
+
     def test_build_spot_runner_command_includes_competition_inventory_grid_arguments(self) -> None:
         config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
         config.update(

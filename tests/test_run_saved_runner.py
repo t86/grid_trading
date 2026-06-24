@@ -223,6 +223,47 @@ class RunSavedRunnerTests(unittest.TestCase):
                 "--require-gate",
             ]
         )
+
+    @patch("grid_optimizer.run_saved_runner.os.chdir")
+    @patch("grid_optimizer.run_saved_runner.os.getcwd", return_value="/repo")
+    @patch("grid_optimizer.run_saved_runner.atexit.register")
+    @patch("grid_optimizer.run_saved_runner._write_pid")
+    @patch("grid_optimizer.run_saved_runner.os.execvpe")
+    @patch("grid_optimizer.run_saved_runner._should_use_spot_runner", return_value=True)
+    @patch("grid_optimizer.run_saved_runner._build_spot_runner_command")
+    @patch("grid_optimizer.run_saved_runner._load_spot_runner_control_config")
+    @patch("grid_optimizer.run_saved_runner.spot_app_loss_audit_main", return_value=0)
+    def test_main_blocks_spot_runner_when_freeze_preflight_rejects_app_loss_recovery(
+        self,
+        mock_app_loss_audit_main,
+        mock_load_spot_runner_control_config,
+        mock_build_spot_runner_command,
+        _mock_should_use_spot_runner,
+        mock_execvpe,
+        _mock_write_pid,
+        _mock_atexit_register,
+        _mock_getcwd,
+        _mock_chdir,
+    ) -> None:
+        mock_load_spot_runner_control_config.return_value = {
+            "symbol": "XPLUSDT",
+            "market_type": "spot",
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "spot_app_loss_guard_enabled": True,
+            "spot_app_loss_recovery_reduce_only_enabled": True,
+            "spot_app_loss_prestart_gate_enabled": True,
+            "spot_freeze_enabled": False,
+            "summary_jsonl": "",
+        }
+
+        with patch.dict("os.environ", {}, clear=True), patch.object(
+            sys, "argv", ["run_saved_runner.py", "--symbol", "xplusdt"]
+        ):
+            with self.assertRaises(ValueError) as raised:
+                run_saved_runner.main()
+
+        self.assertIn("spot_freeze_enabled", str(raised.exception))
+        mock_app_loss_audit_main.assert_not_called()
         mock_build_spot_runner_command.assert_not_called()
         mock_execvpe.assert_not_called()
 
