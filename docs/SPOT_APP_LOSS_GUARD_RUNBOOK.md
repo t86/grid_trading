@@ -66,8 +66,22 @@ APP 万U损耗 = APP 损耗 / (买入成交额 + 卖出成交额) * 10000
 PYTHONPATH=src python -m grid_optimizer.spot_app_loss_audit --symbol XPLUSDT --start-time 2026-06-24T11:57:00Z --require-gate
 ```
 
-- 审计结果中的 `recovery_gate.allowed` 必须为 `true`，否则不恢复。带 `--require-gate` 时，gate 不通过会以非 0 退出码结束，启动脚本必须用它硬性阻断恢复。默认 gate 要求：APP 万U损耗不高于 `10`，maker 占比不低于 `0.99`，如果窗口净多则安全 maker SELL 价距离当前 ask 不超过 `2` 个 tick，且 `myTrades` 结果没有被 `limit` 截断。
+- 审计结果中的 `recovery_gate.allowed` 必须为 `true`，否则不恢复。带 `--require-gate` 时，gate 不通过会以非 0 退出码结束。恢复目标是 APP 万U损耗低于 `1` 或转正；maker 占比不低于 `0.99`；如果窗口净多，安全 maker SELL 价距离当前 ask 不超过 `2` 个 tick；`myTrades` 结果不能被 `limit` 截断。
+- 通过 `/usr/local/bin/grid-saved-runner` 或 systemd 恢复前，控制文件必须显式保留预启动门禁：
+
+```json
+{
+  "spot_app_loss_prestart_gate_enabled": true,
+  "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
+  "spot_app_loss_prestart_gate_max_loss_per_10k": 1.0,
+  "spot_app_loss_prestart_gate_max_safe_sell_gap_ticks": 2.0,
+  "spot_app_loss_prestart_gate_min_maker_ratio": 0.99,
+  "spot_app_loss_prestart_gate_min_gross_notional": 5000.0
+}
+```
+
+`grid_optimizer.run_saved_runner` 会在执行真实 runner 前调用同一审计命令；门禁非 0 时直接退出，不会启动 spot runner。Web 保存现货 runner 配置时也必须保留这一组 `spot_app_loss_prestart_gate_` 字段。
 - 确认当前盘口到 break-even 的 tick 距离；若距离过大，只能接受低速挂 break-even maker SELL，不能为了速度降价卖。
 - 使用小观察额度恢复，不直接使用原 40 万目标。
-- 启动后先观察一个小窗口，确认 APP 万U损耗低于 10 或转正，再扩大目标。
-- 若 APP 万U损耗继续高于 10，立即停机、撤单，并把控制文件改回 `apply=false`。
+- 启动后先观察一个小窗口，确认 APP 万U损耗低于 `1` 或转正，再扩大目标。
+- 若 APP 万U损耗继续高于 `1`，立即停机、撤单，并把控制文件改回 `apply=false`。

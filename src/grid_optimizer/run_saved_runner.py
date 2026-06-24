@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .monitor import RUNNER_PID_PATH, runner_pid_path_for_symbol
+from .spot_app_loss_audit import main as spot_app_loss_audit_main
 from .web import (
     _build_runner_command,
     _build_spot_runner_command,
@@ -24,6 +25,23 @@ RUNTIME_PATH_FLAGS = {
     "--submit-report-json",
     "--summary-jsonl",
 }
+DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_LOSS_PER_10K = 1.0
+DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_SAFE_SELL_GAP_TICKS = 2.0
+DEFAULT_SPOT_APP_LOSS_PRESTART_MIN_MAKER_RATIO = 0.99
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _float_config(config: dict[str, object], key: str, default: float) -> float:
+    try:
+        value = float(config.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0.0 else default
 
 
 def _write_pid(path) -> None:
@@ -63,6 +81,55 @@ def _should_use_spot_runner(symbol: str) -> bool:
     return _spot_runner_control_path(normalized).exists() and not _runner_control_path(normalized).exists()
 
 
+def _run_spot_app_loss_prestart_gate(config: dict[str, object]) -> int:
+    if not _truthy(config.get("spot_app_loss_prestart_gate_enabled", False)):
+        return 0
+    symbol = str(config.get("symbol") or "").upper().strip()
+    if not symbol:
+        raise SystemExit("spot_app_loss_prestart_gate requires symbol")
+    max_loss = _float_config(
+        config,
+        "spot_app_loss_prestart_gate_max_loss_per_10k",
+        _float_config(config, "spot_app_loss_per_10k_hard", DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_LOSS_PER_10K)
+        or DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_LOSS_PER_10K,
+    )
+    max_gap = _float_config(
+        config,
+        "spot_app_loss_prestart_gate_max_safe_sell_gap_ticks",
+        DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_SAFE_SELL_GAP_TICKS,
+    )
+    min_maker_ratio = _float_config(
+        config,
+        "spot_app_loss_prestart_gate_min_maker_ratio",
+        DEFAULT_SPOT_APP_LOSS_PRESTART_MIN_MAKER_RATIO,
+    )
+    min_gross_notional = _float_config(
+        config,
+        "spot_app_loss_prestart_gate_min_gross_notional",
+        _float_config(config, "spot_app_loss_min_notional", 0.0),
+    )
+    argv = ["--symbol", symbol]
+    start_time = str(
+        config.get("spot_app_loss_prestart_gate_start_time") or config.get("runtime_guard_stats_start_time") or ""
+    ).strip()
+    if start_time:
+        argv.extend(["--start-time", start_time])
+    argv.extend(
+        [
+            "--max-app-loss-per-10k",
+            str(max_loss),
+            "--max-safe-maker-sell-gap-ticks",
+            str(max_gap),
+            "--min-maker-ratio",
+            str(min_maker_ratio),
+            "--min-gross-notional",
+            str(min_gross_notional),
+            "--require-gate",
+        ]
+    )
+    return spot_app_loss_audit_main(argv)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", type=str, default="")
@@ -82,6 +149,9 @@ def main() -> None:
     atexit.register(_cleanup_pid, pid_path)
     if _should_use_spot_runner(symbol):
         config = _load_spot_runner_control_config(symbol)
+        gate_code = _run_spot_app_loss_prestart_gate(config)
+        if gate_code != 0:
+            raise SystemExit(gate_code)
         command_builder = _build_spot_runner_command
     else:
         config = _load_runner_control_config(symbol)

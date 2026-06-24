@@ -8546,6 +8546,12 @@ def _save_spot_runner_control_config(config: dict[str, Any], *, symbol: str | No
     normalized_symbol = str(symbol or config.get("symbol", "BTCUSDT")).upper().strip() or "BTCUSDT"
     control_path = _spot_runner_control_path(normalized_symbol)
     control_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _read_json_dict(control_path)
+    if existing:
+        config = dict(config)
+        for key, value in existing.items():
+            if key.startswith("spot_app_loss_prestart_gate_") and key not in config:
+                config[key] = value
     control_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

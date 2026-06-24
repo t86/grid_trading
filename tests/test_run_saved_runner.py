@@ -166,6 +166,66 @@ class RunSavedRunnerTests(unittest.TestCase):
         command = mock_execvpe.call_args.args[1]
         self.assertIn("grid_optimizer.spot_loop_runner", command)
 
+    @patch("grid_optimizer.run_saved_runner.os.chdir")
+    @patch("grid_optimizer.run_saved_runner.os.getcwd", return_value="/repo")
+    @patch("grid_optimizer.run_saved_runner.atexit.register")
+    @patch("grid_optimizer.run_saved_runner._write_pid")
+    @patch("grid_optimizer.run_saved_runner.os.execvpe")
+    @patch("grid_optimizer.run_saved_runner._should_use_spot_runner", return_value=True)
+    @patch("grid_optimizer.run_saved_runner._build_spot_runner_command")
+    @patch("grid_optimizer.run_saved_runner._load_spot_runner_control_config")
+    @patch("grid_optimizer.run_saved_runner.spot_app_loss_audit_main", return_value=2)
+    def test_main_blocks_spot_runner_when_app_loss_prestart_gate_rejects(
+        self,
+        mock_app_loss_audit_main,
+        mock_load_spot_runner_control_config,
+        mock_build_spot_runner_command,
+        _mock_should_use_spot_runner,
+        mock_execvpe,
+        _mock_write_pid,
+        _mock_atexit_register,
+        _mock_getcwd,
+        _mock_chdir,
+    ) -> None:
+        mock_load_spot_runner_control_config.return_value = {
+            "symbol": "XPLUSDT",
+            "market_type": "spot",
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "spot_app_loss_prestart_gate_enabled": True,
+            "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
+            "spot_app_loss_prestart_gate_max_loss_per_10k": 1.0,
+            "spot_app_loss_prestart_gate_max_safe_sell_gap_ticks": 2.0,
+            "spot_app_loss_prestart_gate_min_maker_ratio": 0.99,
+            "spot_app_loss_prestart_gate_min_gross_notional": 5000.0,
+        }
+
+        with patch.dict("os.environ", {}, clear=True), patch.object(
+            sys, "argv", ["run_saved_runner.py", "--symbol", "xplusdt"]
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                run_saved_runner.main()
+
+        self.assertEqual(raised.exception.code, 2)
+        mock_app_loss_audit_main.assert_called_once_with(
+            [
+                "--symbol",
+                "XPLUSDT",
+                "--start-time",
+                "2026-06-24T19:57:00+08:00",
+                "--max-app-loss-per-10k",
+                "1.0",
+                "--max-safe-maker-sell-gap-ticks",
+                "2.0",
+                "--min-maker-ratio",
+                "0.99",
+                "--min-gross-notional",
+                "5000.0",
+                "--require-gate",
+            ]
+        )
+        mock_build_spot_runner_command.assert_not_called()
+        mock_execvpe.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

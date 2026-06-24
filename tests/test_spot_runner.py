@@ -410,6 +410,37 @@ class SpotRunnerTests(unittest.TestCase):
         mock_save_config.assert_called_once()
         self.assertEqual(mock_save_config.call_args.kwargs["symbol"], "VANAUSDT")
 
+    def test_save_spot_runner_control_config_preserves_prestart_gate_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_dir = root / "output"
+            output_dir.mkdir()
+            control_path = output_dir / "xplusdt_spot_loop_runner_control.json"
+            control_path.write_text(
+                json.dumps(
+                    {
+                        "symbol": "XPLUSDT",
+                        "spot_app_loss_prestart_gate_enabled": True,
+                        "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
+                        "spot_app_loss_prestart_gate_max_loss_per_10k": 1.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                web._save_spot_runner_control_config({"symbol": "XPLUSDT", "market_type": "spot"}, symbol="XPLUSDT")
+            finally:
+                os.chdir(previous_cwd)
+
+            saved = json.loads(control_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(saved["spot_app_loss_prestart_gate_enabled"])
+        self.assertEqual(saved["spot_app_loss_prestart_gate_start_time"], "2026-06-24T19:57:00+08:00")
+        self.assertEqual(saved["spot_app_loss_prestart_gate_max_loss_per_10k"], 1.0)
+
     def test_build_spot_runner_command_includes_competition_inventory_grid_arguments(self) -> None:
         config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
         config.update(
