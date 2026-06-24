@@ -15042,6 +15042,10 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--spot-app-loss-min-notional", config.get("spot_app_loss_min_notional")),
         ("--spot-app-loss-per-10k-soft", config.get("spot_app_loss_per_10k_soft")),
         ("--spot-app-loss-per-10k-hard", config.get("spot_app_loss_per_10k_hard")),
+        (
+            "--spot-app-loss-min-bid-break-even-buffer-ticks",
+            config.get("spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks"),
+        ),
         ("--spot-slow-trend-step-5m-return-ratio", config.get("spot_slow_trend_step_5m_return_ratio")),
         ("--spot-slow-trend-step-15m-return-ratio", config.get("spot_slow_trend_step_15m_return_ratio")),
         ("--spot-slow-trend-step-5m-amplitude-ratio", config.get("spot_slow_trend_step_5m_amplitude_ratio")),

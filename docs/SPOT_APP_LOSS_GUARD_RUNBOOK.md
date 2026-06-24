@@ -69,6 +69,7 @@ APP 万U损耗 = APP 损耗 / (买入成交额 + 卖出成交额) * 10000
 - 如果启用 `spot_app_loss_recovery_reduce_only_enabled=true`，即使启动前审计因价格恢复而放行，只要 APP 窗口仍是净多，runner 也只能先做恢复减仓：删除 BUY，删除低于 `max(ask, break-even)` 的 SELL，并补一张 `LIMIT_MAKER` SELL。
 - synthetic neutral 下不能只看 APP 窗口净持仓。减偏离方向和数量必须以 `actual_base_qty - neutral_base_qty` 为边界：高于 neutral 才能 SELL，低于 neutral 只能 BUY，不能卖穿 neutral 底仓。
 - 低于 neutral 的净空偏离只能用 maker BUY 慢慢回补。BUY reduce 单必须按当前 bid 侧参考，不能保留高于 bid 的 BUY 单；高于 bid 的 BUY 会变成吃单或在高价回补，直接放大 APP 损耗。
+- 如果设置了 `spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks`，启动后 runner 也会持续检查同一 bid-buffer。APP 损耗仍为 0 但 bid 到 break-even 的距离已经低于门槛时，runner 必须阻断扩多型 BUY；若 `actual_base_qty < neutral_base_qty`，仍只允许按 bid 上限 maker BUY 回补到 neutral，避免为了低损耗把组合长期卡在净空偏离。
 - 如果 `spot_freeze_skip_reason=short_hedge_capacity_exhausted`，说明冻结仓位没有合约 SHORT 容量继续抵消这段净空现货偏离；不要指望冻结自动生效，必须先低价 maker BUY 补回 neutral。
 - 当 `actual_base_qty` 已回到 `neutral_base_qty`，且 APP 万U损耗仍低于 soft/hard 门槛时，runner 应退出 `recovery_reduce_only` 回到 `cruise`/`observe`。如果 `reduce_side=""` 仍卡在 recovery 状态，属于恢复空转，应停下来排查，不能扩大目标。
 - 如果当前 ask 明显低于 break-even，成交速度慢是正确结果；为了速度在低价卖出，会直接锁定 APP 损耗。

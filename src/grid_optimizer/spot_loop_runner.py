@@ -900,6 +900,8 @@ def _build_spot_app_loss_guard(
     soft_per_10k: float,
     hard_per_10k: float,
     recovery_reduce_only_enabled: bool = False,
+    tick_size: float | None = None,
+    min_bid_break_even_buffer_ticks: float = 0.0,
 ) -> dict[str, Any]:
     buy_notional = max(_safe_float(metrics.get("buy_notional")), 0.0)
     sell_notional = max(_safe_float(metrics.get("sell_notional")), 0.0)
@@ -944,10 +946,32 @@ def _build_spot_app_loss_guard(
     raw_loss = buy_notional - sell_notional - position_value
     app_loss = max(raw_loss, 0.0)
     app_loss_per_10k = app_loss / gross_notional * 10000.0 if gross_notional > EPSILON else 0.0
+    tick = max(_safe_float(tick_size), 0.0)
+    break_even_price = (
+        max((buy_notional - sell_notional) / holding_qty, 0.0)
+        if window_aligned and holding_qty > EPSILON
+        else 0.0
+    )
+    bid_break_even_buffer_ticks = (
+        (mark_price - break_even_price) / tick
+        if tick > EPSILON and mark_price > EPSILON and break_even_price > EPSILON
+        else 0.0
+    )
     safe_min_notional = max(_safe_float(min_notional), 0.0)
     hard = max(_safe_float(hard_per_10k), 0.0)
     soft = max(_safe_float(soft_per_10k), 0.0)
     volume_active = gross_notional + EPSILON >= safe_min_notional
+    min_bid_buffer = max(_safe_float(min_bid_break_even_buffer_ticks), 0.0)
+    bid_buffer_below_min = (
+        bool(enabled)
+        and bool(window_aligned)
+        and volume_active
+        and min_bid_buffer > EPSILON
+        and holding_qty > EPSILON
+        and tick > EPSILON
+        and break_even_price > EPSILON
+        and bid_break_even_buffer_ticks + EPSILON < min_bid_buffer
+    )
     preactive_loss_cap = hard * safe_min_notional / 10000.0 if hard > EPSILON and safe_min_notional > EPSILON else 0.0
     preactive_loss_cap_hit = (
         bool(enabled)
@@ -970,6 +994,8 @@ def _build_spot_app_loss_guard(
     elif not window_aligned:
         state = "insufficient_window"
     elif preactive_loss_cap_hit:
+        state = "blocked"
+    elif bid_buffer_below_min:
         state = "blocked"
     elif not active:
         state = "warming_up"
@@ -997,6 +1023,10 @@ def _build_spot_app_loss_guard(
         "raw_app_loss": raw_loss,
         "app_loss": app_loss,
         "app_loss_per_10k": app_loss_per_10k,
+        "break_even_price": break_even_price,
+        "bid_break_even_buffer_ticks": bid_break_even_buffer_ticks,
+        "min_bid_break_even_buffer_ticks": min_bid_buffer,
+        "bid_break_even_buffer_below_min": bid_buffer_below_min,
         "min_notional": safe_min_notional,
         "soft_per_10k": soft,
         "hard_per_10k": hard,
@@ -1201,6 +1231,7 @@ def _apply_spot_app_loss_guard_to_orders(
     exchange_min_notional: float | None = None,
     available_quote_free: float | None = None,
     available_base_free: float | None = None,
+    min_bid_break_even_buffer_ticks: float = 0.0,
 ) -> list[dict[str, Any]]:
     guard = _build_spot_app_loss_guard(
         enabled=enabled,
@@ -1211,6 +1242,8 @@ def _apply_spot_app_loss_guard_to_orders(
         soft_per_10k=soft_per_10k,
         hard_per_10k=hard_per_10k,
         recovery_reduce_only_enabled=recovery_reduce_only_enabled,
+        tick_size=tick_size,
+        min_bid_break_even_buffer_ticks=min_bid_break_even_buffer_ticks,
     )
     controls["spot_app_loss_guard"] = guard
     if guard["state"] not in {"defensive", "blocked", "recovery_reduce_only"}:
@@ -1269,7 +1302,10 @@ def _apply_spot_app_loss_guard_to_orders(
     if dropped_count > 0:
         pause_reasons = list(controls.get("pause_reasons") or [])
         if guard["state"] == "blocked":
-            reason = "spot_app_loss_guard_blocked"
+            if bool(guard.get("bid_break_even_buffer_below_min")):
+                reason = "spot_app_loss_guard_bid_buffer_below_min"
+            else:
+                reason = "spot_app_loss_guard_blocked"
         elif guard["state"] == "recovery_reduce_only":
             reason = "spot_app_loss_guard_recovery_reduce_only"
         else:
@@ -4262,6 +4298,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         exchange_min_notional=symbol_info.get("min_notional"),
         available_quote_free=quote_free,
         available_base_free=base_free,
+        min_bid_break_even_buffer_ticks=float(getattr(args, "spot_app_loss_min_bid_break_even_buffer_ticks", 0.0)),
     )
     if strategy_mode == "spot_competition_synthetic_neutral_grid":
         def _persist_spot_freeze_ledger(ledger_result: dict[str, Any]) -> None:
@@ -4672,6 +4709,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spot-app-loss-min-notional", type=float, default=10000.0)
     parser.add_argument("--spot-app-loss-per-10k-soft", type=float, default=0.0)
     parser.add_argument("--spot-app-loss-per-10k-hard", type=float, default=0.0)
+    parser.add_argument("--spot-app-loss-min-bid-break-even-buffer-ticks", type=float, default=0.0)
     parser.add_argument("--spot-slow-trend-step-enabled", action="store_true")
     parser.add_argument("--spot-slow-trend-step-5m-return-ratio", type=float, default=0.0)
     parser.add_argument("--spot-slow-trend-step-15m-return-ratio", type=float, default=0.0)
