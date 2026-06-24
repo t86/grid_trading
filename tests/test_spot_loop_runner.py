@@ -242,6 +242,140 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertTrue(controls["buy_paused"])
         self.assertIn("spot_app_loss_guard_blocked", controls["pause_reasons"])
 
+    def test_spot_app_loss_guard_injects_maker_sell_when_long_deviation_has_no_reduce_order(self) -> None:
+        controls = {"actual_base_qty": 140.0, "neutral_base_qty": 100.0}
+        desired_orders = [
+            {"side": "BUY", "role": "grid_entry", "price": 1.0, "qty": 10.0},
+        ]
+
+        filtered = _apply_spot_app_loss_guard_to_orders(
+            desired_orders=desired_orders,
+            controls=controls,
+            metrics={"buy_notional": 1200.0, "sell_notional": 850.0, "buy_qty": 1000.0, "sell_qty": 860.0},
+            position_qty=140.0,
+            latest_price=2.0,
+            enabled=True,
+            min_notional=10.0,
+            soft_per_10k=1.0,
+            hard_per_10k=2.0,
+            maker_reduce_notional=25.0,
+            step_size=0.1,
+            min_qty=0.1,
+            exchange_min_notional=5.0,
+        )
+
+        self.assertEqual([order["side"] for order in filtered], ["SELL"])
+        self.assertEqual(filtered[0]["role"], "spot_app_loss_reduce")
+        self.assertEqual(filtered[0]["tag"], "app_loss_reduce")
+        self.assertAlmostEqual(filtered[0]["price"], 2.0)
+        self.assertAlmostEqual(filtered[0]["qty"], 12.5)
+        self.assertEqual(controls["spot_app_loss_guard"]["injected_order_count"], 1)
+
+    def test_spot_app_loss_guard_injects_maker_buy_when_short_deviation_has_no_reduce_order(self) -> None:
+        controls = {"actual_base_qty": 80.0, "neutral_base_qty": 100.0}
+        desired_orders = [
+            {"side": "SELL", "role": "grid_entry", "price": 1.0, "qty": 10.0},
+        ]
+
+        filtered = _apply_spot_app_loss_guard_to_orders(
+            desired_orders=desired_orders,
+            controls=controls,
+            metrics={"buy_notional": 1200.0, "sell_notional": 850.0, "buy_qty": 1000.0, "sell_qty": 920.0},
+            position_qty=80.0,
+            latest_price=2.0,
+            enabled=True,
+            min_notional=10.0,
+            soft_per_10k=1.0,
+            hard_per_10k=2.0,
+            maker_reduce_notional=10.0,
+            step_size=0.1,
+            min_qty=0.1,
+            exchange_min_notional=5.0,
+        )
+
+        self.assertEqual([order["side"] for order in filtered], ["BUY"])
+        self.assertEqual(filtered[0]["role"], "spot_app_loss_reduce")
+        self.assertAlmostEqual(filtered[0]["qty"], 5.0)
+        self.assertEqual(controls["spot_app_loss_guard"]["injected_order_count"], 1)
+
+    def test_spot_app_loss_guard_does_not_inject_without_deviation_context(self) -> None:
+        controls = {}
+        desired_orders = [
+            {"side": "BUY", "role": "grid_entry", "price": 1.0, "qty": 10.0},
+        ]
+
+        filtered = _apply_spot_app_loss_guard_to_orders(
+            desired_orders=desired_orders,
+            controls=controls,
+            metrics={"buy_notional": 1200.0, "sell_notional": 850.0, "buy_qty": 1000.0, "sell_qty": 860.0},
+            position_qty=140.0,
+            latest_price=2.0,
+            enabled=True,
+            min_notional=10.0,
+            soft_per_10k=1.0,
+            hard_per_10k=2.0,
+            maker_reduce_notional=25.0,
+            step_size=0.1,
+            min_qty=0.1,
+            exchange_min_notional=5.0,
+        )
+
+        self.assertEqual(filtered, [])
+        self.assertEqual(controls["spot_app_loss_guard"]["reduce_side"], "SELL")
+        self.assertEqual(controls["spot_app_loss_guard"]["injected_order_count"], 0)
+
+    def test_spot_app_loss_guard_does_not_inject_sell_without_available_base(self) -> None:
+        controls = {"actual_base_qty": 140.0, "neutral_base_qty": 100.0}
+        desired_orders = [
+            {"side": "BUY", "role": "grid_entry", "price": 1.0, "qty": 10.0},
+        ]
+
+        filtered = _apply_spot_app_loss_guard_to_orders(
+            desired_orders=desired_orders,
+            controls=controls,
+            metrics={"buy_notional": 1200.0, "sell_notional": 850.0, "buy_qty": 1000.0, "sell_qty": 860.0},
+            position_qty=140.0,
+            latest_price=2.0,
+            enabled=True,
+            min_notional=10.0,
+            soft_per_10k=1.0,
+            hard_per_10k=2.0,
+            maker_reduce_notional=25.0,
+            step_size=0.1,
+            min_qty=0.1,
+            exchange_min_notional=5.0,
+            available_base_free=0.0,
+        )
+
+        self.assertEqual(filtered, [])
+        self.assertEqual(controls["spot_app_loss_guard"]["injected_order_count"], 0)
+
+    def test_spot_app_loss_guard_does_not_inject_buy_without_available_quote(self) -> None:
+        controls = {"actual_base_qty": 80.0, "neutral_base_qty": 100.0}
+        desired_orders = [
+            {"side": "SELL", "role": "grid_entry", "price": 1.0, "qty": 10.0},
+        ]
+
+        filtered = _apply_spot_app_loss_guard_to_orders(
+            desired_orders=desired_orders,
+            controls=controls,
+            metrics={"buy_notional": 1200.0, "sell_notional": 850.0, "buy_qty": 1000.0, "sell_qty": 920.0},
+            position_qty=80.0,
+            latest_price=2.0,
+            enabled=True,
+            min_notional=10.0,
+            soft_per_10k=1.0,
+            hard_per_10k=2.0,
+            maker_reduce_notional=10.0,
+            step_size=0.1,
+            min_qty=0.1,
+            exchange_min_notional=5.0,
+            available_quote_free=0.0,
+        )
+
+        self.assertEqual(filtered, [])
+        self.assertEqual(controls["spot_app_loss_guard"]["injected_order_count"], 0)
+
     def test_spot_freeze_gate_rejects_non_hedge_mode(self) -> None:
         gate = _check_spot_freeze_hedge_gate(
             symbol="WLDUSDT",

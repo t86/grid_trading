@@ -950,6 +950,48 @@ def _spot_app_loss_reduce_side(controls: dict[str, Any], position_qty: float) ->
     return ""
 
 
+def _build_spot_app_loss_maker_reduce_order(
+    *,
+    controls: dict[str, Any],
+    latest_price: float,
+    reduce_side: str,
+    maker_reduce_notional: float,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    available_quote_free: float | None,
+    available_base_free: float | None,
+) -> dict[str, Any] | None:
+    normalized_side = str(reduce_side or "").upper().strip()
+    price = max(_safe_float(latest_price), 0.0)
+    notional_cap = max(_safe_float(maker_reduce_notional), 0.0)
+    if normalized_side not in {"BUY", "SELL"} or price <= EPSILON or notional_cap <= EPSILON:
+        return None
+
+    neutral_base_qty = max(_safe_float(controls.get("neutral_base_qty")), 0.0)
+    if "neutral_base_qty" not in controls and "synthetic_net_qty" not in controls:
+        return None
+    deviation_qty = abs(_safe_float(controls.get("actual_base_qty")) - neutral_base_qty)
+    if normalized_side == "BUY":
+        if available_quote_free is not None:
+            notional_cap = min(notional_cap, max(_safe_float(available_quote_free), 0.0))
+        raw_qty = min(deviation_qty, notional_cap / price)
+    else:
+        raw_qty = min(deviation_qty, notional_cap / price)
+        if available_base_free is not None:
+            raw_qty = min(raw_qty, max(_safe_float(available_base_free), 0.0))
+    qty = _round_order_qty(raw_qty, step_size)
+    if not _spot_order_meets_exchange_mins(qty=qty, price=price, min_qty=min_qty, min_notional=min_notional):
+        return None
+    return {
+        "side": normalized_side,
+        "price": price,
+        "qty": qty,
+        "role": "spot_app_loss_reduce",
+        "tag": "app_loss_reduce",
+    }
+
+
 def _apply_spot_app_loss_guard_to_orders(
     *,
     desired_orders: list[dict[str, Any]],
@@ -961,6 +1003,12 @@ def _apply_spot_app_loss_guard_to_orders(
     min_notional: float,
     soft_per_10k: float,
     hard_per_10k: float,
+    maker_reduce_notional: float = 0.0,
+    step_size: float | None = None,
+    min_qty: float | None = None,
+    exchange_min_notional: float | None = None,
+    available_quote_free: float | None = None,
+    available_base_free: float | None = None,
 ) -> list[dict[str, Any]]:
     guard = _build_spot_app_loss_guard(
         enabled=enabled,
@@ -985,6 +1033,22 @@ def _apply_spot_app_loss_guard_to_orders(
     guard["action"] = "reduce_only"
     guard["reduce_side"] = reduce_side
     guard["dropped_order_count"] = dropped_count
+    guard["injected_order_count"] = 0
+    if not kept_orders and reduce_side:
+        reduce_order = _build_spot_app_loss_maker_reduce_order(
+            controls=controls,
+            latest_price=latest_price,
+            reduce_side=reduce_side,
+            maker_reduce_notional=maker_reduce_notional,
+            step_size=step_size,
+            min_qty=min_qty,
+            min_notional=exchange_min_notional,
+            available_quote_free=available_quote_free,
+            available_base_free=available_base_free,
+        )
+        if reduce_order is not None:
+            kept_orders = [reduce_order]
+            guard["injected_order_count"] = 1
     if dropped_count > 0:
         pause_reasons = list(controls.get("pause_reasons") or [])
         reason = "spot_app_loss_guard_blocked" if guard["state"] == "blocked" else "spot_app_loss_guard_defensive"
@@ -3616,6 +3680,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             controls["pause_reasons"] = list(controls.get("pause_reasons") or []) + list(fast_stop_guard.get("reasons") or [])
             controls["risk_state"] = "fast_stop_freeze"
         controls["fast_stop_guard"] = fast_stop_guard
+    quote_free, base_free = _available_new_funds(account_info, base_asset, quote_asset)
     app_loss_position_qty = _total_base_balance(account_info, base_asset)
     desired_orders = _apply_spot_app_loss_guard_to_orders(
         desired_orders=desired_orders,
@@ -3627,6 +3692,12 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         min_notional=float(getattr(args, "spot_app_loss_min_notional", 10000.0)),
         soft_per_10k=float(getattr(args, "spot_app_loss_per_10k_soft", 0.0)),
         hard_per_10k=float(getattr(args, "spot_app_loss_per_10k_hard", 0.0)),
+        maker_reduce_notional=float(getattr(args, "per_order_notional", 0.0)),
+        step_size=symbol_info.get("step_size"),
+        min_qty=symbol_info.get("min_qty"),
+        exchange_min_notional=symbol_info.get("min_notional"),
+        available_quote_free=quote_free,
+        available_base_free=base_free,
     )
     if strategy_mode == "spot_competition_synthetic_neutral_grid":
         def _persist_spot_freeze_ledger(ledger_result: dict[str, Any]) -> None:
@@ -3668,7 +3739,6 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
     placed_count = 0
     placement_errors: list[str] = []
     skipped_below_exchange_mins: list[str] = []
-    quote_free, base_free = _available_new_funds(account_info, base_asset, quote_asset)
     remaining_quote_free = quote_free
     remaining_base_free = base_free
     max_single_cycle_new_orders = max(_safe_int(getattr(args, "max_single_cycle_new_orders", 0)), 0)
