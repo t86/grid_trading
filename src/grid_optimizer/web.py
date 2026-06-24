@@ -8426,6 +8426,7 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "spot_app_loss_min_notional": 10000.0,
     "spot_app_loss_per_10k_soft": 0.0,
     "spot_app_loss_per_10k_hard": 0.0,
+    "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks": 0.0,
     "spot_slow_trend_step_enabled": False,
     "spot_slow_trend_step_5m_return_ratio": 0.0,
     "spot_slow_trend_step_15m_return_ratio": 0.0,
@@ -8493,6 +8494,7 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
 }
 DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_LOSS_PER_10K = 1.0
 DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_SAFE_SELL_GAP_TICKS = 2.0
+DEFAULT_SPOT_APP_LOSS_PRESTART_MIN_BID_BREAK_EVEN_BUFFER_TICKS = 0.0
 DEFAULT_SPOT_APP_LOSS_PRESTART_MIN_MAKER_RATIO = 0.99
 
 
@@ -14463,6 +14465,13 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("spot_app_loss_per_10k_hard", SPOT_RUNNER_DEFAULT_CONFIG["spot_app_loss_per_10k_hard"]),
         "spot_app_loss_per_10k_hard",
     )
+    spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks = _safe_float(
+        payload.get(
+            "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks"],
+        ),
+        "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks",
+    )
     spot_slow_trend_step_enabled = _safe_bool(
         payload.get("spot_slow_trend_step_enabled", SPOT_RUNNER_DEFAULT_CONFIG["spot_slow_trend_step_enabled"]),
         "spot_slow_trend_step_enabled",
@@ -14764,6 +14773,9 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_app_loss_min_notional": spot_app_loss_min_notional,
             "spot_app_loss_per_10k_soft": spot_app_loss_per_10k_soft,
             "spot_app_loss_per_10k_hard": spot_app_loss_per_10k_hard,
+            "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks": (
+                spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks
+            ),
             "spot_slow_trend_step_5m_return_ratio": spot_slow_trend_step_5m_return_ratio,
             "spot_slow_trend_step_15m_return_ratio": spot_slow_trend_step_15m_return_ratio,
             "spot_slow_trend_step_5m_amplitude_ratio": spot_slow_trend_step_5m_amplitude_ratio,
@@ -14854,6 +14866,9 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_app_loss_min_notional": spot_app_loss_min_notional,
             "spot_app_loss_per_10k_soft": spot_app_loss_per_10k_soft,
             "spot_app_loss_per_10k_hard": spot_app_loss_per_10k_hard,
+            "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks": (
+                spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks
+            ),
             "spot_slow_trend_step_enabled": spot_slow_trend_step_enabled,
             "spot_slow_trend_step_5m_return_ratio": spot_slow_trend_step_5m_return_ratio,
             "spot_slow_trend_step_15m_return_ratio": spot_slow_trend_step_15m_return_ratio,
@@ -15144,6 +15159,11 @@ def _run_spot_app_loss_prestart_gate(config: dict[str, Any]) -> int:
         "spot_app_loss_prestart_gate_max_safe_sell_gap_ticks",
         DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_SAFE_SELL_GAP_TICKS,
     )
+    min_bid_buffer = _spot_app_loss_prestart_float_config(
+        config,
+        "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks",
+        DEFAULT_SPOT_APP_LOSS_PRESTART_MIN_BID_BREAK_EVEN_BUFFER_TICKS,
+    )
     min_maker_ratio = _spot_app_loss_prestart_float_config(
         config,
         "spot_app_loss_prestart_gate_min_maker_ratio",
@@ -15166,6 +15186,12 @@ def _run_spot_app_loss_prestart_gate(config: dict[str, Any]) -> int:
             str(max_loss),
             "--max-safe-maker-sell-gap-ticks",
             str(max_gap),
+        ]
+    )
+    if min_bid_buffer > 0:
+        argv.extend(["--min-bid-break-even-buffer-ticks", str(min_bid_buffer)])
+    argv.extend(
+        [
             "--min-maker-ratio",
             str(min_maker_ratio),
             "--min-gross-notional",

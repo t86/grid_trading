@@ -470,6 +470,7 @@ class SpotRunnerTests(unittest.TestCase):
                         "spot_app_loss_prestart_gate_enabled": True,
                         "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
                         "spot_app_loss_prestart_gate_max_loss_per_10k": 1.0,
+                        "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks": 3.0,
                     }
                 ),
                 encoding="utf-8",
@@ -487,6 +488,25 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertTrue(saved["spot_app_loss_prestart_gate_enabled"])
         self.assertEqual(saved["spot_app_loss_prestart_gate_start_time"], "2026-06-24T19:57:00+08:00")
         self.assertEqual(saved["spot_app_loss_prestart_gate_max_loss_per_10k"], 1.0)
+        self.assertEqual(saved["spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks"], 3.0)
+
+    def test_normalize_spot_runner_payload_preserves_bid_break_even_buffer_gate(self) -> None:
+        config = _normalize_spot_runner_payload(
+            {
+                "symbol": "XPLUSDT",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "total_quote_budget": 1000.0,
+                "step_price": 0.0001,
+                "per_order_notional": 20.0,
+                "max_position_notional": 200.0,
+                "max_short_position_notional": 200.0,
+                "neutral_base_qty": 1000.0,
+                "spot_app_loss_prestart_gate_enabled": True,
+                "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks": 3.0,
+            }
+        )
+
+        self.assertEqual(config["spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks"], 3.0)
 
     @patch("grid_optimizer.web.time.sleep")
     @patch("grid_optimizer.web.subprocess.Popen")
@@ -521,6 +541,7 @@ class SpotRunnerTests(unittest.TestCase):
                     "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
                     "spot_app_loss_prestart_gate_max_loss_per_10k": 1.0,
                     "spot_app_loss_prestart_gate_max_safe_sell_gap_ticks": 2.0,
+                    "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks": 3.0,
                     "spot_app_loss_prestart_gate_min_maker_ratio": 0.99,
                     "spot_app_loss_prestart_gate_min_gross_notional": 5000.0,
                 }
@@ -549,6 +570,8 @@ class SpotRunnerTests(unittest.TestCase):
                 "1.0",
                 "--max-safe-maker-sell-gap-ticks",
                 "2.0",
+                "--min-bid-break-even-buffer-ticks",
+                "3.0",
                 "--min-maker-ratio",
                 "0.99",
                 "--min-gross-notional",

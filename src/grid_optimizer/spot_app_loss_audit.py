@@ -221,6 +221,11 @@ def compute_spot_app_loss_audit(
     safe_maker_sell_price = _ceil_to_tick(max(break_even_price, safe_ask), tick_size) if net_qty > EPSILON else 0.0
     tick = max(_safe_float(tick_size), 0.0)
     sell_gap_ticks = ((safe_maker_sell_price - safe_ask) / tick) if tick > EPSILON and safe_maker_sell_price > EPSILON else 0.0
+    bid_break_even_buffer_ticks = (
+        (safe_bid - break_even_price) / tick
+        if net_qty > EPSILON and tick > EPSILON and break_even_price > EPSILON and safe_bid > EPSILON
+        else 0.0
+    )
     return {
         "trade_count": len([item for item in trades if isinstance(item, dict)]),
         "maker_count": maker_count,
@@ -242,6 +247,7 @@ def compute_spot_app_loss_audit(
         "break_even_price": break_even_price,
         "safe_maker_sell_price": safe_maker_sell_price,
         "safe_maker_sell_gap_ticks": sell_gap_ticks,
+        "bid_break_even_buffer_ticks": bid_break_even_buffer_ticks,
         "first_trade_time_ms": first_trade_time_ms,
         "last_trade_time_ms": last_trade_time_ms,
     }
@@ -252,6 +258,7 @@ def evaluate_spot_app_loss_recovery_gate(
     *,
     max_app_loss_per_10k: float = 10.0,
     max_safe_maker_sell_gap_ticks: float = 2.0,
+    min_bid_break_even_buffer_ticks: float = 0.0,
     min_maker_ratio: float = 0.99,
     min_gross_notional: float = 0.0,
 ) -> dict[str, Any]:
@@ -263,6 +270,7 @@ def evaluate_spot_app_loss_recovery_gate(
     app_loss_per_10k = _safe_float(audit.get("app_loss_per_10k"))
     net_qty = _safe_float(audit.get("net_qty"))
     safe_sell_gap_ticks = max(_safe_float(audit.get("safe_maker_sell_gap_ticks")), 0.0)
+    bid_buffer_ticks = _safe_float(audit.get("bid_break_even_buffer_ticks"))
     if trade_count <= 0:
         reasons.append("no_trades")
     if bool(audit.get("truncated")):
@@ -275,16 +283,21 @@ def evaluate_spot_app_loss_recovery_gate(
         reasons.append("maker_ratio_below_min")
     if net_qty > EPSILON and safe_sell_gap_ticks > max(_safe_float(max_safe_maker_sell_gap_ticks), 0.0) + EPSILON:
         reasons.append("safe_maker_sell_too_far")
+    min_bid_buffer = max(_safe_float(min_bid_break_even_buffer_ticks), 0.0)
+    if net_qty > EPSILON and min_bid_buffer > EPSILON and bid_buffer_ticks + EPSILON < min_bid_buffer:
+        reasons.append("bid_break_even_buffer_below_min")
     return {
         "allowed": not reasons,
         "reasons": reasons,
         "max_app_loss_per_10k": max(_safe_float(max_app_loss_per_10k), 0.0),
         "max_safe_maker_sell_gap_ticks": max(_safe_float(max_safe_maker_sell_gap_ticks), 0.0),
+        "min_bid_break_even_buffer_ticks": min_bid_buffer,
         "min_maker_ratio": max(_safe_float(min_maker_ratio), 0.0),
         "min_gross_notional": max(_safe_float(min_gross_notional), 0.0),
         "maker_ratio": maker_ratio,
         "app_loss_per_10k": app_loss_per_10k,
         "safe_maker_sell_gap_ticks": safe_sell_gap_ticks,
+        "bid_break_even_buffer_ticks": bid_buffer_ticks,
         "gross_notional": gross_notional,
         "net_qty": net_qty,
     }
@@ -343,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=1000)
     parser.add_argument("--max-app-loss-per-10k", type=float, default=10.0)
     parser.add_argument("--max-safe-maker-sell-gap-ticks", type=float, default=2.0)
+    parser.add_argument("--min-bid-break-even-buffer-ticks", type=float, default=0.0)
     parser.add_argument("--min-maker-ratio", type=float, default=0.99)
     parser.add_argument("--min-gross-notional", type=float, default=0.0)
     parser.add_argument("--require-gate", action="store_true", help="Exit non-zero when recovery_gate.allowed is false.")
@@ -357,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
         audit,
         max_app_loss_per_10k=args.max_app_loss_per_10k,
         max_safe_maker_sell_gap_ticks=args.max_safe_maker_sell_gap_ticks,
+        min_bid_break_even_buffer_ticks=args.min_bid_break_even_buffer_ticks,
         min_maker_ratio=args.min_maker_ratio,
         min_gross_notional=args.min_gross_notional,
     )

@@ -195,6 +195,7 @@ class RunSavedRunnerTests(unittest.TestCase):
             "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
             "spot_app_loss_prestart_gate_max_loss_per_10k": 1.0,
             "spot_app_loss_prestart_gate_max_safe_sell_gap_ticks": 2.0,
+            "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks": 3.0,
             "spot_app_loss_prestart_gate_min_maker_ratio": 0.99,
             "spot_app_loss_prestart_gate_min_gross_notional": 5000.0,
         }
@@ -216,6 +217,8 @@ class RunSavedRunnerTests(unittest.TestCase):
                 "1.0",
                 "--max-safe-maker-sell-gap-ticks",
                 "2.0",
+                "--min-bid-break-even-buffer-ticks",
+                "3.0",
                 "--min-maker-ratio",
                 "0.99",
                 "--min-gross-notional",

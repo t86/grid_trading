@@ -83,7 +83,7 @@ APP 万U损耗 = APP 损耗 / (买入成交额 + 卖出成交额) * 10000
 PYTHONPATH=src python -m grid_optimizer.spot_app_loss_audit --symbol XPLUSDT --start-time 2026-06-24T11:57:00Z --require-gate
 ```
 
-- 审计结果中的 `recovery_gate.allowed` 必须为 `true`，否则不恢复。带 `--require-gate` 时，gate 不通过会以非 0 退出码结束。恢复目标是 APP 万U损耗低于 `1` 或转正；maker 占比不低于 `0.99`；如果窗口净多，安全 maker SELL 价距离当前 ask 不超过 `2` 个 tick；`myTrades` 结果不能被 `limit` 截断。
+- 审计结果中的 `recovery_gate.allowed` 必须为 `true`，否则不恢复。带 `--require-gate` 时，gate 不通过会以非 0 退出码结束。恢复目标是 APP 万U损耗低于 `1` 或转正；maker 占比不低于 `0.99`；如果窗口净多，安全 maker SELL 价距离当前 ask 不超过 `2` 个 tick，且当前 bid 至少高于 APP break-even 指定 tick 数；`myTrades` 结果不能被 `limit` 截断。
 - 通过 `/usr/local/bin/grid-saved-runner` 或 systemd 恢复前，控制文件必须显式保留预启动门禁：
 
 ```json
@@ -92,6 +92,7 @@ PYTHONPATH=src python -m grid_optimizer.spot_app_loss_audit --symbol XPLUSDT --s
   "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
   "spot_app_loss_prestart_gate_max_loss_per_10k": 1.0,
   "spot_app_loss_prestart_gate_max_safe_sell_gap_ticks": 2.0,
+  "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks": 3.0,
   "spot_app_loss_prestart_gate_min_maker_ratio": 0.99,
   "spot_app_loss_prestart_gate_min_gross_notional": 5000.0,
   "spot_app_loss_recovery_reduce_only_enabled": true

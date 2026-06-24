@@ -28,6 +28,7 @@ RUNTIME_PATH_FLAGS = {
 }
 DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_LOSS_PER_10K = 1.0
 DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_SAFE_SELL_GAP_TICKS = 2.0
+DEFAULT_SPOT_APP_LOSS_PRESTART_MIN_BID_BREAK_EVEN_BUFFER_TICKS = 0.0
 DEFAULT_SPOT_APP_LOSS_PRESTART_MIN_MAKER_RATIO = 0.99
 
 
@@ -99,6 +100,11 @@ def _run_spot_app_loss_prestart_gate(config: dict[str, object]) -> int:
         "spot_app_loss_prestart_gate_max_safe_sell_gap_ticks",
         DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_SAFE_SELL_GAP_TICKS,
     )
+    min_bid_buffer = _float_config(
+        config,
+        "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks",
+        DEFAULT_SPOT_APP_LOSS_PRESTART_MIN_BID_BREAK_EVEN_BUFFER_TICKS,
+    )
     min_maker_ratio = _float_config(
         config,
         "spot_app_loss_prestart_gate_min_maker_ratio",
@@ -121,6 +127,12 @@ def _run_spot_app_loss_prestart_gate(config: dict[str, object]) -> int:
             str(max_loss),
             "--max-safe-maker-sell-gap-ticks",
             str(max_gap),
+        ]
+    )
+    if min_bid_buffer > 0:
+        argv.extend(["--min-bid-break-even-buffer-ticks", str(min_bid_buffer)])
+    argv.extend(
+        [
             "--min-maker-ratio",
             str(min_maker_ratio),
             "--min-gross-notional",
