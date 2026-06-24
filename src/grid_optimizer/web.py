@@ -8771,6 +8771,18 @@ def _runner_start_safety_preflight(
             and not _truthy(config.get("spot_app_loss_prestart_gate_enabled", False))
         ):
             reasons.append("交易赛现货启用 APP loss guard/recovery 时必须启用 spot_app_loss_prestart_gate_enabled")
+        if competition_spot_recovery and _truthy(config.get("spot_app_loss_prestart_gate_enabled", False)):
+            prestart_raw = str(config.get("spot_app_loss_prestart_gate_start_time") or "").strip()
+            runtime_raw = str(config.get("runtime_guard_stats_start_time") or "").strip()
+            prestart_time = _parse_utc_datetime(prestart_raw)
+            runtime_time = _parse_utc_datetime(runtime_raw)
+            if prestart_raw and not runtime_raw:
+                reasons.append("spot_app_loss_prestart_gate_start_time 已设置时 runtime_guard_stats_start_time 必须同源")
+            elif prestart_time is not None and runtime_time is not None:
+                if abs((prestart_time - runtime_time).total_seconds()) > 1.0:
+                    reasons.append(
+                        "spot_app_loss_prestart_gate_start_time 必须与 runtime_guard_stats_start_time 同源，避免启动前/运行中 APP 损耗窗口不一致"
+                    )
         if competition_spot_recovery and not _truthy(config.get("spot_freeze_enabled", False)):
             reasons.append("交易赛现货启用 APP loss guard/recovery 时必须启用 spot_freeze_enabled")
         if competition_spot_recovery and not _truthy(config.get("spot_freeze_maker_execution_enabled", False)):

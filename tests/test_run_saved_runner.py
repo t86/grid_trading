@@ -256,6 +256,7 @@ class RunSavedRunnerTests(unittest.TestCase):
             "spot_app_loss_recovery_reduce_only_enabled": True,
             "spot_app_loss_prestart_gate_enabled": True,
             "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
+            "runtime_guard_stats_start_time": "2026-06-24T19:57:00+08:00",
             "spot_app_loss_prestart_gate_max_loss_per_10k": 1.0,
             "spot_app_loss_prestart_gate_max_safe_sell_gap_ticks": 2.0,
             "spot_app_loss_prestart_gate_min_maker_ratio": 0.99,

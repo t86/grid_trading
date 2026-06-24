@@ -90,6 +90,7 @@ PYTHONPATH=src python -m grid_optimizer.spot_app_loss_audit --symbol XPLUSDT --s
 {
   "spot_app_loss_prestart_gate_enabled": true,
   "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
+  "runtime_guard_stats_start_time": "2026-06-24T19:57:00+08:00",
   "spot_app_loss_prestart_gate_max_loss_per_10k": 1.0,
   "spot_app_loss_prestart_gate_max_safe_sell_gap_ticks": 2.0,
   "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks": 3.0,

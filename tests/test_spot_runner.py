@@ -648,6 +648,32 @@ class SpotRunnerTests(unittest.TestCase):
 
         self.assertIn("spot_app_loss_prestart_gate_enabled", str(raised.exception))
 
+    @patch("grid_optimizer.web._spot_freeze_live_hedge_preflight_reason", return_value=None)
+    def test_spot_runner_preflight_rejects_app_loss_window_mismatch(
+        self,
+        _mock_live_hedge,
+    ) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "XPLUSDT",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "spot_app_loss_guard_enabled": True,
+                "spot_app_loss_recovery_reduce_only_enabled": True,
+                "spot_app_loss_prestart_gate_enabled": True,
+                "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
+                "runtime_guard_stats_start_time": "2026-06-20T08:00:00+08:00",
+                "spot_freeze_enabled": True,
+                "spot_freeze_maker_execution_enabled": True,
+                "spot_freeze_base_hedge_qty": 4800.0,
+            }
+        )
+
+        with self.assertRaises(ValueError) as raised:
+            web._runner_start_safety_preflight(config, spot=True)
+
+        self.assertIn("runtime_guard_stats_start_time", str(raised.exception))
+
     @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
     def test_start_spot_runner_process_requires_spot_freeze_for_app_loss_recovery(
         self,
@@ -822,6 +848,7 @@ class SpotRunnerTests(unittest.TestCase):
                     "spot_app_loss_recovery_reduce_only_enabled": True,
                     "spot_app_loss_prestart_gate_enabled": True,
                     "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
+                    "runtime_guard_stats_start_time": "2026-06-24T19:57:00+08:00",
                     "spot_freeze_enabled": True,
                     "spot_freeze_maker_execution_enabled": True,
                     "spot_freeze_base_hedge_qty": 4800.0,
