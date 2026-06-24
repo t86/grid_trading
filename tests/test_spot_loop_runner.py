@@ -1699,6 +1699,43 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual([order["role"] for order in filtered], ["grid_entry", "spot_freeze_maker"])
         self.assertEqual(controls["spot_freeze_suppressed_app_loss_reduce_orders"], 1)
 
+    def test_spot_app_loss_guard_retags_kept_reduce_order_before_freeze_priority(self) -> None:
+        controls = {"actual_base_qty": 110.0, "neutral_base_qty": 100.0}
+        guarded = _apply_spot_app_loss_guard_to_orders(
+            desired_orders=[
+                {"side": "SELL", "price": 10.10, "qty": 5.0, "role": "bootstrap_entry", "tag": "sell1"},
+                {"side": "BUY", "price": 9.90, "qty": 5.0, "role": "grid_entry", "tag": "buy1"},
+            ],
+            controls=controls,
+            metrics={"buy_notional": 2000.0, "sell_notional": 900.0, "buy_qty": 200.0, "sell_qty": 90.0},
+            position_qty=110.0,
+            latest_price=9.98,
+            enabled=True,
+            min_notional=10.0,
+            soft_per_10k=0.6,
+            hard_per_10k=1.0,
+            maker_reduce_notional=60.0,
+            maker_reference_price=10.0,
+            tick_size=0.01,
+            step_size=0.1,
+            min_qty=0.1,
+            exchange_min_notional=5.0,
+            available_base_free=110.0,
+        )
+
+        self.assertEqual([order["role"] for order in guarded], ["spot_app_loss_reduce"])
+
+        filtered = _apply_spot_freeze_maker_orders_to_desired_orders(
+            desired_orders=guarded,
+            maker_orders=[
+                {"side": "SELL", "price": 10.00, "qty": 5.0, "role": "spot_freeze_maker", "tag": "spot_freeze_long"}
+            ],
+            controls=controls,
+        )
+
+        self.assertEqual([order["role"] for order in filtered], ["spot_freeze_maker"])
+        self.assertEqual(controls["spot_freeze_suppressed_app_loss_reduce_orders"], 1)
+
     def test_spot_freeze_marks_huge_deviation_threshold_as_effectively_disabled(self) -> None:
         args = self._synthetic_args(
             [

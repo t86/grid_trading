@@ -1118,6 +1118,9 @@ def _cap_spot_app_loss_reduce_orders(
         capped = dict(order)
         capped["qty"] = qty
         capped["notional"] = qty * price
+        capped.setdefault("source_role", str(order.get("role", "") or ""))
+        capped["role"] = "spot_app_loss_reduce"
+        capped["tag"] = "app_loss_reduce"
         capped_orders.append(capped)
         remaining_qty = max(remaining_qty - qty, 0.0)
         if remaining_quote is not None:
