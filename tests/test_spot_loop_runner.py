@@ -616,6 +616,48 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertFalse(controls.get("buy_paused", False))
         self.assertIn("spot_app_loss_guard_recovery_reduce_only", controls["pause_reasons"])
 
+    def test_spot_app_loss_recovery_returns_to_cruise_when_neutral_deviation_is_clear(self) -> None:
+        controls = {"actual_base_qty": 4800.0, "neutral_base_qty": 4800.0}
+        desired_orders = [
+            {"side": "BUY", "role": "grid_entry", "price": 0.0899, "qty": 222.0},
+            {"side": "SELL", "role": "grid_exit", "price": 0.0902, "qty": 222.0},
+        ]
+
+        filtered = _apply_spot_app_loss_guard_to_orders(
+            desired_orders=desired_orders,
+            controls=controls,
+            metrics={
+                "buy_notional": 2724.6815,
+                "sell_notional": 2299.6215,
+                "buy_qty": 30794.9,
+                "sell_qty": 25994.9,
+            },
+            position_qty=4800.0,
+            latest_price=0.0901,
+            maker_buy_reference_price=0.09,
+            maker_sell_reference_price=0.0902,
+            enabled=True,
+            recovery_reduce_only_enabled=True,
+            min_notional=5000.0,
+            soft_per_10k=0.6,
+            hard_per_10k=1.0,
+            maker_reduce_notional=20.0,
+            tick_size=0.0001,
+            step_size=0.1,
+            min_qty=0.1,
+            exchange_min_notional=5.0,
+            available_quote_free=1000.0,
+            available_base_free=4800.0,
+        )
+
+        self.assertEqual(filtered, desired_orders)
+        self.assertEqual(controls["spot_app_loss_guard"]["state"], "cruise")
+        self.assertEqual(controls["spot_app_loss_guard"]["action"], "observe")
+        self.assertEqual(controls["spot_app_loss_guard"]["reduce_side"], "")
+        self.assertEqual(controls["spot_app_loss_guard"]["reduce_deviation_qty"], 0.0)
+        self.assertFalse(controls.get("buy_paused", False))
+        self.assertNotIn("spot_app_loss_guard_recovery_reduce_only", controls.get("pause_reasons") or [])
+
     def test_spot_app_loss_guard_drops_buy_reduce_above_bid_reference(self) -> None:
         controls = {"actual_base_qty": 4121.8, "neutral_base_qty": 4800.0}
         desired_orders = [

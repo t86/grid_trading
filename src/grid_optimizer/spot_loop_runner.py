@@ -1217,6 +1217,15 @@ def _apply_spot_app_loss_guard_to_orders(
         return desired_orders
 
     reduce_side = _spot_app_loss_reduce_side(controls, position_qty, app_position_qty=guard.get("position_qty"))
+    if guard["state"] == "recovery_reduce_only" and not reduce_side:
+        guard["state"] = "cruise"
+        guard["action"] = "observe"
+        guard["reduce_side"] = ""
+        guard["dropped_order_count"] = 0
+        guard["injected_order_count"] = 0
+        guard["capped_order_count"] = 0
+        guard["reduce_deviation_qty"] = 0.0
+        return desired_orders
     if reduce_side == "BUY":
         reduce_reference_price = maker_buy_reference_price if maker_buy_reference_price is not None else maker_reference_price
     else:
