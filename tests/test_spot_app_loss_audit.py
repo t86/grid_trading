@@ -3,7 +3,12 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from grid_optimizer.spot_app_loss_audit import compute_spot_app_loss_audit, evaluate_spot_app_loss_recovery_gate, main
+from grid_optimizer.spot_app_loss_audit import (
+    build_live_spot_app_loss_audit,
+    compute_spot_app_loss_audit,
+    evaluate_spot_app_loss_recovery_gate,
+    main,
+)
 
 
 class SpotAppLossAuditTests(unittest.TestCase):
@@ -133,6 +138,56 @@ class SpotAppLossAuditTests(unittest.TestCase):
             code = main(["--symbol", "XPLUSDT", "--require-gate"])
 
         self.assertEqual(code, 0)
+
+    def test_build_live_spot_app_loss_audit_paginates_multi_day_windows(self) -> None:
+        first_day = [
+            {"id": i, "isBuyer": True, "isMaker": True, "price": "1.0", "qty": "1", "quoteQty": "1", "time": i}
+            for i in range(750)
+        ]
+        second_day = [
+            {
+                "id": 1000 + i,
+                "isBuyer": False,
+                "isMaker": True,
+                "price": "1.01",
+                "qty": "1",
+                "quoteQty": "1.01",
+                "time": 86_400_000 + i,
+            }
+            for i in range(750)
+        ]
+        calls: list[tuple[int | None, int | None]] = []
+
+        def fake_fetch_spot_user_trades(**kwargs):
+            start_time_ms = kwargs.get("start_time_ms")
+            end_time_ms = kwargs.get("end_time_ms")
+            calls.append((start_time_ms, end_time_ms))
+            if start_time_ms == 0 and end_time_ms == 172_800_000:
+                return (first_day + second_day)[:1000]
+            if start_time_ms == 0:
+                return first_day
+            return second_day
+
+        with (
+            patch("grid_optimizer.spot_app_loss_audit.load_binance_api_credentials", return_value=("key", "secret")),
+            patch("grid_optimizer.spot_app_loss_audit.fetch_spot_user_trades", side_effect=fake_fetch_spot_user_trades),
+            patch(
+                "grid_optimizer.spot_app_loss_audit.fetch_spot_book_tickers",
+                return_value=[{"bid_price": "1.0", "ask_price": "1.01"}],
+            ),
+            patch("grid_optimizer.spot_app_loss_audit.fetch_spot_symbol_config", return_value={"tick_size": 0.01}),
+        ):
+            audit = build_live_spot_app_loss_audit(
+                symbol="MEGAUSDT",
+                start_time_ms=0,
+                end_time_ms=172_800_000,
+                limit=1000,
+            )
+
+        self.assertEqual(audit["trade_count"], 1500)
+        self.assertEqual(audit["maker_count"], 1500)
+        self.assertFalse(audit["truncated"])
+        self.assertGreaterEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from .data import (
 )
 
 EPSILON = 1e-12
+MAX_SPOT_MY_TRADES_WINDOW_MS = 24 * 60 * 60 * 1000
 
 
 def _safe_float(value: Any) -> float:
@@ -54,6 +55,118 @@ def _ceil_to_tick(value: float, tick_size: float | None) -> float:
     if value <= EPSILON or tick <= EPSILON:
         return max(value, 0.0)
     return math.ceil((value - EPSILON) / tick) * tick
+
+
+def _trade_identity(trade: dict[str, Any]) -> tuple[Any, ...]:
+    trade_id = trade.get("id")
+    if trade_id is not None:
+        return ("id", str(trade_id))
+    return (
+        "fallback",
+        _safe_int(trade.get("time")),
+        str(trade.get("isBuyer")),
+        str(trade.get("price")),
+        str(trade.get("qty")),
+        str(trade.get("quoteQty")),
+    )
+
+
+def _sort_trade_key(trade: dict[str, Any]) -> tuple[int, int]:
+    return (_safe_int(trade.get("time")), _safe_int(trade.get("id")))
+
+
+def _fetch_spot_user_trades_interval(
+    *,
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    start_time_ms: int,
+    end_time_ms: int,
+    limit: int,
+) -> tuple[list[dict[str, Any]], bool, int]:
+    intervals: list[tuple[int, int]] = [(start_time_ms, end_time_ms)]
+    seen: dict[tuple[Any, ...], dict[str, Any]] = {}
+    truncated = False
+    request_count = 0
+    while intervals:
+        interval_start, interval_end = intervals.pop(0)
+        if interval_end < interval_start:
+            continue
+        trades = fetch_spot_user_trades(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            start_time_ms=interval_start,
+            end_time_ms=interval_end,
+            limit=limit,
+        )
+        request_count += 1
+        valid_trades = [trade for trade in trades if isinstance(trade, dict)]
+        for trade in valid_trades:
+            seen[_trade_identity(trade)] = trade
+        if len(valid_trades) < limit:
+            continue
+        trade_times = [_safe_int(trade.get("time")) for trade in valid_trades if _safe_int(trade.get("time")) > 0]
+        if not trade_times:
+            truncated = True
+            continue
+        first_time = min(trade_times)
+        last_time = max(trade_times)
+        split = False
+        if first_time > interval_start:
+            intervals.append((interval_start, first_time - 1))
+            split = True
+        if last_time < interval_end:
+            intervals.append((last_time + 1, interval_end))
+            split = True
+        if not split:
+            truncated = True
+    return sorted(seen.values(), key=_sort_trade_key), truncated, request_count
+
+
+def _fetch_spot_user_trades_paginated(
+    *,
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    start_time_ms: int | None,
+    end_time_ms: int | None,
+    limit: int,
+) -> tuple[list[dict[str, Any]], bool, int]:
+    safe_limit = max(min(int(limit), 1000), 1)
+    if start_time_ms is None or end_time_ms is None:
+        trades = fetch_spot_user_trades(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            limit=safe_limit,
+        )
+        return trades, len(trades) >= safe_limit, 1
+    if end_time_ms < start_time_ms:
+        return [], False, 0
+
+    seen: dict[tuple[Any, ...], dict[str, Any]] = {}
+    truncated = False
+    request_count = 0
+    cursor = start_time_ms
+    while cursor <= end_time_ms:
+        window_end = min(cursor + MAX_SPOT_MY_TRADES_WINDOW_MS - 1, end_time_ms)
+        trades, window_truncated, window_requests = _fetch_spot_user_trades_interval(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            start_time_ms=cursor,
+            end_time_ms=window_end,
+            limit=safe_limit,
+        )
+        request_count += window_requests
+        truncated = truncated or window_truncated
+        for trade in trades:
+            seen[_trade_identity(trade)] = trade
+        cursor = window_end + 1
+    return sorted(seen.values(), key=_sort_trade_key), truncated, request_count
 
 
 def compute_spot_app_loss_audit(
@@ -187,7 +300,9 @@ def build_live_spot_app_loss_audit(
     creds = load_binance_api_credentials()
     if not creds:
         raise RuntimeError("missing Binance API credentials")
-    trades = fetch_spot_user_trades(
+    if start_time_ms is not None and end_time_ms is None:
+        end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    trades, truncated, request_count = _fetch_spot_user_trades_paginated(
         symbol=symbol,
         api_key=creds[0],
         api_secret=creds[1],
@@ -212,7 +327,8 @@ def build_live_spot_app_loss_audit(
             "start_time_ms": start_time_ms,
             "end_time_ms": end_time_ms,
             "limit": int(limit),
-            "truncated": len(trades) >= int(limit),
+            "truncated": truncated,
+            "request_count": request_count,
             "tick_size": symbol_config.get("tick_size"),
         }
     )
