@@ -3085,8 +3085,18 @@ def _maybe_run_spot_freeze(
     tolerance_qty = max(_safe_float(getattr(args, "spot_freeze_tolerance_qty", 0.0)), 0.0)
     ledger = state.get("spot_frozen_ledger") if isinstance(state.get("spot_frozen_ledger"), dict) else new_ledger()
     expected_short_qty = expected_short_position_now(base_hedge_qty, ledger)
-    position_mode = fetch_futures_position_mode(api_key, api_secret)
-    position_risk = fetch_futures_position_risk_v3(api_key, api_secret, symbol=symbol)
+    try:
+        position_mode = fetch_futures_position_mode(api_key, api_secret)
+        position_risk = fetch_futures_position_risk_v3(api_key, api_secret, symbol=symbol)
+    except Exception as exc:
+        controls["spot_freeze_gate"] = {
+            "ok": False,
+            "reason": "futures_position_fetch_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        controls["spot_freeze_alerts"] = ["futures_position_fetch_failed"]
+        controls["spot_freeze_skip_reason"] = "hedge_gate_failed"
+        return
     gate = _check_spot_freeze_hedge_gate(
         symbol=symbol,
         position_mode=position_mode if isinstance(position_mode, dict) else {},
