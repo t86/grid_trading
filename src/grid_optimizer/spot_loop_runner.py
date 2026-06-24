@@ -973,6 +973,16 @@ def _spot_app_loss_deviation_qty(controls: dict[str, Any], position_qty: float) 
     return max(_safe_float(position_qty), 0.0)
 
 
+def _spot_app_loss_break_even_price(controls: dict[str, Any]) -> float:
+    guard = controls.get("spot_app_loss_guard")
+    if not isinstance(guard, dict):
+        return 0.0
+    app_position_qty = max(_safe_float(guard.get("position_qty")), 0.0)
+    if app_position_qty <= EPSILON:
+        return 0.0
+    return max((_safe_float(guard.get("buy_notional")) - _safe_float(guard.get("sell_notional"))) / app_position_qty, 0.0)
+
+
 def _cap_spot_app_loss_reduce_orders(
     *,
     orders: list[dict[str, Any]],
@@ -989,6 +999,7 @@ def _cap_spot_app_loss_reduce_orders(
     if normalized_side not in {"BUY", "SELL"}:
         return []
     remaining_qty = _spot_app_loss_deviation_qty(controls, position_qty)
+    min_sell_price = _spot_app_loss_break_even_price(controls) if normalized_side == "SELL" else 0.0
     if normalized_side == "SELL" and available_base_free is not None:
         remaining_qty = min(remaining_qty, max(_safe_float(available_base_free), 0.0))
     remaining_quote = None
@@ -1002,6 +1013,8 @@ def _cap_spot_app_loss_reduce_orders(
             break
         price = max(_safe_float(order.get("price")), 0.0)
         if price <= EPSILON:
+            continue
+        if normalized_side == "SELL" and min_sell_price > EPSILON and price + EPSILON < min_sell_price:
             continue
         raw_qty = min(max(_safe_float(order.get("qty")), 0.0), remaining_qty)
         if remaining_quote is not None:
@@ -1025,6 +1038,7 @@ def _build_spot_app_loss_maker_reduce_order(
     latest_price: float,
     reduce_side: str,
     maker_reduce_notional: float,
+    tick_size: float | None,
     step_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
@@ -1033,6 +1047,9 @@ def _build_spot_app_loss_maker_reduce_order(
 ) -> dict[str, Any] | None:
     normalized_side = str(reduce_side or "").upper().strip()
     price = max(_safe_float(latest_price), 0.0)
+    if normalized_side == "SELL":
+        price = max(price, _spot_app_loss_break_even_price(controls))
+    price = _round_order_price(price, tick_size, normalized_side)
     notional_cap = max(_safe_float(maker_reduce_notional), 0.0)
     if normalized_side not in {"BUY", "SELL"} or price <= EPSILON or notional_cap <= EPSILON:
         return None
@@ -1073,6 +1090,7 @@ def _apply_spot_app_loss_guard_to_orders(
     soft_per_10k: float,
     hard_per_10k: float,
     maker_reduce_notional: float = 0.0,
+    tick_size: float | None = None,
     step_size: float | None = None,
     min_qty: float | None = None,
     exchange_min_notional: float | None = None,
@@ -1117,6 +1135,7 @@ def _apply_spot_app_loss_guard_to_orders(
             latest_price=latest_price,
             reduce_side=reduce_side,
             maker_reduce_notional=maker_reduce_notional,
+            tick_size=tick_size,
             step_size=step_size,
             min_qty=min_qty,
             min_notional=exchange_min_notional,
@@ -3770,6 +3789,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         soft_per_10k=float(getattr(args, "spot_app_loss_per_10k_soft", 0.0)),
         hard_per_10k=float(getattr(args, "spot_app_loss_per_10k_hard", 0.0)),
         maker_reduce_notional=float(getattr(args, "per_order_notional", 0.0)),
+        tick_size=symbol_info.get("tick_size"),
         step_size=symbol_info.get("step_size"),
         min_qty=symbol_info.get("min_qty"),
         exchange_min_notional=symbol_info.get("min_notional"),
