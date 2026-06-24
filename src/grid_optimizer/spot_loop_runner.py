@@ -1287,6 +1287,30 @@ def _apply_spot_freeze_maker_orders_to_desired_orders(
     return filtered + normalized_maker_orders
 
 
+def _apply_spot_freeze_runtime_hedge_block(
+    *,
+    strategy_mode: str,
+    desired_orders: list[dict[str, Any]],
+    controls: dict[str, Any],
+) -> list[dict[str, Any]]:
+    controls["spot_freeze_runtime_blocked"] = False
+    if strategy_mode != "spot_competition_synthetic_neutral_grid":
+        return desired_orders
+    if not bool(controls.get("spot_freeze_enabled")):
+        return desired_orders
+    if str(controls.get("spot_freeze_skip_reason", "") or "") != "hedge_gate_failed":
+        return desired_orders
+
+    controls["spot_freeze_runtime_blocked"] = True
+    controls["buy_paused"] = True
+    pause_reasons = list(controls.get("pause_reasons") or [])
+    if "spot_freeze_hedge_gate_failed" not in pause_reasons:
+        pause_reasons.append("spot_freeze_hedge_gate_failed")
+    controls["pause_reasons"] = pause_reasons
+    controls["risk_state"] = "spot_freeze_hedge_gate_failed"
+    return []
+
+
 def _record_trade_metrics(
     *,
     metrics: dict[str, Any],
@@ -2880,6 +2904,7 @@ def _spot_freeze_default_controls(enabled: bool) -> dict[str, Any]:
         "spot_freeze_dry_run": False,
         "spot_freeze_market_execution_enabled": False,
         "spot_freeze_maker_execution_enabled": False,
+        "spot_freeze_runtime_blocked": False,
         "spot_freeze_reconcile_ok": None,
         "spot_freeze_alerts": [],
         "spot_freeze_actions": [],
@@ -4225,6 +4250,11 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             persist_ledger=_persist_spot_freeze_ledger,
             existing_maker_orders=_spot_freeze_open_maker_orders(strategy_open_orders, state),
         )
+        desired_orders = _apply_spot_freeze_runtime_hedge_block(
+            strategy_mode=strategy_mode,
+            desired_orders=desired_orders,
+            controls=controls,
+        )
         desired_orders = _apply_spot_freeze_maker_orders_to_desired_orders(
             desired_orders=desired_orders,
             maker_orders=list(controls.get("spot_freeze_maker_orders") or []),
@@ -4417,6 +4447,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "spot_freeze_dry_run": bool(controls.get("spot_freeze_dry_run")),
         "spot_freeze_market_execution_enabled": bool(controls.get("spot_freeze_market_execution_enabled")),
         "spot_freeze_maker_execution_enabled": bool(controls.get("spot_freeze_maker_execution_enabled")),
+        "spot_freeze_runtime_blocked": bool(controls.get("spot_freeze_runtime_blocked")),
         "spot_freeze_reconcile_ok": controls.get("spot_freeze_reconcile_ok"),
         "spot_freeze_alerts": list(controls.get("spot_freeze_alerts") or []),
         "spot_freeze_actions": list(controls.get("spot_freeze_actions") or []),

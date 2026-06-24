@@ -25,6 +25,7 @@ from grid_optimizer.spot_loop_runner import (
     _normalize_commission_quote,
     _apply_spot_app_loss_guard_to_orders,
     _apply_spot_freeze_maker_orders_to_desired_orders,
+    _apply_spot_freeze_runtime_hedge_block,
     _resolve_spot_competition_runtime,
     _run_cycle,
     _spot_order_meets_exchange_mins,
@@ -1735,6 +1736,45 @@ class SpotLoopRunnerTests(unittest.TestCase):
 
         self.assertEqual([order["role"] for order in filtered], ["spot_freeze_maker"])
         self.assertEqual(controls["spot_freeze_suppressed_app_loss_reduce_orders"], 1)
+
+    def test_spot_freeze_runtime_hedge_block_clears_orders_when_gate_failed(self) -> None:
+        controls = {
+            "spot_freeze_enabled": True,
+            "spot_freeze_skip_reason": "hedge_gate_failed",
+            "pause_reasons": ["existing_reason"],
+        }
+        desired_orders = [
+            {"side": "BUY", "price": 10.0, "qty": 1.0},
+            {"side": "SELL", "price": 10.1, "qty": 1.0},
+        ]
+
+        filtered = _apply_spot_freeze_runtime_hedge_block(
+            strategy_mode="spot_competition_synthetic_neutral_grid",
+            desired_orders=desired_orders,
+            controls=controls,
+        )
+
+        self.assertEqual(filtered, [])
+        self.assertTrue(controls["spot_freeze_runtime_blocked"])
+        self.assertTrue(controls["buy_paused"])
+        self.assertEqual(controls["risk_state"], "spot_freeze_hedge_gate_failed")
+        self.assertEqual(controls["pause_reasons"], ["existing_reason", "spot_freeze_hedge_gate_failed"])
+
+    def test_spot_freeze_runtime_hedge_block_keeps_orders_when_gate_ok(self) -> None:
+        controls = {
+            "spot_freeze_enabled": True,
+            "spot_freeze_skip_reason": "eligible",
+        }
+        desired_orders = [{"side": "SELL", "price": 10.1, "qty": 1.0}]
+
+        filtered = _apply_spot_freeze_runtime_hedge_block(
+            strategy_mode="spot_competition_synthetic_neutral_grid",
+            desired_orders=desired_orders,
+            controls=controls,
+        )
+
+        self.assertEqual(filtered, desired_orders)
+        self.assertFalse(controls["spot_freeze_runtime_blocked"])
 
     def test_spot_freeze_marks_huge_deviation_threshold_as_effectively_disabled(self) -> None:
         args = self._synthetic_args(
