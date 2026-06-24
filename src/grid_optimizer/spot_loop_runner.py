@@ -51,6 +51,7 @@ from .spot_freeze_manager import (
     compute_deviation_loss,
     expected_short_position_now,
     freeze_cycle,
+    ledger_totals,
     new_ledger,
 )
 from .trade_database import ensure_trade_database_schema, persist_cycle_snapshot, persist_trade_rows, trade_database_enabled
@@ -61,6 +62,7 @@ PRICE_CACHE_TTL_SECONDS = 30.0
 _LATEST_PRICE_CACHE: dict[str, tuple[float, float]] = {}
 SPOT_COMPETITION_RUNTIME_CACHE_KEY = "spot_competition_inventory_grid_runtime_cache"
 SPOT_SYNTHETIC_NEUTRAL_RUNTIME_CACHE_KEY = "spot_competition_synthetic_neutral_grid_runtime_cache"
+SPOT_FREEZE_MAKER_ROLE = "spot_freeze_maker"
 SPOT_COMPETITION_MODES = {
     "spot_competition_inventory_grid",
     "spot_competition_synthetic_neutral_grid",
@@ -1257,6 +1259,31 @@ def _apply_spot_app_loss_guard_to_orders(
     return kept_orders
 
 
+def _apply_spot_freeze_maker_orders_to_desired_orders(
+    *,
+    desired_orders: list[dict[str, Any]],
+    maker_orders: list[dict[str, Any]],
+    controls: dict[str, Any],
+) -> list[dict[str, Any]]:
+    normalized_maker_orders = [dict(order) for order in list(maker_orders or []) if isinstance(order, dict)]
+    if not normalized_maker_orders:
+        controls["spot_freeze_suppressed_app_loss_reduce_orders"] = 0
+        return desired_orders
+    maker_sides = {str(order.get("side", "") or "").upper().strip() for order in normalized_maker_orders}
+    filtered: list[dict[str, Any]] = []
+    suppressed = 0
+    for order in list(desired_orders or []):
+        if (
+            str(order.get("role", "") or "").strip() == "spot_app_loss_reduce"
+            and str(order.get("side", "") or "").upper().strip() in maker_sides
+        ):
+            suppressed += 1
+            continue
+        filtered.append(order)
+    controls["spot_freeze_suppressed_app_loss_reduce_orders"] = suppressed
+    return filtered + normalized_maker_orders
+
+
 def _record_trade_metrics(
     *,
     metrics: dict[str, Any],
@@ -1597,6 +1624,68 @@ def _sync_volume_shift_trades(
     return applied
 
 
+def _record_spot_freeze_maker_fill(
+    *,
+    state: dict[str, Any],
+    trade: dict[str, Any],
+    side: str,
+    price: float,
+    qty: float,
+) -> None:
+    normalized_side = str(side or "").upper().strip()
+    freeze_qty = max(_safe_float(qty), 0.0)
+    fill_price = max(_safe_float(price), 0.0)
+    trade_id = _safe_int(trade.get("id"))
+    if normalized_side not in {"BUY", "SELL"} or freeze_qty <= EPSILON or fill_price <= EPSILON or trade_id <= 0:
+        return
+    ledger = state.get("spot_frozen_ledger") if isinstance(state.get("spot_frozen_ledger"), dict) else new_ledger()
+    ledger.setdefault("long_lots", [])
+    ledger.setdefault("short_lots", [])
+    ledger.setdefault("pending_contract_actions", [])
+    lot_side = "long" if normalized_side == "SELL" else "short"
+    lot_key = "long_lots" if lot_side == "long" else "short_lots"
+    contract_side = "BUY" if lot_side == "long" else "SELL"
+    reason = "freeze_long_hedge" if lot_side == "long" else "freeze_short_hedge"
+    lot_id = f"spot_freeze_maker_{trade_id}"
+    if any(str(lot.get("lot_id") or "") == lot_id for lot in list(ledger.get("long_lots") or []) + list(ledger.get("short_lots") or [])):
+        return
+    if any(str(action.get("lot_id") or "") == lot_id for action in list(ledger.get("pending_contract_actions") or [])):
+        return
+    ledger[lot_key].append(
+        {
+            "lot_id": lot_id,
+            "qty": freeze_qty,
+            "cost_price": fill_price,
+            "frozen_at": _safe_int(trade.get("time")),
+            "frozen_mid": fill_price,
+            "hedge_pending": True,
+            "spot_order_id": _safe_int(trade.get("orderId")),
+            "spot_trade_id": trade_id,
+        }
+    )
+    ledger["pending_contract_actions"].append(
+        {"side": contract_side, "position_side": "SHORT", "qty": freeze_qty, "reason": reason, "lot_id": lot_id}
+    )
+    ledger_totals(ledger)
+    state["spot_frozen_ledger"] = ledger
+
+
+def _spot_freeze_open_maker_orders(open_orders: list[dict[str, Any]], state: dict[str, Any]) -> list[dict[str, Any]]:
+    known_orders = state.get("known_orders") if isinstance(state.get("known_orders"), dict) else {}
+    matched: list[dict[str, Any]] = []
+    for order in list(open_orders or []):
+        if not isinstance(order, dict):
+            continue
+        order_id = str(_safe_int(order.get("orderId", order.get("order_id"))))
+        meta = known_orders.get(order_id) if isinstance(known_orders, dict) else None
+        client_order_id = str(order.get("clientOrderId", order.get("client_order_id", "")) or "")
+        if (isinstance(meta, dict) and str(meta.get("role", "") or "").strip() == SPOT_FREEZE_MAKER_ROLE) or (
+            SPOT_FREEZE_MAKER_ROLE in client_order_id or "spot_freeze_" in client_order_id
+        ):
+            matched.append(order)
+    return matched
+
+
 def _sync_synthetic_neutral_trades(
     *,
     state: dict[str, Any],
@@ -1637,6 +1726,12 @@ def _sync_synthetic_neutral_trades(
             base_asset=base_asset,
             quote_asset=quote_asset,
         )
+        effective_qty = trade_qty
+        if commission_asset == base_asset:
+            if side == "BUY":
+                effective_qty = max(trade_qty - commission, 0.0)
+            elif side == "SELL":
+                effective_qty = trade_qty + commission
         _record_trade_metrics(
             metrics=metrics,
             trade=trade,
@@ -1649,6 +1744,14 @@ def _sync_synthetic_neutral_trades(
             realized_pnl=-commission_quote,
             role=str(meta.get("role", "") or ""),
         )
+        if str(meta.get("role", "") or "").strip() == SPOT_FREEZE_MAKER_ROLE:
+            _record_spot_freeze_maker_fill(
+                state=state,
+                trade=trade,
+                side=side,
+                price=price,
+                qty=effective_qty,
+            )
         seen_ids.add(trade_id)
         trade_time_ms = int(trade.get("time", 0) or 0)
         if trade_time_ms > last_trade_time_ms:
@@ -2773,9 +2876,13 @@ def _spot_freeze_default_controls(enabled: bool) -> dict[str, Any]:
         "spot_freeze_config_reason": "enabled" if enabled else "disabled",
         "spot_freeze_dry_run": False,
         "spot_freeze_market_execution_enabled": False,
+        "spot_freeze_maker_execution_enabled": False,
         "spot_freeze_reconcile_ok": None,
         "spot_freeze_alerts": [],
         "spot_freeze_actions": [],
+        "spot_freeze_maker_orders": [],
+        "spot_freeze_existing_maker_orders": [],
+        "spot_freeze_suppressed_app_loss_reduce_orders": 0,
         "spot_freeze_frozen_long_qty": 0.0,
         "spot_freeze_frozen_short_qty": 0.0,
         "spot_freeze_pending_contract_actions": [],
@@ -2846,6 +2953,63 @@ def _spot_freeze_app_loss_deviation_loss(
     return DeviationLossResult(usable=True, loss_ratio=loss_ratio, cost_avg=cost_avg, reason="app_loss_guard")
 
 
+def _build_spot_freeze_maker_order(
+    *,
+    args: argparse.Namespace,
+    ledger: dict[str, Any],
+    base_hedge_qty: float,
+    deviation_side: str,
+    deviation_qty: float,
+    mid_price: float,
+    bid_price: float,
+    ask_price: float,
+    qty_step: float,
+    tick_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> tuple[dict[str, Any] | None, str]:
+    side_name = str(deviation_side or "").strip().lower()
+    mid = max(_safe_float(mid_price), 0.0)
+    if side_name not in {"long", "short"} or mid <= EPSILON:
+        return None, "invalid_maker_candidate"
+    long_qty, short_qty = ledger_totals(ledger)
+    cap = max(_safe_float(getattr(args, "spot_freeze_total_cap_notional", 0.0)), 0.0)
+    frozen_notional = (long_qty + short_qty) * mid
+    if cap > EPSILON and frozen_notional + EPSILON >= cap:
+        return None, "total_cap_reached"
+
+    max_qty = max(_safe_float(deviation_qty), 0.0)
+    available_short_qty = expected_short_position_now(base_hedge_qty, ledger)
+    if side_name == "long":
+        max_qty = min(max_qty, max(_safe_float(available_short_qty), 0.0))
+    else:
+        max_contract_short_notional = max(_safe_float(getattr(args, "max_short_position_notional", 0.0)), 0.0)
+        if max_contract_short_notional > EPSILON:
+            max_contract_short_qty = max_contract_short_notional / mid
+            short_capacity_qty = max(max_contract_short_qty - max(_safe_float(available_short_qty), 0.0), 0.0)
+            if short_capacity_qty <= EPSILON:
+                return None, "short_hedge_capacity_exhausted"
+            max_qty = min(max_qty, short_capacity_qty)
+    per_cycle_cap = max(_safe_float(getattr(args, "spot_freeze_max_per_cycle_notional", 0.0)), 0.0)
+    if per_cycle_cap > EPSILON:
+        max_qty = min(max_qty, per_cycle_cap / mid)
+    if cap > EPSILON:
+        max_qty = min(max_qty, max((cap - frozen_notional) / mid, 0.0))
+    qty = _round_order_qty(max_qty, qty_step)
+    side = "SELL" if side_name == "long" else "BUY"
+    reference_price = ask_price if side == "SELL" else bid_price
+    price = _round_order_price(max(_safe_float(reference_price), 0.0), tick_size, side)
+    if not _spot_order_meets_exchange_mins(qty=qty, price=price, min_qty=min_qty, min_notional=min_notional):
+        return None, "qty_too_small"
+    return {
+        "side": side,
+        "price": price,
+        "qty": qty,
+        "role": SPOT_FREEZE_MAKER_ROLE,
+        "tag": "spot_freeze_long" if side_name == "long" else "spot_freeze_short",
+    }, ""
+
+
 def _maybe_run_spot_freeze(
     *,
     args: argparse.Namespace,
@@ -2853,17 +3017,22 @@ def _maybe_run_spot_freeze(
     controls: dict[str, Any],
     symbol: str,
     mid_price: float,
+    bid_price: float = 0.0,
+    ask_price: float = 0.0,
     symbol_info: dict[str, Any],
     api_key: str,
     api_secret: str,
     now: datetime,
     persist_ledger: Any | None = None,
+    existing_maker_orders: list[dict[str, Any]] | None = None,
 ) -> None:
     enabled = bool(getattr(args, "spot_freeze_enabled", False))
     controls.update(_spot_freeze_default_controls(enabled))
     controls["spot_freeze_dry_run"] = bool(getattr(args, "spot_freeze_dry_run", False))
     market_execution_enabled = bool(getattr(args, "spot_freeze_market_execution_enabled", False))
     controls["spot_freeze_market_execution_enabled"] = market_execution_enabled
+    maker_execution_enabled = bool(getattr(args, "spot_freeze_maker_execution_enabled", False))
+    controls["spot_freeze_maker_execution_enabled"] = maker_execution_enabled
     neutral_base_qty = _safe_float(controls.get("neutral_base_qty", getattr(args, "neutral_base_qty", 0.0)))
     spot_inventory_qty = _safe_float(controls.get("actual_base_qty", neutral_base_qty))
     deviation_qty = abs(spot_inventory_qty - neutral_base_qty)
@@ -2907,6 +3076,38 @@ def _maybe_run_spot_freeze(
         controls["spot_freeze_alerts"] = ["futures_symbol_config_failed"]
         controls["spot_freeze_skip_reason"] = "futures_symbol_config_failed"
         return
+    if ledger.get("pending_contract_actions"):
+        pending_dry_run = bool(getattr(args, "spot_freeze_dry_run", False)) or not bool(getattr(args, "apply", False))
+        result = freeze_cycle(
+            symbol=symbol,
+            neutral_base_qty=neutral_base_qty,
+            spot_inventory_qty=spot_inventory_qty,
+            mid_price=mid_price,
+            mark_price=mid_price,
+            ledger=ledger,
+            contract_short_qty=_safe_float(gate.get("contract_short_qty")),
+            base_hedge_qty=base_hedge_qty,
+            deviation_loss_ratio=0.0,
+            loss_ratio_usable=False,
+            config=FreezeConfig(enabled=False),
+            qty_step=qty_step,
+            tolerance_qty=tolerance_qty,
+            now=now.isoformat(),
+            place_spot=_make_spot_freeze_spot_market_callback(symbol=symbol, api_key=api_key, api_secret=api_secret),
+            place_contract=_make_spot_freeze_contract_callback(symbol=symbol, api_key=api_key, api_secret=api_secret),
+            dry_run=pending_dry_run,
+            on_ledger_change=persist_ledger,
+        )
+        ledger_result = result.get("ledger") if isinstance(result, dict) else new_ledger()
+        state["spot_frozen_ledger"] = ledger_result
+        controls["spot_freeze_reconcile_ok"] = bool(result.get("reconcile_ok")) if isinstance(result, dict) else False
+        controls["spot_freeze_alerts"] = list(result.get("alerts") or []) if isinstance(result, dict) else ["invalid_freeze_result"]
+        controls["spot_freeze_actions"] = list(result.get("actions") or []) if isinstance(result, dict) else []
+        controls["spot_freeze_frozen_long_qty"] = _safe_float(ledger_result.get("frozen_long_qty")) if isinstance(ledger_result, dict) else 0.0
+        controls["spot_freeze_frozen_short_qty"] = _safe_float(ledger_result.get("frozen_short_qty")) if isinstance(ledger_result, dict) else 0.0
+        controls["spot_freeze_pending_contract_actions"] = list(ledger_result.get("pending_contract_actions") or []) if isinstance(ledger_result, dict) else []
+        controls["spot_freeze_skip_reason"] = "pending_contract_repair"
+        return
 
     runtime = controls.get("_runtime") if isinstance(controls.get("_runtime"), dict) else {}
     loss = compute_deviation_loss(runtime, neutral_base_qty, mid_price, deviation_side, deviation_qty)
@@ -2937,6 +3138,39 @@ def _maybe_run_spot_freeze(
         controls["spot_freeze_skip_reason"] = "eligible"
     dry_run = bool(getattr(args, "spot_freeze_dry_run", False)) or not bool(getattr(args, "apply", False))
     if not dry_run and not market_execution_enabled:
+        if maker_execution_enabled and controls["spot_freeze_skip_reason"] == "eligible":
+            open_maker_orders = [dict(order) for order in list(existing_maker_orders or []) if isinstance(order, dict)]
+            if open_maker_orders:
+                controls["spot_freeze_existing_maker_orders"] = open_maker_orders
+                controls["spot_freeze_maker_orders"] = []
+                controls["spot_freeze_actions"] = []
+                controls["spot_freeze_skip_reason"] = "maker_order_open"
+                return
+            maker_order, maker_reason = _build_spot_freeze_maker_order(
+                args=args,
+                ledger=ledger,
+                base_hedge_qty=base_hedge_qty,
+                deviation_side=deviation_side,
+                deviation_qty=deviation_qty,
+                mid_price=mid_price,
+                bid_price=bid_price,
+                ask_price=ask_price,
+                qty_step=qty_step,
+                tick_size=symbol_info.get("tick_size"),
+                min_qty=symbol_info.get("min_qty"),
+                min_notional=symbol_info.get("min_notional"),
+            )
+            if maker_order is not None:
+                controls["spot_freeze_maker_orders"] = [maker_order]
+                controls["spot_freeze_actions"] = [
+                    {"type": "freeze_maker_order", "side": deviation_side, "qty": _safe_float(maker_order.get("qty"))}
+                ]
+                controls["spot_freeze_skip_reason"] = "maker_order_pending"
+            else:
+                controls["spot_freeze_alerts"] = [maker_reason or "maker_order_unavailable"]
+                controls["spot_freeze_actions"] = []
+                controls["spot_freeze_skip_reason"] = maker_reason or "maker_order_unavailable"
+            return
         controls["spot_freeze_alerts"] = ["market_execution_disabled"]
         controls["spot_freeze_actions"] = []
         if controls["spot_freeze_skip_reason"] == "eligible":
@@ -3979,11 +4213,19 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             controls=controls,
             symbol=symbol,
             mid_price=mid_price,
+            bid_price=bid_price,
+            ask_price=ask_price,
             symbol_info=symbol_info,
             api_key=api_key,
             api_secret=api_secret,
             now=_utc_now(),
             persist_ledger=_persist_spot_freeze_ledger,
+            existing_maker_orders=_spot_freeze_open_maker_orders(strategy_open_orders, state),
+        )
+        desired_orders = _apply_spot_freeze_maker_orders_to_desired_orders(
+            desired_orders=desired_orders,
+            maker_orders=list(controls.get("spot_freeze_maker_orders") or []),
+            controls=controls,
         )
         if controls.get("spot_freeze_actions") or controls.get("spot_freeze_pending_contract_actions"):
             # Spot freeze may have already placed market orders; persist the ledger
@@ -4171,9 +4413,15 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "spot_freeze_config_reason": str(controls.get("spot_freeze_config_reason", "") or ""),
         "spot_freeze_dry_run": bool(controls.get("spot_freeze_dry_run")),
         "spot_freeze_market_execution_enabled": bool(controls.get("spot_freeze_market_execution_enabled")),
+        "spot_freeze_maker_execution_enabled": bool(controls.get("spot_freeze_maker_execution_enabled")),
         "spot_freeze_reconcile_ok": controls.get("spot_freeze_reconcile_ok"),
         "spot_freeze_alerts": list(controls.get("spot_freeze_alerts") or []),
         "spot_freeze_actions": list(controls.get("spot_freeze_actions") or []),
+        "spot_freeze_maker_orders": list(controls.get("spot_freeze_maker_orders") or []),
+        "spot_freeze_existing_maker_orders": list(controls.get("spot_freeze_existing_maker_orders") or []),
+        "spot_freeze_suppressed_app_loss_reduce_orders": _safe_int(
+            controls.get("spot_freeze_suppressed_app_loss_reduce_orders")
+        ),
         "spot_freeze_frozen_long_qty": _safe_float(controls.get("spot_freeze_frozen_long_qty")),
         "spot_freeze_frozen_short_qty": _safe_float(controls.get("spot_freeze_frozen_short_qty")),
         "spot_freeze_pending_contract_actions": list(controls.get("spot_freeze_pending_contract_actions") or []),
@@ -4381,6 +4629,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spot-freeze-enabled", action="store_true")
     parser.add_argument("--spot-freeze-dry-run", action="store_true")
     parser.add_argument("--spot-freeze-market-execution-enabled", action="store_true")
+    parser.add_argument("--spot-freeze-maker-execution-enabled", action="store_true")
     parser.add_argument("--spot-freeze-base-hedge-qty", type=float, default=0.0)
     parser.add_argument("--spot-freeze-tolerance-qty", type=float, default=0.0)
     parser.add_argument("--spot-freeze-deviation-notional", type=float, default=0.0)

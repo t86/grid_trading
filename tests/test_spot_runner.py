@@ -554,6 +554,7 @@ class SpotRunnerTests(unittest.TestCase):
                 "spot_freeze_enabled": True,
                 "spot_freeze_dry_run": True,
                 "spot_freeze_market_execution_enabled": True,
+                "spot_freeze_maker_execution_enabled": True,
                 "spot_freeze_base_hedge_qty": 100.0,
                 "spot_freeze_tolerance_qty": 0.01,
                 "spot_freeze_deviation_notional": 50.0,
@@ -571,6 +572,7 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("--spot-freeze-enabled", command)
         self.assertIn("--spot-freeze-dry-run", command)
         self.assertIn("--spot-freeze-market-execution-enabled", command)
+        self.assertIn("--spot-freeze-maker-execution-enabled", command)
         self.assertIn("--spot-freeze-base-hedge-qty", command)
         self.assertIn("100.0", command)
         self.assertIn("--spot-freeze-tolerance-qty", command)
@@ -637,6 +639,7 @@ class SpotRunnerTests(unittest.TestCase):
                 "spot_freeze_enabled": True,
                 "spot_freeze_dry_run": True,
                 "spot_freeze_market_execution_enabled": True,
+                "spot_freeze_maker_execution_enabled": True,
                 "spot_freeze_base_hedge_qty": 10000,
                 "spot_freeze_tolerance_qty": 0.01,
                 "spot_freeze_deviation_notional": 50,
@@ -652,6 +655,7 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertTrue(payload["spot_freeze_enabled"])
         self.assertTrue(payload["spot_freeze_dry_run"])
         self.assertTrue(payload["spot_freeze_market_execution_enabled"])
+        self.assertTrue(payload["spot_freeze_maker_execution_enabled"])
         self.assertEqual(payload["spot_freeze_base_hedge_qty"], 10000.0)
         self.assertEqual(payload["spot_freeze_tolerance_qty"], 0.01)
         self.assertEqual(payload["spot_freeze_deviation_notional"], 50.0)

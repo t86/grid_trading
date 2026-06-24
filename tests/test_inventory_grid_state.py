@@ -274,6 +274,38 @@ def test_spot_app_loss_reduce_buy_consumes_short_lot_without_anchor_or_credit() 
     assert runtime["position_lots"][0]["qty"] == 60.0
 
 
+def test_spot_freeze_maker_sell_consumes_long_lot_without_anchor_or_credit() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 0.10
+    runtime["pair_credit_steps"] = 4
+    runtime["position_lots"] = [
+        {
+            "lot_id": "l1",
+            "side": "long",
+            "qty": 100.0,
+            "entry_price": 0.10,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="spot_freeze_maker",
+        side="SELL",
+        price=0.11,
+        qty=40.0,
+        fill_time_ms=2,
+        step_price=0.01,
+    )
+
+    assert runtime["direction_state"] == "long_active"
+    assert runtime["grid_anchor_price"] == 0.10
+    assert runtime["pair_credit_steps"] == 4
+    assert runtime["position_lots"][0]["qty"] == 60.0
+
+
 def test_forced_reduce_fill_debit_matches_planner_cost_for_favorable_price() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["direction_state"] = "long_active"

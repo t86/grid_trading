@@ -8438,6 +8438,7 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "spot_freeze_enabled": False,
     "spot_freeze_dry_run": False,
     "spot_freeze_market_execution_enabled": False,
+    "spot_freeze_maker_execution_enabled": False,
     "spot_freeze_base_hedge_qty": 0.0,
     "spot_freeze_tolerance_qty": 0.0,
     "spot_freeze_deviation_notional": 0.0,
@@ -14446,6 +14447,13 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         ),
         "spot_freeze_market_execution_enabled",
     )
+    spot_freeze_maker_execution_enabled = _safe_bool(
+        payload.get(
+            "spot_freeze_maker_execution_enabled",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_maker_execution_enabled"],
+        ),
+        "spot_freeze_maker_execution_enabled",
+    )
     spot_freeze_base_hedge_qty = _safe_float(
         payload.get("spot_freeze_base_hedge_qty", SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_base_hedge_qty"]),
         "spot_freeze_base_hedge_qty",
@@ -14743,6 +14751,7 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_freeze_enabled": spot_freeze_enabled,
             "spot_freeze_dry_run": spot_freeze_dry_run,
             "spot_freeze_market_execution_enabled": spot_freeze_market_execution_enabled,
+            "spot_freeze_maker_execution_enabled": spot_freeze_maker_execution_enabled,
             "spot_freeze_base_hedge_qty": spot_freeze_base_hedge_qty,
             "spot_freeze_tolerance_qty": spot_freeze_tolerance_qty,
             "spot_freeze_deviation_notional": spot_freeze_deviation_notional,
@@ -14922,6 +14931,8 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         command.append("--spot-freeze-dry-run")
     if _truthy(config.get("spot_freeze_market_execution_enabled", False)):
         command.append("--spot-freeze-market-execution-enabled")
+    if _truthy(config.get("spot_freeze_maker_execution_enabled", False)):
+        command.append("--spot-freeze-maker-execution-enabled")
     if _truthy(config.get("spot_freeze_pair_release_enabled", False)):
         command.append("--spot-freeze-pair-release-enabled")
     if _truthy(config.get("spot_freeze_profit_release_enabled", False)):
@@ -15045,6 +15056,7 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "spot_freeze_enabled",
             "spot_freeze_dry_run",
             "spot_freeze_market_execution_enabled",
+            "spot_freeze_maker_execution_enabled",
             "spot_freeze_base_hedge_qty",
             "spot_freeze_tolerance_qty",
             "spot_freeze_deviation_notional",
