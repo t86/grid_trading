@@ -6,7 +6,7 @@ from typing import Any
 EPSILON = 1e-12
 ANCHOR_UPDATE_ROLES = frozenset({"bootstrap_entry", "grid_entry", "grid_exit"})
 OPENING_ROLES = frozenset({"bootstrap_entry", "grid_entry"})
-CLOSING_ROLES = frozenset({"grid_exit", "forced_reduce", "tail_cleanup"})
+CLOSING_ROLES = frozenset({"grid_exit", "forced_reduce", "tail_cleanup", "spot_app_loss_reduce"})
 VALID_DIRECTION_STATES = frozenset({"flat", "long_active", "short_active"})
 
 

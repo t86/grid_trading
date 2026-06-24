@@ -210,6 +210,70 @@ def test_forced_reduce_fill_floors_pair_credit_steps_at_zero_for_short_side() ->
     assert runtime["position_lots"] == []
 
 
+def test_spot_app_loss_reduce_sell_consumes_long_lot_without_anchor_or_credit() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 0.10
+    runtime["pair_credit_steps"] = 4
+    runtime["position_lots"] = [
+        {
+            "lot_id": "l1",
+            "side": "long",
+            "qty": 100.0,
+            "entry_price": 0.10,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="spot_app_loss_reduce",
+        side="SELL",
+        price=0.11,
+        qty=40.0,
+        fill_time_ms=2,
+        step_price=0.01,
+    )
+
+    assert runtime["direction_state"] == "long_active"
+    assert runtime["grid_anchor_price"] == 0.10
+    assert runtime["pair_credit_steps"] == 4
+    assert runtime["position_lots"][0]["qty"] == 60.0
+
+
+def test_spot_app_loss_reduce_buy_consumes_short_lot_without_anchor_or_credit() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["direction_state"] = "short_active"
+    runtime["grid_anchor_price"] = 0.10
+    runtime["pair_credit_steps"] = 4
+    runtime["position_lots"] = [
+        {
+            "lot_id": "s1",
+            "side": "short",
+            "qty": 100.0,
+            "entry_price": 0.10,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="spot_app_loss_reduce",
+        side="BUY",
+        price=0.09,
+        qty=40.0,
+        fill_time_ms=2,
+        step_price=0.01,
+    )
+
+    assert runtime["direction_state"] == "short_active"
+    assert runtime["grid_anchor_price"] == 0.10
+    assert runtime["pair_credit_steps"] == 4
+    assert runtime["position_lots"][0]["qty"] == 60.0
+
+
 def test_forced_reduce_fill_debit_matches_planner_cost_for_favorable_price() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["direction_state"] = "long_active"
