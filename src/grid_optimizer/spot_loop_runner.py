@@ -2509,6 +2509,7 @@ def _spot_freeze_default_controls(enabled: bool) -> dict[str, Any]:
     return {
         "spot_freeze_enabled": bool(enabled),
         "spot_freeze_dry_run": False,
+        "spot_freeze_market_execution_enabled": False,
         "spot_freeze_reconcile_ok": None,
         "spot_freeze_alerts": [],
         "spot_freeze_actions": [],
@@ -2550,6 +2551,8 @@ def _maybe_run_spot_freeze(
     enabled = bool(getattr(args, "spot_freeze_enabled", False))
     controls.update(_spot_freeze_default_controls(enabled))
     controls["spot_freeze_dry_run"] = bool(getattr(args, "spot_freeze_dry_run", False))
+    market_execution_enabled = bool(getattr(args, "spot_freeze_market_execution_enabled", False))
+    controls["spot_freeze_market_execution_enabled"] = market_execution_enabled
     neutral_base_qty = _safe_float(controls.get("neutral_base_qty", getattr(args, "neutral_base_qty", 0.0)))
     spot_inventory_qty = _safe_float(controls.get("actual_base_qty", neutral_base_qty))
     deviation_qty = abs(spot_inventory_qty - neutral_base_qty)
@@ -2604,6 +2607,13 @@ def _maybe_run_spot_freeze(
         controls["spot_freeze_skip_reason"] = "loss_ratio_below_min"
     else:
         controls["spot_freeze_skip_reason"] = "eligible"
+    dry_run = bool(getattr(args, "spot_freeze_dry_run", False)) or not bool(getattr(args, "apply", False))
+    if not dry_run and not market_execution_enabled:
+        controls["spot_freeze_alerts"] = ["market_execution_disabled"]
+        controls["spot_freeze_actions"] = []
+        if controls["spot_freeze_skip_reason"] == "eligible":
+            controls["spot_freeze_skip_reason"] = "market_execution_disabled"
+        return
     result = freeze_cycle(
         symbol=symbol,
         neutral_base_qty=neutral_base_qty,
@@ -2631,7 +2641,7 @@ def _maybe_run_spot_freeze(
         now=now.isoformat(),
         place_spot=_make_spot_freeze_spot_market_callback(symbol=symbol, api_key=api_key, api_secret=api_secret),
         place_contract=_make_spot_freeze_contract_callback(symbol=symbol, api_key=api_key, api_secret=api_secret),
-        dry_run=bool(getattr(args, "spot_freeze_dry_run", False)) or not bool(getattr(args, "apply", False)),
+        dry_run=dry_run,
         on_ledger_change=persist_ledger,
     )
     ledger_result = result.get("ledger") if isinstance(result, dict) else new_ledger()
@@ -3819,6 +3829,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "max_short_position_notional": _safe_float(controls.get("max_short_position_notional")),
         "spot_freeze_enabled": bool(controls.get("spot_freeze_enabled")),
         "spot_freeze_dry_run": bool(controls.get("spot_freeze_dry_run")),
+        "spot_freeze_market_execution_enabled": bool(controls.get("spot_freeze_market_execution_enabled")),
         "spot_freeze_reconcile_ok": controls.get("spot_freeze_reconcile_ok"),
         "spot_freeze_alerts": list(controls.get("spot_freeze_alerts") or []),
         "spot_freeze_actions": list(controls.get("spot_freeze_actions") or []),
@@ -4026,6 +4037,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--synthetic-freeze-manual-release-price", type=float, default=0.0)
     parser.add_argument("--spot-freeze-enabled", action="store_true")
     parser.add_argument("--spot-freeze-dry-run", action="store_true")
+    parser.add_argument("--spot-freeze-market-execution-enabled", action="store_true")
     parser.add_argument("--spot-freeze-base-hedge-qty", type=float, default=0.0)
     parser.add_argument("--spot-freeze-tolerance-qty", type=float, default=0.0)
     parser.add_argument("--spot-freeze-deviation-notional", type=float, default=0.0)
