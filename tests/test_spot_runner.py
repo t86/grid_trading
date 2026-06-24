@@ -486,6 +486,43 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("0.0015", command)
         self.assertIn("--synthetic-freeze-pair-release-enabled", command)
 
+    def test_build_spot_runner_command_includes_spot_freeze_arguments(self) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "MEGAUSDT",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "spot_freeze_enabled": True,
+                "spot_freeze_base_hedge_qty": 100.0,
+                "spot_freeze_tolerance_qty": 0.01,
+                "spot_freeze_deviation_notional": 50.0,
+                "spot_freeze_min_loss_ratio": 0.01,
+                "spot_freeze_max_per_cycle_notional": 100.0,
+                "spot_freeze_total_cap_notional": 500.0,
+                "spot_freeze_pair_release_enabled": True,
+                "spot_freeze_profit_release_enabled": True,
+                "spot_freeze_release_profit_ratio": 0.02,
+            }
+        )
+
+        command = _build_spot_runner_command(config)
+
+        self.assertIn("--spot-freeze-enabled", command)
+        self.assertIn("--spot-freeze-base-hedge-qty", command)
+        self.assertIn("100.0", command)
+        self.assertIn("--spot-freeze-tolerance-qty", command)
+        self.assertIn("0.01", command)
+        self.assertIn("--spot-freeze-deviation-notional", command)
+        self.assertIn("50.0", command)
+        self.assertIn("--spot-freeze-min-loss-ratio", command)
+        self.assertIn("--spot-freeze-max-per-cycle-notional", command)
+        self.assertIn("--spot-freeze-total-cap-notional", command)
+        self.assertIn("500.0", command)
+        self.assertIn("--spot-freeze-pair-release-enabled", command)
+        self.assertIn("--spot-freeze-profit-release-enabled", command)
+        self.assertIn("--spot-freeze-release-profit-ratio", command)
+        self.assertIn("0.02", command)
+
     @patch("grid_optimizer.web._validate_market_symbol")
     def test_normalize_spot_runner_payload_preserves_synthetic_freeze_arguments(
         self, _mock_validate_symbol
@@ -517,6 +554,46 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertEqual(payload["synthetic_freeze_max_side_notional"], 1000.0)
         self.assertEqual(payload["synthetic_freeze_release_profit_ratio"], 0.0015)
         self.assertTrue(payload["synthetic_freeze_pair_release_enabled"])
+
+    @patch("grid_optimizer.web._validate_market_symbol")
+    def test_normalize_spot_runner_payload_preserves_spot_freeze_arguments(
+        self, _mock_validate_symbol
+    ) -> None:
+        payload = _normalize_spot_runner_payload(
+            {
+                "symbol": "megausdt",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "step_price": 0.0002,
+                "per_order_notional": 180,
+                "threshold_position_notional": 800,
+                "threshold_reduce_target_notional": 650,
+                "max_order_position_notional": 7000,
+                "max_position_notional": 8200,
+                "neutral_base_qty": 10000,
+                "max_short_position_notional": 320,
+                "spot_freeze_enabled": True,
+                "spot_freeze_base_hedge_qty": 10000,
+                "spot_freeze_tolerance_qty": 0.01,
+                "spot_freeze_deviation_notional": 50,
+                "spot_freeze_min_loss_ratio": 0.01,
+                "spot_freeze_max_per_cycle_notional": 100,
+                "spot_freeze_total_cap_notional": 500,
+                "spot_freeze_pair_release_enabled": True,
+                "spot_freeze_profit_release_enabled": True,
+                "spot_freeze_release_profit_ratio": 0.02,
+            }
+        )
+
+        self.assertTrue(payload["spot_freeze_enabled"])
+        self.assertEqual(payload["spot_freeze_base_hedge_qty"], 10000.0)
+        self.assertEqual(payload["spot_freeze_tolerance_qty"], 0.01)
+        self.assertEqual(payload["spot_freeze_deviation_notional"], 50.0)
+        self.assertEqual(payload["spot_freeze_min_loss_ratio"], 0.01)
+        self.assertEqual(payload["spot_freeze_max_per_cycle_notional"], 100.0)
+        self.assertEqual(payload["spot_freeze_total_cap_notional"], 500.0)
+        self.assertTrue(payload["spot_freeze_pair_release_enabled"])
+        self.assertTrue(payload["spot_freeze_profit_release_enabled"])
+        self.assertEqual(payload["spot_freeze_release_profit_ratio"], 0.02)
 
     @patch("grid_optimizer.web.fetch_spot_open_orders")
     @patch("grid_optimizer.web.fetch_spot_account_info")
@@ -792,6 +869,63 @@ class SpotRunnerTests(unittest.TestCase):
                 self.assertEqual(result["cleanup"]["canceled"], 2)
                 self.assertFalse(state_path.exists())
                 self.assertEqual(pid_path.read_text(encoding="utf-8"), "4321")
+
+    @patch("grid_optimizer.web.time.sleep")
+    @patch("grid_optimizer.web.subprocess.Popen")
+    @patch("grid_optimizer.web._build_spot_runner_command")
+    @patch("grid_optimizer.web._save_spot_runner_control_config")
+    @patch("grid_optimizer.web._cancel_spot_strategy_orders")
+    @patch("grid_optimizer.web._stop_spot_runner_process")
+    @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
+    def test_start_spot_runner_process_restarts_when_spot_freeze_config_changes(
+        self,
+        mock_read_runner,
+        mock_stop_runner,
+        mock_cancel_orders,
+        _mock_save_config,
+        mock_build_command,
+        mock_popen,
+        _mock_sleep,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            log_path = tmp_path / "spot_runner.log"
+            pid_path = tmp_path / "spot_runner.pid"
+
+            current_config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+            current_config.update(
+                {
+                    "symbol": "MEGAUSDT",
+                    "reset_state": False,
+                    "state_path": str(tmp_path / "spot_state.json"),
+                    "summary_jsonl": str(tmp_path / "spot_events.jsonl"),
+                }
+            )
+            desired_config = dict(current_config)
+            desired_config.update(
+                {
+                    "spot_freeze_enabled": True,
+                    "spot_freeze_base_hedge_qty": 100.0,
+                    "spot_freeze_deviation_notional": 50.0,
+                }
+            )
+            mock_read_runner.side_effect = [
+                {"configured": True, "pid": 1234, "is_running": True, "args": None, "config": current_config},
+                {"configured": True, "pid": 4321, "is_running": True, "args": None, "config": desired_config},
+            ]
+            mock_stop_runner.return_value = {"stopped": True}
+            mock_cancel_orders.return_value = {"canceled": 0}
+            mock_build_command.return_value = ["python3", "-m", "grid_optimizer.spot_loop_runner"]
+            mock_popen.return_value = MagicMock(pid=4321)
+
+            with patch("grid_optimizer.web._spot_runner_log_path", return_value=log_path), patch(
+                "grid_optimizer.web._spot_runner_pid_path", return_value=pid_path
+            ):
+                result = _start_spot_runner_process(desired_config)
+
+        self.assertTrue(result["started"])
+        self.assertTrue(result["restarted"])
+        mock_stop_runner.assert_called_once_with("MEGAUSDT", cancel_orders=False)
 
     @patch("grid_optimizer.web.time.sleep")
     @patch("grid_optimizer.web.subprocess.Popen")

@@ -43,7 +43,7 @@ from .inventory_grid_state import (
 )
 from .semi_auto_plan import diff_open_orders
 from .spot_flatten_runner import load_live_spot_flatten_snapshot, spot_flatten_client_order_prefix
-from .spot_freeze_manager import FreezeConfig, compute_deviation_loss, freeze_cycle, new_ledger
+from .spot_freeze_manager import FreezeConfig, compute_deviation_loss, expected_short_position_now, freeze_cycle, new_ledger
 from .trade_database import ensure_trade_database_schema, persist_cycle_snapshot, persist_trade_rows, trade_database_enabled
 
 STATE_VERSION = 2
@@ -2115,8 +2115,9 @@ def _build_spot_competition_inventory_grid_orders(
     if synthetic_neutral and bool(runtime.get("synthetic_cost_unknown")) and str(runtime.get("recovery_mode", "live") or "live") != "live":
         plan = dict(plan)
         plan["bootstrap_orders"] = []
-        plan["buy_orders"] = []
-        plan["sell_orders"] = []
+        plan["buy_orders"] = [order for order in list(plan.get("buy_orders") or []) if order.get("role") == "forced_reduce"]
+        plan["sell_orders"] = [order for order in list(plan.get("sell_orders") or []) if order.get("role") == "forced_reduce"]
+        plan["forced_reduce_orders"] = list(plan["buy_orders"]) + list(plan["sell_orders"])
     if synthetic_neutral and not (
         list(plan.get("bootstrap_orders") or [])
         or list(plan.get("buy_orders") or [])
@@ -2277,6 +2278,7 @@ def _check_spot_freeze_hedge_gate(
     position_risk: list[dict[str, Any]],
     base_hedge_qty: float,
     tolerance_qty: float,
+    expected_short_qty: float | None = None,
 ) -> dict[str, Any]:
     if not _truthy(position_mode.get("dualSidePosition")):
         return {"ok": False, "reason": "not_hedge_mode", "contract_short_qty": 0.0, "contract_long_qty": 0.0}
@@ -2286,9 +2288,16 @@ def _check_spot_freeze_hedge_gate(
     if long_qty > tolerance + EPSILON:
         return {"ok": False, "reason": "long_position_not_zero", "contract_short_qty": short_qty, "contract_long_qty": long_qty}
     base_qty = max(_safe_float(base_hedge_qty), 0.0)
-    if abs(short_qty - base_qty) > tolerance + EPSILON:
-        return {"ok": False, "reason": "short_position_base_mismatch", "contract_short_qty": short_qty, "contract_long_qty": long_qty}
-    return {"ok": True, "reason": "ok", "contract_short_qty": short_qty, "contract_long_qty": long_qty}
+    expected_short = base_qty if expected_short_qty is None else max(_safe_float(expected_short_qty), 0.0)
+    if abs(short_qty - expected_short) > tolerance + EPSILON:
+        return {
+            "ok": False,
+            "reason": "short_position_base_mismatch",
+            "contract_short_qty": short_qty,
+            "contract_long_qty": long_qty,
+            "expected_short_qty": expected_short,
+        }
+    return {"ok": True, "reason": "ok", "contract_short_qty": short_qty, "contract_long_qty": long_qty, "expected_short_qty": expected_short}
 
 
 def _make_spot_freeze_spot_market_callback(*, symbol: str, api_key: str, api_secret: str):
@@ -2352,6 +2361,8 @@ def _maybe_run_spot_freeze(
 
     base_hedge_qty = max(_safe_float(getattr(args, "spot_freeze_base_hedge_qty", 0.0)), 0.0)
     tolerance_qty = max(_safe_float(getattr(args, "spot_freeze_tolerance_qty", 0.0)), 0.0)
+    ledger = state.get("spot_frozen_ledger") if isinstance(state.get("spot_frozen_ledger"), dict) else new_ledger()
+    expected_short_qty = expected_short_position_now(base_hedge_qty, ledger)
     position_mode = fetch_futures_position_mode(api_key, api_secret)
     position_risk = fetch_futures_position_risk_v3(api_key, api_secret, symbol=symbol)
     gate = _check_spot_freeze_hedge_gate(
@@ -2360,6 +2371,7 @@ def _maybe_run_spot_freeze(
         position_risk=position_risk if isinstance(position_risk, list) else [],
         base_hedge_qty=base_hedge_qty,
         tolerance_qty=tolerance_qty,
+        expected_short_qty=expected_short_qty,
     )
     controls["spot_freeze_gate"] = gate
     if not bool(gate.get("ok")):
@@ -2372,7 +2384,6 @@ def _maybe_run_spot_freeze(
     deviation_side = "long" if spot_inventory_qty >= neutral_base_qty else "short"
     runtime = controls.get("_runtime") if isinstance(controls.get("_runtime"), dict) else {}
     loss = compute_deviation_loss(runtime, neutral_base_qty, mid_price, deviation_side, deviation_qty)
-    ledger = state.get("spot_frozen_ledger") if isinstance(state.get("spot_frozen_ledger"), dict) else new_ledger()
     result = freeze_cycle(
         symbol=symbol,
         neutral_base_qty=neutral_base_qty,

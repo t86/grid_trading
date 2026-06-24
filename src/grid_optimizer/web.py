@@ -8430,6 +8430,16 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "synthetic_freeze_manual_release_side": "",
     "synthetic_freeze_manual_release_qty": 0.0,
     "synthetic_freeze_manual_release_price": 0.0,
+    "spot_freeze_enabled": False,
+    "spot_freeze_base_hedge_qty": 0.0,
+    "spot_freeze_tolerance_qty": 0.0,
+    "spot_freeze_deviation_notional": 0.0,
+    "spot_freeze_min_loss_ratio": 0.0,
+    "spot_freeze_max_per_cycle_notional": 0.0,
+    "spot_freeze_total_cap_notional": 0.0,
+    "spot_freeze_pair_release_enabled": False,
+    "spot_freeze_profit_release_enabled": False,
+    "spot_freeze_release_profit_ratio": 0.05,
     "max_order_position_notional": 0.0,
     "max_position_notional": 0.0,
     "neutral_base_qty": 0.0,
@@ -14385,6 +14395,52 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         ),
         "synthetic_freeze_manual_release_price",
     )
+    spot_freeze_enabled = _safe_bool(
+        payload.get("spot_freeze_enabled", SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_enabled"]),
+        "spot_freeze_enabled",
+    )
+    spot_freeze_base_hedge_qty = _safe_float(
+        payload.get("spot_freeze_base_hedge_qty", SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_base_hedge_qty"]),
+        "spot_freeze_base_hedge_qty",
+    )
+    spot_freeze_tolerance_qty = _safe_float(
+        payload.get("spot_freeze_tolerance_qty", SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_tolerance_qty"]),
+        "spot_freeze_tolerance_qty",
+    )
+    spot_freeze_deviation_notional = _safe_float(
+        payload.get("spot_freeze_deviation_notional", SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_deviation_notional"]),
+        "spot_freeze_deviation_notional",
+    )
+    spot_freeze_min_loss_ratio = _safe_float(
+        payload.get("spot_freeze_min_loss_ratio", SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_min_loss_ratio"]),
+        "spot_freeze_min_loss_ratio",
+    )
+    spot_freeze_max_per_cycle_notional = _safe_float(
+        payload.get(
+            "spot_freeze_max_per_cycle_notional",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_max_per_cycle_notional"],
+        ),
+        "spot_freeze_max_per_cycle_notional",
+    )
+    spot_freeze_total_cap_notional = _safe_float(
+        payload.get("spot_freeze_total_cap_notional", SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_total_cap_notional"]),
+        "spot_freeze_total_cap_notional",
+    )
+    spot_freeze_pair_release_enabled = _safe_bool(
+        payload.get("spot_freeze_pair_release_enabled", SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_pair_release_enabled"]),
+        "spot_freeze_pair_release_enabled",
+    )
+    spot_freeze_profit_release_enabled = _safe_bool(
+        payload.get(
+            "spot_freeze_profit_release_enabled",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_profit_release_enabled"],
+        ),
+        "spot_freeze_profit_release_enabled",
+    )
+    spot_freeze_release_profit_ratio = _safe_float(
+        payload.get("spot_freeze_release_profit_ratio", SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_release_profit_ratio"]),
+        "spot_freeze_release_profit_ratio",
+    )
     max_order_position_notional = _safe_float(
         payload.get("max_order_position_notional", SPOT_RUNNER_DEFAULT_CONFIG["max_order_position_notional"]),
         "max_order_position_notional",
@@ -14540,6 +14596,13 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "synthetic_freeze_release_profit_ratio": synthetic_freeze_release_profit_ratio,
             "synthetic_freeze_manual_release_qty": synthetic_freeze_manual_release_qty,
             "synthetic_freeze_manual_release_price": synthetic_freeze_manual_release_price,
+            "spot_freeze_base_hedge_qty": spot_freeze_base_hedge_qty,
+            "spot_freeze_tolerance_qty": spot_freeze_tolerance_qty,
+            "spot_freeze_deviation_notional": spot_freeze_deviation_notional,
+            "spot_freeze_min_loss_ratio": spot_freeze_min_loss_ratio,
+            "spot_freeze_max_per_cycle_notional": spot_freeze_max_per_cycle_notional,
+            "spot_freeze_total_cap_notional": spot_freeze_total_cap_notional,
+            "spot_freeze_release_profit_ratio": spot_freeze_release_profit_ratio,
         }.items():
             if value < 0:
                 raise ValueError(f"{name} must be >= 0")
@@ -14622,6 +14685,16 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "synthetic_freeze_manual_release_side": synthetic_freeze_manual_release_side,
             "synthetic_freeze_manual_release_qty": synthetic_freeze_manual_release_qty,
             "synthetic_freeze_manual_release_price": synthetic_freeze_manual_release_price,
+            "spot_freeze_enabled": spot_freeze_enabled,
+            "spot_freeze_base_hedge_qty": spot_freeze_base_hedge_qty,
+            "spot_freeze_tolerance_qty": spot_freeze_tolerance_qty,
+            "spot_freeze_deviation_notional": spot_freeze_deviation_notional,
+            "spot_freeze_min_loss_ratio": spot_freeze_min_loss_ratio,
+            "spot_freeze_max_per_cycle_notional": spot_freeze_max_per_cycle_notional,
+            "spot_freeze_total_cap_notional": spot_freeze_total_cap_notional,
+            "spot_freeze_pair_release_enabled": spot_freeze_pair_release_enabled,
+            "spot_freeze_profit_release_enabled": spot_freeze_profit_release_enabled,
+            "spot_freeze_release_profit_ratio": spot_freeze_release_profit_ratio,
             "max_order_position_notional": max_order_position_notional,
             "max_position_notional": max_position_notional,
             "neutral_base_qty": neutral_base_qty,
@@ -14751,6 +14824,13 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--synthetic-freeze-manual-release-side", config.get("synthetic_freeze_manual_release_side")),
         ("--synthetic-freeze-manual-release-qty", config.get("synthetic_freeze_manual_release_qty")),
         ("--synthetic-freeze-manual-release-price", config.get("synthetic_freeze_manual_release_price")),
+        ("--spot-freeze-base-hedge-qty", config.get("spot_freeze_base_hedge_qty")),
+        ("--spot-freeze-tolerance-qty", config.get("spot_freeze_tolerance_qty")),
+        ("--spot-freeze-deviation-notional", config.get("spot_freeze_deviation_notional")),
+        ("--spot-freeze-min-loss-ratio", config.get("spot_freeze_min_loss_ratio")),
+        ("--spot-freeze-max-per-cycle-notional", config.get("spot_freeze_max_per_cycle_notional")),
+        ("--spot-freeze-total-cap-notional", config.get("spot_freeze_total_cap_notional")),
+        ("--spot-freeze-release-profit-ratio", config.get("spot_freeze_release_profit_ratio")),
         ("--run-start-time", config.get("run_start_time")),
         ("--run-end-time", config.get("run_end_time")),
         ("--runtime-guard-stats-start-time", config.get("runtime_guard_stats_start_time")),
@@ -14772,6 +14852,12 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         command.append("--spot-slow-trend-step-enabled")
     if _truthy(config.get("synthetic_freeze_enabled", False)):
         command.append("--synthetic-freeze-enabled")
+    if _truthy(config.get("spot_freeze_enabled", False)):
+        command.append("--spot-freeze-enabled")
+    if _truthy(config.get("spot_freeze_pair_release_enabled", False)):
+        command.append("--spot-freeze-pair-release-enabled")
+    if _truthy(config.get("spot_freeze_profit_release_enabled", False)):
+        command.append("--spot-freeze-profit-release-enabled")
     command.append(
         "--synthetic-freeze-pair-release-enabled"
         if _truthy(config.get("synthetic_freeze_pair_release_enabled", True))
@@ -14888,6 +14974,16 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "synthetic_freeze_manual_release_side",
             "synthetic_freeze_manual_release_qty",
             "synthetic_freeze_manual_release_price",
+            "spot_freeze_enabled",
+            "spot_freeze_base_hedge_qty",
+            "spot_freeze_tolerance_qty",
+            "spot_freeze_deviation_notional",
+            "spot_freeze_min_loss_ratio",
+            "spot_freeze_max_per_cycle_notional",
+            "spot_freeze_total_cap_notional",
+            "spot_freeze_pair_release_enabled",
+            "spot_freeze_profit_release_enabled",
+            "spot_freeze_release_profit_ratio",
             "run_start_time",
             "run_end_time",
             "runtime_guard_stats_start_time",
