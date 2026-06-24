@@ -60,6 +60,12 @@ APP 万U损耗 = APP 损耗 / (买入成交额 + 卖出成交额) * 10000
 
 - 用户明确同意恢复。
 - 重新读取 Binance `myTrades`，按 APP 公式计算窗口损耗和 break-even。
+- 使用只读审计命令留痕，例如：
+
+```bash
+PYTHONPATH=src python -m grid_optimizer.spot_app_loss_audit --symbol XPLUSDT --start-time 2026-06-24T11:57:00Z
+```
+
 - 确认当前盘口到 break-even 的 tick 距离；若距离过大，只能接受低速挂 break-even maker SELL，不能为了速度降价卖。
 - 使用小观察额度恢复，不直接使用原 40 万目标。
 - 启动后先观察一个小窗口，确认 APP 万U损耗低于 10 或转正，再扩大目标。
