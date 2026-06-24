@@ -517,6 +517,70 @@ class SpotRunnerTests(unittest.TestCase):
         mock_build_command.assert_not_called()
         mock_popen.assert_not_called()
 
+    @patch("grid_optimizer.web.time.sleep")
+    @patch("grid_optimizer.web._run_systemctl")
+    @patch("grid_optimizer.web._runner_service_available", return_value=True)
+    @patch("grid_optimizer.web._runner_service_name_for_symbol", return_value="grid-runner@XPLUSDT.service")
+    @patch("grid_optimizer.web._save_spot_runner_control_config")
+    @patch("grid_optimizer.web._read_volatility_runner_process")
+    @patch("grid_optimizer.web.spot_app_loss_audit_main", return_value=2)
+    def test_start_volatility_spot_runner_blocks_when_app_loss_prestart_gate_rejects(
+        self,
+        mock_app_loss_audit_main,
+        mock_read_runner,
+        mock_save_config,
+        _mock_service_name,
+        _mock_service_available,
+        mock_run_systemctl,
+        _mock_sleep,
+    ) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "XPLUSDT",
+                "spot_app_loss_prestart_gate_enabled": True,
+                "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
+                "spot_app_loss_prestart_gate_max_loss_per_10k": 1.0,
+                "spot_app_loss_prestart_gate_max_safe_sell_gap_ticks": 2.0,
+                "spot_app_loss_prestart_gate_min_maker_ratio": 0.99,
+                "spot_app_loss_prestart_gate_min_gross_notional": 5000.0,
+            }
+        )
+        runner = {"configured": True, "pid": None, "is_running": False, "args": None, "config": config}
+        mock_read_runner.return_value = runner
+
+        result = web._start_volatility_runner_process(config, spot=True)
+
+        self.assertFalse(result["started"])
+        self.assertEqual(result["reason"], "spot_app_loss_prestart_gate_rejected")
+        self.assertEqual(result["gate_code"], 2)
+        self.assertEqual(result["runner"], runner)
+        mock_app_loss_audit_main.assert_called_once()
+        mock_save_config.assert_not_called()
+        mock_run_systemctl.assert_not_called()
+
+    @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
+    def test_start_spot_runner_process_requires_prestart_gate_for_app_loss_recovery(
+        self,
+        mock_read_runner,
+    ) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "XPLUSDT",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "spot_app_loss_guard_enabled": True,
+                "spot_app_loss_recovery_reduce_only_enabled": True,
+                "spot_app_loss_prestart_gate_enabled": False,
+            }
+        )
+        mock_read_runner.return_value = {"configured": False, "pid": None, "is_running": False, "args": None, "config": {}}
+
+        with self.assertRaises(ValueError) as raised:
+            _start_spot_runner_process(config)
+
+        self.assertIn("spot_app_loss_prestart_gate_enabled", str(raised.exception))
+
     def test_build_spot_runner_command_includes_competition_inventory_grid_arguments(self) -> None:
         config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
         config.update(

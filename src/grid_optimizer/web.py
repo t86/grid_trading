@@ -7485,6 +7485,9 @@ def _start_volatility_runner_process(config: dict[str, Any], *, spot: bool = Fal
     runner = _read_volatility_runner_process(symbol, spot=True)
     if runner.get("is_running"):
         return {"started": False, "already_running": True, "runner": runner, "symbol": symbol, "restarted": False}
+    block_result = _spot_app_loss_prestart_block_result(config, runner=runner, symbol=symbol)
+    if block_result is not None:
+        return block_result
 
     _save_spot_runner_control_config(config, symbol=symbol)
     _clear_volatility_trigger_status(symbol, reason="spot_runner_started")
@@ -8671,6 +8674,17 @@ def _runner_start_safety_preflight(
         reasons.append("最近存在执行/API/计划一致性错误")
     if post_shock_active and not spot:
         reasons.append("仍处于 post-shock / volatility pause / adaptive-step 扩张后的危险恢复窗口")
+    if spot:
+        strategy_mode = str(config.get("strategy_mode", "") or "").strip().lower()
+        app_loss_recovery = _truthy(config.get("spot_app_loss_guard_enabled", False)) or _truthy(
+            config.get("spot_app_loss_recovery_reduce_only_enabled", False)
+        )
+        if (
+            strategy_mode == "spot_competition_synthetic_neutral_grid"
+            and app_loss_recovery
+            and not _truthy(config.get("spot_app_loss_prestart_gate_enabled", False))
+        ):
+            reasons.append("交易赛现货启用 APP loss guard/recovery 时必须启用 spot_app_loss_prestart_gate_enabled")
 
     if reasons:
         raise ValueError(
@@ -15059,17 +15073,20 @@ def _run_spot_app_loss_prestart_gate(config: dict[str, Any]) -> int:
     return spot_app_loss_audit_main(argv)
 
 
-def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
-    symbol = str(config.get("symbol", SPOT_RUNNER_DEFAULT_CONFIG["symbol"])).upper().strip() or "BTCUSDT"
-    _runner_start_safety_preflight(config, spot=True)
-    runner = _read_spot_runner_process_for_symbol(symbol)
+def _spot_app_loss_prestart_block_result(
+    config: dict[str, Any],
+    *,
+    runner: dict[str, Any],
+    symbol: str,
+    restarted: bool = False,
+) -> dict[str, Any] | None:
     try:
         gate_code = _run_spot_app_loss_prestart_gate(config)
     except Exception as exc:
         return {
             "started": False,
             "already_running": False,
-            "restarted": False,
+            "restarted": restarted,
             "reason": "spot_app_loss_prestart_gate_error",
             "error": f"{type(exc).__name__}: {exc}",
             "runner": runner,
@@ -15079,12 +15096,22 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
         return {
             "started": False,
             "already_running": False,
-            "restarted": False,
+            "restarted": restarted,
             "reason": "spot_app_loss_prestart_gate_rejected",
             "gate_code": gate_code,
             "runner": runner,
             "symbol": symbol,
         }
+    return None
+
+
+def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(config.get("symbol", SPOT_RUNNER_DEFAULT_CONFIG["symbol"])).upper().strip() or "BTCUSDT"
+    _runner_start_safety_preflight(config, spot=True)
+    runner = _read_spot_runner_process_for_symbol(symbol)
+    block_result = _spot_app_loss_prestart_block_result(config, runner=runner, symbol=symbol)
+    if block_result is not None:
+        return block_result
     restarted = False
     if runner.get("is_running"):
         current_config = dict(runner.get("config") or {})
