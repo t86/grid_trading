@@ -4104,27 +4104,52 @@ def _apply_best_quote_reduce_freeze(
         "reason": None,
     }
     side_cap_reasons: list[str] = []
+    side_cap_min_notional = max(_safe_float(report.get("min_notional")), 0.0)
+
+    def _block_frozen_side(side_label: str, reason: str) -> None:
+        frozen_side_cap_report["active"] = True
+        frozen_side_cap_report["blocks_new_freeze"] = True
+        if side_label not in frozen_side_cap_report["blocked_sides"]:
+            frozen_side_cap_report["blocked_sides"].append(side_label)
+        side_cap_reasons.append(reason)
+
     if (
         safe_frozen_long_cap_notional > 0
         and _safe_float(report.get("frozen_long_notional")) >= safe_frozen_long_cap_notional - 1e-12
     ):
-        frozen_side_cap_report["active"] = True
-        frozen_side_cap_report["blocks_new_freeze"] = True
-        frozen_side_cap_report["blocked_sides"].append("LONG")
-        side_cap_reasons.append(
+        _block_frozen_side(
+            "LONG",
             f"frozen_long_notional={_float(report.get('frozen_long_notional'))} "
-            f">= long_cap_notional={_float(safe_frozen_long_cap_notional)}"
+            f">= long_cap_notional={_float(safe_frozen_long_cap_notional)}",
+        )
+    elif (
+        safe_frozen_long_cap_notional > 0
+        and side_cap_min_notional > 0
+        and frozen_side_cap_report["long_remaining_notional"] + 1e-12 < side_cap_min_notional
+    ):
+        _block_frozen_side(
+            "LONG",
+            f"long_remaining_notional={_float(frozen_side_cap_report['long_remaining_notional'])} "
+            f"< min_notional={_float(side_cap_min_notional)}",
         )
     if (
         safe_frozen_short_cap_notional > 0
         and _safe_float(report.get("frozen_short_notional")) >= safe_frozen_short_cap_notional - 1e-12
     ):
-        frozen_side_cap_report["active"] = True
-        frozen_side_cap_report["blocks_new_freeze"] = True
-        frozen_side_cap_report["blocked_sides"].append("SHORT")
-        side_cap_reasons.append(
+        _block_frozen_side(
+            "SHORT",
             f"frozen_short_notional={_float(report.get('frozen_short_notional'))} "
-            f">= short_cap_notional={_float(safe_frozen_short_cap_notional)}"
+            f">= short_cap_notional={_float(safe_frozen_short_cap_notional)}",
+        )
+    elif (
+        safe_frozen_short_cap_notional > 0
+        and side_cap_min_notional > 0
+        and frozen_side_cap_report["short_remaining_notional"] + 1e-12 < side_cap_min_notional
+    ):
+        _block_frozen_side(
+            "SHORT",
+            f"short_remaining_notional={_float(frozen_side_cap_report['short_remaining_notional'])} "
+            f"< min_notional={_float(side_cap_min_notional)}",
         )
     if side_cap_reasons:
         frozen_side_cap_report["reason"] = "; ".join(side_cap_reasons)
