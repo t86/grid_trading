@@ -219,7 +219,7 @@ def build_live_spot_app_loss_audit(
     return audit
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Audit Binance spot APP loss formula from myTrades.")
     parser.add_argument("--symbol", required=True)
     parser.add_argument("--start-time", default="", help="ISO datetime or millisecond timestamp.")
@@ -229,7 +229,8 @@ def main() -> None:
     parser.add_argument("--max-safe-maker-sell-gap-ticks", type=float, default=2.0)
     parser.add_argument("--min-maker-ratio", type=float, default=0.99)
     parser.add_argument("--min-gross-notional", type=float, default=0.0)
-    args = parser.parse_args()
+    parser.add_argument("--require-gate", action="store_true", help="Exit non-zero when recovery_gate.allowed is false.")
+    args = parser.parse_args(argv)
     audit = build_live_spot_app_loss_audit(
         symbol=str(args.symbol).upper().strip(),
         start_time_ms=_parse_time_ms(args.start_time),
@@ -244,7 +245,10 @@ def main() -> None:
         min_gross_notional=args.min_gross_notional,
     )
     print(json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True))
+    if bool(args.require_gate) and not bool(audit["recovery_gate"].get("allowed")):
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

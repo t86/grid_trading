@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
-from grid_optimizer.spot_app_loss_audit import compute_spot_app_loss_audit, evaluate_spot_app_loss_recovery_gate
+from grid_optimizer.spot_app_loss_audit import compute_spot_app_loss_audit, evaluate_spot_app_loss_recovery_gate, main
 
 
 class SpotAppLossAuditTests(unittest.TestCase):
@@ -98,6 +99,40 @@ class SpotAppLossAuditTests(unittest.TestCase):
         self.assertFalse(gate["allowed"])
         self.assertIn("app_loss_per_10k_above_limit", gate["reasons"])
         self.assertIn("safe_maker_sell_too_far", gate["reasons"])
+
+    def test_main_returns_nonzero_when_required_gate_rejects(self) -> None:
+        audit = compute_spot_app_loss_audit(
+            trades=[
+                {"isBuyer": True, "isMaker": True, "price": "0.08848", "qty": "30794.9", "quoteQty": "2724.6815"},
+                {"isBuyer": False, "isMaker": True, "price": "0.08849", "qty": "26673.1", "quoteQty": "2360.53094"},
+            ],
+            bid_price=0.0868,
+            ask_price=0.0869,
+            tick_size=0.0001,
+        )
+        audit.update({"symbol": "XPLUSDT", "truncated": False})
+
+        with patch("grid_optimizer.spot_app_loss_audit.build_live_spot_app_loss_audit", return_value=audit):
+            code = main(["--symbol", "XPLUSDT", "--require-gate"])
+
+        self.assertEqual(code, 2)
+
+    def test_main_returns_zero_when_required_gate_allows(self) -> None:
+        audit = compute_spot_app_loss_audit(
+            trades=[
+                {"isBuyer": True, "isMaker": True, "price": "0.08848", "qty": "30794.9", "quoteQty": "2724.6815"},
+                {"isBuyer": False, "isMaker": True, "price": "0.08849", "qty": "26673.1", "quoteQty": "2360.53094"},
+            ],
+            bid_price=0.0894,
+            ask_price=0.0895,
+            tick_size=0.0001,
+        )
+        audit.update({"symbol": "XPLUSDT", "truncated": False})
+
+        with patch("grid_optimizer.spot_app_loss_audit.build_live_spot_app_loss_audit", return_value=audit):
+            code = main(["--symbol", "XPLUSDT", "--require-gate"])
+
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":
