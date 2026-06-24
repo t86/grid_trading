@@ -423,7 +423,10 @@ def freeze_cycle(
         alerts.append("total_cap_reached")
         return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
 
+    is_long_deviation = deviation_qty_signed > 0.0
     max_qty = abs(deviation_qty_signed)
+    if is_long_deviation:
+        max_qty = min(max_qty, max(_safe_float(contract_short_qty), 0.0))
     per_cycle_cap = max(_safe_float(config.max_per_cycle_notional), 0.0)
     if per_cycle_cap > EPSILON:
         max_qty = min(max_qty, per_cycle_cap / mid)
@@ -431,10 +434,9 @@ def freeze_cycle(
         max_qty = min(max_qty, max((cap - frozen_notional) / mid, 0.0))
     qty = _round_down_qty(max_qty, qty_step)
     if qty <= EPSILON:
-        alerts.append("qty_too_small")
+        alerts.append("insufficient_short_hedge_to_freeze_long" if is_long_deviation else "qty_too_small")
         return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
 
-    is_long_deviation = deviation_qty_signed > 0.0
     spot_side = "SELL" if is_long_deviation else "BUY"
     contract_side = "BUY" if is_long_deviation else "SELL"
     lot_key = "long_lots" if is_long_deviation else "short_lots"

@@ -208,6 +208,7 @@ def run_cycle(
     spot_inventory_qty: float = 120.0,
     mark_price: float = 10.0,
     contract_short_qty: float = 100.0,
+    base_hedge_qty: float = 100.0,
     loss_ratio_usable: bool = True,
     deviation_loss_ratio: float = 0.10,
     config: FreezeConfig | None = None,
@@ -223,7 +224,7 @@ def run_cycle(
         mark_price=mark_price,
         ledger=ledger or new_ledger(),
         contract_short_qty=contract_short_qty,
-        base_hedge_qty=100.0,
+        base_hedge_qty=base_hedge_qty,
         deviation_loss_ratio=deviation_loss_ratio,
         loss_ratio_usable=loss_ratio_usable,
         config=config or enabled_config(),
@@ -249,6 +250,20 @@ def test_freeze_long_deviation_sells_spot_and_buys_short_position_side() -> None
     assert result["ledger"]["long_lots"][0]["cost_price"] == 10.0
     assert result["ledger"]["long_lots"][0]["hedge_pending"] is False
     assert result["ledger"]["pending_contract_actions"] == []
+
+
+def test_freeze_long_deviation_requires_available_short_hedge() -> None:
+    result, rec = run_cycle(
+        contract_short_qty=0.0,
+        base_hedge_qty=0.0,
+        config=enabled_config(deviation_notional=1.0, min_loss_ratio=0.0),
+    )
+
+    assert rec.spot_orders == []
+    assert rec.contract_orders == []
+    assert result["ledger"]["long_lots"] == []
+    assert result["ledger"]["pending_contract_actions"] == []
+    assert "insufficient_short_hedge_to_freeze_long" in result["alerts"]
 
 
 def test_freeze_short_deviation_buys_spot_and_sells_short_position_side() -> None:
