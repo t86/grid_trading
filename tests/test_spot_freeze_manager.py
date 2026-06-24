@@ -357,6 +357,45 @@ def test_pending_actions_are_repaired_before_new_freeze() -> None:
     assert result["ledger"]["long_lots"][0]["hedge_pending"] is False
 
 
+def test_pending_repair_notifies_ledger_change_after_success() -> None:
+    ledger = new_ledger()
+    ledger["long_lots"] = [{"lot_id": "L1", "qty": 10.0, "cost_price": 10.0, "frozen_at": "t", "frozen_mid": 10.0, "hedge_pending": True}]
+    ledger["pending_contract_actions"] = [
+        {"side": "BUY", "position_side": "SHORT", "qty": 10.0, "reason": "freeze_long_hedge", "lot_id": "L1"}
+    ]
+    ledger_totals(ledger)
+    snapshots: list[dict] = []
+
+    freeze_cycle(
+        symbol="WLDUSDT",
+        neutral_base_qty=100.0,
+        spot_inventory_qty=100.0,
+        mid_price=10.0,
+        mark_price=10.0,
+        ledger=ledger,
+        contract_short_qty=100.0,
+        base_hedge_qty=100.0,
+        deviation_loss_ratio=0.10,
+        loss_ratio_usable=True,
+        config=enabled_config(),
+        qty_step=0.001,
+        tolerance_qty=0.01,
+        now="2026-06-23T12:00:00Z",
+        place_spot=OrderRecorder().spot,
+        place_contract=OrderRecorder().contract,
+        dry_run=False,
+        on_ledger_change=lambda changed: snapshots.append(
+            {
+                "pending_contract_actions": list(changed["pending_contract_actions"]),
+                "hedge_pending": changed["long_lots"][0]["hedge_pending"],
+                "frozen_long_qty": changed["frozen_long_qty"],
+            }
+        ),
+    )
+
+    assert snapshots == [{"pending_contract_actions": [], "hedge_pending": False, "frozen_long_qty": 10.0}]
+
+
 def test_pending_repair_failure_keeps_pending_and_blocks_new_freeze() -> None:
     ledger = new_ledger()
     ledger["long_lots"] = [{"lot_id": "L1", "qty": 10.0, "cost_price": 10.0, "frozen_at": "t", "frozen_mid": 10.0, "hedge_pending": True}]

@@ -43,6 +43,7 @@ from .inventory_grid_state import (
     synthetic_frozen_position_report,
 )
 from .semi_auto_plan import diff_open_orders
+from .submit_plan import _ignore_noop_error
 from .spot_flatten_runner import load_live_spot_flatten_snapshot, spot_flatten_client_order_prefix
 from .spot_freeze_manager import FreezeConfig, compute_deviation_loss, expected_short_position_now, freeze_cycle, new_ledger
 from .trade_database import ensure_trade_database_schema, persist_cycle_snapshot, persist_trade_rows, trade_database_enabled
@@ -2361,6 +2362,7 @@ def _maybe_run_spot_freeze(
     api_key: str,
     api_secret: str,
     now: datetime,
+    persist_ledger: Any | None = None,
 ) -> None:
     enabled = bool(getattr(args, "spot_freeze_enabled", False))
     controls.update(_spot_freeze_default_controls(enabled))
@@ -2425,6 +2427,7 @@ def _maybe_run_spot_freeze(
         place_spot=_make_spot_freeze_spot_market_callback(symbol=symbol, api_key=api_key, api_secret=api_secret),
         place_contract=_make_spot_freeze_contract_callback(symbol=symbol, api_key=api_key, api_secret=api_secret),
         dry_run=not bool(getattr(args, "apply", False)),
+        on_ledger_change=persist_ledger,
     )
     ledger_result = result.get("ledger") if isinstance(result, dict) else new_ledger()
     state["spot_frozen_ledger"] = ledger_result
@@ -2645,12 +2648,16 @@ def _cancel_orders(
         order_id_raw = order.get("orderId")
         if order_id_raw is None:
             continue
-        delete_spot_order(
-            symbol=symbol,
-            api_key=api_key,
-            api_secret=api_secret,
-            order_id=int(order_id_raw),
-        )
+        try:
+            delete_spot_order(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_id=int(order_id_raw),
+            )
+        except RuntimeError as exc:
+            if not _ignore_noop_error(exc, ("-2011", "unknown order sent")):
+                raise
         count += 1
     return count
 
@@ -3393,6 +3400,10 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             controls["risk_state"] = "fast_stop_freeze"
         controls["fast_stop_guard"] = fast_stop_guard
     if strategy_mode == "spot_competition_synthetic_neutral_grid":
+        def _persist_spot_freeze_ledger(ledger_result: dict[str, Any]) -> None:
+            state["spot_frozen_ledger"] = ledger_result
+            _save_state(state_path, state)
+
         _maybe_run_spot_freeze(
             args=args,
             state=state,
@@ -3403,7 +3414,12 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             api_key=api_key,
             api_secret=api_secret,
             now=_utc_now(),
+            persist_ledger=_persist_spot_freeze_ledger,
         )
+        if controls.get("spot_freeze_actions") or controls.get("spot_freeze_pending_contract_actions"):
+            # Spot freeze may have already placed market orders; persist the ledger
+            # before later stale-order reconciliation can abort the cycle.
+            _save_state(state_path, state)
     elif bool(getattr(args, "spot_freeze_enabled", False)):
         controls.update(_spot_freeze_default_controls(True))
         controls["spot_freeze_alerts"] = ["unsupported_strategy_mode"]

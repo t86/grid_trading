@@ -16,12 +16,14 @@ from grid_optimizer.spot_loop_runner import (
     _build_spot_competition_inventory_grid_orders,
     _check_spot_freeze_hedge_gate,
     _clamp_limit_maker_price_to_book,
+    _cancel_orders,
     _load_state,
     _make_spot_freeze_contract_callback,
     _make_spot_freeze_spot_market_callback,
     _maybe_run_spot_freeze,
     _normalize_commission_quote,
     _resolve_spot_competition_runtime,
+    _run_cycle,
     _spot_order_meets_exchange_mins,
     _refresh_spot_trades_after_account_snapshot,
     _sync_synthetic_neutral_trades,
@@ -1763,6 +1765,83 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(state["known_orders"], {})
         self.assertEqual(state["inventory_lots"], [])
         self.assertNotIn("spot_competition_inventory_grid_runtime_cache", state)
+
+    def test_run_cycle_persists_spot_freeze_ledger_before_order_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            summary_path = Path(tmpdir) / "events.jsonl"
+            args = self._synthetic_args(
+                [
+                    "--state-path",
+                    str(state_path),
+                    "--summary-jsonl",
+                    str(summary_path),
+                    "--apply",
+                    "--cancel-stale",
+                    "--spot-freeze-enabled",
+                ]
+            )
+            symbol_info = {
+                "base_asset": "WLD",
+                "quote_asset": "USDT",
+                "tick_size": 0.01,
+                "step_size": 0.001,
+                "min_qty": 0.001,
+                "min_notional": 5.0,
+            }
+            frozen_ledger = new_ledger()
+            frozen_ledger["short_lots"] = [{"lot_id": "spot_freeze_1", "qty": 5.0}]
+            frozen_ledger["frozen_short_qty"] = 5.0
+
+            def mutate_freeze_state(**kwargs):
+                kwargs["state"]["spot_frozen_ledger"] = frozen_ledger
+                kwargs["controls"]["spot_freeze_actions"] = [{"type": "freeze", "side": "short", "qty": 5.0}]
+
+            with patch("grid_optimizer.spot_loop_runner.fetch_spot_book_tickers", return_value=[{"bid_price": "10", "ask_price": "10.02"}]):
+                with patch("grid_optimizer.spot_loop_runner.fetch_spot_user_trades", return_value=[]):
+                    with patch("grid_optimizer.spot_loop_runner.fetch_spot_account_info", return_value={"balances": []}):
+                        with patch(
+                            "grid_optimizer.spot_loop_runner.fetch_spot_open_orders",
+                            return_value=[
+                                {
+                                    "orderId": 123,
+                                    "clientOrderId": "spotgrid_old",
+                                    "side": "BUY",
+                                    "price": "9.9",
+                                    "origQty": "1",
+                                    "executedQty": "0",
+                                    "status": "NEW",
+                                }
+                            ],
+                        ):
+                            with patch("grid_optimizer.spot_loop_runner._refresh_spot_trades_after_account_snapshot", return_value=([], 0)):
+                                with patch(
+                                    "grid_optimizer.spot_loop_runner._build_spot_competition_inventory_grid_orders",
+                                    return_value=([], {"actual_base_qty": 95.0, "neutral_base_qty": 100.0, "_runtime": {}}),
+                                ):
+                                    with patch("grid_optimizer.spot_loop_runner._maybe_run_spot_freeze", side_effect=mutate_freeze_state):
+                                        with patch("grid_optimizer.spot_loop_runner._cancel_orders", side_effect=RuntimeError("cancel failed")):
+                                            with self.assertRaisesRegex(RuntimeError, "cancel failed"):
+                                                _run_cycle(args, symbol_info, api_key="key", api_secret="secret")
+
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["spot_frozen_ledger"]["frozen_short_qty"], 5.0)
+            self.assertEqual(saved["spot_frozen_ledger"]["short_lots"], [{"lot_id": "spot_freeze_1", "qty": 5.0}])
+
+    def test_cancel_orders_ignores_already_gone_spot_order(self) -> None:
+        with patch(
+            "grid_optimizer.spot_loop_runner.delete_spot_order",
+            side_effect=RuntimeError("Binance API error -2011: Unknown order sent."),
+        ) as delete_order:
+            canceled = _cancel_orders(
+                symbol="WLDUSDT",
+                api_key="key",
+                api_secret="secret",
+                orders=[{"orderId": "123"}],
+            )
+
+        self.assertEqual(canceled, 1)
+        delete_order.assert_called_once()
 
     def test_build_spot_competition_inventory_grid_orders_uses_cached_runtime_for_older_inventory(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="spot")

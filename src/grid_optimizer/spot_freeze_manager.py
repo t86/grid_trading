@@ -199,6 +199,11 @@ def _set_lot_pending(ledger: dict[str, Any], lot_id: str, pending: bool) -> None
                 lot["hedge_pending"] = pending
 
 
+def _notify_ledger_change(ledger: dict[str, Any], on_ledger_change: Any | None) -> None:
+    if on_ledger_change is not None:
+        on_ledger_change(ledger)
+
+
 def _repair_pending_actions(
     *,
     symbol: str,
@@ -207,9 +212,11 @@ def _repair_pending_actions(
     dry_run: bool,
     actions: list[dict[str, Any]],
     alerts: list[str],
+    on_ledger_change: Any | None = None,
 ) -> None:
+    pending_actions = [dict(action) for action in ledger.get("pending_contract_actions", [])]
     remaining: list[dict[str, Any]] = []
-    for pending in ledger.get("pending_contract_actions", []):
+    for index, pending in enumerate(pending_actions):
         side = str(pending.get("side", "") or "").upper()
         qty = max(_safe_float(pending.get("qty")), 0.0)
         lot_id = str(pending.get("lot_id", "") or "")
@@ -227,6 +234,9 @@ def _repair_pending_actions(
             continue
         _set_lot_pending(ledger, lot_id, False)
         actions.append({"type": "pending_repaired", "side": side, "qty": qty, "lot_id": lot_id})
+        ledger["pending_contract_actions"] = remaining + [dict(action) for action in pending_actions[index + 1 :]]
+        ledger_totals(ledger)
+        _notify_ledger_change(ledger, on_ledger_change)
     ledger["pending_contract_actions"] = remaining
 
 
@@ -306,6 +316,7 @@ def _apply_profit_release(
     dry_run: bool,
     actions: list[dict[str, Any]],
     alerts: list[str],
+    on_ledger_change: Any | None = None,
 ) -> None:
     mark = _safe_float(mark_price)
     threshold = max(_safe_float(release_profit_ratio), 0.0)
@@ -313,8 +324,9 @@ def _apply_profit_release(
         ("long_lots", "SELL", "long"),
         ("short_lots", "BUY", "short"),
     ):
+        original_lots = [dict(lot) for lot in ledger.get(lot_key, [])]
         kept: list[dict[str, Any]] = []
-        for lot in ledger.get(lot_key, []):
+        for index, lot in enumerate(original_lots):
             qty = max(_safe_float(lot.get("qty")), 0.0)
             cost = _safe_float(lot.get("cost_price"))
             if bool(lot.get("hedge_pending")) or qty <= EPSILON or cost <= EPSILON:
@@ -338,6 +350,9 @@ def _apply_profit_release(
                 alerts.append("profit_release_contract_failed")
                 continue
             actions.append({"type": "profit_release", "side": side_name, "qty": qty, "profit_ratio": profit_ratio})
+            ledger[lot_key] = kept + [dict(item) for item in original_lots[index + 1 :]]
+            ledger_totals(ledger)
+            _notify_ledger_change(ledger, on_ledger_change)
         ledger[lot_key] = kept
     ledger_totals(ledger)
 
@@ -361,6 +376,7 @@ def freeze_cycle(
     place_spot: Any,
     place_contract: Any,
     dry_run: bool,
+    on_ledger_change: Any | None = None,
 ) -> dict[str, Any]:
     working = _ensure_ledger(ledger)
     actions: list[dict[str, Any]] = []
@@ -380,6 +396,7 @@ def freeze_cycle(
             dry_run=dry_run,
             actions=actions,
             alerts=alerts,
+            on_ledger_change=on_ledger_change,
         )
         ledger_totals(working)
         if working.get("pending_contract_actions"):
@@ -402,6 +419,7 @@ def freeze_cycle(
             dry_run=dry_run,
             actions=actions,
             alerts=alerts,
+            on_ledger_change=on_ledger_change,
         )
     available_short_qty = expected_short_position_now(base_hedge_qty, working)
 
@@ -494,4 +512,5 @@ def freeze_cycle(
 
     working[lot_key].append(lot)
     ledger_totals(working)
+    _notify_ledger_change(working, on_ledger_change)
     return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
