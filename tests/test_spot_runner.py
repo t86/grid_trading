@@ -444,6 +444,79 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertEqual(saved["spot_app_loss_prestart_gate_start_time"], "2026-06-24T19:57:00+08:00")
         self.assertEqual(saved["spot_app_loss_prestart_gate_max_loss_per_10k"], 1.0)
 
+    @patch("grid_optimizer.web.time.sleep")
+    @patch("grid_optimizer.web.subprocess.Popen")
+    @patch("grid_optimizer.web._build_spot_runner_command")
+    @patch("grid_optimizer.web._save_spot_runner_control_config")
+    @patch("grid_optimizer.web._cancel_spot_strategy_orders")
+    @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
+    @patch("grid_optimizer.web.spot_app_loss_audit_main", return_value=2)
+    def test_start_spot_runner_process_blocks_when_app_loss_prestart_gate_rejects(
+        self,
+        mock_app_loss_audit_main,
+        mock_read_runner,
+        mock_cancel_orders,
+        mock_save_config,
+        mock_build_command,
+        mock_popen,
+        _mock_sleep,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            log_path = tmp_path / "spot_runner.log"
+            pid_path = tmp_path / "spot_runner.pid"
+
+            config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+            config.update(
+                {
+                    "symbol": "XPLUSDT",
+                    "reset_state": False,
+                    "state_path": str(tmp_path / "spot_state.json"),
+                    "summary_jsonl": str(tmp_path / "spot_events.jsonl"),
+                    "spot_app_loss_prestart_gate_enabled": True,
+                    "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
+                    "spot_app_loss_prestart_gate_max_loss_per_10k": 1.0,
+                    "spot_app_loss_prestart_gate_max_safe_sell_gap_ticks": 2.0,
+                    "spot_app_loss_prestart_gate_min_maker_ratio": 0.99,
+                    "spot_app_loss_prestart_gate_min_gross_notional": 5000.0,
+                }
+            )
+            runner = {"configured": False, "pid": None, "is_running": False, "args": None, "config": {}}
+            mock_read_runner.return_value = runner
+            mock_build_command.return_value = ["python3", "-m", "grid_optimizer.spot_loop_runner"]
+            mock_popen.return_value = MagicMock(pid=4321)
+
+            with patch("grid_optimizer.web._spot_runner_log_path", return_value=log_path), patch(
+                "grid_optimizer.web._spot_runner_pid_path", return_value=pid_path
+            ):
+                result = _start_spot_runner_process(config)
+
+        self.assertFalse(result["started"])
+        self.assertEqual(result["reason"], "spot_app_loss_prestart_gate_rejected")
+        self.assertEqual(result["gate_code"], 2)
+        self.assertEqual(result["runner"], runner)
+        mock_app_loss_audit_main.assert_called_once_with(
+            [
+                "--symbol",
+                "XPLUSDT",
+                "--start-time",
+                "2026-06-24T19:57:00+08:00",
+                "--max-app-loss-per-10k",
+                "1.0",
+                "--max-safe-maker-sell-gap-ticks",
+                "2.0",
+                "--min-maker-ratio",
+                "0.99",
+                "--min-gross-notional",
+                "5000.0",
+                "--require-gate",
+            ]
+        )
+        mock_cancel_orders.assert_not_called()
+        mock_save_config.assert_not_called()
+        mock_build_command.assert_not_called()
+        mock_popen.assert_not_called()
+
     def test_build_spot_runner_command_includes_competition_inventory_grid_arguments(self) -> None:
         config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
         config.update(

@@ -68,6 +68,7 @@ from .competition_board import (
 from .console_overview import _fetch_remote_json
 from .console_registry import load_console_registry
 from .master_sprint import MASTER_SPRINT_PAGE, build_master_sprint_snapshot
+from .spot_app_loss_audit import main as spot_app_loss_audit_main
 from .data import (
     cache_file_path,
     delete_futures_order,
@@ -8485,6 +8486,9 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "rolling_hourly_loss_limit": None,
     "max_cumulative_notional": None,
 }
+DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_LOSS_PER_10K = 1.0
+DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_SAFE_SELL_GAP_TICKS = 2.0
+DEFAULT_SPOT_APP_LOSS_PRESTART_MIN_MAKER_RATIO = 0.99
 
 
 def _spot_runner_pid_path(symbol: str) -> Path:
@@ -14991,10 +14995,96 @@ def _cancel_spot_strategy_orders(config: dict[str, Any]) -> dict[str, Any]:
     return {"canceled": canceled, "errors": errors}
 
 
+def _spot_app_loss_prestart_float_config(config: dict[str, Any], key: str, default: float) -> float:
+    try:
+        value = float(config.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0.0 else default
+
+
+def _run_spot_app_loss_prestart_gate(config: dict[str, Any]) -> int:
+    if not _truthy(config.get("spot_app_loss_prestart_gate_enabled", False)):
+        return 0
+    symbol = str(config.get("symbol") or "").upper().strip()
+    if not symbol:
+        raise ValueError("spot_app_loss_prestart_gate requires symbol")
+    max_loss_default = (
+        _spot_app_loss_prestart_float_config(
+            config,
+            "spot_app_loss_per_10k_hard",
+            DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_LOSS_PER_10K,
+        )
+        or DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_LOSS_PER_10K
+    )
+    max_loss = _spot_app_loss_prestart_float_config(
+        config,
+        "spot_app_loss_prestart_gate_max_loss_per_10k",
+        max_loss_default,
+    )
+    max_gap = _spot_app_loss_prestart_float_config(
+        config,
+        "spot_app_loss_prestart_gate_max_safe_sell_gap_ticks",
+        DEFAULT_SPOT_APP_LOSS_PRESTART_MAX_SAFE_SELL_GAP_TICKS,
+    )
+    min_maker_ratio = _spot_app_loss_prestart_float_config(
+        config,
+        "spot_app_loss_prestart_gate_min_maker_ratio",
+        DEFAULT_SPOT_APP_LOSS_PRESTART_MIN_MAKER_RATIO,
+    )
+    min_gross_notional = _spot_app_loss_prestart_float_config(
+        config,
+        "spot_app_loss_prestart_gate_min_gross_notional",
+        _spot_app_loss_prestart_float_config(config, "spot_app_loss_min_notional", 0.0),
+    )
+    argv = ["--symbol", symbol]
+    start_time = str(
+        config.get("spot_app_loss_prestart_gate_start_time") or config.get("runtime_guard_stats_start_time") or ""
+    ).strip()
+    if start_time:
+        argv.extend(["--start-time", start_time])
+    argv.extend(
+        [
+            "--max-app-loss-per-10k",
+            str(max_loss),
+            "--max-safe-maker-sell-gap-ticks",
+            str(max_gap),
+            "--min-maker-ratio",
+            str(min_maker_ratio),
+            "--min-gross-notional",
+            str(min_gross_notional),
+            "--require-gate",
+        ]
+    )
+    return spot_app_loss_audit_main(argv)
+
+
 def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
     symbol = str(config.get("symbol", SPOT_RUNNER_DEFAULT_CONFIG["symbol"])).upper().strip() or "BTCUSDT"
     _runner_start_safety_preflight(config, spot=True)
     runner = _read_spot_runner_process_for_symbol(symbol)
+    try:
+        gate_code = _run_spot_app_loss_prestart_gate(config)
+    except Exception as exc:
+        return {
+            "started": False,
+            "already_running": False,
+            "restarted": False,
+            "reason": "spot_app_loss_prestart_gate_error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "runner": runner,
+            "symbol": symbol,
+        }
+    if gate_code != 0:
+        return {
+            "started": False,
+            "already_running": False,
+            "restarted": False,
+            "reason": "spot_app_loss_prestart_gate_rejected",
+            "gate_code": gate_code,
+            "runner": runner,
+            "symbol": symbol,
+        }
     restarted = False
     if runner.get("is_running"):
         current_config = dict(runner.get("config") or {})
