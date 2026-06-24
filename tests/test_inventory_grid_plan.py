@@ -107,6 +107,63 @@ def test_spot_flat_warmup_mode_places_only_top_of_book_buy() -> None:
     assert plan["bootstrap_orders"][0]["role"] == "bootstrap_entry"
 
 
+def test_synthetic_neutral_flat_defaults_to_one_tick_away_from_book() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.0880,
+        ask_price=0.0881,
+        step_price=0.0001,
+        per_order_notional=40.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=120.0,
+        max_order_position_notional=120.0,
+        max_position_notional=180.0,
+        max_short_order_position_notional=120.0,
+        max_short_position_notional=180.0,
+        buy_levels=2,
+        sell_levels=2,
+        tick_size=0.0001,
+        step_size=0.1,
+        min_qty=0.1,
+        min_notional=5.0,
+    )
+
+    assert [order["price"] for order in plan["bootstrap_orders"] if order["side"] == "BUY"] == [0.0879, 0.0878]
+    assert [order["price"] for order in plan["bootstrap_orders"] if order["side"] == "SELL"] == [0.0882, 0.0883]
+
+
+def test_synthetic_neutral_flat_warmup_places_top_of_book_maker_orders() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.0880,
+        ask_price=0.0881,
+        step_price=0.0001,
+        per_order_notional=40.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=120.0,
+        warmup_position_notional=1.0,
+        max_order_position_notional=120.0,
+        max_position_notional=180.0,
+        max_short_order_position_notional=120.0,
+        max_short_position_notional=180.0,
+        buy_levels=2,
+        sell_levels=2,
+        tick_size=0.0001,
+        step_size=0.1,
+        min_qty=0.1,
+        min_notional=5.0,
+    )
+
+    assert [order["price"] for order in plan["bootstrap_orders"] if order["side"] == "BUY"] == [0.0880, 0.0879]
+    assert [order["price"] for order in plan["bootstrap_orders"] if order["side"] == "SELL"] == [0.0881, 0.0882]
+
+
 def test_conservative_flat_runtime_does_not_bootstrap() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["recovery_mode"] = "conservative_reduce_only"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from .dry_run import _round_order_price, _round_order_qty
@@ -41,6 +42,14 @@ def _build_order(
     if position_side:
         order["position_side"] = position_side.upper()
     return order
+
+
+def _price_level(reference_price: float, step_price: float, level: int, *, side: str) -> float:
+    reference = Decimal(str(reference_price))
+    step = Decimal(str(step_price))
+    offset = step * Decimal(int(level))
+    price = reference - offset if side.upper() == "BUY" else reference + offset
+    return float(max(price, Decimal("0")))
 
 
 def _order_meets_mins(*, qty: float, price: float, min_qty: float | None, min_notional: float | None) -> bool:
@@ -633,7 +642,7 @@ def _build_buy_ladder_orders(
     safe_levels = _safe_positive_int(levels, default=1)
     for offset in range(safe_levels):
         level = start_level + offset
-        raw_price = max(float(reference_price) - float(step_price) * float(level), 0.0)
+        raw_price = _price_level(reference_price, step_price, level, side="BUY")
         if raw_price <= 0:
             break
         price = _round_order_price(raw_price, tick_size, "BUY")
@@ -690,7 +699,7 @@ def _build_sell_ladder_orders(
     safe_levels = _safe_positive_int(levels, default=1)
     for offset in range(safe_levels):
         level = start_level + offset
-        raw_price = max(float(reference_price) + float(step_price) * float(level), 0.0)
+        raw_price = _price_level(reference_price, step_price, level, side="SELL")
         if raw_price <= 0:
             continue
         price = _round_order_price(raw_price, tick_size, "SELL")
@@ -855,6 +864,7 @@ def build_inventory_grid_orders(
                 min_notional=min_notional,
             )
         elif synthetic_neutral:
+            flat_start_level = 0 if warmup_notional > EPSILON else 1
             bootstrap_orders = _build_buy_ladder_orders(
                 reference_price=bid_price,
                 step_price=step_price,
@@ -863,7 +873,7 @@ def build_inventory_grid_orders(
                 per_order_notional=per_order_notional,
                 first_role="bootstrap_entry",
                 next_role="grid_entry",
-                start_level=1,
+                start_level=flat_start_level,
                 max_total_notional=max_order_position_notional if max_order_position_notional > 0 else None,
                 tick_size=tick_size,
                 step_size=step_size,
@@ -889,7 +899,7 @@ def build_inventory_grid_orders(
                     role="grid_entry",
                     first_role="bootstrap_entry",
                     next_role="grid_entry",
-                    start_level=1,
+                    start_level=flat_start_level,
                     max_total_qty=max_short_qty,
                     tick_size=tick_size,
                     step_size=step_size,
