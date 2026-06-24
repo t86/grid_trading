@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from grid_optimizer.spot_app_loss_audit import compute_spot_app_loss_audit
+from grid_optimizer.spot_app_loss_audit import compute_spot_app_loss_audit, evaluate_spot_app_loss_recovery_gate
 
 
 class SpotAppLossAuditTests(unittest.TestCase):
@@ -62,6 +62,42 @@ class SpotAppLossAuditTests(unittest.TestCase):
         self.assertAlmostEqual(result["raw_app_loss"], -0.1)
         self.assertEqual(result["app_loss"], 0.0)
         self.assertEqual(result["safe_maker_sell_price"], 0.0)
+
+    def test_recovery_gate_allows_small_observation_when_loss_and_gap_are_good(self) -> None:
+        audit = compute_spot_app_loss_audit(
+            trades=[
+                {"isBuyer": True, "isMaker": True, "price": "0.08848", "qty": "30794.9", "quoteQty": "2724.6815"},
+                {"isBuyer": False, "isMaker": True, "price": "0.08849", "qty": "26673.1", "quoteQty": "2360.53094"},
+            ],
+            bid_price=0.0894,
+            ask_price=0.0895,
+            tick_size=0.0001,
+        )
+
+        gate = evaluate_spot_app_loss_recovery_gate(audit)
+
+        self.assertTrue(gate["allowed"])
+        self.assertEqual(gate["reasons"], [])
+        self.assertEqual(gate["maker_ratio"], 1.0)
+        self.assertEqual(gate["app_loss_per_10k"], 0.0)
+        self.assertLessEqual(gate["safe_maker_sell_gap_ticks"], 2.0)
+
+    def test_recovery_gate_rejects_high_loss_and_far_safe_maker_sell(self) -> None:
+        audit = compute_spot_app_loss_audit(
+            trades=[
+                {"isBuyer": True, "isMaker": True, "price": "0.08848", "qty": "30794.9", "quoteQty": "2724.6815"},
+                {"isBuyer": False, "isMaker": True, "price": "0.08849", "qty": "26673.1", "quoteQty": "2360.53094"},
+            ],
+            bid_price=0.0868,
+            ask_price=0.0869,
+            tick_size=0.0001,
+        )
+
+        gate = evaluate_spot_app_loss_recovery_gate(audit)
+
+        self.assertFalse(gate["allowed"])
+        self.assertIn("app_loss_per_10k_above_limit", gate["reasons"])
+        self.assertIn("safe_maker_sell_too_far", gate["reasons"])
 
 
 if __name__ == "__main__":

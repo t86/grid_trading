@@ -66,6 +66,7 @@ APP 万U损耗 = APP 损耗 / (买入成交额 + 卖出成交额) * 10000
 PYTHONPATH=src python -m grid_optimizer.spot_app_loss_audit --symbol XPLUSDT --start-time 2026-06-24T11:57:00Z
 ```
 
+- 审计结果中的 `recovery_gate.allowed` 必须为 `true`，否则不恢复。默认 gate 要求：APP 万U损耗不高于 `10`，maker 占比不低于 `0.99`，如果窗口净多则安全 maker SELL 价距离当前 ask 不超过 `2` 个 tick，且 `myTrades` 结果没有被 `limit` 截断。
 - 确认当前盘口到 break-even 的 tick 距离；若距离过大，只能接受低速挂 break-even maker SELL，不能为了速度降价卖。
 - 使用小观察额度恢复，不直接使用原 40 万目标。
 - 启动后先观察一个小窗口，确认 APP 万U损耗低于 10 或转正，再扩大目标。

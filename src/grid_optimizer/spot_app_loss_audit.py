@@ -134,6 +134,49 @@ def compute_spot_app_loss_audit(
     }
 
 
+def evaluate_spot_app_loss_recovery_gate(
+    audit: dict[str, Any],
+    *,
+    max_app_loss_per_10k: float = 10.0,
+    max_safe_maker_sell_gap_ticks: float = 2.0,
+    min_maker_ratio: float = 0.99,
+    min_gross_notional: float = 0.0,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    trade_count = _safe_int(audit.get("trade_count"))
+    maker_count = _safe_int(audit.get("maker_count"))
+    maker_ratio = (maker_count / trade_count) if trade_count > 0 else 0.0
+    gross_notional = _safe_float(audit.get("gross_notional"))
+    app_loss_per_10k = _safe_float(audit.get("app_loss_per_10k"))
+    net_qty = _safe_float(audit.get("net_qty"))
+    safe_sell_gap_ticks = max(_safe_float(audit.get("safe_maker_sell_gap_ticks")), 0.0)
+    if trade_count <= 0:
+        reasons.append("no_trades")
+    if bool(audit.get("truncated")):
+        reasons.append("trade_window_truncated")
+    if gross_notional + EPSILON < max(_safe_float(min_gross_notional), 0.0):
+        reasons.append("gross_notional_below_min")
+    if app_loss_per_10k > max(_safe_float(max_app_loss_per_10k), 0.0) + EPSILON:
+        reasons.append("app_loss_per_10k_above_limit")
+    if trade_count > 0 and maker_ratio + EPSILON < max(_safe_float(min_maker_ratio), 0.0):
+        reasons.append("maker_ratio_below_min")
+    if net_qty > EPSILON and safe_sell_gap_ticks > max(_safe_float(max_safe_maker_sell_gap_ticks), 0.0) + EPSILON:
+        reasons.append("safe_maker_sell_too_far")
+    return {
+        "allowed": not reasons,
+        "reasons": reasons,
+        "max_app_loss_per_10k": max(_safe_float(max_app_loss_per_10k), 0.0),
+        "max_safe_maker_sell_gap_ticks": max(_safe_float(max_safe_maker_sell_gap_ticks), 0.0),
+        "min_maker_ratio": max(_safe_float(min_maker_ratio), 0.0),
+        "min_gross_notional": max(_safe_float(min_gross_notional), 0.0),
+        "maker_ratio": maker_ratio,
+        "app_loss_per_10k": app_loss_per_10k,
+        "safe_maker_sell_gap_ticks": safe_sell_gap_ticks,
+        "gross_notional": gross_notional,
+        "net_qty": net_qty,
+    }
+
+
 def build_live_spot_app_loss_audit(
     *,
     symbol: str,
@@ -182,12 +225,23 @@ def main() -> None:
     parser.add_argument("--start-time", default="", help="ISO datetime or millisecond timestamp.")
     parser.add_argument("--end-time", default="", help="ISO datetime or millisecond timestamp.")
     parser.add_argument("--limit", type=int, default=1000)
+    parser.add_argument("--max-app-loss-per-10k", type=float, default=10.0)
+    parser.add_argument("--max-safe-maker-sell-gap-ticks", type=float, default=2.0)
+    parser.add_argument("--min-maker-ratio", type=float, default=0.99)
+    parser.add_argument("--min-gross-notional", type=float, default=0.0)
     args = parser.parse_args()
     audit = build_live_spot_app_loss_audit(
         symbol=str(args.symbol).upper().strip(),
         start_time_ms=_parse_time_ms(args.start_time),
         end_time_ms=_parse_time_ms(args.end_time),
         limit=max(min(int(args.limit), 1000), 1),
+    )
+    audit["recovery_gate"] = evaluate_spot_app_loss_recovery_gate(
+        audit,
+        max_app_loss_per_10k=args.max_app_loss_per_10k,
+        max_safe_maker_sell_gap_ticks=args.max_safe_maker_sell_gap_ticks,
+        min_maker_ratio=args.min_maker_ratio,
+        min_gross_notional=args.min_gross_notional,
     )
     print(json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True))
 
