@@ -42,6 +42,13 @@ def test_saved_runner_fallback_stop_cancels_spot_strategy_orders_around_process_
     ) in script
 
 
+def test_runner_systemd_does_not_restart_on_controlled_gate_reject() -> None:
+    script = Path("deploy/oracle/install_runner_systemd.sh").read_text(encoding="utf-8")
+
+    assert "Restart=always" in script
+    assert "RestartPreventExitStatus=2" in script
+
+
 def test_disk_pressure_watchdog_has_safe_cleanup_and_alerts() -> None:
     script = Path("deploy/oracle/disk_pressure_watchdog.sh").read_text(encoding="utf-8")
 

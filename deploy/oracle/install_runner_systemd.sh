@@ -69,6 +69,7 @@ Environment=GRID_RUNNER_SYMBOL=%i
 Environment=GRID_RUNNER_SERVICE_TEMPLATE=${GRID_RUNNER_SERVICE_TEMPLATE}
 ExecStart=${PYTHON_BIN} -u -m grid_optimizer.run_saved_runner --symbol %i
 Restart=always
+RestartPreventExitStatus=2
 RestartSec=5
 TimeoutStartSec=30
 TimeoutStopSec=20

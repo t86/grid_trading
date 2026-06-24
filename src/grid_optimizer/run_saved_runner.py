@@ -162,7 +162,11 @@ def main() -> None:
     atexit.register(_cleanup_pid, pid_path)
     if _should_use_spot_runner(symbol):
         config = _load_spot_runner_control_config(symbol)
-        _runner_start_safety_preflight(config, spot=True)
+        try:
+            _runner_start_safety_preflight(config, spot=True)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(2) from exc
         gate_code = _run_spot_app_loss_prestart_gate(config)
         if gate_code != 0:
             raise SystemExit(gate_code)

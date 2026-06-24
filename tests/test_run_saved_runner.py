@@ -326,10 +326,10 @@ class RunSavedRunnerTests(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=True), patch.object(
             sys, "argv", ["run_saved_runner.py", "--symbol", "xplusdt"]
         ):
-            with self.assertRaises(ValueError) as raised:
+            with self.assertRaises(SystemExit) as raised:
                 run_saved_runner.main()
 
-        self.assertIn("spot_freeze_enabled", str(raised.exception))
+        self.assertEqual(raised.exception.code, 2)
         mock_app_loss_audit_main.assert_not_called()
         mock_build_spot_runner_command.assert_not_called()
         mock_execvpe.assert_not_called()
