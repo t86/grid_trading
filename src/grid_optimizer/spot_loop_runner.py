@@ -1052,6 +1052,25 @@ def _build_spot_app_loss_guard(
     }
 
 
+def _spot_app_loss_guard_stop_reason(guard: dict[str, Any]) -> str:
+    if not isinstance(guard, dict):
+        return ""
+    if str(guard.get("state", "") or "").strip().lower() != "blocked":
+        return ""
+    if bool(guard.get("preactive_loss_cap_hit")):
+        return "spot_app_loss_preactive_cap_hit"
+    if bool(guard.get("bid_break_even_buffer_below_min")):
+        return "spot_app_loss_bid_buffer_below_min"
+    hard = max(_safe_float(guard.get("hard_per_10k")), 0.0)
+    if hard > EPSILON and _safe_float(guard.get("app_loss_per_10k")) + EPSILON >= hard:
+        return "spot_app_loss_hard_limit_hit"
+    return ""
+
+
+def _spot_app_loss_guard_should_stop_runner(guard: dict[str, Any]) -> bool:
+    return bool(_spot_app_loss_guard_stop_reason(guard))
+
+
 def _spot_app_loss_mark_price(*, metrics: dict[str, Any], bid_price: float, ask_price: float) -> float:
     bid = max(_safe_float(bid_price), 0.0)
     ask = max(_safe_float(ask_price), 0.0)
@@ -4399,40 +4418,56 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         available_base_free=base_free,
         min_bid_break_even_buffer_ticks=float(getattr(args, "spot_app_loss_min_bid_break_even_buffer_ticks", 0.0)),
     )
+    spot_app_loss_stop_reason = _spot_app_loss_guard_stop_reason(
+        controls.get("spot_app_loss_guard") if isinstance(controls.get("spot_app_loss_guard"), dict) else {}
+    )
+    if spot_app_loss_stop_reason:
+        desired_orders = []
+        controls["risk_state"] = spot_app_loss_stop_reason
+        controls["spot_app_loss_runner_stop_reason"] = spot_app_loss_stop_reason
+        controls["buy_paused"] = True
+        pause_reasons = list(controls.get("pause_reasons") or [])
+        if spot_app_loss_stop_reason not in pause_reasons:
+            pause_reasons.append(spot_app_loss_stop_reason)
+        controls["pause_reasons"] = pause_reasons
     if strategy_mode == "spot_competition_synthetic_neutral_grid":
         def _persist_spot_freeze_ledger(ledger_result: dict[str, Any]) -> None:
             state["spot_frozen_ledger"] = ledger_result
             _save_state(state_path, state)
 
-        _maybe_run_spot_freeze(
-            args=args,
-            state=state,
-            controls=controls,
-            symbol=symbol,
-            mid_price=mid_price,
-            bid_price=bid_price,
-            ask_price=ask_price,
-            symbol_info=symbol_info,
-            api_key=api_key,
-            api_secret=api_secret,
-            now=_utc_now(),
-            persist_ledger=_persist_spot_freeze_ledger,
-            existing_maker_orders=_spot_freeze_open_maker_orders(strategy_open_orders, state),
-        )
-        desired_orders = _apply_spot_freeze_runtime_hedge_block(
-            strategy_mode=strategy_mode,
-            desired_orders=desired_orders,
-            controls=controls,
-        )
-        desired_orders = _apply_spot_freeze_maker_orders_to_desired_orders(
-            desired_orders=desired_orders,
-            maker_orders=list(controls.get("spot_freeze_maker_orders") or []),
-            controls=controls,
-        )
-        if controls.get("spot_freeze_actions") or controls.get("spot_freeze_pending_contract_actions"):
-            # Spot freeze may have already placed market orders; persist the ledger
-            # before later stale-order reconciliation can abort the cycle.
-            _save_state(state_path, state)
+        if spot_app_loss_stop_reason:
+            controls.update(_spot_freeze_default_controls(bool(getattr(args, "spot_freeze_enabled", False))))
+            controls["spot_freeze_skip_reason"] = "spot_app_loss_runner_stop"
+        else:
+            _maybe_run_spot_freeze(
+                args=args,
+                state=state,
+                controls=controls,
+                symbol=symbol,
+                mid_price=mid_price,
+                bid_price=bid_price,
+                ask_price=ask_price,
+                symbol_info=symbol_info,
+                api_key=api_key,
+                api_secret=api_secret,
+                now=_utc_now(),
+                persist_ledger=_persist_spot_freeze_ledger,
+                existing_maker_orders=_spot_freeze_open_maker_orders(strategy_open_orders, state),
+            )
+            desired_orders = _apply_spot_freeze_runtime_hedge_block(
+                strategy_mode=strategy_mode,
+                desired_orders=desired_orders,
+                controls=controls,
+            )
+            desired_orders = _apply_spot_freeze_maker_orders_to_desired_orders(
+                desired_orders=desired_orders,
+                maker_orders=list(controls.get("spot_freeze_maker_orders") or []),
+                controls=controls,
+            )
+            if controls.get("spot_freeze_actions") or controls.get("spot_freeze_pending_contract_actions"):
+                # Spot freeze may have already placed market orders; persist the ledger
+                # before later stale-order reconciliation can abort the cycle.
+                _save_state(state_path, state)
     elif bool(getattr(args, "spot_freeze_enabled", False)):
         controls.update(_spot_freeze_default_controls(True))
         controls["spot_freeze_alerts"] = ["unsupported_strategy_mode"]
@@ -4441,7 +4476,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
     diff = diff_open_orders(existing_orders=strategy_open_orders, desired_orders=desired_orders)
 
     canceled_count = 0
-    if _truthy(args.cancel_stale) and diff["stale_orders"]:
+    if (_truthy(args.cancel_stale) or spot_app_loss_stop_reason) and diff["stale_orders"]:
         canceled_count = _cancel_orders(
             symbol=symbol,
             api_key=api_key,
@@ -4690,6 +4725,12 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
         "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
     }
+    if spot_app_loss_stop_reason:
+        summary["runtime_status"] = "stopped"
+        summary["stop_triggered"] = True
+        summary["stop_reason"] = spot_app_loss_stop_reason
+        summary["stop_reasons"] = [spot_app_loss_stop_reason]
+        summary["stop_triggered_at"] = _utc_now().isoformat()
     summary["cycle_database"] = _persist_spot_cycle_database(
         symbol=symbol,
         strategy_mode=strategy_mode,
@@ -4880,6 +4921,8 @@ def main() -> None:
             )
             if summary.get("stop_reason"):
                 print(f"  stop_reason: {summary['stop_reason']}")
+            if summary.get("stop_triggered"):
+                raise SystemExit(2)
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # pragma: no cover - runtime specific

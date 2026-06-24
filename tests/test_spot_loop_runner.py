@@ -34,6 +34,7 @@ from grid_optimizer.spot_loop_runner import (
     _refresh_spot_trades_after_account_snapshot,
     _sync_synthetic_neutral_trades,
     _sync_volume_shift_trades,
+    _spot_app_loss_guard_should_stop_runner,
     _runtime_guard_events_from_metrics,
 )
 from grid_optimizer.spot_freeze_manager import new_ledger
@@ -339,6 +340,45 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(guard["break_even_price"], 1.0)
         self.assertAlmostEqual(guard["bid_break_even_buffer_ticks"], 1.0)
         self.assertTrue(guard["bid_break_even_buffer_below_min"])
+
+    def test_spot_app_loss_guard_hard_block_requests_runner_stop(self) -> None:
+        hard_loss_guard = _build_spot_app_loss_guard(
+            enabled=True,
+            metrics={"buy_notional": 1000.0, "sell_notional": 800.0, "buy_qty": 1000.0, "sell_qty": 900.0},
+            position_qty=100.0,
+            latest_price=1.0,
+            min_notional=10.0,
+            soft_per_10k=1.0,
+            hard_per_10k=2.0,
+        )
+        preactive_guard = _build_spot_app_loss_guard(
+            enabled=True,
+            metrics={"buy_notional": 2000.0, "sell_notional": 1999.4, "buy_qty": 2000.0, "sell_qty": 1999.4},
+            position_qty=0.6,
+            latest_price=0.0,
+            min_notional=5000.0,
+            soft_per_10k=0.6,
+            hard_per_10k=1.0,
+        )
+        bid_buffer_guard = _build_spot_app_loss_guard(
+            enabled=True,
+            metrics={"buy_notional": 1000.0, "sell_notional": 900.0, "buy_qty": 1000.0, "sell_qty": 900.0},
+            position_qty=100.0,
+            latest_price=1.01,
+            min_notional=10.0,
+            soft_per_10k=1.0,
+            hard_per_10k=2.0,
+            tick_size=0.01,
+            min_bid_break_even_buffer_ticks=3.0,
+        )
+        defensive_guard = dict(hard_loss_guard, state="defensive", app_loss_per_10k=1.2)
+        recovery_guard = dict(hard_loss_guard, state="recovery_reduce_only", app_loss_per_10k=0.0)
+
+        self.assertTrue(_spot_app_loss_guard_should_stop_runner(hard_loss_guard))
+        self.assertTrue(_spot_app_loss_guard_should_stop_runner(preactive_guard))
+        self.assertTrue(_spot_app_loss_guard_should_stop_runner(bid_buffer_guard))
+        self.assertFalse(_spot_app_loss_guard_should_stop_runner(defensive_guard))
+        self.assertFalse(_spot_app_loss_guard_should_stop_runner(recovery_guard))
 
     def test_spot_app_loss_guard_does_not_reduce_when_window_unaligned(self) -> None:
         controls = {"actual_base_qty": 120.0, "neutral_base_qty": 100.0}
@@ -3936,10 +3976,112 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(guard["window_source"], "recent_trades")
         self.assertEqual(guard["state"], "blocked")
         self.assertEqual(guard["reduce_side"], "BUY")
-        self.assertEqual(summary["active_buy_orders"], 1)
+        self.assertEqual(summary["active_buy_orders"], 0)
         self.assertEqual(summary["active_sell_orders"], 0)
+        self.assertTrue(summary["stop_triggered"])
+        self.assertEqual(summary["runtime_status"], "stopped")
+        self.assertEqual(summary["stop_reason"], "spot_app_loss_hard_limit_hit")
+        self.assertEqual(summary["spot_freeze_skip_reason"], "spot_app_loss_runner_stop")
         self.assertAlmostEqual(guard["latest_price"], 0.0868)
         self.assertGreaterEqual(summary["spot_app_loss_per_10k"], 1.0)
+
+    def test_run_cycle_app_loss_hard_stop_cancels_orders_even_when_cancel_stale_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            summary_path = Path(tmpdir) / "events.jsonl"
+            args = self._synthetic_args(
+                [
+                    "--state-path",
+                    str(state_path),
+                    "--summary-jsonl",
+                    str(summary_path),
+                    "--per-order-notional",
+                    "60",
+                    "--neutral-base-qty",
+                    "4800",
+                    "--spot-app-loss-guard-enabled",
+                    "--spot-app-loss-min-notional",
+                    "10",
+                    "--spot-app-loss-per-10k-soft",
+                    "0.6",
+                    "--spot-app-loss-per-10k-hard",
+                    "1.0",
+                    "--no-cancel-stale",
+                ]
+            )
+            symbol_info = {
+                "base_asset": "WLD",
+                "quote_asset": "USDT",
+                "tick_size": 0.0001,
+                "step_size": 0.1,
+                "min_qty": 0.1,
+                "min_notional": 5.0,
+            }
+            raw_trades = [
+                {
+                    "id": 1,
+                    "orderId": 10,
+                    "isBuyer": True,
+                    "isMaker": True,
+                    "price": "0.0885",
+                    "qty": "4800",
+                    "quoteQty": "424.8",
+                    "commission": "0",
+                    "commissionAsset": "BNB",
+                    "time": 1000,
+                },
+                {
+                    "id": 2,
+                    "orderId": 11,
+                    "isBuyer": False,
+                    "isMaker": True,
+                    "price": "0.0870",
+                    "qty": "680",
+                    "quoteQty": "59.16",
+                    "commission": "0",
+                    "commissionAsset": "BNB",
+                    "time": 1100,
+                },
+            ]
+            open_orders = [
+                {
+                    "orderId": 123,
+                    "clientOrderId": "spotgrid-old",
+                    "side": "BUY",
+                    "type": "LIMIT_MAKER",
+                    "price": "0.0867",
+                    "origQty": "690.0",
+                    "positionSide": "BOTH",
+                }
+            ]
+
+            with patch("grid_optimizer.spot_loop_runner.fetch_spot_book_tickers", return_value=[{"bid_price": "0.0868", "ask_price": "0.0869"}]):
+                with patch("grid_optimizer.spot_loop_runner.fetch_spot_user_trades", return_value=raw_trades):
+                    with patch(
+                        "grid_optimizer.spot_loop_runner.fetch_spot_account_info",
+                        return_value={
+                            "balances": [
+                                {"asset": "WLD", "free": "4120", "locked": "0"},
+                                {"asset": "USDT", "free": "3000", "locked": "0"},
+                            ]
+                        },
+                    ):
+                        with patch("grid_optimizer.spot_loop_runner.fetch_spot_open_orders", return_value=open_orders):
+                            with patch(
+                                "grid_optimizer.spot_loop_runner._build_spot_competition_inventory_grid_orders",
+                                return_value=(
+                                    [{"side": "BUY", "role": "grid_exit", "price": 0.0867, "qty": 690.0}],
+                                    {"actual_base_qty": 4120.0, "neutral_base_qty": 4800.0, "_runtime": {}},
+                                ),
+                            ):
+                                with patch("grid_optimizer.spot_loop_runner._cancel_orders", return_value=1) as cancel_orders:
+                                    summary = _run_cycle(args, symbol_info, api_key="key", api_secret="secret")
+
+        cancel_orders.assert_called_once()
+        self.assertEqual(cancel_orders.call_args.kwargs["orders"], open_orders)
+        self.assertEqual(summary["canceled_count"], 1)
+        self.assertTrue(summary["stop_triggered"])
+        self.assertEqual(summary["stop_reason"], "spot_app_loss_hard_limit_hit")
 
     def test_cancel_orders_ignores_already_gone_spot_order(self) -> None:
         with patch(
