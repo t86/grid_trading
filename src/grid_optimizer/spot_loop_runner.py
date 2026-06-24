@@ -1477,6 +1477,7 @@ def _apply_spot_freeze_runtime_hedge_block(
     skip_reason = str(controls.get("spot_freeze_skip_reason", "") or "").strip()
     blocking_reasons = {
         "hedge_gate_failed",
+        "insufficient_short_hedge_to_freeze_long",
         "pending_contract_unrepaired",
         "total_cap_reached",
         "short_hedge_capacity_exhausted",
@@ -3217,6 +3218,8 @@ def _build_spot_freeze_maker_order(
     max_qty = max(_safe_float(deviation_qty), 0.0)
     available_short_qty = expected_short_position_now(base_hedge_qty, ledger)
     if side_name == "long":
+        if _safe_float(available_short_qty) <= EPSILON:
+            return None, "insufficient_short_hedge_to_freeze_long"
         max_qty = min(max_qty, max(_safe_float(available_short_qty), 0.0))
     else:
         max_contract_short_notional = max(_safe_float(getattr(args, "max_short_position_notional", 0.0)), 0.0)
