@@ -8783,6 +8783,19 @@ def _runner_start_safety_preflight(
                     reasons.append(
                         "spot_app_loss_prestart_gate_start_time 必须与 runtime_guard_stats_start_time 同源，避免启动前/运行中 APP 损耗窗口不一致"
                     )
+                elif not _truthy(config.get("reset_state", True)):
+                    state_path = Path(str(config.get("state_path", "") or "").strip())
+                    state = _read_json_dict(state_path) if str(state_path) else {}
+                    metrics = state.get("metrics") if isinstance(state.get("metrics"), dict) else {}
+                    first_trade_time_ms = 0
+                    if isinstance(metrics, dict) and metrics.get("first_trade_time_ms") not in {"", None}:
+                        first_trade_time_ms = _safe_int(metrics.get("first_trade_time_ms"), "first_trade_time_ms")
+                    if first_trade_time_ms > 0:
+                        first_trade_time = datetime.fromtimestamp(first_trade_time_ms / 1000.0, tz=timezone.utc)
+                        if first_trade_time + timedelta(seconds=1) < runtime_time:
+                            reasons.append(
+                                "spot APP loss state metrics 早于 runtime_guard_stats_start_time，必须 reset_state 或重建同源窗口"
+                            )
         if competition_spot_recovery and not _truthy(config.get("spot_freeze_enabled", False)):
             reasons.append("交易赛现货启用 APP loss guard/recovery 时必须启用 spot_freeze_enabled")
         if competition_spot_recovery and not _truthy(config.get("spot_freeze_maker_execution_enabled", False)):
