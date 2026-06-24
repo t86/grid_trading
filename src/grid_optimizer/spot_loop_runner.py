@@ -950,7 +950,9 @@ def _build_spot_app_loss_guard(
     }
 
 
-def _spot_app_loss_reduce_side(controls: dict[str, Any], position_qty: float) -> str:
+def _spot_app_loss_reduce_side(controls: dict[str, Any], position_qty: float, app_position_qty: float | None = None) -> str:
+    if app_position_qty is not None and _safe_float(app_position_qty) > EPSILON:
+        return "SELL"
     neutral_base_qty = max(_safe_float(controls.get("neutral_base_qty")), 0.0)
     if neutral_base_qty > EPSILON or "synthetic_net_qty" in controls:
         deviation_qty = _safe_float(controls.get("actual_base_qty")) - neutral_base_qty
@@ -1090,7 +1092,7 @@ def _apply_spot_app_loss_guard_to_orders(
     if guard["state"] not in {"defensive", "blocked"}:
         return desired_orders
 
-    reduce_side = _spot_app_loss_reduce_side(controls, position_qty)
+    reduce_side = _spot_app_loss_reduce_side(controls, position_qty, app_position_qty=guard.get("position_qty"))
     kept_orders = _cap_spot_app_loss_reduce_orders(
         orders=desired_orders,
         controls=controls,

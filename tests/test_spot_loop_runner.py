@@ -380,7 +380,40 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(filtered[0]["qty"], 12.5)
         self.assertEqual(controls["spot_app_loss_guard"]["injected_order_count"], 1)
 
-    def test_spot_app_loss_guard_injects_maker_buy_when_short_deviation_has_no_reduce_order(self) -> None:
+    def test_spot_app_loss_guard_sells_when_app_window_is_long_even_below_neutral(self) -> None:
+        controls = {"actual_base_qty": 4121.8, "neutral_base_qty": 4800.0}
+        desired_orders = [
+            {"side": "BUY", "role": "grid_exit", "price": 0.0867, "qty": 691.2},
+        ]
+
+        filtered = _apply_spot_app_loss_guard_to_orders(
+            desired_orders=desired_orders,
+            controls=controls,
+            metrics={
+                "buy_notional": 2724.6815,
+                "sell_notional": 2360.53094,
+                "buy_qty": 30794.9,
+                "sell_qty": 26673.1,
+            },
+            position_qty=4121.8,
+            latest_price=0.0868,
+            enabled=True,
+            min_notional=5000.0,
+            soft_per_10k=0.6,
+            hard_per_10k=1.0,
+            maker_reduce_notional=60.0,
+            step_size=0.1,
+            min_qty=0.1,
+            exchange_min_notional=5.0,
+            available_base_free=4121.8,
+        )
+
+        self.assertEqual([order["side"] for order in filtered], ["SELL"])
+        self.assertEqual(filtered[0]["role"], "spot_app_loss_reduce")
+        self.assertEqual(controls["spot_app_loss_guard"]["reduce_side"], "SELL")
+        self.assertTrue(controls["buy_paused"])
+
+    def test_spot_app_loss_guard_injects_maker_buy_when_short_deviation_has_no_app_long_exposure(self) -> None:
         controls = {"actual_base_qty": 80.0, "neutral_base_qty": 100.0}
         desired_orders = [
             {"side": "SELL", "role": "grid_entry", "price": 1.0, "qty": 10.0},
@@ -389,7 +422,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         filtered = _apply_spot_app_loss_guard_to_orders(
             desired_orders=desired_orders,
             controls=controls,
-            metrics={"buy_notional": 1200.0, "sell_notional": 850.0, "buy_qty": 1000.0, "sell_qty": 920.0},
+            metrics={"buy_notional": 1200.0, "sell_notional": 850.0, "buy_qty": 1000.0, "sell_qty": 1000.0},
             position_qty=80.0,
             latest_price=2.0,
             enabled=True,
@@ -468,7 +501,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         filtered = _apply_spot_app_loss_guard_to_orders(
             desired_orders=desired_orders,
             controls=controls,
-            metrics={"buy_notional": 1200.0, "sell_notional": 850.0, "buy_qty": 1000.0, "sell_qty": 920.0},
+            metrics={"buy_notional": 1200.0, "sell_notional": 850.0, "buy_qty": 1000.0, "sell_qty": 1000.0},
             position_qty=80.0,
             latest_price=2.0,
             enabled=True,
