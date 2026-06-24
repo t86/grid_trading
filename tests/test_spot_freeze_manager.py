@@ -275,6 +275,25 @@ def test_freeze_short_deviation_buys_spot_and_sells_short_position_side() -> Non
     assert result["ledger"]["short_lots"][0]["qty"] == 10.0
 
 
+def test_freeze_short_deviation_respects_contract_short_limit() -> None:
+    ledger = new_ledger()
+    ledger["short_lots"] = [{"lot_id": "S1", "qty": 9.0, "cost_price": 10.0, "frozen_at": "t", "frozen_mid": 10.0, "hedge_pending": False}]
+    ledger_totals(ledger)
+
+    result, rec = run_cycle(
+        ledger=ledger,
+        spot_inventory_qty=80.0,
+        contract_short_qty=9.0,
+        base_hedge_qty=0.0,
+        config=enabled_config(max_contract_short_notional=90.0),
+    )
+
+    assert rec.spot_orders == []
+    assert rec.contract_orders == []
+    assert result["ledger"]["short_lots"] == ledger["short_lots"]
+    assert "short_hedge_capacity_exhausted" in result["alerts"]
+
+
 def test_freeze_skips_when_loss_ratio_unusable() -> None:
     result, rec = run_cycle(loss_ratio_usable=False)
 
@@ -459,6 +478,28 @@ def test_profit_release_short_buys_short_position_then_removes_lot() -> None:
     assert rec.contract_orders == [{"symbol": "WLDUSDT", "side": "BUY", "qty": 10.0, "position_side": "SHORT"}]
     assert result["ledger"]["short_lots"] == []
     assert result["ledger"]["pending_contract_actions"] == []
+
+
+def test_profit_release_short_updates_available_hedge_before_long_freeze() -> None:
+    ledger = new_ledger()
+    ledger["short_lots"] = [{"lot_id": "S1", "qty": 10.0, "cost_price": 10.0, "frozen_at": "t", "frozen_mid": 11.0, "hedge_pending": False}]
+    ledger_totals(ledger)
+
+    result, rec = run_cycle(
+        ledger=ledger,
+        spot_inventory_qty=120.0,
+        contract_short_qty=10.0,
+        base_hedge_qty=0.0,
+        mark_price=9.0,
+        config=enabled_config(profit_release_enabled=True, release_profit_ratio=0.05),
+    )
+
+    assert rec.spot_orders == []
+    assert rec.contract_orders == [{"symbol": "WLDUSDT", "side": "BUY", "qty": 10.0, "position_side": "SHORT"}]
+    assert result["ledger"]["long_lots"] == []
+    assert result["ledger"]["short_lots"] == []
+    assert result["ledger"]["pending_contract_actions"] == []
+    assert "insufficient_short_hedge_to_freeze_long" in result["alerts"]
 
 
 def test_profit_release_contract_failure_keeps_lot_and_does_not_create_pending() -> None:

@@ -16,6 +16,7 @@ class FreezeConfig:
     min_loss_ratio: float = 0.0
     max_per_cycle_notional: float = 0.0
     total_cap_notional: float = 0.0
+    max_contract_short_notional: float = 0.0
     pair_release_enabled: bool = False
     profit_release_enabled: bool = False
     release_profit_ratio: float = 0.05
@@ -384,6 +385,7 @@ def freeze_cycle(
         if working.get("pending_contract_actions"):
             return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
 
+    available_short_qty = expected_short_position_now(base_hedge_qty, working)
     if not config.enabled:
         ledger_totals(working)
         return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
@@ -401,6 +403,7 @@ def freeze_cycle(
             actions=actions,
             alerts=alerts,
         )
+    available_short_qty = expected_short_position_now(base_hedge_qty, working)
 
     deviation_qty_signed = _safe_float(spot_inventory_qty) - _safe_float(neutral_base_qty)
     mid = max(_safe_float(mid_price), 0.0)
@@ -425,8 +428,16 @@ def freeze_cycle(
 
     is_long_deviation = deviation_qty_signed > 0.0
     max_qty = abs(deviation_qty_signed)
+    short_capacity_exhausted = False
     if is_long_deviation:
-        max_qty = min(max_qty, max(_safe_float(contract_short_qty), 0.0))
+        max_qty = min(max_qty, max(_safe_float(available_short_qty), 0.0))
+    else:
+        max_contract_short_notional = max(_safe_float(config.max_contract_short_notional), 0.0)
+        if max_contract_short_notional > EPSILON:
+            max_contract_short_qty = max_contract_short_notional / mid
+            short_capacity_qty = max(max_contract_short_qty - max(_safe_float(available_short_qty), 0.0), 0.0)
+            short_capacity_exhausted = short_capacity_qty <= EPSILON
+            max_qty = min(max_qty, short_capacity_qty)
     per_cycle_cap = max(_safe_float(config.max_per_cycle_notional), 0.0)
     if per_cycle_cap > EPSILON:
         max_qty = min(max_qty, per_cycle_cap / mid)
@@ -434,7 +445,12 @@ def freeze_cycle(
         max_qty = min(max_qty, max((cap - frozen_notional) / mid, 0.0))
     qty = _round_down_qty(max_qty, qty_step)
     if qty <= EPSILON:
-        alerts.append("insufficient_short_hedge_to_freeze_long" if is_long_deviation else "qty_too_small")
+        if is_long_deviation:
+            alerts.append("insufficient_short_hedge_to_freeze_long")
+        elif short_capacity_exhausted:
+            alerts.append("short_hedge_capacity_exhausted")
+        else:
+            alerts.append("qty_too_small")
         return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
 
     spot_side = "SELL" if is_long_deviation else "BUY"

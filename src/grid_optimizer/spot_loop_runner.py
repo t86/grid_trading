@@ -2414,6 +2414,7 @@ def _maybe_run_spot_freeze(
             min_loss_ratio=max(_safe_float(getattr(args, "spot_freeze_min_loss_ratio", 0.0)), 0.0),
             max_per_cycle_notional=max(_safe_float(getattr(args, "spot_freeze_max_per_cycle_notional", 0.0)), 0.0),
             total_cap_notional=max(_safe_float(getattr(args, "spot_freeze_total_cap_notional", 0.0)), 0.0),
+            max_contract_short_notional=max(_safe_float(getattr(args, "max_short_position_notional", 0.0)), 0.0),
             pair_release_enabled=bool(getattr(args, "spot_freeze_pair_release_enabled", False)),
             profit_release_enabled=bool(getattr(args, "spot_freeze_profit_release_enabled", False)),
             release_profit_ratio=max(_safe_float(getattr(args, "spot_freeze_release_profit_ratio", 0.05)), 0.0),
