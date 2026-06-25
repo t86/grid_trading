@@ -1627,6 +1627,8 @@ def _apply_spot_freeze_runtime_hedge_block(
         "insufficient_short_hedge_to_freeze_long",
         "pending_contract_unrepaired",
         "total_cap_reached",
+        "long_total_cap_reached",
+        "short_total_cap_reached",
         "short_hedge_capacity_exhausted",
     }
     if skip_reason not in blocking_reasons:
@@ -3277,6 +3279,8 @@ def _spot_freeze_default_controls(enabled: bool) -> dict[str, Any]:
         "spot_freeze_deviation_side": "",
         "spot_freeze_deviation_notional": 0.0,
         "spot_freeze_deviation_threshold_notional": 0.0,
+        "spot_freeze_long_total_cap_notional": 0.0,
+        "spot_freeze_short_total_cap_notional": 0.0,
         "spot_freeze_deviation_loss_ratio": 0.0,
         "spot_freeze_deviation_cost_avg": 0.0,
         "spot_freeze_deviation_loss_reason": "",
@@ -3297,6 +3301,8 @@ def _spot_freeze_threshold_effectively_disables(args: argparse.Namespace, deviat
         return False
     capacity = max(
         max(_safe_float(getattr(args, "spot_freeze_total_cap_notional", 0.0)), 0.0),
+        max(_safe_float(getattr(args, "spot_freeze_long_total_cap_notional", 0.0)), 0.0),
+        max(_safe_float(getattr(args, "spot_freeze_short_total_cap_notional", 0.0)), 0.0),
         max(_safe_float(getattr(args, "spot_freeze_max_per_cycle_notional", 0.0)), 0.0),
         max(_safe_float(getattr(args, "max_position_notional", 0.0)), 0.0),
         max(_safe_float(getattr(args, "max_short_position_notional", 0.0)), 0.0),
@@ -3305,6 +3311,19 @@ def _spot_freeze_threshold_effectively_disables(args: argparse.Namespace, deviat
         max(_safe_float(getattr(args, "per_order_notional", 0.0)), 0.0),
     )
     return capacity > EPSILON and threshold >= capacity * 1000.0
+
+
+def _spot_freeze_side_cap_mode(args: argparse.Namespace) -> bool:
+    return (
+        max(_safe_float(getattr(args, "spot_freeze_long_total_cap_notional", 0.0)), 0.0) > EPSILON
+        or max(_safe_float(getattr(args, "spot_freeze_short_total_cap_notional", 0.0)), 0.0) > EPSILON
+    )
+
+
+def _spot_freeze_side_total_cap_notional(args: argparse.Namespace, side_name: str) -> float:
+    if str(side_name or "").strip().lower() == "long":
+        return max(_safe_float(getattr(args, "spot_freeze_long_total_cap_notional", 0.0)), 0.0)
+    return max(_safe_float(getattr(args, "spot_freeze_short_total_cap_notional", 0.0)), 0.0)
 
 
 def _spot_freeze_app_loss_deviation_loss(
@@ -3361,7 +3380,13 @@ def _build_spot_freeze_maker_order(
     long_qty, short_qty = ledger_totals(ledger)
     cap = max(_safe_float(getattr(args, "spot_freeze_total_cap_notional", 0.0)), 0.0)
     frozen_notional = (long_qty + short_qty) * mid
-    if cap > EPSILON and frozen_notional + EPSILON >= cap:
+    side_cap_mode = _spot_freeze_side_cap_mode(args)
+    side_cap = _spot_freeze_side_total_cap_notional(args, side_name)
+    side_frozen_notional = (long_qty if side_name == "long" else short_qty) * mid
+    if side_cap_mode:
+        if side_cap > EPSILON and side_frozen_notional + EPSILON >= side_cap:
+            return None, f"{side_name}_total_cap_reached"
+    elif cap > EPSILON and frozen_notional + EPSILON >= cap:
         return None, "total_cap_reached"
 
     max_qty = max(_safe_float(deviation_qty), 0.0)
@@ -3381,7 +3406,9 @@ def _build_spot_freeze_maker_order(
     per_cycle_cap = max(_safe_float(getattr(args, "spot_freeze_max_per_cycle_notional", 0.0)), 0.0)
     if per_cycle_cap > EPSILON:
         max_qty = min(max_qty, per_cycle_cap / mid)
-    if cap > EPSILON:
+    if side_cap_mode and side_cap > EPSILON:
+        max_qty = min(max_qty, max((side_cap - side_frozen_notional) / mid, 0.0))
+    elif cap > EPSILON:
         max_qty = min(max_qty, max((cap - frozen_notional) / mid, 0.0))
     qty = _round_order_qty(max_qty, qty_step)
     side = "SELL" if side_name == "long" else "BUY"
@@ -3431,6 +3458,12 @@ def _maybe_run_spot_freeze(
     controls["spot_freeze_deviation_side"] = deviation_side
     controls["spot_freeze_deviation_notional"] = deviation_notional
     controls["spot_freeze_deviation_threshold_notional"] = deviation_threshold
+    controls["spot_freeze_long_total_cap_notional"] = max(
+        _safe_float(getattr(args, "spot_freeze_long_total_cap_notional", 0.0)), 0.0
+    )
+    controls["spot_freeze_short_total_cap_notional"] = max(
+        _safe_float(getattr(args, "spot_freeze_short_total_cap_notional", 0.0)), 0.0
+    )
     threshold_disables = enabled and _spot_freeze_threshold_effectively_disables(args, deviation_threshold)
     controls["spot_freeze_effective_enabled"] = bool(enabled and not threshold_disables)
     controls["spot_freeze_config_reason"] = (
@@ -3595,6 +3628,12 @@ def _maybe_run_spot_freeze(
             min_loss_ratio=min_loss_ratio,
             max_per_cycle_notional=max(_safe_float(getattr(args, "spot_freeze_max_per_cycle_notional", 0.0)), 0.0),
             total_cap_notional=max(_safe_float(getattr(args, "spot_freeze_total_cap_notional", 0.0)), 0.0),
+            long_total_cap_notional=max(
+                _safe_float(getattr(args, "spot_freeze_long_total_cap_notional", 0.0)), 0.0
+            ),
+            short_total_cap_notional=max(
+                _safe_float(getattr(args, "spot_freeze_short_total_cap_notional", 0.0)), 0.0
+            ),
             max_contract_short_notional=max(_safe_float(getattr(args, "max_short_position_notional", 0.0)), 0.0),
             pair_release_enabled=bool(getattr(args, "spot_freeze_pair_release_enabled", False)),
             profit_release_enabled=bool(getattr(args, "spot_freeze_profit_release_enabled", False)),
@@ -4870,6 +4909,8 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "spot_freeze_deviation_side": str(controls.get("spot_freeze_deviation_side", "") or ""),
         "spot_freeze_deviation_notional": _safe_float(controls.get("spot_freeze_deviation_notional")),
         "spot_freeze_deviation_threshold_notional": _safe_float(controls.get("spot_freeze_deviation_threshold_notional")),
+        "spot_freeze_long_total_cap_notional": _safe_float(controls.get("spot_freeze_long_total_cap_notional")),
+        "spot_freeze_short_total_cap_notional": _safe_float(controls.get("spot_freeze_short_total_cap_notional")),
         "spot_freeze_deviation_loss_ratio": _safe_float(controls.get("spot_freeze_deviation_loss_ratio")),
         "spot_freeze_deviation_cost_avg": _safe_float(controls.get("spot_freeze_deviation_cost_avg")),
         "spot_freeze_deviation_loss_reason": str(controls.get("spot_freeze_deviation_loss_reason", "") or ""),
@@ -5083,6 +5124,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spot-freeze-min-loss-ratio", type=float, default=0.0)
     parser.add_argument("--spot-freeze-max-per-cycle-notional", type=float, default=0.0)
     parser.add_argument("--spot-freeze-total-cap-notional", type=float, default=0.0)
+    parser.add_argument("--spot-freeze-long-total-cap-notional", type=float, default=0.0)
+    parser.add_argument("--spot-freeze-short-total-cap-notional", type=float, default=0.0)
     parser.add_argument("--spot-freeze-pair-release-enabled", action="store_true")
     parser.add_argument("--spot-freeze-profit-release-enabled", action="store_true")
     parser.add_argument("--spot-freeze-release-profit-ratio", type=float, default=0.05)

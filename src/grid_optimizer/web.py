@@ -8452,6 +8452,8 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "spot_freeze_min_loss_ratio": 0.0,
     "spot_freeze_max_per_cycle_notional": 0.0,
     "spot_freeze_total_cap_notional": 0.0,
+    "spot_freeze_long_total_cap_notional": 0.0,
+    "spot_freeze_short_total_cap_notional": 0.0,
     "spot_freeze_pair_release_enabled": False,
     "spot_freeze_profit_release_enabled": False,
     "spot_freeze_release_profit_ratio": 0.05,
@@ -8605,6 +8607,8 @@ def _spot_freeze_threshold_effectively_disables_config(config: dict[str, Any]) -
         return False
     capacity = max(
         max(_safe_optional_float(config.get("spot_freeze_total_cap_notional")) or 0.0, 0.0),
+        max(_safe_optional_float(config.get("spot_freeze_long_total_cap_notional")) or 0.0, 0.0),
+        max(_safe_optional_float(config.get("spot_freeze_short_total_cap_notional")) or 0.0, 0.0),
         max(_safe_optional_float(config.get("spot_freeze_max_per_cycle_notional")) or 0.0, 0.0),
         max(_safe_optional_float(config.get("max_position_notional")) or 0.0, 0.0),
         max(_safe_optional_float(config.get("max_short_position_notional")) or 0.0, 0.0),
@@ -8613,6 +8617,13 @@ def _spot_freeze_threshold_effectively_disables_config(config: dict[str, Any]) -
         max(_safe_optional_float(config.get("per_order_notional")) or 0.0, 0.0),
     )
     return capacity > 0.0 and threshold >= capacity * 1000.0
+
+
+def _spot_freeze_side_cap_mode_config(config: dict[str, Any]) -> bool:
+    return (
+        max(_safe_optional_float(config.get("spot_freeze_long_total_cap_notional")) or 0.0, 0.0) > 0.0
+        or max(_safe_optional_float(config.get("spot_freeze_short_total_cap_notional")) or 0.0, 0.0) > 0.0
+    )
 
 
 def _spot_freeze_short_capacity_requirement_config(config: dict[str, Any]) -> float:
@@ -8837,12 +8848,22 @@ def _runner_start_safety_preflight(
                     "max_short_position_notional 小于 spot_freeze 首次冻结所需短侧容量，"
                     "短偏离发生时可能补不回 neutral"
                 )
-            total_cap = max(_safe_optional_float(config.get("spot_freeze_total_cap_notional")) or 0.0, 0.0)
-            if total_cap + 1e-12 < short_capacity:
-                reasons.append(
-                    "spot_freeze_total_cap_notional 小于 max_short_position_notional，"
-                    "冻结总容量不足会导致短偏离刚开始恢复就 total_cap_reached"
+            if _spot_freeze_side_cap_mode_config(config):
+                short_total_cap = max(
+                    _safe_optional_float(config.get("spot_freeze_short_total_cap_notional")) or 0.0, 0.0
                 )
+                if short_total_cap > 0.0 and short_capacity + 1e-12 < short_total_cap:
+                    reasons.append(
+                        "max_short_position_notional 小于 spot_freeze_short_total_cap_notional，"
+                        "短侧冻结合约容量不足"
+                    )
+            else:
+                total_cap = max(_safe_optional_float(config.get("spot_freeze_total_cap_notional")) or 0.0, 0.0)
+                if total_cap + 1e-12 < short_capacity:
+                    reasons.append(
+                        "spot_freeze_total_cap_notional 小于 max_short_position_notional，"
+                        "冻结总容量不足会导致短偏离刚开始恢复就 total_cap_reached"
+                    )
         if (
             strategy_mode == "spot_competition_synthetic_neutral_grid"
             and _truthy(config.get("spot_freeze_enabled", False))
@@ -14679,6 +14700,20 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("spot_freeze_total_cap_notional", SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_total_cap_notional"]),
         "spot_freeze_total_cap_notional",
     )
+    spot_freeze_long_total_cap_notional = _safe_float(
+        payload.get(
+            "spot_freeze_long_total_cap_notional",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_long_total_cap_notional"],
+        ),
+        "spot_freeze_long_total_cap_notional",
+    )
+    spot_freeze_short_total_cap_notional = _safe_float(
+        payload.get(
+            "spot_freeze_short_total_cap_notional",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_short_total_cap_notional"],
+        ),
+        "spot_freeze_short_total_cap_notional",
+    )
     spot_freeze_pair_release_enabled = _safe_bool(
         payload.get("spot_freeze_pair_release_enabled", SPOT_RUNNER_DEFAULT_CONFIG["spot_freeze_pair_release_enabled"]),
         "spot_freeze_pair_release_enabled",
@@ -14861,6 +14896,8 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_freeze_min_loss_ratio": spot_freeze_min_loss_ratio,
             "spot_freeze_max_per_cycle_notional": spot_freeze_max_per_cycle_notional,
             "spot_freeze_total_cap_notional": spot_freeze_total_cap_notional,
+            "spot_freeze_long_total_cap_notional": spot_freeze_long_total_cap_notional,
+            "spot_freeze_short_total_cap_notional": spot_freeze_short_total_cap_notional,
             "spot_freeze_release_profit_ratio": spot_freeze_release_profit_ratio,
         }.items():
             if value < 0:
@@ -14962,6 +14999,8 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_freeze_min_loss_ratio": spot_freeze_min_loss_ratio,
             "spot_freeze_max_per_cycle_notional": spot_freeze_max_per_cycle_notional,
             "spot_freeze_total_cap_notional": spot_freeze_total_cap_notional,
+            "spot_freeze_long_total_cap_notional": spot_freeze_long_total_cap_notional,
+            "spot_freeze_short_total_cap_notional": spot_freeze_short_total_cap_notional,
             "spot_freeze_pair_release_enabled": spot_freeze_pair_release_enabled,
             "spot_freeze_profit_release_enabled": spot_freeze_profit_release_enabled,
             "spot_freeze_release_profit_ratio": spot_freeze_release_profit_ratio,
@@ -15107,6 +15146,8 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--spot-freeze-min-loss-ratio", config.get("spot_freeze_min_loss_ratio")),
         ("--spot-freeze-max-per-cycle-notional", config.get("spot_freeze_max_per_cycle_notional")),
         ("--spot-freeze-total-cap-notional", config.get("spot_freeze_total_cap_notional")),
+        ("--spot-freeze-long-total-cap-notional", config.get("spot_freeze_long_total_cap_notional")),
+        ("--spot-freeze-short-total-cap-notional", config.get("spot_freeze_short_total_cap_notional")),
         ("--spot-freeze-release-profit-ratio", config.get("spot_freeze_release_profit_ratio")),
         ("--run-start-time", config.get("run_start_time")),
         ("--run-end-time", config.get("run_end_time")),
@@ -15381,6 +15422,8 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "spot_freeze_min_loss_ratio",
             "spot_freeze_max_per_cycle_notional",
             "spot_freeze_total_cap_notional",
+            "spot_freeze_long_total_cap_notional",
+            "spot_freeze_short_total_cap_notional",
             "spot_freeze_pair_release_enabled",
             "spot_freeze_profit_release_enabled",
             "spot_freeze_release_profit_ratio",

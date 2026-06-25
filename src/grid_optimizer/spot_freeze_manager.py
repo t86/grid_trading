@@ -16,6 +16,8 @@ class FreezeConfig:
     min_loss_ratio: float = 0.0
     max_per_cycle_notional: float = 0.0
     total_cap_notional: float = 0.0
+    long_total_cap_notional: float = 0.0
+    short_total_cap_notional: float = 0.0
     max_contract_short_notional: float = 0.0
     pair_release_enabled: bool = False
     profit_release_enabled: bool = False
@@ -179,6 +181,19 @@ def _round_down_qty(qty: float, qty_step: float) -> float:
     if step <= EPSILON:
         return max(_safe_float(qty), 0.0)
     return math.floor(max(_safe_float(qty), 0.0) / step) * step
+
+
+def _side_cap_mode(config: FreezeConfig) -> bool:
+    return (
+        max(_safe_float(config.long_total_cap_notional), 0.0) > EPSILON
+        or max(_safe_float(config.short_total_cap_notional), 0.0) > EPSILON
+    )
+
+
+def _side_total_cap_notional(config: FreezeConfig, side_name: str) -> float:
+    if str(side_name or "").strip().lower() == "long":
+        return max(_safe_float(config.long_total_cap_notional), 0.0)
+    return max(_safe_float(config.short_total_cap_notional), 0.0)
 
 
 def _avg_spot_price(response: dict[str, Any], fallback_price: float) -> float:
@@ -437,14 +452,22 @@ def freeze_cycle(
         ledger_totals(working)
         return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
 
+    is_long_deviation = deviation_qty_signed > 0.0
+    side_name = "long" if is_long_deviation else "short"
     long_qty, short_qty = ledger_totals(working)
     cap = max(_safe_float(config.total_cap_notional), 0.0)
     frozen_notional = (long_qty + short_qty) * mid
-    if cap > EPSILON and frozen_notional + EPSILON >= cap:
+    side_cap_mode = _side_cap_mode(config)
+    side_cap = _side_total_cap_notional(config, side_name)
+    side_frozen_notional = (long_qty if is_long_deviation else short_qty) * mid
+    if side_cap_mode:
+        if side_cap > EPSILON and side_frozen_notional + EPSILON >= side_cap:
+            alerts.append(f"{side_name}_total_cap_reached")
+            return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
+    elif cap > EPSILON and frozen_notional + EPSILON >= cap:
         alerts.append("total_cap_reached")
         return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
 
-    is_long_deviation = deviation_qty_signed > 0.0
     max_qty = abs(deviation_qty_signed)
     short_capacity_exhausted = False
     if is_long_deviation:
@@ -459,7 +482,9 @@ def freeze_cycle(
     per_cycle_cap = max(_safe_float(config.max_per_cycle_notional), 0.0)
     if per_cycle_cap > EPSILON:
         max_qty = min(max_qty, per_cycle_cap / mid)
-    if cap > EPSILON:
+    if side_cap_mode and side_cap > EPSILON:
+        max_qty = min(max_qty, max((side_cap - side_frozen_notional) / mid, 0.0))
+    elif cap > EPSILON:
         max_qty = min(max_qty, max((cap - frozen_notional) / mid, 0.0))
     qty = _round_down_qty(max_qty, qty_step)
     if qty <= EPSILON:

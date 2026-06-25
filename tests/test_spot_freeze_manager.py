@@ -372,6 +372,51 @@ def test_freeze_respects_total_cap_across_long_and_short_lots() -> None:
     assert "total_cap_reached" in result["alerts"]
 
 
+def test_freeze_long_respects_side_total_cap() -> None:
+    ledger = new_ledger()
+    ledger["long_lots"] = [{"lot_id": "L1", "qty": 4.0, "cost_price": 10.0, "frozen_at": "t", "frozen_mid": 10.0, "hedge_pending": False}]
+    ledger_totals(ledger)
+
+    result, rec = run_cycle(
+        ledger=ledger,
+        contract_short_qty=96.0,
+        config=enabled_config(
+            total_cap_notional=1000.0,
+            long_total_cap_notional=30.0,
+            short_total_cap_notional=500.0,
+        ),
+    )
+
+    assert rec.spot_orders == []
+    assert rec.contract_orders == []
+    assert result["ledger"]["long_lots"] == ledger["long_lots"]
+    assert "long_total_cap_reached" in result["alerts"]
+
+
+def test_freeze_short_respects_side_total_cap_without_blocking_long_cap() -> None:
+    ledger = new_ledger()
+    ledger["long_lots"] = [{"lot_id": "L1", "qty": 4.0, "cost_price": 10.0, "frozen_at": "t", "frozen_mid": 10.0, "hedge_pending": False}]
+    ledger["short_lots"] = [{"lot_id": "S1", "qty": 50.0, "cost_price": 10.0, "frozen_at": "t", "frozen_mid": 10.0, "hedge_pending": False}]
+    ledger_totals(ledger)
+
+    result, rec = run_cycle(
+        ledger=ledger,
+        spot_inventory_qty=80.0,
+        contract_short_qty=146.0,
+        config=enabled_config(
+            total_cap_notional=1000.0,
+            long_total_cap_notional=30.0,
+            short_total_cap_notional=500.0,
+            max_contract_short_notional=1000.0,
+        ),
+    )
+
+    assert rec.spot_orders == []
+    assert rec.contract_orders == []
+    assert result["ledger"]["short_lots"] == ledger["short_lots"]
+    assert "short_total_cap_reached" in result["alerts"]
+
+
 def test_freeze_contract_failure_records_pending_and_marks_lot_pending() -> None:
     result, rec = run_cycle(recorder=OrderRecorder(fail_contract=True))
 
