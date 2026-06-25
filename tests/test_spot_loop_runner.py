@@ -4399,6 +4399,109 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(guard["latest_price"], 0.0868)
         self.assertGreaterEqual(summary["spot_app_loss_per_10k"], 1.0)
 
+    def test_run_cycle_app_loss_guard_resets_stale_metrics_to_runtime_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            summary_path = Path(tmpdir) / "events.jsonl"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "symbol": "WLDUSDT",
+                        "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                        "last_trade_time_ms": 1_000,
+                        "seen_trade_ids": [100],
+                        "metrics": {
+                            "gross_notional": 6897.78006,
+                            "buy_notional": 3448.89003,
+                            "sell_notional": 3448.89003,
+                            "buy_qty": 1000.0,
+                            "sell_qty": 1000.0,
+                            "app_loss_window_aligned": True,
+                            "trade_count": 204,
+                            "maker_count": 204,
+                            "recent_trades": [],
+                            "first_trade_time_ms": 1_000,
+                            "last_trade_time_ms": 1_000,
+                        },
+                    }
+                )
+            )
+            args = self._synthetic_args(
+                [
+                    "--state-path",
+                    str(state_path),
+                    "--summary-jsonl",
+                    str(summary_path),
+                    "--per-order-notional",
+                    "60",
+                    "--neutral-base-qty",
+                    "4800",
+                    "--runtime-guard-stats-start-time",
+                    "1970-01-01T00:00:02+00:00",
+                    "--spot-app-loss-guard-enabled",
+                    "--spot-app-loss-min-notional",
+                    "10",
+                    "--spot-app-loss-per-10k-soft",
+                    "0.6",
+                    "--spot-app-loss-per-10k-hard",
+                    "1.0",
+                ]
+            )
+            symbol_info = {
+                "base_asset": "WLD",
+                "quote_asset": "USDT",
+                "tick_size": 0.0001,
+                "step_size": 0.1,
+                "min_qty": 0.1,
+                "min_notional": 5.0,
+            }
+            raw_trades = [
+                {
+                    "id": 200,
+                    "orderId": 20,
+                    "isBuyer": True,
+                    "isMaker": True,
+                    "price": "0.0935",
+                    "qty": "4800",
+                    "quoteQty": "448.8",
+                    "commission": "0",
+                    "commissionAsset": "BNB",
+                    "time": 2_500,
+                },
+            ]
+
+            with patch("grid_optimizer.spot_loop_runner.fetch_spot_book_tickers", return_value=[{"bid_price": "0.0931", "ask_price": "0.0932"}]):
+                with patch("grid_optimizer.spot_loop_runner.fetch_spot_user_trades", return_value=raw_trades) as fetch_trades:
+                    with patch(
+                        "grid_optimizer.spot_loop_runner.fetch_spot_account_info",
+                        return_value={
+                            "balances": [
+                                {"asset": "WLD", "free": "4800", "locked": "0"},
+                                {"asset": "USDT", "free": "3000", "locked": "0"},
+                            ]
+                        },
+                    ):
+                        with patch("grid_optimizer.spot_loop_runner.fetch_spot_open_orders", return_value=[]):
+                            with patch(
+                                "grid_optimizer.spot_loop_runner._build_spot_competition_inventory_grid_orders",
+                                return_value=(
+                                    [{"side": "BUY", "role": "grid_exit", "price": 0.0930, "qty": 640.0}],
+                                    {"actual_base_qty": 4800.0, "neutral_base_qty": 4800.0, "_runtime": {}},
+                                ),
+                            ):
+                                summary = _run_cycle(args, symbol_info, api_key="key", api_secret="secret")
+
+        start_times = [call.kwargs.get("start_time_ms") for call in fetch_trades.call_args_list]
+        self.assertTrue(start_times)
+        self.assertTrue(all(start_time >= 2_000 for start_time in start_times))
+        guard = summary["spot_app_loss_guard"]
+        self.assertEqual(guard["window_source"], "recent_trades")
+        self.assertAlmostEqual(guard["buy_notional"], 448.8)
+        self.assertAlmostEqual(guard["sell_notional"], 0.0)
+        self.assertEqual(guard["state"], "blocked")
+        self.assertTrue(summary["stop_triggered"])
+        self.assertEqual(summary["stop_reason"], "spot_app_loss_hard_limit_hit")
+
     def test_run_cycle_app_loss_hard_stop_cancels_orders_even_when_cancel_stale_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "state.json"

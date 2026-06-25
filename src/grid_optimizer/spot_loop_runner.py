@@ -101,6 +101,40 @@ def _truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes"}
 
 
+def _parse_time_ms(value: Any) -> int:
+    raw = str(value or "").strip()
+    if not raw:
+        return 0
+    if raw.isdigit():
+        return _safe_int(raw)
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return 0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1000)
+
+
+def _reset_stale_metrics_for_runtime_start(state: dict[str, Any], *, runtime_start_ms: int) -> None:
+    if runtime_start_ms <= 0:
+        return
+    metrics = state.get("metrics") if isinstance(state.get("metrics"), dict) else {}
+    has_metrics = (
+        _safe_float(metrics.get("gross_notional")) > EPSILON
+        or _safe_int(metrics.get("trade_count")) > 0
+        or _safe_float(metrics.get("buy_notional")) + _safe_float(metrics.get("sell_notional")) > EPSILON
+    )
+    if not has_metrics:
+        return
+    first_trade_ms = _safe_int(metrics.get("first_trade_time_ms")) or _safe_int(state.get("last_trade_time_ms"))
+    if first_trade_ms <= 0 or first_trade_ms < runtime_start_ms:
+        state["metrics"] = _new_metrics()
+        state["seen_trade_ids"] = []
+        state["last_trade_time_ms"] = runtime_start_ms
+
+
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
@@ -4183,6 +4217,9 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         cells_by_index = {int(cell["idx"]): cell for cell in cells}
     state_path = Path(args.state_path)
     state = _load_state(state_path, symbol, strategy_mode, len(cells))
+    runtime_stats_start_ms = _parse_time_ms(getattr(args, "runtime_guard_stats_start_time", None))
+    if strategy_mode == "spot_competition_synthetic_neutral_grid":
+        _reset_stale_metrics_for_runtime_start(state, runtime_start_ms=runtime_stats_start_ms)
     state["cycle"] = int(state.get("cycle", 0) or 0) + 1
     state["symbol"] = symbol
     state["strategy_mode"] = strategy_mode
@@ -4192,6 +4229,8 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         trade_start_ms = max(trade_start_ms - 60_000, 0)
     else:
         trade_start_ms = max(int(time.time() * 1000) - 48 * 3600 * 1000, 0)
+    if runtime_stats_start_ms > 0:
+        trade_start_ms = max(trade_start_ms, runtime_stats_start_ms)
 
     trades = fetch_spot_user_trades(
         symbol=symbol,
