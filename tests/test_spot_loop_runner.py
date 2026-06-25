@@ -90,6 +90,26 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertRegex(client_order_id, r"^[a-zA-Z0-9-_]{1,36}$")
         self.assertTrue(client_order_id.startswith("sgxpl114_"))
         self.assertIn("_b_", client_order_id)
+        self.assertTrue(client_order_id.endswith("_349765432"))
+
+    def test_client_order_id_preserves_side_and_nonce_for_long_and_reduce_tags(self) -> None:
+        with patch("grid_optimizer.spot_loop_runner.time.time", return_value=1782349765.432):
+            freeze_short = _build_client_order_id("sgxpl114", "spot_freeze_short", "BUY")
+            freeze_long = _build_client_order_id("sgxpl114", "spot_freeze_long", "SELL")
+            app_loss_buy = _build_client_order_id("sgxpl114", "spot_app_loss_reduce", "BUY")
+            app_loss_sell = _build_client_order_id("sgxpl114", "spot_app_loss_reduce", "SELL")
+
+        client_order_ids = [freeze_short, freeze_long, app_loss_buy, app_loss_sell]
+        self.assertEqual(len(set(client_order_ids)), len(client_order_ids))
+        for client_order_id in client_order_ids:
+            self.assertLessEqual(len(client_order_id), 36)
+            self.assertRegex(client_order_id, r"^[a-zA-Z0-9-_]{1,36}$")
+            self.assertTrue(client_order_id.endswith("_349765432"))
+
+        self.assertIn("_b_", freeze_short)
+        self.assertIn("_s_", freeze_long)
+        self.assertIn("_b_", app_loss_buy)
+        self.assertIn("_s_", app_loss_sell)
 
     def test_runtime_guard_events_use_spot_realized_pnl_as_net_pnl(self) -> None:
         events = _runtime_guard_events_from_metrics(
@@ -751,6 +771,46 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(controls["spot_app_loss_guard"]["reduce_side"], "")
         self.assertEqual(controls["spot_app_loss_guard"]["reduce_deviation_qty"], 0.0)
         self.assertFalse(controls.get("buy_paused", False))
+        self.assertNotIn("spot_app_loss_guard_recovery_reduce_only", controls.get("pause_reasons") or [])
+
+    def test_spot_app_loss_recovery_treats_neutral_dust_as_cruise(self) -> None:
+        controls = {"actual_base_qty": 4799.9, "neutral_base_qty": 4800.0, "spot_freeze_tolerance_qty": 0.2}
+        desired_orders = [
+            {"side": "BUY", "role": "grid_entry", "price": 0.0931, "qty": 118.0},
+            {"side": "SELL", "role": "grid_exit", "price": 0.0933, "qty": 118.0},
+        ]
+
+        filtered = _apply_spot_app_loss_guard_to_orders(
+            desired_orders=desired_orders,
+            controls=controls,
+            metrics={
+                "buy_notional": 2787.96262,
+                "sell_notional": 2360.53094,
+                "buy_qty": 31473.0,
+                "sell_qty": 26673.1,
+            },
+            position_qty=0.0,
+            latest_price=0.0932,
+            maker_buy_reference_price=0.0931,
+            maker_sell_reference_price=0.0933,
+            enabled=True,
+            recovery_reduce_only_enabled=True,
+            min_notional=5000.0,
+            soft_per_10k=0.6,
+            hard_per_10k=1.0,
+            maker_reduce_notional=11.0,
+            tick_size=0.0001,
+            step_size=0.1,
+            min_qty=0.1,
+            exchange_min_notional=5.0,
+            available_quote_free=1000.0,
+            available_base_free=4799.9,
+        )
+
+        self.assertEqual(filtered, desired_orders)
+        self.assertEqual(controls["spot_app_loss_guard"]["state"], "cruise")
+        self.assertEqual(controls["spot_app_loss_guard"]["reduce_side"], "")
+        self.assertEqual(controls["spot_app_loss_guard"]["reduce_deviation_qty"], 0.0)
         self.assertNotIn("spot_app_loss_guard_recovery_reduce_only", controls.get("pause_reasons") or [])
 
     def test_spot_app_loss_guard_drops_buy_reduce_above_bid_reference(self) -> None:
@@ -2390,6 +2450,41 @@ class SpotLoopRunnerTests(unittest.TestCase):
                 "tag": "spot_freeze_short",
             },
         )
+
+    def test_spot_freeze_open_maker_orders_recovers_truncated_client_ids(self) -> None:
+        state = {
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "known_orders": {},
+            "spot_frozen_ledger": new_ledger(),
+        }
+
+        with patch("grid_optimizer.spot_loop_runner.time.time", return_value=1782349765.432):
+            short_client_order_id = _build_client_order_id("sgxpl114", "spot_freeze_short", "BUY")
+            long_client_order_id = _build_client_order_id("sgxpl114", "spot_freeze_long", "SELL")
+
+        matched = _spot_freeze_open_maker_orders(
+            [
+                {
+                    "orderId": 7004,
+                    "clientOrderId": short_client_order_id,
+                    "side": "BUY",
+                    "price": "0.0887",
+                    "origQty": "676.0",
+                },
+                {
+                    "orderId": 7005,
+                    "clientOrderId": long_client_order_id,
+                    "side": "SELL",
+                    "price": "0.0889",
+                    "origQty": "676.0",
+                },
+            ],
+            state,
+        )
+
+        self.assertEqual(len(matched), 2)
+        self.assertEqual(state["known_orders"]["7004"]["tag"], "spot_freeze_short")
+        self.assertEqual(state["known_orders"]["7005"]["tag"], "spot_freeze_long")
 
     def test_spot_freeze_open_maker_orders_does_not_default_unknown_direction_to_long(self) -> None:
         state = {

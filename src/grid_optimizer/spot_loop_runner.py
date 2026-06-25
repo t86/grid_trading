@@ -1107,7 +1107,12 @@ def _spot_app_loss_mark_price(*, metrics: dict[str, Any], bid_price: float, ask_
 def _spot_app_loss_reduce_side(controls: dict[str, Any], position_qty: float, app_position_qty: float | None = None) -> str:
     neutral_base_qty = max(_safe_float(controls.get("neutral_base_qty")), 0.0)
     if neutral_base_qty > EPSILON or "synthetic_net_qty" in controls:
-        deviation_qty = _safe_float(controls.get("actual_base_qty")) - neutral_base_qty
+        actual_base_qty = _safe_float(controls.get("actual_base_qty"))
+        deviation_qty = actual_base_qty - neutral_base_qty
+        neutral_tolerance_qty = max(_safe_float(controls.get("spot_freeze_tolerance_qty")), 0.0)
+        neutral_tolerance_qty = max(neutral_tolerance_qty, _qty_zero_tolerance(actual_base_qty, neutral_base_qty))
+        if abs(deviation_qty) <= neutral_tolerance_qty:
+            return ""
         if deviation_qty > EPSILON:
             return "SELL"
         if deviation_qty < -EPSILON:
@@ -1123,7 +1128,13 @@ def _spot_app_loss_reduce_side(controls: dict[str, Any], position_qty: float, ap
 def _spot_app_loss_deviation_qty(controls: dict[str, Any], position_qty: float) -> float:
     neutral_base_qty = max(_safe_float(controls.get("neutral_base_qty")), 0.0)
     if neutral_base_qty > EPSILON or "synthetic_net_qty" in controls:
-        return abs(_safe_float(controls.get("actual_base_qty")) - neutral_base_qty)
+        actual_base_qty = _safe_float(controls.get("actual_base_qty"))
+        deviation_qty = abs(actual_base_qty - neutral_base_qty)
+        neutral_tolerance_qty = max(_safe_float(controls.get("spot_freeze_tolerance_qty")), 0.0)
+        neutral_tolerance_qty = max(neutral_tolerance_qty, _qty_zero_tolerance(actual_base_qty, neutral_base_qty))
+        if deviation_qty <= neutral_tolerance_qty:
+            return 0.0
+        return deviation_qty
     guard = controls.get("spot_app_loss_guard")
     if isinstance(guard, dict):
         app_position_qty = max(_safe_float(guard.get("position_qty")), 0.0)
