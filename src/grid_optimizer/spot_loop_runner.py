@@ -1108,7 +1108,11 @@ def _spot_app_loss_reduce_side(controls: dict[str, Any], position_qty: float, ap
     neutral_base_qty = max(_safe_float(controls.get("neutral_base_qty")), 0.0)
     if neutral_base_qty > EPSILON or "synthetic_net_qty" in controls:
         actual_base_qty = _safe_float(controls.get("actual_base_qty"))
-        deviation_qty = actual_base_qty - neutral_base_qty
+        deviation_qty = (
+            _safe_float(controls.get("synthetic_net_qty"))
+            if "synthetic_net_qty" in controls
+            else actual_base_qty - neutral_base_qty
+        )
         neutral_tolerance_qty = max(_safe_float(controls.get("spot_freeze_tolerance_qty")), 0.0)
         neutral_tolerance_qty = max(neutral_tolerance_qty, _qty_zero_tolerance(actual_base_qty, neutral_base_qty))
         if abs(deviation_qty) <= neutral_tolerance_qty:
@@ -1129,7 +1133,12 @@ def _spot_app_loss_deviation_qty(controls: dict[str, Any], position_qty: float) 
     neutral_base_qty = max(_safe_float(controls.get("neutral_base_qty")), 0.0)
     if neutral_base_qty > EPSILON or "synthetic_net_qty" in controls:
         actual_base_qty = _safe_float(controls.get("actual_base_qty"))
-        deviation_qty = abs(actual_base_qty - neutral_base_qty)
+        raw_deviation_qty = (
+            _safe_float(controls.get("synthetic_net_qty"))
+            if "synthetic_net_qty" in controls
+            else actual_base_qty - neutral_base_qty
+        )
+        deviation_qty = abs(raw_deviation_qty)
         neutral_tolerance_qty = max(_safe_float(controls.get("spot_freeze_tolerance_qty")), 0.0)
         neutral_tolerance_qty = max(neutral_tolerance_qty, _qty_zero_tolerance(actual_base_qty, neutral_base_qty))
         if deviation_qty <= neutral_tolerance_qty:

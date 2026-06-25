@@ -774,7 +774,13 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertNotIn("spot_app_loss_guard_recovery_reduce_only", controls.get("pause_reasons") or [])
 
     def test_spot_app_loss_recovery_treats_neutral_dust_as_cruise(self) -> None:
-        controls = {"actual_base_qty": 4799.9, "neutral_base_qty": 4800.0, "spot_freeze_tolerance_qty": 0.2}
+        controls = {
+            "actual_base_qty": 4799.6,
+            "neutral_base_qty": 4800.0,
+            "synthetic_net_qty": 0.0,
+            "synthetic_dust_qty": -0.4,
+            "spot_freeze_tolerance_qty": 0.2,
+        }
         desired_orders = [
             {"side": "BUY", "role": "grid_entry", "price": 0.0931, "qty": 118.0},
             {"side": "SELL", "role": "grid_exit", "price": 0.0933, "qty": 118.0},
