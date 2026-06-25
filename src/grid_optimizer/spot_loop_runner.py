@@ -2727,6 +2727,7 @@ def _build_spot_competition_inventory_grid_orders(
     max_short_position_notional: float = 0.0,
     actual_base_qty: float | None = None,
     spot_freeze_tolerance_qty: float = 0.0,
+    spot_base_restore_only: bool = False,
     symbol: str = "",
     slow_trend_step_enabled: bool = False,
     slow_trend_step_5m_return_ratio: float = 0.0,
@@ -3105,6 +3106,17 @@ def _build_spot_competition_inventory_grid_orders(
         synthetic_net_qty = _isolate_synthetic_frozen_exposure()
         plan = build_inventory_grid_orders(**plan_kwargs)
     desired_orders = list(plan.get("bootstrap_orders") or []) + list(plan.get("buy_orders") or []) + list(plan.get("sell_orders") or [])
+    desired_orders, base_restore_only = _apply_spot_base_restore_only_orders(
+        desired_orders,
+        enabled=bool(spot_base_restore_only),
+        synthetic_neutral=bool(synthetic_neutral),
+        actual_base_qty=resolved_actual_base_qty,
+        neutral_base_qty=neutral_qty,
+        tolerance_qty=spot_freeze_tolerance_qty,
+        step_size=step_size,
+        min_qty=min_qty,
+        min_notional=min_notional,
+    )
     reduce_target_notional = max(_safe_float(threshold_reduce_target_notional), 0.0)
     display_soft_limit = reduce_target_notional if reduce_target_notional > 0 else _safe_float(threshold_position_notional)
     current_long_notional = max(synthetic_net_qty, 0.0) * mid_price
@@ -3146,6 +3158,8 @@ def _build_spot_competition_inventory_grid_orders(
         "synthetic_dust_qty": synthetic_dust_qty,
         "synthetic_dust_notional": synthetic_dust_notional,
         "spot_freeze_tolerance_qty": max(_safe_float(spot_freeze_tolerance_qty), 0.0),
+        "spot_base_restore_only": bool(spot_base_restore_only),
+        "spot_base_restore_only_status": base_restore_only,
         "current_long_notional": current_long_notional,
         "current_short_notional": current_short_notional,
         "synthetic_freeze_enabled": bool(synthetic_neutral and synthetic_freeze_enabled),
@@ -3679,6 +3693,76 @@ def _spot_order_meets_exchange_mins(
     if min_notional is not None and qty * price + EPSILON < float(min_notional):
         return False
     return True
+
+
+def _apply_spot_base_restore_only_orders(
+    orders: list[dict[str, Any]],
+    *,
+    enabled: bool,
+    synthetic_neutral: bool,
+    actual_base_qty: float,
+    neutral_base_qty: float,
+    tolerance_qty: float,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if not enabled or not synthetic_neutral:
+        return orders, {"enabled": bool(enabled), "active": False, "reason": "disabled"}
+    safe_actual = max(_safe_float(actual_base_qty), 0.0)
+    safe_neutral = max(_safe_float(neutral_base_qty), 0.0)
+    tolerance = max(_safe_float(tolerance_qty), _qty_zero_tolerance(safe_actual, safe_neutral))
+    deviation_qty = safe_actual - safe_neutral
+    if abs(deviation_qty) <= tolerance:
+        return [], {
+            "enabled": True,
+            "active": True,
+            "reason": "base_restored",
+            "allowed_side": None,
+            "actual_base_qty": safe_actual,
+            "neutral_base_qty": safe_neutral,
+            "deviation_qty": deviation_qty,
+            "tolerance_qty": tolerance,
+            "kept_orders": 0,
+            "dropped_orders": len(orders),
+        }
+
+    allowed_side = "BUY" if deviation_qty < 0 else "SELL"
+    remaining_qty = abs(deviation_qty)
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    for order in orders:
+        if str(order.get("side", "") or "").upper().strip() != allowed_side:
+            dropped += 1
+            continue
+        price = max(_safe_float(order.get("price")), 0.0)
+        raw_qty = min(max(_safe_float(order.get("qty")), 0.0), remaining_qty)
+        qty = _round_order_qty(raw_qty, step_size)
+        if not _spot_order_meets_exchange_mins(qty=qty, price=price, min_qty=min_qty, min_notional=min_notional):
+            dropped += 1
+            continue
+        capped = dict(order)
+        capped["qty"] = qty
+        capped["notional"] = qty * price
+        capped["base_restore_only"] = True
+        kept.append(capped)
+        remaining_qty = max(remaining_qty - qty, 0.0)
+        if remaining_qty <= tolerance:
+            break
+    dropped += max(len(orders) - len(kept) - dropped, 0)
+    return kept, {
+        "enabled": True,
+        "active": True,
+        "reason": "base_deficit" if allowed_side == "BUY" else "base_surplus",
+        "allowed_side": allowed_side,
+        "actual_base_qty": safe_actual,
+        "neutral_base_qty": safe_neutral,
+        "deviation_qty": deviation_qty,
+        "tolerance_qty": tolerance,
+        "remaining_qty": remaining_qty,
+        "kept_orders": len(kept),
+        "dropped_orders": dropped,
+    }
 
 
 def _clamp_limit_maker_price_to_book(
@@ -4574,6 +4658,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             max_short_position_notional=float(getattr(args, "max_short_position_notional", 0.0)),
             actual_base_qty=_total_base_balance(account_info, base_asset) if synthetic_neutral_mode else None,
             spot_freeze_tolerance_qty=float(getattr(args, "spot_freeze_tolerance_qty", 0.0)),
+            spot_base_restore_only=bool(getattr(args, "spot_base_restore_only", False)),
             symbol=symbol,
             slow_trend_step_enabled=bool(getattr(args, "spot_slow_trend_step_enabled", False)),
             slow_trend_step_5m_return_ratio=float(getattr(args, "spot_slow_trend_step_5m_return_ratio", 0.0)),
@@ -5089,6 +5174,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spot-fast-stop-min-base-buffer-qty", type=float, default=0.0)
     parser.add_argument("--spot-app-loss-guard-enabled", action="store_true")
     parser.add_argument("--spot-app-loss-recovery-reduce-only-enabled", action="store_true")
+    parser.add_argument("--spot-base-restore-only", action="store_true")
     parser.add_argument("--spot-app-loss-min-notional", type=float, default=10000.0)
     parser.add_argument("--spot-app-loss-per-10k-soft", type=float, default=0.0)
     parser.add_argument("--spot-app-loss-per-10k-hard", type=float, default=0.0)

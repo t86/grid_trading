@@ -8423,6 +8423,7 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "spot_fast_stop_min_base_buffer_qty": 0.0,
     "spot_app_loss_guard_enabled": False,
     "spot_app_loss_recovery_reduce_only_enabled": False,
+    "spot_base_restore_only": False,
     "spot_app_loss_min_notional": 10000.0,
     "spot_app_loss_per_10k_soft": 0.0,
     "spot_app_loss_per_10k_hard": 0.0,
@@ -14542,6 +14543,10 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         ),
         "spot_app_loss_recovery_reduce_only_enabled",
     )
+    spot_base_restore_only = _safe_bool(
+        payload.get("spot_base_restore_only", SPOT_RUNNER_DEFAULT_CONFIG["spot_base_restore_only"]),
+        "spot_base_restore_only",
+    )
     spot_app_loss_min_notional = _safe_float(
         payload.get("spot_app_loss_min_notional", SPOT_RUNNER_DEFAULT_CONFIG["spot_app_loss_min_notional"]),
         "spot_app_loss_min_notional",
@@ -14968,6 +14973,7 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_fast_stop_min_base_buffer_qty": spot_fast_stop_min_base_buffer_qty,
             "spot_app_loss_guard_enabled": spot_app_loss_guard_enabled,
             "spot_app_loss_recovery_reduce_only_enabled": spot_app_loss_recovery_reduce_only_enabled,
+            "spot_base_restore_only": spot_base_restore_only,
             "spot_app_loss_min_notional": spot_app_loss_min_notional,
             "spot_app_loss_per_10k_soft": spot_app_loss_per_10k_soft,
             "spot_app_loss_per_10k_hard": spot_app_loss_per_10k_hard,
@@ -15170,6 +15176,8 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         command.append("--spot-app-loss-guard-enabled")
     if _truthy(config.get("spot_app_loss_recovery_reduce_only_enabled", False)):
         command.append("--spot-app-loss-recovery-reduce-only-enabled")
+    if _truthy(config.get("spot_base_restore_only", False)):
+        command.append("--spot-base-restore-only")
     if _truthy(config.get("spot_slow_trend_step_enabled", False)):
         command.append("--spot-slow-trend-step-enabled")
     if _truthy(config.get("synthetic_freeze_enabled", False)):
@@ -15403,6 +15411,7 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "spot_fast_stop_exit_position_notional",
             "spot_fast_stop_reduce_target_notional",
             "spot_fast_stop_min_base_buffer_qty",
+            "spot_base_restore_only",
             "synthetic_freeze_enabled",
             "synthetic_freeze_loss_ratio",
             "synthetic_freeze_min_notional",

@@ -83,6 +83,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(args.spot_freeze_long_total_cap_notional, 0.0)
         self.assertEqual(args.spot_freeze_short_total_cap_notional, 0.0)
         self.assertEqual(args.spot_freeze_release_profit_ratio, 0.05)
+        self.assertFalse(args.spot_base_restore_only)
 
     def test_client_order_id_stays_within_binance_limit_for_spot_freeze_tag(self) -> None:
         with patch("grid_optimizer.spot_loop_runner.time.time", return_value=1782349765.432):
@@ -3273,6 +3274,95 @@ class SpotLoopRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual({order["side"] for order in desired_orders}, {"SELL"})
+
+    def test_spot_base_restore_only_buys_back_base_without_selling(self) -> None:
+        runtime = new_inventory_grid_runtime(market_type="futures")
+        runtime["synthetic_neutral"] = True
+        runtime["direction_state"] = "short_active"
+        runtime["grid_anchor_price"] = 0.1
+        runtime["position_lots"] = [
+            {
+                "lot_id": "active_short",
+                "side": "short",
+                "qty": 150.0,
+                "entry_price": 0.1,
+                "opened_at_ms": 1,
+                "source_role": "grid_entry",
+            }
+        ]
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state={
+                "known_orders": {},
+                "spot_competition_synthetic_neutral_grid_runtime_cache": {
+                    "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                    "market_type": "futures",
+                    "runtime": runtime,
+                    "applied_trade_keys": [],
+                },
+            },
+            trades=[],
+            bid_price=0.099,
+            ask_price=0.101,
+            step_price=0.002,
+            buy_levels=2,
+            sell_levels=2,
+            first_order_multiplier=1.0,
+            per_order_notional=10.0,
+            threshold_position_notional=10.0,
+            max_order_position_notional=80.0,
+            max_position_notional=100.0,
+            tick_size=0.000001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=1000.0,
+            max_short_position_notional=80.0,
+            actual_base_qty=850.0,
+            spot_freeze_tolerance_qty=0.2,
+            spot_base_restore_only=True,
+        )
+
+        self.assertTrue(desired_orders)
+        self.assertEqual({order["side"] for order in desired_orders}, {"BUY"})
+        self.assertTrue(all(order.get("base_restore_only") for order in desired_orders))
+        self.assertTrue(controls["spot_base_restore_only"])
+        self.assertEqual(controls["spot_base_restore_only_status"]["allowed_side"], "BUY")
+        self.assertEqual(controls["effective_sell_levels"], 0)
+
+    def test_spot_base_restore_only_stops_orders_when_base_restored(self) -> None:
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state={
+                "known_orders": {},
+                "inventory_lots": [],
+            },
+            trades=[],
+            bid_price=0.099,
+            ask_price=0.101,
+            step_price=0.002,
+            buy_levels=2,
+            sell_levels=2,
+            first_order_multiplier=1.0,
+            per_order_notional=10.0,
+            threshold_position_notional=60.0,
+            max_order_position_notional=80.0,
+            max_position_notional=100.0,
+            tick_size=0.000001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=1000.0,
+            max_short_position_notional=80.0,
+            actual_base_qty=1000.1,
+            spot_freeze_tolerance_qty=0.2,
+            spot_base_restore_only=True,
+        )
+
+        self.assertEqual(desired_orders, [])
+        self.assertEqual(controls["spot_base_restore_only_status"]["reason"], "base_restored")
+        self.assertEqual(controls["effective_buy_levels"], 0)
+        self.assertEqual(controls["effective_sell_levels"], 0)
 
     def test_synthetic_neutral_stale_recovery_below_soft_threshold_resumes_flat_ladder(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="futures")

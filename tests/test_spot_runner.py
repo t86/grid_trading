@@ -389,6 +389,7 @@ class SpotRunnerTests(unittest.TestCase):
                 "max_position_notional": 900,
                 "max_short_position_notional": 650,
                 "elastic_volume_enabled": True,
+                "spot_base_restore_only": True,
                 "spot_slow_trend_step_enabled": True,
                 "spot_slow_trend_step_5m_return_ratio": 0.0045,
                 "spot_slow_trend_step_15m_return_ratio": 0.008,
@@ -1159,6 +1160,7 @@ class SpotRunnerTests(unittest.TestCase):
                 "max_position_notional": 900.0,
                 "max_short_position_notional": 650.0,
                 "elastic_volume_enabled": True,
+                "spot_base_restore_only": True,
                 "spot_slow_trend_step_enabled": True,
                 "spot_slow_trend_step_5m_return_ratio": 0.0045,
                 "spot_slow_trend_step_15m_return_ratio": 0.008,
@@ -1176,6 +1178,7 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("--max-short-position-notional", command)
         self.assertIn("650.0", command)
         self.assertIn("--elastic-volume-enabled", command)
+        self.assertIn("--spot-base-restore-only", command)
         self.assertIn("--spot-slow-trend-step-enabled", command)
         self.assertIn("--spot-slow-trend-step-5m-return-ratio", command)
         self.assertIn("0.0045", command)
@@ -1364,11 +1367,13 @@ class SpotRunnerTests(unittest.TestCase):
                 "spot_app_loss_per_10k_soft": 1.0,
                 "spot_app_loss_per_10k_hard": 1.5,
                 "spot_app_loss_recovery_reduce_only_enabled": True,
+                "spot_base_restore_only": True,
             }
         )
 
         self.assertTrue(payload["spot_app_loss_guard_enabled"])
         self.assertTrue(payload["spot_app_loss_recovery_reduce_only_enabled"])
+        self.assertTrue(payload["spot_base_restore_only"])
         self.assertEqual(payload["spot_app_loss_min_notional"], 5000.0)
         self.assertEqual(payload["spot_app_loss_per_10k_soft"], 1.0)
         self.assertEqual(payload["spot_app_loss_per_10k_hard"], 1.5)

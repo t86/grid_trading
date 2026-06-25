@@ -61,5 +61,6 @@
 - 普通底舱回归、库存偏离修正、补底仓或刷量提速时，不得用合约仓位做平衡；底舱回归只能通过现货挂单或停止等待完成。
 - 只有明确属于冻结仓位账本的动作，才允许联动合约；例如 `spot_freeze` 生成的 `freeze_long_hedge` / `freeze_short_hedge`、`pending_contract_repair`、冻结释放或冻结配对释放。
 - 判断冻结仓位是否合理时，按冻结账本核对：`expected_short = base_hedge_qty - frozen_long_qty + frozen_short_qty`。实际合约空仓应与该值在容差内一致。
+- 底舱恢复优先于刷量；启用 `spot_base_restore_only` 时，只允许保留能把现货底舱拉回 `neutral_base_qty` 的订单，回到容差内后不得重新进入 normal 双边网格。
 - `spot_freeze_long_total_cap_notional` 和 `spot_freeze_short_total_cap_notional` 表示分侧冻结累计总量硬上限，不是触发阈值；某侧已冻结名义值达到或超过该上限后，不得继续冻结该侧。
 - 汇报时必须区分“冻结仓位导致的合约变化”和“底舱回归导致的合约变化”。前者可以接受，后者违反运行边界。
