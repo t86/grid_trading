@@ -2984,6 +2984,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
             neutral_base_qty=1000.0,
             max_short_position_notional=80.0,
             actual_base_qty=1000.0,
+            spot_freeze_tolerance_qty=0.2,
         )
 
         self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY", "SELL", "SELL"])
@@ -2998,6 +2999,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(controls["current_long_notional"], 0.0)
         self.assertAlmostEqual(controls["current_short_notional"], 0.0)
         self.assertAlmostEqual(controls["max_short_position_notional"], 80.0)
+        self.assertAlmostEqual(controls["spot_freeze_tolerance_qty"], 0.2)
 
     def test_build_spot_competition_synthetic_neutral_grid_ignores_frozen_short_for_spot(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="futures")
