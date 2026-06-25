@@ -113,6 +113,14 @@ class SpotAppLossAuditTests(unittest.TestCase):
         self.assertEqual(gate["app_loss_per_10k"], 0.0)
         self.assertLessEqual(gate["safe_maker_sell_gap_ticks"], 2.0)
 
+    def test_recovery_gate_allows_empty_fresh_window_when_no_minimum_gross_is_required(self) -> None:
+        audit = compute_spot_app_loss_audit(trades=[], bid_price=0.0928, ask_price=0.0929, tick_size=0.00001)
+
+        gate = evaluate_spot_app_loss_recovery_gate(audit, min_gross_notional=0.0)
+
+        self.assertTrue(gate["allowed"])
+        self.assertEqual(gate["reasons"], [])
+
     def test_recovery_gate_rejects_high_loss_and_far_safe_maker_sell(self) -> None:
         audit = compute_spot_app_loss_audit(
             trades=[

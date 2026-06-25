@@ -278,11 +278,12 @@ def evaluate_spot_app_loss_recovery_gate(
     net_qty = _safe_float(audit.get("net_qty"))
     safe_sell_gap_ticks = max(_safe_float(audit.get("safe_maker_sell_gap_ticks")), 0.0)
     bid_buffer_ticks = _safe_float(audit.get("bid_break_even_buffer_ticks"))
-    if trade_count <= 0:
+    min_gross = max(_safe_float(min_gross_notional), 0.0)
+    if trade_count <= 0 and min_gross > EPSILON:
         reasons.append("no_trades")
     if bool(audit.get("truncated")):
         reasons.append("trade_window_truncated")
-    if gross_notional + EPSILON < max(_safe_float(min_gross_notional), 0.0):
+    if gross_notional + EPSILON < min_gross:
         reasons.append("gross_notional_below_min")
     if app_loss_per_10k > max(_safe_float(max_app_loss_per_10k), 0.0) + EPSILON:
         reasons.append("app_loss_per_10k_above_limit")
