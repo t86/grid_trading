@@ -1335,6 +1335,82 @@ def _drop_spot_app_loss_projected_bid_buffer_buy_orders(
     return kept
 
 
+def _drop_spot_app_loss_non_loss_exit_orders(
+    *,
+    orders: list[dict[str, Any]],
+    controls: dict[str, Any],
+    guard: dict[str, Any],
+    require_non_loss_exit: bool,
+    tick_size: float | None,
+) -> list[dict[str, Any]]:
+    guard["non_loss_exit_dropped_order_count"] = 0
+    if (
+        not bool(require_non_loss_exit)
+        or not bool(guard.get("enabled"))
+        or not bool(guard.get("window_aligned"))
+    ):
+        return orders
+    buy_notional = max(_safe_float(guard.get("buy_notional")), 0.0)
+    sell_notional = max(_safe_float(guard.get("sell_notional")), 0.0)
+    buy_qty = max(_safe_float(guard.get("buy_qty")), 0.0)
+    sell_qty = max(_safe_float(guard.get("sell_qty")), 0.0)
+    net_qty = buy_qty - sell_qty
+    if abs(net_qty) <= _qty_zero_tolerance(buy_qty, sell_qty):
+        return orders
+
+    floor_side = ""
+    floor_price = 0.0
+    if net_qty > EPSILON:
+        floor_side = "SELL"
+        floor_price = (buy_notional - sell_notional) / net_qty if buy_notional > sell_notional else 0.0
+    elif net_qty < -EPSILON:
+        floor_side = "BUY"
+        floor_price = (sell_notional - buy_notional) / abs(net_qty) if sell_notional > buy_notional else 0.0
+    if floor_price <= EPSILON:
+        return orders
+    if floor_side == "SELL":
+        floor_price = _round_order_price(max(floor_price - EPSILON, 0.0), tick_size, floor_side)
+    else:
+        floor_price = _round_order_price(floor_price + EPSILON, tick_size, floor_side)
+
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    dropped_buy = 0
+    for order in orders:
+        side = str(order.get("side", "") or "").upper().strip()
+        price = max(_safe_float(order.get("price")), 0.0)
+        should_drop = (
+            side == "SELL"
+            and floor_side == "SELL"
+            and price > EPSILON
+            and price + EPSILON < floor_price
+        ) or (
+            side == "BUY"
+            and floor_side == "BUY"
+            and price > EPSILON
+            and price > floor_price + EPSILON
+        )
+        if should_drop:
+            dropped += 1
+            if side == "BUY":
+                dropped_buy += 1
+            continue
+        kept.append(order)
+
+    guard["non_loss_exit_dropped_order_count"] = dropped
+    if dropped > 0:
+        guard["non_loss_exit_side"] = floor_side
+        guard["non_loss_exit_price"] = floor_price
+        pause_reasons = list(controls.get("pause_reasons") or [])
+        reason = "spot_app_loss_non_loss_exit_projected_loss"
+        if reason not in pause_reasons:
+            pause_reasons.append(reason)
+        controls["pause_reasons"] = pause_reasons
+        if dropped_buy > 0:
+            controls["buy_paused"] = True
+    return kept
+
+
 def _build_spot_app_loss_maker_reduce_order(
     *,
     controls: dict[str, Any],
@@ -1404,6 +1480,7 @@ def _apply_spot_app_loss_guard_to_orders(
     available_quote_free: float | None = None,
     available_base_free: float | None = None,
     min_bid_break_even_buffer_ticks: float = 0.0,
+    require_non_loss_exit: bool = False,
 ) -> list[dict[str, Any]]:
     guard = _build_spot_app_loss_guard(
         enabled=enabled,
@@ -1433,6 +1510,13 @@ def _apply_spot_app_loss_guard_to_orders(
         orders=desired_orders,
         controls=controls,
         guard=guard,
+        tick_size=tick_size,
+    )
+    desired_orders = _drop_spot_app_loss_non_loss_exit_orders(
+        orders=desired_orders,
+        controls=controls,
+        guard=guard,
+        require_non_loss_exit=require_non_loss_exit,
         tick_size=tick_size,
     )
     if guard["state"] not in {"defensive", "blocked", "recovery_reduce_only"}:
@@ -4534,6 +4618,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         available_quote_free=quote_free,
         available_base_free=base_free,
         min_bid_break_even_buffer_ticks=float(getattr(args, "spot_app_loss_min_bid_break_even_buffer_ticks", 0.0)),
+        require_non_loss_exit=bool(getattr(args, "require_non_loss_exit", False)),
     )
     spot_app_loss_stop_reason = _spot_app_loss_guard_stop_reason(
         controls.get("spot_app_loss_guard") if isinstance(controls.get("spot_app_loss_guard"), dict) else {}

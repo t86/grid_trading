@@ -590,6 +590,41 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(controls["spot_app_loss_guard"]["capped_order_count"], 0)
         self.assertEqual(controls["spot_app_loss_guard"]["injected_order_count"], 1)
 
+    def test_spot_app_loss_guard_drops_lossy_sell_when_non_loss_exit_is_required(self) -> None:
+        controls = {"actual_base_qty": 4800.0, "neutral_base_qty": 4800.0}
+        desired_orders = [
+            {"side": "SELL", "role": "grid_entry", "price": 0.09296, "qty": 118.3},
+            {"side": "SELL", "role": "grid_entry", "price": 0.09298, "qty": 118.3},
+            {"side": "BUY", "role": "grid_entry", "price": 0.09285, "qty": 118.4},
+        ]
+
+        filtered = _apply_spot_app_loss_guard_to_orders(
+            desired_orders=desired_orders,
+            controls=controls,
+            metrics={
+                "buy_notional": 10.999534,
+                "sell_notional": 0.0,
+                "buy_qty": 118.3,
+                "sell_qty": 0.0,
+            },
+            position_qty=4800.0,
+            latest_price=0.09296,
+            enabled=True,
+            min_notional=5000.0,
+            soft_per_10k=0.6,
+            hard_per_10k=1.0,
+            maker_reduce_notional=11.0,
+            tick_size=0.00001,
+            step_size=0.1,
+            min_qty=0.1,
+            exchange_min_notional=5.0,
+            available_base_free=4800.0,
+            require_non_loss_exit=True,
+        )
+
+        self.assertEqual([(order["side"], order["price"]) for order in filtered], [("SELL", 0.09298), ("BUY", 0.09285)])
+        self.assertEqual(controls["spot_app_loss_guard"]["non_loss_exit_dropped_order_count"], 1)
+
     def test_spot_app_loss_guard_does_not_sell_when_neutral_deviation_is_zero(self) -> None:
         controls = {"actual_base_qty": 4800.0, "neutral_base_qty": 4800.0}
         desired_orders = [
