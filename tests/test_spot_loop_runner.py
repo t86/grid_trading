@@ -216,6 +216,33 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(guard["app_loss"], 146.56831, places=5)
         self.assertEqual(guard["window_source"], "metrics")
 
+    def test_spot_app_loss_guard_includes_starting_base_inventory_value(self) -> None:
+        guard = _build_spot_app_loss_guard(
+            enabled=True,
+            metrics={
+                "app_loss_baseline_qty": 5475.3,
+                "app_loss_baseline_notional": 511.0371255,
+                "buy_notional": 5950.937708,
+                "sell_notional": 6034.176797,
+                "buy_qty": 63685.0,
+                "sell_qty": 64595.9,
+            },
+            position_qty=4564.4,
+            latest_price=0.093535,
+            min_notional=0.0,
+            soft_per_10k=0.6,
+            hard_per_10k=1.0,
+        )
+
+        self.assertAlmostEqual(guard["baseline_qty"], 5475.3)
+        self.assertAlmostEqual(guard["baseline_notional"], 511.0371255)
+        self.assertAlmostEqual(guard["buy_notional"], 6461.9748335)
+        self.assertAlmostEqual(guard["position_qty"], 4564.4)
+        self.assertAlmostEqual(guard["position_value"], 426.931154)
+        self.assertAlmostEqual(guard["app_loss"], 0.8668825)
+        self.assertAlmostEqual(guard["app_loss_per_10k"], 0.8668825 / 11985.114505 * 10000.0)
+        self.assertEqual(guard["state"], "defensive")
+
     def test_spot_app_loss_guard_treats_tiny_window_net_qty_as_flat(self) -> None:
         guard = _build_spot_app_loss_guard(
             enabled=True,
@@ -4754,6 +4781,69 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(guard["state"], "blocked")
         self.assertTrue(summary["stop_triggered"])
         self.assertEqual(summary["stop_reason"], "spot_app_loss_hard_limit_hit")
+
+    def test_run_cycle_seeds_app_loss_baseline_from_starting_base_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            summary_path = Path(tmpdir) / "events.jsonl"
+            args = self._synthetic_args(
+                [
+                    "--state-path",
+                    str(state_path),
+                    "--summary-jsonl",
+                    str(summary_path),
+                    "--neutral-base-qty",
+                    "4800",
+                    "--spot-app-loss-guard-enabled",
+                    "--spot-app-loss-min-notional",
+                    "0",
+                    "--spot-app-loss-per-10k-soft",
+                    "0.6",
+                    "--spot-app-loss-per-10k-hard",
+                    "1.0",
+                ]
+            )
+            symbol_info = {
+                "base_asset": "WLD",
+                "quote_asset": "USDT",
+                "tick_size": 0.0001,
+                "step_size": 0.1,
+                "min_qty": 0.1,
+                "min_notional": 5.0,
+            }
+
+            with patch("grid_optimizer.spot_loop_runner.fetch_spot_book_tickers", return_value=[{"bid_price": "0.0935", "ask_price": "0.0935"}]):
+                with patch("grid_optimizer.spot_loop_runner.fetch_spot_user_trades", return_value=[]):
+                    with patch(
+                        "grid_optimizer.spot_loop_runner.fetch_spot_account_info",
+                        return_value={
+                            "balances": [
+                                {"asset": "WLD", "free": "4800", "locked": "0"},
+                                {"asset": "USDT", "free": "3000", "locked": "0"},
+                            ]
+                        },
+                    ):
+                        with patch("grid_optimizer.spot_loop_runner.fetch_spot_open_orders", return_value=[]):
+                            with patch(
+                                "grid_optimizer.spot_loop_runner._build_spot_competition_inventory_grid_orders",
+                                return_value=(
+                                    [],
+                                    {"actual_base_qty": 4800.0, "neutral_base_qty": 4800.0, "_runtime": {}},
+                                ),
+                            ):
+                                summary = _run_cycle(args, symbol_info, api_key="key", api_secret="secret")
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        metrics = state["metrics"]
+        guard = summary["spot_app_loss_guard"]
+        self.assertAlmostEqual(metrics["app_loss_baseline_qty"], 4800.0)
+        self.assertAlmostEqual(metrics["app_loss_baseline_price"], 0.0935)
+        self.assertAlmostEqual(metrics["app_loss_baseline_notional"], 448.8)
+        self.assertAlmostEqual(guard["baseline_qty"], 4800.0)
+        self.assertAlmostEqual(guard["buy_notional"], 448.8)
+        self.assertAlmostEqual(guard["position_value"], 448.8)
+        self.assertAlmostEqual(guard["app_loss"], 0.0)
 
     def test_run_cycle_app_loss_hard_stop_cancels_orders_even_when_cancel_stale_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

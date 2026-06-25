@@ -149,6 +149,10 @@ def _new_metrics() -> dict[str, Any]:
         "buy_qty": 0.0,
         "sell_qty": 0.0,
         "app_loss_window_aligned": True,
+        "app_loss_baseline_qty": 0.0,
+        "app_loss_baseline_price": 0.0,
+        "app_loss_baseline_notional": 0.0,
+        "app_loss_baseline_time_ms": 0,
         "commission_quote": 0.0,
         "commission_raw_by_asset": {},
         "realized_pnl": 0.0,
@@ -267,6 +271,35 @@ def _load_state(path: Path, symbol: str, strategy_mode: str, cell_count: int) ->
 def _save_state(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _ensure_spot_app_loss_baseline(
+    metrics: dict[str, Any],
+    *,
+    position_qty: float,
+    latest_price: float,
+    now_ms: int,
+) -> None:
+    if (
+        _safe_float(metrics.get("app_loss_baseline_qty")) > EPSILON
+        or _safe_float(metrics.get("app_loss_baseline_notional")) > EPSILON
+        or _safe_int(metrics.get("app_loss_baseline_time_ms")) > 0
+    ):
+        return
+    if (
+        _safe_float(metrics.get("gross_notional")) > EPSILON
+        or _safe_float(metrics.get("buy_notional")) + _safe_float(metrics.get("sell_notional")) > EPSILON
+        or _safe_int(metrics.get("trade_count")) > 0
+        or _safe_int(metrics.get("first_trade_time_ms")) > 0
+    ):
+        return
+
+    qty = max(_safe_float(position_qty), 0.0)
+    price = max(_safe_float(latest_price), 0.0)
+    metrics["app_loss_baseline_qty"] = qty
+    metrics["app_loss_baseline_price"] = price if qty > EPSILON else 0.0
+    metrics["app_loss_baseline_notional"] = qty * price if qty > EPSILON else 0.0
+    metrics["app_loss_baseline_time_ms"] = max(_safe_int(now_ms), 0)
 
 
 def _extract_balance(account_info: dict[str, Any], asset: str) -> tuple[float, float]:
@@ -951,13 +984,17 @@ def _build_spot_app_loss_guard(
     tick_size: float | None = None,
     min_bid_break_even_buffer_ticks: float = 0.0,
 ) -> dict[str, Any]:
-    buy_notional = max(_safe_float(metrics.get("buy_notional")), 0.0)
-    sell_notional = max(_safe_float(metrics.get("sell_notional")), 0.0)
-    buy_qty = max(_safe_float(metrics.get("buy_qty")), 0.0)
-    sell_qty = max(_safe_float(metrics.get("sell_qty")), 0.0)
+    trade_buy_notional = max(_safe_float(metrics.get("buy_notional")), 0.0)
+    trade_sell_notional = max(_safe_float(metrics.get("sell_notional")), 0.0)
+    trade_buy_qty = max(_safe_float(metrics.get("buy_qty")), 0.0)
+    trade_sell_qty = max(_safe_float(metrics.get("sell_qty")), 0.0)
     window_source = "metrics"
     window_aligned = bool(metrics.get("app_loss_window_aligned", True))
-    need_recent_window = not window_aligned or (buy_notional + sell_notional > EPSILON and buy_qty <= EPSILON and sell_qty <= EPSILON)
+    need_recent_window = not window_aligned or (
+        trade_buy_notional + trade_sell_notional > EPSILON
+        and trade_buy_qty <= EPSILON
+        and trade_sell_qty <= EPSILON
+    )
     if need_recent_window and isinstance(metrics.get("recent_trades"), list) and metrics.get("recent_trades"):
         recent_buy_notional = 0.0
         recent_sell_notional = 0.0
@@ -977,17 +1014,28 @@ def _build_spot_app_loss_guard(
             elif side == "SELL":
                 recent_sell_qty += qty
                 recent_sell_notional += notional
-        buy_notional = recent_buy_notional
-        sell_notional = recent_sell_notional
-        buy_qty = recent_buy_qty
-        sell_qty = recent_sell_qty
+        trade_buy_notional = recent_buy_notional
+        trade_sell_notional = recent_sell_notional
+        trade_buy_qty = recent_buy_qty
+        trade_sell_qty = recent_sell_qty
         window_source = "recent_trades"
-        window_aligned = buy_notional + sell_notional > EPSILON
+        window_aligned = trade_buy_notional + trade_sell_notional > EPSILON
     elif need_recent_window:
         window_source = "position_fallback"
         window_aligned = False
 
-    gross_notional = buy_notional + sell_notional
+    baseline_qty = max(_safe_float(metrics.get("app_loss_baseline_qty")), 0.0)
+    baseline_price = max(_safe_float(metrics.get("app_loss_baseline_price")), 0.0)
+    baseline_notional = max(_safe_float(metrics.get("app_loss_baseline_notional")), 0.0)
+    if baseline_notional <= EPSILON and baseline_qty > EPSILON and baseline_price > EPSILON:
+        baseline_notional = baseline_qty * baseline_price
+
+    buy_notional = trade_buy_notional + baseline_notional
+    sell_notional = trade_sell_notional
+    buy_qty = trade_buy_qty + baseline_qty
+    sell_qty = trade_sell_qty
+    gross_notional = trade_buy_notional + trade_sell_notional
+    formula_gross_notional = buy_notional + sell_notional
     if window_aligned and (buy_qty > EPSILON or sell_qty > EPSILON):
         window_net_qty = buy_qty - sell_qty
         if abs(window_net_qty) <= _qty_zero_tolerance(buy_qty, sell_qty):
@@ -1066,11 +1114,19 @@ def _build_spot_app_loss_guard(
         "formula": "buy_notional-sell_notional-position_qty*latest_price",
         "window_source": window_source,
         "window_aligned": bool(window_aligned),
+        "baseline_qty": baseline_qty,
+        "baseline_price": baseline_price,
+        "baseline_notional": baseline_notional,
+        "trade_buy_notional": trade_buy_notional,
+        "trade_sell_notional": trade_sell_notional,
+        "trade_buy_qty": trade_buy_qty,
+        "trade_sell_qty": trade_sell_qty,
         "buy_notional": buy_notional,
         "sell_notional": sell_notional,
         "buy_qty": buy_qty,
         "sell_qty": sell_qty,
         "gross_notional": gross_notional,
+        "formula_gross_notional": formula_gross_notional,
         "position_qty": holding_qty,
         "latest_price": mark_price,
         "position_value": position_value,
@@ -4528,6 +4584,13 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         )
         applied_trades += refreshed_applied_trades
     metrics = state.get("metrics") if isinstance(state.get("metrics"), dict) else _new_metrics()
+    if strategy_mode == "spot_competition_synthetic_neutral_grid" and not trades:
+        _ensure_spot_app_loss_baseline(
+            metrics,
+            position_qty=_total_base_balance(account_info, base_asset),
+            latest_price=_spot_app_loss_mark_price(metrics=metrics, bid_price=bid_price, ask_price=ask_price),
+            now_ms=int(time.time() * 1000),
+        )
     app_loss_metrics = _spot_app_loss_metrics_with_trade_fallback(metrics=metrics, trades=trades)
     trade_database_status: dict[str, Any] = {"enabled": trade_database_enabled(), "trade_inserted": 0, "income_inserted": 0}
     runtime_guard_config = normalize_runtime_guard_config(vars(args))
