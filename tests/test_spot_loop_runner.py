@@ -12,6 +12,7 @@ from grid_optimizer.types import Candle
 from grid_optimizer.spot_loop_runner import (
     _assess_spot_fast_stop_guard,
     _auto_flatten_on_runtime_guard,
+    _build_client_order_id,
     _build_parser,
     _build_spot_app_loss_guard,
     _build_spot_competition_inventory_grid_orders,
@@ -80,6 +81,15 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertFalse(args.spot_freeze_maker_execution_enabled)
         self.assertEqual(args.spot_freeze_base_hedge_qty, 0.0)
         self.assertEqual(args.spot_freeze_release_profit_ratio, 0.05)
+
+    def test_client_order_id_stays_within_binance_limit_for_spot_freeze_tag(self) -> None:
+        with patch("grid_optimizer.spot_loop_runner.time.time", return_value=1782349765.432):
+            client_order_id = _build_client_order_id("sgxpl114", "spot_freeze_short", "BUY")
+
+        self.assertLessEqual(len(client_order_id), 36)
+        self.assertRegex(client_order_id, r"^[a-zA-Z0-9-_]{1,36}$")
+        self.assertTrue(client_order_id.startswith("sgxpl114_"))
+        self.assertIn("_b_", client_order_id)
 
     def test_runtime_guard_events_use_spot_realized_pnl_as_net_pnl(self) -> None:
         events = _runtime_guard_events_from_metrics(

@@ -5,6 +5,7 @@ import copy
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -63,6 +64,8 @@ _LATEST_PRICE_CACHE: dict[str, tuple[float, float]] = {}
 SPOT_COMPETITION_RUNTIME_CACHE_KEY = "spot_competition_inventory_grid_runtime_cache"
 SPOT_SYNTHETIC_NEUTRAL_RUNTIME_CACHE_KEY = "spot_competition_synthetic_neutral_grid_runtime_cache"
 SPOT_FREEZE_MAKER_ROLE = "spot_freeze_maker"
+BINANCE_CLIENT_ORDER_ID_MAX_LEN = 36
+BINANCE_CLIENT_ORDER_ID_SAFE_RE = re.compile(r"[^A-Za-z0-9_-]+")
 SPOT_COMPETITION_MODES = {
     "spot_competition_inventory_grid",
     "spot_competition_synthetic_neutral_grid",
@@ -248,8 +251,14 @@ def _extract_balance(account_info: dict[str, Any], asset: str) -> tuple[float, f
 
 def _build_client_order_id(prefix: str, tag: str, side: str) -> str:
     side_text = "b" if str(side).upper().strip() == "BUY" else "s"
-    nonce = int(time.time() * 1000) % 1_000_000_000
-    return f"{prefix}_{tag[:20]}_{side_text}_{nonce}"
+    nonce_text = str(int(time.time() * 1000) % 1_000_000_000)
+    prefix_text = BINANCE_CLIENT_ORDER_ID_SAFE_RE.sub("_", str(prefix or "").strip()) or "wg"
+    tag_text = BINANCE_CLIENT_ORDER_ID_SAFE_RE.sub("_", str(tag or "").strip()) or "ord"
+    reserved_len = len(prefix_text) + len(side_text) + len(nonce_text) + 3
+    max_tag_len = max(BINANCE_CLIENT_ORDER_ID_MAX_LEN - reserved_len, 0)
+    if max_tag_len <= 0:
+        return f"{prefix_text}_{side_text}_{nonce_text}"[:BINANCE_CLIENT_ORDER_ID_MAX_LEN]
+    return f"{prefix_text}_{tag_text[:max_tag_len]}_{side_text}_{nonce_text}"
 
 
 def _sum_inventory_qty(lots: list[dict[str, Any]]) -> float:
