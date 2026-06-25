@@ -8784,10 +8784,10 @@ def _runner_start_safety_preflight(
                     config.get("spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks", 0.0),
                     "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks",
                 )
-                <= 0.0
+                < 0.0
             ):
                 reasons.append(
-                    "交易赛现货 APP loss guard/recovery 必须设置正数 spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks"
+                    "交易赛现货 APP loss guard/recovery 的 spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks 不能为负数"
                 )
             prestart_raw = str(config.get("spot_app_loss_prestart_gate_start_time") or "").strip()
             runtime_raw = str(config.get("runtime_guard_stats_start_time") or "").strip()

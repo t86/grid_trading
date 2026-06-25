@@ -666,6 +666,8 @@ class SpotRunnerTests(unittest.TestCase):
                 "spot_freeze_enabled": True,
                 "spot_freeze_maker_execution_enabled": True,
                 "spot_freeze_base_hedge_qty": 4800.0,
+                "spot_freeze_total_cap_notional": 66.0,
+                "max_short_position_notional": 66.0,
             }
         )
 
@@ -675,7 +677,7 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("runtime_guard_stats_start_time", str(raised.exception))
 
     @patch("grid_optimizer.web._spot_freeze_live_hedge_preflight_reason", return_value=None)
-    def test_spot_runner_preflight_requires_app_loss_bid_buffer(
+    def test_spot_runner_preflight_allows_zero_app_loss_bid_buffer(
         self,
         _mock_live_hedge,
     ) -> None:
@@ -690,6 +692,32 @@ class SpotRunnerTests(unittest.TestCase):
                 "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
                 "runtime_guard_stats_start_time": "2026-06-24T19:57:00+08:00",
                 "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks": 0.0,
+                "spot_freeze_enabled": True,
+                "spot_freeze_maker_execution_enabled": True,
+                "spot_freeze_base_hedge_qty": 4800.0,
+                "spot_freeze_total_cap_notional": 66.0,
+                "max_short_position_notional": 66.0,
+            }
+        )
+
+        web._runner_start_safety_preflight(config, spot=True)
+
+    @patch("grid_optimizer.web._spot_freeze_live_hedge_preflight_reason", return_value=None)
+    def test_spot_runner_preflight_rejects_negative_app_loss_bid_buffer(
+        self,
+        _mock_live_hedge,
+    ) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "XPLUSDT",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "spot_app_loss_guard_enabled": True,
+                "spot_app_loss_recovery_reduce_only_enabled": True,
+                "spot_app_loss_prestart_gate_enabled": True,
+                "spot_app_loss_prestart_gate_start_time": "2026-06-24T19:57:00+08:00",
+                "runtime_guard_stats_start_time": "2026-06-24T19:57:00+08:00",
+                "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks": -1.0,
                 "spot_freeze_enabled": True,
                 "spot_freeze_maker_execution_enabled": True,
                 "spot_freeze_base_hedge_qty": 4800.0,
