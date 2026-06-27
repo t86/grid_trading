@@ -2957,8 +2957,10 @@ def _build_spot_competition_inventory_grid_orders(
             return raw_synthetic_net_qty
         frozen_report = synthetic_frozen_position_report(runtime=runtime, mid_price=mid_price)
         frozen_net_qty = _safe_float(frozen_report.get("long_qty")) - _safe_float(frozen_report.get("short_qty"))
+        spot_freeze_ledger_present = False
         spot_freeze_ledger = state.get("spot_frozen_ledger") if isinstance(state.get("spot_frozen_ledger"), dict) else {}
         if spot_freeze_ledger:
+            spot_freeze_ledger_present = True
             spot_frozen_long_qty, spot_frozen_short_qty = ledger_totals(dict(spot_freeze_ledger))
             frozen_net_qty += max(_safe_float(spot_frozen_long_qty), 0.0)
             frozen_net_qty -= max(_safe_float(spot_frozen_short_qty), 0.0)
@@ -2974,6 +2976,13 @@ def _build_spot_competition_inventory_grid_orders(
             price=mid_price,
             min_qty=min_qty,
             min_notional=min_notional,
+        ):
+            active_net_qty = 0.0
+        reduce_target_notional = max(_safe_float(threshold_reduce_target_notional), 0.0)
+        if (
+            spot_freeze_ledger_present
+            and reduce_target_notional > EPSILON
+            and abs(active_net_qty) * mid_price <= reduce_target_notional
         ):
             active_net_qty = 0.0
         expected_direction_state = (
