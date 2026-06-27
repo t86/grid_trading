@@ -3278,6 +3278,7 @@ def _build_spot_competition_inventory_grid_orders(
         "available_sell_qty": 0.0,
         "dropped_sell_orders": 0,
         "capped_sell_orders": 0,
+        "added_conservative_buy_orders": 0,
     }
     if synthetic_neutral and neutral_qty > EPSILON:
         retained_extra_qty = reduce_target_notional / mid_price if mid_price > EPSILON else 0.0
@@ -3334,6 +3335,68 @@ def _build_spot_competition_inventory_grid_orders(
                     "capped_sell_orders": capped,
                 }
             )
+        can_add_floor_buys = (
+            not bool(spot_base_restore_only)
+            and resolved_actual_base_qty + tolerance_qty >= neutral_qty
+            and str(runtime.get("direction_state", "flat") or "flat").strip().lower() != "short_active"
+            and str(runtime.get("recovery_mode", "live") or "live").strip().lower() == "live"
+            and not bool(runtime.get("synthetic_cost_unknown"))
+        )
+        if can_add_floor_buys:
+            floor_buy_ceiling = _round_order_price(max(_safe_float(bid_price) - effective_step_price, 0.0), tick_size, "BUY")
+            if floor_buy_ceiling > EPSILON:
+                conservative_orders: list[dict[str, Any]] = []
+                dropped_floor_buy = 0
+                for order in desired_orders:
+                    if str(order.get("side", "") or "").upper().strip() == "BUY" and _safe_float(order.get("price")) > floor_buy_ceiling + EPSILON:
+                        dropped_floor_buy += 1
+                        continue
+                    conservative_orders.append(order)
+                desired_orders = conservative_orders
+                if dropped_floor_buy:
+                    synthetic_sell_floor["active"] = True
+                    synthetic_sell_floor["dropped_non_conservative_buy_orders"] = dropped_floor_buy
+        if can_add_floor_buys and not any(str(order.get("side", "") or "").upper().strip() == "BUY" for order in desired_orders):
+            long_notional = max(resolved_actual_base_qty - neutral_qty, 0.0) * mid_price
+            buy_budget_notional = max(_safe_float(threshold_position_notional) - long_notional, 0.0)
+            existing_keys = {
+                f"{str(order.get('side', '')).upper().strip()}:{_safe_float(order.get('price')):.10f}"
+                for order in desired_orders
+                if isinstance(order, dict)
+            }
+            added = 0
+            for level in range(1, max(int(buy_levels or 0), 0) + 1):
+                if buy_budget_notional <= EPSILON:
+                    break
+                raw_price = max(_safe_float(bid_price) - (effective_step_price * level), 0.0)
+                price = _round_order_price(raw_price, tick_size, "BUY")
+                if price <= EPSILON or price >= _safe_float(bid_price) - EPSILON:
+                    continue
+                notional_budget = min(max(_safe_float(per_order_notional), 0.0), buy_budget_notional)
+                qty = _round_order_qty(notional_budget / price if price > EPSILON else 0.0, step_size)
+                if not _spot_order_meets_exchange_mins(qty=qty, price=price, min_qty=min_qty, min_notional=min_notional):
+                    continue
+                key = f"BUY:{price:.10f}"
+                if key in existing_keys:
+                    continue
+                existing_keys.add(key)
+                desired_orders.insert(
+                    added,
+                    {
+                        "side": "BUY",
+                        "price": price,
+                        "qty": qty,
+                        "notional": qty * price,
+                        "level": level,
+                        "role": "grid_entry",
+                        "position_side": "BOTH",
+                        "synthetic_base_sell_floor_conservative_buy": True,
+                    },
+                )
+                added += 1
+                buy_budget_notional = max(buy_budget_notional - (qty * price), 0.0)
+            if added:
+                synthetic_sell_floor["added_conservative_buy_orders"] = added
     display_soft_limit = reduce_target_notional if reduce_target_notional > 0 else _safe_float(threshold_position_notional)
     current_long_notional = max(synthetic_net_qty, 0.0) * mid_price
     current_short_notional = max(-synthetic_net_qty, 0.0) * mid_price
