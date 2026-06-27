@@ -302,6 +302,99 @@ def _ensure_spot_app_loss_baseline(
     metrics["app_loss_baseline_time_ms"] = max(_safe_int(now_ms), 0)
 
 
+def _short_contract_unrealized_pnl(lot: dict[str, Any], mark_price: float) -> float:
+    qty = max(_safe_float(lot.get("qty")), 0.0)
+    entry_price = max(
+        _safe_float(lot.get("entry_price"))
+        or _safe_float(lot.get("contract_entry_price"))
+        or _safe_float(lot.get("frozen_mid")),
+        0.0,
+    )
+    mark = max(_safe_float(mark_price), 0.0)
+    if qty <= EPSILON or entry_price <= EPSILON or mark <= EPSILON:
+        return 0.0
+    return (entry_price - mark) * qty
+
+
+def _sum_base_hedge_contract_pnl(state: dict[str, Any], mark_price: float) -> tuple[float, float]:
+    lots = state.get("spot_contract_hedge_lots")
+    if not isinstance(lots, list):
+        return 0.0, 0.0
+    pnl = 0.0
+    qty = 0.0
+    for lot in lots:
+        if not isinstance(lot, dict):
+            continue
+        side = str(lot.get("position_side", lot.get("side", "SHORT")) or "SHORT").upper().strip()
+        lot_qty = max(_safe_float(lot.get("qty")), 0.0)
+        if lot_qty <= EPSILON:
+            continue
+        if side == "SHORT":
+            pnl += _short_contract_unrealized_pnl(lot, mark_price)
+            qty += lot_qty
+    return pnl, qty
+
+
+def _sum_freeze_contract_pnl(ledger: dict[str, Any], mark_price: float) -> tuple[float, float]:
+    if not isinstance(ledger, dict):
+        return 0.0, 0.0
+    pnl = 0.0
+    qty = 0.0
+    for lot in ledger.get("short_lots", []):
+        if not isinstance(lot, dict):
+            continue
+        lot_qty = max(_safe_float(lot.get("qty")), 0.0)
+        pnl += _short_contract_unrealized_pnl(lot, mark_price)
+        qty += lot_qty
+    for lot in ledger.get("long_lots", []):
+        if not isinstance(lot, dict):
+            continue
+        pnl += _safe_float(lot.get("contract_realized_pnl"))
+    return pnl, qty
+
+
+def _build_spot_equity_pnl_summary(
+    *,
+    state: dict[str, Any],
+    metrics: dict[str, Any],
+    actual_base_qty: float,
+    latest_price: float,
+    mark_price: float,
+) -> dict[str, Any]:
+    baseline_notional = max(_safe_float(metrics.get("app_loss_baseline_notional")), 0.0)
+    baseline_qty = max(_safe_float(metrics.get("app_loss_baseline_qty")), 0.0)
+    trade_buy_notional = max(_safe_float(metrics.get("buy_notional")), 0.0)
+    trade_sell_notional = max(_safe_float(metrics.get("sell_notional")), 0.0)
+    position_value = max(_safe_float(actual_base_qty), 0.0) * max(_safe_float(latest_price), 0.0)
+    base_hedge_pnl, base_hedge_qty = _sum_base_hedge_contract_pnl(state, mark_price)
+    freeze_pnl, freeze_contract_qty = _sum_freeze_contract_pnl(
+        state.get("spot_frozen_ledger") if isinstance(state.get("spot_frozen_ledger"), dict) else {},
+        mark_price,
+    )
+    contract_pnl = base_hedge_pnl + freeze_pnl
+    spot_cashflow_pnl = position_value + trade_sell_notional - baseline_notional - trade_buy_notional
+    equity_pnl = spot_cashflow_pnl + contract_pnl
+    cost_basis = baseline_notional + trade_buy_notional - trade_sell_notional
+    return {
+        "formula": "position_value+sell_notional+contract_pnl-initial_base_cost-buy_notional",
+        "initial_base_qty": baseline_qty,
+        "initial_base_cost": baseline_notional,
+        "buy_notional": trade_buy_notional,
+        "sell_notional": trade_sell_notional,
+        "position_qty": max(_safe_float(actual_base_qty), 0.0),
+        "position_value": position_value,
+        "cost_basis_after_sells": cost_basis,
+        "spot_cashflow_pnl": spot_cashflow_pnl,
+        "base_hedge_contract_qty": base_hedge_qty,
+        "base_hedge_contract_pnl": base_hedge_pnl,
+        "freeze_contract_qty": freeze_contract_qty,
+        "freeze_contract_pnl": freeze_pnl,
+        "contract_pnl": contract_pnl,
+        "equity_pnl": equity_pnl,
+        "equity_loss": -equity_pnl,
+    }
+
+
 def _extract_balance(account_info: dict[str, Any], asset: str) -> tuple[float, float]:
     wanted = str(asset or "").upper().strip()
     balances = account_info.get("balances", [])
@@ -4992,6 +5085,17 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
     )
     unrealized_pnl = (mid_price - inventory_avg_cost) * inventory_qty if inventory_qty > EPSILON else 0.0
     net_pnl_estimate = _safe_float(metrics.get("realized_pnl")) + unrealized_pnl
+    actual_base_qty_for_equity = _safe_float(controls.get("actual_base_qty"))
+    mark_price_for_equity = _safe_float((controls.get("spot_freeze_gate") or {}).get("contract_short_mark_price")) if isinstance(controls.get("spot_freeze_gate"), dict) else 0.0
+    if mark_price_for_equity <= EPSILON:
+        mark_price_for_equity = mid_price
+    equity_pnl_summary = _build_spot_equity_pnl_summary(
+        state=state,
+        metrics=metrics,
+        actual_base_qty=actual_base_qty_for_equity,
+        latest_price=bid_price if bid_price > EPSILON else mid_price,
+        mark_price=mark_price_for_equity,
+    )
     trade_database_status = _persist_spot_trade_database(
         symbol=symbol,
         strategy_mode=strategy_mode,
@@ -5033,6 +5137,9 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "recycle_loss_abs": _safe_float(metrics.get("recycle_loss_abs")),
         "unrealized_pnl": unrealized_pnl,
         "net_pnl_estimate": net_pnl_estimate,
+        "equity_pnl": _safe_float(equity_pnl_summary.get("equity_pnl")),
+        "equity_loss": _safe_float(equity_pnl_summary.get("equity_loss")),
+        "spot_equity_pnl": equity_pnl_summary,
         "trade_count": _safe_int(metrics.get("trade_count")),
         "maker_count": _safe_int(metrics.get("maker_count")),
         "buy_count": _safe_int(metrics.get("buy_count")),

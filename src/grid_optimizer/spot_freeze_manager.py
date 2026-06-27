@@ -207,6 +207,13 @@ def _avg_spot_price(response: dict[str, Any], fallback_price: float) -> float:
     return max(_safe_float(fallback_price), 0.0)
 
 
+def _avg_contract_price(response: dict[str, Any], fallback_price: float) -> float:
+    avg_price = _safe_float(response.get("avgPrice"))
+    if avg_price > EPSILON:
+        return avg_price
+    return max(_safe_float(fallback_price), 0.0)
+
+
 def _set_lot_pending(ledger: dict[str, Any], lot_id: str, pending: bool) -> None:
     for key in ("long_lots", "short_lots"):
         for lot in ledger.get(key, []):
@@ -528,7 +535,12 @@ def freeze_cycle(
         "hedge_pending": False,
     }
     try:
-        place_contract(symbol=symbol, side=contract_side, qty=filled_qty, position_side="SHORT")
+        contract_response = place_contract(symbol=symbol, side=contract_side, qty=filled_qty, position_side="SHORT")
+        contract_price = _avg_contract_price(contract_response if isinstance(contract_response, dict) else {}, mid)
+        if contract_side == "SELL":
+            lot["contract_entry_price"] = contract_price
+        else:
+            lot["contract_exit_price"] = contract_price
         actions.append({"type": "freeze", "side": "long" if is_long_deviation else "short", "qty": filled_qty})
     except Exception:
         lot["hedge_pending"] = True

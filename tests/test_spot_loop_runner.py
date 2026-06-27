@@ -16,6 +16,7 @@ from grid_optimizer.spot_loop_runner import (
     _build_parser,
     _build_spot_app_loss_guard,
     _build_spot_competition_inventory_grid_orders,
+    _build_spot_equity_pnl_summary,
     _check_spot_freeze_hedge_gate,
     _clamp_limit_maker_price_to_book,
     _cancel_orders,
@@ -295,6 +296,37 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(guard["sell_notional"], 950.0)
         self.assertAlmostEqual(guard["position_qty"], 10.0)
         self.assertAlmostEqual(guard["app_loss"], 10.0)
+
+    def test_spot_equity_pnl_uses_initial_base_trade_cashflow_and_tracked_contract_pnl(self) -> None:
+        state = {
+            "spot_contract_hedge_lots": [
+                {"qty": 0.12, "entry_price": 1575.68, "position_side": "SHORT"},
+            ],
+            "spot_frozen_ledger": {
+                "short_lots": [{"qty": 0.01, "contract_entry_price": 1600.0}],
+                "long_lots": [{"qty": 0.02, "contract_realized_pnl": 0.5}],
+            },
+        }
+        metrics = {
+            "app_loss_baseline_qty": 0.1,
+            "app_loss_baseline_notional": 100.0,
+            "buy_notional": 20.0,
+            "sell_notional": 10.0,
+        }
+
+        summary = _build_spot_equity_pnl_summary(
+            state=state,
+            metrics=metrics,
+            actual_base_qty=0.11,
+            latest_price=1000.0,
+            mark_price=1570.0,
+        )
+
+        self.assertAlmostEqual(summary["spot_cashflow_pnl"], 0.0)
+        self.assertAlmostEqual(summary["base_hedge_contract_pnl"], (1575.68 - 1570.0) * 0.12)
+        self.assertAlmostEqual(summary["freeze_contract_pnl"], (1600.0 - 1570.0) * 0.01 + 0.5)
+        self.assertAlmostEqual(summary["equity_pnl"], summary["contract_pnl"])
+        self.assertAlmostEqual(summary["equity_loss"], -summary["equity_pnl"])
 
     def test_spot_app_loss_metrics_falls_back_to_raw_mytrades_when_state_window_empty(self) -> None:
         metrics = _spot_app_loss_metrics_with_trade_fallback(

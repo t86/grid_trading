@@ -121,13 +121,19 @@ def _summary_outcome(summary: dict[str, Any]) -> dict[str, Any]:
     net = _safe_float(summary.get("net_pnl_estimate"))
     if net == 0.0:
         net = realized - commission + _safe_float(summary.get("funding_fee"))
+    equity_pnl = _safe_float(summary.get("equity_pnl"))
+    equity_loss = _safe_float(summary.get("equity_loss"))
     return {
         "gross_notional": gross,
         "trade_count": _safe_int(summary.get("trade_count")),
         "realized_pnl": realized,
         "commission": commission,
         "net_pnl": net,
+        "equity_pnl": equity_pnl,
+        "equity_loss": equity_loss,
+        "spot_equity_pnl": summary.get("spot_equity_pnl", {}),
         "loss_per_10k": abs(min(net, 0.0)) / gross * 10_000 if gross > 0 else 0.0,
+        "equity_loss_per_10k": max(equity_loss, 0.0) / gross * 10_000 if gross > 0 else 0.0,
         "maker_count": _safe_int(summary.get("maker_count")),
         "buy_notional": _safe_float(summary.get("buy_notional")),
         "sell_notional": _safe_float(summary.get("sell_notional")),
