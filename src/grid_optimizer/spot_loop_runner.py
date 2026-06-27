@@ -3270,6 +3270,70 @@ def _build_spot_competition_inventory_grid_orders(
         min_notional=min_notional,
     )
     reduce_target_notional = max(_safe_float(threshold_reduce_target_notional), 0.0)
+    synthetic_sell_floor = {
+        "enabled": False,
+        "active": False,
+        "retained_extra_notional": 0.0,
+        "floor_qty": 0.0,
+        "available_sell_qty": 0.0,
+        "dropped_sell_orders": 0,
+        "capped_sell_orders": 0,
+    }
+    if synthetic_neutral and neutral_qty > EPSILON:
+        retained_extra_qty = reduce_target_notional / mid_price if mid_price > EPSILON else 0.0
+        floor_qty = neutral_qty + max(retained_extra_qty, 0.0)
+        tolerance_qty = max(_safe_float(spot_freeze_tolerance_qty), _qty_zero_tolerance(resolved_actual_base_qty, floor_qty))
+        available_sell_qty = max(resolved_actual_base_qty - floor_qty, 0.0)
+        synthetic_sell_floor.update(
+            {
+                "enabled": True,
+                "retained_extra_notional": reduce_target_notional,
+                "floor_qty": floor_qty,
+                "available_sell_qty": available_sell_qty,
+            }
+        )
+        if resolved_actual_base_qty <= floor_qty + tolerance_qty:
+            dropped = sum(1 for order in desired_orders if str(order.get("side", "") or "").upper().strip() == "SELL")
+            desired_orders = [
+                order for order in desired_orders if str(order.get("side", "") or "").upper().strip() != "SELL"
+            ]
+            synthetic_sell_floor.update({"active": dropped > 0, "dropped_sell_orders": dropped})
+        else:
+            remaining_sell_qty = available_sell_qty
+            filtered_orders: list[dict[str, Any]] = []
+            dropped = 0
+            capped = 0
+            for order in desired_orders:
+                if str(order.get("side", "") or "").upper().strip() != "SELL":
+                    filtered_orders.append(order)
+                    continue
+                if remaining_sell_qty <= EPSILON:
+                    dropped += 1
+                    continue
+                price = max(_safe_float(order.get("price")), 0.0)
+                raw_qty = min(max(_safe_float(order.get("qty")), 0.0), remaining_sell_qty)
+                qty = _round_order_qty(raw_qty, step_size)
+                if not _spot_order_meets_exchange_mins(qty=qty, price=price, min_qty=min_qty, min_notional=min_notional):
+                    dropped += 1
+                    continue
+                kept = dict(order)
+                original_qty = max(_safe_float(order.get("qty")), 0.0)
+                if qty + EPSILON < original_qty:
+                    kept["qty"] = qty
+                    kept["notional"] = qty * price
+                    kept["synthetic_base_sell_floor_capped"] = True
+                    capped += 1
+                filtered_orders.append(kept)
+                remaining_sell_qty = max(remaining_sell_qty - qty, 0.0)
+            desired_orders = filtered_orders
+            synthetic_sell_floor.update(
+                {
+                    "active": bool(dropped or capped),
+                    "available_sell_qty": available_sell_qty,
+                    "dropped_sell_orders": dropped,
+                    "capped_sell_orders": capped,
+                }
+            )
     display_soft_limit = reduce_target_notional if reduce_target_notional > 0 else _safe_float(threshold_position_notional)
     current_long_notional = max(synthetic_net_qty, 0.0) * mid_price
     current_short_notional = max(-synthetic_net_qty, 0.0) * mid_price
@@ -3312,6 +3376,7 @@ def _build_spot_competition_inventory_grid_orders(
         "spot_freeze_tolerance_qty": max(_safe_float(spot_freeze_tolerance_qty), 0.0),
         "spot_base_restore_only": bool(spot_base_restore_only),
         "spot_base_restore_only_status": base_restore_only,
+        "synthetic_base_sell_floor": synthetic_sell_floor,
         "current_long_notional": current_long_notional,
         "current_short_notional": current_short_notional,
         "synthetic_freeze_enabled": bool(synthetic_neutral and synthetic_freeze_enabled),

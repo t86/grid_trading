@@ -3223,7 +3223,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(controls["direction_state"], "flat")
         self.assertEqual(controls["risk_state"], "normal")
 
-    def test_build_spot_competition_synthetic_neutral_grid_orders_opens_both_sides_from_base(self) -> None:
+    def test_build_spot_competition_synthetic_neutral_grid_orders_preserves_base_from_neutral(self) -> None:
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(
             state={
                 "known_orders": {},
@@ -3251,11 +3251,9 @@ class SpotLoopRunnerTests(unittest.TestCase):
             spot_freeze_tolerance_qty=0.2,
         )
 
-        self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY", "SELL", "SELL"])
+        self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY"])
         self.assertLess(desired_orders[0]["price"], 0.099)
         self.assertLess(desired_orders[1]["price"], desired_orders[0]["price"])
-        self.assertGreater(desired_orders[2]["price"], 0.101)
-        self.assertGreater(desired_orders[3]["price"], desired_orders[2]["price"])
         self.assertEqual(controls["mode"], "competition_synthetic_neutral_grid")
         self.assertEqual(controls["direction_state"], "flat")
         self.assertAlmostEqual(controls["neutral_base_qty"], 1000.0)
@@ -3264,6 +3262,43 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(controls["current_short_notional"], 0.0)
         self.assertAlmostEqual(controls["max_short_position_notional"], 80.0)
         self.assertAlmostEqual(controls["spot_freeze_tolerance_qty"], 0.2)
+        self.assertTrue(controls["synthetic_base_sell_floor"]["active"])
+        self.assertEqual(controls["synthetic_base_sell_floor"]["dropped_sell_orders"], 2)
+
+    def test_build_spot_competition_synthetic_neutral_grid_sells_only_excess_above_base_floor(self) -> None:
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state={
+                "known_orders": {},
+                "inventory_lots": [],
+            },
+            trades=[],
+            bid_price=99.0,
+            ask_price=101.0,
+            step_price=2.0,
+            buy_levels=1,
+            sell_levels=2,
+            first_order_multiplier=1.0,
+            per_order_notional=100.0,
+            threshold_position_notional=200.0,
+            threshold_reduce_target_notional=50.0,
+            max_order_position_notional=300.0,
+            max_position_notional=500.0,
+            tick_size=0.1,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=1.0,
+            max_short_position_notional=200.0,
+            actual_base_qty=2.0,
+        )
+
+        sell_orders = [order for order in desired_orders if order["side"] == "SELL"]
+        self.assertTrue(sell_orders)
+        self.assertLessEqual(sum(order["qty"] for order in sell_orders), 0.5 + 1e-12)
+        self.assertTrue(any(order.get("synthetic_base_sell_floor_capped") for order in sell_orders))
+        self.assertAlmostEqual(controls["synthetic_base_sell_floor"]["floor_qty"], 1.5)
+        self.assertAlmostEqual(controls["synthetic_base_sell_floor"]["available_sell_qty"], 0.5)
 
     def test_build_spot_competition_synthetic_neutral_grid_ignores_frozen_short_for_spot(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="futures")
@@ -3367,7 +3402,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
             actual_base_qty=1000.0,
         )
 
-        self.assertEqual({order["side"] for order in desired_orders}, {"SELL"})
+        self.assertEqual(desired_orders, [])
 
     def test_spot_base_restore_only_buys_back_base_without_selling(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="futures")
@@ -3501,11 +3536,9 @@ class SpotLoopRunnerTests(unittest.TestCase):
             actual_base_qty=7871.5,
         )
 
-        self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY", "SELL", "SELL"])
+        self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY"])
         self.assertLess(desired_orders[0]["price"], 0.0901)
         self.assertLess(desired_orders[1]["price"], desired_orders[0]["price"])
-        self.assertGreater(desired_orders[2]["price"], 0.0902)
-        self.assertGreater(desired_orders[3]["price"], desired_orders[2]["price"])
         self.assertEqual(controls["direction_state"], "flat")
         self.assertEqual(controls["risk_state"], "normal")
         self.assertAlmostEqual(controls["synthetic_net_qty"], 0.0)
@@ -3621,7 +3654,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         buy_prices = [order["price"] for order in desired_orders if order["side"] == "BUY"]
         sell_prices = [order["price"] for order in desired_orders if order["side"] == "SELL"]
         self.assertEqual(buy_prices, [682.58, 682.46, 682.34])
-        self.assertEqual(sell_prices, [682.92, 683.04, 683.16])
+        self.assertEqual(sell_prices, [])
         self.assertAlmostEqual(controls["base_step_price"], 0.06)
         self.assertAlmostEqual(controls["effective_step_price"], 0.12)
         self.assertTrue(controls["slow_trend_step"]["active"])
@@ -3677,7 +3710,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
             actual_base_qty=29931.0,
         )
 
-        self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY", "SELL", "SELL"])
+        self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY"])
         self.assertEqual(controls["direction_state"], "flat")
         self.assertAlmostEqual(controls["synthetic_net_qty"], 0.0)
         self.assertAlmostEqual(controls["actual_base_qty"], 29931.0)
@@ -3734,7 +3767,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
             actual_base_qty=29931.0,
         )
 
-        self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY", "SELL", "SELL"])
+        self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY"])
         self.assertEqual(controls["direction_state"], "flat")
         self.assertEqual(controls["risk_state"], "normal")
         self.assertEqual(
@@ -4229,7 +4262,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
             synthetic_freeze_release_profit_ratio=0.01,
         )
 
-        self.assertEqual([order["role"] for order in desired_orders], ["grid_entry", "grid_entry", "grid_entry", "grid_exit"])
+        self.assertEqual([order["role"] for order in desired_orders], ["grid_entry", "grid_entry", "grid_entry"])
         self.assertNotIn("synthetic_frozen_release", [order["role"] for order in desired_orders])
         cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
         self.assertEqual(cached_runtime["frozen_position_lots"], [])
@@ -5245,7 +5278,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
 
         cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
         roles = {str(order.get("role")) for order in desired_orders}
-        self.assertIn("grid_exit", roles)
+        self.assertNotIn("grid_exit", roles)
         self.assertIn("grid_entry", roles)
         self.assertEqual(cached_runtime["position_lots"][0]["source_role"], "synthetic_recovery")
         self.assertEqual(cached_runtime["recovery_mode"], "live")
