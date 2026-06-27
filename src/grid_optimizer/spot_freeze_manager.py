@@ -93,7 +93,8 @@ def pending_signed_short_delta(ledger: dict[str, Any]) -> float:
 
 def expected_short_position_now(base_hedge_qty: float, ledger: dict[str, Any]) -> float:
     long_qty, short_qty = ledger_totals(ledger)
-    expected_short = max(_safe_float(base_hedge_qty), 0.0) + long_qty + short_qty
+    del long_qty
+    expected_short = max(_safe_float(base_hedge_qty), 0.0) + short_qty
     return expected_short - pending_signed_short_delta(ledger)
 
 
@@ -351,7 +352,7 @@ def _apply_profit_release(
     mark = _safe_float(mark_price)
     threshold = max(_safe_float(release_profit_ratio), 0.0)
     for lot_key, contract_side, side_name in (
-        ("long_lots", "SELL", "long"),
+        ("long_lots", "", "long"),
         ("short_lots", "BUY", "short"),
     ):
         original_lots = [dict(lot) for lot in ledger.get(lot_key, [])]
@@ -373,12 +374,13 @@ def _apply_profit_release(
                 kept.append(dict(lot))
                 actions.append({"type": "profit_release_dry_run", "side": side_name, "qty": qty, "profit_ratio": profit_ratio})
                 continue
-            try:
-                place_contract(symbol=symbol, side=contract_side, qty=qty, position_side="SHORT")
-            except Exception:
-                kept.append(dict(lot))
-                alerts.append("profit_release_contract_failed")
-                continue
+            if contract_side:
+                try:
+                    place_contract(symbol=symbol, side=contract_side, qty=qty, position_side="SHORT")
+                except Exception:
+                    kept.append(dict(lot))
+                    alerts.append("profit_release_contract_failed")
+                    continue
             actions.append({"type": "profit_release", "side": side_name, "qty": qty, "profit_ratio": profit_ratio})
             ledger[lot_key] = kept + [dict(item) for item in original_lots[index + 1 :]]
             ledger_totals(ledger)
@@ -504,18 +506,15 @@ def freeze_cycle(
         max_qty = min(max_qty, max((cap - frozen_notional) / mid, 0.0))
     qty = _round_down_qty(max_qty, qty_step)
     if qty <= EPSILON:
-        if is_long_deviation:
-            alerts.append("insufficient_short_hedge_to_freeze_long")
-        elif short_capacity_exhausted:
+        if short_capacity_exhausted:
             alerts.append("short_hedge_capacity_exhausted")
         else:
             alerts.append("qty_too_small")
         return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
 
-    spot_side = "SELL" if is_long_deviation else "BUY"
     contract_side = "SELL"
     lot_key = "long_lots" if is_long_deviation else "short_lots"
-    reason = "freeze_long_hedge" if is_long_deviation else "freeze_short_hedge"
+    reason = "freeze_long_spot_only" if is_long_deviation else "freeze_short_hedge"
     lot_id = f"spot_freeze_{len(working['long_lots']) + len(working['short_lots']) + 1}"
 
     if dry_run:
@@ -527,7 +526,7 @@ def freeze_cycle(
         spot_response: dict[str, Any] = {}
     else:
         try:
-            spot_response = place_spot(symbol=symbol, side=spot_side, qty=qty)
+            spot_response = place_spot(symbol=symbol, side="BUY", qty=qty)
         except Exception as exc:
             alerts.append(f"spot_failed: {type(exc).__name__}: {exc}")
             return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
@@ -544,21 +543,21 @@ def freeze_cycle(
         "frozen_mid": mid,
         "hedge_pending": False,
     }
-    try:
-        contract_response = place_contract(symbol=symbol, side=contract_side, qty=filled_qty, position_side="SHORT")
-        contract_price = _avg_contract_price(contract_response if isinstance(contract_response, dict) else {}, mid)
-        if contract_side == "SELL":
+    if is_long_deviation:
+        actions.append({"type": "freeze", "side": "long", "qty": filled_qty, "mode": "spot_only"})
+    else:
+        try:
+            contract_response = place_contract(symbol=symbol, side=contract_side, qty=filled_qty, position_side="SHORT")
+            contract_price = _avg_contract_price(contract_response if isinstance(contract_response, dict) else {}, mid)
             lot["contract_entry_price"] = contract_price
-        else:
-            lot["contract_exit_price"] = contract_price
-        actions.append({"type": "freeze", "side": "long" if is_long_deviation else "short", "qty": filled_qty})
-    except Exception:
-        lot["hedge_pending"] = True
-        working["pending_contract_actions"].append(
-            {"side": contract_side, "position_side": "SHORT", "qty": filled_qty, "reason": reason, "lot_id": lot_id}
-        )
-        alerts.append("contract_failed")
-        actions.append({"type": "freeze_pending", "side": "long" if is_long_deviation else "short", "qty": filled_qty})
+            actions.append({"type": "freeze", "side": "short", "qty": filled_qty})
+        except Exception:
+            lot["hedge_pending"] = True
+            working["pending_contract_actions"].append(
+                {"side": contract_side, "position_side": "SHORT", "qty": filled_qty, "reason": reason, "lot_id": lot_id}
+            )
+            alerts.append("contract_failed")
+            actions.append({"type": "freeze_pending", "side": "short", "qty": filled_qty})
 
     working[lot_key].append(lot)
     ledger_totals(working)

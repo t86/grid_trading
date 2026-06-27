@@ -2156,8 +2156,8 @@ def _record_spot_freeze_maker_fill(
     ledger.setdefault("pending_contract_actions", [])
     lot_side = "long" if normalized_side == "SELL" else "short"
     lot_key = "long_lots" if lot_side == "long" else "short_lots"
-    contract_side = "BUY" if lot_side == "long" else "SELL"
-    reason = "freeze_long_hedge" if lot_side == "long" else "freeze_short_hedge"
+    contract_side = "" if lot_side == "long" else "SELL"
+    reason = "freeze_long_spot_only" if lot_side == "long" else "freeze_short_hedge"
     lot_id = f"spot_freeze_maker_{trade_id}"
     if any(str(lot.get("lot_id") or "") == lot_id for lot in list(ledger.get("long_lots") or []) + list(ledger.get("short_lots") or [])):
         return
@@ -2170,14 +2170,15 @@ def _record_spot_freeze_maker_fill(
             "cost_price": fill_price,
             "frozen_at": _safe_int(trade.get("time")),
             "frozen_mid": fill_price,
-            "hedge_pending": True,
+            "hedge_pending": bool(contract_side),
             "spot_order_id": _safe_int(trade.get("orderId")),
             "spot_trade_id": trade_id,
         }
     )
-    ledger["pending_contract_actions"].append(
-        {"side": contract_side, "position_side": "SHORT", "qty": freeze_qty, "reason": reason, "lot_id": lot_id}
-    )
+    if contract_side:
+        ledger["pending_contract_actions"].append(
+            {"side": contract_side, "position_side": "SHORT", "qty": freeze_qty, "reason": reason, "lot_id": lot_id}
+        )
     ledger_totals(ledger)
     state["spot_frozen_ledger"] = ledger
 

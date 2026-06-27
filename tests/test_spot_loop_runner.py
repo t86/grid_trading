@@ -2449,7 +2449,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
                 "grid_optimizer.spot_loop_runner.fetch_futures_position_risk_v3",
                 return_value=[
                     {"symbol": "WLDUSDT", "positionSide": "LONG", "positionAmt": "0"},
-                    {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-110"},
+                    {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-100"},
                 ],
             ):
                 with patch("grid_optimizer.spot_loop_runner.fetch_futures_symbol_config", return_value={"step_size": 0.001}):
@@ -2470,7 +2470,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
                         )
 
         kwargs = mock_cycle.call_args.kwargs
-        self.assertEqual(kwargs["contract_short_qty"], 110.0)
+        self.assertEqual(kwargs["contract_short_qty"], 100.0)
         self.assertEqual(kwargs["base_hedge_qty"], 100.0)
         self.assertEqual(controls["spot_freeze_gate"]["reason"], "ok")
 
@@ -2651,19 +2651,8 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(applied, 1)
         self.assertEqual(ledger["long_lots"][0]["qty"], 3.5)
         self.assertEqual(ledger["long_lots"][0]["cost_price"], 10.0)
-        self.assertTrue(ledger["long_lots"][0]["hedge_pending"])
-        self.assertEqual(
-            ledger["pending_contract_actions"],
-            [
-                {
-                    "side": "BUY",
-                    "position_side": "SHORT",
-                    "qty": 3.5,
-                    "reason": "freeze_long_hedge",
-                    "lot_id": "spot_freeze_maker_9001",
-                }
-            ],
-        )
+        self.assertFalse(ledger["long_lots"][0]["hedge_pending"])
+        self.assertEqual(ledger["pending_contract_actions"], [])
         self.assertEqual(ledger["frozen_long_qty"], 3.5)
 
     def test_sync_synthetic_neutral_spot_freeze_maker_buy_fill_records_short_pending_contract(self) -> None:
