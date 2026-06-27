@@ -518,8 +518,8 @@ def freeze_cycle(
 
     try:
         spot_response = place_spot(symbol=symbol, side=spot_side, qty=qty)
-    except Exception:
-        alerts.append("spot_failed")
+    except Exception as exc:
+        alerts.append(f"spot_failed: {type(exc).__name__}: {exc}")
         return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
     filled_qty = _round_down_qty(_safe_float(spot_response.get("executedQty")), qty_step)
     if filled_qty <= EPSILON:
