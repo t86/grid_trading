@@ -500,13 +500,16 @@ def test_pending_repair_failure_keeps_pending_and_blocks_new_freeze() -> None:
     assert "pending_contract_failed" in result["alerts"]
 
 
-def test_reconcile_drift_blocks_all_orders() -> None:
+def test_reconcile_drift_is_recorded_without_blocking_freeze_cycle() -> None:
     result, rec = run_cycle(contract_short_qty=99.0)
 
     assert result["reconcile_ok"] is False
-    assert rec.spot_orders == []
-    assert rec.contract_orders == []
+    assert rec.spot_orders
+    assert rec.contract_orders
     assert "reconcile_drift" in result["alerts"][0]
+    assert result["ledger"]["last_contract_short_qty"] == 99.0
+    assert result["ledger"]["last_expected_short_qty"] == 100.0
+    assert result["ledger"]["last_short_drift_qty"] == -1.0
 
 
 def test_dry_run_records_actions_without_calling_callbacks() -> None:

@@ -398,10 +398,13 @@ def freeze_cycle(
     alerts: list[str] = []
 
     reconcile_ok, expected_short = reconcile_short_position(base_hedge_qty, contract_short_qty, working, tolerance_qty)
+    result_reconcile_ok = bool(reconcile_ok)
     working["last_reconcile_at"] = now
+    working["last_contract_short_qty"] = max(_safe_float(contract_short_qty), 0.0)
+    working["last_expected_short_qty"] = expected_short
+    working["last_short_drift_qty"] = max(_safe_float(contract_short_qty), 0.0) - expected_short
     if not reconcile_ok:
         alerts.append(f"reconcile_drift: real={contract_short_qty} expected={expected_short}")
-        return {"ledger": working, "actions": actions, "reconcile_ok": False, "alerts": alerts}
 
     if working.get("pending_contract_actions"):
         _repair_pending_actions(
@@ -415,12 +418,12 @@ def freeze_cycle(
         )
         ledger_totals(working)
         if working.get("pending_contract_actions"):
-            return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
+            return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
 
     available_short_qty = expected_short_position_now(base_hedge_qty, working)
     if not config.enabled:
         ledger_totals(working)
-        return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
+        return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
 
     if config.pair_release_enabled:
         _apply_pair_release(working, actions)
@@ -443,14 +446,14 @@ def freeze_cycle(
     deviation_notional = abs(deviation_qty_signed) * mid
     if mid <= EPSILON or deviation_notional <= max(_safe_float(config.deviation_notional), 0.0) + EPSILON:
         ledger_totals(working)
-        return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
+        return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
     if not loss_ratio_usable:
         alerts.append("cost_not_usable")
         ledger_totals(working)
-        return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
+        return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
     if _safe_float(deviation_loss_ratio) + EPSILON < max(_safe_float(config.min_loss_ratio), 0.0):
         ledger_totals(working)
-        return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
+        return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
 
     is_long_deviation = deviation_qty_signed > 0.0
     side_name = "long" if is_long_deviation else "short"
@@ -463,10 +466,10 @@ def freeze_cycle(
     if side_cap_mode:
         if side_cap > EPSILON and side_frozen_notional + EPSILON >= side_cap:
             alerts.append(f"{side_name}_total_cap_reached")
-            return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
+            return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
     elif cap > EPSILON and frozen_notional + EPSILON >= cap:
         alerts.append("total_cap_reached")
-        return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
+        return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
 
     max_qty = abs(deviation_qty_signed)
     short_capacity_exhausted = False
@@ -494,7 +497,7 @@ def freeze_cycle(
             alerts.append("short_hedge_capacity_exhausted")
         else:
             alerts.append("qty_too_small")
-        return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
+        return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
 
     spot_side = "SELL" if is_long_deviation else "BUY"
     contract_side = "BUY" if is_long_deviation else "SELL"
@@ -504,17 +507,17 @@ def freeze_cycle(
 
     if dry_run:
         actions.append({"type": "freeze_dry_run", "side": "long" if is_long_deviation else "short", "qty": qty})
-        return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
+        return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
 
     try:
         spot_response = place_spot(symbol=symbol, side=spot_side, qty=qty)
     except Exception:
         alerts.append("spot_failed")
-        return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
+        return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
     filled_qty = _round_down_qty(_safe_float(spot_response.get("executedQty")), qty_step)
     if filled_qty <= EPSILON:
         alerts.append("spot_no_fill")
-        return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
+        return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
 
     lot = {
         "lot_id": lot_id,
@@ -538,4 +541,4 @@ def freeze_cycle(
     working[lot_key].append(lot)
     ledger_totals(working)
     _notify_ledger_change(working, on_ledger_change)
-    return {"ledger": working, "actions": actions, "reconcile_ok": True, "alerts": alerts}
+    return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}

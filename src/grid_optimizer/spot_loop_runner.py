@@ -1679,13 +1679,7 @@ def _apply_spot_freeze_runtime_hedge_block(
         return desired_orders
     skip_reason = str(controls.get("spot_freeze_skip_reason", "") or "").strip()
     blocking_reasons = {
-        "hedge_gate_failed",
-        "insufficient_short_hedge_to_freeze_long",
         "pending_contract_unrepaired",
-        "total_cap_reached",
-        "long_total_cap_reached",
-        "short_total_cap_reached",
-        "short_hedge_capacity_exhausted",
     }
     if skip_reason not in blocking_reasons:
         return desired_orders
@@ -3268,6 +3262,25 @@ def _spot_freeze_position_side_qty(position_risk: list[dict[str, Any]], symbol: 
     return 0.0
 
 
+def _spot_freeze_position_side_snapshot(position_risk: list[dict[str, Any]], symbol: str, position_side: str) -> dict[str, Any]:
+    wanted_symbol = str(symbol or "").upper().strip()
+    wanted_side = str(position_side or "").upper().strip()
+    for row in position_risk:
+        if str(row.get("symbol", "") or "").upper().strip() != wanted_symbol:
+            continue
+        if str(row.get("positionSide", row.get("position_side", "")) or "").upper().strip() != wanted_side:
+            continue
+        qty = abs(_safe_float(row.get("positionAmt", row.get("position_amt"))))
+        return {
+            "qty": qty,
+            "entry_price": _safe_float(row.get("entryPrice", row.get("entry_price"))),
+            "mark_price": _safe_float(row.get("markPrice", row.get("mark_price"))),
+            "unrealized_pnl": _safe_float(row.get("unRealizedProfit", row.get("unrealized_pnl"))),
+            "notional": abs(_safe_float(row.get("notional"))) if row.get("notional") is not None else 0.0,
+        }
+    return {"qty": 0.0, "entry_price": 0.0, "mark_price": 0.0, "unrealized_pnl": 0.0, "notional": 0.0}
+
+
 def _check_spot_freeze_hedge_gate(
     *,
     symbol: str,
@@ -3277,24 +3290,39 @@ def _check_spot_freeze_hedge_gate(
     tolerance_qty: float,
     expected_short_qty: float | None = None,
 ) -> dict[str, Any]:
-    if not _truthy(position_mode.get("dualSidePosition")):
-        return {"ok": False, "reason": "not_hedge_mode", "contract_short_qty": 0.0, "contract_long_qty": 0.0}
     tolerance = max(_safe_float(tolerance_qty), 0.0)
-    long_qty = _spot_freeze_position_side_qty(position_risk, symbol, "LONG")
-    short_qty = _spot_freeze_position_side_qty(position_risk, symbol, "SHORT")
-    if long_qty > tolerance + EPSILON:
-        return {"ok": False, "reason": "long_position_not_zero", "contract_short_qty": short_qty, "contract_long_qty": long_qty}
+    long_snapshot = _spot_freeze_position_side_snapshot(position_risk, symbol, "LONG")
+    short_snapshot = _spot_freeze_position_side_snapshot(position_risk, symbol, "SHORT")
+    long_qty = _safe_float(long_snapshot.get("qty"))
+    short_qty = _safe_float(short_snapshot.get("qty"))
     base_qty = max(_safe_float(base_hedge_qty), 0.0)
     expected_short = base_qty if expected_short_qty is None else max(_safe_float(expected_short_qty), 0.0)
-    if abs(short_qty - expected_short) > tolerance + EPSILON:
-        return {
-            "ok": False,
-            "reason": "short_position_base_mismatch",
-            "contract_short_qty": short_qty,
-            "contract_long_qty": long_qty,
-            "expected_short_qty": expected_short,
-        }
-    return {"ok": True, "reason": "ok", "contract_short_qty": short_qty, "contract_long_qty": long_qty, "expected_short_qty": expected_short}
+    short_drift_qty = short_qty - expected_short
+    observations: list[str] = []
+    if not _truthy(position_mode.get("dualSidePosition")):
+        observations.append("not_hedge_mode")
+    if long_qty > tolerance + EPSILON:
+        observations.append("long_position_not_zero")
+    if abs(short_drift_qty) > tolerance + EPSILON:
+        observations.append("short_position_base_mismatch")
+    return {
+        "ok": True,
+        "reason": "observed" if observations else "ok",
+        "observations": observations,
+        "contract_short_qty": short_qty,
+        "contract_long_qty": long_qty,
+        "expected_short_qty": expected_short,
+        "short_drift_qty": short_drift_qty,
+        "tolerance_qty": tolerance,
+        "contract_short_entry_price": _safe_float(short_snapshot.get("entry_price")),
+        "contract_long_entry_price": _safe_float(long_snapshot.get("entry_price")),
+        "contract_short_mark_price": _safe_float(short_snapshot.get("mark_price")),
+        "contract_long_mark_price": _safe_float(long_snapshot.get("mark_price")),
+        "contract_short_unrealized_pnl": _safe_float(short_snapshot.get("unrealized_pnl")),
+        "contract_long_unrealized_pnl": _safe_float(long_snapshot.get("unrealized_pnl")),
+        "contract_short_notional": _safe_float(short_snapshot.get("notional")),
+        "contract_long_notional": _safe_float(long_snapshot.get("notional")),
+    }
 
 
 def _make_spot_freeze_spot_market_callback(*, symbol: str, api_key: str, api_secret: str):
@@ -3567,10 +3595,9 @@ def _maybe_run_spot_freeze(
         expected_short_qty=expected_short_qty,
     )
     controls["spot_freeze_gate"] = gate
-    if not bool(gate.get("ok")):
-        controls["spot_freeze_alerts"] = [str(gate.get("reason") or "gate_failed")]
-        controls["spot_freeze_skip_reason"] = "hedge_gate_failed"
-        return
+    gate_observations = [str(item) for item in list(gate.get("observations") or []) if str(item)]
+    if gate_observations:
+        controls["spot_freeze_alerts"] = gate_observations
     try:
         qty_step = _spot_freeze_common_qty_step(symbol, symbol_info)
     except Exception:

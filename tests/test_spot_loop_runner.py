@@ -1259,7 +1259,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(filtered, [])
         self.assertEqual(controls["spot_app_loss_guard"]["injected_order_count"], 0)
 
-    def test_spot_freeze_gate_rejects_non_hedge_mode(self) -> None:
+    def test_spot_freeze_gate_observes_non_hedge_mode_without_blocking(self) -> None:
         gate = _check_spot_freeze_hedge_gate(
             symbol="WLDUSDT",
             position_mode={"dualSidePosition": False},
@@ -1268,25 +1268,37 @@ class SpotLoopRunnerTests(unittest.TestCase):
             tolerance_qty=0.01,
         )
 
-        self.assertFalse(gate["ok"])
-        self.assertEqual(gate["reason"], "not_hedge_mode")
+        self.assertTrue(gate["ok"])
+        self.assertEqual(gate["reason"], "observed")
+        self.assertEqual(gate["observations"], ["not_hedge_mode", "short_position_base_mismatch"])
 
-    def test_spot_freeze_gate_rejects_existing_long_position(self) -> None:
+    def test_spot_freeze_gate_observes_existing_long_position_with_cost(self) -> None:
         gate = _check_spot_freeze_hedge_gate(
             symbol="WLDUSDT",
             position_mode={"dualSidePosition": True},
             position_risk=[
-                {"symbol": "WLDUSDT", "positionSide": "LONG", "positionAmt": "0.5"},
-                {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-100"},
+                {
+                    "symbol": "WLDUSDT",
+                    "positionSide": "LONG",
+                    "positionAmt": "0.5",
+                    "entryPrice": "8.5",
+                    "markPrice": "8.0",
+                    "unRealizedProfit": "-0.25",
+                },
+                {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-100", "entryPrice": "9.5"},
             ],
             base_hedge_qty=100.0,
             tolerance_qty=0.01,
         )
 
-        self.assertFalse(gate["ok"])
-        self.assertEqual(gate["reason"], "long_position_not_zero")
+        self.assertTrue(gate["ok"])
+        self.assertEqual(gate["reason"], "observed")
+        self.assertEqual(gate["observations"], ["long_position_not_zero"])
+        self.assertEqual(gate["contract_long_qty"], 0.5)
+        self.assertEqual(gate["contract_long_entry_price"], 8.5)
+        self.assertEqual(gate["contract_short_entry_price"], 9.5)
 
-    def test_spot_freeze_gate_rejects_short_position_not_matching_base_hedge(self) -> None:
+    def test_spot_freeze_gate_observes_short_position_not_matching_base_hedge(self) -> None:
         gate = _check_spot_freeze_hedge_gate(
             symbol="WLDUSDT",
             position_mode={"dualSidePosition": True},
@@ -1298,8 +1310,10 @@ class SpotLoopRunnerTests(unittest.TestCase):
             tolerance_qty=0.01,
         )
 
-        self.assertFalse(gate["ok"])
-        self.assertEqual(gate["reason"], "short_position_base_mismatch")
+        self.assertTrue(gate["ok"])
+        self.assertEqual(gate["reason"], "observed")
+        self.assertEqual(gate["observations"], ["short_position_base_mismatch"])
+        self.assertEqual(gate["short_drift_qty"], -5.0)
 
     def test_spot_freeze_contract_wrapper_uses_position_side_short_without_reduce_kwargs(self) -> None:
         with patch("grid_optimizer.spot_loop_runner.post_futures_market_order", return_value={"executedQty": "2"}) as mock_post:
@@ -1810,7 +1824,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(controls["spot_freeze_skip_reason"], "long_total_cap_reached")
         self.assertEqual(controls["spot_freeze_maker_orders"], [])
 
-    def test_spot_freeze_long_maker_fails_closed_when_short_hedge_is_unavailable(self) -> None:
+    def test_spot_freeze_long_maker_records_unavailable_short_hedge_without_blocking_orders(self) -> None:
         args = self._synthetic_args(
             [
                 "--apply",
@@ -1873,9 +1887,14 @@ class SpotLoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(controls["spot_freeze_skip_reason"], "insufficient_short_hedge_to_freeze_long")
         self.assertEqual(controls["spot_freeze_maker_orders"], [])
-        self.assertEqual(filtered, [])
-        self.assertTrue(controls["spot_freeze_runtime_blocked"])
-        self.assertEqual(controls["risk_state"], "spot_freeze_insufficient_short_hedge_to_freeze_long")
+        self.assertEqual(
+            filtered,
+            [
+                {"side": "BUY", "price": 9.99, "qty": 1.0},
+                {"side": "SELL", "price": 10.01, "qty": 1.0},
+            ],
+        )
+        self.assertFalse(controls["spot_freeze_runtime_blocked"])
 
     def test_spot_freeze_maker_execution_builds_short_side_buy_order(self) -> None:
         args = self._synthetic_args(
@@ -2791,7 +2810,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual([order["role"] for order in filtered], ["spot_freeze_maker"])
         self.assertEqual(controls["spot_freeze_suppressed_app_loss_reduce_orders"], 1)
 
-    def test_spot_freeze_runtime_hedge_block_clears_orders_when_gate_failed(self) -> None:
+    def test_spot_freeze_runtime_hedge_block_keeps_orders_when_gate_failed_observation(self) -> None:
         controls = {
             "spot_freeze_enabled": True,
             "spot_freeze_skip_reason": "hedge_gate_failed",
@@ -2808,13 +2827,12 @@ class SpotLoopRunnerTests(unittest.TestCase):
             controls=controls,
         )
 
-        self.assertEqual(filtered, [])
-        self.assertTrue(controls["spot_freeze_runtime_blocked"])
-        self.assertTrue(controls["buy_paused"])
-        self.assertEqual(controls["risk_state"], "spot_freeze_hedge_gate_failed")
-        self.assertEqual(controls["pause_reasons"], ["existing_reason", "spot_freeze_hedge_gate_failed"])
+        self.assertEqual(filtered, desired_orders)
+        self.assertFalse(controls["spot_freeze_runtime_blocked"])
+        self.assertNotIn("buy_paused", controls)
+        self.assertEqual(controls["pause_reasons"], ["existing_reason"])
 
-    def test_spot_freeze_runtime_block_clears_orders_when_capacity_is_exhausted(self) -> None:
+    def test_spot_freeze_runtime_block_keeps_orders_when_capacity_is_exhausted(self) -> None:
         for skip_reason in (
             "total_cap_reached",
             "long_total_cap_reached",
@@ -2839,12 +2857,10 @@ class SpotLoopRunnerTests(unittest.TestCase):
                     controls=controls,
                 )
 
-                expected_reason = f"spot_freeze_{skip_reason}"
-                self.assertEqual(filtered, [])
-                self.assertTrue(controls["spot_freeze_runtime_blocked"])
-                self.assertTrue(controls["buy_paused"])
-                self.assertEqual(controls["risk_state"], expected_reason)
-                self.assertEqual(controls["pause_reasons"], ["existing_reason", expected_reason])
+                self.assertEqual(filtered, desired_orders)
+                self.assertFalse(controls["spot_freeze_runtime_blocked"])
+                self.assertNotIn("buy_paused", controls)
+                self.assertEqual(controls["pause_reasons"], ["existing_reason"])
 
     def test_spot_freeze_runtime_hedge_block_keeps_orders_when_gate_ok(self) -> None:
         controls = {
