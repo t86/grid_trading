@@ -328,6 +328,25 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(summary["equity_pnl"], summary["contract_pnl"])
         self.assertAlmostEqual(summary["equity_loss"], -summary["equity_pnl"])
 
+    def test_spot_equity_pnl_offsets_initial_base_buy_when_it_is_already_in_trade_metrics(self) -> None:
+        summary = _build_spot_equity_pnl_summary(
+            state={},
+            metrics={
+                "equity_initial_base_qty": 0.12,
+                "equity_initial_base_notional": 189.24,
+                "equity_buy_notional_offset": 189.24,
+                "buy_notional": 189.24,
+                "sell_notional": 0.0,
+            },
+            actual_base_qty=0.12,
+            latest_price=1577.0,
+            mark_price=1577.0,
+        )
+
+        self.assertAlmostEqual(summary["initial_base_cost"], 189.24)
+        self.assertAlmostEqual(summary["buy_notional"], 0.0)
+        self.assertAlmostEqual(summary["spot_cashflow_pnl"], 0.0)
+
     def test_spot_app_loss_metrics_falls_back_to_raw_mytrades_when_state_window_empty(self) -> None:
         metrics = _spot_app_loss_metrics_with_trade_fallback(
             metrics={"buy_notional": 0.0, "sell_notional": 0.0, "buy_qty": 0.0, "sell_qty": 0.0},

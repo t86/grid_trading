@@ -361,9 +361,18 @@ def _build_spot_equity_pnl_summary(
     latest_price: float,
     mark_price: float,
 ) -> dict[str, Any]:
-    baseline_notional = max(_safe_float(metrics.get("app_loss_baseline_notional")), 0.0)
-    baseline_qty = max(_safe_float(metrics.get("app_loss_baseline_qty")), 0.0)
-    trade_buy_notional = max(_safe_float(metrics.get("buy_notional")), 0.0)
+    baseline_notional = max(
+        _safe_float(metrics.get("equity_initial_base_notional"))
+        or _safe_float(metrics.get("app_loss_baseline_notional")),
+        0.0,
+    )
+    baseline_qty = max(
+        _safe_float(metrics.get("equity_initial_base_qty"))
+        or _safe_float(metrics.get("app_loss_baseline_qty")),
+        0.0,
+    )
+    buy_offset = max(_safe_float(metrics.get("equity_buy_notional_offset")), 0.0)
+    trade_buy_notional = max(_safe_float(metrics.get("buy_notional")) - buy_offset, 0.0)
     trade_sell_notional = max(_safe_float(metrics.get("sell_notional")), 0.0)
     position_value = max(_safe_float(actual_base_qty), 0.0) * max(_safe_float(latest_price), 0.0)
     base_hedge_pnl, base_hedge_qty = _sum_base_hedge_contract_pnl(state, mark_price)
