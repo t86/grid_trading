@@ -37,15 +37,15 @@ def test_ledger_totals_sums_lots_and_refreshes_summary_fields() -> None:
     assert ledger["frozen_short_qty"] == 3.0
 
 
-def test_pending_signed_short_delta_buy_reduces_short_sell_increases_short() -> None:
+def test_pending_signed_short_delta_tracks_short_side_actions() -> None:
     ledger = new_ledger()
     ledger["pending_contract_actions"] = [
-        {"side": "BUY", "position_side": "SHORT", "qty": 2.0, "reason": "freeze_long_hedge", "lot_id": "L1"},
+        {"side": "SELL", "position_side": "SHORT", "qty": 2.0, "reason": "freeze_long_hedge", "lot_id": "L1"},
         {"side": "SELL", "position_side": "SHORT", "qty": 1.0, "reason": "freeze_short_hedge", "lot_id": "S1"},
         {"side": "BUY", "position_side": "LONG", "qty": 9.0, "reason": "ignore", "lot_id": "bad"},
     ]
 
-    assert pending_signed_short_delta(ledger) == -1.0
+    assert pending_signed_short_delta(ledger) == 3.0
 
 
 def test_expected_short_position_now_removes_pending_effect_from_ledger_expectation() -> None:
@@ -53,11 +53,11 @@ def test_expected_short_position_now_removes_pending_effect_from_ledger_expectat
     ledger["long_lots"] = [{"qty": 10.0}]
     ledger["short_lots"] = [{"qty": 3.0}]
     ledger["pending_contract_actions"] = [
-        {"side": "BUY", "position_side": "SHORT", "qty": 2.0, "reason": "freeze_long_hedge", "lot_id": "L1"},
+        {"side": "SELL", "position_side": "SHORT", "qty": 2.0, "reason": "freeze_long_hedge", "lot_id": "L1"},
         {"side": "SELL", "position_side": "SHORT", "qty": 1.0, "reason": "freeze_short_hedge", "lot_id": "S1"},
     ]
 
-    assert expected_short_position_now(100.0, ledger) == 94.0
+    assert expected_short_position_now(100.0, ledger) == 110.0
 
 
 def test_reconcile_short_position_accepts_within_tolerance_and_rejects_drift() -> None:
@@ -65,12 +65,12 @@ def test_reconcile_short_position_accepts_within_tolerance_and_rejects_drift() -
     ledger["long_lots"] = [{"qty": 10.0}]
     ledger["short_lots"] = [{"qty": 3.0}]
     ledger["pending_contract_actions"] = [
-        {"side": "BUY", "position_side": "SHORT", "qty": 2.0, "reason": "freeze_long_hedge", "lot_id": "L1"},
+        {"side": "SELL", "position_side": "SHORT", "qty": 2.0, "reason": "freeze_long_hedge", "lot_id": "L1"},
         {"side": "SELL", "position_side": "SHORT", "qty": 1.0, "reason": "freeze_short_hedge", "lot_id": "S1"},
     ]
 
-    assert reconcile_short_position(100.0, 94.0, ledger, 0.01) == (True, 94.0)
-    assert reconcile_short_position(100.0, 95.5, ledger, 0.01) == (False, 94.0)
+    assert reconcile_short_position(100.0, 110.0, ledger, 0.01) == (True, 110.0)
+    assert reconcile_short_position(100.0, 111.5, ledger, 0.01) == (False, 110.0)
 
 
 def test_compute_deviation_loss_long_uses_highest_entry_price_lots_first() -> None:
@@ -244,11 +244,11 @@ def run_cycle(
     return result, rec
 
 
-def test_freeze_long_deviation_sells_spot_and_buys_short_position_side() -> None:
+def test_freeze_long_deviation_keeps_spot_and_sells_short_position_side() -> None:
     result, rec = run_cycle()
 
-    assert rec.spot_orders[0]["side"] == "SELL"
-    assert rec.contract_orders[0]["side"] == "BUY"
+    assert rec.spot_orders == []
+    assert rec.contract_orders[0]["side"] == "SELL"
     assert rec.contract_orders[0]["position_side"] == "SHORT"
     assert "reduce_only" not in rec.contract_orders[0]
     assert "reduceOnly" not in rec.contract_orders[0]
@@ -258,7 +258,7 @@ def test_freeze_long_deviation_sells_spot_and_buys_short_position_side() -> None
     assert result["ledger"]["pending_contract_actions"] == []
 
 
-def test_freeze_long_deviation_requires_available_short_hedge() -> None:
+def test_freeze_long_deviation_does_not_require_existing_short_hedge() -> None:
     result, rec = run_cycle(
         contract_short_qty=0.0,
         base_hedge_qty=0.0,
@@ -266,10 +266,10 @@ def test_freeze_long_deviation_requires_available_short_hedge() -> None:
     )
 
     assert rec.spot_orders == []
-    assert rec.contract_orders == []
-    assert result["ledger"]["long_lots"] == []
+    assert rec.contract_orders == [{"symbol": "WLDUSDT", "side": "SELL", "qty": 10.0, "position_side": "SHORT"}]
+    assert result["ledger"]["long_lots"][0]["qty"] == 10.0
     assert result["ledger"]["pending_contract_actions"] == []
-    assert "insufficient_short_hedge_to_freeze_long" in result["alerts"]
+    assert result["alerts"] == []
 
 
 def test_freeze_short_deviation_buys_spot_and_sells_short_position_side() -> None:
@@ -426,9 +426,9 @@ def test_freeze_short_respects_side_total_cap_without_blocking_long_cap() -> Non
 def test_freeze_contract_failure_records_pending_and_marks_lot_pending() -> None:
     result, rec = run_cycle(recorder=OrderRecorder(fail_contract=True))
 
-    assert rec.spot_orders[0]["side"] == "SELL"
-    assert rec.contract_orders[0]["side"] == "BUY"
-    assert result["ledger"]["pending_contract_actions"][0]["side"] == "BUY"
+    assert rec.spot_orders == []
+    assert rec.contract_orders[0]["side"] == "SELL"
+    assert result["ledger"]["pending_contract_actions"][0]["side"] == "SELL"
     assert result["ledger"]["pending_contract_actions"][0]["position_side"] == "SHORT"
     assert result["ledger"]["long_lots"][0]["hedge_pending"] is True
     assert "contract_failed" in result["alerts"]
@@ -510,7 +510,7 @@ def test_reconcile_drift_is_recorded_without_blocking_freeze_cycle() -> None:
     result, rec = run_cycle(contract_short_qty=99.0)
 
     assert result["reconcile_ok"] is False
-    assert rec.spot_orders
+    assert rec.spot_orders == []
     assert rec.contract_orders
     assert "reconcile_drift" in result["alerts"][0]
     assert result["ledger"]["last_contract_short_qty"] == 99.0
@@ -630,11 +630,14 @@ def test_profit_release_short_updates_available_hedge_before_long_freeze() -> No
     )
 
     assert rec.spot_orders == []
-    assert rec.contract_orders == [{"symbol": "WLDUSDT", "side": "BUY", "qty": 10.0, "position_side": "SHORT"}]
-    assert result["ledger"]["long_lots"] == []
+    assert rec.contract_orders == [
+        {"symbol": "WLDUSDT", "side": "BUY", "qty": 10.0, "position_side": "SHORT"},
+        {"symbol": "WLDUSDT", "side": "SELL", "qty": 10.0, "position_side": "SHORT"},
+    ]
+    assert result["ledger"]["long_lots"][0]["qty"] == 10.0
     assert result["ledger"]["short_lots"] == []
     assert result["ledger"]["pending_contract_actions"] == []
-    assert "insufficient_short_hedge_to_freeze_long" in result["alerts"]
+    assert result["alerts"] == []
 
 
 def test_profit_release_contract_failure_keeps_lot_and_does_not_create_pending() -> None:

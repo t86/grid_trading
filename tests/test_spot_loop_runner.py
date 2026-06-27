@@ -2449,7 +2449,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
                 "grid_optimizer.spot_loop_runner.fetch_futures_position_risk_v3",
                 return_value=[
                     {"symbol": "WLDUSDT", "positionSide": "LONG", "positionAmt": "0"},
-                    {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-90"},
+                    {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-110"},
                 ],
             ):
                 with patch("grid_optimizer.spot_loop_runner.fetch_futures_symbol_config", return_value={"step_size": 0.001}):
@@ -2470,7 +2470,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
                         )
 
         kwargs = mock_cycle.call_args.kwargs
-        self.assertEqual(kwargs["contract_short_qty"], 90.0)
+        self.assertEqual(kwargs["contract_short_qty"], 110.0)
         self.assertEqual(kwargs["base_hedge_qty"], 100.0)
         self.assertEqual(controls["spot_freeze_gate"]["reason"], "ok")
 

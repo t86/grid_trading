@@ -93,7 +93,7 @@ def pending_signed_short_delta(ledger: dict[str, Any]) -> float:
 
 def expected_short_position_now(base_hedge_qty: float, ledger: dict[str, Any]) -> float:
     long_qty, short_qty = ledger_totals(ledger)
-    expected_short = max(_safe_float(base_hedge_qty), 0.0) - long_qty + short_qty
+    expected_short = max(_safe_float(base_hedge_qty), 0.0) + long_qty + short_qty
     return expected_short - pending_signed_short_delta(ledger)
 
 
@@ -488,9 +488,7 @@ def freeze_cycle(
 
     max_qty = abs(deviation_qty_signed)
     short_capacity_exhausted = False
-    if is_long_deviation:
-        max_qty = min(max_qty, max(_safe_float(available_short_qty), 0.0))
-    else:
+    if not is_long_deviation:
         max_contract_short_notional = max(_safe_float(config.max_contract_short_notional), 0.0)
         if max_contract_short_notional > EPSILON:
             max_contract_short_qty = max_contract_short_notional / mid
@@ -515,7 +513,7 @@ def freeze_cycle(
         return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
 
     spot_side = "SELL" if is_long_deviation else "BUY"
-    contract_side = "BUY" if is_long_deviation else "SELL"
+    contract_side = "SELL"
     lot_key = "long_lots" if is_long_deviation else "short_lots"
     reason = "freeze_long_hedge" if is_long_deviation else "freeze_short_hedge"
     lot_id = f"spot_freeze_{len(working['long_lots']) + len(working['short_lots']) + 1}"
@@ -524,15 +522,19 @@ def freeze_cycle(
         actions.append({"type": "freeze_dry_run", "side": "long" if is_long_deviation else "short", "qty": qty})
         return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
 
-    try:
-        spot_response = place_spot(symbol=symbol, side=spot_side, qty=qty)
-    except Exception as exc:
-        alerts.append(f"spot_failed: {type(exc).__name__}: {exc}")
-        return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
-    filled_qty = _round_down_qty(_safe_float(spot_response.get("executedQty")), qty_step)
-    if filled_qty <= EPSILON:
-        alerts.append("spot_no_fill")
-        return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
+    if is_long_deviation:
+        filled_qty = qty
+        spot_response: dict[str, Any] = {}
+    else:
+        try:
+            spot_response = place_spot(symbol=symbol, side=spot_side, qty=qty)
+        except Exception as exc:
+            alerts.append(f"spot_failed: {type(exc).__name__}: {exc}")
+            return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
+        filled_qty = _round_down_qty(_safe_float(spot_response.get("executedQty")), qty_step)
+        if filled_qty <= EPSILON:
+            alerts.append("spot_no_fill")
+            return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
 
     lot = {
         "lot_id": lot_id,
