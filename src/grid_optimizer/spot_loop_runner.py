@@ -3919,7 +3919,8 @@ def _maybe_run_spot_freeze(
     else:
         controls["spot_freeze_skip_reason"] = "eligible"
     dry_run = bool(getattr(args, "spot_freeze_dry_run", False)) or not bool(getattr(args, "apply", False))
-    if not dry_run and not market_execution_enabled:
+    ledger_only_long_freeze = deviation_side == "long"
+    if not dry_run and not market_execution_enabled and not ledger_only_long_freeze:
         if maker_execution_enabled and controls["spot_freeze_skip_reason"] == "eligible":
             open_maker_orders = [dict(order) for order in list(existing_maker_orders or []) if isinstance(order, dict)]
             if open_maker_orders:
@@ -4003,7 +4004,7 @@ def _maybe_run_spot_freeze(
     controls["spot_freeze_frozen_short_qty"] = _safe_float(ledger_result.get("frozen_short_qty")) if isinstance(ledger_result, dict) else 0.0
     controls["spot_freeze_pending_contract_actions"] = list(ledger_result.get("pending_contract_actions") or []) if isinstance(ledger_result, dict) else []
     if controls["spot_freeze_actions"]:
-        controls["spot_freeze_skip_reason"] = ""
+        controls["spot_freeze_skip_reason"] = "frozen"
     elif controls["spot_freeze_alerts"] and controls["spot_freeze_skip_reason"] == "eligible":
         controls["spot_freeze_skip_reason"] = str(controls["spot_freeze_alerts"][0])
 

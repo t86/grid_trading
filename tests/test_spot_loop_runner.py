@@ -1619,7 +1619,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertTrue(controls["spot_freeze_dry_run"])
         self.assertEqual(controls["spot_freeze_actions"][0]["type"], "freeze_dry_run")
 
-    def test_spot_freeze_apply_without_market_execution_stays_diagnostic_only(self) -> None:
+    def test_spot_freeze_short_apply_without_market_execution_stays_diagnostic_only(self) -> None:
         args = self._synthetic_args(
             [
                 "--apply",
@@ -1638,12 +1638,12 @@ class SpotLoopRunnerTests(unittest.TestCase):
         )
         state = {"spot_frozen_ledger": new_ledger()}
         controls = {
-            "actual_base_qty": 120.0,
+            "actual_base_qty": 80.0,
             "neutral_base_qty": 100.0,
             "_runtime": {
                 "recovery_mode": "live",
                 "synthetic_cost_unknown": False,
-                "position_lots": [{"lot_id": "L1", "side": "long", "qty": 20.0, "entry_price": 12.0}],
+                "position_lots": [{"lot_id": "S1", "side": "short", "qty": 20.0, "entry_price": 8.0}],
             },
         }
 
@@ -1733,7 +1733,75 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertTrue(controls["spot_freeze_market_execution_enabled"])
         self.assertEqual(controls["spot_freeze_actions"], [{"type": "freeze"}])
 
-    def test_spot_freeze_maker_execution_builds_limit_maker_order_without_market_cycle(self) -> None:
+    def test_spot_freeze_long_ledger_only_runs_without_market_execution_flag(self) -> None:
+        args = self._synthetic_args(
+            [
+                "--apply",
+                "--spot-freeze-enabled",
+                "--spot-freeze-base-hedge-qty",
+                "100",
+                "--spot-freeze-deviation-notional",
+                "50",
+                "--spot-freeze-min-loss-ratio",
+                "0.01",
+                "--spot-freeze-max-per-cycle-notional",
+                "100",
+                "--spot-freeze-total-cap-notional",
+                "500",
+            ]
+        )
+        ledger = new_ledger()
+        result_ledger = new_ledger()
+        result_ledger["long_lots"] = [{"lot_id": "L1", "qty": 10.0}]
+        result_ledger["frozen_long_qty"] = 10.0
+        state = {"spot_frozen_ledger": ledger}
+        controls = {
+            "actual_base_qty": 120.0,
+            "neutral_base_qty": 100.0,
+            "_runtime": {
+                "recovery_mode": "live",
+                "synthetic_cost_unknown": False,
+                "position_lots": [{"lot_id": "L1", "side": "long", "qty": 20.0, "entry_price": 12.0}],
+            },
+        }
+
+        with patch("grid_optimizer.spot_loop_runner.fetch_futures_position_mode", return_value={"dualSidePosition": True}):
+            with patch(
+                "grid_optimizer.spot_loop_runner.fetch_futures_position_risk_v3",
+                return_value=[
+                    {"symbol": "WLDUSDT", "positionSide": "LONG", "positionAmt": "0"},
+                    {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-100"},
+                ],
+            ):
+                with patch("grid_optimizer.spot_loop_runner.fetch_futures_symbol_config", return_value={"step_size": 0.001}):
+                    with patch(
+                        "grid_optimizer.spot_loop_runner.freeze_cycle",
+                        return_value={
+                            "ledger": result_ledger,
+                            "actions": [{"type": "freeze", "side": "long", "qty": 10.0, "mode": "spot_only"}],
+                            "reconcile_ok": True,
+                            "alerts": [],
+                        },
+                    ) as mock_cycle:
+                        _maybe_run_spot_freeze(
+                            args=args,
+                            state=state,
+                            controls=controls,
+                            symbol="WLDUSDT",
+                            mid_price=10.0,
+                            symbol_info={"step_size": 0.001},
+                            api_key="key",
+                            api_secret="secret",
+                            now=datetime(2026, 6, 23, tzinfo=timezone.utc),
+                        )
+
+        self.assertFalse(controls["spot_freeze_market_execution_enabled"])
+        self.assertFalse(mock_cycle.call_args.kwargs["dry_run"])
+        self.assertEqual(controls["spot_freeze_actions"], [{"type": "freeze", "side": "long", "qty": 10.0, "mode": "spot_only"}])
+        self.assertEqual(controls["spot_freeze_skip_reason"], "frozen")
+        self.assertEqual(state["spot_frozen_ledger"]["frozen_long_qty"], 10.0)
+
+    def test_spot_freeze_long_maker_execution_uses_ledger_only_without_market_cycle(self) -> None:
         args = self._synthetic_args(
             [
                 "--apply",
@@ -1762,6 +1830,10 @@ class SpotLoopRunnerTests(unittest.TestCase):
             },
         }
 
+        result_ledger = new_ledger()
+        result_ledger["long_lots"] = [{"lot_id": "L1", "qty": 10.0}]
+        result_ledger["frozen_long_qty"] = 10.0
+
         with patch("grid_optimizer.spot_loop_runner.fetch_futures_position_mode", return_value={"dualSidePosition": True}):
             with patch(
                 "grid_optimizer.spot_loop_runner.fetch_futures_position_risk_v3",
@@ -1771,7 +1843,15 @@ class SpotLoopRunnerTests(unittest.TestCase):
                 ],
             ):
                 with patch("grid_optimizer.spot_loop_runner.fetch_futures_symbol_config", return_value={"step_size": 0.001}):
-                    with patch("grid_optimizer.spot_loop_runner.freeze_cycle", side_effect=AssertionError("maker freeze must not use market cycle")):
+                    with patch(
+                        "grid_optimizer.spot_loop_runner.freeze_cycle",
+                        return_value={
+                            "ledger": result_ledger,
+                            "actions": [{"type": "freeze", "side": "long", "qty": 10.0, "mode": "spot_only"}],
+                            "reconcile_ok": True,
+                            "alerts": [],
+                        },
+                    ) as mock_cycle:
                         _maybe_run_spot_freeze(
                             args=args,
                             state=state,
@@ -1787,13 +1867,12 @@ class SpotLoopRunnerTests(unittest.TestCase):
                         )
 
         self.assertTrue(controls["spot_freeze_maker_execution_enabled"])
-        self.assertEqual(controls["spot_freeze_skip_reason"], "maker_order_pending")
-        self.assertEqual(
-            controls["spot_freeze_maker_orders"],
-            [{"side": "SELL", "price": 10.01, "qty": 10.0, "role": "spot_freeze_maker", "tag": "spot_freeze_long"}],
-        )
+        self.assertFalse(mock_cycle.call_args.kwargs["dry_run"])
+        self.assertEqual(controls["spot_freeze_skip_reason"], "frozen")
+        self.assertEqual(controls["spot_freeze_maker_orders"], [])
+        self.assertEqual(controls["spot_freeze_actions"], [{"type": "freeze", "side": "long", "qty": 10.0, "mode": "spot_only"}])
 
-    def test_spot_freeze_maker_execution_waits_when_existing_maker_order_is_open(self) -> None:
+    def test_spot_freeze_long_ledger_only_ignores_existing_maker_order(self) -> None:
         args = self._synthetic_args(
             [
                 "--apply",
@@ -1821,6 +1900,10 @@ class SpotLoopRunnerTests(unittest.TestCase):
             },
         }
 
+        result_ledger = new_ledger()
+        result_ledger["long_lots"] = [{"lot_id": "L1", "qty": 10.0}]
+        result_ledger["frozen_long_qty"] = 10.0
+
         with patch("grid_optimizer.spot_loop_runner.fetch_futures_position_mode", return_value={"dualSidePosition": True}):
             with patch(
                 "grid_optimizer.spot_loop_runner.fetch_futures_position_risk_v3",
@@ -1830,22 +1913,31 @@ class SpotLoopRunnerTests(unittest.TestCase):
                 ],
             ):
                 with patch("grid_optimizer.spot_loop_runner.fetch_futures_symbol_config", return_value={"step_size": 0.001}):
-                    _maybe_run_spot_freeze(
-                        args=args,
-                        state=state,
-                        controls=controls,
-                        symbol="WLDUSDT",
-                        bid_price=9.99,
-                        ask_price=10.01,
-                        mid_price=10.0,
-                        symbol_info={"tick_size": 0.01, "step_size": 0.001, "min_qty": 0.001, "min_notional": 5.0},
-                        api_key="key",
-                        api_secret="secret",
-                        now=datetime(2026, 6, 23, tzinfo=timezone.utc),
-                        existing_maker_orders=[{"orderId": 7001, "side": "SELL", "price": "10.01", "origQty": "10"}],
-                    )
+                    with patch(
+                        "grid_optimizer.spot_loop_runner.freeze_cycle",
+                        return_value={
+                            "ledger": result_ledger,
+                            "actions": [{"type": "freeze", "side": "long", "qty": 10.0, "mode": "spot_only"}],
+                            "reconcile_ok": True,
+                            "alerts": [],
+                        },
+                    ):
+                        _maybe_run_spot_freeze(
+                            args=args,
+                            state=state,
+                            controls=controls,
+                            symbol="WLDUSDT",
+                            bid_price=9.99,
+                            ask_price=10.01,
+                            mid_price=10.0,
+                            symbol_info={"tick_size": 0.01, "step_size": 0.001, "min_qty": 0.001, "min_notional": 5.0},
+                            api_key="key",
+                            api_secret="secret",
+                            now=datetime(2026, 6, 23, tzinfo=timezone.utc),
+                            existing_maker_orders=[{"orderId": 7001, "side": "SELL", "price": "10.01", "origQty": "10"}],
+                        )
 
-        self.assertEqual(controls["spot_freeze_skip_reason"], "maker_order_open")
+        self.assertEqual(controls["spot_freeze_skip_reason"], "frozen")
         self.assertEqual(controls["spot_freeze_maker_orders"], [])
 
     def test_spot_freeze_long_maker_respects_side_total_cap(self) -> None:
@@ -1886,7 +1978,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
                 "grid_optimizer.spot_loop_runner.fetch_futures_position_risk_v3",
                 return_value=[
                     {"symbol": "WLDUSDT", "positionSide": "LONG", "positionAmt": "0"},
-                    {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-96"},
+                    {"symbol": "WLDUSDT", "positionSide": "SHORT", "positionAmt": "-100"},
                 ],
             ):
                 with patch("grid_optimizer.spot_loop_runner.fetch_futures_symbol_config", return_value={"step_size": 0.001}):
@@ -1907,7 +1999,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(controls["spot_freeze_skip_reason"], "long_total_cap_reached")
         self.assertEqual(controls["spot_freeze_maker_orders"], [])
 
-    def test_spot_freeze_long_maker_records_unavailable_short_hedge_without_blocking_orders(self) -> None:
+    def test_spot_freeze_long_ledger_only_does_not_require_available_short_hedge(self) -> None:
         args = self._synthetic_args(
             [
                 "--apply",
@@ -1968,7 +2060,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
             controls=controls,
         )
 
-        self.assertEqual(controls["spot_freeze_skip_reason"], "insufficient_short_hedge_to_freeze_long")
+        self.assertEqual(controls["spot_freeze_skip_reason"], "frozen")
         self.assertEqual(controls["spot_freeze_maker_orders"], [])
         self.assertEqual(
             filtered,
