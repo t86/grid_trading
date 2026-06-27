@@ -3273,7 +3273,7 @@ def _build_spot_competition_inventory_grid_orders(
     synthetic_sell_floor = {
         "enabled": False,
         "active": False,
-        "retained_extra_notional": 0.0,
+        "allowed_short_notional": 0.0,
         "floor_qty": 0.0,
         "available_sell_qty": 0.0,
         "dropped_sell_orders": 0,
@@ -3281,14 +3281,14 @@ def _build_spot_competition_inventory_grid_orders(
         "added_conservative_buy_orders": 0,
     }
     if synthetic_neutral and neutral_qty > EPSILON:
-        retained_extra_qty = reduce_target_notional / mid_price if mid_price > EPSILON else 0.0
-        floor_qty = neutral_qty + max(retained_extra_qty, 0.0)
+        allowed_short_qty = reduce_target_notional / mid_price if mid_price > EPSILON else 0.0
+        floor_qty = max(neutral_qty - max(allowed_short_qty, 0.0), 0.0)
         tolerance_qty = max(_safe_float(spot_freeze_tolerance_qty), _qty_zero_tolerance(resolved_actual_base_qty, floor_qty))
         available_sell_qty = max(resolved_actual_base_qty - floor_qty, 0.0)
         synthetic_sell_floor.update(
             {
                 "enabled": True,
-                "retained_extra_notional": reduce_target_notional,
+                "allowed_short_notional": reduce_target_notional,
                 "floor_qty": floor_qty,
                 "available_sell_qty": available_sell_qty,
             }
