@@ -1,4 +1,5 @@
 from grid_optimizer.spot_freeze_manager import (
+    _round_down_qty,
     compute_deviation_loss,
     expected_short_position_now,
     freeze_cycle,
@@ -19,6 +20,11 @@ def test_new_ledger_contains_pending_actions_and_zero_totals() -> None:
     assert ledger["pending_contract_actions"] == []
     assert ledger["frozen_long_qty"] == 0.0
     assert ledger["frozen_short_qty"] == 0.0
+
+
+def test_round_down_qty_avoids_float_precision_tail() -> None:
+    assert str(_round_down_qty(0.0262, 0.0001)) == "0.0262"
+    assert str(_round_down_qty(0.0262, 0.001)) == "0.026"
 
 
 def test_ledger_totals_sums_lots_and_refreshes_summary_fields() -> None:

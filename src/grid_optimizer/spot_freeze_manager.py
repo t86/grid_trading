@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 import math
 from typing import Any
 
@@ -177,10 +178,17 @@ def compute_deviation_loss(
 
 
 def _round_down_qty(qty: float, qty_step: float) -> float:
+    safe_qty = max(_safe_float(qty), 0.0)
     step = _safe_float(qty_step)
     if step <= EPSILON:
-        return max(_safe_float(qty), 0.0)
-    return math.floor(max(_safe_float(qty), 0.0) / step) * step
+        return safe_qty
+    try:
+        qty_decimal = Decimal(str(safe_qty))
+        step_decimal = Decimal(str(step))
+        units = (qty_decimal / step_decimal).to_integral_value(rounding=ROUND_FLOOR)
+        return float(units * step_decimal)
+    except (InvalidOperation, ValueError, ZeroDivisionError):
+        return math.floor(safe_qty / step) * step
 
 
 def _side_cap_mode(config: FreezeConfig) -> bool:
