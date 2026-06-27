@@ -1504,7 +1504,6 @@ def _drop_spot_app_loss_non_loss_exit_orders(
     guard["non_loss_exit_dropped_order_count"] = 0
     if (
         not bool(require_non_loss_exit)
-        or not bool(guard.get("enabled"))
         or not bool(guard.get("window_aligned"))
     ):
         return orders
