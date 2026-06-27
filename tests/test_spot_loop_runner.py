@@ -3335,6 +3335,84 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(controls["synthetic_base_sell_floor"]["floor_qty"], 0.5)
         self.assertAlmostEqual(controls["synthetic_base_sell_floor"]["available_sell_qty"], 1.5)
 
+    def test_build_spot_competition_synthetic_neutral_grid_excludes_spot_frozen_long_from_active_net(self) -> None:
+        ledger = new_ledger()
+        ledger["long_lots"] = [{"lot_id": "freeze-long-1", "qty": 1.0}]
+        ledger["frozen_long_qty"] = 1.0
+
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state={
+                "known_orders": {},
+                "inventory_lots": [],
+                "spot_frozen_ledger": ledger,
+            },
+            trades=[],
+            bid_price=99.0,
+            ask_price=101.0,
+            step_price=2.0,
+            buy_levels=1,
+            sell_levels=1,
+            first_order_multiplier=1.0,
+            per_order_notional=100.0,
+            threshold_position_notional=200.0,
+            threshold_reduce_target_notional=50.0,
+            max_order_position_notional=300.0,
+            max_position_notional=500.0,
+            tick_size=0.1,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=1.0,
+            max_short_position_notional=200.0,
+            actual_base_qty=2.0,
+        )
+
+        self.assertEqual(controls["direction_state"], "flat")
+        self.assertAlmostEqual(controls["synthetic_net_qty"], 0.0)
+        self.assertAlmostEqual(controls["current_long_notional"], 0.0)
+        self.assertAlmostEqual(controls["current_short_notional"], 0.0)
+        self.assertIn("BUY", [order["side"] for order in desired_orders])
+        self.assertIn("SELL", [order["side"] for order in desired_orders])
+
+    def test_build_spot_competition_synthetic_neutral_grid_caps_stale_overfrozen_long(self) -> None:
+        ledger = new_ledger()
+        ledger["long_lots"] = [{"lot_id": "stale-freeze-long", "qty": 3.0}]
+        ledger["frozen_long_qty"] = 3.0
+
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state={
+                "known_orders": {},
+                "inventory_lots": [],
+                "spot_frozen_ledger": ledger,
+            },
+            trades=[],
+            bid_price=99.0,
+            ask_price=101.0,
+            step_price=2.0,
+            buy_levels=1,
+            sell_levels=1,
+            first_order_multiplier=1.0,
+            per_order_notional=100.0,
+            threshold_position_notional=200.0,
+            threshold_reduce_target_notional=50.0,
+            max_order_position_notional=300.0,
+            max_position_notional=500.0,
+            tick_size=0.1,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=1.0,
+            max_short_position_notional=200.0,
+            actual_base_qty=2.0,
+        )
+
+        self.assertEqual(controls["direction_state"], "flat")
+        self.assertAlmostEqual(controls["synthetic_net_qty"], 0.0)
+        self.assertIn("BUY", [order["side"] for order in desired_orders])
+        self.assertIn("SELL", [order["side"] for order in desired_orders])
+
     def test_build_spot_competition_synthetic_neutral_grid_keeps_buys_while_allowing_small_sell_below_base(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="futures")
         runtime["synthetic_neutral"] = True
