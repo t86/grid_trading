@@ -8546,11 +8546,11 @@ def _load_spot_runner_control_config(symbol: str | None = None) -> dict[str, Any
     for key, value in runtime_paths.items():
         config[key] = value
     stored = _read_json_dict(_spot_runner_control_path(normalized_symbol))
-    if stored:
-        config.update(stored)
     runner = _read_spot_runner_process_for_symbol(normalized_symbol)
     if runner.get("config"):
         config.update(runner["config"])
+    if stored:
+        config.update(stored)
     config["symbol"] = str(config.get("symbol", normalized_symbol)).upper().strip() or normalized_symbol
     runtime_paths = _default_spot_runtime_paths_for_symbol(str(config["symbol"]))
     for key, value in runtime_paths.items():
