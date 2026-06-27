@@ -5874,6 +5874,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(_uses_entry_price_cost_basis("billusdt_best_quote_maker_volume_reset_v1"))
         self.assertTrue(_uses_entry_price_cost_basis("pharosusdt_adaptive_regime_router_v1"))
         self.assertTrue(_uses_entry_price_cost_basis("pharosusdt_best_quote_maker_volume_v1"))
+        self.assertTrue(_uses_entry_price_cost_basis("reusdt_daily_75k_nofreeze_volume_v8"))
 
     def test_defi_competition_maker_neutral_profiles_use_entry_price_cost_basis(self) -> None:
         self.assertTrue(_uses_entry_price_cost_basis("bzusdt_competition_maker_neutral_v1"))

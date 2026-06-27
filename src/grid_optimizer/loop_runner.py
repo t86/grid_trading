@@ -2240,6 +2240,7 @@ def _uses_entry_price_cost_basis(strategy_profile: str | None) -> bool:
         "billusdt_best_quote_maker_volume_reset_v1",
         "pharosusdt_adaptive_regime_router_v1",
         "pharosusdt_best_quote_maker_volume_v1",
+        "reusdt_daily_75k_nofreeze_volume_v8",
     } or normalized_profile.endswith("_competition_neutral_ping_pong_v1") or normalized_profile.endswith(
         "_neutral_regime_budget_ping_pong_v2"
     )
