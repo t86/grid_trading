@@ -158,6 +158,7 @@ from .running_status import (
     normalize_running_status_server_payload,
 )
 from .short_volume_candidates import build_short_volume_candidate_report
+from .spot_competition_tuner import build_spot_competition_recommendation
 from .symbol_lists import (
     DEFAULT_SYMBOL_LISTS,
     get_symbol_list,
@@ -30951,6 +30952,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         <a href="/monitor">打开合约实盘监控</a>
         <a href="/basis">打开现货/合约价差监控</a>
         <a href="/spot_monitor">打开现货成交监控</a>
+        <a href="/spot_competition_tuner">打开交易赛参数推荐</a>
         <a href="/spot_strategies">打开现货总览</a>
         <a href="/strategies">打开策略总览</a>
       </div>
@@ -31745,6 +31747,246 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     toggleModeFields();
     loadSymbols().then(() => loadStatus());
     restartTimer();
+  </script>
+</body>
+</html>
+"""
+
+
+SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>现货交易赛参数推荐</title>
+  <style>
+    :root {
+      --bg: #f5f7f3;
+      --panel: #ffffff;
+      --line: #d9e2d7;
+      --text: #18211c;
+      --muted: #657066;
+      --brand: #176b5b;
+      --soft: #e9f5f1;
+      --good: #0f7b45;
+      --warn: #9a6500;
+      --bad: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background: linear-gradient(180deg, #fbfdf8 0%, var(--bg) 100%);
+      font-family: "Avenir Next", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    }
+    .wrap { max-width: 1320px; margin: 24px auto 48px; padding: 0 16px; display: grid; gap: 16px; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; box-shadow: 0 8px 24px rgba(16,24,40,0.04); }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    h2 { margin: 0 0 12px; font-size: 18px; }
+    p, .meta { margin: 0; color: var(--muted); line-height: 1.6; font-size: 14px; }
+    .links, .toolbar, .actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 12px; }
+    a, button {
+      height: 38px; display: inline-flex; align-items: center; justify-content: center;
+      padding: 0 14px; border-radius: 8px; border: 1px solid var(--line);
+      background: var(--soft); color: #0f423f; text-decoration: none; font-weight: 700; cursor: pointer;
+    }
+    button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .fields { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+    label { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 700; }
+    input, select {
+      height: 38px; border-radius: 8px; border: 1px solid var(--line); padding: 0 10px;
+      background: #fff; color: var(--text); font-size: 14px;
+    }
+    .grid-2 { display: grid; grid-template-columns: 0.9fr 1.1fr; gap: 16px; }
+    .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .metric { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fbfdfb; min-height: 92px; }
+    .metric .k { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+    .metric .v { font-size: 22px; font-weight: 800; }
+    .metric .s { color: var(--muted); font-size: 12px; margin-top: 6px; line-height: 1.45; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 9px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); width: 190px; }
+    pre { white-space: pre-wrap; word-break: break-word; margin: 0; padding: 12px; border-radius: 8px; border: 1px solid var(--line); background: #101815; color: #e9fff6; font-size: 12px; max-height: 520px; overflow: auto; }
+    .note { padding: 10px 12px; border-radius: 8px; background: #fff9e8; color: #6c4b00; border: 1px solid #f1d99b; font-size: 13px; line-height: 1.55; }
+    .good { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    @media (max-width: 980px) {
+      .fields, .metrics, .grid-2 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="card">
+      <h1>现货交易赛参数推荐</h1>
+      <p>根据现货币种最近波动、成交额、盘口点差和趋势，生成 maker-only 交易赛配置草案。保存只写入现货 runner 配置，不会启动策略或下单。</p>
+      <div class="links">
+        <a href="/spot_runner">现货执行台</a>
+        <a href="/spot_strategies">现货总览</a>
+        <a href="/spot_monitor">成交监控</a>
+      </div>
+      <div class="fields">
+        <label>交易对
+          <input id="symbol" value="BTCUSDT" spellcheck="false" />
+        </label>
+        <label>预算 USDT
+          <input id="budget_quote" type="number" min="0" step="10" value="1000" />
+        </label>
+        <label>风险偏好
+          <select id="risk_level">
+            <option value="balanced">均衡</option>
+            <option value="conservative">保守</option>
+            <option value="aggressive">激进</option>
+          </select>
+        </label>
+        <label>策略形态
+          <select id="target_mode">
+            <option value="inventory_grid">库存网格</option>
+            <option value="synthetic_neutral">合成中性</option>
+          </select>
+        </label>
+        <label>分析窗口分钟
+          <input id="window_minutes" type="number" min="30" max="1440" step="30" value="180" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="recommend_btn" class="primary">生成推荐配置</button>
+        <button id="save_btn" disabled>保存到现货 runner</button>
+        <span id="status" class="meta">等待生成。</span>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="card">
+        <h2>市场画像</h2>
+        <div id="metrics" class="metrics"></div>
+        <div id="notes" style="display:grid; gap:8px; margin-top:12px;"></div>
+        <table style="margin-top:12px;">
+          <tbody id="params_body"></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>配置草案</h2>
+        <pre id="config_json">{}</pre>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const symbolEl = document.getElementById("symbol");
+    const budgetEl = document.getElementById("budget_quote");
+    const riskEl = document.getElementById("risk_level");
+    const targetModeEl = document.getElementById("target_mode");
+    const windowEl = document.getElementById("window_minutes");
+    const recommendBtn = document.getElementById("recommend_btn");
+    const saveBtn = document.getElementById("save_btn");
+    const statusEl = document.getElementById("status");
+    const metricsEl = document.getElementById("metrics");
+    const notesEl = document.getElementById("notes");
+    const paramsBody = document.getElementById("params_body");
+    const configJsonEl = document.getElementById("config_json");
+    let latestConfig = null;
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+    function fmt(v, digits = 4) {
+      if (v === null || v === undefined || Number.isNaN(Number(v))) return "--";
+      return Number(v).toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+    }
+    function pct(v) {
+      if (v === null || v === undefined || Number.isNaN(Number(v))) return "--";
+      return `${(Number(v) * 100).toFixed(3)}%`;
+    }
+    function readPayload() {
+      return {
+        symbol: String(symbolEl.value || "").trim().toUpperCase(),
+        budget_quote: Number(budgetEl.value || 0),
+        risk_level: riskEl.value,
+        target_mode: targetModeEl.value,
+        window_minutes: Number(windowEl.value || 180),
+      };
+    }
+    function setStatus(text, isError = false) {
+      statusEl.textContent = text;
+      statusEl.className = isError ? "meta bad" : "meta";
+    }
+    function render(data) {
+      const m = data.metrics || {};
+      const c = data.classification || {};
+      const cfg = data.recommended_config || {};
+      latestConfig = cfg;
+      saveBtn.disabled = false;
+      metricsEl.innerHTML = [
+        ["市场状态", c.regime || "--", `${c.liquidity_bucket || "--"} liquidity · ${c.volatility_bucket || "--"} volatility`],
+        ["中价", fmt(m.mid_price, 8), `点差 ${pct(m.spread_ratio)}`],
+        ["窗口成交额", fmt(m.quote_volume, 2), `每分钟 ${fmt(m.quote_volume_per_minute, 2)}`],
+        ["趋势/振幅", `${pct(m.trend_return_ratio)} / ${pct(m.avg_amplitude_ratio)}`, `订单簿偏斜 ${pct(m.orderbook_imbalance)}`],
+      ].map(([k, v, s]) => `<div class="metric"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div><div class="s">${escapeHtml(s)}</div></div>`).join("");
+      notesEl.innerHTML = (data.notes || []).map((note) => `<div class="note">${escapeHtml(note)}</div>`).join("");
+      paramsBody.innerHTML = [
+        ["策略模式", cfg.strategy_mode],
+        ["固定步长", fmt(cfg.step_price, 8)],
+        ["单笔金额", fmt(cfg.per_order_notional, 4)],
+        ["最大下单持仓", fmt(cfg.max_order_position_notional, 4)],
+        ["最大可持仓", fmt(cfg.max_position_notional, 4)],
+        ["库存软/硬上限", `${fmt(cfg.inventory_soft_limit_notional, 4)} / ${fmt(cfg.inventory_hard_limit_notional, 4)}`],
+        ["快速止损阈值", `${pct(cfg.spot_fast_stop_10s_abs_return_ratio)} / ${pct(cfg.spot_fast_stop_30s_abs_return_ratio)}`],
+        ["慢趋势步长", cfg.spot_slow_trend_step_enabled ? `开启，scale=${fmt(cfg.spot_slow_trend_step_scale, 2)}` : "关闭"],
+      ].map(([k, v]) => `<tr><th>${escapeHtml(k)}</th><td>${escapeHtml(v)}</td></tr>`).join("");
+      configJsonEl.textContent = JSON.stringify(cfg, null, 2);
+    }
+    async function recommend() {
+      recommendBtn.disabled = true;
+      saveBtn.disabled = true;
+      setStatus("正在拉取 Binance 现货行情并生成参数...");
+      try {
+        const resp = await fetch("/api/spot_competition_tuner/recommend", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(readPayload()),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        render(data);
+        setStatus(`已生成 ${data.symbol} 的推荐配置。`);
+      } catch (err) {
+        latestConfig = null;
+        configJsonEl.textContent = "{}";
+        setStatus(`生成失败：${err}`, true);
+      } finally {
+        recommendBtn.disabled = false;
+      }
+    }
+    async function save() {
+      if (!latestConfig) return;
+      saveBtn.disabled = true;
+      setStatus("正在保存到现货 runner 配置...");
+      try {
+        const resp = await fetch("/api/spot_competition_tuner/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ config: latestConfig }),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        setStatus(`已保存 ${data.symbol} 的配置，未启动。`);
+      } catch (err) {
+        setStatus(`保存失败：${err}`, true);
+      } finally {
+        saveBtn.disabled = false;
+      }
+    }
+    symbolEl.addEventListener("input", () => { symbolEl.value = String(symbolEl.value || "").toUpperCase(); });
+    recommendBtn.addEventListener("click", recommend);
+    saveBtn.addEventListener("click", save);
   </script>
 </body>
 </html>
@@ -37501,6 +37743,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path in {"/spot_runner", "/spot_runner.html"}:
             self._send_html(SPOT_RUNNER_PAGE, status=HTTPStatus.OK)
             return
+        if path in {"/spot_competition_tuner", "/spot_competition_tuner.html"}:
+            self._send_html(SPOT_COMPETITION_TUNER_PAGE, status=HTTPStatus.OK)
+            return
         if path in {"/spot_monitor", "/spot_monitor.html"}:
             self._send_html(SPOT_MONITOR_PAGE, status=HTTPStatus.OK)
             return
@@ -38003,6 +38248,7 @@ class _Handler(BaseHTTPRequestHandler):
             or path == "/api/spot_runner/status"
             or path == "/api/spot_monitor"
             or path == "/api/spot_runner/save"
+            or path.startswith("/api/spot_competition_tuner/")
             or path == "/api/manual_trade/status"
         ):
             if path == "/api/competition_board" and not _competition_board_enabled():
@@ -38102,6 +38348,38 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     result = _manual_trade_cancel(payload)
                     self._send_json({"ok": True, **result}, status=200)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return
+        if path in {"/api/spot_competition_tuner/recommend", "/api/spot_competition_tuner/save"}:
+            try:
+                content_len = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._send_json({"ok": False, "error": "Invalid Content-Length"}, status=400)
+                return
+            if content_len <= 0 or content_len > 1024 * 1024:
+                self._send_json({"ok": False, "error": "Invalid payload size"}, status=400)
+                return
+            raw = self.rfile.read(content_len)
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"ok": False, "error": "Invalid JSON"}, status=400)
+                return
+            if not isinstance(payload, dict):
+                self._send_json({"ok": False, "error": "JSON body must be object"}, status=400)
+                return
+            try:
+                if path.endswith("/recommend"):
+                    result = build_spot_competition_recommendation(payload)
+                else:
+                    config = payload.get("config")
+                    if not isinstance(config, dict):
+                        raise ValueError("config is required")
+                    result = _save_spot_runner_config_without_start(config)
+                self._send_json({"ok": True, **result}, status=200)
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
             except Exception as exc:

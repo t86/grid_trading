@@ -295,6 +295,9 @@ Web UI notes:
 - Backtest supports explicit `start_time` and `end_time` (local timezone input in browser).
 - `最大买入金额` is used as max total notional deployment (same semantics as original `total_buy_notional`).
 - Funding can be toggled on/off in UI, and funding history is cached locally.
+- 新增现货交易赛参数推荐页：`http://127.0.0.1:8787/spot_competition_tuner`
+  - 根据现货波动、成交额、盘口点差和趋势生成 maker-only runner 配置草案
+  - 一键保存只写入现货 runner 配置，不会启动策略或下单
 - 新增现货 / 永续价差监控页：`http://127.0.0.1:8787/basis`
   - 自动聚合所有同时存在现货与永续合约的币种
   - 展示现货买一/卖一、合约买一/卖一、中位价差、两种可执行套利价差、当前资金费率、上一期资金费率、上一期结算时刻的现货/合约价差
