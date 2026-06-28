@@ -8408,6 +8408,10 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "threshold_reduce_target_notional": 0.0,
     "warmup_position_notional": 0.0,
     "require_non_loss_exit": False,
+    "non_loss_exit_auto_relax_enabled": False,
+    "non_loss_exit_auto_relax_stall_cycles": 0,
+    "non_loss_exit_auto_relax_cycles": 0,
+    "non_loss_exit_pause_entry_when_blocked": True,
     "spot_taker_exit_enabled": False,
     "spot_taker_exit_fee_ratio": 0.001,
     "spot_taker_exit_min_profit_ratio": 0.0,
@@ -15130,6 +15134,8 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--spot-app-loss-min-notional", config.get("spot_app_loss_min_notional")),
         ("--spot-app-loss-per-10k-soft", config.get("spot_app_loss_per_10k_soft")),
         ("--spot-app-loss-per-10k-hard", config.get("spot_app_loss_per_10k_hard")),
+        ("--non-loss-exit-auto-relax-stall-cycles", config.get("non_loss_exit_auto_relax_stall_cycles")),
+        ("--non-loss-exit-auto-relax-cycles", config.get("non_loss_exit_auto_relax_cycles")),
         (
             "--spot-app-loss-min-bid-break-even-buffer-ticks",
             config.get("spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks"),
@@ -15168,6 +15174,10 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
             command.extend([flag, str(value)])
     if _truthy(config.get("require_non_loss_exit", False)):
         command.append("--require-non-loss-exit")
+    if _truthy(config.get("non_loss_exit_auto_relax_enabled", False)):
+        command.append("--non-loss-exit-auto-relax-enabled")
+    if not _truthy(config.get("non_loss_exit_pause_entry_when_blocked", True)):
+        command.append("--no-non-loss-exit-pause-entry-when-blocked")
     if _truthy(config.get("spot_taker_exit_enabled", False)):
         command.append("--spot-taker-exit-enabled")
     if _truthy(config.get("spot_fast_stop_enabled", False)):

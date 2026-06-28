@@ -1502,6 +1502,8 @@ def _drop_spot_app_loss_non_loss_exit_orders(
     tick_size: float | None,
 ) -> list[dict[str, Any]]:
     guard["non_loss_exit_dropped_order_count"] = 0
+    guard["non_loss_exit_dropped_buy_count"] = 0
+    guard["non_loss_exit_dropped_sell_count"] = 0
     if (
         not bool(require_non_loss_exit)
         or not bool(guard.get("window_aligned"))
@@ -1533,6 +1535,7 @@ def _drop_spot_app_loss_non_loss_exit_orders(
     kept: list[dict[str, Any]] = []
     dropped = 0
     dropped_buy = 0
+    dropped_sell = 0
     for order in orders:
         side = str(order.get("side", "") or "").upper().strip()
         price = max(_safe_float(order.get("price")), 0.0)
@@ -1551,10 +1554,14 @@ def _drop_spot_app_loss_non_loss_exit_orders(
             dropped += 1
             if side == "BUY":
                 dropped_buy += 1
+            elif side == "SELL":
+                dropped_sell += 1
             continue
         kept.append(order)
 
     guard["non_loss_exit_dropped_order_count"] = dropped
+    guard["non_loss_exit_dropped_buy_count"] = dropped_buy
+    guard["non_loss_exit_dropped_sell_count"] = dropped_sell
     if dropped > 0:
         guard["non_loss_exit_side"] = floor_side
         guard["non_loss_exit_price"] = floor_price
@@ -1565,6 +1572,33 @@ def _drop_spot_app_loss_non_loss_exit_orders(
         controls["pause_reasons"] = pause_reasons
         if dropped_buy > 0:
             controls["buy_paused"] = True
+    return kept
+
+
+def _pause_spot_app_loss_entry_when_exit_blocked(
+    *,
+    orders: list[dict[str, Any]],
+    controls: dict[str, Any],
+    guard: dict[str, Any],
+) -> list[dict[str, Any]]:
+    guard["non_loss_exit_paused_entry_order_count"] = 0
+    if _safe_int(guard.get("non_loss_exit_dropped_sell_count")) <= 0:
+        return orders
+    kept: list[dict[str, Any]] = []
+    paused = 0
+    for order in orders:
+        if str(order.get("side", "") or "").upper().strip() == "BUY":
+            paused += 1
+            continue
+        kept.append(order)
+    guard["non_loss_exit_paused_entry_order_count"] = paused
+    if paused > 0:
+        controls["buy_paused"] = True
+        pause_reasons = list(controls.get("pause_reasons") or [])
+        reason = "spot_app_loss_non_loss_exit_entry_paused"
+        if reason not in pause_reasons:
+            pause_reasons.append(reason)
+        controls["pause_reasons"] = pause_reasons
     return kept
 
 
@@ -1638,6 +1672,11 @@ def _apply_spot_app_loss_guard_to_orders(
     available_base_free: float | None = None,
     min_bid_break_even_buffer_ticks: float = 0.0,
     require_non_loss_exit: bool = False,
+    state: dict[str, Any] | None = None,
+    non_loss_exit_auto_relax_enabled: bool = False,
+    non_loss_exit_auto_relax_stall_cycles: int = 0,
+    non_loss_exit_auto_relax_cycles: int = 0,
+    non_loss_exit_pause_entry_when_blocked: bool = True,
 ) -> list[dict[str, Any]]:
     guard = _build_spot_app_loss_guard(
         enabled=enabled,
@@ -1669,13 +1708,57 @@ def _apply_spot_app_loss_guard_to_orders(
         guard=guard,
         tick_size=tick_size,
     )
+    relax_active = False
+    if state is not None and require_non_loss_exit and non_loss_exit_auto_relax_enabled:
+        remaining = max(_safe_int(state.get("non_loss_exit_relax_cycles_remaining")), 0)
+        if remaining > 0:
+            relax_active = True
+            state["non_loss_exit_relax_cycles_remaining"] = max(remaining - 1, 0)
+            guard["non_loss_exit_auto_relax_active"] = True
+            guard["non_loss_exit_auto_relax_cycles_remaining"] = max(remaining - 1, 0)
+            pause_reasons = list(controls.get("pause_reasons") or [])
+            reason = "spot_app_loss_non_loss_exit_auto_relax_active"
+            if reason not in pause_reasons:
+                pause_reasons.append(reason)
+            controls["pause_reasons"] = pause_reasons
     desired_orders = _drop_spot_app_loss_non_loss_exit_orders(
         orders=desired_orders,
         controls=controls,
         guard=guard,
-        require_non_loss_exit=require_non_loss_exit,
+        require_non_loss_exit=require_non_loss_exit and not relax_active,
         tick_size=tick_size,
     )
+    if (
+        require_non_loss_exit
+        and not relax_active
+        and non_loss_exit_pause_entry_when_blocked
+    ):
+        desired_orders = _pause_spot_app_loss_entry_when_exit_blocked(
+            orders=desired_orders,
+            controls=controls,
+            guard=guard,
+        )
+    if state is not None and require_non_loss_exit and non_loss_exit_auto_relax_enabled:
+        stall_trigger = max(_safe_int(non_loss_exit_auto_relax_stall_cycles), 0)
+        relax_cycles = max(_safe_int(non_loss_exit_auto_relax_cycles), 0)
+        if relax_active:
+            state["non_loss_exit_stall_cycles"] = 0
+        elif _safe_int(guard.get("non_loss_exit_dropped_sell_count")) > 0:
+            stall_cycles = max(_safe_int(state.get("non_loss_exit_stall_cycles")), 0) + 1
+            state["non_loss_exit_stall_cycles"] = stall_cycles
+            guard["non_loss_exit_auto_relax_stall_cycles"] = stall_cycles
+            if stall_trigger > 0 and relax_cycles > 0 and stall_cycles >= stall_trigger:
+                state["non_loss_exit_relax_cycles_remaining"] = relax_cycles
+                state["non_loss_exit_stall_cycles"] = 0
+                guard["non_loss_exit_auto_relax_armed"] = True
+                guard["non_loss_exit_auto_relax_cycles_remaining"] = relax_cycles
+                pause_reasons = list(controls.get("pause_reasons") or [])
+                reason = "spot_app_loss_non_loss_exit_auto_relax_armed"
+                if reason not in pause_reasons:
+                    pause_reasons.append(reason)
+                controls["pause_reasons"] = pause_reasons
+        else:
+            state["non_loss_exit_stall_cycles"] = 0
     if guard["state"] not in {"defensive", "blocked", "recovery_reduce_only"}:
         return desired_orders
 
@@ -5084,6 +5167,13 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         available_base_free=base_free,
         min_bid_break_even_buffer_ticks=float(getattr(args, "spot_app_loss_min_bid_break_even_buffer_ticks", 0.0)),
         require_non_loss_exit=bool(getattr(args, "require_non_loss_exit", False)),
+        state=state,
+        non_loss_exit_auto_relax_enabled=bool(getattr(args, "non_loss_exit_auto_relax_enabled", False)),
+        non_loss_exit_auto_relax_stall_cycles=int(getattr(args, "non_loss_exit_auto_relax_stall_cycles", 0)),
+        non_loss_exit_auto_relax_cycles=int(getattr(args, "non_loss_exit_auto_relax_cycles", 0)),
+        non_loss_exit_pause_entry_when_blocked=bool(
+            getattr(args, "non_loss_exit_pause_entry_when_blocked", True)
+        ),
     )
     spot_app_loss_stop_reason = _spot_app_loss_guard_stop_reason(
         controls.get("spot_app_loss_guard") if isinstance(controls.get("spot_app_loss_guard"), dict) else {}
@@ -5512,6 +5602,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--threshold-reduce-target-notional", type=float, default=0.0)
     parser.add_argument("--warmup-position-notional", type=float, default=0.0)
     parser.add_argument("--require-non-loss-exit", action="store_true")
+    parser.add_argument("--non-loss-exit-auto-relax-enabled", action="store_true")
+    parser.add_argument("--non-loss-exit-auto-relax-stall-cycles", type=int, default=0)
+    parser.add_argument("--non-loss-exit-auto-relax-cycles", type=int, default=0)
+    parser.add_argument("--non-loss-exit-pause-entry-when-blocked", dest="non_loss_exit_pause_entry_when_blocked", action="store_true")
+    parser.add_argument("--no-non-loss-exit-pause-entry-when-blocked", dest="non_loss_exit_pause_entry_when_blocked", action="store_false")
+    parser.set_defaults(non_loss_exit_pause_entry_when_blocked=True)
     parser.add_argument("--spot-taker-exit-enabled", action="store_true")
     parser.add_argument("--spot-taker-exit-fee-ratio", type=float, default=0.001)
     parser.add_argument("--spot-taker-exit-min-profit-ratio", type=float, default=0.0)
