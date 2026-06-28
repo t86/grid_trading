@@ -4231,6 +4231,10 @@ def _env_flag_enabled(name: str, *, default: bool) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _web_background_loop_enabled(name: str) -> bool:
+    return _env_flag_enabled(name, default=True)
+
+
 def _competition_board_auto_refresh_interval_seconds() -> float:
     raw = os.environ.get("GRID_COMPETITION_BOARD_REFRESH_SECONDS", "").strip()
     if not raw:
@@ -38803,21 +38807,27 @@ def main() -> None:
     args = parser.parse_args()
 
     volume_trigger_stop_event = threading.Event()
-    volume_trigger_thread = threading.Thread(
-        target=_run_volume_trigger_loop,
-        args=(volume_trigger_stop_event,),
-        daemon=True,
-        name="runner-volume-trigger",
-    )
-    volume_trigger_thread.start()
     volatility_trigger_stop_event = threading.Event()
-    volatility_trigger_thread = threading.Thread(
-        target=_run_volatility_trigger_loop,
-        args=(volatility_trigger_stop_event,),
-        daemon=True,
-        name="runner-volatility-trigger",
-    )
-    volatility_trigger_thread.start()
+    if _web_background_loop_enabled("GRID_WEB_VOLUME_TRIGGER_LOOP_ENABLED"):
+        volume_trigger_thread = threading.Thread(
+            target=_run_volume_trigger_loop,
+            args=(volume_trigger_stop_event,),
+            daemon=True,
+            name="runner-volume-trigger",
+        )
+        volume_trigger_thread.start()
+    else:
+        print("[volume-trigger] background loop disabled by GRID_WEB_VOLUME_TRIGGER_LOOP_ENABLED")
+    if _web_background_loop_enabled("GRID_WEB_VOLATILITY_TRIGGER_LOOP_ENABLED"):
+        volatility_trigger_thread = threading.Thread(
+            target=_run_volatility_trigger_loop,
+            args=(volatility_trigger_stop_event,),
+            daemon=True,
+            name="runner-volatility-trigger",
+        )
+        volatility_trigger_thread.start()
+    else:
+        print("[volatility-trigger] background loop disabled by GRID_WEB_VOLATILITY_TRIGGER_LOOP_ENABLED")
     competition_refresh_stop_event = threading.Event()
     hourly_email_stop_event = threading.Event()
     running_status_overview_email_stop_event = threading.Event()
