@@ -2266,6 +2266,25 @@ def _record_spot_freeze_maker_fill(
     state["spot_frozen_ledger"] = ledger
 
 
+def _cap_spot_freeze_lots_to_qty(lots: list[dict[str, Any]], max_qty: float) -> list[dict[str, Any]]:
+    remaining = max(_safe_float(max_qty), 0.0)
+    capped: list[dict[str, Any]] = []
+    for lot in lots:
+        if not isinstance(lot, dict):
+            continue
+        qty = max(_safe_float(lot.get("qty")), 0.0)
+        if qty <= EPSILON:
+            continue
+        if remaining <= EPSILON:
+            break
+        kept_qty = min(qty, remaining)
+        kept = dict(lot)
+        kept["qty"] = kept_qty
+        capped.append(kept)
+        remaining = max(remaining - kept_qty, 0.0)
+    return capped
+
+
 def _spot_freeze_open_maker_orders(open_orders: list[dict[str, Any]], state: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(state.get("known_orders"), dict):
         state["known_orders"] = {}
@@ -3384,8 +3403,16 @@ def _build_spot_competition_inventory_grid_orders(
         "added_conservative_buy_orders": 0,
     }
     if synthetic_neutral and neutral_qty > EPSILON:
+        spot_frozen_long_qty = 0.0
+        spot_freeze_ledger = state.get("spot_frozen_ledger") if isinstance(state.get("spot_frozen_ledger"), dict) else {}
+        if spot_freeze_ledger:
+            spot_frozen_long_qty, _ = ledger_totals(dict(spot_freeze_ledger))
+            spot_frozen_long_qty = min(
+                max(_safe_float(spot_frozen_long_qty), 0.0),
+                max(resolved_actual_base_qty - neutral_qty, 0.0),
+            )
         allowed_short_qty = reduce_target_notional / mid_price if mid_price > EPSILON else 0.0
-        floor_qty = max(neutral_qty - max(allowed_short_qty, 0.0), 0.0)
+        floor_qty = max(neutral_qty - max(allowed_short_qty, 0.0), 0.0) + max(_safe_float(spot_frozen_long_qty), 0.0)
         tolerance_qty = max(_safe_float(spot_freeze_tolerance_qty), _qty_zero_tolerance(resolved_actual_base_qty, floor_qty))
         available_sell_qty = max(resolved_actual_base_qty - floor_qty, 0.0)
         synthetic_sell_floor.update(
@@ -3393,6 +3420,7 @@ def _build_spot_competition_inventory_grid_orders(
                 "enabled": True,
                 "allowed_short_notional": reduce_target_notional,
                 "floor_qty": floor_qty,
+                "spot_frozen_long_qty": max(_safe_float(spot_frozen_long_qty), 0.0),
                 "available_sell_qty": available_sell_qty,
             }
         )
@@ -3906,6 +3934,19 @@ def _maybe_run_spot_freeze(
     base_hedge_qty = max(_safe_float(getattr(args, "spot_freeze_base_hedge_qty", 0.0)), 0.0)
     tolerance_qty = max(_safe_float(getattr(args, "spot_freeze_tolerance_qty", 0.0)), 0.0)
     ledger = state.get("spot_frozen_ledger") if isinstance(state.get("spot_frozen_ledger"), dict) else new_ledger()
+    frozen_long_qty, _ = ledger_totals(ledger)
+    max_supported_frozen_long_qty = max(spot_inventory_qty - neutral_base_qty, 0.0)
+    if frozen_long_qty > max_supported_frozen_long_qty + tolerance_qty + EPSILON:
+        before_qty = frozen_long_qty
+        ledger["long_lots"] = _cap_spot_freeze_lots_to_qty(
+            [dict(lot) for lot in list(ledger.get("long_lots") or []) if isinstance(lot, dict)],
+            max_supported_frozen_long_qty,
+        )
+        ledger_totals(ledger)
+        state["spot_frozen_ledger"] = ledger
+        controls["spot_freeze_trimmed_long_qty"] = before_qty - max_supported_frozen_long_qty
+        if persist_ledger is not None:
+            persist_ledger(ledger)
     expected_short_qty = expected_short_position_now(base_hedge_qty, ledger)
     try:
         position_mode = fetch_futures_position_mode(api_key, api_secret)
@@ -4670,7 +4711,21 @@ def _maybe_execute_spot_fast_stop_exit(
         return result
     account_info = fetch_spot_account_info(api_key, api_secret)
     base_free, _ = _extract_balance(account_info, base_asset)
-    protected_base_qty = neutral_qty + max(_safe_float(getattr(args, "spot_fast_stop_min_base_buffer_qty", 0.0)), 0.0)
+    frozen_long_qty = 0.0
+    spot_freeze_ledger = state.get("spot_frozen_ledger") if isinstance(state.get("spot_frozen_ledger"), dict) else {}
+    if spot_freeze_ledger:
+        frozen_long_qty, _ = ledger_totals(dict(spot_freeze_ledger))
+        frozen_long_qty = min(
+            max(_safe_float(frozen_long_qty), 0.0),
+            max(actual_base_qty - neutral_qty, 0.0),
+        )
+    protected_base_qty = (
+        neutral_qty
+        + frozen_long_qty
+        + max(_safe_float(getattr(args, "spot_fast_stop_min_base_buffer_qty", 0.0)), 0.0)
+    )
+    result["protected_base_qty"] = protected_base_qty
+    result["spot_freeze_frozen_long_qty"] = frozen_long_qty
     free_excess_qty = max(base_free - protected_base_qty, 0.0)
     sell_qty = _round_order_qty(min(desired_sell_qty, free_excess_qty), step_size)
     if sell_qty <= EPSILON:
