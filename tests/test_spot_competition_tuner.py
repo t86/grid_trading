@@ -154,7 +154,7 @@ class SpotCompetitionTunerTests(unittest.TestCase):
                         "max_position_notional": 600,
                     }
                 )
-                saved_payload = json.loads(Path(result["runner"]["control_path"]).read_text())
+                saved_payload = json.loads(web._spot_runner_control_path("BTCUSDT").read_text())
             finally:
                 os.chdir(previous_cwd)
 
