@@ -472,9 +472,10 @@ def freeze_cycle(
         ledger_totals(working)
         return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
 
+    long_qty, short_qty = ledger_totals(working)
     is_long_deviation = deviation_qty_signed > 0.0
     side_name = "long" if is_long_deviation else "short"
-    long_qty, short_qty = ledger_totals(working)
+    already_frozen_qty = long_qty if is_long_deviation else short_qty
     cap = max(_safe_float(config.total_cap_notional), 0.0)
     frozen_notional = (long_qty + short_qty) * mid
     side_cap_mode = _side_cap_mode(config)
@@ -488,7 +489,12 @@ def freeze_cycle(
         alerts.append("total_cap_reached")
         return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
 
-    max_qty = abs(deviation_qty_signed)
+    remaining_deviation_qty = max(abs(deviation_qty_signed) - max(_safe_float(already_frozen_qty), 0.0), 0.0)
+    if remaining_deviation_qty <= max(_safe_float(tolerance_qty), 0.0) + EPSILON:
+        alerts.append(f"{side_name}_deviation_already_frozen")
+        return {"ledger": working, "actions": actions, "reconcile_ok": result_reconcile_ok, "alerts": alerts}
+
+    max_qty = remaining_deviation_qty
     short_capacity_exhausted = False
     if not is_long_deviation:
         max_contract_short_notional = max(_safe_float(config.max_contract_short_notional), 0.0)

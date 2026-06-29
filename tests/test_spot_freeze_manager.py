@@ -270,6 +270,22 @@ def test_freeze_long_deviation_does_not_require_existing_short_hedge() -> None:
     assert result["alerts"] == []
 
 
+def test_existing_frozen_long_deviation_is_not_frozen_again() -> None:
+    ledger = new_ledger()
+    ledger["long_lots"] = [
+        {"lot_id": "L1", "qty": 20.0, "cost_price": 12.0, "frozen_at": "t", "frozen_mid": 10.0, "hedge_pending": False}
+    ]
+    ledger_totals(ledger)
+
+    result, rec = run_cycle(ledger=ledger, spot_inventory_qty=120.0)
+
+    assert rec.spot_orders == []
+    assert rec.contract_orders == []
+    assert result["actions"] == []
+    assert result["ledger"]["frozen_long_qty"] == 20.0
+    assert "long_deviation_already_frozen" in result["alerts"]
+
+
 def test_freeze_short_deviation_buys_spot_and_sells_short_position_side() -> None:
     result, rec = run_cycle(spot_inventory_qty=80.0)
 
