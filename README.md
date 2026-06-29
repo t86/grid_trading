@@ -297,6 +297,7 @@ Web UI notes:
 - Funding can be toggled on/off in UI, and funding history is cached locally.
 - 新增现货交易赛参数推荐页：`http://127.0.0.1:8787/spot_competition_tuner`
   - 根据现货波动、成交额、盘口点差和趋势生成 maker-only runner 配置草案
+  - 支持选择时间段用公开 K 线回测当前配置的成交额、收益、库存和回撤
   - 一键保存只写入现货 runner 配置，不会启动策略或下单
 - 新增现货 / 永续价差监控页：`http://127.0.0.1:8787/basis`
   - 自动聚合所有同时存在现货与永续合约的币种

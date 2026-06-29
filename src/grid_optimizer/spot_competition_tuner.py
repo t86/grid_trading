@@ -9,6 +9,14 @@ from .types import Candle
 
 
 EPSILON = 1e-12
+_BACKTEST_INTERVAL_MS = {
+    "1m": 60_000,
+    "3m": 180_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "1h": 3_600_000,
+}
 
 
 @dataclass(frozen=True)
@@ -45,6 +53,30 @@ def _round_up_to_step(value: float, step: float | None) -> float:
         return value
     units = int((value + step - EPSILON) / step)
     return max(units * step, step)
+
+
+def _parse_utc_datetime(value: Any, field_name: str) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name} is required")
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be ISO datetime") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _downsample_points(rows: list[dict[str, Any]], limit: int = 240) -> list[dict[str, Any]]:
+    if len(rows) <= limit:
+        return rows
+    step = max(int(len(rows) / limit), 1)
+    sampled = rows[::step]
+    if sampled[-1] != rows[-1]:
+        sampled.append(rows[-1])
+    return sampled
 
 
 def _trade_notional(trade: dict[str, Any]) -> float:
@@ -347,4 +379,232 @@ def build_spot_competition_recommendation(
         ),
         metrics=metrics,
         symbol_config=symbol_config,
+    )
+
+
+def _simulate_spot_competition_backtest(
+    *,
+    symbol: str,
+    candles: list[Candle],
+    config: dict[str, Any],
+    interval: str,
+    start_time: datetime,
+    end_time: datetime,
+    maker_fee_rate: float,
+) -> dict[str, Any]:
+    if len(candles) < 2:
+        raise RuntimeError(f"not enough spot klines for {symbol}: {len(candles)}")
+
+    budget = max(_safe_float(config.get("total_quote_budget"), 0.0), 0.0)
+    if budget <= EPSILON:
+        raise ValueError("config.total_quote_budget must be > 0")
+    per_order_notional = max(_safe_float(config.get("per_order_notional"), 0.0), 0.0)
+    if per_order_notional <= EPSILON:
+        raise ValueError("config.per_order_notional must be > 0")
+    step_price = max(_safe_float(config.get("step_price"), 0.0), 0.0)
+    if step_price <= EPSILON:
+        raise ValueError("config.step_price must be > 0")
+
+    max_position_notional = max(
+        _safe_float(config.get("max_position_notional"), budget * 0.5),
+        per_order_notional,
+    )
+    max_cycle_orders = max(_safe_int(config.get("max_single_cycle_new_orders"), 8), 2)
+    buy_levels = max(1, min(max_cycle_orders // 2, 12))
+
+    cash = budget
+    lots: list[dict[str, float]] = []
+    buy_count = 0
+    sell_count = 0
+    gross_trade_notional = 0.0
+    total_fees = 0.0
+    realized_gross_pnl = 0.0
+    max_inventory_notional = 0.0
+    inventory_notional_sum = 0.0
+    peak_equity = budget
+    max_drawdown = 0.0
+    equity_points: list[dict[str, Any]] = []
+    trade_samples: list[dict[str, Any]] = []
+
+    def inventory_qty() -> float:
+        return sum(lot["qty"] for lot in lots)
+
+    def inventory_cost() -> float:
+        return sum(lot["cost"] for lot in lots)
+
+    def record_trade(row: dict[str, Any]) -> None:
+        if len(trade_samples) < 80:
+            trade_samples.append(row)
+
+    previous_close = candles[0].open
+    for candle in candles:
+        reference_price = previous_close if previous_close > EPSILON else candle.open
+
+        remaining_lots: list[dict[str, float]] = []
+        for lot in lots:
+            sell_price = lot["price"] + step_price
+            if candle.high + EPSILON >= sell_price:
+                notional = lot["qty"] * sell_price
+                fee = notional * maker_fee_rate
+                cash += notional - fee
+                gross_trade_notional += notional
+                total_fees += fee
+                sell_count += 1
+                realized = notional - lot["cost"]
+                realized_gross_pnl += realized
+                record_trade(
+                    {
+                        "time": candle.open_time.isoformat(),
+                        "side": "SELL",
+                        "price": sell_price,
+                        "qty": lot["qty"],
+                        "notional": notional,
+                        "gross_pnl": realized,
+                    }
+                )
+            else:
+                remaining_lots.append(lot)
+        lots = remaining_lots
+
+        current_inventory_notional = inventory_qty() * candle.close
+        for level in range(1, buy_levels + 1):
+            buy_price = reference_price - step_price * level
+            if buy_price <= EPSILON or candle.low > buy_price + EPSILON:
+                continue
+            if current_inventory_notional + per_order_notional > max_position_notional + EPSILON:
+                break
+            fee = per_order_notional * maker_fee_rate
+            required_cash = per_order_notional + fee
+            if cash + EPSILON < required_cash:
+                break
+            qty = per_order_notional / buy_price
+            cash -= required_cash
+            lots.append({"qty": qty, "price": buy_price, "cost": per_order_notional})
+            current_inventory_notional += qty * candle.close
+            gross_trade_notional += per_order_notional
+            total_fees += fee
+            buy_count += 1
+            record_trade(
+                {
+                    "time": candle.open_time.isoformat(),
+                    "side": "BUY",
+                    "price": buy_price,
+                    "qty": qty,
+                    "notional": per_order_notional,
+                    "gross_pnl": None,
+                }
+            )
+
+        final_inventory_qty = inventory_qty()
+        inventory_value = final_inventory_qty * candle.close
+        inventory_notional_sum += inventory_value
+        max_inventory_notional = max(max_inventory_notional, inventory_value)
+        equity = cash + inventory_value
+        peak_equity = max(peak_equity, equity)
+        if peak_equity > EPSILON:
+            max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
+        equity_points.append(
+            {
+                "time": candle.close_time.isoformat(),
+                "price": candle.close,
+                "equity": equity,
+                "inventory_notional": inventory_value,
+            }
+        )
+        previous_close = candle.close
+
+    end_price = candles[-1].close
+    final_inventory_qty = inventory_qty()
+    final_inventory_notional = final_inventory_qty * end_price
+    final_inventory_cost = inventory_cost()
+    unrealized_gross_pnl = final_inventory_notional - final_inventory_cost
+    equity_end = cash + final_inventory_notional
+    net_pnl = equity_end - budget
+    trade_count = buy_count + sell_count
+    duration_days = max((candles[-1].close_time - candles[0].open_time).total_seconds() / 86400.0, EPSILON)
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "interval": interval,
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+        "candle_count": len(candles),
+        "summary": {
+            "budget_quote": budget,
+            "maker_fee_rate": maker_fee_rate,
+            "start_price": candles[0].open,
+            "end_price": end_price,
+            "underlying_return_ratio": (end_price - candles[0].open) / candles[0].open if candles[0].open > EPSILON else 0.0,
+            "gross_trade_notional": gross_trade_notional,
+            "turnover_multiple": gross_trade_notional / max(budget, EPSILON),
+            "annualized_turnover_multiple": (gross_trade_notional / max(budget, EPSILON)) / duration_days * 365.0,
+            "trade_count": trade_count,
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "realized_gross_pnl": realized_gross_pnl,
+            "unrealized_gross_pnl": unrealized_gross_pnl,
+            "total_fees": total_fees,
+            "net_pnl": net_pnl,
+            "return_ratio": net_pnl / max(budget, EPSILON),
+            "max_drawdown_ratio": max_drawdown,
+            "final_inventory_qty": final_inventory_qty,
+            "final_inventory_notional": final_inventory_notional,
+            "max_inventory_notional": max_inventory_notional,
+            "avg_inventory_notional": inventory_notional_sum / max(len(candles), 1),
+            "cash_end": cash,
+            "equity_end": equity_end,
+        },
+        "equity_points": _downsample_points(equity_points),
+        "trade_samples": trade_samples,
+        "notes": [
+            "回测只使用公开 K 线，不会读取账户、不提交订单。",
+            "成交按 K 线 high/low 触碰挂单价估算，未模拟盘口排队、撤单延迟和同根 K 线真实路径。",
+            "卖出按买入价加一个 step_price 的 maker 网格近似处理，用于比较参数稳健性而非精确复盘。",
+        ],
+    }
+
+
+def build_spot_competition_backtest(payload: dict[str, Any]) -> dict[str, Any]:
+    config = payload.get("config")
+    if not isinstance(config, dict):
+        recommendation = build_spot_competition_recommendation(payload)
+        config = recommendation.get("recommended_config")
+    if not isinstance(config, dict):
+        raise ValueError("config is required")
+
+    symbol = str(payload.get("symbol") or config.get("symbol") or "BTCUSDT").upper().strip()
+    if not symbol:
+        raise ValueError("symbol is required")
+    interval = str(payload.get("backtest_interval") or payload.get("interval") or "1m").strip() or "1m"
+    if interval not in _BACKTEST_INTERVAL_MS:
+        raise ValueError(f"unsupported backtest interval: {interval}")
+    start_time = _parse_utc_datetime(payload.get("start_time"), "start_time")
+    end_time = _parse_utc_datetime(payload.get("end_time"), "end_time")
+    if start_time >= end_time:
+        raise ValueError("start_time must be before end_time")
+
+    interval_ms = _BACKTEST_INTERVAL_MS[interval]
+    estimated_candles = int((end_time - start_time).total_seconds() * 1000 / interval_ms)
+    max_candles = 20_000
+    if estimated_candles > max_candles:
+        max_days = max_candles * interval_ms / 86_400_000
+        raise ValueError(f"backtest range is too large for {interval}; max about {max_days:.1f} days")
+
+    maker_fee_rate = _clamp(_safe_float(payload.get("maker_fee_rate"), 0.0002), 0.0, 0.005)
+    candles = fetch_spot_klines(
+        symbol,
+        interval,
+        int(start_time.timestamp() * 1000),
+        int(end_time.timestamp() * 1000),
+    )
+    candles = [candle for candle in candles if candle.open_time >= start_time and candle.open_time < end_time]
+    return _simulate_spot_competition_backtest(
+        symbol=symbol,
+        candles=candles,
+        config=config,
+        interval=interval,
+        start_time=start_time,
+        end_time=end_time,
+        maker_fee_rate=maker_fee_rate,
     )

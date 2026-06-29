@@ -10,6 +10,7 @@ from unittest.mock import patch
 import grid_optimizer.web as web
 from grid_optimizer.spot_competition_tuner import (
     SpotCompetitionTuningInputs,
+    build_spot_competition_backtest,
     recommend_spot_competition_config,
 )
 from grid_optimizer.types import Candle
@@ -43,6 +44,8 @@ class SpotCompetitionTunerTests(unittest.TestCase):
         self.assertIn("现货交易赛参数推荐", web.SPOT_COMPETITION_TUNER_PAGE)
         self.assertIn("/api/spot_competition_tuner/recommend", web.SPOT_COMPETITION_TUNER_PAGE)
         self.assertIn("/api/spot_competition_tuner/save", web.SPOT_COMPETITION_TUNER_PAGE)
+        self.assertIn("/api/spot_competition_tuner/backtest", web.SPOT_COMPETITION_TUNER_PAGE)
+        self.assertIn("时间段回测", web.SPOT_COMPETITION_TUNER_PAGE)
         self.assertIn("/spot_competition_tuner", web.SPOT_RUNNER_PAGE)
 
     def test_recommendation_tight_liquid_uses_tighter_step_and_larger_inventory(self) -> None:
@@ -159,6 +162,46 @@ class SpotCompetitionTunerTests(unittest.TestCase):
         self.assertEqual(result["config"]["strategy_mode"], "spot_competition_inventory_grid")
         self.assertEqual(result["config"]["symbol"], "BTCUSDT")
         self.assertEqual(saved_payload["symbol"], "BTCUSDT")
+
+    @patch("grid_optimizer.spot_competition_tuner.fetch_spot_klines")
+    def test_backtest_uses_config_and_time_range(self, mock_klines) -> None:
+        start = datetime(2026, 6, 28, tzinfo=timezone.utc)
+        mock_klines.return_value = [
+            Candle(
+                open_time=start + timedelta(minutes=idx),
+                close_time=start + timedelta(minutes=idx + 1),
+                open=100.0,
+                high=101.5,
+                low=98.5,
+                close=100.2,
+            )
+            for idx in range(20)
+        ]
+
+        result = build_spot_competition_backtest(
+            {
+                "symbol": "BTCUSDT",
+                "start_time": start.isoformat(),
+                "end_time": (start + timedelta(minutes=20)).isoformat(),
+                "backtest_interval": "1m",
+                "maker_fee_rate": 0.0002,
+                "config": {
+                    "symbol": "BTCUSDT",
+                    "total_quote_budget": 1000,
+                    "step_price": 1.0,
+                    "per_order_notional": 50,
+                    "max_position_notional": 300,
+                    "max_single_cycle_new_orders": 4,
+                },
+            }
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["symbol"], "BTCUSDT")
+        self.assertEqual(result["interval"], "1m")
+        self.assertGreater(result["summary"]["trade_count"], 0)
+        self.assertIn("net_pnl", result["summary"])
+        self.assertLessEqual(len(result["equity_points"]), 240)
 
 
 if __name__ == "__main__":

@@ -158,7 +158,7 @@ from .running_status import (
     normalize_running_status_server_payload,
 )
 from .short_volume_candidates import build_short_volume_candidate_report
-from .spot_competition_tuner import build_spot_competition_recommendation
+from .spot_competition_tuner import build_spot_competition_backtest, build_spot_competition_recommendation
 from .symbol_lists import (
     DEFAULT_SYMBOL_LISTS,
     get_symbol_list,
@@ -31858,6 +31858,7 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
       <div class="actions">
         <button id="recommend_btn" class="primary">生成推荐配置</button>
         <button id="save_btn" disabled>保存到现货 runner</button>
+        <button id="backtest_btn" disabled>回测当前配置</button>
         <span id="status" class="meta">等待生成。</span>
       </div>
     </section>
@@ -31876,6 +31877,38 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
         <pre id="config_json">{}</pre>
       </div>
     </section>
+
+    <section class="card">
+      <h2>时间段回测</h2>
+      <p>用公开现货 K 线估算当前配置在指定时间段内的 maker 网格表现，适合比较不同币种和参数组合。</p>
+      <div class="fields">
+        <label>开始时间
+          <input id="backtest_start_time" type="datetime-local" />
+        </label>
+        <label>结束时间
+          <input id="backtest_end_time" type="datetime-local" />
+        </label>
+        <label>K 线周期
+          <select id="backtest_interval">
+            <option value="1m">1m</option>
+            <option value="5m">5m</option>
+            <option value="15m">15m</option>
+            <option value="1h">1h</option>
+          </select>
+        </label>
+        <label>Maker 费率
+          <input id="maker_fee_rate" type="number" min="0" max="0.005" step="0.00001" value="0.0002" />
+        </label>
+        <label>回测状态
+          <input id="backtest_status" value="等待配置。" readonly />
+        </label>
+      </div>
+      <div id="backtest_metrics" class="metrics" style="margin-top:14px;"></div>
+      <div id="backtest_notes" style="display:grid; gap:8px; margin-top:12px;"></div>
+      <table style="margin-top:12px;">
+        <tbody id="backtest_body"></tbody>
+      </table>
+    </section>
   </div>
 
   <script>
@@ -31886,13 +31919,32 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
     const windowEl = document.getElementById("window_minutes");
     const recommendBtn = document.getElementById("recommend_btn");
     const saveBtn = document.getElementById("save_btn");
+    const backtestBtn = document.getElementById("backtest_btn");
     const statusEl = document.getElementById("status");
     const metricsEl = document.getElementById("metrics");
     const notesEl = document.getElementById("notes");
     const paramsBody = document.getElementById("params_body");
     const configJsonEl = document.getElementById("config_json");
+    const backtestStartEl = document.getElementById("backtest_start_time");
+    const backtestEndEl = document.getElementById("backtest_end_time");
+    const backtestIntervalEl = document.getElementById("backtest_interval");
+    const makerFeeRateEl = document.getElementById("maker_fee_rate");
+    const backtestStatusEl = document.getElementById("backtest_status");
+    const backtestMetricsEl = document.getElementById("backtest_metrics");
+    const backtestNotesEl = document.getElementById("backtest_notes");
+    const backtestBodyEl = document.getElementById("backtest_body");
     let latestConfig = null;
 
+    function initBacktestTimes() {
+      const end = new Date();
+      const start = new Date(end.getTime() - 6 * 60 * 60 * 1000);
+      const toLocal = (date) => {
+        const shifted = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+        return shifted.toISOString().slice(0, 16);
+      };
+      backtestStartEl.value = toLocal(start);
+      backtestEndEl.value = toLocal(end);
+    }
     function escapeHtml(value) {
       return String(value ?? "")
         .replaceAll("&", "&amp;")
@@ -31908,6 +31960,12 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
     function pct(v) {
       if (v === null || v === undefined || Number.isNaN(Number(v))) return "--";
       return `${(Number(v) * 100).toFixed(3)}%`;
+    }
+    function localDateTimeToIso(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return "";
+      return date.toISOString();
     }
     function readPayload() {
       return {
@@ -31928,6 +31986,8 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
       const cfg = data.recommended_config || {};
       latestConfig = cfg;
       saveBtn.disabled = false;
+      backtestBtn.disabled = false;
+      backtestStatusEl.value = "可回测当前配置。";
       metricsEl.innerHTML = [
         ["市场状态", c.regime || "--", `${c.liquidity_bucket || "--"} liquidity · ${c.volatility_bucket || "--"} volatility`],
         ["中价", fmt(m.mid_price, 8), `点差 ${pct(m.spread_ratio)}`],
@@ -31947,9 +32007,29 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
       ].map(([k, v]) => `<tr><th>${escapeHtml(k)}</th><td>${escapeHtml(v)}</td></tr>`).join("");
       configJsonEl.textContent = JSON.stringify(cfg, null, 2);
     }
+    function renderBacktest(data) {
+      const s = data.summary || {};
+      backtestMetricsEl.innerHTML = [
+        ["成交额", fmt(s.gross_trade_notional, 2), `换手 ${fmt(s.turnover_multiple, 2)}x · 年化 ${fmt(s.annualized_turnover_multiple, 1)}x`],
+        ["净收益", fmt(s.net_pnl, 4), `收益率 ${pct(s.return_ratio)} · 标的 ${pct(s.underlying_return_ratio)}`],
+        ["成交次数", `${Number(s.trade_count || 0).toLocaleString("zh-CN")}`, `买 ${s.buy_count || 0} / 卖 ${s.sell_count || 0}`],
+        ["库存/回撤", fmt(s.final_inventory_notional, 4), `最大库存 ${fmt(s.max_inventory_notional, 4)} · 回撤 ${pct(s.max_drawdown_ratio)}`],
+      ].map(([k, v, sub]) => `<div class="metric"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div><div class="s">${escapeHtml(sub)}</div></div>`).join("");
+      backtestNotesEl.innerHTML = (data.notes || []).map((note) => `<div class="note">${escapeHtml(note)}</div>`).join("");
+      backtestBodyEl.innerHTML = [
+        ["时间范围", `${escapeHtml(data.start_time)} ~ ${escapeHtml(data.end_time)} (${escapeHtml(data.interval)}, ${data.candle_count || 0} 根)`],
+        ["起止价格", `${fmt(s.start_price, 8)} → ${fmt(s.end_price, 8)}`],
+        ["已实现/未实现毛收益", `${fmt(s.realized_gross_pnl, 4)} / ${fmt(s.unrealized_gross_pnl, 4)}`],
+        ["手续费", fmt(s.total_fees, 4)],
+        ["最终现金/权益", `${fmt(s.cash_end, 4)} / ${fmt(s.equity_end, 4)}`],
+        ["最终库存数量", fmt(s.final_inventory_qty, 8)],
+        ["平均库存金额", fmt(s.avg_inventory_notional, 4)],
+      ].map(([k, v]) => `<tr><th>${escapeHtml(k)}</th><td>${v}</td></tr>`).join("");
+    }
     async function recommend() {
       recommendBtn.disabled = true;
       saveBtn.disabled = true;
+      backtestBtn.disabled = true;
       setStatus("正在拉取 Binance 现货行情并生成参数...");
       try {
         const resp = await fetch("/api/spot_competition_tuner/recommend", {
@@ -31964,6 +32044,7 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
       } catch (err) {
         latestConfig = null;
         configJsonEl.textContent = "{}";
+        backtestStatusEl.value = "等待配置。";
         setStatus(`生成失败：${err}`, true);
       } finally {
         recommendBtn.disabled = false;
@@ -31988,9 +32069,39 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
         saveBtn.disabled = false;
       }
     }
+    async function backtest() {
+      if (!latestConfig) return;
+      backtestBtn.disabled = true;
+      backtestStatusEl.value = "正在回测...";
+      try {
+        const payload = {
+          ...readPayload(),
+          config: latestConfig,
+          start_time: localDateTimeToIso(backtestStartEl.value),
+          end_time: localDateTimeToIso(backtestEndEl.value),
+          backtest_interval: backtestIntervalEl.value,
+          maker_fee_rate: Number(makerFeeRateEl.value || 0),
+        };
+        const resp = await fetch("/api/spot_competition_tuner/backtest", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        renderBacktest(data);
+        backtestStatusEl.value = `完成：${data.symbol}`;
+      } catch (err) {
+        backtestStatusEl.value = `回测失败：${err}`;
+      } finally {
+        backtestBtn.disabled = false;
+      }
+    }
     symbolEl.addEventListener("input", () => { symbolEl.value = String(symbolEl.value || "").toUpperCase(); });
     recommendBtn.addEventListener("click", recommend);
     saveBtn.addEventListener("click", save);
+    backtestBtn.addEventListener("click", backtest);
+    initBacktestTimes();
   </script>
 </body>
 </html>
@@ -38357,7 +38468,11 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
             return
-        if path in {"/api/spot_competition_tuner/recommend", "/api/spot_competition_tuner/save"}:
+        if path in {
+            "/api/spot_competition_tuner/recommend",
+            "/api/spot_competition_tuner/save",
+            "/api/spot_competition_tuner/backtest",
+        }:
             try:
                 content_len = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -38378,6 +38493,8 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 if path.endswith("/recommend"):
                     result = build_spot_competition_recommendation(payload)
+                elif path.endswith("/backtest"):
+                    result = build_spot_competition_backtest(payload)
                 else:
                     config = payload.get("config")
                     if not isinstance(config, dict):
