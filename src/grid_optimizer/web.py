@@ -158,7 +158,11 @@ from .running_status import (
     normalize_running_status_server_payload,
 )
 from .short_volume_candidates import build_short_volume_candidate_report
-from .spot_competition_tuner import build_spot_competition_backtest, build_spot_competition_recommendation
+from .spot_competition_tuner import (
+    build_spot_competition_backtest,
+    build_spot_competition_recommendation,
+    validate_spot_competition_config,
+)
 from .symbol_lists import (
     DEFAULT_SYMBOL_LISTS,
     get_symbol_list,
@@ -31798,9 +31802,14 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
     button:disabled { opacity: 0.55; cursor: not-allowed; }
     .fields { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
     label { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 700; }
-    input, select {
+    input, select, textarea {
       height: 38px; border-radius: 8px; border: 1px solid var(--line); padding: 0 10px;
       background: #fff; color: var(--text); font-size: 14px;
+    }
+    textarea {
+      width: 100%; min-height: 520px; height: 520px; padding: 12px; resize: vertical;
+      background: #101815; color: #e9fff6; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px; line-height: 1.45; white-space: pre; overflow: auto;
     }
     .grid-2 { display: grid; grid-template-columns: 0.9fr 1.1fr; gap: 16px; }
     .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
@@ -31811,8 +31820,9 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { padding: 9px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
     th { color: var(--muted); width: 190px; }
-    pre { white-space: pre-wrap; word-break: break-word; margin: 0; padding: 12px; border-radius: 8px; border: 1px solid var(--line); background: #101815; color: #e9fff6; font-size: 12px; max-height: 520px; overflow: auto; }
     .note { padding: 10px 12px; border-radius: 8px; background: #fff9e8; color: #6c4b00; border: 1px solid #f1d99b; font-size: 13px; line-height: 1.55; }
+    .note.error { background: #fff1f0; color: var(--bad); border-color: #f6b6b1; }
+    .note.ok { background: #edf8f1; color: var(--good); border-color: #bfe6ca; }
     .good { color: var(--good); }
     .warn { color: var(--warn); }
     .bad { color: var(--bad); }
@@ -31874,7 +31884,12 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
       </div>
       <div class="card">
         <h2>配置草案</h2>
-        <pre id="config_json">{}</pre>
+        <div class="actions" style="margin:0 0 10px;">
+          <button id="validate_btn" disabled>检查配置</button>
+          <span id="validate_status" class="meta">生成后可编辑。</span>
+        </div>
+        <textarea id="config_json" spellcheck="false">{}</textarea>
+        <div id="validation_notes" style="display:grid; gap:8px; margin-top:12px;"></div>
       </div>
     </section>
 
@@ -31920,11 +31935,14 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
     const recommendBtn = document.getElementById("recommend_btn");
     const saveBtn = document.getElementById("save_btn");
     const backtestBtn = document.getElementById("backtest_btn");
+    const validateBtn = document.getElementById("validate_btn");
     const statusEl = document.getElementById("status");
+    const validateStatusEl = document.getElementById("validate_status");
     const metricsEl = document.getElementById("metrics");
     const notesEl = document.getElementById("notes");
     const paramsBody = document.getElementById("params_body");
     const configJsonEl = document.getElementById("config_json");
+    const validationNotesEl = document.getElementById("validation_notes");
     const backtestStartEl = document.getElementById("backtest_start_time");
     const backtestEndEl = document.getElementById("backtest_end_time");
     const backtestIntervalEl = document.getElementById("backtest_interval");
@@ -31934,6 +31952,7 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
     const backtestNotesEl = document.getElementById("backtest_notes");
     const backtestBodyEl = document.getElementById("backtest_body");
     let latestConfig = null;
+    let latestValidation = null;
 
     function initBacktestTimes() {
       const end = new Date();
@@ -31980,14 +31999,80 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
       statusEl.textContent = text;
       statusEl.className = isError ? "meta bad" : "meta";
     }
+    function setValidationStatus(text, isError = false) {
+      validateStatusEl.textContent = text;
+      validateStatusEl.className = isError ? "meta bad" : "meta";
+    }
+    function readEditedConfig() {
+      try {
+        const parsed = JSON.parse(configJsonEl.value || "{}");
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("配置必须是 JSON object");
+        }
+        latestConfig = parsed;
+        validateBtn.disabled = false;
+        saveBtn.disabled = false;
+        backtestBtn.disabled = false;
+        setValidationStatus("JSON 可解析，建议检查配置。");
+        return parsed;
+      } catch (err) {
+        saveBtn.disabled = true;
+        backtestBtn.disabled = true;
+        setValidationStatus(`JSON 错误：${err}`, true);
+        return null;
+      }
+    }
+    function renderValidation(data) {
+      latestValidation = data;
+      const blocks = [];
+      (data.errors || []).forEach((item) => blocks.push(["error", `错误：${item}`]));
+      (data.warnings || []).forEach((item) => blocks.push(["", `警告：${item}`]));
+      (data.suggestions || []).forEach((item) => blocks.push([data.severity === "ok" ? "ok" : "", `建议：${item}`]));
+      validationNotesEl.innerHTML = blocks.map(([kind, text]) => `<div class="note ${kind}">${escapeHtml(text)}</div>`).join("");
+      if (data.ok) {
+        setValidationStatus(data.severity === "warning" ? "检查通过，有建议需确认。" : "检查通过。");
+        saveBtn.disabled = false;
+        backtestBtn.disabled = false;
+      } else {
+        setValidationStatus("检查未通过，请先修正错误。", true);
+        saveBtn.disabled = true;
+        backtestBtn.disabled = true;
+      }
+    }
+    async function validateConfig() {
+      const config = readEditedConfig();
+      if (!config) return null;
+      validateBtn.disabled = true;
+      setValidationStatus("正在检查配置...");
+      try {
+        const resp = await fetch("/api/spot_competition_tuner/validate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ config }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        renderValidation(data);
+        return data;
+      } catch (err) {
+        setValidationStatus(`检查失败：${err}`, true);
+        return null;
+      } finally {
+        validateBtn.disabled = false;
+      }
+    }
     function render(data) {
       const m = data.metrics || {};
       const c = data.classification || {};
       const cfg = data.recommended_config || {};
       latestConfig = cfg;
+      latestValidation = null;
+      validationNotesEl.innerHTML = "";
       saveBtn.disabled = false;
       backtestBtn.disabled = false;
+      validateBtn.disabled = false;
       backtestStatusEl.value = "可回测当前配置。";
+      setValidationStatus("推荐配置已生成，可直接编辑或检查。");
       metricsEl.innerHTML = [
         ["市场状态", c.regime || "--", `${c.liquidity_bucket || "--"} liquidity · ${c.volatility_bucket || "--"} volatility`],
         ["中价", fmt(m.mid_price, 8), `点差 ${pct(m.spread_ratio)}`],
@@ -32005,7 +32090,7 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
         ["快速止损阈值", `${pct(cfg.spot_fast_stop_10s_abs_return_ratio)} / ${pct(cfg.spot_fast_stop_30s_abs_return_ratio)}`],
         ["慢趋势步长", cfg.spot_slow_trend_step_enabled ? `开启，scale=${fmt(cfg.spot_slow_trend_step_scale, 2)}` : "关闭"],
       ].map(([k, v]) => `<tr><th>${escapeHtml(k)}</th><td>${escapeHtml(v)}</td></tr>`).join("");
-      configJsonEl.textContent = JSON.stringify(cfg, null, 2);
+      configJsonEl.value = JSON.stringify(cfg, null, 2);
     }
     function renderBacktest(data) {
       const s = data.summary || {};
@@ -32030,6 +32115,7 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
       recommendBtn.disabled = true;
       saveBtn.disabled = true;
       backtestBtn.disabled = true;
+      validateBtn.disabled = true;
       setStatus("正在拉取 Binance 现货行情并生成参数...");
       try {
         const resp = await fetch("/api/spot_competition_tuner/recommend", {
@@ -32043,22 +32129,28 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
         setStatus(`已生成 ${data.symbol} 的推荐配置。`);
       } catch (err) {
         latestConfig = null;
-        configJsonEl.textContent = "{}";
+        latestValidation = null;
+        configJsonEl.value = "{}";
+        validationNotesEl.innerHTML = "";
         backtestStatusEl.value = "等待配置。";
+        setValidationStatus("生成后可编辑。", true);
         setStatus(`生成失败：${err}`, true);
       } finally {
         recommendBtn.disabled = false;
       }
     }
     async function save() {
-      if (!latestConfig) return;
+      const config = readEditedConfig();
+      if (!config) return;
+      const check = await validateConfig();
+      if (!check || !check.ok) return;
       saveBtn.disabled = true;
       setStatus("正在保存到现货 runner 配置...");
       try {
         const resp = await fetch("/api/spot_competition_tuner/save", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ config: latestConfig }),
+          body: JSON.stringify({ config }),
         });
         const data = await resp.json();
         if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
@@ -32070,13 +32162,16 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
       }
     }
     async function backtest() {
-      if (!latestConfig) return;
+      const config = readEditedConfig();
+      if (!config) return;
+      const check = await validateConfig();
+      if (!check || !check.ok) return;
       backtestBtn.disabled = true;
       backtestStatusEl.value = "正在回测...";
       try {
         const payload = {
           ...readPayload(),
-          config: latestConfig,
+          config,
           start_time: localDateTimeToIso(backtestStartEl.value),
           end_time: localDateTimeToIso(backtestEndEl.value),
           backtest_interval: backtestIntervalEl.value,
@@ -32098,9 +32193,15 @@ SPOT_COMPETITION_TUNER_PAGE = """<!doctype html>
       }
     }
     symbolEl.addEventListener("input", () => { symbolEl.value = String(symbolEl.value || "").toUpperCase(); });
+    configJsonEl.addEventListener("input", () => {
+      latestValidation = null;
+      validationNotesEl.innerHTML = "";
+      readEditedConfig();
+    });
     recommendBtn.addEventListener("click", recommend);
     saveBtn.addEventListener("click", save);
     backtestBtn.addEventListener("click", backtest);
+    validateBtn.addEventListener("click", validateConfig);
     initBacktestTimes();
   </script>
 </body>
@@ -38470,6 +38571,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path in {
             "/api/spot_competition_tuner/recommend",
+            "/api/spot_competition_tuner/validate",
             "/api/spot_competition_tuner/save",
             "/api/spot_competition_tuner/backtest",
         }:
@@ -38493,6 +38595,11 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 if path.endswith("/recommend"):
                     result = build_spot_competition_recommendation(payload)
+                elif path.endswith("/validate"):
+                    config = payload.get("config")
+                    if not isinstance(config, dict):
+                        raise ValueError("config is required")
+                    result = validate_spot_competition_config(config)
                 elif path.endswith("/backtest"):
                     result = build_spot_competition_backtest(payload)
                 else:

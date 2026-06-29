@@ -329,6 +329,119 @@ def recommend_spot_competition_config(
     }
 
 
+def validate_spot_competition_config(config: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(config, dict):
+        raise ValueError("config is required")
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    suggestions: list[str] = []
+    normalized_symbol = str(config.get("symbol") or "").upper().strip()
+    strategy_mode = str(config.get("strategy_mode") or "").strip()
+    budget = _safe_float(config.get("total_quote_budget"))
+    step_price = _safe_float(config.get("step_price"))
+    per_order = _safe_float(config.get("per_order_notional"))
+    max_order_position = _safe_float(config.get("max_order_position_notional"))
+    max_position = _safe_float(config.get("max_position_notional"))
+    soft_limit = _safe_float(config.get("inventory_soft_limit_notional"))
+    hard_limit = _safe_float(config.get("inventory_hard_limit_notional"))
+    cycle_orders = _safe_int(config.get("max_single_cycle_new_orders"), 0)
+
+    if not normalized_symbol:
+        errors.append("symbol 不能为空。")
+    elif not normalized_symbol.endswith(("USDT", "USDC", "FDUSD")):
+        warnings.append("交易对不是常见稳定币报价，保存前请确认现货 runner 支持该报价币。")
+
+    allowed_modes = {"spot_competition_inventory_grid", "spot_competition_synthetic_neutral_grid"}
+    if strategy_mode not in allowed_modes:
+        errors.append("strategy_mode 需要是 spot_competition_inventory_grid 或 spot_competition_synthetic_neutral_grid。")
+
+    required_positive = [
+        ("total_quote_budget", budget),
+        ("step_price", step_price),
+        ("per_order_notional", per_order),
+        ("max_order_position_notional", max_order_position),
+        ("max_position_notional", max_position),
+    ]
+    for key, value in required_positive:
+        if value <= EPSILON:
+            errors.append(f"{key} 必须大于 0。")
+
+    if budget > EPSILON and per_order > EPSILON:
+        order_ratio = per_order / budget
+        if per_order < 5.0:
+            warnings.append("per_order_notional 低于 5 USDT，可能低于 Binance 最小成交额。")
+        if order_ratio > 0.12:
+            warnings.append("单笔金额超过预算 12%，成交会更快但库存波动会明显放大。")
+        elif order_ratio < 0.005:
+            suggestions.append("单笔金额低于预算 0.5%，如果交易赛更看重成交额，可考虑适当放大 per_order_notional。")
+
+    if budget > EPSILON and max_position > budget * 0.85:
+        warnings.append("max_position_notional 超过预算 85%，单边行情下接近满仓风险较高。")
+    if max_order_position > EPSILON and max_position > EPSILON and max_order_position > max_position:
+        errors.append("max_order_position_notional 不能大于 max_position_notional。")
+    if per_order > EPSILON and max_position > EPSILON and max_position < per_order * 2:
+        warnings.append("max_position_notional 小于两笔单量，策略可能很快停止新增买单。")
+    if soft_limit > EPSILON and hard_limit > EPSILON and soft_limit > hard_limit:
+        errors.append("inventory_soft_limit_notional 不能大于 inventory_hard_limit_notional。")
+    if hard_limit > EPSILON and max_position > EPSILON and hard_limit > max_position * 1.05:
+        warnings.append("inventory_hard_limit_notional 高于 max_position_notional，库存提示和硬限制语义不一致。")
+    if cycle_orders <= 0:
+        errors.append("max_single_cycle_new_orders 必须大于 0。")
+    elif cycle_orders > 16:
+        warnings.append("单轮新单数超过 16，容易制造过密订单和撤单压力。")
+    elif cycle_orders < 4:
+        suggestions.append("单轮新单数低于 4，交易赛成交额可能偏慢。")
+
+    if bool(config.get("spot_taker_exit_enabled")):
+        warnings.append("spot_taker_exit_enabled 已开启，这会允许 taker 退出，不符合 maker-only 优先目标。")
+    if bool(config.get("require_non_loss_exit")):
+        warnings.append("require_non_loss_exit 已开启，可能降低成交额；交易赛刷量配置通常关闭它。")
+    if not bool(config.get("cancel_stale", True)):
+        suggestions.append("建议保持 cancel_stale=true，避免旧挂单偏离当前中心。")
+    if not bool(config.get("spot_app_loss_guard_enabled", False)):
+        warnings.append("spot_app_loss_guard_enabled 未开启，建议保留应用层亏损保护。")
+
+    fast_stop = _safe_float(config.get("spot_fast_stop_10s_abs_return_ratio"))
+    if fast_stop > 0.03:
+        warnings.append("10s 快速止损阈值高于 3%，极端波动下保护可能偏慢。")
+    elif fast_stop > EPSILON and fast_stop < 0.0015:
+        warnings.append("10s 快速止损阈值低于 0.15%，可能过于敏感并频繁冻结库存。")
+
+    if strategy_mode == "spot_competition_synthetic_neutral_grid":
+        neutral_base_qty = _safe_float(config.get("neutral_base_qty"))
+        max_short_position = _safe_float(config.get("max_short_position_notional"))
+        if neutral_base_qty <= EPSILON:
+            warnings.append("合成中性模式下 neutral_base_qty 为 0，启动前需要核对 Base 余额或调回库存网格。")
+        if max_short_position <= EPSILON:
+            warnings.append("合成中性模式下 max_short_position_notional 为 0，中性约束不会生效。")
+    else:
+        if _safe_float(config.get("max_short_position_notional")) > EPSILON:
+            suggestions.append("库存网格模式不需要 max_short_position_notional，可保持 0。")
+
+    min_price = _safe_float(config.get("min_price"))
+    max_price = _safe_float(config.get("max_price"))
+    if min_price > EPSILON and max_price > EPSILON and min_price >= max_price:
+        errors.append("min_price 必须小于 max_price。")
+    if step_price > EPSILON and min_price > EPSILON and max_price > EPSILON:
+        span_steps = (max_price - min_price) / step_price
+        if span_steps < 8:
+            warnings.append("价格区间不足 8 个 step，网格覆盖偏窄。")
+
+    severity = "error" if errors else "warning" if warnings else "ok"
+    if not errors and not warnings:
+        suggestions.append("配置检查通过，可以继续回测或保存。")
+    return {
+        "ok": not errors,
+        "symbol": normalized_symbol,
+        "severity": severity,
+        "errors": errors,
+        "warnings": warnings,
+        "suggestions": suggestions,
+        "checked_config": dict(config),
+    }
+
+
 def build_spot_competition_recommendation(
     payload: dict[str, Any],
     *,

@@ -12,6 +12,7 @@ from grid_optimizer.spot_competition_tuner import (
     SpotCompetitionTuningInputs,
     build_spot_competition_backtest,
     recommend_spot_competition_config,
+    validate_spot_competition_config,
 )
 from grid_optimizer.types import Candle
 
@@ -43,8 +44,10 @@ class SpotCompetitionTunerTests(unittest.TestCase):
     def test_page_is_exposed(self) -> None:
         self.assertIn("现货交易赛参数推荐", web.SPOT_COMPETITION_TUNER_PAGE)
         self.assertIn("/api/spot_competition_tuner/recommend", web.SPOT_COMPETITION_TUNER_PAGE)
+        self.assertIn("/api/spot_competition_tuner/validate", web.SPOT_COMPETITION_TUNER_PAGE)
         self.assertIn("/api/spot_competition_tuner/save", web.SPOT_COMPETITION_TUNER_PAGE)
         self.assertIn("/api/spot_competition_tuner/backtest", web.SPOT_COMPETITION_TUNER_PAGE)
+        self.assertIn("检查配置", web.SPOT_COMPETITION_TUNER_PAGE)
         self.assertIn("时间段回测", web.SPOT_COMPETITION_TUNER_PAGE)
         self.assertIn("/spot_competition_tuner", web.SPOT_RUNNER_PAGE)
 
@@ -162,6 +165,51 @@ class SpotCompetitionTunerTests(unittest.TestCase):
         self.assertEqual(result["config"]["strategy_mode"], "spot_competition_inventory_grid")
         self.assertEqual(result["config"]["symbol"], "BTCUSDT")
         self.assertEqual(saved_payload["symbol"], "BTCUSDT")
+
+    def test_validate_config_returns_errors_and_suggestions(self) -> None:
+        result = validate_spot_competition_config(
+            {
+                "symbol": "BTCUSDT",
+                "strategy_mode": "spot_competition_inventory_grid",
+                "total_quote_budget": 1000,
+                "step_price": 0.1,
+                "per_order_notional": 20,
+                "max_order_position_notional": 700,
+                "max_position_notional": 600,
+                "inventory_soft_limit_notional": 500,
+                "inventory_hard_limit_notional": 650,
+                "max_single_cycle_new_orders": 20,
+                "spot_taker_exit_enabled": True,
+                "spot_app_loss_guard_enabled": False,
+            }
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["severity"], "error")
+        self.assertTrue(any("max_order_position_notional" in item for item in result["errors"]))
+        self.assertTrue(any("taker" in item for item in result["warnings"]))
+
+    def test_validate_config_accepts_recommended_shape(self) -> None:
+        result = validate_spot_competition_config(
+            {
+                "symbol": "BTCUSDT",
+                "strategy_mode": "spot_competition_inventory_grid",
+                "total_quote_budget": 1000,
+                "step_price": 1.0,
+                "per_order_notional": 30,
+                "max_order_position_notional": 320,
+                "max_position_notional": 420,
+                "inventory_soft_limit_notional": 260,
+                "inventory_hard_limit_notional": 420,
+                "max_single_cycle_new_orders": 8,
+                "spot_taker_exit_enabled": False,
+                "spot_app_loss_guard_enabled": True,
+                "cancel_stale": True,
+            }
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertIn(result["severity"], {"ok", "warning"})
 
     @patch("grid_optimizer.spot_competition_tuner.fetch_spot_klines")
     def test_backtest_uses_config_and_time_range(self, mock_klines) -> None:
