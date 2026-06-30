@@ -3665,6 +3665,7 @@ def _transfer_best_quote_volume_to_frozen(
     mid_price: float = 0.0,
     band_budget_enabled: bool = False,
     band_budget_price_ratio: float = 0.0,
+    band_budget_min_price: float = 0.0,
     band_budget_base_notional: float = 0.0,
     band_budget_emergency_extra_ratio: float = 0.0,
     band_budget_recover_ratio: float = 0.0,
@@ -3683,13 +3684,24 @@ def _transfer_best_quote_volume_to_frozen(
     band_key = ""
     if bool(band_budget_enabled):
         safe_mid = max(_safe_float(mid_price), 0.0)
+        safe_min_price = max(_safe_float(band_budget_min_price), 0.0)
         band_info = _best_quote_freeze_band_info(
             side=normalized_side,
             price=safe_mid,
             band_ratio=band_budget_price_ratio,
         )
         base_notional = max(_safe_float(band_budget_base_notional), 0.0)
-        if band_info is None or safe_mid <= 0 or base_notional <= 0:
+        if safe_min_price > 0 and safe_mid < safe_min_price:
+            allowed_qty = 0.0
+            budget_report.update(
+                {
+                    "price": safe_mid,
+                    "min_price": safe_min_price,
+                    "allowed_qty": 0.0,
+                    "blocked_reason": "below_band_budget_min_price",
+                }
+            )
+        elif band_info is None or safe_mid <= 0 or base_notional <= 0:
             allowed_qty = 0.0
             budget_report.update({"allowed_qty": 0.0, "blocked_reason": "invalid_band_budget_config"})
         else:
@@ -3713,6 +3725,7 @@ def _transfer_best_quote_volume_to_frozen(
             budget_report.update(
                 {
                     **band_info,
+                    "min_price": safe_min_price,
                     "base_budget_notional": base_notional,
                     "emergency_active": bool(band_budget_emergency_active),
                     "emergency_extra_ratio": emergency_extra_ratio,
@@ -4022,6 +4035,7 @@ def _apply_best_quote_reduce_freeze(
     dynamic_threshold_frozen_notional_full: float = 0.0,
     band_budget_enabled: bool = False,
     band_budget_price_ratio: float = 0.0,
+    band_budget_min_price: float = 0.0,
     band_budget_base_notional: float = 0.0,
     band_budget_emergency_extra_ratio: float = 0.0,
     band_budget_recover_ratio: float = 0.0,
@@ -4175,6 +4189,7 @@ def _apply_best_quote_reduce_freeze(
     band_budget_report: dict[str, Any] = {
         "enabled": bool(band_budget_enabled),
         "price_ratio": max(_safe_float(band_budget_price_ratio), 0.0),
+        "min_price": max(_safe_float(band_budget_min_price), 0.0),
         "base_notional": max(_safe_float(band_budget_base_notional), 0.0),
         "emergency_extra_ratio": max(_safe_float(band_budget_emergency_extra_ratio), 0.0),
         "recover_ratio": min(max(_safe_float(band_budget_recover_ratio), 0.0), 1.0),
@@ -4532,6 +4547,7 @@ def _apply_best_quote_reduce_freeze(
             mid_price=mid_price,
             band_budget_enabled=band_budget_enabled,
             band_budget_price_ratio=band_budget_price_ratio,
+            band_budget_min_price=band_budget_min_price,
             band_budget_base_notional=band_budget_base_notional,
             band_budget_emergency_extra_ratio=band_budget_emergency_extra_ratio,
             band_budget_recover_ratio=band_budget_recover_ratio,
@@ -4568,6 +4584,7 @@ def _apply_best_quote_reduce_freeze(
             mid_price=mid_price,
             band_budget_enabled=band_budget_enabled,
             band_budget_price_ratio=band_budget_price_ratio,
+            band_budget_min_price=band_budget_min_price,
             band_budget_base_notional=band_budget_base_notional,
             band_budget_emergency_extra_ratio=band_budget_emergency_extra_ratio,
             band_budget_recover_ratio=band_budget_recover_ratio,
@@ -18119,6 +18136,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_band_budget_price_ratio", 0.005)),
             0.0,
         )
+        best_quote_reduce_freeze_band_budget_min_price = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_band_budget_min_price", 0.0)),
+            0.0,
+        )
         best_quote_reduce_freeze_band_budget_base_notional = max(
             _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_band_budget_base_notional", 0.0)),
             0.0,
@@ -18254,6 +18275,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 "band_budget_enabled": best_quote_reduce_freeze_band_budget_enabled,
                 "band_budget_price_ratio": best_quote_reduce_freeze_band_budget_price_ratio,
+                "band_budget_min_price": best_quote_reduce_freeze_band_budget_min_price,
                 "band_budget_base_notional": best_quote_reduce_freeze_band_budget_base_notional,
                 "band_budget_emergency_extra_ratio": best_quote_reduce_freeze_band_budget_emergency_extra_ratio,
                 "band_budget_recover_ratio": best_quote_reduce_freeze_band_budget_recover_ratio,
@@ -18314,6 +18336,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             band_budget_enabled=best_quote_reduce_freeze_band_budget_enabled,
             band_budget_price_ratio=best_quote_reduce_freeze_band_budget_price_ratio,
+            band_budget_min_price=best_quote_reduce_freeze_band_budget_min_price,
             band_budget_base_notional=best_quote_reduce_freeze_band_budget_base_notional,
             band_budget_emergency_extra_ratio=best_quote_reduce_freeze_band_budget_emergency_extra_ratio,
             band_budget_recover_ratio=best_quote_reduce_freeze_band_budget_recover_ratio,
@@ -21698,6 +21721,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-band-budget-price-ratio", type=float, default=0.005)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-band-budget-min-price", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-band-budget-base-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-band-budget-emergency-extra-ratio", type=float, default=0.5)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-band-budget-recover-ratio", type=float, default=0.5)
@@ -22933,6 +22957,7 @@ def main() -> None:
         or args.best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_start < 0
         or args.best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_full < 0
         or args.best_quote_maker_volume_reduce_freeze_band_budget_price_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_band_budget_min_price < 0
         or args.best_quote_maker_volume_reduce_freeze_band_budget_base_notional < 0
         or args.best_quote_maker_volume_reduce_freeze_band_budget_emergency_extra_ratio < 0
         or args.best_quote_maker_volume_reduce_freeze_band_budget_emergency_loss_ratio_scale < 0
