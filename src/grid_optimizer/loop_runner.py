@@ -6411,13 +6411,27 @@ def _isolated_frozen_actions_tolerate_position_drift(
     frozen_long_qty: float = 0.0,
     frozen_short_qty: float = 0.0,
 ) -> bool:
+    place_orders = [item for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    expected_exchange_long_qty = max(_safe_float(expected_long_qty), 0.0) + max(_safe_float(frozen_long_qty), 0.0)
+    expected_exchange_short_qty = max(_safe_float(expected_short_qty), 0.0) + max(_safe_float(frozen_short_qty), 0.0)
+    exchange_position_matches = (
+        abs(max(_safe_float(current_long_qty), 0.0) - expected_exchange_long_qty) <= 1e-9
+        and abs(max(_safe_float(current_short_qty), 0.0) - expected_exchange_short_qty) <= 1e-9
+    )
+    if not exchange_position_matches:
+        # When frozen inventory is isolated, normal entries are only safe after
+        # the live exchange position matches active+frozen. Reduce-only actions
+        # and cancels may still proceed through the legacy tolerance below.
+        for order in place_orders:
+            if not (bool(order.get("force_reduce_only")) and _is_hedge_side_reduce_order(order)):
+                return False
     long_deficit = current_long_qty + 1e-9 < expected_long_qty
     short_deficit = current_short_qty + 1e-9 < expected_short_qty
     if not long_deficit and not short_deficit:
         return True
     reduce_long_qty = 0.0
     reduce_short_qty = 0.0
-    for order in [item for item in actions.get("place_orders", []) if isinstance(item, dict)]:
+    for order in place_orders:
         side = str(order.get("side", "")).upper().strip()
         position_side = _order_position_side(order)
         if (long_deficit or short_deficit) and position_side == "BOTH":

@@ -574,6 +574,50 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertFalse(allowed)
 
+    def test_isolated_frozen_position_drift_blocks_normal_entry_until_exchange_matches(self) -> None:
+        allowed = _isolated_frozen_actions_tolerate_position_drift(
+            {
+                "place_orders": [
+                    {
+                        "role": "best_quote_entry_short",
+                        "side": "SELL",
+                        "position_side": "SHORT",
+                        "qty": 13.0,
+                    },
+                ]
+            },
+            expected_long_qty=26.0,
+            expected_short_qty=32.0,
+            current_long_qty=26.0,
+            current_short_qty=526.0,
+            frozen_long_qty=0.0,
+            frozen_short_qty=403.0,
+        )
+
+        self.assertFalse(allowed)
+
+    def test_isolated_frozen_position_drift_allows_normal_entry_when_exchange_matches(self) -> None:
+        allowed = _isolated_frozen_actions_tolerate_position_drift(
+            {
+                "place_orders": [
+                    {
+                        "role": "best_quote_entry_short",
+                        "side": "SELL",
+                        "position_side": "SHORT",
+                        "qty": 13.0,
+                    },
+                ]
+            },
+            expected_long_qty=26.0,
+            expected_short_qty=32.0,
+            current_long_qty=26.0,
+            current_short_qty=435.0,
+            frozen_long_qty=0.0,
+            frozen_short_qty=403.0,
+        )
+
+        self.assertTrue(allowed)
+
     def test_resolve_volatility_entry_pause_holds_for_min_observation_window(self) -> None:
         trigger_now = datetime(2026, 5, 16, 4, 7, tzinfo=timezone.utc)
         triggered = resolve_volatility_entry_pause(
