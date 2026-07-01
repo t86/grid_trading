@@ -9974,6 +9974,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_same_side_entry_price_guard_enabled",
         "best_quote_maker_volume_dynamic_tick_enabled",
         "best_quote_maker_volume_inventory_bias_enabled",
+        "best_quote_maker_volume_inventory_bias_opposite_entry_enabled",
         "best_quote_maker_volume_dynamic_control_enabled",
         "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled",
         "best_quote_maker_volume_dynamic_control_trend_inventory_guard_enabled",
@@ -11111,6 +11112,9 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("best_quote_maker_volume_inventory_bias_min_notional_gap_soft_ratio", 0.0)),
         "--best-quote-maker-volume-inventory-bias-reduce-share",
         str(config.get("best_quote_maker_volume_inventory_bias_reduce_share", 0.70)),
+        "--best-quote-maker-volume-inventory-bias-opposite-entry-enabled"
+        if config.get("best_quote_maker_volume_inventory_bias_opposite_entry_enabled", False)
+        else "--no-best-quote-maker-volume-inventory-bias-opposite-entry-enabled",
         "--best-quote-maker-volume-inventory-bias-same-side-extra-ticks",
         str(config.get("best_quote_maker_volume_inventory_bias_same_side_extra_ticks", 2)),
         "--best-quote-maker-volume-inventory-bias-reduce-extra-ticks",
