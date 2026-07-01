@@ -422,6 +422,58 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertFalse(guarded["reduce_only_no_loss_guard"]["enabled"])
         self.assertEqual(guarded["place_orders"][0]["role"], "best_quote_reduce_long")
 
+    def test_reduce_only_no_loss_guard_can_bypass_only_inventory_unlock_role(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.5199,
+                    "qty": 11.0,
+                    "notional": 5.7189,
+                    "role": "inventory_unlock_reduce_short",
+                    "position_side": "SHORT",
+                    "force_reduce_only": True,
+                },
+                {
+                    "side": "BUY",
+                    "price": 0.5199,
+                    "qty": 11.0,
+                    "notional": 5.7189,
+                    "role": "best_quote_reduce_short",
+                    "position_side": "SHORT",
+                    "force_reduce_only": True,
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+        }
+
+        guarded = apply_reduce_only_no_loss_guard_to_actions(
+            actions=actions,
+            plan_report={
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "take_profit_guard": {"enabled": True, "short_ceiling_price": 0.5076},
+                "current_short_avg_price": 0.5076,
+            },
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            live_bid_price=0.5198,
+            live_ask_price=0.5199,
+            tick_size=0.0001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+            allow_loss_roles={"inventory_unlock_reduce_short"},
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertEqual(guarded["place_orders"][0]["role"], "inventory_unlock_reduce_short")
+        self.assertEqual(
+            guarded["place_orders"][0]["reduce_only_no_loss_guard"],
+            "bypassed_allow_loss_role_inventory_unlock_reduce_short",
+        )
+        self.assertEqual(guarded["reduce_only_no_loss_guard"]["dropped_orders"][0]["role"], "best_quote_reduce_short")
+
     def test_suppress_same_side_nearby_place_orders_preserves_existing_queue(self) -> None:
         actions = {
             "place_orders": [

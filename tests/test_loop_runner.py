@@ -12900,7 +12900,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(plan["sell_orders"][1]["price"], 1.022, places=8)
         self.assertAlmostEqual(plan["buy_orders"][0]["price"], 0.979, places=8)
 
-    def test_apply_take_profit_profit_guard_exempts_hedge_bq_reduce_short_when_allow_loss(self) -> None:
+    def test_apply_take_profit_profit_guard_keeps_hedge_bq_reduce_short_protected_when_allow_loss(self) -> None:
         long_roles, short_roles = _best_quote_take_profit_guard_role_sets(
             hedge_best_quote=True,
             enabled=True,
@@ -12939,8 +12939,8 @@ class LoopRunnerTests(unittest.TestCase):
         )
 
         self.assertTrue(result["short_active"])
-        self.assertEqual(result["adjusted_buy_orders"], 0)
-        self.assertAlmostEqual(plan["buy_orders"][0]["price"], 0.6400, places=8)
+        self.assertEqual(result["adjusted_buy_orders"], 1)
+        self.assertAlmostEqual(plan["buy_orders"][0]["price"], 0.6155, places=8)
 
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
@@ -15110,8 +15110,8 @@ class LoopRunnerTests(unittest.TestCase):
             allow_loss_reduce_only=True,
         )
 
-        self.assertEqual(long_roles, set())
-        self.assertEqual(short_roles, set())
+        self.assertEqual(long_roles, {"best_quote_reduce_long"})
+        self.assertEqual(short_roles, {"best_quote_reduce_short"})
 
     def test_best_quote_take_profit_guard_keeps_non_hedge_entry_roles_when_allow_loss(self) -> None:
         long_roles, short_roles = _best_quote_take_profit_guard_role_sets(

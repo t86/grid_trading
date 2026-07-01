@@ -10616,8 +10616,6 @@ def _best_quote_take_profit_guard_role_sets(
 ) -> tuple[set[str] | None, set[str] | None]:
     if not enabled:
         return None, None
-    if hedge_best_quote and allow_loss_reduce_only:
-        return set(), set()
 
     long_roles = {"best_quote_reduce_long"}
     short_roles = {"best_quote_reduce_short"}
@@ -20850,7 +20848,12 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
-        enabled=not bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)),
+        enabled=True,
+        allow_loss_roles=(
+            {"inventory_unlock_reduce_long", "inventory_unlock_reduce_short"}
+            if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False))
+            else None
+        ),
     )
     validation["actions"] = isolate_frozen_pair_release_place_orders(validation["actions"])
     if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
@@ -21306,7 +21309,12 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
-        enabled=not bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)),
+        enabled=True,
+        allow_loss_roles=(
+            {"inventory_unlock_reduce_long", "inventory_unlock_reduce_short"}
+            if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False))
+            else None
+        ),
     )
     if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
         validation["errors"] = [

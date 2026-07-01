@@ -1070,6 +1070,7 @@ def apply_reduce_only_no_loss_guard_to_actions(
     min_notional: float | None,
     step_size: float | None = None,
     enabled: bool = True,
+    allow_loss_roles: set[str] | None = None,
 ) -> dict[str, Any]:
     """Drop reduce-only places that would submit beyond the no-loss floor/ceiling."""
     place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
@@ -1108,6 +1109,7 @@ def apply_reduce_only_no_loss_guard_to_actions(
         if short_avg > 0:
             short_ceiling = short_avg * (1.0 - min_profit_ratio)
 
+    allowed_loss_roles = {str(item).strip().lower() for item in (allow_loss_roles or set()) if str(item).strip()}
     kept_place_orders: list[dict[str, Any]] = []
     dropped_orders: list[dict[str, Any]] = []
     for order in place_orders:
@@ -1156,6 +1158,12 @@ def apply_reduce_only_no_loss_guard_to_actions(
             if long_floor > 0 and (submitted_price <= 0 or submitted_price + 1e-12 < long_floor):
                 drop_reason = "long_reduce_below_no_loss_floor"
         if drop_reason:
+            if role in allowed_loss_roles:
+                order["reduce_only_no_loss_guard"] = f"bypassed_allow_loss_role_{role}"
+                order["reduce_only_no_loss_guard_price"] = guard_price
+                order["reduce_only_no_loss_submitted_price"] = submitted_price
+                kept_place_orders.append(order)
+                continue
             dropped = dict(order)
             dropped["reduce_only_no_loss_drop_reason"] = drop_reason
             dropped["reduce_only_no_loss_guard_price"] = guard_price
