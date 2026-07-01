@@ -205,6 +205,12 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("生成建议参数", MONITOR_PAGE)
         self.assertIn("data-alert-action", MONITOR_PAGE)
 
+    def test_monitor_page_default_symbols_include_ousdt(self) -> None:
+        self.assertIn('"OUSDT"', MONITOR_PAGE)
+
+    def test_strategies_page_monitor_defaults_include_ousdt(self) -> None:
+        self.assertIn('"OUSDT"', STRATEGIES_PAGE)
+
     def test_monitor_page_contains_xaut_adaptive_status_text(self) -> None:
         self.assertIn("XAUT 三态状态", MONITOR_PAGE)
         self.assertIn("XAUT 三态原因", MONITOR_PAGE)

@@ -47,6 +47,10 @@ class SymbolListsTests(unittest.TestCase):
             self.assertIn(symbol, loaded["competition"])
         self.assertIn("PHAROSUSDT", loaded["monitor"])
 
+    def test_default_monitor_symbols_include_ousdt(self) -> None:
+        loaded = load_symbol_lists(self.path)
+        self.assertIn("OUSDT", loaded["monitor"])
+
     def test_set_symbol_list_normalizes_and_deduplicates(self) -> None:
         symbols = set_symbol_list("monitor", [" soonusdt ", "soonusdt", "SOONUSDT"], self.path)
         self.assertEqual(symbols, ["SOONUSDT"])

@@ -23603,7 +23603,7 @@ MONITOR_PAGE = """<!doctype html>
     const customGridStatusEl = document.getElementById("custom_grid_status");
     const customGridSummaryEl = document.getElementById("custom_grid_summary");
     const customGridPreviewBody = document.getElementById("custom_grid_preview_body");
-    const DEFAULT_MONITOR_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT", "OPGUSDT"];
+    const DEFAULT_MONITOR_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT", "OPGUSDT", "OUSDT"];
     const VISIBLE_STRATEGY_PRESET_KEYS = new Set([
       "volume_long_v4",
       "based_volume_push_bard_v1",
@@ -32968,7 +32968,7 @@ STRATEGIES_PAGE = """<!doctype html>
   </div>
 
   <script>
-    const DEFAULT_MONITOR_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT", "OPGUSDT"];
+    const DEFAULT_MONITOR_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT", "OPGUSDT", "OUSDT"];
     const DEFAULT_COMPETITION_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT", "OPGUSDT"];
     const DEFAULT_SPOT_SYMBOLS = ["TONUSDT", "XAUTUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"];
     const cardsEl = document.getElementById("cards");

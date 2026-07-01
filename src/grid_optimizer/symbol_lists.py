@@ -22,6 +22,7 @@ DEFAULT_SYMBOL_LISTS: dict[str, list[str]] = {
         "TRUMPUSDC",
         "AIGENSYNUSDT",
         "OPGUSDT",
+        "OUSDT",
     ],
     "competition": [
         "PHAROSUSDT",
