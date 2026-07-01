@@ -7305,6 +7305,7 @@ class LoopRunnerTests(unittest.TestCase):
             min_notional=5.0,
             bid_price=0.14205,
             ask_price=0.14206,
+            position_side="SHORT",
         )
 
         release_orders = [order for order in plan["buy_orders"] if order["role"] == "inventory_unlock_reduce_short"]
@@ -7316,6 +7317,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(release_orders[0]["force_reduce_only"])
         self.assertEqual(release_orders[0]["time_in_force"], "GTX")
         self.assertEqual(release_orders[0]["execution_type"], "inventory_unlock_release")
+        self.assertEqual(release_orders[0]["position_side"], "SHORT")
         self.assertGreater(release_orders[0]["price"], 0.14095)
         self.assertLessEqual(release_orders[0]["notional"], 733.0)
 

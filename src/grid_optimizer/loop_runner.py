@@ -11972,6 +11972,7 @@ def apply_inventory_unlock_release(
     min_notional: float | None,
     bid_price: float,
     ask_price: float,
+    position_side: str = "BOTH",
     confirm_cycles: int = 3,
 ) -> dict[str, Any]:
     report = _inventory_unlock_default_report()
@@ -12139,7 +12140,7 @@ def apply_inventory_unlock_release(
         "notional": notional,
         "level": 1,
         "role": role,
-        "position_side": "BOTH",
+        "position_side": str(position_side or "BOTH").upper(),
         "force_reduce_only": True,
         "time_in_force": "GTX",
         "execution_type": "inventory_unlock_release",
@@ -20191,31 +20192,55 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         args=effective_args,
         fallback_notional=inventory_tier.get("effective_per_order_notional", getattr(effective_args, "per_order_notional", 0.0)),
     )
+    best_quote_metrics = dict(best_quote_maker_volume.get("metrics") or {})
+    best_quote_unlock_mode = _is_best_quote_maker_volume_mode(strategy_mode)
+    unlock_long_pause_notional = _resolve_inventory_unlock_pause_notional(
+        args=effective_args,
+        strategy_mode=strategy_mode,
+        side="long",
+        fallback_pause_notional=effective_args.pause_buy_position_notional,
+        open_entry_notional=_safe_float(best_quote_metrics.get("open_entry_long_notional")),
+        pending_entry_buffer_notional=_safe_float(best_quote_metrics.get("pending_entry_buffer_notional")),
+    )
+    unlock_short_pause_notional = _resolve_inventory_unlock_pause_notional(
+        args=effective_args,
+        strategy_mode=strategy_mode,
+        side="short",
+        fallback_pause_notional=effective_args.pause_short_position_notional,
+        open_entry_notional=_safe_float(best_quote_metrics.get("open_entry_short_notional")),
+        pending_entry_buffer_notional=_safe_float(best_quote_metrics.get("pending_entry_buffer_notional")),
+    )
+    unlock_long_entry_paused = bool(controls.get("buy_paused")) or (
+        best_quote_unlock_mode
+        and _safe_float(current_long_notional) > _safe_float(unlock_long_pause_notional) + 1e-12
+    )
+    unlock_short_entry_paused = bool(controls.get("short_paused")) or (
+        best_quote_unlock_mode
+        and _safe_float(current_short_notional) > _safe_float(unlock_short_pause_notional) + 1e-12
+    )
     unlock_long_side = strategy_mode == "one_way_long" or (
-        strategy_mode == "best_quote_maker_volume_v1" and current_long_qty > 1e-12
+        best_quote_unlock_mode and current_long_qty > 1e-12 and unlock_long_entry_paused
     )
     unlock_short_side = strategy_mode == "one_way_short" or (
-        strategy_mode == "best_quote_maker_volume_v1" and current_short_qty > 1e-12
+        best_quote_unlock_mode and current_short_qty > 1e-12 and unlock_short_entry_paused
     )
+    if unlock_long_side and unlock_short_side:
+        unlock_long_excess = _safe_float(current_long_notional) - _safe_float(unlock_long_pause_notional)
+        unlock_short_excess = _safe_float(current_short_notional) - _safe_float(unlock_short_pause_notional)
+        if unlock_short_excess > unlock_long_excess:
+            unlock_long_side = False
+        else:
+            unlock_short_side = False
     if unlock_long_side:
-        best_quote_metrics = dict(best_quote_maker_volume.get("metrics") or {})
-        unlock_pause_notional = _resolve_inventory_unlock_pause_notional(
-            args=effective_args,
-            strategy_mode=strategy_mode,
-            side="long",
-            fallback_pause_notional=effective_args.pause_buy_position_notional,
-            open_entry_notional=_safe_float(best_quote_metrics.get("open_entry_long_notional")),
-            pending_entry_buffer_notional=_safe_float(best_quote_metrics.get("pending_entry_buffer_notional")),
-        )
         inventory_unlock_release = apply_inventory_unlock_release(
             plan=plan,
             state=state,
             side="long",
-            entry_paused=bool(controls.get("buy_paused")),
+            entry_paused=unlock_long_entry_paused,
             take_profit_guard=take_profit_guard,
             current_qty=current_long_qty,
             current_notional=controls.get("current_long_notional", current_long_notional),
-            pause_notional=unlock_pause_notional,
+            pause_notional=unlock_long_pause_notional,
             release_cap_notional=unlock_release_cap,
             per_order_notional=inventory_tier.get("effective_per_order_notional", getattr(effective_args, "per_order_notional", 0.0)),
             step_price=effective_args.step_price,
@@ -20225,26 +20250,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_notional=symbol_info.get("min_notional"),
             bid_price=bid_price,
             ask_price=ask_price,
+            position_side="LONG" if hedge_best_quote else "BOTH",
         )
     elif unlock_short_side:
-        best_quote_metrics = dict(best_quote_maker_volume.get("metrics") or {})
-        unlock_pause_notional = _resolve_inventory_unlock_pause_notional(
-            args=effective_args,
-            strategy_mode=strategy_mode,
-            side="short",
-            fallback_pause_notional=effective_args.pause_short_position_notional,
-            open_entry_notional=_safe_float(best_quote_metrics.get("open_entry_short_notional")),
-            pending_entry_buffer_notional=_safe_float(best_quote_metrics.get("pending_entry_buffer_notional")),
-        )
         inventory_unlock_release = apply_inventory_unlock_release(
             plan=plan,
             state=state,
             side="short",
-            entry_paused=bool(controls.get("short_paused")),
+            entry_paused=unlock_short_entry_paused,
             take_profit_guard=take_profit_guard,
             current_qty=current_short_qty,
             current_notional=controls.get("current_short_notional", current_short_notional),
-            pause_notional=unlock_pause_notional,
+            pause_notional=unlock_short_pause_notional,
             release_cap_notional=unlock_release_cap,
             per_order_notional=inventory_tier.get("effective_per_order_notional", getattr(effective_args, "per_order_notional", 0.0)),
             step_price=effective_args.step_price,
@@ -20254,6 +20271,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_notional=symbol_info.get("min_notional"),
             bid_price=bid_price,
             ask_price=ask_price,
+            position_side="SHORT" if hedge_best_quote else "BOTH",
         )
     else:
         state.pop("inventory_unlock_release", None)
