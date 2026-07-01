@@ -80,6 +80,7 @@ from grid_optimizer.loop_runner import (
     apply_volume_long_v4_flow_sleeve,
     apply_hard_loss_forced_reduce,
     apply_inventory_unlock_release,
+    apply_best_quote_active_pair_reduce,
     _resolve_inventory_unlock_pause_notional,
     _is_best_quote_maker_volume_mode,
     resolve_loss_recovery_brush,
@@ -7244,6 +7245,84 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertFalse(report["active"])
         self.assertEqual(report["stall_count"], 1)
+        self.assertEqual(plan["sell_orders"], [])
+
+    def test_best_quote_active_pair_reduce_soft_trigger_adds_maker_reduces(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+        state: dict[str, object] = {}
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state=state,
+            enabled=True,
+            current_long_qty=1400.0,
+            current_short_qty=1000.0,
+            current_long_notional=720.0,
+            current_short_notional=520.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.70,
+            min_side_notional=100.0,
+            per_order_notional=50.0,
+            max_reduce_notional_per_side=200.0,
+            offset_ticks=1,
+            step_price=0.0005,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.5149,
+            ask_price=0.5150,
+            volatility_entry_pause={"active": False},
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["order_count"], 2)
+        self.assertAlmostEqual(report["long_target_notional"], 520.0)
+        self.assertAlmostEqual(report["short_target_notional"], 320.0)
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_active_pair_reduce_long")
+        self.assertEqual(plan["sell_orders"][0]["side"], "SELL")
+        self.assertEqual(plan["sell_orders"][0]["position_side"], "LONG")
+        self.assertTrue(plan["sell_orders"][0]["force_reduce_only"])
+        self.assertEqual(plan["sell_orders"][0]["time_in_force"], "GTX")
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_active_pair_reduce_short")
+        self.assertEqual(plan["buy_orders"][0]["side"], "BUY")
+        self.assertEqual(plan["buy_orders"][0]["position_side"], "SHORT")
+        self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
+        self.assertEqual(plan["buy_orders"][0]["time_in_force"], "GTX")
+        self.assertTrue(state["best_quote_active_pair_reduce"]["active"])
+
+    def test_best_quote_active_pair_reduce_respects_volatility_pause(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state={},
+            enabled=True,
+            current_long_qty=1400.0,
+            current_short_qty=1000.0,
+            current_long_notional=720.0,
+            current_short_notional=520.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.70,
+            min_side_notional=100.0,
+            per_order_notional=50.0,
+            max_reduce_notional_per_side=200.0,
+            offset_ticks=1,
+            step_price=0.0005,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.5149,
+            ask_price=0.5150,
+            volatility_entry_pause={"active": True},
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report["reason"], "volatility_entry_pause")
+        self.assertEqual(plan["buy_orders"], [])
         self.assertEqual(plan["sell_orders"], [])
 
     def test_best_quote_inventory_unlock_uses_soft_pause_threshold(self) -> None:

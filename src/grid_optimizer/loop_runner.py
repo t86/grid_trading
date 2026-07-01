@@ -11906,6 +11906,228 @@ def _inventory_unlock_default_report() -> dict[str, Any]:
     }
 
 
+def _best_quote_active_pair_reduce_default_report() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "active": False,
+        "reason": "disabled",
+        "order_count": 0,
+        "long_order_notional": 0.0,
+        "short_order_notional": 0.0,
+        "long_target_notional": None,
+        "short_target_notional": None,
+        "long_start_notional": 0.0,
+        "short_start_notional": 0.0,
+        "long_soft_notional": 0.0,
+        "short_soft_notional": 0.0,
+        "per_order_notional": 0.0,
+        "max_reduce_notional_per_side": 0.0,
+        "triggered": False,
+        "completed": False,
+    }
+
+
+def apply_best_quote_active_pair_reduce(
+    *,
+    plan: dict[str, Any],
+    state: dict[str, Any],
+    enabled: bool,
+    current_long_qty: float,
+    current_short_qty: float,
+    current_long_notional: float,
+    current_short_notional: float,
+    max_long_notional: float,
+    max_short_notional: float,
+    soft_ratio: float,
+    min_side_notional: float,
+    per_order_notional: float,
+    max_reduce_notional_per_side: float,
+    offset_ticks: int,
+    step_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    bid_price: float,
+    ask_price: float,
+    volatility_entry_pause: dict[str, Any] | None,
+) -> dict[str, Any]:
+    report = _best_quote_active_pair_reduce_default_report()
+    report["enabled"] = bool(enabled)
+    safe_per_order = max(_safe_float(per_order_notional), 0.0)
+    safe_max_reduce = max(_safe_float(max_reduce_notional_per_side), 0.0)
+    safe_min_side = max(_safe_float(min_side_notional), 0.0)
+    safe_long_notional = max(_safe_float(current_long_notional), 0.0)
+    safe_short_notional = max(_safe_float(current_short_notional), 0.0)
+    safe_long_qty = max(_safe_float(current_long_qty), 0.0)
+    safe_short_qty = max(_safe_float(current_short_qty), 0.0)
+    safe_soft_ratio = _clamp_ratio(_safe_float(soft_ratio))
+    long_soft = max(_safe_float(max_long_notional), 0.0) * safe_soft_ratio
+    short_soft = max(_safe_float(max_short_notional), 0.0) * safe_soft_ratio
+    report.update(
+        {
+            "per_order_notional": safe_per_order,
+            "max_reduce_notional_per_side": safe_max_reduce,
+            "long_soft_notional": long_soft,
+            "short_soft_notional": short_soft,
+        }
+    )
+
+    existing = state.get("best_quote_active_pair_reduce")
+    memory = dict(existing) if isinstance(existing, dict) else {}
+
+    def _clear(reason: str, *, completed: bool = False) -> dict[str, Any]:
+        state.pop("best_quote_active_pair_reduce", None)
+        plan["buy_orders"] = [
+            dict(item)
+            for item in plan.get("buy_orders", [])
+            if isinstance(item, dict) and _order_role(item) != "best_quote_active_pair_reduce_short"
+        ]
+        plan["sell_orders"] = [
+            dict(item)
+            for item in plan.get("sell_orders", [])
+            if isinstance(item, dict) and _order_role(item) != "best_quote_active_pair_reduce_long"
+        ]
+        report["reason"] = reason
+        report["completed"] = bool(completed)
+        return report
+
+    if not enabled:
+        return _clear("disabled")
+    if safe_per_order <= 0 or safe_max_reduce <= 0:
+        return _clear("invalid_budget")
+    if bool((volatility_entry_pause or {}).get("active")):
+        report["reason"] = "volatility_entry_pause"
+        return report
+    if safe_long_qty <= 0 or safe_short_qty <= 0:
+        return _clear("missing_active_pair_inventory")
+    if safe_min_side > 0 and (safe_long_notional < safe_min_side or safe_short_notional < safe_min_side):
+        return _clear("below_min_side_notional")
+    if long_soft <= 0 or short_soft <= 0:
+        return _clear("invalid_soft_notional")
+
+    active = bool(memory.get("active"))
+    touched_soft = safe_long_notional >= long_soft or safe_short_notional >= short_soft
+    if not active and touched_soft:
+        long_target = max(safe_long_notional - safe_max_reduce, 0.0)
+        short_target = max(safe_short_notional - safe_max_reduce, 0.0)
+        memory = {
+            "active": True,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "long_start_notional": safe_long_notional,
+            "short_start_notional": safe_short_notional,
+            "long_target_notional": long_target,
+            "short_target_notional": short_target,
+            "trigger_count": int(memory.get("trigger_count") or 0) + 1,
+        }
+        active = True
+        report["triggered"] = True
+    elif not active:
+        return _clear("below_soft")
+
+    long_target = max(_safe_float(memory.get("long_target_notional")), 0.0)
+    short_target = max(_safe_float(memory.get("short_target_notional")), 0.0)
+    report.update(
+        {
+            "active": True,
+            "long_target_notional": long_target,
+            "short_target_notional": short_target,
+            "long_start_notional": max(_safe_float(memory.get("long_start_notional")), 0.0),
+            "short_start_notional": max(_safe_float(memory.get("short_start_notional")), 0.0),
+        }
+    )
+    if safe_long_notional <= long_target + 1e-12 and safe_short_notional <= short_target + 1e-12:
+        return _clear("target_reached", completed=True)
+
+    level_index = max(int(offset_ticks or 1), 1)
+    placed: list[dict[str, Any]] = []
+
+    def _append_reduce_order(
+        *,
+        side_name: str,
+        order_side: str,
+        order_key: str,
+        role: str,
+        position_side: str,
+        current_qty: float,
+        current_notional: float,
+        target_notional: float,
+    ) -> None:
+        remaining_notional = max(current_notional - target_notional, 0.0)
+        budget = min(safe_per_order, safe_max_reduce, remaining_notional, current_notional)
+        if budget <= 0:
+            return
+        price = _resolve_near_market_release_price(
+            side=order_side,
+            level_index=level_index,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            step_price=step_price,
+            tick_size=tick_size,
+        )
+        if price <= 0:
+            return
+        qty = _round_order_qty(min(current_qty, budget / price), step_size)
+        notional = qty * price
+        if qty <= 0:
+            return
+        if min_qty is not None and qty < min_qty:
+            return
+        if min_notional is not None and notional < min_notional:
+            return
+        plan[order_key] = [
+            dict(item)
+            for item in plan.get(order_key, [])
+            if isinstance(item, dict) and _order_role(item) != role
+        ]
+        order = {
+            "side": order_side,
+            "price": price,
+            "qty": qty,
+            "notional": notional,
+            "level": level_index,
+            "role": role,
+            "position_side": position_side,
+            "force_reduce_only": True,
+            "time_in_force": "GTX",
+            "execution_type": "best_quote_active_pair_reduce",
+            "best_quote_active_pair_reduce": True,
+        }
+        plan[order_key].append(order)
+        placed.append(order)
+        report[f"{side_name}_order_notional"] = notional
+
+    _append_reduce_order(
+        side_name="long",
+        order_side="SELL",
+        order_key="sell_orders",
+        role="best_quote_active_pair_reduce_long",
+        position_side="LONG",
+        current_qty=safe_long_qty,
+        current_notional=safe_long_notional,
+        target_notional=long_target,
+    )
+    _append_reduce_order(
+        side_name="short",
+        order_side="BUY",
+        order_key="buy_orders",
+        role="best_quote_active_pair_reduce_short",
+        position_side="SHORT",
+        current_qty=safe_short_qty,
+        current_notional=safe_short_notional,
+        target_notional=short_target,
+    )
+    if not placed:
+        report["reason"] = "no_valid_reduce_order"
+        state["best_quote_active_pair_reduce"] = memory
+        return report
+
+    report["order_count"] = len(placed)
+    report["reason"] = "soft_pair_reduce"
+    state["best_quote_active_pair_reduce"] = memory
+    return report
+
+
 def _resolve_inventory_unlock_release_cap(*, args: Any, fallback_notional: float) -> float:
     for attr in (
         "loss_inventory_no_cross_small_entry_notional",
@@ -16559,6 +16781,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "inventory_pause_timeout_aggressive": False,
     }
     inventory_unlock_release = _inventory_unlock_default_report()
+    best_quote_active_pair_reduce = _best_quote_active_pair_reduce_default_report()
     long_inventory_pause_timeout = {
         "enabled": False,
         "side": "long",
@@ -20274,6 +20497,38 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     else:
         state.pop("inventory_unlock_release", None)
 
+    if _is_best_quote_maker_volume_mode(strategy_mode):
+        best_quote_active_pair_reduce = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state=state,
+            enabled=bool(getattr(effective_args, "best_quote_maker_volume_active_pair_reduce_enabled", False)),
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_notional=controls.get("current_long_notional", current_long_notional),
+            current_short_notional=controls.get("current_short_notional", current_short_notional),
+            max_long_notional=getattr(effective_args, "best_quote_maker_volume_max_long_notional", 0.0),
+            max_short_notional=getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0),
+            soft_ratio=best_quote_inventory_soft_ratio,
+            min_side_notional=getattr(effective_args, "best_quote_maker_volume_active_pair_reduce_min_side_notional", 0.0),
+            per_order_notional=getattr(effective_args, "best_quote_maker_volume_active_pair_reduce_order_notional", 50.0),
+            max_reduce_notional_per_side=getattr(
+                effective_args,
+                "best_quote_maker_volume_active_pair_reduce_max_notional_per_side",
+                200.0,
+            ),
+            offset_ticks=getattr(effective_args, "best_quote_maker_volume_active_pair_reduce_offset_ticks", 1),
+            step_price=effective_args.step_price,
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+            bid_price=bid_price,
+            ask_price=ask_price,
+            volatility_entry_pause=volatility_entry_pause,
+        )
+    else:
+        state.pop("best_quote_active_pair_reduce", None)
+
     volume_long_v4_open_orders = (
         _decorate_volume_long_v4_open_orders(open_orders)
         if _uses_volume_long_v4_staged_delever(effective_strategy_profile) and strategy_mode == "one_way_long"
@@ -20589,6 +20844,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "loss_inventory_no_cross_small_entry_notional": effective_loss_inventory_no_cross_small_entry_notional,
         "active_delever": active_delever,
         "inventory_unlock_release": inventory_unlock_release,
+        "best_quote_active_pair_reduce": best_quote_active_pair_reduce,
+        "best_quote_active_pair_reduce_enabled": bool(best_quote_active_pair_reduce.get("enabled")),
+        "best_quote_active_pair_reduce_active": bool(best_quote_active_pair_reduce.get("active")),
+        "best_quote_active_pair_reduce_order_count": int(
+            _safe_float(best_quote_active_pair_reduce.get("order_count"))
+        ),
+        "best_quote_active_pair_reduce_long_order_notional": _safe_float(
+            best_quote_active_pair_reduce.get("long_order_notional")
+        ),
+        "best_quote_active_pair_reduce_short_order_notional": _safe_float(
+            best_quote_active_pair_reduce.get("short_order_notional")
+        ),
         "long_inventory_pause_timeout": long_inventory_pause_timeout,
         "short_inventory_pause_timeout": short_inventory_pause_timeout,
         "short_threshold_timeout": short_threshold_timeout,
@@ -20838,10 +21105,18 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
         enabled=True,
         allow_loss_roles=(
-            {"inventory_unlock_reduce_long", "inventory_unlock_reduce_short"}
-            if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False))
-            else None
-        ),
+            (
+                {"inventory_unlock_reduce_long", "inventory_unlock_reduce_short"}
+                if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False))
+                else set()
+            )
+            | (
+                {"best_quote_active_pair_reduce_long", "best_quote_active_pair_reduce_short"}
+                if bool(getattr(args, "best_quote_maker_volume_active_pair_reduce_enabled", False))
+                else set()
+            )
+        )
+        or None,
     )
     validation["actions"] = isolate_frozen_pair_release_place_orders(validation["actions"])
     if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
@@ -21299,10 +21574,18 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
         enabled=True,
         allow_loss_roles=(
-            {"inventory_unlock_reduce_long", "inventory_unlock_reduce_short"}
-            if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False))
-            else None
-        ),
+            (
+                {"inventory_unlock_reduce_long", "inventory_unlock_reduce_short"}
+                if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False))
+                else set()
+            )
+            | (
+                {"best_quote_active_pair_reduce_long", "best_quote_active_pair_reduce_short"}
+                if bool(getattr(args, "best_quote_maker_volume_active_pair_reduce_enabled", False))
+                else set()
+            )
+        )
+        or None,
     )
     if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
         validation["errors"] = [
@@ -21706,6 +21989,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--best-quote-maker-volume-allow-loss-reduce-only", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--best-quote-maker-volume-suppress-short-reduce-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--best-quote-maker-volume-active-pair-reduce-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--best-quote-maker-volume-active-pair-reduce-order-notional", type=float, default=50.0)
+    parser.add_argument("--best-quote-maker-volume-active-pair-reduce-max-notional-per-side", type=float, default=200.0)
+    parser.add_argument("--best-quote-maker-volume-active-pair-reduce-min-side-notional", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-active-pair-reduce-offset-ticks", type=int, default=1)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-min-loss", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-ratio", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-realized-credit-ratio", type=float, default=1.0)
@@ -22895,6 +23187,13 @@ def main() -> None:
     if args.multi_timeframe_bias_scheduler_reduce_max_order_scale <= 0 or args.multi_timeframe_bias_scheduler_reduce_max_order_scale > 1:
         raise SystemExit("--multi-timeframe-bias-scheduler-reduce-max-order-scale must be within (0, 1]")
     _validate_multi_timeframe_bias_args(args)
+    if (
+        args.best_quote_maker_volume_active_pair_reduce_order_notional < 0
+        or args.best_quote_maker_volume_active_pair_reduce_max_notional_per_side < 0
+        or args.best_quote_maker_volume_active_pair_reduce_min_side_notional < 0
+        or args.best_quote_maker_volume_active_pair_reduce_offset_ticks < 0
+    ):
+        raise SystemExit("--best-quote-maker-volume-active-pair-reduce values must be >= 0")
     _validate_best_quote_frozen_inventory_principles(args)
     if args.elastic_volume_enabled and str(args.elastic_volume_mode).strip() != "competition_elastic_volume_v1":
         raise SystemExit("--elastic-volume-mode must be competition_elastic_volume_v1")
