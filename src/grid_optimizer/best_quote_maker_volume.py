@@ -1046,8 +1046,7 @@ def build_best_quote_maker_volume_plan(
         recover_reduce_notional = cycle_budget * bias_reduce_share
         recover_other_notional = cycle_budget * bias_entry_share
         if (
-            reduce_long_only
-            and not reduce_short_only
+            (reduce_long_only or reduce_short_only or not allow_entry_long or not allow_entry_short)
             and long_notional_gap >= bias_min_notional_gap
             and long_soft > 0
             and long_notional >= long_soft * bias_start
@@ -1063,8 +1062,7 @@ def build_best_quote_maker_volume_plan(
                 }
             )
         elif (
-            reduce_short_only
-            and not reduce_long_only
+            (reduce_short_only or reduce_long_only or not allow_entry_short or not allow_entry_long)
             and short_notional_gap >= bias_min_notional_gap
             and short_soft > 0
             and short_notional >= short_soft * bias_start
@@ -1225,6 +1223,7 @@ def build_best_quote_maker_volume_plan(
             and reduce_short_price > 0
             and short_avg_price > 0
             and reduce_short_price > short_avg_price + 1e-12
+            and inventory_bias_report["side"] != "long"
         ):
             long_entry_notional = buy_side_notional * long_entry_budget_scale
             if long_limit > 0:
@@ -1328,6 +1327,7 @@ def build_best_quote_maker_volume_plan(
             and reduce_long_price > 0
             and long_avg_price > 0
             and reduce_long_price + 1e-12 < long_avg_price
+            and inventory_bias_report["side"] != "short"
         ):
             short_entry_notional = sell_side_notional * short_entry_budget_scale
             if short_limit > 0:
