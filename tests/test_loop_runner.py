@@ -7331,7 +7331,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(release_orders[0]["position_side"], "SHORT")
         self.assertGreater(release_orders[0]["price"], 0.14095)
         self.assertLessEqual(release_orders[0]["notional"], 733.0)
-        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual([order["role"] for order in plan["sell_orders"]], ["best_quote_reduce_long"])
 
     def test_inventory_unlock_release_blocks_same_side_reentry_after_release(self) -> None:
         plan = {
