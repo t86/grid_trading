@@ -32,6 +32,7 @@ class BestQuoteMakerVolumeConfig:
     inventory_bias_min_notional_gap: float = 10.0
     inventory_bias_min_notional_gap_soft_ratio: float = 0.0
     inventory_bias_reduce_share: float = 0.70
+    inventory_bias_opposite_entry_enabled: bool = False
     inventory_bias_same_side_extra_ticks: int = 2
     inventory_bias_reduce_extra_ticks: int = -1
     dynamic_control_enabled: bool = False
@@ -1020,6 +1021,7 @@ def build_best_quote_maker_volume_plan(
         "inventory_ratio": inventory_ratio,
         "reduce_share": None,
         "same_side_entry_share": None,
+        "opposite_entry_enabled": bool(config.inventory_bias_opposite_entry_enabled),
         "reduce_offset_ticks": None,
         "same_side_offset_ticks": None,
         "ratio_gap": abs(short_inventory_ratio - long_inventory_ratio),
@@ -1148,18 +1150,32 @@ def build_best_quote_maker_volume_plan(
                     force_reduce_only=True,
                 ),
             )
-            sell_orders.extend(
-                _build_entry_ladder(
-                    side="SELL",
-                    anchor_price=ask,
-                    base_gap=same_side_gap,
-                    total_notional=same_side_notional * short_entry_budget_scale,
-                    slots=max_entry_orders_per_side,
-                    role="best_quote_entry_short",
-                    inputs=inputs,
-                    position_side=short_entry_position_side,
+            if config.inventory_bias_opposite_entry_enabled:
+                buy_orders.extend(
+                    _build_entry_ladder(
+                        side="BUY",
+                        anchor_price=bid,
+                        base_gap=same_side_gap,
+                        total_notional=same_side_notional * long_entry_budget_scale,
+                        slots=max_entry_orders_per_side,
+                        role="best_quote_entry_long",
+                        inputs=inputs,
+                        position_side=long_entry_position_side,
+                    )
                 )
-            )
+            else:
+                sell_orders.extend(
+                    _build_entry_ladder(
+                        side="SELL",
+                        anchor_price=ask,
+                        base_gap=same_side_gap,
+                        total_notional=same_side_notional * short_entry_budget_scale,
+                        slots=max_entry_orders_per_side,
+                        role="best_quote_entry_short",
+                        inputs=inputs,
+                        position_side=short_entry_position_side,
+                    )
+                )
         else:
             long_reduce_ticks = max(
                 int(offset_ticks) + int(config.inventory_bias_reduce_extra_ticks) + reduce_long_extra_ticks,
@@ -1183,18 +1199,32 @@ def build_best_quote_maker_volume_plan(
                     force_reduce_only=True,
                 ),
             )
-            buy_orders.extend(
-                _build_entry_ladder(
-                    side="BUY",
-                    anchor_price=bid,
-                    base_gap=same_side_gap,
-                    total_notional=same_side_notional * long_entry_budget_scale,
-                    slots=max_entry_orders_per_side,
-                    role="best_quote_entry_long",
-                    inputs=inputs,
-                    position_side=long_entry_position_side,
+            if config.inventory_bias_opposite_entry_enabled:
+                sell_orders.extend(
+                    _build_entry_ladder(
+                        side="SELL",
+                        anchor_price=ask,
+                        base_gap=same_side_gap,
+                        total_notional=same_side_notional * short_entry_budget_scale,
+                        slots=max_entry_orders_per_side,
+                        role="best_quote_entry_short",
+                        inputs=inputs,
+                        position_side=short_entry_position_side,
+                    )
                 )
-            )
+            else:
+                buy_orders.extend(
+                    _build_entry_ladder(
+                        side="BUY",
+                        anchor_price=bid,
+                        base_gap=same_side_gap,
+                        total_notional=same_side_notional * long_entry_budget_scale,
+                        slots=max_entry_orders_per_side,
+                        role="best_quote_entry_long",
+                        inputs=inputs,
+                        position_side=long_entry_position_side,
+                    )
+                )
 
     if (
         not inventory_bias_report["applied"]

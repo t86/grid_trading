@@ -1019,6 +1019,51 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"][0]["position_side"], "SHORT")
         self.assertGreater(plan["buy_orders"][0]["notional"], plan["sell_orders"][0]["notional"])
 
+    def test_hedge_inventory_bias_can_use_opposite_entry_to_balance_long(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                quote_offset_ticks=0,
+                max_long_notional=1_000.0,
+                max_short_notional=700.0,
+                inventory_soft_ratio=0.85,
+                min_cycle_budget_notional=6.0,
+                inventory_bias_enabled=True,
+                inventory_bias_start_ratio=0.03,
+                inventory_bias_min_notional_gap=25.0,
+                inventory_bias_reduce_share=0.5,
+                inventory_bias_opposite_entry_enabled=True,
+                inventory_bias_same_side_extra_ticks=0,
+                inventory_bias_reduce_extra_ticks=-1,
+            ),
+            inputs=_inputs(
+                bid_price=0.5140,
+                ask_price=0.5141,
+                mid_price=0.51405,
+                tick_size=0.0001,
+                step_size=1.0,
+                min_qty=1.0,
+                position_side_mode="hedge",
+                target_volume_remaining=300_000.0,
+                current_long_qty=1050.0,
+                current_short_qty=960.0,
+                current_long_avg_price=0.5120,
+                current_short_avg_price=0.5160,
+                cycle_budget_notional=12.0,
+            ),
+        )
+
+        self.assertEqual(plan["regime"], "inventory_bias")
+        self.assertEqual(plan["metrics"]["inventory_bias"]["side"], "long")
+        self.assertTrue(plan["metrics"]["inventory_bias"]["opposite_entry_enabled"])
+        self.assertEqual([order["role"] for order in plan["buy_orders"]], [])
+        self.assertEqual([order["role"] for order in plan["sell_orders"]], [
+            "best_quote_reduce_long",
+            "best_quote_entry_short",
+        ])
+        self.assertEqual(plan["sell_orders"][0]["position_side"], "LONG")
+        self.assertEqual(plan["sell_orders"][1]["position_side"], "SHORT")
+
     def test_hedge_inventory_bias_keeps_both_sides_when_gross_inventory_is_balanced(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
