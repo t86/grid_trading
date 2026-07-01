@@ -5417,8 +5417,21 @@ def _cap_best_quote_reduce_orders_to_managed_inventory(
         return trimmed, max(available_qty - qty, 0.0), bool(qty + 1e-12 < original_qty)
 
     long_available = min(managed_long_qty, exchange_available_long_qty)
+    def _cap_priority(order: dict[str, Any]) -> int:
+        role = _order_role(order)
+        if role in {"best_quote_active_pair_reduce_long", "best_quote_active_pair_reduce_short"}:
+            return 0
+        if role in {"best_quote_reduce_long", "best_quote_reduce_short"}:
+            return 1
+        return 2
+
     sell_orders: list[dict[str, Any]] = []
-    for raw_order in [item for item in plan.get("sell_orders", []) if isinstance(item, dict)]:
+    raw_sell_orders = [
+        dict(item)
+        for item in plan.get("sell_orders", [])
+        if isinstance(item, dict)
+    ]
+    for raw_order in sorted(raw_sell_orders, key=_cap_priority):
         order = dict(raw_order)
         if _is_manual_frozen_reduce(order):
             cap_report["skipped_manual_reduce_orders"] += 1
@@ -5438,7 +5451,12 @@ def _cap_best_quote_reduce_orders_to_managed_inventory(
 
     short_available = min(managed_short_qty, exchange_available_short_qty)
     buy_orders: list[dict[str, Any]] = []
-    for raw_order in [item for item in plan.get("buy_orders", []) if isinstance(item, dict)]:
+    raw_buy_orders = [
+        dict(item)
+        for item in plan.get("buy_orders", [])
+        if isinstance(item, dict)
+    ]
+    for raw_order in sorted(raw_buy_orders, key=_cap_priority):
         order = dict(raw_order)
         if _is_manual_frozen_reduce(order):
             cap_report["skipped_manual_reduce_orders"] += 1
