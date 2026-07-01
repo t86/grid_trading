@@ -7292,6 +7292,55 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["buy_orders"][0]["time_in_force"], "GTX")
         self.assertTrue(state["best_quote_active_pair_reduce"]["active"])
 
+    def test_best_quote_active_pair_reduce_suppresses_normal_entries(self) -> None:
+        plan = {
+            "buy_orders": [
+                {"side": "BUY", "role": "best_quote_entry_long", "notional": 25.0},
+                {"side": "BUY", "role": "best_quote_reduce_short", "notional": 10.0},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "role": "best_quote_entry_short", "notional": 25.0},
+                {"side": "SELL", "role": "best_quote_reduce_long", "notional": 10.0},
+            ],
+        }
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state={},
+            enabled=True,
+            current_long_qty=1400.0,
+            current_short_qty=1000.0,
+            current_long_notional=720.0,
+            current_short_notional=520.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.70,
+            min_side_notional=100.0,
+            per_order_notional=50.0,
+            max_reduce_notional_per_side=200.0,
+            offset_ticks=1,
+            step_price=0.0005,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.5149,
+            ask_price=0.5150,
+            volatility_entry_pause={"active": False},
+        )
+
+        self.assertTrue(report["active"])
+        self.assertTrue(report["normal_entry_suppressed"])
+        self.assertEqual(report["suppressed_entry_order_count"], 2)
+        buy_roles = {str(item.get("role")) for item in plan["buy_orders"]}
+        sell_roles = {str(item.get("role")) for item in plan["sell_orders"]}
+        self.assertNotIn("best_quote_entry_long", buy_roles)
+        self.assertNotIn("best_quote_entry_short", sell_roles)
+        self.assertIn("best_quote_reduce_short", buy_roles)
+        self.assertIn("best_quote_reduce_long", sell_roles)
+        self.assertIn("best_quote_active_pair_reduce_short", buy_roles)
+        self.assertIn("best_quote_active_pair_reduce_long", sell_roles)
+
     def test_best_quote_active_pair_reduce_respects_volatility_pause(self) -> None:
         plan = {"buy_orders": [], "sell_orders": []}
 

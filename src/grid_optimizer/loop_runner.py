@@ -11940,6 +11940,8 @@ def _best_quote_active_pair_reduce_default_report() -> dict[str, Any]:
         "short_soft_notional": 0.0,
         "per_order_notional": 0.0,
         "max_reduce_notional_per_side": 0.0,
+        "normal_entry_suppressed": False,
+        "suppressed_entry_order_count": 0,
         "triggered": False,
         "completed": False,
     }
@@ -12056,6 +12058,24 @@ def apply_best_quote_active_pair_reduce(
     )
     if safe_long_notional <= long_target + 1e-12 and safe_short_notional <= short_target + 1e-12:
         return _clear("target_reached", completed=True)
+
+    suppressed_entry_order_count = 0
+    for order_key, entry_role in (
+        ("buy_orders", "best_quote_entry_long"),
+        ("sell_orders", "best_quote_entry_short"),
+    ):
+        kept_orders: list[dict[str, Any]] = []
+        for item in plan.get(order_key, []):
+            if not isinstance(item, dict):
+                continue
+            if _order_role(item) == entry_role:
+                suppressed_entry_order_count += 1
+                continue
+            kept_orders.append(dict(item))
+        plan[order_key] = kept_orders
+    if suppressed_entry_order_count:
+        report["normal_entry_suppressed"] = True
+        report["suppressed_entry_order_count"] = suppressed_entry_order_count
 
     level_index = max(int(offset_ticks or 1), 1)
     placed: list[dict[str, Any]] = []
