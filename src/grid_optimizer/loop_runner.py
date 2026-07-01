@@ -18737,7 +18737,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 min_notional=symbol_info.get("min_notional"),
                 open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
                 open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
-                pending_entry_buffer_notional=cycle_budget * 0.5,
+                pending_entry_buffer_notional=cycle_budget
+                * max(
+                    _safe_float(
+                        getattr(effective_args, "best_quote_maker_volume_pending_entry_buffer_share", 0.5)
+                    ),
+                    0.0,
+                ),
                 entry_ladder_spacing=_safe_float(getattr(effective_args, "step_price", 0.0)),
                 current_long_qty=current_long_qty,
                 current_short_qty=current_short_qty,
@@ -21666,6 +21672,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-loss-per-10k-hard", type=float, default=0.8)
     parser.add_argument("--best-quote-maker-volume-soft-loss-budget-scale", type=float, default=0.50)
     parser.add_argument("--best-quote-maker-volume-min-cycle-budget-notional", type=float, default=20.0)
+    parser.add_argument("--best-quote-maker-volume-pending-entry-buffer-share", type=float, default=0.5)
     parser.add_argument("--best-quote-maker-volume-below-soft-cost-gap-scale", type=float, default=1.0)
     parser.add_argument("--best-quote-maker-volume-below-soft-adverse-threshold-scale", type=float, default=1.0)
     parser.add_argument("--best-quote-maker-volume-inventory-cost-gate-enabled", action=argparse.BooleanOptionalAction, default=True)
