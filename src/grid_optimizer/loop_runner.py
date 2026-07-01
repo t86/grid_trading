@@ -12133,6 +12133,18 @@ def apply_inventory_unlock_release(
         for item in plan.get(order_key, [])
         if isinstance(item, dict) and _order_role(item) != role
     ]
+    if normalized_side == "long":
+        plan["buy_orders"] = [
+            dict(item)
+            for item in plan.get("buy_orders", [])
+            if isinstance(item, dict) and not _is_short_exit_order(item)
+        ]
+    elif normalized_side == "short":
+        plan["sell_orders"] = [
+            dict(item)
+            for item in plan.get("sell_orders", [])
+            if isinstance(item, dict) and not _is_long_exit_order(item)
+        ]
     order = {
         "side": price_side,
         "price": price,

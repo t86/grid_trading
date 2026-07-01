@@ -7272,7 +7272,18 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(long_pause or 0.0, 2725.0)
 
     def test_inventory_unlock_release_fires_for_best_quote_short_soft_stall(self) -> None:
-        plan = {"buy_orders": [], "sell_orders": []}
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.143,
+                    "qty": 100.0,
+                    "notional": 14.3,
+                    "role": "best_quote_reduce_long",
+                }
+            ],
+        }
         state = {"inventory_unlock_release": {"side": "short", "stall_count": 2}}
         args = SimpleNamespace(
             best_quote_maker_volume_inventory_soft_ratio=0.55,
@@ -7320,6 +7331,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(release_orders[0]["position_side"], "SHORT")
         self.assertGreater(release_orders[0]["price"], 0.14095)
         self.assertLessEqual(release_orders[0]["notional"], 733.0)
+        self.assertEqual(plan["sell_orders"], [])
 
     def test_inventory_unlock_release_blocks_same_side_reentry_after_release(self) -> None:
         plan = {
