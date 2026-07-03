@@ -21065,6 +21065,29 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
+def hedge_bq_position_drift_tolerance_qty(
+    *,
+    args: argparse.Namespace,
+    strategy_mode: str,
+    mid_price: float,
+) -> float:
+    """hedge BQ 提交前持仓校验的快市容差（qty 口径）。
+
+    计划生成到提交之间落地的少量成交属于正常竞态；容差按名义额配置
+    （--hedge-bq-position-drift-tolerance-notional，0=严格模式与旧行为一致），
+    仅对 hedge_best_quote_maker_volume 模式生效。
+    """
+    if not _is_hedge_best_quote_maker_volume_mode(strategy_mode):
+        return 0.0
+    tolerance_notional = max(
+        _safe_float(getattr(args, "hedge_bq_position_drift_tolerance_notional", 0.0)), 0.0
+    )
+    safe_mid = _safe_float(mid_price)
+    if tolerance_notional <= 0 or safe_mid <= 0:
+        return 0.0
+    return tolerance_notional / safe_mid
+
+
 def _mark_submit_report_blocked(report: dict[str, Any], *, reason: str = "validation_failed") -> dict[str, Any]:
     validation = report.get("validation") or {}
     actions = validation.get("actions") or {}
@@ -21478,6 +21501,16 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         return _mark_submit_report_blocked(report, reason="hedge_best_quote_exchange_flat_resynced")
     if len(current_strategy_open_orders) != expected_open_order_count:
         raise RuntimeError("当前未成交委托数量与计划生成时不一致，请等待下一轮刷新")
+    # hedge BQ 快市容差：计划生成到提交之间落地的少量成交不再整轮拒绝。
+    # reduce-only 超挂由 cap_reduce_only_place_orders_to_position 兜底，敞口由
+    # position_reconcile 下轮对齐；容差为 0（默认）时行为与旧版完全一致。
+    bq_drift_tolerance_qty = hedge_bq_position_drift_tolerance_qty(
+        args=args,
+        strategy_mode=strategy_mode,
+        mid_price=_safe_float(plan_report.get("mid_price")),
+    )
+    validation["hedge_bq_position_drift_tolerance_qty"] = bq_drift_tolerance_qty
+    position_drift_tolerance_qty = max(1e-9, bq_drift_tolerance_qty)
     if _is_synthetic_neutral_mode(strategy_mode):
         synthetic_net_qty = expected_long_qty - expected_short_qty
         synthetic_drift_qty = current_actual_net_qty - synthetic_net_qty
@@ -21518,7 +21551,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         if abs(current_short_qty - expected_short_qty) > 1e-9:
             raise RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新")
     elif (
-        abs(current_long_qty - expected_exchange_long_qty) > 1e-9
+        abs(current_long_qty - expected_exchange_long_qty) > position_drift_tolerance_qty
         and not allow_reduce_only_position_surplus
         and not allow_isolated_frozen_position_mismatch
         and not allow_hedge_best_quote_flat_dust_position_mismatch
@@ -21526,7 +21559,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         raise RuntimeError("当前持仓与计划生成时不一致，请等待下一轮刷新")
     if (
         _uses_exchange_hedge_position_sides(strategy_mode)
-        and abs(current_short_qty - expected_exchange_short_qty) > 1e-9
+        and abs(current_short_qty - expected_exchange_short_qty) > position_drift_tolerance_qty
         and not allow_reduce_only_position_surplus
         and not allow_isolated_frozen_position_mismatch
         and not allow_hedge_best_quote_flat_dust_position_mismatch
@@ -22681,6 +22714,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recv-window", type=int, default=5000)
     parser.add_argument("--max-plan-age-seconds", type=int, default=30)
     parser.add_argument("--max-mid-drift-steps", type=float, default=4.0)
+    # hedge BQ 提交前持仓校验的快市容差（名义额，0=严格模式，与旧行为一致）
+    parser.add_argument("--hedge-bq-position-drift-tolerance-notional", type=float, default=0.0)
     parser.add_argument("--max-new-orders", type=int, default=16)
     parser.add_argument("--max-total-notional", type=float, default=220.0)
     parser.add_argument("--reconcile-interval-cycles", type=int, default=5)

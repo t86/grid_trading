@@ -11237,6 +11237,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(int(config.get("max_plan_age_seconds", 30))),
         "--max-mid-drift-steps",
         str(config.get("max_mid_drift_steps", 4.0)),
+        "--hedge-bq-position-drift-tolerance-notional",
+        str(config.get("hedge_bq_position_drift_tolerance_notional", 0.0)),
         "--maker-retries",
         str(config.get("maker_retries", 2)),
         "--execution-request-budget-per-cycle",
