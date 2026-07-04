@@ -339,3 +339,61 @@ When restarting a saved runner through `/api/runner/start`, prefer sending the f
 from the live `output/*_control.json` and then editing only the fields you intend to change. Partial
 payloads are easy to start from, but they can silently drop live overrides such as
 `take_profit_min_profit_ratio`, inventory guards, or preset-specific caps.
+
+## 7) Competition Volume-Farming Ops Stack (稳健 model)
+
+Hedge `best_quote_maker_volume` farming (REUSDT, and now ARXUSDT / OUSDT) is supervised by a small
+server-side automation stack. Two of its pieces are tracked, symbol-generic package modules — deploy
+them by `git pull`, not by hand-editing `output/ops/*.py`:
+
+- `python -m grid_optimizer.competition_target_gate` — stop + flatten at the target
+  (`max_cumulative_notional` from the live control JSON) or past `--first` with wear above
+  `--wear-stop`. It flattens **managed only**, keeps frozen inventory, and rests a `FROZENTP*` BUY
+  limit on the kept frozen shorts (priced so no lot is underwater at the fill). A per-symbol
+  `output/<symbol>_target_gate_done_YYYYMMDD.flag` prevents repeats within a UTC day.
+- `python -m grid_optimizer.competition_health_monitor` — the stable supervisor. It **never boosts
+  budget to chase a target**; it only (1) restarts an "active but not placing" runner, (2) self-heals
+  the balanced-hedge deadlock by closing only the net-neutral matched managed qty
+  `min(managed_long, managed_short)` — a spread hedge that would realize a loss, or a one-sided
+  loss-reduce (`matched=0`), is left untouched — and (3) runs a hysteretic wear governor that raises
+  `quote_offset_ticks` when recent wear is hot and lowers it when wear recovers.
+
+Both read exchange `userTrades` for the true wear (`-realized_pnl / gross_notional * 1e4`), never the
+runner's own `loss_per_10k` field.
+
+### Why this supersedes the per-symbol pace controllers
+
+The hand-maintained `output/ops/<symbol>_pace_controller.py` chases the daily target by **boosting**
+`cycle_budget`. On a high-volatility pair that just churns quotes that never fill and bleeds wear (see
+the ARX 2026-07-02 night retrospective in `docs/STRATEGY_EXECUTION_GUIDE.md`). The health monitor's
+governor is brake-only: it protects volume by never stopping, and protects wear by widening the
+offset — the same design REUSDT has run stably. Prefer the health monitor for ARX/OUSDT; keep a pace
+controller only if you deliberately want target-chasing on a calm, liquid pair.
+
+The health monitor also folds in the job of the standalone `bq_liveness_watchdog.py` (liveness) plus
+the deadlock self-heal, so those become redundant once it is wired.
+
+### Cron wiring (per host, run from the app dir as `ubuntu`)
+
+`daily_reset` (the 08:00 target/param roll + restart) stays a per-account script under `output/ops/`
+because its config body differs per machine; the two modules below are symbol-generic. Target keeps
+its own auto-stop disabled for pure farming via `--wear-stop 999999 --first 999999999` (the campaign
+convention); drop those overrides to re-enable target/wear auto-stop.
+
+```cron
+# --- ARXUSDT ---
+*/8 * * * * cd /home/ubuntu/wangge && set -a && . /home/ubuntu/.config/wangge/binance_api_env.env && set +a && flock -n /tmp/arx_tgt_gate.lock .venv/bin/python -m grid_optimizer.competition_target_gate --symbol ARXUSDT --service grid-loop@ARXUSDT.service --workdir /home/ubuntu/wangge --tick 0.0001 --wear-stop 999999 --first 999999999 --enforce >> output/arxusdt_target_gate.log 2>&1
+*/10 * * * * cd /home/ubuntu/wangge && set -a && . /home/ubuntu/.config/wangge/binance_api_env.env && set +a && flock -n /tmp/arx_health.lock .venv/bin/python -m grid_optimizer.competition_health_monitor --symbol ARXUSDT --service grid-loop@ARXUSDT.service --workdir /home/ubuntu/wangge --first 3000 --hard-wear 1.6 --brake-wear 2.0 --release-wear 1.0 --max-offset 4 --enforce >> output/arxusdt_health_monitor.log 2>&1
+
+# --- OUSDT ---
+*/8 * * * * cd /home/ubuntu/wangge && set -a && . /home/ubuntu/.config/wangge/binance_api_env.env && set +a && flock -n /tmp/o_tgt_gate.lock .venv/bin/python -m grid_optimizer.competition_target_gate --symbol OUSDT --service grid-loop@OUSDT.service --workdir /home/ubuntu/wangge --tick 0.0001 --wear-stop 999999 --first 999999999 --enforce >> output/ousdt_target_gate.log 2>&1
+*/10 * * * * cd /home/ubuntu/wangge && set -a && . /home/ubuntu/.config/wangge/binance_api_env.env && set +a && flock -n /tmp/o_health.lock .venv/bin/python -m grid_optimizer.competition_health_monitor --symbol OUSDT --service grid-loop@OUSDT.service --workdir /home/ubuntu/wangge --first 3000 --hard-wear 1.6 --brake-wear 2.0 --release-wear 1.0 --max-offset 4 --enforce >> output/ousdt_health_monitor.log 2>&1
+```
+
+On the API2 host (150) use `--workdir /home/ubuntu/wangge_api2` and that host's env file. Validate a
+new symbol without side effects by dropping `--enforce` (both modules then only print the JSON
+decision). Confirm `crontab -l` and tail the `output/*_health_monitor.log` for a few cycles before
+trusting it unattended.
+
+The `--first`/`--brake-wear`/`--hard-wear` values above are aligned to the ARX v2 wear budget
+(soft 0.9 / hard 1.6 per 10k); tune per campaign and per the reward economics, not by copy-paste.
