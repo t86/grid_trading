@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 import grid_optimizer.competition_health_monitor as hm
+import grid_optimizer.competition_state_realign as ra
 import grid_optimizer.competition_target_gate as tg
 
 
@@ -297,3 +298,51 @@ def test_restart_reports_returncode(monkeypatch) -> None:
 
     monkeypatch.setattr(hm.subprocess, "run", lambda cmd, **kw: _FakeProc(returncode=0))
     assert hm.restart("grid-loop@ARXUSDT.service")["ok"] is True
+
+
+# --- competition_state_realign: never revive a runner it did not stop itself ---
+
+
+def test_realign_never_starts_an_already_inactive_runner() -> None:
+    # The 2026-07-04 ARX incident: auto_realign blind-started a guard-stopped runner
+    # into a crash three times. Inactive stays down unless explicitly allowed.
+    assert ra.should_start_after_realign(was_active=False, allow_start_when_stopped=False) is False
+    assert ra.should_start_after_realign(was_active=True, allow_start_when_stopped=False) is True
+    assert ra.should_start_after_realign(was_active=False, allow_start_when_stopped=True) is True
+
+
+def test_compute_drift_counts_ledger_plus_frozen_vs_exchange() -> None:
+    state = {
+        "best_quote_volume_ledger": {
+            "long_lots": [{"qty": 5000}, {"qty": 838}],
+            "short_lots": [{"qty": 2709}],
+        },
+        "best_quote_frozen_inventory": {"long_lots": [], "short_lots": [{"qty": 291}]},
+    }
+    ldrift, sdrift = ra.compute_drift(state, long_qty=0.0, short_qty=0.0)
+    assert ldrift == 5838.0                       # ledger thinks long, exchange flat
+    assert sdrift == 3000.0                       # 2709 ledger + 291 frozen
+    ldrift2, sdrift2 = ra.compute_drift(state, long_qty=5838.0, short_qty=3000.0)
+    assert ldrift2 == 0.0 and sdrift2 == 0.0
+
+
+def test_realign_ledger_preserves_frozen_and_writes_active_remainder() -> None:
+    state = {
+        "best_quote_volume_ledger": {"long_lots": [{"qty": 999}], "short_lots": []},
+        "best_quote_frozen_inventory": {"long_lots": [{"qty": 100}], "short_lots": [{"qty": 40}]},
+    }
+    out = ra.realign_ledger(state, lq=250.0, lavg=0.21, sq=40.0, savg=0.22)
+    led = state["best_quote_volume_ledger"]
+    assert out == {"new_long": 150.0, "new_short": 0.0}   # 250 exch - 100 frozen; short fully frozen
+    assert led["long_lots"] == [{"qty": 150.0, "price": 0.21, "source": "auto_realign", "side": "LONG"}]
+    assert led["short_lots"] == []
+
+
+def test_archive_stale_plan_moves_file_and_tolerates_missing(tmp_path) -> None:
+    (tmp_path / "output").mkdir(parents=True)
+    plan = tmp_path / "output" / "arxusdt_loop_latest_plan.json"
+    plan.write_text(json.dumps({"actual_net_qty": 5838}), encoding="utf-8")
+    dst = ra.archive_stale_plan(str(tmp_path), "arxusdt")
+    assert dst is not None and not plan.exists()          # moved aside -> startup guard can't latch
+    assert json.loads(Path(dst).read_text())["actual_net_qty"] == 5838
+    assert ra.archive_stale_plan(str(tmp_path), "arxusdt") is None   # idempotent when absent

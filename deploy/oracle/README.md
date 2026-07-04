@@ -360,8 +360,19 @@ them by `git pull`, not by hand-editing `output/ops/*.py`:
   `quote_offset_ticks` when recent wear is hot and lowers it when wear recovers. Every restart checks
   the systemctl return code and is recorded, so a failed restart is retried, not silently assumed.
 
-Both read exchange `userTrades` for the true wear (`-realized_pnl / gross_notional * 1e4`), never the
-runner's own `loss_per_10k` field.
+- `python -m grid_optimizer.competition_state_realign` — ledger auto-realign for profiles whose BQ
+  ledger inflates structurally (e.g. ARX closes longs through the non-BQ grid book). When
+  ledger-vs-exchange drift exceeds `--threshold-qty` it rewrites the ledger lots to exchange truth,
+  preserving frozen inventory. **Revival policy: it never starts a runner it did not stop itself** —
+  service active + drift → stop/realign/start; service already inactive → realign only and
+  `REALIGNED_SKIPPED_START_INACTIVE` (an inactive runner was stopped for a reason; blind restarts
+  into a crash are how the 2026-07-04 ARX net blowout compounded 566→1198).
+  `--allow-start-when-stopped` is the explicit escape hatch. Before any start it archives the stale
+  `<symbol>_loop_latest_plan.json`, because the runtime guard reads that file at startup and a
+  pre-realign snapshot with a huge net notional latches `max_actual_net_notional_hit` forever.
+
+The gate and health monitor read exchange `userTrades` for the true wear
+(`-realized_pnl / gross_notional * 1e4`), never the runner's own `loss_per_10k` field.
 
 ### Why this supersedes the per-symbol pace controllers
 
@@ -386,6 +397,7 @@ convention); drop those overrides to re-enable target/wear auto-stop.
 # --- ARXUSDT ---
 */8 * * * * cd /home/ubuntu/wangge && set -a && . /home/ubuntu/.config/wangge/binance_api_env.env && set +a && flock -n /tmp/arx_tgt_gate.lock .venv/bin/python -m grid_optimizer.competition_target_gate --symbol ARXUSDT --service grid-loop@ARXUSDT.service --workdir /home/ubuntu/wangge --tick 0.0001 --wear-stop 999999 --first 999999999 --enforce >> output/arxusdt_target_gate.log 2>&1
 */10 * * * * cd /home/ubuntu/wangge && set -a && . /home/ubuntu/.config/wangge/binance_api_env.env && set +a && flock -n /tmp/arx_health.lock .venv/bin/python -m grid_optimizer.competition_health_monitor --symbol ARXUSDT --service grid-loop@ARXUSDT.service --workdir /home/ubuntu/wangge --first 3000 --hard-wear 1.6 --brake-wear 2.0 --release-wear 1.0 --max-offset 4 --enforce >> output/arxusdt_health_monitor.log 2>&1
+6-56/10 * * * * cd /home/ubuntu/wangge && set -a && . /home/ubuntu/.config/wangge/binance_api_env.env && set +a && flock -n /tmp/arx_realign.lock .venv/bin/python -m grid_optimizer.competition_state_realign --symbol ARXUSDT --service grid-loop@ARXUSDT.service --workdir /home/ubuntu/wangge --threshold-qty 150 --enforce >> output/arx_auto_realign.log 2>&1
 
 # --- OUSDT ---
 */8 * * * * cd /home/ubuntu/wangge && set -a && . /home/ubuntu/.config/wangge/binance_api_env.env && set +a && flock -n /tmp/o_tgt_gate.lock .venv/bin/python -m grid_optimizer.competition_target_gate --symbol OUSDT --service grid-loop@OUSDT.service --workdir /home/ubuntu/wangge --tick 0.0001 --wear-stop 999999 --first 999999999 --enforce >> output/ousdt_target_gate.log 2>&1
