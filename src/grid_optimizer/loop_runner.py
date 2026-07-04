@@ -9268,6 +9268,7 @@ def _start_futures_flatten_process(
     symbol: str,
     *,
     allow_loss: bool = False,
+    max_loss_ratio: float | None = None,
     preserve_long_qty: float = 0.0,
     preserve_short_qty: float = 0.0,
 ) -> dict[str, Any]:
@@ -9299,6 +9300,9 @@ def _start_futures_flatten_process(
     ]
     if allow_loss:
         command.append("--allow-loss")
+    safe_max_loss_ratio = max(_safe_float(max_loss_ratio), 0.0) if max_loss_ratio is not None else None
+    if safe_max_loss_ratio is not None:
+        command.extend(["--max-loss-ratio", str(safe_max_loss_ratio)])
     safe_preserve_long_qty = max(_safe_float(preserve_long_qty), 0.0)
     safe_preserve_short_qty = max(_safe_float(preserve_short_qty), 0.0)
     if safe_preserve_long_qty > 0:
@@ -9319,6 +9323,7 @@ def _start_futures_flatten_process(
         "started": True,
         "already_running": False,
         "pid": proc.pid,
+        "max_loss_ratio": safe_max_loss_ratio,
         "preserve_long_qty": safe_preserve_long_qty,
         "preserve_short_qty": safe_preserve_short_qty,
     }
@@ -10393,12 +10398,19 @@ def _maybe_handle_runtime_guard(
         recv_window=args.recv_window,
     )
     flatten_result = {"started": False, "already_running": False}
-    flatten_allow_loss = not _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", "")))
+    flatten_is_best_quote = _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", "")))
+    flatten_allow_loss = True
+    flatten_max_loss_ratio = (
+        max(_safe_float(getattr(args, "best_quote_maker_volume_reduce_freeze_loss_ratio", 0.01)), 0.0)
+        if flatten_is_best_quote
+        else None
+    )
     flatten_snapshot = load_live_flatten_snapshot(
         args.symbol.upper().strip(),
         api_key,
         api_secret,
         allow_loss=flatten_allow_loss,
+        max_loss_ratio=flatten_max_loss_ratio,
         preserve_long_qty=frozen_long_qty,
         preserve_short_qty=frozen_short_qty,
     )
@@ -10453,6 +10465,7 @@ def _maybe_handle_runtime_guard(
         flatten_result = _start_futures_flatten_process(
             args.symbol.upper().strip(),
             allow_loss=flatten_allow_loss,
+            max_loss_ratio=flatten_max_loss_ratio,
             preserve_long_qty=frozen_long_qty,
             preserve_short_qty=frozen_short_qty,
         )

@@ -109,6 +109,7 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
             "key",
             "secret",
             allow_loss=True,
+            max_loss_ratio=None,
             preserve_long_qty=0.0,
             preserve_short_qty=0.0,
         )
@@ -120,7 +121,7 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
     @patch("grid_optimizer.loop_runner.evaluate_runtime_guards")
     @patch("grid_optimizer.loop_runner._load_futures_runtime_guard_inputs")
-    def test_runtime_guard_best_quote_stop_uses_no_loss_flatten(
+    def test_runtime_guard_best_quote_stop_uses_capped_loss_flatten(
         self,
         mock_inputs,
         mock_evaluate,
@@ -151,6 +152,7 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
                 max_actual_net_notional=400.0,
                 max_synthetic_drift_notional=None,
                 max_unrealized_loss=None,
+                best_quote_maker_volume_reduce_freeze_loss_ratio=0.01,
                 auto_regime_enabled=False,
                 state_path=str(state_path),
                 plan_json=str(Path(tmpdir) / "plan.json"),
@@ -195,13 +197,15 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
             "ARXUSDT",
             "key",
             "secret",
-            allow_loss=False,
+            allow_loss=True,
+            max_loss_ratio=0.01,
             preserve_long_qty=0.0,
             preserve_short_qty=0.0,
         )
         mock_start_flatten.assert_called_once_with(
             "ARXUSDT",
-            allow_loss=False,
+            allow_loss=True,
+            max_loss_ratio=0.01,
             preserve_long_qty=0.0,
             preserve_short_qty=0.0,
         )
