@@ -3819,6 +3819,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "base_position_notional": 420.0,
     "sticky_entry_levels": 4,
     "sticky_entry_price_tolerance_steps": 2.0,
+    "sticky_exit_price_tolerance_steps": 1.0,
     "sticky_entry_preserve_less_aggressive": True,
     "synthetic_residual_long_flat_notional": None,
     "synthetic_residual_short_flat_notional": None,
@@ -9894,6 +9895,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "elastic_early_wide_inventory_ratio",
         "elastic_early_wide_loss_per_10k_5m",
         "sticky_entry_price_tolerance_steps",
+        "sticky_exit_price_tolerance_steps",
     }
     int_fields = {
         "buy_levels",
@@ -11279,6 +11281,13 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
             [
                 "--sticky-entry-price-tolerance-steps",
                 str(config["sticky_entry_price_tolerance_steps"]),
+            ]
+        )
+    if config.get("sticky_exit_price_tolerance_steps") is not None:
+        command.extend(
+            [
+                "--sticky-exit-price-tolerance-steps",
+                str(config["sticky_exit_price_tolerance_steps"]),
             ]
         )
     if bool(config.get("sticky_entry_preserve_less_aggressive", False)):

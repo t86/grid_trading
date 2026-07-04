@@ -20683,7 +20683,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             existing_orders=open_orders_for_diff,
             desired_orders=desired_orders,
             sticky_roles={"best_quote_reduce_long", "best_quote_reduce_short"},
-            price_tolerance=max(_safe_float(effective_args.step_price), 0.0),
+            price_tolerance=max(_safe_float(effective_args.step_price), 0.0)
+            * max(_safe_float(getattr(effective_args, "sticky_exit_price_tolerance_steps", 1.0)), 0.0),
         )
         _sync_plan_orders_from_desired_orders(plan, desired_orders)
         best_quote_paired_reduce_separation = _separate_paired_best_quote_reduce_orders(
@@ -22331,6 +22332,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-take-profit-guard-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sticky-entry-levels", type=int, default=4)
     parser.add_argument("--sticky-entry-price-tolerance-steps", type=float, default=2.0)
+    parser.add_argument("--sticky-exit-price-tolerance-steps", type=float, default=1.0)
     parser.add_argument("--sticky-entry-preserve-less-aggressive", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--synthetic-residual-long-flat-notional", type=float, default=None)
     parser.add_argument("--synthetic-residual-short-flat-notional", type=float, default=None)
@@ -23099,6 +23101,8 @@ def main() -> None:
         raise SystemExit("--sticky-entry-levels must be >= 0")
     if args.sticky_entry_price_tolerance_steps < 0:
         raise SystemExit("--sticky-entry-price-tolerance-steps must be >= 0")
+    if args.sticky_exit_price_tolerance_steps < 0:
+        raise SystemExit("--sticky-exit-price-tolerance-steps must be >= 0")
     if args.synthetic_residual_long_flat_notional is not None and args.synthetic_residual_long_flat_notional < 0:
         raise SystemExit("--synthetic-residual-long-flat-notional must be >= 0")
     if args.synthetic_residual_short_flat_notional is not None and args.synthetic_residual_short_flat_notional < 0:
