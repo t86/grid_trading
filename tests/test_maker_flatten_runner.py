@@ -87,6 +87,57 @@ class MakerFlattenRunnerTests(unittest.TestCase):
         self.assertEqual(order["quantity"], 80.0)
         self.assertTrue(order["reduce_only"])
 
+    def test_one_way_long_preserves_frozen_qty(self) -> None:
+        result = build_flatten_orders_from_snapshot(
+            symbol="TESTUSDT",
+            bid_price=1.23,
+            ask_price=1.25,
+            dual_side_position=False,
+            account_info={
+                "positions": [
+                    {
+                        "symbol": "TESTUSDT",
+                        "positionAmt": "200",
+                        "positionSide": "BOTH",
+                        "entryPrice": "1.20",
+                    }
+                ]
+            },
+            symbol_info={"tick_size": 0.01, "step_size": 1.0, "min_qty": 1.0, "min_notional": 5.0},
+            preserve_long_qty=150.0,
+        )
+
+        self.assertEqual(result["preserve_long_qty"], 150.0)
+        self.assertEqual(len(result["orders"]), 1)
+        order = result["orders"][0]
+        self.assertEqual(order["side"], "SELL")
+        self.assertEqual(order["quantity"], 50.0)
+
+    def test_hedge_mode_preserves_frozen_qty_per_side(self) -> None:
+        result = build_flatten_orders_from_snapshot(
+            symbol="TESTUSDT",
+            bid_price=1.23,
+            ask_price=1.25,
+            dual_side_position=True,
+            account_info={
+                "positions": [
+                    {"symbol": "TESTUSDT", "positionAmt": "200", "positionSide": "LONG", "entryPrice": "1.20"},
+                    {"symbol": "TESTUSDT", "positionAmt": "-90", "positionSide": "SHORT", "entryPrice": "1.30"},
+                ]
+            },
+            symbol_info={"tick_size": 0.01, "step_size": 1.0, "min_qty": 1.0, "min_notional": 5.0},
+            preserve_long_qty=150.0,
+            preserve_short_qty=80.0,
+        )
+
+        self.assertEqual(result["preserve_long_qty"], 150.0)
+        self.assertEqual(result["preserve_short_qty"], 80.0)
+        self.assertEqual(len(result["orders"]), 2)
+        self.assertEqual(result["orders"][0]["side"], "SELL")
+        self.assertEqual(result["orders"][0]["quantity"], 50.0)
+        self.assertEqual(result["orders"][1]["side"], "BUY")
+        self.assertEqual(result["orders"][1]["quantity"], 10.0)
+
     def test_one_way_long_target_reached_places_no_order(self) -> None:
         result = build_flatten_orders_from_snapshot(
             symbol="TESTUSDT",

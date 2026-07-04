@@ -79,12 +79,16 @@ def build_flatten_orders_from_snapshot(
     allow_loss: bool = False,
     min_profit_ratio: float = 0.0,
     max_loss_ratio: float | None = None,
+    preserve_long_qty: float = 0.0,
+    preserve_short_qty: float = 0.0,
 ) -> dict[str, Any]:
     if bid_price <= 0 or ask_price <= 0:
         raise ValueError("bid_price and ask_price must be > 0")
     target_notional = max(float(target_position_notional or 0.0), 0.0)
     safe_min_profit_ratio = max(_safe_float(min_profit_ratio), 0.0)
     safe_max_loss_ratio = max(_safe_float(max_loss_ratio), 0.0)
+    safe_preserve_long_qty = max(_safe_float(preserve_long_qty), 0.0)
+    safe_preserve_short_qty = max(_safe_float(preserve_short_qty), 0.0)
 
     result = {
         "orders": [],
@@ -98,6 +102,8 @@ def build_flatten_orders_from_snapshot(
         "net_qty": 0.0,
         "target_position_notional": target_notional,
         "target_mode": "full_flatten" if target_notional <= 0 else "reduce_to_notional",
+        "preserve_long_qty": safe_preserve_long_qty,
+        "preserve_short_qty": safe_preserve_short_qty,
     }
     tick_size = symbol_info.get("tick_size")
     step_size = symbol_info.get("step_size")
@@ -179,14 +185,21 @@ def build_flatten_orders_from_snapshot(
         result["orders"].append(order)
 
     def _qty_above_target(qty: float, price: float, position_side: str | None) -> float:
+        side_text = str(position_side or "").upper().strip()
+        preserve_qty = safe_preserve_short_qty if side_text == "SHORT" else safe_preserve_long_qty
         if target_notional <= 0:
-            return abs(qty)
+            return max(abs(qty) - preserve_qty, 0.0)
         current_notional = abs(qty) * price
         result_key = "long_target_reached" if str(position_side or "").upper() != "SHORT" else "short_target_reached"
-        if current_notional <= target_notional:
+        target_qty = target_notional / max(price, 1e-12)
+        keep_qty = max(preserve_qty, target_qty)
+        if abs(qty) <= keep_qty:
             result[result_key] = True
             return 0.0
-        return max((current_notional - target_notional) / max(price, 1e-12), 0.0)
+        if current_notional <= target_notional and preserve_qty <= target_qty:
+            result[result_key] = True
+            return 0.0
+        return max(abs(qty) - keep_qty, 0.0)
 
     if dual_side_position:
         long_position = extract_symbol_position(account_info, symbol, "LONG")
@@ -255,6 +268,10 @@ def build_flatten_orders_from_snapshot(
         bool(result.get("long_target_reached")) or bool(result.get("short_target_reached"))
     ):
         result["warnings"].append(f"{symbol} 当前仓位名义已不高于目标 {target_notional:.4f}U，未继续减仓")
+    if not result["orders"] and (safe_preserve_long_qty > 0 or safe_preserve_short_qty > 0):
+        result["warnings"].append(
+            f"{symbol} maker_flatten 已保护冻结仓位 long={safe_preserve_long_qty:.8g} short={safe_preserve_short_qty:.8g}，未继续平仓"
+        )
 
     return result
 
@@ -268,6 +285,8 @@ def load_live_flatten_snapshot(
     allow_loss: bool = False,
     min_profit_ratio: float = 0.0,
     max_loss_ratio: float | None = None,
+    preserve_long_qty: float = 0.0,
+    preserve_short_qty: float = 0.0,
 ) -> dict[str, Any]:
     symbol_info = fetch_futures_symbol_config(symbol)
     book = fetch_futures_book_tickers(symbol=symbol)
@@ -291,6 +310,8 @@ def load_live_flatten_snapshot(
         allow_loss=allow_loss,
         min_profit_ratio=min_profit_ratio,
         max_loss_ratio=max_loss_ratio,
+        preserve_long_qty=preserve_long_qty,
+        preserve_short_qty=preserve_short_qty,
     )
     snapshot["bid_price"] = bid_price
     snapshot["ask_price"] = ask_price
@@ -420,6 +441,8 @@ def _run(args: argparse.Namespace) -> int:
                 allow_loss=bool(args.allow_loss),
                 min_profit_ratio=float(args.min_profit_ratio),
                 max_loss_ratio=args.max_loss_ratio,
+                preserve_long_qty=float(args.preserve_long_qty),
+                preserve_short_qty=float(args.preserve_short_qty),
             )
             open_orders = fetch_futures_open_orders(args.symbol, api_key, api_secret, recv_window=args.recv_window)
             our_orders = [order for order in open_orders if isinstance(order, dict) and is_flatten_order(order, prefix)]
@@ -536,6 +559,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-loss", action="store_true")
     parser.add_argument("--min-profit-ratio", type=float, default=0.0)
     parser.add_argument("--max-loss-ratio", type=float, default=None)
+    parser.add_argument("--preserve-long-qty", type=float, default=0.0)
+    parser.add_argument("--preserve-short-qty", type=float, default=0.0)
     return parser
 
 
@@ -554,6 +579,10 @@ def main() -> None:
         raise SystemExit("--min-profit-ratio must be >= 0")
     if args.max_loss_ratio is not None and args.max_loss_ratio < 0:
         raise SystemExit("--max-loss-ratio must be >= 0")
+    if args.preserve_long_qty < 0:
+        raise SystemExit("--preserve-long-qty must be >= 0")
+    if args.preserve_short_qty < 0:
+        raise SystemExit("--preserve-short-qty must be >= 0")
     raise SystemExit(_run(args))
 
 

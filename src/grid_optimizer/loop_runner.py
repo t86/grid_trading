@@ -9264,7 +9264,13 @@ def _pid_is_running(pid_path: Path) -> bool:
     return True
 
 
-def _start_futures_flatten_process(symbol: str, *, allow_loss: bool = False) -> dict[str, Any]:
+def _start_futures_flatten_process(
+    symbol: str,
+    *,
+    allow_loss: bool = False,
+    preserve_long_qty: float = 0.0,
+    preserve_short_qty: float = 0.0,
+) -> dict[str, Any]:
     pid_path = _flatten_pid_path(symbol)
     if _pid_is_running(pid_path):
         return {"started": False, "already_running": True}
@@ -9293,6 +9299,12 @@ def _start_futures_flatten_process(symbol: str, *, allow_loss: bool = False) -> 
     ]
     if allow_loss:
         command.append("--allow-loss")
+    safe_preserve_long_qty = max(_safe_float(preserve_long_qty), 0.0)
+    safe_preserve_short_qty = max(_safe_float(preserve_short_qty), 0.0)
+    if safe_preserve_long_qty > 0:
+        command.extend(["--preserve-long-qty", str(safe_preserve_long_qty)])
+    if safe_preserve_short_qty > 0:
+        command.extend(["--preserve-short-qty", str(safe_preserve_short_qty)])
     with log_path.open("ab") as log_file:
         proc = subprocess.Popen(
             command,
@@ -9303,7 +9315,13 @@ def _start_futures_flatten_process(symbol: str, *, allow_loss: bool = False) -> 
             start_new_session=True,
         )
     pid_path.write_text(str(proc.pid), encoding="utf-8")
-    return {"started": True, "already_running": False, "pid": proc.pid}
+    return {
+        "started": True,
+        "already_running": False,
+        "pid": proc.pid,
+        "preserve_long_qty": safe_preserve_long_qty,
+        "preserve_short_qty": safe_preserve_short_qty,
+    }
 
 
 def _load_futures_runtime_guard_inputs(
@@ -10233,6 +10251,7 @@ def _maybe_handle_runtime_guard(
     )
     frozen_inventory_present = _has_best_quote_frozen_inventory_position(state)
     manual_frozen_directive_pending = _has_pending_frozen_inventory_manual_directive(state)
+    frozen_long_qty, frozen_short_qty = _best_quote_frozen_inventory_qtys(state)
     if frozen_inventory_present and not manual_frozen_directive_pending:
         if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
             stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
@@ -10374,11 +10393,14 @@ def _maybe_handle_runtime_guard(
         recv_window=args.recv_window,
     )
     flatten_result = {"started": False, "already_running": False}
+    flatten_allow_loss = not _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", "")))
     flatten_snapshot = load_live_flatten_snapshot(
         args.symbol.upper().strip(),
         api_key,
         api_secret,
-        allow_loss=True,
+        allow_loss=flatten_allow_loss,
+        preserve_long_qty=frozen_long_qty,
+        preserve_short_qty=frozen_short_qty,
     )
     if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
         stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
@@ -10428,7 +10450,12 @@ def _maybe_handle_runtime_guard(
             )
         _write_json(state_path, state)
     if list(flatten_snapshot.get("orders", [])) and not (loss_only_stop and _runtime_guard_loss_recovery_enabled(args)):
-        flatten_result = _start_futures_flatten_process(args.symbol.upper().strip(), allow_loss=True)
+        flatten_result = _start_futures_flatten_process(
+            args.symbol.upper().strip(),
+            allow_loss=flatten_allow_loss,
+            preserve_long_qty=frozen_long_qty,
+            preserve_short_qty=frozen_short_qty,
+        )
     summary = _build_runtime_guard_stop_summary(
         args=args,
         cycle=cycle,
