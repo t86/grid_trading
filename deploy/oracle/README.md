@@ -352,11 +352,13 @@ them by `git pull`, not by hand-editing `output/ops/*.py`:
   limit on the kept frozen shorts (priced so no lot is underwater at the fill). A per-symbol
   `output/<symbol>_target_gate_done_YYYYMMDD.flag` prevents repeats within a UTC day.
 - `python -m grid_optimizer.competition_health_monitor` — the stable supervisor. It **never boosts
-  budget to chase a target**; it only (1) restarts an "active but not placing" runner, (2) self-heals
-  the balanced-hedge deadlock by closing only the net-neutral matched managed qty
-  `min(managed_long, managed_short)` — a spread hedge that would realize a loss, or a one-sided
-  loss-reduce (`matched=0`), is left untouched — and (3) runs a hysteretic wear governor that raises
-  `quote_offset_ticks` when recent wear is hot and lowers it when wear recovers.
+  budget to chase a target**; it only (1) restarts an "active but not placing" runner, (2) *detects*
+  the balanced-hedge deadlock and logs it (`would_unstick` / `blocked_by_config`) — it does **not**
+  auto market-reduce managed positions unless the operator explicitly passes
+  `--enable-deadlock-unstick` (OFF by default, and production cron leaves it off, per the "no
+  automatic managed pair-reduce" policy) — and (3) runs a hysteretic wear governor that raises
+  `quote_offset_ticks` when recent wear is hot and lowers it when wear recovers. Every restart checks
+  the systemctl return code and is recorded, so a failed restart is retried, not silently assumed.
 
 Both read exchange `userTrades` for the true wear (`-realized_pnl / gross_notional * 1e4`), never the
 runner's own `loss_per_10k` field.
@@ -394,6 +396,19 @@ On the API2 host (150) use `--workdir /home/ubuntu/wangge_api2` and that host's 
 new symbol without side effects by dropping `--enforce` (both modules then only print the JSON
 decision). Confirm `crontab -l` and tail the `output/*_health_monitor.log` for a few cycles before
 trusting it unattended.
+
+Built-in production-safety behaviour of the target gate (no cron flags needed):
+
+- It fires the target stop only for a **positive** target. A missing/unreadable control JSON or a
+  `<= 0` target reports `config_error` and does nothing, so a 0 target can never stop+flatten on a
+  `vol >= 0` read.
+- After `systemctl stop` it **confirms the service is inactive** before cancelling orders or
+  flattening; if the stop fails it reports `ABORTED_STOP_FAILED` and touches nothing.
+- Dry-run (`--enforce` omitted) performs **no** exchange side effects, including the `FROZENTP`
+  cleanup.
+- `--qty-step` (default `1`) truncates the frozen-short TP qty to the symbol lot step, and the qty is
+  clamped to the actual kept short so the BUY can never over-buy into a long. Set it if a symbol uses
+  a non-integer contract step.
 
 The `--first`/`--brake-wear`/`--hard-wear` values above are aligned to the ARX v2 wear budget
 (soft 0.9 / hard 1.6 per 10k); tune per campaign and per the reward economics, not by copy-paste.

@@ -90,18 +90,39 @@ def _patch_positions(monkeypatch, long_amt, short_amt, long_entry, short_entry):
     monkeypatch.setattr(data, "fetch_futures_position_risk_v3", fake_pos, raising=False)
 
 
-def test_deadlock_closes_only_matched_neutral_hedge(tmp_path: Path, monkeypatch) -> None:
-    # Balanced hedge opened near the same price: 120 long (20 frozen) + 100 short (10 frozen)
-    # -> managed 100 long / 90 short -> matched 90, net-neutral, so it acts.
+def _patch_market_orders(monkeypatch) -> list:
+    orders: list = []
+
+    def rec(**kw):
+        orders.append((kw["side"], kw["quantity"], kw["position_side"]))
+
+    monkeypatch.setattr(hm, "post_futures_market_order", rec, raising=False)
+    import grid_optimizer.data as data
+    monkeypatch.setattr(data, "post_futures_market_order", rec, raising=False)
+    return orders
+
+
+def test_deadlock_is_detect_only_by_default(tmp_path: Path, monkeypatch) -> None:
+    # A closable net-neutral hedge exists, but auto_close defaults to False: no market order,
+    # just a blocked_by_config detection for alerting (policy: no automatic managed pair-reduce).
     _plan(tmp_path, "arxusdt", 20, 10)
     _patch_positions(monkeypatch, long_amt=120, short_amt=-100, long_entry=0.2200, short_entry=0.2201)
-    orders: list = []
-    monkeypatch.setattr(hm, "post_futures_market_order",
-                        lambda **kw: orders.append((kw["side"], kw["quantity"], kw["position_side"])), raising=False)
-    import grid_optimizer.data as data
-    monkeypatch.setattr(data, "post_futures_market_order",
-                        lambda **kw: orders.append((kw["side"], kw["quantity"], kw["position_side"])), raising=False)
+    orders = _patch_market_orders(monkeypatch)
     out = hm.deadlock_unstick("ARXUSDT", "k", "s", str(tmp_path), "arxusdt", min_matched=20)
+    assert out["matched"] == 90
+    assert out["acted"] is False
+    assert out["reason"] == "blocked_by_config"
+    assert out["would_unstick"] is True
+    assert orders == []
+
+
+def test_deadlock_closes_only_matched_neutral_hedge_when_opted_in(tmp_path: Path, monkeypatch) -> None:
+    # Balanced hedge opened near the same price: 120 long (20 frozen) + 100 short (10 frozen)
+    # -> managed 100 long / 90 short -> matched 90, net-neutral; only acts with auto_close=True.
+    _plan(tmp_path, "arxusdt", 20, 10)
+    _patch_positions(monkeypatch, long_amt=120, short_amt=-100, long_entry=0.2200, short_entry=0.2201)
+    orders = _patch_market_orders(monkeypatch)
+    out = hm.deadlock_unstick("ARXUSDT", "k", "s", str(tmp_path), "arxusdt", min_matched=20, auto_close=True)
     assert out["matched"] == 90
     assert out["acted"] is True
     assert ("SELL", 90, "LONG") in orders and ("BUY", 90, "SHORT") in orders
@@ -156,3 +177,123 @@ def test_get_offset_prefers_bq_key_then_falls_back(tmp_path: Path) -> None:
 def test_placed_sum_parses_journal_lines() -> None:
     assert hm.placed_sum("foo placed=2 bar\nbaz placed=0\nqux placed=5") == 7
     assert hm.placed_sum("no counters here") == 0
+
+
+# --- target_gate main() production-safety guards (fixes 2/3/4) ---
+
+class _FakeProc:
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _fake_subprocess(calls: list, active: str = "active"):
+    def run(cmd, **kw):
+        calls.append(cmd)
+        return _FakeProc(stdout=active if "is-active" in cmd else "")
+    return run
+
+
+def _run_gate_main(monkeypatch, argv: list[str]) -> None:
+    monkeypatch.setenv("BINANCE_API_KEY", "k")
+    monkeypatch.setenv("BINANCE_API_SECRET", "s")
+    monkeypatch.setattr("sys.argv", ["competition_target_gate", *argv])
+    tg.main()
+
+
+def _control(workdir: Path, slug: str, max_cum: float) -> None:
+    (workdir / "output").mkdir(parents=True, exist_ok=True)
+    (workdir / "output" / f"{slug}_loop_runner_control.json").write_text(
+        json.dumps({"max_cumulative_notional": max_cum}), encoding="utf-8")
+
+
+def test_gate_zero_target_never_stops_even_with_huge_volume(tmp_path: Path, monkeypatch, capsys) -> None:
+    # No control JSON -> target stays 0. A 0 target with huge day volume must NOT stop+flatten.
+    (tmp_path / "output").mkdir(parents=True)
+    calls: list = []
+    monkeypatch.setattr(tg, "subprocess", type("S", (), {"run": staticmethod(_fake_subprocess(calls))}))
+    monkeypatch.setattr(tg, "daily_vol_wear", lambda *a, **k: (10_000_000.0, 0.0))
+    monkeypatch.setattr(tg, "cancel_frozen_tp", lambda *a, **k: 0)   # pre-cleanup must not hit network
+    _run_gate_main(monkeypatch, ["--symbol", "ARXUSDT", "--service", "grid-loop@ARXUSDT.service",
+                                 "--workdir", str(tmp_path), "--enforce"])
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["hit_target"] is False
+    assert out["config_error"] == "missing_config"
+    assert not any("stop" in c for c in calls)          # never stopped the runner
+
+
+def test_gate_dry_run_does_not_cancel_frozen_tp(tmp_path: Path, monkeypatch, capsys) -> None:
+    # Active runner + no --enforce: the FROZENTP cleanup must not touch the exchange.
+    _control(tmp_path, "arxusdt", 100_000)
+    calls: list = []
+    monkeypatch.setattr(tg, "subprocess", type("S", (), {"run": staticmethod(_fake_subprocess(calls))}))
+    monkeypatch.setattr(tg, "daily_vol_wear", lambda *a, **k: (0.0, 0.0))
+    canceled = {"n": 0}
+    monkeypatch.setattr(tg, "cancel_frozen_tp", lambda *a, **k: canceled.__setitem__("n", 1))
+    _run_gate_main(monkeypatch, ["--symbol", "ARXUSDT", "--service", "grid-loop@ARXUSDT.service",
+                                 "--workdir", str(tmp_path)])
+    assert canceled["n"] == 0
+
+
+def test_gate_aborts_when_stop_not_confirmed_inactive(tmp_path: Path, monkeypatch, capsys) -> None:
+    # Target hit + --enforce, but the service never goes inactive: abort BEFORE cancelling or
+    # flattening anything.
+    _control(tmp_path, "arxusdt", 100_000)
+    calls: list = []
+    monkeypatch.setattr(tg, "subprocess", type("S", (), {"run": staticmethod(_fake_subprocess(calls))}))
+    monkeypatch.setattr(tg, "daily_vol_wear", lambda *a, **k: (200_000.0, 0.0))
+    monkeypatch.setattr(tg, "confirm_stopped", lambda *a, **k: False)
+    monkeypatch.setattr(tg, "cancel_frozen_tp", lambda *a, **k: 0)   # isolate the flatten path
+    touched: list = []
+    monkeypatch.setattr(tg, "fetch_futures_open_orders", lambda *a, **k: touched.append("cancel") or [])
+    monkeypatch.setattr(tg, "fetch_futures_position_risk_v3", lambda *a, **k: touched.append("pos") or [])
+    monkeypatch.setattr(tg, "post_futures_market_order", lambda *a, **k: touched.append("flatten"))
+    _run_gate_main(monkeypatch, ["--symbol", "ARXUSDT", "--service", "grid-loop@ARXUSDT.service",
+                                 "--workdir", str(tmp_path), "--enforce"])
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["action"] == "ABORTED_STOP_FAILED"
+    assert touched == []                                 # no cancel / no position read / no flatten
+
+
+def test_gate_frozen_tp_qty_clamped_to_kept_short_and_step(tmp_path: Path, monkeypatch) -> None:
+    # 250 frozen-short lot qty but only 90 kept short -> BUY clamped to 90, truncated to step 5.
+    _write_state(tmp_path, "arxusdt", [{"qty": 250, "entry_price": 0.30}])
+    captured: dict = {}
+    monkeypatch.setattr(tg, "post_futures_order", lambda **kw: captured.update(kw) or {"orderId": 1})
+    out = tg.place_frozen_short_tp("ARXUSDT", "k", "s", str(tmp_path), "arxusdt", 0.05, 0.0001,
+                                   qty_step=5.0, max_qty=92.0)
+    assert out["placed"] is True
+    assert out["qty"] == 90                              # min(250, 92) truncated to a multiple of 5
+    assert captured["quantity"] == 90
+    assert str(out["coid"]).startswith("FROZENTParxusdt")
+
+
+def test_evaluate_triggers_zero_target_is_never_a_hit() -> None:
+    # target <= 0 -> target_ok False and hit_target forced False regardless of volume.
+    assert tg.evaluate_triggers(1e9, 0.0, 0.0, 75000, 2.0) == (False, False, False)
+    assert tg.evaluate_triggers(1e9, 0.0, -5.0, 75000, 2.0) == (False, False, False)
+    # positive target: hit only once volume reaches it.
+    assert tg.evaluate_triggers(90_000, 0.0, 100_000, 75000, 2.0) == (True, False, False)
+    assert tg.evaluate_triggers(100_000, 0.0, 100_000, 75000, 2.0) == (True, True, False)
+    # wear stop is independent of the target and only arms past `first`.
+    assert tg.evaluate_triggers(80_000, 3.0, 0.0, 75000, 2.0) == (False, False, True)
+    assert tg.evaluate_triggers(50_000, 9.0, 0.0, 75000, 2.0) == (False, False, False)
+
+
+def test_restart_reports_returncode(monkeypatch) -> None:
+    # A failed restart must surface ok=False + the code so the caller retries instead of
+    # assuming the runner came back.
+    def fake_run(cmd, **kw):
+        rc = 0 if "reset-failed" in cmd else 1
+        return _FakeProc(returncode=rc, stderr="boom")
+
+    monkeypatch.setattr(hm.subprocess, "run", fake_run)
+    out = hm.restart("grid-loop@ARXUSDT.service")
+    assert out["ok"] is False
+    assert out["restart_rc"] == 1
+    assert out["reset_failed_rc"] == 0
+    assert out["error"] == "boom"
+
+    monkeypatch.setattr(hm.subprocess, "run", lambda cmd, **kw: _FakeProc(returncode=0))
+    assert hm.restart("grid-loop@ARXUSDT.service")["ok"] is True

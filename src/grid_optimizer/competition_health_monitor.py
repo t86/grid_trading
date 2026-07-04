@@ -137,19 +137,36 @@ def apply_offset(cfg_path: str, key: str, val: int, updated_by: str) -> None:
     os.replace(tmp, cfg_path)
 
 
-def restart(service: str) -> None:
-    subprocess.run(["sudo", "-n", "systemctl", "reset-failed", service], capture_output=True)
-    subprocess.run(["sudo", "-n", "systemctl", "restart", service], capture_output=True)
+def restart(service: str) -> dict[str, Any]:
+    """Restart the service and report the systemctl return codes.
+
+    The caller must NOT assume the runner restarted: it inspects ``ok`` and only
+    advances its rate-limit / did_restart bookkeeping when the restart actually
+    succeeded, so a failed restart is retried instead of silently swallowed.
+    """
+    reset = subprocess.run(["sudo", "-n", "systemctl", "reset-failed", service], capture_output=True)
+    res = subprocess.run(["sudo", "-n", "systemctl", "restart", service], capture_output=True, text=True)
+    ok = res.returncode == 0
+    out: dict[str, Any] = {"ok": ok, "reset_failed_rc": reset.returncode, "restart_rc": res.returncode}
+    if not ok:
+        out["error"] = (res.stderr or "").strip()[:160]
+    return out
 
 
-def deadlock_unstick(sym: str, k: str, s: str, workdir: str, slug: str, min_matched: int) -> dict[str, Any]:
-    """Break the balanced-hedge deadlock with a net-neutral matched close.
+def deadlock_unstick(
+    sym: str, k: str, s: str, workdir: str, slug: str, min_matched: int, auto_close: bool = False
+) -> dict[str, Any]:
+    """Detect the balanced-hedge deadlock; only close it when ``auto_close`` is set.
 
     When the runner holds a long AND a short both near the cap and a slightly
-    underwater leg has frozen entries+exits, it can sit looping with placed=0.
-    Close only the MATCHED managed qty ``min(managed_long, managed_short)``: that is
-    net-neutral (~$0 realized) and non-zero ONLY in a balanced hedge -- a one-sided
-    position (a legit loss-reduce) has matched=0 and is left untouched. Frozen is kept.
+    underwater leg has frozen entries+exits, it can sit looping with placed=0. The
+    ONLY net-neutral remedy is to close the MATCHED managed qty
+    ``min(managed_long, managed_short)`` (non-zero only in a balanced hedge; a
+    one-sided legit loss-reduce has matched=0). But auto market-reducing managed
+    positions conflicts with the "no automatic managed pair-reduce" policy, so it is
+    DISABLED by default: this function reports the detection (for alerting) and fires
+    the matched close only when the operator explicitly opts in with ``auto_close``.
+    Frozen inventory is always kept.
     """
     from .data import fetch_futures_position_risk_v3, post_futures_market_order
 
@@ -186,6 +203,13 @@ def deadlock_unstick(sym: str, k: str, s: str, workdir: str, slug: str, min_matc
         out["acted"] = False
         out["reason"] = "spread_hedge_would_realize_loss"
         return out
+    # A closable net-neutral hedge was found, but auto managed pair-reduce is off by policy:
+    # report it for alerting and place NO market order unless the operator opted in.
+    if not auto_close:
+        out["acted"] = False
+        out["reason"] = "blocked_by_config"
+        out["would_unstick"] = True
+        return out
     out["acted"] = True
     try:
         post_futures_market_order(symbol=sym, side="SELL", quantity=matched, api_key=k, api_secret=s,
@@ -215,6 +239,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--min-matched-qty", type=int, default=20)         # only unstick a hedge at least this big
     ap.add_argument("--recent-min", type=int, default=20)
     ap.add_argument("--governor-cooldown-min", type=int, default=20)
+    ap.add_argument("--enable-deadlock-unstick", action="store_true",
+                    help="Opt in to the automatic net-neutral matched managed close. OFF by "
+                         "default (policy: no automatic managed pair-reduce); when off the monitor "
+                         "only detects and logs the deadlock. Production cron should leave this off.")
     ap.add_argument("--enforce", action="store_true")
     return ap
 
@@ -254,9 +282,11 @@ def main() -> None:
     if active and looping and placed == 0 and not intended and (tnow - last_wd) >= a.watchdog_min * 60:
         rec["watchdog"] = "restart_not_placing"
         if a.enforce:
-            restart(a.service)
-            st["last_watchdog_ts"] = tnow
-            did_restart = True
+            rr = restart(a.service)
+            rec["watchdog_restart"] = rr
+            if rr["ok"]:                      # a failed restart is retried next cycle, not swallowed
+                st["last_watchdog_ts"] = tnow
+                did_restart = True
 
     # --- 1b. deadlock self-heal: looping but placed=0 for --deadlock-min and NOT a real terminal
     #     stop (the runner's own pauses like buy_paused/net_loss_reduce ARE the deadlock symptom,
@@ -275,7 +305,10 @@ def main() -> None:
                 if a.enforce:
                     kk = os.environ["BINANCE_API_KEY"]
                     ss = os.environ["BINANCE_API_SECRET"]
-                    deadlock["unstick"] = deadlock_unstick(sym, kk, ss, wd, slug, a.min_matched_qty)
+                    deadlock["unstick"] = deadlock_unstick(
+                        sym, kk, ss, wd, slug, a.min_matched_qty,
+                        auto_close=a.enable_deadlock_unstick,
+                    )
                     if (deadlock["unstick"] or {}).get("acted"):
                         st["last_deadlock_ts"] = tnow
                         did_restart = True   # skip the governor this cycle after acting
@@ -308,17 +341,21 @@ def main() -> None:
                     gov["action"] = "brake_%d->%d" % (off, off + 1)
                     if a.enforce:
                         apply_offset(cfg, okey, off + 1, "health_governor_brake")
-                        restart(a.service)
-                        st["last_governor_ts"] = tnow
-                        did_restart = True
+                        rr = restart(a.service)
+                        gov["restart"] = rr
+                        if rr["ok"]:
+                            st["last_governor_ts"] = tnow
+                            did_restart = True
                     streak = 0
             elif off > a.min_offset and (rwear < a.release_wear or day_wear < a.brake_day_wear - 0.2) and gov_cooled:
                 gov["action"] = "release_%d->%d" % (off, off - 1)
                 if a.enforce:
                     apply_offset(cfg, okey, off - 1, "health_governor_release")
-                    restart(a.service)
-                    st["last_governor_ts"] = tnow
-                    did_restart = True
+                    rr = restart(a.service)
+                    gov["restart"] = rr
+                    if rr["ok"]:
+                        st["last_governor_ts"] = tnow
+                        did_restart = True
                 streak = 0
             else:
                 streak = 0

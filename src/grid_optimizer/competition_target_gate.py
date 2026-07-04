@@ -32,6 +32,7 @@ import json
 import math
 import os
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,13 @@ FROZEN_TP_PREFIX = "FROZENTP"
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _truncate_step(qty: float, step: float) -> float:
+    """Truncate a quantity down to a whole multiple of the symbol step size."""
+    if step <= 0:
+        return float(qty)
+    return math.floor(qty / step) * step
 
 
 def daily_vol_wear(sym: str, k: str, s: str) -> tuple[float, float]:
@@ -93,7 +101,8 @@ def _frozen_short_lots(workdir: str, slug: str) -> list[tuple[float, float]]:
 
 
 def place_frozen_short_tp(
-    sym: str, k: str, s: str, workdir: str, slug: str, tp_ratio: float, tick: float
+    sym: str, k: str, s: str, workdir: str, slug: str, tp_ratio: float, tick: float,
+    qty_step: float = 1.0, max_qty: float | None = None,
 ) -> dict[str, Any]:
     """Rest a BUY limit to take profit on kept frozen shorts.
 
@@ -101,6 +110,11 @@ def place_frozen_short_tp(
     book closes at >= ``tp_ratio`` average profit AND no individual lot is
     underwater at the fill price (min_entry guard), so a stopped runner can never
     realize a loss on the kept frozen shorts.
+
+    The BUY qty is clamped to ``max_qty`` (the actual short size we are keeping, so
+    the TP can never over-buy and flip the position long) and truncated down to the
+    symbol ``qty_step``. The clientOrderId carries the symbol so two symbols placing
+    a TP in the same minute cannot collide.
     """
     lots = _frozen_short_lots(workdir, slug)
     if not lots:
@@ -113,10 +127,13 @@ def place_frozen_short_tp(
     min_entry = min(e for _, e in lots)
     raw = min(wavg * (1.0 - max(tp_ratio, 0.0)), min_entry)
     tp_price = round(math.floor(raw / tick) * tick, 8)
-    qty = int(tot_q)
+    # Never place a BUY larger than the short we actually hold (would flip to long).
+    target_qty = tot_q if max_qty is None else min(tot_q, max(max_qty, 0.0))
+    qty = _truncate_step(target_qty, qty_step)
+    qty = int(qty) if float(qty).is_integer() else round(qty, 8)
     if qty <= 0 or tp_price <= 0:
-        return {"placed": False, "reason": "bad_qty_or_price"}
-    coid = FROZEN_TP_PREFIX + _now().strftime("%Y%m%d%H%M")
+        return {"placed": False, "reason": "bad_qty_or_price", "qty": qty, "price": tp_price}
+    coid = (FROZEN_TP_PREFIX + slug + _now().strftime("%Y%m%d%H%M%S"))[:36]
     try:
         r = post_futures_order(
             symbol=sym, side="BUY", quantity=qty, price=tp_price, api_key=k, api_secret=s,
@@ -162,6 +179,37 @@ def _read_frozen_from_plan(workdir: str, slug: str, plan_json: str) -> tuple[flo
         return 0.0, 0.0
 
 
+def evaluate_triggers(
+    vol: float, wear: float, target: float, first: float, wear_stop: float
+) -> tuple[bool, bool, bool]:
+    """Return (target_ok, hit_target, hit_wear).
+
+    ``target_ok`` is False for a missing/zero/negative target; in that case
+    ``hit_target`` is forced False so a 0 target can never stop+flatten on a
+    vol>=0 read. The wear stop still fires independently once vol is past ``first``.
+    """
+    target_ok = target > 0
+    hit_target = target_ok and vol >= target
+    hit_wear = vol >= first and wear > wear_stop
+    return target_ok, hit_target, hit_wear
+
+
+def confirm_stopped(service: str, retries: int = 6, delay: float = 1.0) -> bool:
+    """Return True only once systemctl reports the service inactive.
+
+    The gate must never cancel orders or market-flatten while the runner might
+    still be trading, so the caller aborts if this returns False.
+    """
+    for _ in range(max(retries, 1)):
+        state = subprocess.run(
+            ["systemctl", "is-active", service], capture_output=True, text=True
+        ).stdout.strip()
+        if state in ("inactive", "failed"):
+            return True
+        time.sleep(delay)
+    return False
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--symbol", required=True)
@@ -171,6 +219,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Fallback target; overridden by the live control max_cumulative_notional.")
     ap.add_argument("--wear-stop", type=float, default=2.0)
     ap.add_argument("--first", type=float, default=75000.0)
+    ap.add_argument("--qty-step", type=float, default=1.0,
+                    help="Symbol lot step; the frozen-short TP qty is truncated to it.")
     ap.add_argument("--plan-json", default=None,
                     help="Defaults to output/<symbol>_loop_latest_plan.json.")
     ap.add_argument("--tp-ratio", type=float, default=0.05)
@@ -191,33 +241,41 @@ def main() -> None:
 
     # Target tracks the runner max_cumulative_notional (daily_reset updates it each day),
     # so today/tomorrow target changes flow from the config without editing this cron.
+    # config_ok distinguishes "read the config and target is 0/negative" from "could not read
+    # the config at all" -- either way we must NOT treat a 0 target as an instant stop trigger.
+    config_ok = False
     try:
         cfg = json.load(open(os.path.join(a.workdir, "output", f"{slug}_loop_runner_control.json")))
+        config_ok = True
         ct = float(cfg.get("max_cumulative_notional") or 0)
         if ct > 0:
             a.target = ct
     except Exception:
-        pass
+        config_ok = False
 
     ts = _now().isoformat()
 
     # Manual: rest the frozen-short TP for an already-stopped runner, then exit.
     if a.place_tp_now:
-        info = place_frozen_short_tp(sym, k, s, a.workdir, slug, a.tp_ratio, a.tick) if a.enforce else {"dry_run": True}
+        info = (
+            place_frozen_short_tp(sym, k, s, a.workdir, slug, a.tp_ratio, a.tick, a.qty_step)
+            if a.enforce else {"dry_run": True}
+        )
         print(json.dumps({"ts": ts, "place_tp_now": info}))
         return
 
     # Once the runner is back up it manages frozen itself -> clean up any stale resting TP.
-    try:
-        alive = subprocess.run(
-            ["systemctl", "is-active", a.service], capture_output=True, text=True
-        ).stdout.strip() == "active"
-        if alive:
+    # dry-run must have NO exchange side effects, so only cancel under --enforce.
+    alive = subprocess.run(
+        ["systemctl", "is-active", a.service], capture_output=True, text=True
+    ).stdout.strip() == "active"
+    if a.enforce and alive:
+        try:
             c = cancel_frozen_tp(sym, k, s)
             if c:
                 print(json.dumps({"ts": ts, "frozen_tp_canceled": c}))
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     done_marker = os.path.join(
         a.workdir, "output", f"{slug}_target_gate_done_{_now().strftime('%Y%m%d')}.flag"
@@ -226,13 +284,17 @@ def main() -> None:
         print(json.dumps({"ts": ts, "skip": "already_done_today"}))
         return
 
+    # A missing/zero target must never fire the gate: a 0 target with vol>=0 would stop+flatten
+    # on every run. Require a positive target (report config_error otherwise); wear-stop still
+    # works independently once volume is past --first.
     vol, wear = daily_vol_wear(sym, k, s)
-    hit_target = vol >= a.target
-    hit_wear = vol >= a.first and wear > a.wear_stop
+    target_ok, hit_target, hit_wear = evaluate_triggers(vol, wear, a.target, a.first, a.wear_stop)
     status: dict[str, Any] = {
         "ts": ts, "vol": round(vol, 0), "wear": round(wear, 2), "target": a.target,
         "hit_target": hit_target, "hit_wear": hit_wear, "enforce": a.enforce,
     }
+    if not target_ok:
+        status["config_error"] = "missing_config" if not config_ok else "non_positive_target"
     if not (hit_target or hit_wear):
         print(json.dumps(status))
         return
@@ -242,8 +304,15 @@ def main() -> None:
         print(json.dumps(status))
         return
 
-    # 1. stop runner
-    subprocess.run(["sudo", "-n", "systemctl", "stop", a.service], capture_output=True)
+    # 1. stop runner -- and CONFIRM it is inactive before touching orders/positions. If the stop
+    #    fails or the service is still active, abort without cancelling or flattening anything.
+    stop_rc = subprocess.run(["sudo", "-n", "systemctl", "stop", a.service], capture_output=True).returncode
+    if not confirm_stopped(a.service):
+        status["action"] = "ABORTED_STOP_FAILED"
+        status["stop_rc"] = stop_rc
+        print(json.dumps(status))
+        return
+    status["stop_rc"] = stop_rc
     # 2. read frozen inventory to keep; only flatten managed/non-frozen position.
     frozen_long, frozen_short = _read_frozen_from_plan(a.workdir, slug, plan_json)
     # 3. cancel open orders
@@ -272,7 +341,8 @@ def main() -> None:
     # 5. rest a take-profit LIMIT on the kept frozen shorts (fills automatically if price reaches
     #    the tp-ratio line while the runner is stopped; the runner cancels it on its next active cycle).
     tp = (
-        place_frozen_short_tp(sym, k, s, a.workdir, slug, a.tp_ratio, a.tick)
+        place_frozen_short_tp(sym, k, s, a.workdir, slug, a.tp_ratio, a.tick, a.qty_step,
+                              max_qty=frozen_short)
         if frozen_short > 0 else {"placed": False, "reason": "no_frozen_short"}
     )
     Path(done_marker).write_text(ts, encoding="utf-8")
