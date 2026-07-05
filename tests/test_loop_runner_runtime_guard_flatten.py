@@ -216,6 +216,80 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
     @patch("grid_optimizer.loop_runner.evaluate_runtime_guards")
     @patch("grid_optimizer.loop_runner._load_futures_runtime_guard_inputs")
+    def test_runtime_guard_end_window_skips_flatten(
+        self,
+        mock_inputs,
+        mock_evaluate,
+        mock_credentials,
+        mock_cancel,
+        mock_snapshot,
+        mock_start_flatten,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text("{}", encoding="utf-8")
+            args = argparse.Namespace(
+                symbol="ARXUSDT",
+                recv_window=5000,
+                strategy_profile="test",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                runtime_guard_stats_start_time=None,
+                run_start_time=None,
+                run_end_time="2026-07-05T08:00:00+08:00",
+                rolling_hourly_loss_limit=None,
+                rolling_hourly_loss_per_10k_limit=None,
+                rolling_hourly_loss_per_10k_min_notional=None,
+                runtime_guard_loss_recovery_enabled=True,
+                runtime_guard_loss_recovery_cooldown_seconds=180.0,
+                runtime_guard_loss_recovery_max_1m_amplitude_ratio=0.012,
+                runtime_guard_loss_recovery_max_3m_amplitude_ratio=0.025,
+                max_cumulative_notional=None,
+                max_actual_net_notional=400.0,
+                max_synthetic_drift_notional=None,
+                max_unrealized_loss=None,
+                best_quote_maker_volume_reduce_freeze_loss_ratio=0.01,
+                auto_regime_enabled=False,
+                state_path=str(state_path),
+                plan_json=str(Path(tmpdir) / "plan.json"),
+            )
+            now = datetime(2026, 7, 5, 0, 0, 1, tzinfo=timezone.utc)
+            mock_inputs.return_value = (1000.0, [], None)
+            mock_evaluate.return_value = argparse.Namespace(
+                tradable=False,
+                runtime_status="stopped",
+                stop_triggered=True,
+                primary_reason="after_end_window",
+                matched_reasons=["after_end_window"],
+                triggered_at=now.isoformat(),
+                rolling_hourly_loss=0.0,
+                rolling_hourly_gross_notional=0.0,
+                rolling_hourly_loss_per_10k=0.0,
+                rolling_hourly_loss_per_10k_active=False,
+                cumulative_gross_notional=1000.0,
+                unrealized_loss=0.0,
+            )
+            mock_credentials.return_value = ("key", "secret")
+            mock_cancel.return_value = 2
+
+            summary = _maybe_handle_runtime_guard(
+                args=args,
+                cycle=1,
+                cycle_started_at=now,
+                summary_path=Path(tmpdir) / "events.jsonl",
+            )
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["stop_reason"], "after_end_window")
+        self.assertFalse(summary["flatten_started"])
+        mock_snapshot.assert_not_called()
+        mock_start_flatten.assert_not_called()
+
+    @patch("grid_optimizer.loop_runner._start_futures_flatten_process")
+    @patch("grid_optimizer.loop_runner.load_live_flatten_snapshot")
+    @patch("grid_optimizer.loop_runner._cancel_futures_strategy_orders")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.evaluate_runtime_guards")
+    @patch("grid_optimizer.loop_runner._load_futures_runtime_guard_inputs")
     def test_runtime_guard_non_loss_stop_allows_frozen_manual_override_without_flatten(
         self,
         mock_inputs,

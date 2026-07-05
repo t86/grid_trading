@@ -10254,6 +10254,7 @@ def _maybe_handle_runtime_guard(
         ["rolling_hourly_loss_limit_hit"],
         ["rolling_hourly_loss_per_10k_limit_hit"],
     )
+    end_window_stop = runtime_guard_result.primary_reason == "after_end_window"
     frozen_inventory_present = _has_best_quote_frozen_inventory_position(state)
     manual_frozen_directive_pending = _has_pending_frozen_inventory_manual_directive(state)
     frozen_long_qty, frozen_short_qty = _best_quote_frozen_inventory_qtys(state)
@@ -10405,15 +10406,26 @@ def _maybe_handle_runtime_guard(
         if flatten_is_best_quote
         else None
     )
-    flatten_snapshot = load_live_flatten_snapshot(
-        args.symbol.upper().strip(),
-        api_key,
-        api_secret,
-        allow_loss=flatten_allow_loss,
-        max_loss_ratio=flatten_max_loss_ratio,
-        preserve_long_qty=frozen_long_qty,
-        preserve_short_qty=frozen_short_qty,
-    )
+    if end_window_stop:
+        flatten_snapshot = {
+            "orders": [],
+            "warnings": [f"{args.symbol.upper().strip()} after_end_window 停机只撤单，不启动自动平仓"],
+            "allow_loss": flatten_allow_loss,
+            "max_loss_ratio": flatten_max_loss_ratio,
+            "preserve_long_qty": frozen_long_qty,
+            "preserve_short_qty": frozen_short_qty,
+            "skip_reason": "after_end_window",
+        }
+    else:
+        flatten_snapshot = load_live_flatten_snapshot(
+            args.symbol.upper().strip(),
+            api_key,
+            api_secret,
+            allow_loss=flatten_allow_loss,
+            max_loss_ratio=flatten_max_loss_ratio,
+            preserve_long_qty=frozen_long_qty,
+            preserve_short_qty=frozen_short_qty,
+        )
     if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
         stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
         if recovered_at is not None and (stopped_at is None or recovered_at >= stopped_at):
@@ -10461,7 +10473,11 @@ def _maybe_handle_runtime_guard(
                 rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
             )
         _write_json(state_path, state)
-    if list(flatten_snapshot.get("orders", [])) and not (loss_only_stop and _runtime_guard_loss_recovery_enabled(args)):
+    if (
+        not end_window_stop
+        and list(flatten_snapshot.get("orders", []))
+        and not (loss_only_stop and _runtime_guard_loss_recovery_enabled(args))
+    ):
         flatten_result = _start_futures_flatten_process(
             args.symbol.upper().strip(),
             allow_loss=flatten_allow_loss,
