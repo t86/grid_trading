@@ -1453,7 +1453,7 @@ def suppress_same_side_nearby_place_orders(
     protected_existing_orders: list[dict[str, Any]] = []
     for index, order in enumerate(place_orders):
         side = str(order.get("side", "")).upper().strip()
-        if bool(order.get("force_reduce_only")) or _is_urgent_reduce_only_order(order, strategy_mode="synthetic_neutral"):
+        if _is_urgent_reduce_only_order(order, strategy_mode="synthetic_neutral"):
             kept_by_index[index] = order
             continue
         if side not in side_orders:

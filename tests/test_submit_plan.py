@@ -203,13 +203,12 @@ class SubmitPlanTests(unittest.TestCase):
             step_size=1.0,
         )
 
-        self.assertEqual(guarded["place_count"], 3)
+        self.assertEqual(guarded["place_count"], 2)
         self.assertEqual([(item["side"], item["price"]) for item in guarded["place_orders"]], [
-            ("BUY", 0.15900),
             ("BUY", 0.15900),
             ("SELL", 0.16091),
         ])
-        self.assertEqual(guarded["same_side_spacing_guard"]["suppressed_place_count"], 2)
+        self.assertEqual(guarded["same_side_spacing_guard"]["suppressed_place_count"], 3)
 
     def test_reduce_only_no_loss_guard_drops_cost_gate_short_cover_above_ceiling(self) -> None:
         actions = {
@@ -1652,6 +1651,100 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(validation["actions"]["place_count"], 1)
         self.assertAlmostEqual(validation["actions"]["place_notional"], 358.01856, places=8)
         self.assertEqual(validation["actions"]["reduce_only_position_cap"]["dropped_order_count"], 1)
+
+    def test_same_side_spacing_guard_suppresses_nearby_reduce_only_orders(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.2389,
+                    "qty": 125.0,
+                    "notional": 29.8625,
+                    "role": "inventory_unlock_reduce_short",
+                    "position_side": "SHORT",
+                    "force_reduce_only": True,
+                    "execution_type": "inventory_unlock_release",
+                },
+                {
+                    "side": "BUY",
+                    "price": 0.2387,
+                    "qty": 125.0,
+                    "notional": 29.8375,
+                    "role": "best_quote_reduce_short",
+                    "position_side": "SHORT",
+                    "force_reduce_only": True,
+                    "execution_type": "maker",
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+            "place_notional": 59.7,
+        }
+
+        guarded = suppress_same_side_nearby_place_orders(
+            actions=actions,
+            current_open_orders=[],
+            min_price_spacing=0.0003,
+            live_bid_price=0.2388,
+            live_ask_price=0.2389,
+            tick_size=0.0001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertEqual(guarded["place_orders"][0]["role"], "inventory_unlock_reduce_short")
+        spacing_guard = guarded["same_side_spacing_guard"]
+        self.assertEqual(spacing_guard["suppressed_place_count"], 1)
+        self.assertEqual(spacing_guard["suppressed_place_orders"][0]["role"], "best_quote_reduce_short")
+
+    def test_same_side_spacing_guard_keeps_urgent_reduce_only_orders(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.2389,
+                    "qty": 125.0,
+                    "notional": 29.8625,
+                    "role": "hard_loss_forced_reduce_short",
+                    "position_side": "SHORT",
+                    "force_reduce_only": True,
+                    "execution_type": "aggressive",
+                    "time_in_force": "IOC",
+                },
+                {
+                    "side": "BUY",
+                    "price": 0.2388,
+                    "qty": 125.0,
+                    "notional": 29.85,
+                    "role": "best_quote_reduce_short",
+                    "position_side": "SHORT",
+                    "force_reduce_only": True,
+                    "execution_type": "maker",
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+            "place_notional": 59.7125,
+        }
+
+        guarded = suppress_same_side_nearby_place_orders(
+            actions=actions,
+            current_open_orders=[],
+            min_price_spacing=0.0003,
+            live_bid_price=0.2388,
+            live_ask_price=0.2389,
+            tick_size=0.0001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(guarded["place_count"], 2)
+        self.assertNotIn("same_side_spacing_guard", guarded)
 
     def test_preserve_queue_priority_drops_replace_when_post_only_projects_back_to_same_bucket(self) -> None:
         actions = {
