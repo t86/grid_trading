@@ -433,6 +433,7 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
             plan_path.write_text(
                 json.dumps(
                     {
+                        "generated_at": now.isoformat(),
                         "mid_price": 0.663,
                         "current_long_qty": 0.0,
                         "current_short_qty": 0.0,
@@ -516,6 +517,7 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
             plan_path.write_text(
                 json.dumps(
                     {
+                        "generated_at": now.isoformat(),
                         "mid_price": 0.663,
                         "current_long_qty": 0.0,
                         "current_short_qty": 0.0,

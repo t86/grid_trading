@@ -424,3 +424,42 @@ Built-in production-safety behaviour of the target gate (no cron flags needed):
 
 The `--first`/`--brake-wear`/`--hard-wear` values above are aligned to the ARX v2 wear budget
 (soft 0.9 / hard 1.6 per 10k); tune per campaign and per the reward economics, not by copy-paste.
+
+### Runtime-guard stop semantics and the revival matrix (deploy checklist)
+
+A runtime-guard stop (`max_actual_net_notional_hit`, rolling loss limits, …) encodes a risk
+decision. After the 2026-07-04/05 ARX incidents, exactly ONE automation may revive a runner, and
+only the one that stopped it:
+
+| Path | Revives? |
+|---|---|
+| systemd | Crashes only (`Restart=on-failure` drop-in); clean guard exits stay down |
+| `runner_watchdog.sh` | Skips every restart path when `intended_stop_reason()` fires (target-gate done flag, or last event has a `stop_reason`) — including the active-but-stale-events path, because a guard-stopped runner stays process-alive without writing events |
+| `competition_state_realign` | Only restarts a runner it stopped itself (was active); inactive stays down |
+| `competition_health_monitor` | Governor/deadlock paths are suppressed on any `TERMINAL_STOP_MARKERS` journal match, even while the service is still active |
+| Human / daily reset cron | The deliberate revival entry points |
+
+Deploy notes for the `Restart=on-failure` drop-in
+(`/etc/systemd/system/grid-loop@.service.d/80-runtime-guard-stop.conf`, written by
+`install_runner_systemd.sh`):
+
+- It applies to **every** `grid-loop@` runner on the host, not only competition symbols. Crash
+  recovery is unchanged (non-zero exits still restart); what changes is that clean exits — runtime
+  guard stops, `after_end_window`, cumulative-cap stops — are no longer blind-revived by
+  `Restart=always`. Liveness for healthy runners is covered by the watchdog timer and the health
+  monitor, and scheduled revival by the daily-reset crons.
+- Verify after install: `systemctl show -p Restart 'grid-loop@ARXUSDT.service'` must print
+  `Restart=on-failure`.
+
+Stale-plan guard fallback (`loop_runner`): the runtime guard normally reads the ledger-scoped
+`strategy_actual_net_notional` from the latest plan. Only when a **non-empty** persisted plan
+snapshot is stale (`generated_at` older than 180s, or missing from the snapshot) does it re-read
+**account-level** exposure from live positionRisk; a missing plan file keeps legacy no-network
+semantics — a guard-stopped runner stops writing plans, and trusting the pre-stop snapshot
+latches the stop across every restart even on a flat account. The live reading includes frozen
+inventory, which is deliberate (fail-closed; the state ledger cannot be trusted at that moment —
+external fills are what desynchronized it). Operating rule that follows: **a symbol holding a
+frozen reservoir must keep `max_actual_net_notional` at reservoir + normal-farming headroom**
+(OUSDT: guard 1500 vs ~720 frozen short reservoir — check the live reservoir size before ever
+lowering that guard, or the fallback will hold stops on the reservoir alone and conflict with
+"frozen inventory must not affect normal farming").

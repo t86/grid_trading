@@ -55,6 +55,7 @@ from .data import (
     fetch_futures_klines,
     fetch_futures_open_orders,
     fetch_futures_position_mode,
+    fetch_futures_position_risk_v3,
     fetch_futures_premium_index,
     fetch_futures_symbol_config,
     fetch_futures_user_trades,
@@ -10176,6 +10177,135 @@ def _build_runtime_guard_stop_summary(
     }
 
 
+RUNTIME_GUARD_PLAN_MAX_AGE_SECONDS = 180.0
+
+
+def _runtime_guard_plan_age_state(
+    plan_report: dict[str, Any],
+    *,
+    now: datetime,
+    max_age_seconds: float = RUNTIME_GUARD_PLAN_MAX_AGE_SECONDS,
+) -> str:
+    """Age state of the persisted latest-plan snapshot: ``fresh``/``stale``/``unknown``.
+
+    A runner held in a runtime-guard stop no longer writes plans, so the on-disk
+    snapshot freezes at the last pre-stop cycle. Trusting it latches the guard on
+    pre-stop exposure across every restart: it can keep an already-flat account
+    stopped forever, and it can equally miss a real position change.
+
+    Empty reports (no plan file yet) are ``unknown`` and stay offline-capable. A
+    non-empty report with a missing/unparseable timestamp is treated as ``stale``:
+    it is a persisted snapshot, but not a trustworthy fresh one.
+    """
+    if not plan_report:
+        return "unknown"
+    generated_at = _parse_state_datetime(plan_report.get("generated_at"))
+    if generated_at is None:
+        return "stale"
+    try:
+        age_seconds = (now - generated_at).total_seconds()
+    except TypeError:
+        return "stale"
+    return "fresh" if age_seconds <= max_age_seconds else "stale"
+
+
+def _runtime_guard_plan_report_is_fresh(
+    plan_report: dict[str, Any],
+    *,
+    now: datetime,
+    max_age_seconds: float = RUNTIME_GUARD_PLAN_MAX_AGE_SECONDS,
+) -> bool:
+    return _runtime_guard_plan_age_state(plan_report, now=now, max_age_seconds=max_age_seconds) == "fresh"
+
+
+def _runtime_guard_live_exposure(
+    symbol: str,
+    *,
+    fetch_position_risk: Any = None,
+    load_credentials: Any = None,
+) -> tuple[float, float] | None:
+    """Live (net_notional, unrealized_pnl) from exchange positionRisk.
+
+    Used instead of a stale latest-plan snapshot. Returns None on any failure so
+    the caller keeps the stale values — fail-closed: a stale stop may hold longer
+    than necessary, but exposure is never blind-released on missing data.
+
+    Scope: this is deliberately the ACCOUNT-level net for the symbol, which
+    includes frozen inventory (e.g. the OUSDT frozen short reservoir), and can
+    read wider than the plan's ledger-scoped ``strategy_actual_net_notional`` it
+    substitutes for. Two reasons:
+
+    - The fallback exists precisely because the plan/state are untrustworthy at
+      this moment: external fills (a manual flatten or reduce) are what
+      desynchronize them (2026-07-04/05 ARX incidents). Deriving a "managed only"
+      figure from the state ledger minus frozen would re-trust the very data the
+      fallback is escaping — the pre-realign ledger still said 5268/2314 while
+      the exchange held a flat 1400/1400 hedge, so a ledger-based fallback would
+      have kept the guard latched on a flat account.
+    - Including frozen only errs conservative: the guard can fire earlier, never
+      blind-release. Symbols that hold a frozen reservoir must size
+      ``max_actual_net_notional`` above reservoir + trading headroom — already
+      the operating convention (OUSDT: guard 1500 vs ~720 reservoir).
+    """
+    fetcher = fetch_position_risk or fetch_futures_position_risk_v3
+    loader = load_credentials or load_binance_api_credentials
+    try:
+        credentials = loader()
+        if not credentials:
+            return None
+        api_key, api_secret = credentials
+        positions = fetcher(api_key=api_key, api_secret=api_secret, symbol=symbol)
+    except Exception:
+        return None
+    net_notional = 0.0
+    unrealized_pnl = 0.0
+    for position in positions or []:
+        amount = _safe_float(position.get("positionAmt"))
+        mark_price = _safe_float(position.get("markPrice"))
+        net_notional += amount * mark_price
+        unrealized_pnl += _safe_float(position.get("unRealizedProfit"))
+    return net_notional, unrealized_pnl
+
+
+def _runtime_guard_exposure_inputs(
+    latest_plan_report: dict[str, Any],
+    *,
+    now: datetime,
+    symbol: str,
+    live_exposure_fetcher: Any = None,
+) -> tuple[Any, Any, str]:
+    """Select the (net_notional, unrealized_pnl, source) fed to the runtime guard.
+
+    - EMPTY report (no plan file yet — first cycle of a fresh deployment): legacy
+      semantics, no live call. There is no stale snapshot to latch on, and
+      plan-less guard evaluations must not require network access.
+    - FRESH plan (``generated_at`` within ``RUNTIME_GUARD_PLAN_MAX_AGE_SECONDS``):
+      plan values are used and live positionRisk is NOT consulted at all — normal
+      cycles keep the ledger-scoped ``strategy_actual_net_notional`` semantics.
+    - STALE plan or a non-empty snapshot missing/unparseable ``generated_at`` (a
+      guard-stopped runner no longer writes plans): re-read account-level exposure
+      from live positionRisk, which unlatches a stop whose pre-stop snapshot no
+      longer matches reality.
+    - Live fetch failure: keep the stale plan values (fail-closed — a stale stop may
+      hold longer than necessary, but exposure is never blind-released).
+    """
+    net = latest_plan_report.get("strategy_actual_net_notional")
+    if net is None:
+        net = latest_plan_report.get("actual_net_notional")
+    upnl = latest_plan_report.get("strategy_unrealized_pnl")
+    if upnl is None:
+        upnl = latest_plan_report.get("unrealized_pnl")
+    if not latest_plan_report:
+        return net, upnl, "no_plan"
+    if _runtime_guard_plan_report_is_fresh(latest_plan_report, now=now):
+        return net, upnl, "plan"
+    fetcher = live_exposure_fetcher or _runtime_guard_live_exposure
+    live = fetcher(symbol)
+    if live is None:
+        return net, upnl, "stale_plan_fail_closed"
+    return live[0], live[1], "live_position_risk"
+
+
 def _maybe_handle_runtime_guard(
     *,
     args: argparse.Namespace,
@@ -10230,12 +10360,13 @@ def _maybe_handle_runtime_guard(
         latest_mid_price,
         _safe_float(latest_plan_report.get("synthetic_drift_qty")),
     )
-    guard_actual_net_notional = latest_plan_report.get("strategy_actual_net_notional")
-    if guard_actual_net_notional is None:
-        guard_actual_net_notional = latest_plan_report.get("actual_net_notional")
-    guard_unrealized_pnl = latest_plan_report.get("strategy_unrealized_pnl")
-    if guard_unrealized_pnl is None:
-        guard_unrealized_pnl = latest_plan_report.get("unrealized_pnl")
+    guard_actual_net_notional, guard_unrealized_pnl, _guard_exposure_source = (
+        _runtime_guard_exposure_inputs(
+            latest_plan_report,
+            now=cycle_started_at,
+            symbol=str(args.symbol).upper().strip(),
+        )
+    )
     runtime_guard_result = evaluate_runtime_guards(
         config=runtime_guard_config,
         now=cycle_started_at,

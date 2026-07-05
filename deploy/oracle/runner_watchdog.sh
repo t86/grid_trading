@@ -32,7 +32,33 @@ if [ ! -f "$CONTROL_PATH" ]; then
   exit 0
 fi
 
+# Echoes a reason and returns 0 when the runner's stop is INTENDED (target gate done
+# today, or the last event carries a stop_reason such as a runtime-guard risk stop).
+# EVERY restart-capable path below must consult this — a guard-stopped runner can be
+# inactive OR still process-alive with stale events, and blind revival of either is
+# how the 2026-07-04 ARX net blowout compounded.
+intended_stop_reason() {
+  local gate_done_flag="${APP_DIR}/output/${SYMBOL_SLUG}_target_gate_done_$(date -u +%Y%m%d).flag"
+  if [ -f "$gate_done_flag" ]; then
+    echo "target_gate_done_today"
+    return 0
+  fi
+  if [ -f "$EVENTS_PATH" ] && tail -n 1 "$EVENTS_PATH" | grep -Eq '"stop_reason": *"[^"]+"'; then
+    echo "last_event_stop_reason"
+    return 0
+  fi
+  return 1
+}
+
 if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+  if [ "${RUNNER_WATCHDOG_START_INACTIVE:-1}" != "1" ]; then
+    echo "runner_watchdog: $SERVICE_NAME is not active; start-inactive disabled; skip"
+    exit 0
+  fi
+  if stop_reason="$(intended_stop_reason)"; then
+    echo "runner_watchdog: $SERVICE_NAME inactive with intended stop (${stop_reason}); skip start"
+    exit 0
+  fi
   echo "runner_watchdog: $SERVICE_NAME is not active; start"
   systemctl reset-failed "$SERVICE_NAME" || true
   systemctl start "$SERVICE_NAME"
@@ -40,6 +66,10 @@ if ! systemctl is-active --quiet "$SERVICE_NAME"; then
 fi
 
 if [ ! -f "$EVENTS_PATH" ]; then
+  if stop_reason="$(intended_stop_reason)"; then
+    echo "runner_watchdog: $SERVICE_NAME missing events but intended stop (${stop_reason}); skip restart"
+    exit 0
+  fi
   echo "runner_watchdog: $EVENTS_PATH does not exist; restart $SERVICE_NAME"
   systemctl restart "$SERVICE_NAME"
   exit 0
@@ -50,6 +80,14 @@ mtime="$(stat -c %Y "$EVENTS_PATH")"
 age="$((now - mtime))"
 if [ "$age" -le "$RUNNER_WATCHDOG_STALE_SECONDS" ]; then
   echo "runner_watchdog: $SERVICE_NAME healthy; events age ${age}s"
+  exit 0
+fi
+
+# Stale events do NOT necessarily mean a hang: a runner held in a runtime-guard stop
+# keeps the service active but stops writing events, and restarting it would revive
+# a risk-stopped runner (and re-latch on the stale plan snapshot).
+if stop_reason="$(intended_stop_reason)"; then
+  echo "runner_watchdog: $SERVICE_NAME events stale (${age}s) but intended stop (${stop_reason}); skip restart"
   exit 0
 fi
 

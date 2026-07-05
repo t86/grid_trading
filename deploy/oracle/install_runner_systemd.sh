@@ -80,6 +80,17 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
 
+# Runtime-guard stops exit cleanly; with Restart=always systemd would blind-revive a
+# risk-stopped runner straight back into the market (2026-07-04 ARX incident class).
+# The drop-in narrows revival to failures only; RestartPreventExitStatus=2 still
+# keeps controlled gate rejections down.
+RUNNER_DROPIN_DIR="/etc/systemd/system/${RUNNER_UNIT_NAME}@.service.d"
+sudo mkdir -p "$RUNNER_DROPIN_DIR"
+sudo tee "${RUNNER_DROPIN_DIR}/80-runtime-guard-stop.conf" >/dev/null <<EOF
+[Service]
+Restart=on-failure
+EOF
+
 if [ "$INSTALL_WATCHDOG" != "0" ]; then
   WATCHDOG_SERVICE_FILE="/etc/systemd/system/${WATCHDOG_UNIT_NAME}@.service"
   WATCHDOG_TIMER_FILE="/etc/systemd/system/${WATCHDOG_UNIT_NAME}@.timer"

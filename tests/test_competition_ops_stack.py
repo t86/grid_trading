@@ -346,3 +346,264 @@ def test_archive_stale_plan_moves_file_and_tolerates_missing(tmp_path) -> None:
     assert dst is not None and not plan.exists()          # moved aside -> startup guard can't latch
     assert json.loads(Path(dst).read_text())["actual_net_qty"] == 5838
     assert ra.archive_stale_plan(str(tmp_path), "arxusdt") is None   # idempotent when absent
+
+
+def test_realign_order_prefix_matches_loop_runner() -> None:
+    # The realign cancel filter must track the runner's managed-order prefix exactly;
+    # a drift here silently flips "cancel managed only" into "cancel nothing/em everything".
+    import grid_optimizer.loop_runner as lr
+
+    for sym in ("ARXUSDT", "OUSDT", "REUSDT"):
+        assert ra.strategy_client_order_prefix(sym) == lr._strategy_client_order_prefix(sym)
+
+
+def test_realign_cancels_managed_only_preserves_frozentp_and_external() -> None:
+    managed = {"clientOrderId": "gx-arxu-bestquot-1-08624"}
+    frozen_tp = {"clientOrderId": "FROZENTParxusdt20260705"}     # target gate protective TP
+    manual_flatten = {"clientOrderId": "mfarxusd_closelon_s_1"}  # external maker flatten
+    manual_reduce = {"clientOrderId": "usrreduceL2607050"}
+    missing = {}
+    assert ra.is_managed_order(managed, "ARXUSDT") is True
+    assert ra.is_managed_order(frozen_tp, "ARXUSDT") is False
+    assert ra.is_managed_order(manual_flatten, "ARXUSDT") is False
+    assert ra.is_managed_order(manual_reduce, "ARXUSDT") is False
+    assert ra.is_managed_order(missing, "ARXUSDT") is False
+
+
+def test_realign_aborts_before_any_cancel_when_backup_fails(tmp_path: Path, monkeypatch, capsys) -> None:
+    # Backup failure must abort the WHOLE realign before any order cancel or state
+    # mutation -- otherwise a failed copy leaves no rollback for the ledger rewrite.
+    (tmp_path / "output").mkdir(parents=True)
+    state_file = tmp_path / "output" / "arxusdt_loop_state.json"
+    original_state = {"best_quote_volume_ledger": {"long_lots": [{"qty": 5268}], "short_lots": []}}
+    state_file.write_text(json.dumps(original_state), encoding="utf-8")
+
+    monkeypatch.setenv("BINANCE_API_KEY", "k")
+    monkeypatch.setenv("BINANCE_API_SECRET", "s")
+    monkeypatch.setattr("sys.argv", ["realign", "--symbol", "ARXUSDT", "--service", "svc",
+                                     "--workdir", str(tmp_path), "--enforce"])
+    monkeypatch.setattr(ra, "fetch_exchange_sides", lambda *a, **k: (1400.0, 0.21, 1400.0, 0.21))
+    monkeypatch.setattr(ra, "is_active", lambda service: True)
+    monkeypatch.setattr(ra.subprocess, "run", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(ra.time, "sleep", lambda *_: None)
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ra.shutil, "copy2", boom)
+    touched: list = []
+    monkeypatch.setattr(ra, "fetch_futures_open_orders", lambda *a, **k: touched.append("list") or [])
+    monkeypatch.setattr(ra, "delete_futures_order", lambda *a, **k: touched.append("cancel"))
+
+    try:
+        ra.main()
+        raise AssertionError("expected SystemExit")
+    except SystemExit as exc:
+        assert exc.code == 1
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["action"] == "ABORTED_BACKUP_FAILED"
+    assert touched == []                                            # no cancels attempted
+    assert json.loads(state_file.read_text()) == original_state     # state untouched
+
+
+# --- loop_runner runtime-guard stale-plan fallback (fixes the startup latch) ---
+
+
+def test_guard_plan_freshness_thresholds() -> None:
+    import grid_optimizer.loop_runner as lr
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 7, 5, 0, 0, 0, tzinfo=timezone.utc)
+    fresh = {"generated_at": (now - timedelta(seconds=60)).isoformat()}
+    stale = {"generated_at": (now - timedelta(seconds=400)).isoformat()}
+    assert lr._runtime_guard_plan_report_is_fresh(fresh, now=now) is True
+    assert lr._runtime_guard_plan_report_is_fresh(stale, now=now) is False
+    assert lr._runtime_guard_plan_report_is_fresh({}, now=now) is False               # no timestamp
+    assert lr._runtime_guard_plan_report_is_fresh({"generated_at": "garbage"}, now=now) is False
+
+
+def test_guard_live_exposure_is_account_level_and_fail_closed() -> None:
+    import grid_optimizer.loop_runner as lr
+
+    creds = lambda: ("k", "s")  # noqa: E731
+
+    # Balanced hedge nets to ~0 even though both legs are large.
+    hedge = [
+        {"positionAmt": "1400", "markPrice": "0.2", "unRealizedProfit": "-10.5"},
+        {"positionAmt": "-1400", "markPrice": "0.2", "unRealizedProfit": "4.5"},
+    ]
+    net, upnl = lr._runtime_guard_live_exposure(
+        "ARXUSDT", fetch_position_risk=lambda **kw: hedge, load_credentials=creds)
+    assert net == 0.0
+    assert upnl == -6.0
+
+    # ACCOUNT-level scope: a frozen short reservoir (OUSDT ~720) is included, so the
+    # reading is conservative; the symbol's max_actual_net_notional (1500) must be
+    # sized above reservoir + headroom -- the documented operating convention.
+    reservoir = [
+        {"positionAmt": "2", "markPrice": "1.0", "unRealizedProfit": "0"},
+        {"positionAmt": "-723", "markPrice": "1.0", "unRealizedProfit": "12.0"},
+    ]
+    net, _ = lr._runtime_guard_live_exposure(
+        "OUSDT", fetch_position_risk=lambda **kw: reservoir, load_credentials=creds)
+    assert net == -721.0
+    assert abs(net) < 1500.0                             # reservoir alone must not trip the O guard
+
+    # Fail-closed: fetch failure or missing credentials -> None (caller keeps stale values).
+    def boom(**kw):
+        raise RuntimeError("api down")
+
+    assert lr._runtime_guard_live_exposure("ARXUSDT", fetch_position_risk=boom, load_credentials=creds) is None
+    assert lr._runtime_guard_live_exposure("ARXUSDT", fetch_position_risk=lambda **kw: [],
+                                           load_credentials=lambda: None) is None
+
+
+def test_guard_exposure_inputs_fresh_plan_never_touches_live(monkeypatch) -> None:
+    import grid_optimizer.loop_runner as lr
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 7, 5, 0, 0, 0, tzinfo=timezone.utc)
+    fresh_plan = {
+        "generated_at": (now - timedelta(seconds=30)).isoformat(),
+        "strategy_actual_net_notional": 123.0,
+        "strategy_unrealized_pnl": -4.0,
+    }
+    calls: list = []
+
+    def fetcher(symbol):
+        calls.append(symbol)
+        return (999.0, 999.0)
+
+    net, upnl, source = lr._runtime_guard_exposure_inputs(
+        fresh_plan, now=now, symbol="ARXUSDT", live_exposure_fetcher=fetcher)
+    assert (net, upnl, source) == (123.0, -4.0, "plan")
+    assert calls == []                                   # fresh plan: live NOT consulted
+
+
+def test_guard_exposure_inputs_stale_or_missing_ts_uses_live(monkeypatch) -> None:
+    import grid_optimizer.loop_runner as lr
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 7, 5, 0, 0, 0, tzinfo=timezone.utc)
+    # The incident shape: pre-stop snapshot says net 812 but the account was reduced
+    # externally to a flat hedge -- the stale value must be replaced by live truth.
+    stale_plan = {
+        "generated_at": (now - timedelta(seconds=400)).isoformat(),
+        "strategy_actual_net_notional": 812.0,
+        "strategy_unrealized_pnl": -58.0,
+    }
+    net, upnl, source = lr._runtime_guard_exposure_inputs(
+        stale_plan, now=now, symbol="ARXUSDT", live_exposure_fetcher=lambda sym: (0.0, -1.0))
+    assert (net, upnl, source) == (0.0, -1.0, "live_position_risk")
+
+    no_ts_plan = {"strategy_actual_net_notional": 812.0}
+    net, upnl, source = lr._runtime_guard_exposure_inputs(
+        no_ts_plan, now=now, symbol="ARXUSDT", live_exposure_fetcher=lambda sym: (5.0, 0.0))
+    assert (net, upnl, source) == (5.0, 0.0, "live_position_risk")
+
+    # EMPTY report (no plan file yet) keeps legacy semantics: nothing stale to latch
+    # on, and a plan-less guard evaluation must not require network access.
+    calls: list = []
+    net, upnl, source = lr._runtime_guard_exposure_inputs(
+        {}, now=now, symbol="ARXUSDT",
+        live_exposure_fetcher=lambda sym: calls.append(sym) or (9.0, 9.0))
+    assert (net, upnl, source) == (None, None, "no_plan")
+    assert calls == []
+
+
+def test_guard_exposure_inputs_fail_closed_keeps_stale_values() -> None:
+    import grid_optimizer.loop_runner as lr
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 7, 5, 0, 0, 0, tzinfo=timezone.utc)
+    stale_plan = {
+        "generated_at": (now - timedelta(seconds=400)).isoformat(),
+        "strategy_actual_net_notional": 812.0,
+        "strategy_unrealized_pnl": -58.0,
+    }
+    # Live fetch fails -> keep the stale (conservative) values, never blind-release.
+    net, upnl, source = lr._runtime_guard_exposure_inputs(
+        stale_plan, now=now, symbol="ARXUSDT", live_exposure_fetcher=lambda sym: None)
+    assert (net, upnl, source) == (812.0, -58.0, "stale_plan_fail_closed")
+
+
+def test_realign_main_cancels_managed_only_and_archives_plan(tmp_path: Path, monkeypatch, capsys) -> None:
+    # End-to-end enforce path with an ACTIVE runner: stop -> cancel MANAGED (gx-) only
+    # -> realign ledger -> archive stale plan -> start. FROZENTP / manual / external
+    # orders must survive.
+    (tmp_path / "output").mkdir(parents=True)
+    state_file = tmp_path / "output" / "arxusdt_loop_state.json"
+    state_file.write_text(json.dumps({
+        "best_quote_volume_ledger": {"long_lots": [{"qty": 5268}], "short_lots": [{"qty": 2314}]},
+        "best_quote_frozen_inventory": {},
+    }), encoding="utf-8")
+    plan_file = tmp_path / "output" / "arxusdt_loop_latest_plan.json"
+    plan_file.write_text(json.dumps({"strategy_actual_net_notional": 812}), encoding="utf-8")
+
+    monkeypatch.setenv("BINANCE_API_KEY", "k")
+    monkeypatch.setenv("BINANCE_API_SECRET", "s")
+    monkeypatch.setattr("sys.argv", ["realign", "--symbol", "ARXUSDT", "--service", "svc",
+                                     "--workdir", str(tmp_path), "--enforce"])
+    monkeypatch.setattr(ra, "fetch_exchange_sides", lambda *a, **k: (1400.0, 0.2175, 1400.0, 0.2142))
+    monkeypatch.setattr(ra, "is_active", lambda service: True)
+    sysctl: list = []
+    monkeypatch.setattr(ra.subprocess, "run",
+                        lambda cmd, **kw: sysctl.append(" ".join(cmd)) or _FakeProc())
+    monkeypatch.setattr(ra.time, "sleep", lambda *_: None)
+    open_orders = [
+        {"orderId": 1, "clientOrderId": "gx-arxu-bestquot-1-08624"},
+        {"orderId": 2, "clientOrderId": "FROZENTParxusdt202607050113"},
+        {"orderId": 3, "clientOrderId": "mfarxusd_closelon_s_1"},
+        {"orderId": 4, "clientOrderId": "usrreduceL2607050"},
+    ]
+    monkeypatch.setattr(ra, "fetch_futures_open_orders", lambda *a, **k: open_orders)
+    canceled: list = []
+    monkeypatch.setattr(ra, "delete_futures_order",
+                        lambda **kw: canceled.append(kw["order_id"]))
+
+    ra.main()
+
+    assert canceled == [1]                                    # ONLY the managed gx- order
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["action"] == "REALIGNED_AND_RESTARTED"
+    assert out["canceled_managed_orders"] == 1
+    assert out["kept_unmanaged_orders"] == 3                  # FROZENTP + mf + usr preserved
+    assert not plan_file.exists()                             # stale plan archived before start
+    assert any("stop" in c for c in sysctl) and any("start" in c for c in sysctl)
+    new_state = json.loads(state_file.read_text())
+    lots = new_state["best_quote_volume_ledger"]
+    assert lots["long_lots"][0]["qty"] == 1400.0              # ledger realigned to exchange truth
+    assert lots["short_lots"][0]["qty"] == 1400.0
+
+
+def test_health_monitor_terminal_stop_suppresses_governor_and_deadlock(tmp_path: Path, monkeypatch, capsys) -> None:
+    # A runner held in a runtime-guard stop can stay process-alive (service active,
+    # journal shows stop_reason). Neither the wear governor (config change + restart)
+    # nor the deadlock path may touch it -- the stop encodes a risk decision.
+    (tmp_path / "output").mkdir(parents=True)
+    (tmp_path / "output" / "arxusdt_health_monitor_state.json").write_text(
+        json.dumps({"high_streak": 1}), encoding="utf-8")     # one more hot reading would brake
+
+    monkeypatch.setenv("BINANCE_API_KEY", "k")
+    monkeypatch.setenv("BINANCE_API_SECRET", "s")
+    monkeypatch.setattr("sys.argv", ["hm", "--symbol", "ARXUSDT", "--service", "svc",
+                                     "--workdir", str(tmp_path), "--first", "3000", "--enforce"])
+    monkeypatch.setattr(hm, "is_active", lambda service: True)
+    monkeypatch.setattr(hm, "journal",
+                        lambda service, minutes: "mid=0.2 placed=0\n  stop_reason: max_actual_net_notional_hit")
+    # Wear numbers that WOULD brake (rwear > brake 3.0, day 1.8 in (brake_day 1.5, hard 2.0)).
+    monkeypatch.setattr(hm, "daily_recent_wear", lambda *a, **k: (5000.0, 1.8, 500.0, 5.0))
+    monkeypatch.setattr(hm, "get_offset", lambda cfg: ("best_quote_maker_volume_quote_offset_ticks", 0))
+    forbidden: list = []
+    monkeypatch.setattr(hm, "apply_offset", lambda *a, **k: forbidden.append("apply_offset"))
+    monkeypatch.setattr(hm, "restart", lambda *a, **k: forbidden.append("restart") or {"ok": True})
+    monkeypatch.setattr(hm, "deadlock_unstick", lambda *a, **k: forbidden.append("unstick") or {})
+
+    hm.main()
+
+    assert forbidden == []                                    # no restart, no config change, no unstick
+    rec = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert rec["terminal_stop"] is True
+    assert rec["intended_stop"] is True
+    assert rec["deadlock"].get("terminal") is True
+    assert "action" not in rec.get("governor", {})

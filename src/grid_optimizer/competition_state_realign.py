@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -44,6 +45,21 @@ from .data import (
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def strategy_client_order_prefix(symbol: str) -> str:
+    """The runner's managed-order clientOrderId prefix (e.g. ``gx-arxu-``).
+
+    Must stay in sync with ``loop_runner._strategy_client_order_prefix`` (a test
+    asserts parity). Realign only cancels orders under this prefix: protective
+    resting orders like the target gate's ``FROZENTP*`` take-profit, manual
+    orders, and external flatten orders are never touched.
+    """
+    return f"gx-{symbol.lower().replace('usdt', 'u')}-"
+
+
+def is_managed_order(order: dict[str, Any], symbol: str) -> bool:
+    return str(order.get("clientOrderId") or "").startswith(strategy_client_order_prefix(symbol))
 
 
 def qty_sum(lots: Any) -> float:
@@ -158,17 +174,37 @@ def main() -> None:
         subprocess.run(["sudo", "-n", "systemctl", "stop", a.service], capture_output=True)
         time.sleep(2)
 
+    # Backup must succeed before any mutation: abort the whole realign otherwise.
     bak = state_path + ".bak_autorealign_" + str(int(time.time()))
-    subprocess.run(["cp", state_path, bak])
+    try:
+        shutil.copy2(state_path, bak)
+    except OSError as exc:
+        status["action"] = "ABORTED_BACKUP_FAILED"
+        status["error"] = str(exc)[:140]
+        print(json.dumps(status))
+        raise SystemExit(1)
+
+    # Cancel ONLY the runner's managed (gx-<sym>-) orders. Protective resting orders
+    # (target gate FROZENTP*), manual and external orders stay untouched.
+    canceled = skipped_protected = 0
     for o in fetch_futures_open_orders(sym, k, s) or []:
+        if not is_managed_order(o, sym):
+            skipped_protected += 1
+            continue
         try:
             delete_futures_order(symbol=sym, order_id=o["orderId"], api_key=k, api_secret=s)
+            canceled += 1
         except Exception:
             pass
+    status["canceled_managed_orders"] = canceled
+    status["kept_unmanaged_orders"] = skipped_protected
 
     lq, lavg, sq, savg = fetch_exchange_sides(sym, k, s)  # refresh after cancels
     state = json.load(open(state_path))
     new_lots = realign_ledger(state, lq, lavg, sq, savg)
+    state["updated_at"] = _now_iso()
+    state["updated_by"] = "competition_state_realign"
+    state["last_realign"] = {"at": _now_iso(), "backup": bak, **new_lots}
     tmp = state_path + ".tmp"
     json.dump(state, open(tmp, "w"))
     os.replace(tmp, state_path)

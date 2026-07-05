@@ -145,3 +145,35 @@ def test_low_volume_monitor_installer_runs_every_ten_minutes() -> None:
     assert "MIN_VOLUME_NOTIONAL=\"${MIN_VOLUME_NOTIONAL:-1000}\"" in script
     assert "ON_UNIT_ACTIVE_SEC=\"${ON_UNIT_ACTIVE_SEC:-10min}\"" in script
     assert 'status "${TIMER_UNIT_NAME}.service" | sed -n \'1,20p\' || true' in script
+
+
+def test_runner_watchdog_never_revives_an_intended_stop() -> None:
+    """Every restart-capable branch (inactive start, missing events, stale events)
+    must consult intended_stop_reason() -- a guard-stopped runner can present as
+    inactive OR as active-with-stale-events, and blind revival of either is the
+    2026-07-04 ARX incident class."""
+    script = Path("deploy/oracle/runner_watchdog.sh").read_text(encoding="utf-8")
+
+    assert "intended_stop_reason() {" in script
+    assert "target_gate_done_" in script
+    assert '"stop_reason": *"[^"]+"' in script
+    # Three guarded branches: inactive-start, missing-events restart, stale-events restart.
+    assert script.count('if stop_reason="$(intended_stop_reason)"; then') == 3
+    assert "skip start" in script
+    assert "skip restart" in script
+    # The stale-events guard must run BEFORE the final unconditional restart.
+    stale_guard = script.index("events stale (${age}s) but intended stop")
+    final_restart = script.rindex('systemctl restart "$SERVICE_NAME"')
+    assert stale_guard < final_restart
+    # The inactive-start knob stays available.
+    assert "RUNNER_WATCHDOG_START_INACTIVE" in script
+
+
+def test_runner_systemd_installer_narrows_restart_to_failures() -> None:
+    """Runtime-guard stops exit cleanly; Restart=always would blind-revive a
+    risk-stopped runner. The installer must ship the on-failure drop-in that
+    production host 150 already carries."""
+    script = Path("deploy/oracle/install_runner_systemd.sh").read_text(encoding="utf-8")
+
+    assert "80-runtime-guard-stop.conf" in script
+    assert "Restart=on-failure" in script
