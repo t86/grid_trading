@@ -10836,8 +10836,11 @@ def _best_quote_take_profit_guard_role_sets(
     if not enabled:
         return None, None
 
-    long_roles = {"best_quote_reduce_long"}
-    short_roles = {"best_quote_reduce_short"}
+    long_roles: set[str] = set()
+    short_roles: set[str] = set()
+    if not allow_loss_reduce_only:
+        long_roles.add("best_quote_reduce_long")
+        short_roles.add("best_quote_reduce_short")
     if not hedge_best_quote:
         long_roles.add("best_quote_entry_short")
         short_roles.add("best_quote_entry_long")
