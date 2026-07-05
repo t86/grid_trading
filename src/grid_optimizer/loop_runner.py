@@ -10847,6 +10847,27 @@ def _best_quote_take_profit_guard_role_sets(
     return long_roles, short_roles
 
 
+def _best_quote_submit_allow_loss_roles(args: Any) -> set[str] | None:
+    roles: set[str] = set()
+    if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)):
+        roles.update(
+            {
+                "best_quote_reduce_long",
+                "best_quote_reduce_short",
+                "inventory_unlock_reduce_long",
+                "inventory_unlock_reduce_short",
+            }
+        )
+    if bool(getattr(args, "best_quote_maker_volume_active_pair_reduce_enabled", False)):
+        roles.update(
+            {
+                "best_quote_active_pair_reduce_long",
+                "best_quote_active_pair_reduce_short",
+            }
+        )
+    return roles or None
+
+
 def _best_quote_take_profit_guard_cost_basis(
     *,
     managed_avg_price: float,
@@ -21370,19 +21391,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
         enabled=True,
-        allow_loss_roles=(
-            (
-                {"inventory_unlock_reduce_long", "inventory_unlock_reduce_short"}
-                if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False))
-                else set()
-            )
-            | (
-                {"best_quote_active_pair_reduce_long", "best_quote_active_pair_reduce_short"}
-                if bool(getattr(args, "best_quote_maker_volume_active_pair_reduce_enabled", False))
-                else set()
-            )
-        )
-        or None,
+        allow_loss_roles=_best_quote_submit_allow_loss_roles(args),
     )
     validation["actions"] = isolate_frozen_pair_release_place_orders(validation["actions"])
     if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
@@ -21849,19 +21858,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
         enabled=True,
-        allow_loss_roles=(
-            (
-                {"inventory_unlock_reduce_long", "inventory_unlock_reduce_short"}
-                if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False))
-                else set()
-            )
-            | (
-                {"best_quote_active_pair_reduce_long", "best_quote_active_pair_reduce_short"}
-                if bool(getattr(args, "best_quote_maker_volume_active_pair_reduce_enabled", False))
-                else set()
-            )
-        )
-        or None,
+        allow_loss_roles=_best_quote_submit_allow_loss_roles(args),
     )
     if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
         validation["errors"] = [

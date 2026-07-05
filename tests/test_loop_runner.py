@@ -22,6 +22,7 @@ from grid_optimizer.loop_runner import (
     AUDIT_SYNC_MIN_INTERVAL_SECONDS,
     _build_parser,
     _validate_best_quote_frozen_inventory_principles,
+    _best_quote_submit_allow_loss_roles,
     _best_quote_take_profit_guard_role_sets,
     _validate_multi_timeframe_bias_args,
     _should_sync_account_audit,
@@ -13197,6 +13198,50 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(result["short_active"])
         self.assertEqual(result["adjusted_buy_orders"], 0)
         self.assertAlmostEqual(plan["buy_orders"][0]["price"], 0.6400, places=8)
+
+    def test_best_quote_submit_allow_loss_roles_include_normal_bq_reduces(self) -> None:
+        roles = _best_quote_submit_allow_loss_roles(
+            SimpleNamespace(
+                best_quote_maker_volume_allow_loss_reduce_only=True,
+                best_quote_maker_volume_active_pair_reduce_enabled=False,
+            )
+        )
+
+        self.assertEqual(
+            roles,
+            {
+                "best_quote_reduce_long",
+                "best_quote_reduce_short",
+                "inventory_unlock_reduce_long",
+                "inventory_unlock_reduce_short",
+            },
+        )
+
+    def test_best_quote_submit_allow_loss_roles_keep_active_pair_separate(self) -> None:
+        roles = _best_quote_submit_allow_loss_roles(
+            SimpleNamespace(
+                best_quote_maker_volume_allow_loss_reduce_only=False,
+                best_quote_maker_volume_active_pair_reduce_enabled=True,
+            )
+        )
+
+        self.assertEqual(
+            roles,
+            {
+                "best_quote_active_pair_reduce_long",
+                "best_quote_active_pair_reduce_short",
+            },
+        )
+
+    def test_best_quote_submit_allow_loss_roles_empty_when_disabled(self) -> None:
+        roles = _best_quote_submit_allow_loss_roles(
+            SimpleNamespace(
+                best_quote_maker_volume_allow_loss_reduce_only=False,
+                best_quote_maker_volume_active_pair_reduce_enabled=False,
+            )
+        )
+
+        self.assertIsNone(roles)
 
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
