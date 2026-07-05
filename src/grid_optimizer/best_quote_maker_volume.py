@@ -229,6 +229,52 @@ def _build_entry_ladder(
     return []
 
 
+def _prune_clustered_same_side_entry_orders(
+    orders: list[dict[str, Any]],
+    *,
+    side: str,
+    min_gap: float,
+) -> tuple[list[dict[str, Any]], int]:
+    if min_gap <= 0 or len(orders) <= 1:
+        return orders, 0
+    side = str(side or "").upper()
+    protected = [
+        order
+        for order in orders
+        if str(order.get("role", "")).lower().strip() not in {"best_quote_entry_long", "best_quote_entry_short"}
+        or bool(order.get("force_reduce_only"))
+    ]
+    entries = [
+        order
+        for order in orders
+        if str(order.get("role", "")).lower().strip() in {"best_quote_entry_long", "best_quote_entry_short"}
+        and not bool(order.get("force_reduce_only"))
+    ]
+    if not entries:
+        return orders, 0
+
+    kept_entries: list[dict[str, Any]] = []
+    anchor_prices = [_safe_float(order.get("price")) for order in protected if _safe_float(order.get("price")) > 0]
+    reverse = side == "SELL"
+    for order in sorted(entries, key=lambda item: _safe_float(item.get("price")), reverse=reverse):
+        price = _safe_float(order.get("price"))
+        if price <= 0:
+            continue
+        if any(abs(price - existing) < min_gap - 1e-12 for existing in anchor_prices):
+            continue
+        kept_entries.append(order)
+        anchor_prices.append(price)
+
+    kept_entry_ids = {id(order) for order in kept_entries}
+    protected_ids = {id(order) for order in protected}
+    pruned = [
+        order
+        for order in orders
+        if id(order) in protected_ids or id(order) in kept_entry_ids
+    ]
+    return pruned, len(entries) - len(kept_entries)
+
+
 def _build_paired_reduce_orders_for_entries(
     *,
     entries: list[dict[str, Any]],
@@ -1462,6 +1508,9 @@ def build_best_quote_maker_volume_plan(
         "blocked_sell_orders": 0,
         "would_block_buy_orders": 0,
         "would_block_sell_orders": 0,
+        "cluster_pruning_applied": False,
+        "cluster_pruned_buy_orders": 0,
+        "cluster_pruned_sell_orders": 0,
     }
     if config.same_side_entry_price_guard_enabled:
         guard_gap = _tick_gap(inputs.tick_size, int(same_side_entry_price_guard_report["gap_ticks"]))
@@ -1500,6 +1549,21 @@ def build_best_quote_maker_volume_plan(
                 same_side_entry_price_guard_report["would_block_short_entry"] = True
                 same_side_entry_price_guard_report["would_block_sell_orders"] = len(blocked_sell_orders)
                 same_side_entry_price_guard_report["min_short_entry_price"] = min_short_entry_price
+        if guard_gap > 0:
+            buy_orders, pruned_buy_orders = _prune_clustered_same_side_entry_orders(
+                buy_orders,
+                side="BUY",
+                min_gap=guard_gap,
+            )
+            sell_orders, pruned_sell_orders = _prune_clustered_same_side_entry_orders(
+                sell_orders,
+                side="SELL",
+                min_gap=guard_gap,
+            )
+            if pruned_buy_orders or pruned_sell_orders:
+                same_side_entry_price_guard_report["cluster_pruning_applied"] = True
+                same_side_entry_price_guard_report["cluster_pruned_buy_orders"] = pruned_buy_orders
+                same_side_entry_price_guard_report["cluster_pruned_sell_orders"] = pruned_sell_orders
 
     planned = sum(order["notional"] for order in [*buy_orders, *sell_orders])
     return {

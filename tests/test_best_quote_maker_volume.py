@@ -6,6 +6,7 @@ from grid_optimizer.best_quote_maker_volume import (
     BestQuoteMakerVolumeConfig,
     BestQuoteMakerVolumeInputs,
     build_best_quote_maker_volume_plan,
+    _prune_clustered_same_side_entry_orders,
 )
 
 
@@ -181,6 +182,62 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual(len(plan["sell_orders"]), 2)
         self.assertEqual([order["price"] for order in plan["buy_orders"]], [0.15968, 0.15949])
         self.assertEqual([order["price"] for order in plan["sell_orders"]], [0.15969, 0.15988])
+
+    def test_same_side_entry_cluster_pruning_thins_adjacent_entry_orders(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_entry_orders_per_side=3,
+                same_side_entry_price_guard_enabled=True,
+                same_side_entry_price_guard_gap_ticks=2,
+            ),
+            inputs=_inputs(
+                bid_price=0.15968,
+                ask_price=0.15969,
+                mid_price=0.159685,
+                cycle_budget_notional=460.0,
+                tick_size=0.00001,
+                step_size=1.0,
+                entry_ladder_spacing=0.00001,
+            ),
+        )
+
+        self.assertEqual([order["price"] for order in plan["buy_orders"]], [0.15968, 0.15966])
+        self.assertEqual([order["price"] for order in plan["sell_orders"]], [0.15969, 0.15971])
+        guard = plan["metrics"]["same_side_entry_price_guard"]
+        self.assertTrue(guard["cluster_pruning_applied"])
+        self.assertEqual(guard["cluster_pruned_buy_orders"], 1)
+        self.assertEqual(guard["cluster_pruned_sell_orders"], 1)
+
+    def test_same_side_entry_cluster_pruning_keeps_reduce_only_over_entry(self) -> None:
+        orders = [
+            {
+                "side": "BUY",
+                "price": 0.15968,
+                "role": "best_quote_reduce_short",
+                "force_reduce_only": True,
+            },
+            {
+                "side": "BUY",
+                "price": 0.15967,
+                "role": "best_quote_entry_long",
+            },
+            {
+                "side": "BUY",
+                "price": 0.15964,
+                "role": "best_quote_entry_long",
+            },
+        ]
+
+        pruned, dropped = _prune_clustered_same_side_entry_orders(
+            orders,
+            side="BUY",
+            min_gap=0.00002,
+        )
+
+        self.assertEqual(dropped, 1)
+        self.assertEqual([order["price"] for order in pruned], [0.15968, 0.15964])
+        self.assertTrue(pruned[0]["force_reduce_only"])
 
     def test_ladder_falls_back_to_fewer_slots_when_split_orders_are_too_small(self) -> None:
         plan = build_best_quote_maker_volume_plan(
