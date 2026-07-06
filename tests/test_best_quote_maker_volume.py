@@ -1325,5 +1325,126 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual(plan["metrics"]["frozen_v2"]["short_state"], "capped")
 
 
+class RecoverOppositeEntryTests(unittest.TestCase):
+    """Keep the opposite entry leg available during inventory recovery.
+
+    This covers the ARX live stop where heavy long exposure with short_qty=0
+    left only a far reduce_long order and no entry_short volume leg.
+    """
+
+    @staticmethod
+    def _arx_inputs(**overrides):
+        data = {
+            "bid_price": 0.2172,
+            "ask_price": 0.2173,
+            "mid_price": 0.21725,
+            "current_net_qty": 0.0,
+            "cycle_budget_notional": 96.0,
+            "loss_per_10k_15m": 0.0,
+            "target_volume_remaining": 10_000.0,
+            "tick_size": 0.0001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+            "position_side_mode": "hedge",
+        }
+        data.update(overrides)
+        return BestQuoteMakerVolumeInputs(**data)
+
+    @staticmethod
+    def _arx_config(**overrides):
+        data = {
+            "enabled": True,
+            "max_long_notional": 400.0,
+            "max_short_notional": 400.0,
+            "inventory_soft_ratio": 0.9,
+            "inventory_bias_enabled": True,
+            "inventory_bias_opposite_entry_enabled": True,
+            "inventory_bias_min_notional_gap": 80.0,
+        }
+        data.update(overrides)
+        return BestQuoteMakerVolumeConfig(**data)
+
+    def test_heavy_long_recover_keeps_entry_short_alongside_reduce_long(self) -> None:
+        # 364U long > 360U soft line, short is empty, reduce is far away.
+        plan = build_best_quote_maker_volume_plan(
+            config=self._arx_config(),
+            inputs=self._arx_inputs(
+                current_long_qty=1676.0,
+                current_short_qty=0.0,
+                current_long_avg_price=0.2150,
+            ),
+        )
+
+        self.assertEqual(plan["regime"], "inventory_recover")
+        bias = plan["metrics"]["inventory_bias"]
+        self.assertTrue(bias["recover_applied"])
+        self.assertEqual(bias["side"], "long")
+        sell_roles = [o["role"] for o in plan["sell_orders"]]
+        self.assertIn("best_quote_reduce_long", sell_roles)
+        self.assertIn("best_quote_entry_short", sell_roles)
+        self.assertEqual(bias["recover_opposite_entry_side"], "short")
+        entry_short_notional = sum(
+            o["notional"] for o in plan["sell_orders"] if o["role"] == "best_quote_entry_short"
+        )
+        self.assertLessEqual(entry_short_notional, 400.0)
+        reduce_orders = [o for o in plan["sell_orders"] if o["role"] == "best_quote_reduce_long"]
+        self.assertTrue(reduce_orders)
+        self.assertTrue(all(o.get("force_reduce_only") for o in reduce_orders))
+
+    def test_heavy_short_recover_keeps_entry_long_alongside_reduce_short(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=self._arx_config(),
+            inputs=self._arx_inputs(
+                current_long_qty=0.0,
+                current_short_qty=1676.0,
+                current_short_avg_price=0.2195,
+            ),
+        )
+
+        self.assertEqual(plan["regime"], "inventory_recover")
+        bias = plan["metrics"]["inventory_bias"]
+        self.assertTrue(bias["recover_applied"])
+        self.assertEqual(bias["side"], "short")
+        buy_roles = [o["role"] for o in plan["buy_orders"]]
+        self.assertIn("best_quote_reduce_short", buy_roles)
+        self.assertIn("best_quote_entry_long", buy_roles)
+        self.assertEqual(bias["recover_opposite_entry_side"], "long")
+        reduce_orders = [o for o in plan["buy_orders"] if o["role"] == "best_quote_reduce_short"]
+        self.assertTrue(reduce_orders)
+        self.assertTrue(all(o.get("force_reduce_only") for o in reduce_orders))
+
+    def test_opposite_entry_respects_short_cap_headroom(self) -> None:
+        # If projected short headroom is only 10U, entry is clipped to cap.
+        plan = build_best_quote_maker_volume_plan(
+            config=self._arx_config(),
+            inputs=self._arx_inputs(
+                current_long_qty=1676.0,
+                current_short_qty=0.0,
+                current_long_avg_price=0.2150,
+                open_entry_short_notional=390.0,
+            ),
+        )
+
+        entry_short_notional = sum(
+            o["notional"] for o in plan["sell_orders"] if o["role"] == "best_quote_entry_short"
+        )
+        self.assertLessEqual(entry_short_notional, 10.0 + 1e-6)
+
+    def test_opposite_entry_disabled_keeps_old_behavior(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=self._arx_config(inventory_bias_opposite_entry_enabled=False),
+            inputs=self._arx_inputs(
+                current_long_qty=1676.0,
+                current_short_qty=0.0,
+                current_long_avg_price=0.2150,
+            ),
+        )
+
+        sell_roles = [o["role"] for o in plan["sell_orders"]]
+        self.assertIn("best_quote_reduce_long", sell_roles)
+        self.assertNotIn("best_quote_entry_short", sell_roles)
+
+
 if __name__ == "__main__":
     unittest.main()

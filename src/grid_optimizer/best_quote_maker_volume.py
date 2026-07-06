@@ -1076,6 +1076,7 @@ def build_best_quote_maker_volume_plan(
         "min_notional_gap": None,
         "min_notional_gap_soft_ratio": None,
         "recover_applied": False,
+        "recover_opposite_entry_side": None,
     }
     bias_start = _clamp(_safe_float(config.inventory_bias_start_ratio), 0.0, 1.0)
     bias_min_ratio_gap = max(_safe_float(config.inventory_bias_min_ratio_gap), 0.0)
@@ -1326,6 +1327,35 @@ def build_best_quote_maker_volume_plan(
                         "reduce_short_price": reduce_short_price,
                     }
                 )
+        # In recovery, the reduce leg can sit far away or be dropped by the
+        # no-loss guard. Keep the opposite entry leg available without
+        # bypassing soft/cap/projected limits or loss-reduce protections.
+        if (
+            inventory_bias_report["recover_applied"]
+            and inventory_bias_report["side"] == "short"
+            and config.inventory_bias_opposite_entry_enabled
+            and allow_entry_long
+            and not loss_blocked_reduce_fallback_report["long_entry"]
+        ):
+            opposite_long_notional = cycle_budget * bias_entry_share * long_entry_budget_scale
+            if long_limit > 0:
+                opposite_long_notional = min(
+                    opposite_long_notional,
+                    max(long_limit - projected_long_entry_notional, 0.0),
+                )
+            opposite_long_entries = _build_entry_ladder(
+                side="BUY",
+                anchor_price=bid,
+                base_gap=gap,
+                total_notional=opposite_long_notional,
+                slots=max_entry_orders_per_side,
+                role="best_quote_entry_long",
+                inputs=inputs,
+                position_side=long_entry_position_side,
+            )
+            if opposite_long_entries:
+                buy_orders.extend(opposite_long_entries)
+                inventory_bias_report["recover_opposite_entry_side"] = "long"
     elif not inventory_bias_report["applied"] and allow_entry_long:
         long_entry_notional = buy_side_notional * long_entry_budget_scale
         if long_limit > 0:
@@ -1430,6 +1460,34 @@ def build_best_quote_maker_volume_plan(
                         "reduce_long_price": reduce_long_price,
                     }
                 )
+        # Symmetric heavy-long recovery: keep entry_short in the submit path
+        # even when reduce_long is far away or later dropped by no-loss guard.
+        if (
+            inventory_bias_report["recover_applied"]
+            and inventory_bias_report["side"] == "long"
+            and config.inventory_bias_opposite_entry_enabled
+            and allow_entry_short
+            and not loss_blocked_reduce_fallback_report["short_entry"]
+        ):
+            opposite_short_notional = cycle_budget * bias_entry_share * short_entry_budget_scale
+            if short_limit > 0:
+                opposite_short_notional = min(
+                    opposite_short_notional,
+                    max(short_limit - projected_short_entry_notional, 0.0),
+                )
+            opposite_short_entries = _build_entry_ladder(
+                side="SELL",
+                anchor_price=ask,
+                base_gap=gap,
+                total_notional=opposite_short_notional,
+                slots=max_entry_orders_per_side,
+                role="best_quote_entry_short",
+                inputs=inputs,
+                position_side=short_entry_position_side,
+            )
+            if opposite_short_entries:
+                sell_orders.extend(opposite_short_entries)
+                inventory_bias_report["recover_opposite_entry_side"] = "short"
     elif allow_entry_short:
         short_entry_notional = sell_side_notional * short_entry_budget_scale
         if short_limit > 0:
