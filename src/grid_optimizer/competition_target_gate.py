@@ -17,6 +17,11 @@ Behaviour (unchanged from the battle-tested server version):
    past ``--first`` and wear is above ``--wear-stop``.
 3. Flatten ONLY the managed (non-frozen) position; frozen long/short inventory
    is kept so a stopped runner never realizes the frozen legs at a loss.
+   A managed side is market-closed only when it is NOT underwater at the mark
+   (vs its active-ledger weighted cost). An underwater side is kept and a
+   breakeven+``--active-tp-ratio`` reduce LIMIT rests instead (``TGTTP*``
+   clientOrderId, cancelled once the runner is active again), so a trend-day
+   target stop can never realize the active book's unrealized loss.
 4. Rest a BUY take-profit LIMIT on the kept frozen shorts, priced so the whole
    frozen book closes at >= ``--tp-ratio`` average profit and no individual lot
    is underwater at the fill (``min_entry`` guard). The runner cancels this
@@ -48,6 +53,7 @@ from .data import (
 from .monitor import summarize_user_trades
 
 FROZEN_TP_PREFIX = "FROZENTP"
+ACTIVE_TP_PREFIX = "TGTTP"
 
 
 def _now() -> datetime:
@@ -145,11 +151,73 @@ def place_frozen_short_tp(
         return {"placed": False, "reason": str(e)[:140]}
 
 
+def _active_wavg(workdir: str, slug: str) -> tuple[float, float]:
+    """(long_wavg, short_wavg) of the active best-quote ledger; 0.0 when unknown."""
+    try:
+        st = json.load(open(os.path.join(workdir, "output", f"{slug}_loop_state.json")))
+        led = st.get("best_quote_volume_ledger") or {}
+        out: list[float] = []
+        for side in ("long_lots", "short_lots"):
+            lots = led.get(side) or []
+            q = sum(float(l.get("qty", 0) or 0) for l in lots)
+            c = sum(float(l.get("qty", 0) or 0) * float(l.get("price", 0) or 0) for l in lots)
+            out.append((c / q) if q > 0 else 0.0)
+        return out[0], out[1]
+    except Exception:
+        return 0.0, 0.0
+
+
+def resolve_flatten_action(side: str, close_qty: float, mark: float, wavg: float) -> str:
+    """'market' | 'rest_tp' | 'skip' for one managed side at target/wear stop.
+
+    An underwater side (mark below cost for LONG / above cost for SHORT) is never
+    market-closed; it keeps the position and rests a breakeven TP instead. With no
+    ledger cost or no mark available we fall back to the old market-flatten.
+    """
+    if close_qty <= 0:
+        return "skip"
+    if wavg <= 0 or mark <= 0:
+        return "market"
+    if side == "LONG":
+        return "market" if mark >= wavg else "rest_tp"
+    return "market" if mark <= wavg else "rest_tp"
+
+
+def place_active_tp(
+    sym: str, k: str, s: str, slug: str, side: str, qty: float, wavg: float,
+    ratio: float, tick: float, qty_step: float = 1.0,
+) -> dict[str, Any]:
+    """Rest a breakeven(+ratio) reduce LIMIT for a kept underwater managed side."""
+    if side == "LONG":
+        raw = wavg * (1.0 + max(ratio, 0.0))
+        price = round(math.ceil(raw / tick) * tick, 8)
+        order_side = "SELL"
+    else:
+        raw = wavg * (1.0 - max(ratio, 0.0))
+        price = round(math.floor(raw / tick) * tick, 8)
+        order_side = "BUY"
+    q = _truncate_step(qty, qty_step)
+    q = int(q) if float(q).is_integer() else round(q, 8)
+    if q <= 0 or price <= 0:
+        return {"placed": False, "reason": "bad_qty_or_price", "qty": q, "price": price}
+    coid = (ACTIVE_TP_PREFIX + side[0] + slug + _now().strftime("%Y%m%d%H%M%S"))[:36]
+    try:
+        r = post_futures_order(
+            symbol=sym, side=order_side, quantity=q, price=price, api_key=k, api_secret=s,
+            time_in_force="GTC", position_side=side, new_client_order_id=coid,
+        )
+        return {"placed": True, "qty": q, "price": price, "wavg": round(wavg, 6),
+                "orderId": r.get("orderId"), "coid": coid}
+    except Exception as e:  # noqa: BLE001 - report the exchange error, keep going
+        return {"placed": False, "reason": str(e)[:140]}
+
+
 def cancel_frozen_tp(sym: str, k: str, s: str) -> int:
+    """Cancel any resting gate TP orders (frozen FROZENTP* and active TGTTP*)."""
     n = 0
     try:
         for o in fetch_futures_open_orders(sym, k, s):
-            if str(o.get("clientOrderId", "")).startswith(FROZEN_TP_PREFIX):
+            if str(o.get("clientOrderId", "")).startswith((FROZEN_TP_PREFIX, ACTIVE_TP_PREFIX)):
                 try:
                     delete_futures_order(symbol=sym, order_id=int(o.get("orderId")), api_key=k, api_secret=s)
                     n += 1
@@ -224,6 +292,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--plan-json", default=None,
                     help="Defaults to output/<symbol>_loop_latest_plan.json.")
     ap.add_argument("--tp-ratio", type=float, default=0.05)
+    ap.add_argument("--active-tp-ratio", type=float, default=0.001,
+                    help="Breakeven margin for the kept underwater managed side's resting TP.")
     ap.add_argument("--tick", type=float, default=0.0001)
     ap.add_argument("--place-tp-now", action="store_true",
                     help="Rest the frozen-short TP for an already-stopped runner, then exit.")
@@ -322,22 +392,45 @@ def main() -> None:
             delete_futures_order(symbol=sym, order_id=int(o.get("orderId")), api_key=k, api_secret=s)
         except Exception:
             pass
-    # 4. flatten managed only; preserve frozen long/short inventory.
+    # 4. handle managed only; preserve frozen long/short inventory. A side in profit at the
+    #    mark is market-closed (old behaviour); an underwater side keeps its position and
+    #    rests a breakeven+active_tp_ratio reduce LIMIT so the stop never realizes its loss.
     pos = fetch_futures_position_risk_v3(symbol=sym, api_key=k, api_secret=s, contract_type="usdm")
-    d = {x.get("positionSide"): float(x.get("positionAmt", 0)) for x in pos}
-    lo = d.get("LONG", 0.0)
-    sh = -d.get("SHORT", 0.0)  # sh = short size positive
+    rows = {x.get("positionSide"): x for x in pos}
+    lo = float((rows.get("LONG") or {}).get("positionAmt", 0) or 0)
+    sh = -float((rows.get("SHORT") or {}).get("positionAmt", 0) or 0)  # sh = short size positive
+    mark = 0.0
+    for ps in ("LONG", "SHORT"):
+        m = float((rows.get(ps) or {}).get("markPrice", 0) or 0)
+        if m > 0:
+            mark = m
+            break
+    long_wavg, short_wavg = _active_wavg(a.workdir, slug)
     close_long = int(max(lo - frozen_long, 0))
     close_short = int(max(sh - frozen_short, 0))
     acted: list[str] = []
-    if close_long > 0:
+    long_action = resolve_flatten_action("LONG", close_long, mark, long_wavg)
+    if long_action == "market":
         post_futures_market_order(symbol=sym, side="SELL", quantity=close_long, api_key=k, api_secret=s,
                                   position_side="LONG", new_client_order_id="tgtflatL")
         acted.append(f"closeLONG{close_long}")
-    if close_short > 0:
+    elif long_action == "rest_tp":
+        r = place_active_tp(sym, k, s, slug, "LONG", close_long, long_wavg,
+                            a.active_tp_ratio, a.tick, a.qty_step)
+        acted.append(f"restLONGTP{close_long}@{r.get('price')}" if r.get("placed")
+                     else f"restLONGTP_failed:{r.get('reason')}")
+        status["active_tp_long"] = r
+    short_action = resolve_flatten_action("SHORT", close_short, mark, short_wavg)
+    if short_action == "market":
         post_futures_market_order(symbol=sym, side="BUY", quantity=close_short, api_key=k, api_secret=s,
                                   position_side="SHORT", new_client_order_id="tgtflatS")
         acted.append(f"closeSHORT{close_short}")
+    elif short_action == "rest_tp":
+        r = place_active_tp(sym, k, s, slug, "SHORT", close_short, short_wavg,
+                            a.active_tp_ratio, a.tick, a.qty_step)
+        acted.append(f"restSHORTTP{close_short}@{r.get('price')}" if r.get("placed")
+                     else f"restSHORTTP_failed:{r.get('reason')}")
+        status["active_tp_short"] = r
     # 5. rest a take-profit LIMIT on the kept frozen shorts (fills automatically if price reaches
     #    the tp-ratio line while the runner is stopped; the runner cancels it on its next active cycle).
     tp = (
