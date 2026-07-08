@@ -35,6 +35,10 @@ MIN_ORDER_QTY_BUMP_ROLES = {
     "grid_entry",
 }
 FROZEN_MANUAL_REDUCE_IOC_CROSS_TICKS = 10
+INVENTORY_UNLOCK_ALLOW_LOSS_ROLES = {
+    "inventory_unlock_reduce_long",
+    "inventory_unlock_reduce_short",
+}
 
 
 def _float(value: float) -> str:
@@ -2092,6 +2096,7 @@ def main() -> None:
         min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+        allow_loss_roles=INVENTORY_UNLOCK_ALLOW_LOSS_ROLES,
     )
     validation["actions"] = apply_reduce_only_no_loss_guard_to_actions(
         actions=validation["actions"],
@@ -2192,6 +2197,7 @@ def main() -> None:
             min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
             min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
             step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+            allow_loss_roles=INVENTORY_UNLOCK_ALLOW_LOSS_ROLES,
         )
         validation = enforce_execution_action_limits(
             validation=validation,
