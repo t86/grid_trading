@@ -10849,14 +10849,15 @@ def _best_quote_take_profit_guard_role_sets(
 
 
 def _best_quote_submit_allow_loss_roles(args: Any) -> set[str] | None:
-    roles: set[str] = set()
+    roles: set[str] = {
+        "inventory_unlock_reduce_long",
+        "inventory_unlock_reduce_short",
+    }
     if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)):
         roles.update(
             {
                 "best_quote_reduce_long",
                 "best_quote_reduce_short",
-                "inventory_unlock_reduce_long",
-                "inventory_unlock_reduce_short",
             }
         )
     if bool(getattr(args, "best_quote_maker_volume_active_pair_reduce_enabled", False)):
