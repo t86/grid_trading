@@ -2239,6 +2239,7 @@ def _uses_entry_price_cost_basis(strategy_profile: str | None) -> bool:
         "clusdt_competition_maker_neutral_conservative_v1",
         "ethusdc_um_volume_long_v1",
         "billusdt_best_quote_maker_volume_reset_v1",
+        "arxusdt_best_quote_maker_volume_114_v2",
         "pharosusdt_adaptive_regime_router_v1",
         "pharosusdt_best_quote_maker_volume_v1",
         "reusdt_daily_75k_nofreeze_volume_v8",
