@@ -3099,6 +3099,18 @@ def _build_spot_competition_inventory_grid_orders(
         active_position_qty = abs(active_net_qty)
         position_lots = [dict(item) for item in list(runtime.get("position_lots") or []) if isinstance(item, dict)]
         active_lot_qty = _sum_inventory_qty(position_lots)
+        active_lot_is_exchange_dust = active_lot_qty > EPSILON and _synthetic_residual_is_dust(
+            qty=active_lot_qty,
+            price=mid_price,
+            min_qty=min_qty,
+            min_notional=min_notional,
+        )
+        active_position_meets_exchange_mins = not _synthetic_residual_is_dust(
+            qty=active_position_qty,
+            price=mid_price,
+            min_qty=min_qty,
+            min_notional=min_notional,
+        )
         if active_position_qty <= EPSILON:
             runtime["direction_state"] = "flat"
             runtime["position_lots"] = []
@@ -3205,6 +3217,7 @@ def _build_spot_competition_inventory_grid_orders(
             return _handle_unknown_cost_runtime(reason=recovery_errors[0] if recovery_errors else "synthetic_cost_unknown")
         if (
             runtime_direction_state != expected_direction_state
+            or (active_lot_is_exchange_dust and active_position_meets_exchange_mins)
             or not _competition_position_qty_matches(
                 active_lot_qty,
                 active_position_qty,

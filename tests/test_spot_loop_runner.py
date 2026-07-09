@@ -3472,6 +3472,62 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(controls["synthetic_base_sell_floor"]["soft_tolerance_qty"], 100.0)
         self.assertEqual(controls["synthetic_base_sell_floor"]["hard_tolerance_qty"], 1000.0)
 
+    def test_build_spot_competition_synthetic_neutral_refreshes_dust_runtime_lot(self) -> None:
+        runtime = new_inventory_grid_runtime(market_type="futures")
+        runtime["synthetic_neutral"] = True
+        runtime["direction_state"] = "short_active"
+        runtime["grid_anchor_price"] = 1.588
+        runtime["position_lots"] = [
+            {
+                "lot_id": "stale-dust-short",
+                "side": "short",
+                "qty": 0.97,
+                "entry_price": 1.588,
+                "opened_at_ms": 1,
+                "source_role": "bootstrap_entry",
+            }
+        ]
+
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state={
+                "known_orders": {},
+                "spot_competition_synthetic_neutral_grid_runtime_cache": {
+                    "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                    "market_type": "futures",
+                    "runtime": runtime,
+                    "applied_trade_keys": [],
+                },
+            },
+            trades=[],
+            bid_price=1.596,
+            ask_price=1.597,
+            step_price=0.001,
+            buy_levels=1,
+            sell_levels=1,
+            first_order_multiplier=1.0,
+            per_order_notional=10.0,
+            threshold_position_notional=20.0,
+            threshold_reduce_target_notional=0.0,
+            warmup_position_notional=6.0,
+            max_order_position_notional=25.0,
+            max_position_notional=40.0,
+            tick_size=0.001,
+            step_size=0.01,
+            min_qty=0.01,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=100.0,
+            max_short_position_notional=40.0,
+            actual_base_qty=96.23,
+        )
+
+        buy_orders = [order for order in desired_orders if order["side"] == "BUY"]
+        self.assertTrue(buy_orders)
+        self.assertEqual(buy_orders[0]["role"], "tail_cleanup")
+        self.assertGreaterEqual(buy_orders[0]["qty"] * buy_orders[0]["price"], 5.0)
+        self.assertAlmostEqual(controls["current_short_notional"], 3.77 * 1.5965)
+        self.assertAlmostEqual(runtime["position_lots"][0]["qty"], 3.77)
+
     def test_build_spot_competition_synthetic_neutral_reduces_buys_when_base_surplus(self) -> None:
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(
             state={
