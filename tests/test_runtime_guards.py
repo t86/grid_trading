@@ -304,6 +304,66 @@ class RuntimeGuardsTests(unittest.TestCase):
         self.assertAlmostEqual(result.rolling_hourly_loss_per_10k, 12.0)
         self.assertTrue(result.rolling_hourly_loss_per_10k_active)
 
+    def test_evaluate_runtime_guards_excludes_spot_commission_from_loss(self) -> None:
+        now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
+        cfg = RuntimeGuardConfig(
+            run_start_time=None,
+            run_end_time=None,
+            rolling_hourly_loss_limit=None,
+            rolling_hourly_loss_per_10k_limit=3.0,
+            rolling_hourly_loss_per_10k_min_notional=1_000.0,
+            max_cumulative_notional=None,
+            max_actual_net_notional=None,
+            max_synthetic_drift_notional=None,
+        )
+        result = evaluate_runtime_guards(
+            config=cfg,
+            now=now,
+            cumulative_gross_notional=10_000.0,
+            pnl_events=[
+                {
+                    "ts": (now - timedelta(minutes=20)).isoformat(),
+                    "realized_pnl": -5.0,
+                    "commission_quote": 5.0,
+                    "gross_notional": 10_000.0,
+                },
+            ],
+        )
+        self.assertTrue(result.tradable)
+        self.assertFalse(result.stop_triggered)
+        self.assertAlmostEqual(result.rolling_hourly_loss, 0.0)
+        self.assertAlmostEqual(result.rolling_hourly_loss_per_10k, 0.0)
+
+    def test_evaluate_runtime_guards_stops_on_spot_price_loss_excluding_commission(self) -> None:
+        now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
+        cfg = RuntimeGuardConfig(
+            run_start_time=None,
+            run_end_time=None,
+            rolling_hourly_loss_limit=None,
+            rolling_hourly_loss_per_10k_limit=3.0,
+            rolling_hourly_loss_per_10k_min_notional=1_000.0,
+            max_cumulative_notional=None,
+            max_actual_net_notional=None,
+            max_synthetic_drift_notional=None,
+        )
+        result = evaluate_runtime_guards(
+            config=cfg,
+            now=now,
+            cumulative_gross_notional=10_000.0,
+            pnl_events=[
+                {
+                    "ts": (now - timedelta(minutes=20)).isoformat(),
+                    "realized_pnl": -9.0,
+                    "commission_quote": 5.0,
+                    "gross_notional": 10_000.0,
+                },
+            ],
+        )
+        self.assertTrue(result.stop_triggered)
+        self.assertEqual(result.primary_reason, "rolling_hourly_loss_per_10k_limit_hit")
+        self.assertAlmostEqual(result.rolling_hourly_loss, 4.0)
+        self.assertAlmostEqual(result.rolling_hourly_loss_per_10k, 4.0)
+
     def test_evaluate_runtime_guards_ignores_per_10k_below_min_notional(self) -> None:
         now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
         cfg = RuntimeGuardConfig(

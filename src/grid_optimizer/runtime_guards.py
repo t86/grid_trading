@@ -62,7 +62,7 @@ def _event_net_pnl(item: dict[str, Any]) -> float:
     funding = float(item.get("funding_fee") or item.get("income") or 0.0)
     commission = float(item.get("commission_quote") or 0.0)
     recycle_loss = float(item.get("recycle_loss_abs") or 0.0)
-    return realized + funding - commission - recycle_loss
+    return realized + funding + commission - recycle_loss
 
 
 def _trade_order_identity(row: dict[str, Any]) -> str:
