@@ -3472,6 +3472,43 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(controls["synthetic_base_sell_floor"]["soft_tolerance_qty"], 100.0)
         self.assertEqual(controls["synthetic_base_sell_floor"]["hard_tolerance_qty"], 1000.0)
 
+    def test_build_spot_competition_synthetic_neutral_reduces_buys_when_base_surplus(self) -> None:
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state={
+                "known_orders": {},
+                "inventory_lots": [],
+            },
+            trades=[],
+            bid_price=0.0610,
+            ask_price=0.0611,
+            step_price=0.0001,
+            buy_levels=2,
+            sell_levels=2,
+            first_order_multiplier=1.0,
+            per_order_notional=10.0,
+            threshold_position_notional=35.0,
+            threshold_reduce_target_notional=10.0,
+            max_order_position_notional=80.0,
+            max_position_notional=200.0,
+            tick_size=0.0001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=2000.0,
+            max_short_position_notional=200.0,
+            actual_base_qty=2489.2,
+            spot_freeze_tolerance_qty=1.0,
+            spot_base_rebalance_soft_tolerance_qty=100.0,
+            spot_base_rebalance_hard_tolerance_qty=1000.0,
+            spot_base_rebalance_max_buy_levels=2,
+        )
+
+        self.assertEqual(sum(1 for order in desired_orders if order["side"] == "BUY"), 1)
+        self.assertEqual(sum(1 for order in desired_orders if order["side"] == "SELL"), 2)
+        self.assertTrue(controls["synthetic_base_sell_floor"]["base_rebalance_active"])
+        self.assertEqual(controls["synthetic_base_sell_floor"]["dropped_buy_orders"], 1)
+
     def test_build_spot_competition_synthetic_neutral_grid_excludes_spot_frozen_long_from_active_net(self) -> None:
         ledger = new_ledger()
         ledger["long_lots"] = [{"lot_id": "freeze-long-1", "qty": 1.0}]

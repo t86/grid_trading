@@ -3498,18 +3498,34 @@ def _build_spot_competition_inventory_grid_orders(
             synthetic_sell_floor["base_rebalance_active"] = True
             if base_shortfall_qty > soft_tolerance_qty + tolerance_qty:
                 hard_stop_sell = hard_tolerance_qty > EPSILON and base_shortfall_qty >= hard_tolerance_qty - tolerance_qty
-                if hard_stop_sell:
-                    extra_dropped = sum(
-                        1 for order in desired_orders if str(order.get("side", "") or "").upper().strip() == "SELL"
-                    )
-                    desired_orders = [
-                        order for order in desired_orders if str(order.get("side", "") or "").upper().strip() != "SELL"
+                if hard_stop_sell or hard_tolerance_qty > soft_tolerance_qty + EPSILON:
+                    sell_orders = [
+                        order for order in desired_orders if str(order.get("side", "") or "").upper().strip() == "SELL"
                     ]
+                    if hard_stop_sell:
+                        keep_sell_count = 0
+                    else:
+                        severity = (base_shortfall_qty - soft_tolerance_qty) / (hard_tolerance_qty - soft_tolerance_qty)
+                        keep_sell_count = max(0, int(math.floor(len(sell_orders) * max(1.0 - severity, 0.0))))
+                    kept_sell = 0
+                    filtered_orders = []
+                    extra_dropped = 0
+                    for order in desired_orders:
+                        if str(order.get("side", "") or "").upper().strip() != "SELL":
+                            filtered_orders.append(order)
+                            continue
+                        if kept_sell < keep_sell_count:
+                            filtered_orders.append(order)
+                            kept_sell += 1
+                        else:
+                            extra_dropped += 1
+                    desired_orders = filtered_orders
                     synthetic_sell_floor["active"] = synthetic_sell_floor["active"] or extra_dropped > 0
                     synthetic_sell_floor["dropped_sell_orders"] = _safe_int(
                         synthetic_sell_floor.get("dropped_sell_orders")
                     ) + extra_dropped
-
+                    synthetic_sell_floor["base_rebalance_kept_sell_orders"] = kept_sell
+                    synthetic_sell_floor["base_rebalance_dropped_sell_orders"] = extra_dropped
                 restore_budget_qty = max(base_shortfall_qty - soft_tolerance_qty, 0.0)
                 buy_level_cap = max(_safe_int(spot_base_rebalance_max_buy_levels), 0)
                 if buy_level_cap <= 0:
@@ -3555,17 +3571,34 @@ def _build_spot_competition_inventory_grid_orders(
                     synthetic_sell_floor["added_base_rebalance_buy_orders"] = added
             elif base_surplus_qty > soft_tolerance_qty + tolerance_qty:
                 hard_stop_buy = hard_tolerance_qty > EPSILON and base_surplus_qty >= hard_tolerance_qty - tolerance_qty
-                if hard_stop_buy:
-                    dropped_buys = sum(
-                        1 for order in desired_orders if str(order.get("side", "") or "").upper().strip() == "BUY"
-                    )
-                    desired_orders = [
-                        order for order in desired_orders if str(order.get("side", "") or "").upper().strip() != "BUY"
+                if hard_stop_buy or hard_tolerance_qty > soft_tolerance_qty + EPSILON:
+                    buy_orders = [
+                        order for order in desired_orders if str(order.get("side", "") or "").upper().strip() == "BUY"
                     ]
+                    if hard_stop_buy:
+                        keep_buy_count = 0
+                    else:
+                        severity = (base_surplus_qty - soft_tolerance_qty) / (hard_tolerance_qty - soft_tolerance_qty)
+                        keep_buy_count = max(0, int(math.floor(len(buy_orders) * max(1.0 - severity, 0.0))))
+                    kept_buy = 0
+                    filtered_orders = []
+                    dropped_buys = 0
+                    for order in desired_orders:
+                        if str(order.get("side", "") or "").upper().strip() != "BUY":
+                            filtered_orders.append(order)
+                            continue
+                        if kept_buy < keep_buy_count:
+                            filtered_orders.append(order)
+                            kept_buy += 1
+                        else:
+                            dropped_buys += 1
+                    desired_orders = filtered_orders
                     synthetic_sell_floor["active"] = synthetic_sell_floor["active"] or dropped_buys > 0
                     synthetic_sell_floor["dropped_buy_orders"] = dropped_buys
+                    synthetic_sell_floor["base_rebalance_kept_buy_orders"] = kept_buy
         can_add_floor_buys = (
             not bool(spot_base_restore_only)
+            and not (soft_tolerance_qty > EPSILON and base_surplus_qty > soft_tolerance_qty + tolerance_qty)
             and resolved_actual_base_qty + tolerance_qty >= neutral_qty
             and str(runtime.get("direction_state", "flat") or "flat").strip().lower() != "short_active"
             and str(runtime.get("recovery_mode", "live") or "live").strip().lower() == "live"
