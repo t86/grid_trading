@@ -8447,6 +8447,9 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "spot_app_loss_guard_enabled": False,
     "spot_app_loss_recovery_reduce_only_enabled": False,
     "spot_base_restore_only": False,
+    "spot_base_rebalance_soft_tolerance_qty": 0.0,
+    "spot_base_rebalance_hard_tolerance_qty": 0.0,
+    "spot_base_rebalance_max_buy_levels": 0,
     "spot_app_loss_min_notional": 10000.0,
     "spot_app_loss_per_10k_soft": 0.0,
     "spot_app_loss_per_10k_hard": 0.0,
@@ -14607,6 +14610,27 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("spot_base_restore_only", SPOT_RUNNER_DEFAULT_CONFIG["spot_base_restore_only"]),
         "spot_base_restore_only",
     )
+    spot_base_rebalance_soft_tolerance_qty = _safe_float(
+        payload.get(
+            "spot_base_rebalance_soft_tolerance_qty",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_base_rebalance_soft_tolerance_qty"],
+        ),
+        "spot_base_rebalance_soft_tolerance_qty",
+    )
+    spot_base_rebalance_hard_tolerance_qty = _safe_float(
+        payload.get(
+            "spot_base_rebalance_hard_tolerance_qty",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_base_rebalance_hard_tolerance_qty"],
+        ),
+        "spot_base_rebalance_hard_tolerance_qty",
+    )
+    spot_base_rebalance_max_buy_levels = _safe_int(
+        payload.get(
+            "spot_base_rebalance_max_buy_levels",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_base_rebalance_max_buy_levels"],
+        ),
+        "spot_base_rebalance_max_buy_levels",
+    )
     spot_app_loss_min_notional = _safe_float(
         payload.get("spot_app_loss_min_notional", SPOT_RUNNER_DEFAULT_CONFIG["spot_app_loss_min_notional"]),
         "spot_app_loss_min_notional",
@@ -14941,6 +14965,9 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_app_loss_min_notional": spot_app_loss_min_notional,
             "spot_app_loss_per_10k_soft": spot_app_loss_per_10k_soft,
             "spot_app_loss_per_10k_hard": spot_app_loss_per_10k_hard,
+            "spot_base_rebalance_soft_tolerance_qty": spot_base_rebalance_soft_tolerance_qty,
+            "spot_base_rebalance_hard_tolerance_qty": spot_base_rebalance_hard_tolerance_qty,
+            "spot_base_rebalance_max_buy_levels": spot_base_rebalance_max_buy_levels,
             "spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks": (
                 spot_app_loss_prestart_gate_min_bid_break_even_buffer_ticks
             ),
@@ -14971,6 +14998,11 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("synthetic_freeze_manual_release_side must be long or short")
         if spot_slow_trend_step_enabled and spot_slow_trend_step_scale <= 1.0:
             raise ValueError("spot_slow_trend_step_scale must be > 1 when enabled")
+        if (
+            spot_base_rebalance_hard_tolerance_qty > 0
+            and spot_base_rebalance_soft_tolerance_qty > spot_base_rebalance_hard_tolerance_qty
+        ):
+            raise ValueError("spot_base_rebalance_soft_tolerance_qty cannot exceed hard tolerance")
         if max_order_position_notional < 0:
             raise ValueError("max_order_position_notional must be >= 0")
         if max_position_notional <= 0:
@@ -15034,6 +15066,9 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_app_loss_guard_enabled": spot_app_loss_guard_enabled,
             "spot_app_loss_recovery_reduce_only_enabled": spot_app_loss_recovery_reduce_only_enabled,
             "spot_base_restore_only": spot_base_restore_only,
+            "spot_base_rebalance_soft_tolerance_qty": spot_base_rebalance_soft_tolerance_qty,
+            "spot_base_rebalance_hard_tolerance_qty": spot_base_rebalance_hard_tolerance_qty,
+            "spot_base_rebalance_max_buy_levels": spot_base_rebalance_max_buy_levels,
             "spot_app_loss_min_notional": spot_app_loss_min_notional,
             "spot_app_loss_per_10k_soft": spot_app_loss_per_10k_soft,
             "spot_app_loss_per_10k_hard": spot_app_loss_per_10k_hard,
@@ -15190,6 +15225,9 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--spot-app-loss-min-notional", config.get("spot_app_loss_min_notional")),
         ("--spot-app-loss-per-10k-soft", config.get("spot_app_loss_per_10k_soft")),
         ("--spot-app-loss-per-10k-hard", config.get("spot_app_loss_per_10k_hard")),
+        ("--spot-base-rebalance-soft-tolerance-qty", config.get("spot_base_rebalance_soft_tolerance_qty")),
+        ("--spot-base-rebalance-hard-tolerance-qty", config.get("spot_base_rebalance_hard_tolerance_qty")),
+        ("--spot-base-rebalance-max-buy-levels", config.get("spot_base_rebalance_max_buy_levels")),
         ("--non-loss-exit-auto-relax-stall-cycles", config.get("non_loss_exit_auto_relax_stall_cycles")),
         ("--non-loss-exit-auto-relax-cycles", config.get("non_loss_exit_auto_relax_cycles")),
         (
@@ -15478,6 +15516,9 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "spot_fast_stop_reduce_target_notional",
             "spot_fast_stop_min_base_buffer_qty",
             "spot_base_restore_only",
+            "spot_base_rebalance_soft_tolerance_qty",
+            "spot_base_rebalance_hard_tolerance_qty",
+            "spot_base_rebalance_max_buy_levels",
             "synthetic_freeze_enabled",
             "synthetic_freeze_loss_ratio",
             "synthetic_freeze_min_notional",

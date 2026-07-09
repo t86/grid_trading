@@ -86,6 +86,22 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(args.spot_freeze_release_profit_ratio, 0.05)
         self.assertFalse(args.spot_base_restore_only)
 
+    def test_parser_accepts_spot_base_rebalance_controls(self) -> None:
+        args = self._synthetic_args(
+            [
+                "--spot-base-rebalance-soft-tolerance-qty",
+                "100",
+                "--spot-base-rebalance-hard-tolerance-qty",
+                "1000",
+                "--spot-base-rebalance-max-buy-levels",
+                "2",
+            ]
+        )
+
+        self.assertEqual(args.spot_base_rebalance_soft_tolerance_qty, 100.0)
+        self.assertEqual(args.spot_base_rebalance_hard_tolerance_qty, 1000.0)
+        self.assertEqual(args.spot_base_rebalance_max_buy_levels, 2)
+
     def test_client_order_id_stays_within_binance_limit_for_spot_freeze_tag(self) -> None:
         with patch("grid_optimizer.spot_loop_runner.time.time", return_value=1782349765.432):
             client_order_id = _build_client_order_id("sgxpl114", "spot_freeze_short", "BUY")
@@ -3415,6 +3431,46 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertLessEqual(sum(order["qty"] for order in sell_orders), 1.5 + 1e-12)
         self.assertAlmostEqual(controls["synthetic_base_sell_floor"]["floor_qty"], 0.5)
         self.assertAlmostEqual(controls["synthetic_base_sell_floor"]["available_sell_qty"], 1.5)
+
+    def test_build_spot_competition_synthetic_neutral_rebalances_large_base_shortfall(self) -> None:
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state={
+                "known_orders": {},
+                "inventory_lots": [],
+            },
+            trades=[],
+            bid_price=0.0610,
+            ask_price=0.0611,
+            step_price=0.0001,
+            buy_levels=2,
+            sell_levels=2,
+            first_order_multiplier=1.0,
+            per_order_notional=10.0,
+            threshold_position_notional=35.0,
+            threshold_reduce_target_notional=10.0,
+            max_order_position_notional=80.0,
+            max_position_notional=200.0,
+            tick_size=0.0001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=2000.0,
+            max_short_position_notional=200.0,
+            actual_base_qty=900.0,
+            spot_freeze_tolerance_qty=1.0,
+            spot_base_rebalance_soft_tolerance_qty=100.0,
+            spot_base_rebalance_hard_tolerance_qty=1000.0,
+            spot_base_rebalance_max_buy_levels=2,
+        )
+
+        self.assertFalse(any(order["side"] == "SELL" for order in desired_orders))
+        rebalance_buys = [order for order in desired_orders if order.get("role") == "base_rebalance_buy"]
+        self.assertTrue(rebalance_buys)
+        self.assertTrue(controls["synthetic_base_sell_floor"]["base_rebalance_active"])
+        self.assertAlmostEqual(controls["synthetic_base_sell_floor"]["base_shortfall_qty"], 1100.0)
+        self.assertEqual(controls["synthetic_base_sell_floor"]["soft_tolerance_qty"], 100.0)
+        self.assertEqual(controls["synthetic_base_sell_floor"]["hard_tolerance_qty"], 1000.0)
 
     def test_build_spot_competition_synthetic_neutral_grid_excludes_spot_frozen_long_from_active_net(self) -> None:
         ledger = new_ledger()

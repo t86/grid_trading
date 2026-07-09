@@ -2981,6 +2981,9 @@ def _build_spot_competition_inventory_grid_orders(
     max_short_position_notional: float = 0.0,
     actual_base_qty: float | None = None,
     spot_freeze_tolerance_qty: float = 0.0,
+    spot_base_rebalance_soft_tolerance_qty: float = 0.0,
+    spot_base_rebalance_hard_tolerance_qty: float = 0.0,
+    spot_base_rebalance_max_buy_levels: int = 0,
     spot_base_restore_only: bool = False,
     symbol: str = "",
     slow_trend_step_enabled: bool = False,
@@ -3396,13 +3399,27 @@ def _build_spot_competition_inventory_grid_orders(
         "enabled": False,
         "active": False,
         "allowed_short_notional": 0.0,
+        "allowed_short_qty": 0.0,
         "floor_qty": 0.0,
         "available_sell_qty": 0.0,
         "dropped_sell_orders": 0,
         "capped_sell_orders": 0,
         "added_conservative_buy_orders": 0,
+        "base_rebalance_active": False,
+        "base_shortfall_qty": 0.0,
+        "base_surplus_qty": 0.0,
+        "soft_tolerance_qty": 0.0,
+        "hard_tolerance_qty": 0.0,
     }
     if synthetic_neutral and neutral_qty > EPSILON:
+        soft_tolerance_qty = max(_safe_float(spot_base_rebalance_soft_tolerance_qty), 0.0)
+        hard_tolerance_qty = max(_safe_float(spot_base_rebalance_hard_tolerance_qty), 0.0)
+        if hard_tolerance_qty > EPSILON and soft_tolerance_qty > hard_tolerance_qty:
+            soft_tolerance_qty = hard_tolerance_qty
+        if hard_tolerance_qty <= EPSILON:
+            hard_tolerance_qty = 0.0
+        base_shortfall_qty = max(neutral_qty - resolved_actual_base_qty, 0.0)
+        base_surplus_qty = max(resolved_actual_base_qty - neutral_qty, 0.0)
         spot_frozen_long_qty = 0.0
         spot_freeze_ledger = state.get("spot_frozen_ledger") if isinstance(state.get("spot_frozen_ledger"), dict) else {}
         if spot_freeze_ledger:
@@ -3412,6 +3429,8 @@ def _build_spot_competition_inventory_grid_orders(
                 max(resolved_actual_base_qty - neutral_qty, 0.0),
             )
         allowed_short_qty = reduce_target_notional / mid_price if mid_price > EPSILON else 0.0
+        if soft_tolerance_qty > EPSILON:
+            allowed_short_qty = min(allowed_short_qty, soft_tolerance_qty) if allowed_short_qty > EPSILON else soft_tolerance_qty
         floor_qty = max(neutral_qty - max(allowed_short_qty, 0.0), 0.0) + max(_safe_float(spot_frozen_long_qty), 0.0)
         tolerance_qty = max(_safe_float(spot_freeze_tolerance_qty), _qty_zero_tolerance(resolved_actual_base_qty, floor_qty))
         available_sell_qty = max(resolved_actual_base_qty - floor_qty, 0.0)
@@ -3419,9 +3438,14 @@ def _build_spot_competition_inventory_grid_orders(
             {
                 "enabled": True,
                 "allowed_short_notional": reduce_target_notional,
+                "allowed_short_qty": allowed_short_qty,
                 "floor_qty": floor_qty,
                 "spot_frozen_long_qty": max(_safe_float(spot_frozen_long_qty), 0.0),
                 "available_sell_qty": available_sell_qty,
+                "base_shortfall_qty": base_shortfall_qty,
+                "base_surplus_qty": base_surplus_qty,
+                "soft_tolerance_qty": soft_tolerance_qty,
+                "hard_tolerance_qty": hard_tolerance_qty,
             }
         )
         if resolved_actual_base_qty <= floor_qty + tolerance_qty:
@@ -3466,6 +3490,80 @@ def _build_spot_competition_inventory_grid_orders(
                     "capped_sell_orders": capped,
                 }
             )
+        base_rebalance_active = soft_tolerance_qty > EPSILON and (
+            base_shortfall_qty > soft_tolerance_qty + tolerance_qty
+            or base_surplus_qty > soft_tolerance_qty + tolerance_qty
+        )
+        if base_rebalance_active:
+            synthetic_sell_floor["base_rebalance_active"] = True
+            if base_shortfall_qty > soft_tolerance_qty + tolerance_qty:
+                hard_stop_sell = hard_tolerance_qty > EPSILON and base_shortfall_qty >= hard_tolerance_qty - tolerance_qty
+                if hard_stop_sell:
+                    extra_dropped = sum(
+                        1 for order in desired_orders if str(order.get("side", "") or "").upper().strip() == "SELL"
+                    )
+                    desired_orders = [
+                        order for order in desired_orders if str(order.get("side", "") or "").upper().strip() != "SELL"
+                    ]
+                    synthetic_sell_floor["active"] = synthetic_sell_floor["active"] or extra_dropped > 0
+                    synthetic_sell_floor["dropped_sell_orders"] = _safe_int(
+                        synthetic_sell_floor.get("dropped_sell_orders")
+                    ) + extra_dropped
+
+                restore_budget_qty = max(base_shortfall_qty - soft_tolerance_qty, 0.0)
+                buy_level_cap = max(_safe_int(spot_base_rebalance_max_buy_levels), 0)
+                if buy_level_cap <= 0:
+                    buy_level_cap = max(int(buy_levels or 0), 1)
+                existing_keys = {
+                    f"{str(order.get('side', '')).upper().strip()}:{_safe_float(order.get('price')):.10f}"
+                    for order in desired_orders
+                    if isinstance(order, dict)
+                }
+                added = 0
+                for level in range(1, buy_level_cap + 1):
+                    if restore_budget_qty <= tolerance_qty:
+                        break
+                    raw_price = max(_safe_float(bid_price) - (effective_step_price * level), 0.0)
+                    price = _round_order_price(raw_price, tick_size, "BUY")
+                    if price <= EPSILON or price >= _safe_float(bid_price) - EPSILON:
+                        continue
+                    order_notional = min(max(_safe_float(per_order_notional), 0.0), restore_budget_qty * price)
+                    qty = _round_order_qty(order_notional / price if price > EPSILON else 0.0, step_size)
+                    if not _spot_order_meets_exchange_mins(qty=qty, price=price, min_qty=min_qty, min_notional=min_notional):
+                        continue
+                    key = f"BUY:{price:.10f}"
+                    if key in existing_keys:
+                        continue
+                    existing_keys.add(key)
+                    desired_orders.insert(
+                        added,
+                        {
+                            "side": "BUY",
+                            "price": price,
+                            "qty": qty,
+                            "notional": qty * price,
+                            "level": level,
+                            "role": "base_rebalance_buy",
+                            "position_side": "BOTH",
+                            "synthetic_base_rebalance": True,
+                        },
+                    )
+                    added += 1
+                    restore_budget_qty = max(restore_budget_qty - qty, 0.0)
+                if added:
+                    synthetic_sell_floor["active"] = True
+                    synthetic_sell_floor["added_base_rebalance_buy_orders"] = added
+            elif base_surplus_qty > soft_tolerance_qty + tolerance_qty:
+                hard_stop_buy = hard_tolerance_qty > EPSILON and base_surplus_qty >= hard_tolerance_qty - tolerance_qty
+                if hard_stop_buy:
+                    dropped_buys = sum(
+                        1 for order in desired_orders if str(order.get("side", "") or "").upper().strip() == "BUY"
+                    )
+                    desired_orders = [
+                        order for order in desired_orders if str(order.get("side", "") or "").upper().strip() != "BUY"
+                    ]
+                    synthetic_sell_floor["active"] = synthetic_sell_floor["active"] or dropped_buys > 0
+                    synthetic_sell_floor["dropped_buy_orders"] = dropped_buys
         can_add_floor_buys = (
             not bool(spot_base_restore_only)
             and resolved_actual_base_qty + tolerance_qty >= neutral_qty
@@ -5137,6 +5235,13 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             max_short_position_notional=float(getattr(args, "max_short_position_notional", 0.0)),
             actual_base_qty=_total_base_balance(account_info, base_asset) if synthetic_neutral_mode else None,
             spot_freeze_tolerance_qty=float(getattr(args, "spot_freeze_tolerance_qty", 0.0)),
+            spot_base_rebalance_soft_tolerance_qty=float(
+                getattr(args, "spot_base_rebalance_soft_tolerance_qty", 0.0)
+            ),
+            spot_base_rebalance_hard_tolerance_qty=float(
+                getattr(args, "spot_base_rebalance_hard_tolerance_qty", 0.0)
+            ),
+            spot_base_rebalance_max_buy_levels=int(getattr(args, "spot_base_rebalance_max_buy_levels", 0)),
             spot_base_restore_only=bool(getattr(args, "spot_base_restore_only", False)),
             symbol=symbol,
             slow_trend_step_enabled=bool(getattr(args, "spot_slow_trend_step_enabled", False)),
@@ -5681,6 +5786,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spot-app-loss-guard-enabled", action="store_true")
     parser.add_argument("--spot-app-loss-recovery-reduce-only-enabled", action="store_true")
     parser.add_argument("--spot-base-restore-only", action="store_true")
+    parser.add_argument("--spot-base-rebalance-soft-tolerance-qty", type=float, default=0.0)
+    parser.add_argument("--spot-base-rebalance-hard-tolerance-qty", type=float, default=0.0)
+    parser.add_argument("--spot-base-rebalance-max-buy-levels", type=int, default=0)
     parser.add_argument("--spot-app-loss-min-notional", type=float, default=10000.0)
     parser.add_argument("--spot-app-loss-per-10k-soft", type=float, default=0.0)
     parser.add_argument("--spot-app-loss-per-10k-hard", type=float, default=0.0)

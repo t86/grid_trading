@@ -1228,6 +1228,9 @@ class SpotRunnerTests(unittest.TestCase):
                 "spot_freeze_maker_execution_enabled": True,
                 "spot_freeze_base_hedge_qty": 100.0,
                 "spot_freeze_tolerance_qty": 0.01,
+                "spot_base_rebalance_soft_tolerance_qty": 100.0,
+                "spot_base_rebalance_hard_tolerance_qty": 1000.0,
+                "spot_base_rebalance_max_buy_levels": 2,
                 "spot_freeze_deviation_notional": 50.0,
                 "spot_freeze_min_loss_ratio": 0.01,
                 "spot_freeze_max_per_cycle_notional": 100.0,
@@ -1250,6 +1253,10 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("100.0", command)
         self.assertIn("--spot-freeze-tolerance-qty", command)
         self.assertIn("0.01", command)
+        self.assertIn("--spot-base-rebalance-soft-tolerance-qty", command)
+        self.assertIn("--spot-base-rebalance-hard-tolerance-qty", command)
+        self.assertIn("--spot-base-rebalance-max-buy-levels", command)
+        self.assertIn("1000.0", command)
         self.assertIn("--spot-freeze-deviation-notional", command)
         self.assertIn("50.0", command)
         self.assertIn("--spot-freeze-min-loss-ratio", command)
