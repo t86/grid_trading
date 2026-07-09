@@ -3243,7 +3243,11 @@ def _build_spot_competition_inventory_grid_orders(
 
         if has_synthetic_recovered_lot and active_position_meets_exchange_mins:
             active_notional = active_position_qty * mid_price
-            small_realign_notional = max(warmup_notional, _safe_float(min_notional), 0.0) * 1.25
+            small_realign_notional = max(
+                _safe_float(warmup_position_notional),
+                _safe_float(min_notional),
+                0.0,
+            ) * 1.25
             if (
                 runtime_direction_state == expected_direction_state
                 and _competition_position_qty_matches(
