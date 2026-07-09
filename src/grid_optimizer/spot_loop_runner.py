@@ -3241,6 +3241,25 @@ def _build_spot_competition_inventory_grid_orders(
             runtime.pop("synthetic_cost_unknown", None)
             return active_net_qty
 
+        if has_synthetic_recovered_lot and active_position_meets_exchange_mins:
+            active_notional = active_position_qty * mid_price
+            small_realign_notional = max(warmup_notional, _safe_float(min_notional), 0.0) * 1.25
+            if (
+                runtime_direction_state == expected_direction_state
+                and _competition_position_qty_matches(
+                    active_lot_qty,
+                    active_position_qty,
+                    extra_tolerance=position_qty_tolerance,
+                )
+                and active_notional <= small_realign_notional + EPSILON
+                and all(_safe_float(item.get("entry_price")) > EPSILON for item in position_lots)
+            ):
+                runtime["risk_state"] = "normal"
+                runtime["recovery_mode"] = "live"
+                runtime["recovery_errors"] = []
+                runtime.pop("synthetic_cost_unknown", None)
+                return active_net_qty
+
         if has_synthetic_recovered_lot:
             return _handle_unknown_cost_runtime(reason="synthetic_recovered_cost_unknown")
         if recovery_mode != "live":

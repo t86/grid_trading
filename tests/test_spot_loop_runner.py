@@ -3533,6 +3533,66 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(cached_runtime["recovery_mode"], "live")
         self.assertNotIn("synthetic_cost_unknown", cached_runtime)
 
+    def test_build_spot_competition_synthetic_neutral_recovers_small_unknown_dust_realign(self) -> None:
+        runtime = new_inventory_grid_runtime(market_type="futures")
+        runtime["synthetic_neutral"] = True
+        runtime["direction_state"] = "short_active"
+        runtime["risk_state"] = "hard_reduce_only"
+        runtime["recovery_mode"] = "conservative_reduce_only"
+        runtime["synthetic_cost_unknown"] = True
+        runtime["position_lots"] = [
+            {
+                "lot_id": "synthetic_recovered",
+                "side": "short",
+                "qty": 3.77,
+                "entry_price": 1.588,
+                "opened_at_ms": 0,
+                "source_role": "synthetic_recovery",
+                "recovery_reason": "synthetic_recovered_cost_unknown",
+            }
+        ]
+        state = {
+            "known_orders": {},
+            "spot_competition_synthetic_neutral_grid_runtime_cache": {
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "market_type": "futures",
+                "runtime": runtime,
+                "applied_trade_keys": [],
+            },
+        }
+
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state=state,
+            trades=[],
+            bid_price=1.598,
+            ask_price=1.599,
+            step_price=0.001,
+            buy_levels=1,
+            sell_levels=1,
+            first_order_multiplier=1.0,
+            per_order_notional=10.0,
+            threshold_position_notional=20.0,
+            threshold_reduce_target_notional=0.0,
+            warmup_position_notional=6.0,
+            max_order_position_notional=25.0,
+            max_position_notional=40.0,
+            tick_size=0.001,
+            step_size=0.01,
+            min_qty=0.01,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=100.0,
+            max_short_position_notional=40.0,
+            actual_base_qty=96.23,
+        )
+
+        self.assertTrue([order for order in desired_orders if order["side"] == "BUY"])
+        cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
+        self.assertEqual(cached_runtime["risk_state"], "normal")
+        self.assertEqual(cached_runtime["recovery_mode"], "live")
+        self.assertNotIn("synthetic_cost_unknown", cached_runtime)
+        self.assertAlmostEqual(controls["current_short_notional"], 3.77 * 1.5985)
+
     def test_build_spot_competition_synthetic_neutral_reduces_buys_when_base_surplus(self) -> None:
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(
             state={
