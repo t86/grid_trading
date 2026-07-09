@@ -3488,16 +3488,17 @@ class SpotLoopRunnerTests(unittest.TestCase):
             }
         ]
 
-        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
-            state={
-                "known_orders": {},
-                "spot_competition_synthetic_neutral_grid_runtime_cache": {
-                    "strategy_mode": "spot_competition_synthetic_neutral_grid",
-                    "market_type": "futures",
-                    "runtime": runtime,
-                    "applied_trade_keys": [],
-                },
+        state = {
+            "known_orders": {},
+            "spot_competition_synthetic_neutral_grid_runtime_cache": {
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "market_type": "futures",
+                "runtime": runtime,
+                "applied_trade_keys": [],
             },
+        }
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state=state,
             trades=[],
             bid_price=1.596,
             ask_price=1.597,
@@ -3526,7 +3527,8 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(buy_orders[0]["role"], "tail_cleanup")
         self.assertGreaterEqual(buy_orders[0]["qty"] * buy_orders[0]["price"], 5.0)
         self.assertAlmostEqual(controls["current_short_notional"], 3.77 * 1.5965)
-        self.assertAlmostEqual(runtime["position_lots"][0]["qty"], 3.77)
+        cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
+        self.assertAlmostEqual(cached_runtime["position_lots"][0]["qty"], 3.77)
 
     def test_build_spot_competition_synthetic_neutral_reduces_buys_when_base_surplus(self) -> None:
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(
