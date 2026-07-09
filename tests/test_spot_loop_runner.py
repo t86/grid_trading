@@ -131,7 +131,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertIn("_b_", app_loss_buy)
         self.assertIn("_s_", app_loss_sell)
 
-    def test_runtime_guard_events_use_spot_realized_pnl_as_net_pnl(self) -> None:
+    def test_runtime_guard_events_exclude_spot_commission_from_net_pnl(self) -> None:
         events = _runtime_guard_events_from_metrics(
             {
                 "recent_trades": [
@@ -146,7 +146,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["net_pnl"], -0.12)
+        self.assertEqual(events[0]["net_pnl"], 0.0)
         self.assertEqual(events[0]["gross_notional"], 200.0)
 
     def test_spot_app_loss_guard_uses_binance_app_formula_without_offsets(self) -> None:

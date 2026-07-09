@@ -1019,11 +1019,12 @@ def _runtime_guard_events_from_metrics(metrics: dict[str, Any]) -> list[dict[str
             continue
         commission_quote = _safe_float(row.get("commission_quote"))
         realized_pnl = _safe_float(row.get("realized_pnl"))
+        fee_excluded_pnl = realized_pnl + commission_quote
         recycle_loss_abs = abs(realized_pnl) if "recycle" in str(row.get("role", "")).lower() and realized_pnl < 0 else 0.0
         events.append(
             {
                 "ts": datetime.fromtimestamp(trade_time_ms / 1000.0, tz=timezone.utc).isoformat(),
-                "net_pnl": realized_pnl,
+                "net_pnl": fee_excluded_pnl,
                 "realized_pnl": realized_pnl,
                 "commission_quote": commission_quote,
                 "gross_notional": _safe_float(row.get("notional")),
