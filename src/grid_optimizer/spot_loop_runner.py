@@ -3210,6 +3210,37 @@ def _build_spot_competition_inventory_grid_orders(
             _prepare_conservative_reduce_runtime(reason=reason)
             return active_net_qty
 
+        if (
+            runtime_direction_state == expected_direction_state
+            and active_lot_is_exchange_dust
+            and active_position_meets_exchange_mins
+        ):
+            existing_entry_prices = [
+                max(_safe_float(item.get("entry_price")), 0.0)
+                for item in position_lots
+                if isinstance(item, dict) and _safe_float(item.get("entry_price")) > EPSILON
+            ]
+            anchor_price = max(_safe_float(runtime.get("grid_anchor_price")), 0.0)
+            if anchor_price > EPSILON:
+                existing_entry_prices.append(anchor_price)
+            entry_price = existing_entry_prices[0] if existing_entry_prices else mid_price
+            runtime["direction_state"] = expected_direction_state
+            runtime["risk_state"] = "normal"
+            runtime["recovery_mode"] = "live"
+            runtime["recovery_errors"] = []
+            runtime["position_lots"] = [
+                {
+                    "lot_id": "synthetic_dust_runtime_realign",
+                    "side": "long" if expected_direction_state == "long_active" else "short",
+                    "qty": active_position_qty,
+                    "entry_price": entry_price,
+                    "opened_at_ms": 0,
+                    "source_role": "synthetic_runtime_realign",
+                }
+            ]
+            runtime.pop("synthetic_cost_unknown", None)
+            return active_net_qty
+
         if has_synthetic_recovered_lot:
             return _handle_unknown_cost_runtime(reason="synthetic_recovered_cost_unknown")
         if recovery_mode != "live":

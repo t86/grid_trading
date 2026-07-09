@@ -3529,6 +3529,9 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(controls["current_short_notional"], 3.77 * 1.5965)
         cached_runtime = state["spot_competition_synthetic_neutral_grid_runtime_cache"]["runtime"]
         self.assertAlmostEqual(cached_runtime["position_lots"][0]["qty"], 3.77)
+        self.assertEqual(cached_runtime["risk_state"], "normal")
+        self.assertEqual(cached_runtime["recovery_mode"], "live")
+        self.assertNotIn("synthetic_cost_unknown", cached_runtime)
 
     def test_build_spot_competition_synthetic_neutral_reduces_buys_when_base_surplus(self) -> None:
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(
