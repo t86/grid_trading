@@ -12253,6 +12253,11 @@ def apply_best_quote_active_pair_reduce(
     if long_soft <= 0 or short_soft <= 0:
         return _clear("invalid_soft_notional")
 
+    heavier_notional = max(safe_long_notional, safe_short_notional)
+    lighter_notional = min(safe_long_notional, safe_short_notional)
+    if heavier_notional > 0 and lighter_notional < heavier_notional * 0.5:
+        return _clear("pair_imbalance_too_large")
+
     active = bool(memory.get("active"))
     touched_soft = safe_long_notional >= long_soft or safe_short_notional >= short_soft
     if not active and touched_soft:

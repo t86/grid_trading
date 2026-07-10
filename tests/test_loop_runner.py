@@ -7389,6 +7389,46 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertIn("best_quote_active_pair_reduce_short", buy_roles)
         self.assertIn("best_quote_active_pair_reduce_long", sell_roles)
 
+    def test_best_quote_active_pair_reduce_keeps_normal_flow_for_large_pair_imbalance(self) -> None:
+        plan = {
+            "buy_orders": [
+                {"side": "BUY", "role": "best_quote_entry_long", "notional": 25.0},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "role": "best_quote_entry_short", "notional": 25.0},
+            ],
+        }
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state={},
+            enabled=True,
+            current_long_qty=4000.0,
+            current_short_qty=800.0,
+            current_long_notional=712.0,
+            current_short_notional=144.0,
+            max_long_notional=750.0,
+            max_short_notional=750.0,
+            soft_ratio=0.92,
+            min_side_notional=80.0,
+            per_order_notional=24.0,
+            max_reduce_notional_per_side=48.0,
+            offset_ticks=1,
+            step_price=0.0001,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.1768,
+            ask_price=0.1769,
+            volatility_entry_pause={"active": False},
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report["reason"], "pair_imbalance_too_large")
+        self.assertEqual([item["role"] for item in plan["buy_orders"]], ["best_quote_entry_long"])
+        self.assertEqual([item["role"] for item in plan["sell_orders"]], ["best_quote_entry_short"])
+
     def test_best_quote_active_pair_reduce_respects_volatility_pause(self) -> None:
         plan = {"buy_orders": [], "sell_orders": []}
 
