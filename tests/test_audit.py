@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from grid_optimizer.audit import (
     build_audit_paths,
@@ -11,16 +12,47 @@ from grid_optimizer.audit import (
     income_row_key,
     income_row_time_ms,
     parse_iso_ts,
+    read_json,
     read_jsonl,
     read_jsonl_filtered,
     read_trade_audit_rows,
     scan_iso_bounds,
     trade_row_key,
     trade_row_time_ms,
+    write_json,
 )
 
 
 class AuditTests(unittest.TestCase):
+    def test_write_json_preserves_existing_file_when_write_is_interrupted(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            old_payload = {"cycle": 17}
+            path.write_text('{"cycle": 17}', encoding="utf-8")
+            original_write_text = Path.write_text
+
+            def interrupted_write(
+                target: Path,
+                data: str,
+                encoding: str | None = None,
+                errors: str | None = None,
+                newline: str | None = None,
+            ) -> int:
+                original_write_text(
+                    target,
+                    data[:5],
+                    encoding=encoding,
+                    errors=errors,
+                    newline=newline,
+                )
+                raise OSError("interrupted")
+
+            with patch.object(Path, "write_text", new=interrupted_write):
+                with self.assertRaisesRegex(OSError, "interrupted"):
+                    write_json(path, {"cycle": 18})
+
+            self.assertEqual(read_json(path), old_payload)
+
     def test_build_audit_paths_derives_consistent_filenames(self) -> None:
         paths = build_audit_paths(Path("output/night_loop_events.jsonl"))
 

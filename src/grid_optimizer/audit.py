@@ -5,6 +5,7 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
+from uuid import uuid4
 
 DEFAULT_AUDIT_LOOKBACK_DAYS = 7
 _JSONL_LINE_COUNT_CACHE: dict[str, tuple[int, int, int]] = {}
@@ -44,7 +45,15 @@ def read_json(path: Path) -> dict[str, Any] | None:
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
