@@ -887,7 +887,7 @@ def build_inventory_grid_orders(
                 min_notional=min_notional,
             )
         elif synthetic_neutral:
-            flat_start_level = 0 if warmup_notional > EPSILON else 1
+            flat_start_level = 0
             bootstrap_orders = _build_buy_ladder_orders(
                 reference_price=bid_price,
                 step_price=step_price,

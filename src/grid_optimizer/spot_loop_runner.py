@@ -3748,20 +3748,6 @@ def _build_spot_competition_inventory_grid_orders(
             and str(runtime.get("recovery_mode", "live") or "live").strip().lower() == "live"
             and not bool(runtime.get("synthetic_cost_unknown"))
         )
-        if can_add_floor_buys:
-            floor_buy_ceiling = _round_order_price(max(_safe_float(bid_price) - effective_step_price, 0.0), tick_size, "BUY")
-            if floor_buy_ceiling > EPSILON:
-                conservative_orders: list[dict[str, Any]] = []
-                dropped_floor_buy = 0
-                for order in desired_orders:
-                    if str(order.get("side", "") or "").upper().strip() == "BUY" and _safe_float(order.get("price")) > floor_buy_ceiling + EPSILON:
-                        dropped_floor_buy += 1
-                        continue
-                    conservative_orders.append(order)
-                desired_orders = conservative_orders
-                if dropped_floor_buy:
-                    synthetic_sell_floor["active"] = True
-                    synthetic_sell_floor["dropped_non_conservative_buy_orders"] = dropped_floor_buy
         if can_add_floor_buys and not any(str(order.get("side", "") or "").upper().strip() == "BUY" for order in desired_orders):
             long_notional = max(resolved_actual_base_qty - neutral_qty, 0.0) * mid_price
             buy_budget_notional = max(_safe_float(threshold_position_notional) - long_notional, 0.0)

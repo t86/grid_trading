@@ -5977,6 +5977,32 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual([order["price"] for order in desired_orders], [100.0, 99.3, 98.6])
         self.assertEqual(controls["effective_buy_levels"], 3)
 
+    def test_synthetic_neutral_grid_keeps_first_buy_at_best_bid(self) -> None:
+        desired_orders, _ = _build_spot_competition_inventory_grid_orders(
+            state={"known_orders": {}, "inventory_lots": []},
+            trades=[],
+            bid_price=100.0,
+            ask_price=100.2,
+            step_price=0.7,
+            buy_levels=3,
+            sell_levels=1,
+            first_order_multiplier=1.0,
+            per_order_notional=20.0,
+            threshold_position_notional=200.0,
+            max_order_position_notional=300.0,
+            max_position_notional=400.0,
+            tick_size=0.1,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=300.0,
+            actual_base_qty=300.0,
+        )
+
+        buy_prices = [order["price"] for order in desired_orders if order["side"] == "BUY"]
+        self.assertEqual(buy_prices, [100.0, 99.3, 98.6])
+
     def test_build_spot_competition_inventory_grid_orders_supports_multiple_sell_levels(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="spot")
         apply_inventory_grid_fill(
