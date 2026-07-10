@@ -16,6 +16,7 @@ UserTradesPageFetcher = Callable[..., list[dict[str, Any]]]
 _RECOVERY_CONTROL_KEYS = (
     "best_quote_maker_volume_allow_loss_reduce_only",
     "best_quote_maker_volume_inventory_cost_gate_enabled",
+    "best_quote_maker_volume_inventory_bias_min_notional_gap",
 )
 
 
@@ -453,6 +454,7 @@ def check_symbol(
     allow_inventory_cost_gate_disable: bool = True,
     max_recovery_seconds: float = 300.0,
     cooldown_seconds: float = 600.0,
+    inventory_bias_relief_notional_margin: float = 24.0,
     trade_rows: list[dict[str, Any]] | None = None,
     volume_source: str = "local_audit",
     dry_run: bool = False,
@@ -498,12 +500,46 @@ def check_symbol(
     status_reasons = set(assessment.get("reasons") or [])
     stale_or_missing = bool({"missing_control", "latest_plan_stale", "latest_submit_stale"} & status_reasons)
     cooldown_until = _parse_time(item.get("cooldown_until"))
+    recovery_original_controls = item.get("guard_original_controls")
+    recovery_has_original_controls = isinstance(recovery_original_controls, dict) and bool(recovery_original_controls)
 
     try:
         if stale_or_missing:
             action = "skip_stale_or_missing_inputs"
         elif cooldown_until is not None and now < cooldown_until:
             action = "cooldown"
+        elif recovery_has_original_controls and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only")):
+            cap_buffer_ok = (
+                _safe_float(assessment.get("current_long_notional"))
+                < _safe_float(assessment.get("max_long_notional")) * max(float(recover_cap_ratio), 0.0)
+                and _safe_float(assessment.get("current_short_notional"))
+                < _safe_float(assessment.get("max_short_notional")) * max(float(recover_cap_ratio), 0.0)
+            )
+            restore_ready = (
+                _safe_float(volume_summary.get("gross_notional")) >= recover_floor
+                and _safe_int(assessment.get("active_order_count")) > 0
+                and _safe_int(assessment.get("near_market_order_count")) > 0
+                and cap_buffer_ok
+            )
+            if restore_ready:
+                updates = _restore_recovery_controls(item)
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = "dry_run_restore_recovery_controls" if dry_run else "restore_recovery_controls"
+                item.update({"status": "normal", "last_normal_at": now.isoformat()})
+                item.pop("guard_original_controls", None)
+                item.pop("recovery_started_at", None)
+                item.pop("recovery_owned", None)
+            else:
+                action = "hold_inventory_bias_relief"
+                item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
         elif bool(control.get("best_quote_maker_volume_allow_loss_reduce_only")):
             if bool(control.get("best_quote_maker_volume_net_loss_reduce_enabled")):
                 updates = {"best_quote_maker_volume_net_loss_reduce_enabled": False}
@@ -631,7 +667,43 @@ def check_symbol(
             elif not bool(assessment.get("near_cap")):
                 action = "low_volume_not_near_cap"
             elif not bool(assessment.get("ineffective_orders")):
-                action = "low_volume_orders_effective"
+                current_gap = abs(
+                    _safe_float(assessment.get("current_long_notional"))
+                    - _safe_float(assessment.get("current_short_notional"))
+                )
+                configured_gap = _safe_float(control.get("best_quote_maker_volume_inventory_bias_min_notional_gap"))
+                relief_gap = current_gap + max(float(inventory_bias_relief_notional_margin), 0.0)
+                if relief_gap > configured_gap:
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        ("best_quote_maker_volume_inventory_bias_min_notional_gap",),
+                    )
+                    updates = {
+                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                        "best_quote_maker_volume_inventory_bias_min_notional_gap": relief_gap,
+                    }
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
+                    action = "dry_run_relax_inventory_bias_for_volume" if dry_run else "relax_inventory_bias_for_volume"
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                            "recovery_owned": True,
+                            "last_recovery_action_at": now.isoformat(),
+                            "last_recovery_action": action,
+                        }
+                    )
+                else:
+                    action = "low_volume_orders_effective"
             else:
                 updates = {"best_quote_maker_volume_net_loss_reduce_enabled": False}
                 if (
@@ -704,6 +776,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-inventory-cost-gate-disable", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-recovery-seconds", type=float, default=300.0)
     parser.add_argument("--cooldown-seconds", type=float, default=600.0)
+    parser.add_argument("--inventory-bias-relief-notional-margin", type=float, default=24.0)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
@@ -751,6 +824,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_inventory_cost_gate_disable=args.allow_inventory_cost_gate_disable,
             max_recovery_seconds=args.max_recovery_seconds,
             cooldown_seconds=args.cooldown_seconds,
+            inventory_bias_relief_notional_margin=args.inventory_bias_relief_notional_margin,
             trade_rows=trade_rows,
             volume_source="exchange_user_trades",
             dry_run=args.dry_run,

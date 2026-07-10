@@ -415,6 +415,94 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(item["status"], "cooldown")
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_relaxes_ordinary_inventory_bias_when_effective_orders_still_have_no_volume(self) -> None:
+        now = datetime(2026, 6, 26, 7, 50, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_inventory_bias_min_notional_gap": 80.0},
+                long_notional=990.0,
+                short_notional=850.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                inventory_bias_relief_notional_margin=24,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["action"], "relax_inventory_bias_for_volume")
+            self.assertEqual(control["best_quote_maker_volume_inventory_bias_min_notional_gap"], 164.0)
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_restores_inventory_bias_after_volume_recovers(self) -> None:
+        now = datetime(2026, 6, 26, 8, 0, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_inventory_bias_min_notional_gap": 164.0},
+                long_notional=940.0,
+                short_notional=850.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+                recent_trade_notional=80.0,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_inventory_bias_min_notional_gap": 80.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                recover_min_volume_notional=10,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["action"], "restore_recovery_controls")
+            self.assertEqual(control["best_quote_maker_volume_inventory_bias_min_notional_gap"], 80.0)
+            self.assertEqual(restarts, ["REUSDT"])
+
 
 if __name__ == "__main__":
     unittest.main()
