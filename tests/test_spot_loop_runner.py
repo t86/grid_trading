@@ -77,6 +77,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
     def test_parser_spot_freeze_defaults_disabled(self) -> None:
         args = self._synthetic_args()
 
+        self.assertTrue(args.spot_same_price_take_exit_enabled)
         self.assertFalse(args.spot_freeze_enabled)
         self.assertFalse(args.spot_freeze_dry_run)
         self.assertFalse(args.spot_freeze_market_execution_enabled)
@@ -86,6 +87,11 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(args.spot_freeze_short_total_cap_notional, 0.0)
         self.assertEqual(args.spot_freeze_release_profit_ratio, 0.05)
         self.assertFalse(args.spot_base_restore_only)
+
+    def test_parser_can_disable_same_price_take_exit(self) -> None:
+        args = self._synthetic_args(["--no-spot-same-price-take-exit-enabled"])
+
+        self.assertFalse(args.spot_same_price_take_exit_enabled)
 
     def test_parser_accepts_spot_base_rebalance_controls(self) -> None:
         args = self._synthetic_args(
@@ -5349,6 +5355,78 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(post_order.call_args.kwargs["time_in_force"], "IOC")
         self.assertEqual(post_order.call_args.kwargs["price"], 1.62)
         self.assertEqual(post_order.call_args.kwargs["quantity"], 6.0)
+
+    def test_synthetic_neutral_cycle_skips_same_price_take_exit_when_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            summary_path = Path(tmpdir) / "events.jsonl"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "symbol": "WLDUSDT",
+                        "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                        "known_orders": {"88": {"side": "BUY", "tag": "buy"}},
+                        "same_price_take_exit_start_time_ms": 1782349764000,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = self._synthetic_args(
+                [
+                    "--state-path",
+                    str(state_path),
+                    "--summary-jsonl",
+                    str(summary_path),
+                    "--apply",
+                    "--no-spot-same-price-take-exit-enabled",
+                ]
+            )
+            symbol_info = {
+                "base_asset": "WLD",
+                "quote_asset": "USDT",
+                "tick_size": 0.01,
+                "step_size": 0.001,
+                "min_qty": 0.001,
+                "min_notional": 5.0,
+            }
+            trades = [
+                {
+                    "id": 701,
+                    "orderId": 88,
+                    "time": 1782349765000,
+                    "price": "1.62",
+                    "qty": "6",
+                    "commission": "0",
+                    "commissionAsset": "BNB",
+                    "isBuyer": True,
+                    "isMaker": True,
+                }
+            ]
+            with patch(
+                "grid_optimizer.spot_loop_runner.fetch_spot_book_tickers",
+                return_value=[{"bid_price": "1.61", "bid_qty": "10", "ask_price": "1.62"}],
+            ):
+                with patch("grid_optimizer.spot_loop_runner.fetch_spot_user_trades", return_value=trades):
+                    with patch(
+                        "grid_optimizer.spot_loop_runner.fetch_spot_account_info",
+                        return_value={
+                            "balances": [
+                                {"asset": "WLD", "free": "106", "locked": "0"},
+                                {"asset": "USDT", "free": "1000", "locked": "0"},
+                            ]
+                        },
+                    ):
+                        with patch("grid_optimizer.spot_loop_runner.fetch_spot_open_orders", return_value=[]):
+                            with patch(
+                                "grid_optimizer.spot_loop_runner._build_spot_competition_inventory_grid_orders",
+                                return_value=([], {"actual_base_qty": 106.0, "neutral_base_qty": 100.0, "_runtime": {}}),
+                            ):
+                                with patch("grid_optimizer.spot_loop_runner.post_spot_order") as post_order:
+                                    summary = _run_cycle(args, symbol_info, api_key="key", api_secret="secret")
+
+        self.assertEqual(summary["same_price_take_exit"]["enabled"], False)
+        self.assertEqual(summary["same_price_take_exit"]["reason"], "disabled")
+        post_order.assert_not_called()
 
     def test_run_cycle_app_loss_guard_uses_raw_trades_when_known_orders_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

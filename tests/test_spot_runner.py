@@ -388,6 +388,7 @@ class SpotRunnerTests(unittest.TestCase):
                 "max_order_position_notional": 700,
                 "max_position_notional": 900,
                 "max_short_position_notional": 650,
+                "spot_same_price_take_exit_enabled": False,
                 "elastic_volume_enabled": True,
                 "spot_base_restore_only": True,
                 "spot_slow_trend_step_enabled": True,
@@ -403,6 +404,7 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertEqual(payload["symbol"], "SPKUSDT")
         self.assertEqual(payload["neutral_base_qty"], 30000.0)
         self.assertEqual(payload["max_short_position_notional"], 650.0)
+        self.assertFalse(payload["spot_same_price_take_exit_enabled"])
         self.assertTrue(payload["elastic_volume_enabled"])
         self.assertTrue(payload["spot_slow_trend_step_enabled"])
         self.assertEqual(payload["spot_slow_trend_step_5m_return_ratio"], 0.0045)
@@ -1159,6 +1161,7 @@ class SpotRunnerTests(unittest.TestCase):
                 "max_order_position_notional": 700.0,
                 "max_position_notional": 900.0,
                 "max_short_position_notional": 650.0,
+                "spot_same_price_take_exit_enabled": False,
                 "elastic_volume_enabled": True,
                 "spot_base_restore_only": True,
                 "spot_slow_trend_step_enabled": True,
@@ -1177,6 +1180,7 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("30000.0", command)
         self.assertIn("--max-short-position-notional", command)
         self.assertIn("650.0", command)
+        self.assertIn("--no-spot-same-price-take-exit-enabled", command)
         self.assertIn("--elastic-volume-enabled", command)
         self.assertIn("--spot-base-restore-only", command)
         self.assertIn("--spot-slow-trend-step-enabled", command)

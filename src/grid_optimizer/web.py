@@ -8432,6 +8432,7 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "non_loss_exit_auto_relax_cycles": 0,
     "non_loss_exit_pause_entry_when_blocked": True,
     "spot_taker_exit_enabled": False,
+    "spot_same_price_take_exit_enabled": True,
     "spot_taker_exit_fee_ratio": 0.001,
     "spot_taker_exit_min_profit_ratio": 0.0,
     "spot_fast_stop_enabled": False,
@@ -14523,6 +14524,13 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("spot_taker_exit_enabled", SPOT_RUNNER_DEFAULT_CONFIG["spot_taker_exit_enabled"]),
         "spot_taker_exit_enabled",
     )
+    spot_same_price_take_exit_enabled = _safe_bool(
+        payload.get(
+            "spot_same_price_take_exit_enabled",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_same_price_take_exit_enabled"],
+        ),
+        "spot_same_price_take_exit_enabled",
+    )
     spot_taker_exit_fee_ratio = _safe_float(
         payload.get("spot_taker_exit_fee_ratio", SPOT_RUNNER_DEFAULT_CONFIG["spot_taker_exit_fee_ratio"]),
         "spot_taker_exit_fee_ratio",
@@ -15051,6 +15059,7 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "warmup_position_notional": warmup_position_notional,
             "require_non_loss_exit": require_non_loss_exit,
             "spot_taker_exit_enabled": spot_taker_exit_enabled,
+            "spot_same_price_take_exit_enabled": spot_same_price_take_exit_enabled,
             "spot_taker_exit_fee_ratio": spot_taker_exit_fee_ratio,
             "spot_taker_exit_min_profit_ratio": spot_taker_exit_min_profit_ratio,
             "spot_fast_stop_enabled": spot_fast_stop_enabled,
@@ -15274,6 +15283,10 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         command.append("--no-non-loss-exit-pause-entry-when-blocked")
     if _truthy(config.get("spot_taker_exit_enabled", False)):
         command.append("--spot-taker-exit-enabled")
+    if _truthy(config.get("spot_same_price_take_exit_enabled", True)):
+        command.append("--spot-same-price-take-exit-enabled")
+    else:
+        command.append("--no-spot-same-price-take-exit-enabled")
     if _truthy(config.get("spot_fast_stop_enabled", False)):
         command.append("--spot-fast-stop-enabled")
     if _truthy(config.get("spot_app_loss_guard_enabled", False)):
@@ -15503,6 +15516,7 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "inventory_recycle_min_profit_ratio",
             "max_single_cycle_new_orders",
             "spot_taker_exit_enabled",
+            "spot_same_price_take_exit_enabled",
             "spot_taker_exit_fee_ratio",
             "spot_taker_exit_min_profit_ratio",
             "spot_fast_stop_enabled",

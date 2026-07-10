@@ -5245,8 +5245,17 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         controls = {}
 
     account_info = fetch_spot_account_info(api_key, api_secret)
-    same_price_take_exit: dict[str, Any] = {"enabled": strategy_mode == "spot_competition_synthetic_neutral_grid", "reason": "no_candidate"}
-    if strategy_mode == "spot_competition_synthetic_neutral_grid" and _truthy(args.apply):
+    same_price_take_exit_enabled = (
+        strategy_mode == "spot_competition_synthetic_neutral_grid"
+        and bool(getattr(args, "spot_same_price_take_exit_enabled", True))
+    )
+    same_price_take_exit: dict[str, Any] = {
+        "enabled": same_price_take_exit_enabled,
+        "reason": "no_candidate",
+    }
+    if strategy_mode == "spot_competition_synthetic_neutral_grid" and not same_price_take_exit_enabled:
+        same_price_take_exit["reason"] = "disabled"
+    elif strategy_mode == "spot_competition_synthetic_neutral_grid" and _truthy(args.apply):
         actual_base_qty = _total_base_balance(account_info, base_asset)
         neutral_base_qty = max(_safe_float(getattr(args, "neutral_base_qty", 0.0)), 0.0)
         base_restore_active = actual_base_qty + _qty_zero_tolerance(actual_base_qty, neutral_base_qty) < neutral_base_qty
@@ -5982,6 +5991,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-non-loss-exit-pause-entry-when-blocked", dest="non_loss_exit_pause_entry_when_blocked", action="store_false")
     parser.set_defaults(non_loss_exit_pause_entry_when_blocked=True)
     parser.add_argument("--spot-taker-exit-enabled", action="store_true")
+    parser.add_argument(
+        "--spot-same-price-take-exit-enabled",
+        dest="spot_same_price_take_exit_enabled",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no-spot-same-price-take-exit-enabled",
+        dest="spot_same_price_take_exit_enabled",
+        action="store_false",
+    )
+    parser.set_defaults(spot_same_price_take_exit_enabled=True)
     parser.add_argument("--spot-taker-exit-fee-ratio", type=float, default=0.001)
     parser.add_argument("--spot-taker-exit-min-profit-ratio", type=float, default=0.0)
     parser.add_argument("--spot-fast-stop-enabled", action="store_true")
