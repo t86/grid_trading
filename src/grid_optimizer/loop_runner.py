@@ -8538,6 +8538,103 @@ def _filter_futures_strategy_orders(open_orders: Iterable[Any], symbol: str) -> 
     ]
 
 
+def _filter_futures_normal_strategy_orders(open_orders: Iterable[Any], symbol: str) -> list[dict[str, Any]]:
+    return [
+        order
+        for order in _filter_futures_strategy_orders(open_orders, symbol)
+        if "-frozen" not in str(order.get("clientOrderId", "") or "").lower()
+    ]
+
+
+def _maybe_recover_hedge_bq_position_mismatch(
+    *,
+    args: argparse.Namespace,
+    exc: Exception,
+    consecutive_errors: int,
+) -> dict[str, Any] | None:
+    if int(consecutive_errors) != 3:
+        return None
+    if not _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", ""))):
+        return None
+    message = str(exc)
+    if not any(
+        token in message
+        for token in (
+            "当前持仓与计划生成时不一致",
+            "当前空头持仓与计划生成时不一致",
+            "当前净持仓与计划生成时不一致",
+        )
+    ):
+        return None
+
+    symbol = str(getattr(args, "symbol", "")).upper().strip()
+    report: dict[str, Any] = {
+        "action": "cancel_normal_orders_for_position_realign",
+        "trigger_consecutive_errors": int(consecutive_errors),
+        "canceled_order_ids": [],
+        "preserved_frozen_order_ids": [],
+        "cancel_errors": [],
+    }
+    try:
+        credentials = load_binance_api_credentials()
+        if credentials is None:
+            report["action"] = "position_realign_recovery_missing_credentials"
+            return report
+        api_key, api_secret = credentials
+        open_orders = fetch_futures_open_orders(
+            symbol,
+            api_key,
+            api_secret,
+            recv_window=int(getattr(args, "recv_window", 5000)),
+            use_cache=False,
+        )
+    except Exception as recovery_exc:
+        report["action"] = "position_realign_recovery_failed"
+        report["recovery_error"] = f"{recovery_exc.__class__.__name__}: {recovery_exc}"
+        return report
+    normal_orders = _filter_futures_normal_strategy_orders(open_orders, symbol)
+    normal_order_ids = {
+        int(order["orderId"])
+        for order in normal_orders
+        if str(order.get("orderId", "")).strip()
+    }
+    report["preserved_frozen_order_ids"] = [
+        int(order["orderId"])
+        for order in _filter_futures_strategy_orders(open_orders, symbol)
+        if str(order.get("orderId", "")).strip()
+        and int(order["orderId"]) not in normal_order_ids
+    ]
+    if not normal_orders:
+        report["action"] = "await_position_realign_without_normal_orders"
+        return report
+
+    for order in normal_orders:
+        order_id = int(order["orderId"]) if str(order.get("orderId", "")).strip() else None
+        client_order_id = str(order.get("clientOrderId", "") or "").strip()
+        try:
+            delete_futures_order(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_id=order_id,
+                orig_client_order_id=client_order_id or None,
+                recv_window=int(getattr(args, "recv_window", 5000)),
+            )
+        except RuntimeError as cancel_exc:
+            if not _ignore_noop_error(cancel_exc, ("-2011", "unknown order sent")):
+                report["cancel_errors"].append(
+                    {
+                        "order_id": order_id,
+                        "client_order_id": client_order_id,
+                        "error": str(cancel_exc),
+                    }
+                )
+                continue
+        if order_id is not None:
+            report["canceled_order_ids"].append(order_id)
+    return report
+
+
 def _maybe_start_runner_user_data_stream(args: argparse.Namespace) -> FuturesUserDataStream | None:
     credentials = load_binance_api_credentials()
     if credentials is None:
@@ -24728,6 +24825,11 @@ def main() -> None:
                     print(f"[{cycle}] error: {exc}")
                     raise SystemExit(str(exc)) from exc
                 consecutive_errors += 1
+                position_mismatch_recovery = _maybe_recover_hedge_bq_position_mismatch(
+                    args=args,
+                    exc=exc,
+                    consecutive_errors=consecutive_errors,
+                )
                 error_report = {
                     "ts": cycle_started_at.isoformat(),
                     "cycle": cycle,
@@ -24737,6 +24839,8 @@ def main() -> None:
                     "traceback": traceback.format_exc(),
                     "consecutive_errors": consecutive_errors,
                 }
+                if position_mismatch_recovery is not None:
+                    error_report["position_mismatch_recovery"] = position_mismatch_recovery
                 _append_jsonl(summary_path, error_report)
                 print(f"[{cycle}] error: {exc}")
                 if _is_binance_rate_limit_error(exc):

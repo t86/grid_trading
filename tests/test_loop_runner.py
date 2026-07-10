@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import grid_optimizer.loop_runner as loop_runner_module
 from grid_optimizer.audit import build_audit_paths
 from grid_optimizer.best_quote_maker_volume import (
     BestQuoteMakerVolumeConfig,
@@ -5494,6 +5495,92 @@ class LoopRunnerTests(unittest.TestCase):
         result = _filter_futures_strategy_orders(open_orders, "BTCUSDC")
 
         self.assertEqual(result, [{"clientOrderId": "gx-btcusdc-001", "orderId": 1}])
+
+    def test_filter_futures_normal_strategy_orders_preserves_frozen_orders(self) -> None:
+        open_orders = [
+            {"clientOrderId": "gx-arxu-bestquot-1", "orderId": 1},
+            {"clientOrderId": "gx-arxu-frozen-1", "orderId": 2},
+            {"clientOrderId": "gx-arxu-frozenin-1", "orderId": 3},
+            {"clientOrderId": "manual-order", "orderId": 4},
+        ]
+
+        result = loop_runner_module._filter_futures_normal_strategy_orders(open_orders, "ARXUSDT")
+
+        self.assertEqual(result, [{"clientOrderId": "gx-arxu-bestquot-1", "orderId": 1}])
+
+    def test_position_mismatch_recovery_cancels_normal_orders_after_three_errors(self) -> None:
+        args = Namespace(
+            symbol="ARXUSDT",
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            recv_window=5000,
+        )
+        open_orders = [
+            {"clientOrderId": "gx-arxu-bestquot-1", "orderId": 1},
+            {"clientOrderId": "gx-arxu-frozenin-1", "orderId": 2},
+        ]
+
+        with (
+            patch("grid_optimizer.loop_runner.load_binance_api_credentials", return_value=("key", "secret")),
+            patch("grid_optimizer.loop_runner.fetch_futures_open_orders", return_value=open_orders),
+            patch("grid_optimizer.loop_runner.delete_futures_order", return_value={"status": "CANCELED"}) as cancel,
+        ):
+            result = loop_runner_module._maybe_recover_hedge_bq_position_mismatch(
+                args=args,
+                exc=RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新"),
+                consecutive_errors=3,
+            )
+
+        self.assertEqual(result["action"], "cancel_normal_orders_for_position_realign")
+        self.assertEqual(result["canceled_order_ids"], [1])
+        self.assertEqual(result["preserved_frozen_order_ids"], [2])
+        cancel.assert_called_once_with(
+            symbol="ARXUSDT",
+            api_key="key",
+            api_secret="secret",
+            order_id=1,
+            orig_client_order_id="gx-arxu-bestquot-1",
+            recv_window=5000,
+        )
+
+    def test_position_mismatch_recovery_waits_for_three_errors(self) -> None:
+        args = Namespace(
+            symbol="ARXUSDT",
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            recv_window=5000,
+        )
+
+        with patch("grid_optimizer.loop_runner.fetch_futures_open_orders") as fetch_orders:
+            result = loop_runner_module._maybe_recover_hedge_bq_position_mismatch(
+                args=args,
+                exc=RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新"),
+                consecutive_errors=2,
+            )
+
+        self.assertIsNone(result)
+        fetch_orders.assert_not_called()
+
+    def test_position_mismatch_recovery_records_exchange_query_failure(self) -> None:
+        args = Namespace(
+            symbol="ARXUSDT",
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            recv_window=5000,
+        )
+
+        with (
+            patch("grid_optimizer.loop_runner.load_binance_api_credentials", return_value=("key", "secret")),
+            patch(
+                "grid_optimizer.loop_runner.fetch_futures_open_orders",
+                side_effect=RuntimeError("exchange unavailable"),
+            ),
+        ):
+            result = loop_runner_module._maybe_recover_hedge_bq_position_mismatch(
+                args=args,
+                exc=RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新"),
+                consecutive_errors=3,
+            )
+
+        self.assertEqual(result["action"], "position_realign_recovery_failed")
+        self.assertEqual(result["recovery_error"], "RuntimeError: exchange unavailable")
 
     def test_preserve_frozen_inventory_manual_limit_open_orders_keeps_existing_order(self) -> None:
         open_orders = [
