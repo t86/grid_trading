@@ -12,7 +12,7 @@ import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .backtest import build_grid_levels
 from .data import (
@@ -189,6 +189,7 @@ def _load_state(path: Path, symbol: str, strategy_mode: str, cell_count: int) ->
         state["known_orders"] = {}
         state["inventory_lots"] = []
         state["seen_trade_ids"] = []
+        state["same_price_take_exit_trade_ids"] = []
         state["last_trade_time_ms"] = 0
         state["metrics"] = _new_metrics()
         state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
@@ -201,6 +202,7 @@ def _load_state(path: Path, symbol: str, strategy_mode: str, cell_count: int) ->
     state["strategy_mode"] = strategy_mode
     state.setdefault("last_trade_time_ms", 0)
     state.setdefault("seen_trade_ids", [])
+    state.setdefault("same_price_take_exit_trade_ids", [])
     state.setdefault("known_orders", {})
     state.setdefault("cells", {})
     state.setdefault("cycle", 0)
@@ -2324,6 +2326,71 @@ def _spot_freeze_open_maker_orders(open_orders: list[dict[str, Any]], state: dic
                 }
             matched.append(order)
     return matched
+
+
+def _run_same_price_take_exits(
+    *,
+    state: dict[str, Any],
+    trades: list[dict[str, Any]],
+    bid_price: float,
+    bid_qty: float,
+    min_qty: float | None,
+    min_notional: float | None,
+    step_size: float | None,
+    submit_ioc_sell: Callable[[float, float], dict[str, Any]],
+    base_asset: str = "",
+) -> dict[str, Any]:
+    processed_ids = {
+        _safe_int(trade_id)
+        for trade_id in state.get("same_price_take_exit_trade_ids", [])
+        if _safe_int(trade_id) > 0
+    }
+    known_orders = state.get("known_orders") if isinstance(state.get("known_orders"), dict) else {}
+    result: dict[str, Any] = {
+        "eligible_qty": 0.0,
+        "executed_qty": 0.0,
+        "submitted_trade_ids": [],
+        "skipped": [],
+        "errors": [],
+    }
+    for trade in sorted(trades, key=lambda row: (_safe_int(row.get("time")), _safe_int(row.get("id")))):
+        trade_id = _safe_int(trade.get("id"))
+        if trade_id <= 0 or trade_id in processed_ids:
+            continue
+        meta = known_orders.get(str(_safe_int(trade.get("orderId"))))
+        if not isinstance(meta, dict) or str(meta.get("side", "")).upper().strip() != "BUY":
+            continue
+        if str(meta.get("role", "")).strip() == SPOT_FREEZE_MAKER_ROLE:
+            continue
+        fill_price = max(_safe_float(trade.get("price")), 0.0)
+        sell_qty = _round_order_qty(max(_safe_float(trade.get("qty")), 0.0), step_size)
+        if str(trade.get("commissionAsset", "")).upper().strip() == str(base_asset).upper().strip():
+            sell_qty = _round_order_qty(max(sell_qty - _safe_float(trade.get("commission")), 0.0), step_size)
+        if bid_price + EPSILON < fill_price:
+            result["skipped"].append({"trade_id": trade_id, "reason": "bid_below_fill"})
+            continue
+        if bid_qty + EPSILON < sell_qty:
+            result["skipped"].append({"trade_id": trade_id, "reason": "best_bid_too_thin"})
+            continue
+        if not _spot_order_meets_exchange_mins(
+            qty=sell_qty,
+            price=bid_price,
+            min_qty=min_qty,
+            min_notional=min_notional,
+        ):
+            result["skipped"].append({"trade_id": trade_id, "reason": "below_exchange_mins"})
+            continue
+        result["eligible_qty"] += sell_qty
+        try:
+            response = submit_ioc_sell(sell_qty, fill_price)
+        except Exception as exc:  # pragma: no cover - exchange/runtime specific
+            result["errors"].append(f"trade {trade_id}: {type(exc).__name__}: {exc}")
+            continue
+        processed_ids.add(trade_id)
+        result["submitted_trade_ids"].append(trade_id)
+        result["executed_qty"] += max(_safe_float(response.get("executedQty")), 0.0) or sell_qty
+    state["same_price_take_exit_trade_ids"] = sorted(processed_ids)[-5000:]
+    return result
 
 
 def _sync_synthetic_neutral_trades(
@@ -5182,6 +5249,50 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         )
         controls = {}
 
+    same_price_take_exit: dict[str, Any] = {"enabled": strategy_mode == "spot_competition_synthetic_neutral_grid", "reason": "no_candidate"}
+    if strategy_mode == "spot_competition_synthetic_neutral_grid" and _truthy(args.apply):
+        processed_ids = {_safe_int(trade_id) for trade_id in state.get("same_price_take_exit_trade_ids", [])}
+        known_orders = state.get("known_orders") if isinstance(state.get("known_orders"), dict) else {}
+        has_candidate = any(
+            _safe_int(trade.get("id")) not in processed_ids
+            and isinstance(known_orders.get(str(_safe_int(trade.get("orderId")))), dict)
+            and str(known_orders[str(_safe_int(trade.get("orderId")))].get("side", "")).upper().strip() == "BUY"
+            and str(known_orders[str(_safe_int(trade.get("orderId")))].get("role", "")).strip() != SPOT_FREEZE_MAKER_ROLE
+            for trade in trades
+        )
+        if has_candidate:
+            latest_book_rows = fetch_spot_book_tickers(symbol=symbol)
+            latest_book = latest_book_rows[0] if latest_book_rows else {}
+
+            def _submit_same_price_take_exit(qty: float, price: float) -> dict[str, Any]:
+                return post_spot_order(
+                    symbol=symbol,
+                    side="SELL",
+                    quantity=qty,
+                    price=price,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    order_type="LIMIT",
+                    time_in_force="IOC",
+                    new_client_order_id=_build_client_order_id(str(args.client_order_prefix), "samepriceexit", "SELL"),
+                )
+
+            same_price_take_exit = _run_same_price_take_exits(
+                state=state,
+                trades=trades,
+                bid_price=_safe_float(latest_book.get("bid_price")),
+                bid_qty=_safe_float(latest_book.get("bid_qty")),
+                min_qty=symbol_info.get("min_qty"),
+                min_notional=symbol_info.get("min_notional"),
+                step_size=symbol_info.get("step_size"),
+                submit_ioc_sell=_submit_same_price_take_exit,
+                base_asset=base_asset,
+            )
+        else:
+            same_price_take_exit["reason"] = "no_new_known_maker_buy_fill"
+    elif strategy_mode == "spot_competition_synthetic_neutral_grid":
+        same_price_take_exit["reason"] = "dry_run"
+
     account_info = fetch_spot_account_info(api_key, api_secret)
     if open_orders is None:
         open_orders = fetch_spot_open_orders(symbol, api_key, api_secret)
@@ -5629,6 +5740,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "quote_asset": quote_asset,
         "base_asset": base_asset,
         "applied_trades": applied_trades,
+        "same_price_take_exit": same_price_take_exit,
         "trade_database": trade_database_status,
         "placed_count": placed_count,
         "canceled_count": canceled_count,
