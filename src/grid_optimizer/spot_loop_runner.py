@@ -203,6 +203,7 @@ def _load_state(path: Path, symbol: str, strategy_mode: str, cell_count: int) ->
     state.setdefault("last_trade_time_ms", 0)
     state.setdefault("seen_trade_ids", [])
     state.setdefault("same_price_take_exit_trade_ids", [])
+    state.setdefault("same_price_take_exit_start_time_ms", int(time.time() * 1000))
     state.setdefault("known_orders", {})
     state.setdefault("cells", {})
     state.setdefault("cycle", 0)
@@ -2337,6 +2338,7 @@ def _run_same_price_take_exits(
     min_qty: float | None,
     min_notional: float | None,
     step_size: float | None,
+    start_time_ms: int = 0,
     submit_ioc_sell: Callable[[float, float], dict[str, Any]],
     base_asset: str = "",
 ) -> dict[str, Any]:
@@ -2356,6 +2358,9 @@ def _run_same_price_take_exits(
     for trade in sorted(trades, key=lambda row: (_safe_int(row.get("time")), _safe_int(row.get("id")))):
         trade_id = _safe_int(trade.get("id"))
         if trade_id <= 0 or trade_id in processed_ids:
+            continue
+        if start_time_ms > 0 and _safe_int(trade.get("time")) < start_time_ms:
+            result["skipped"].append({"trade_id": trade_id, "reason": "before_activation"})
             continue
         meta = known_orders.get(str(_safe_int(trade.get("orderId"))))
         if not isinstance(meta, dict) or str(meta.get("side", "")).upper().strip() != "BUY":
@@ -5285,6 +5290,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
                 step_size=symbol_info.get("step_size"),
+                start_time_ms=_safe_int(state.get("same_price_take_exit_start_time_ms")),
                 submit_ioc_sell=_submit_same_price_take_exit,
                 base_asset=base_asset,
             )
