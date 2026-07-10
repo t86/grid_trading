@@ -978,6 +978,7 @@ def build_inventory_grid_orders(
     )
 
     if direction_state == "long_active":
+        tail_cleanup_planned_qty = 0.0
         if tail_cleanup_active and not warmup_top_of_book_active:
             cleanup_qty = _round_order_qty(held_qty, step_size)
             cleanup_price = _round_order_price(ask_price, tick_size, "SELL")
@@ -1008,26 +1009,30 @@ def build_inventory_grid_orders(
                         role="tail_cleanup",
                     )
                 )
-                return _finalize_inventory_grid_plan(
-                    risk_state=risk_state,
-                    bootstrap_orders=bootstrap_orders,
-                    buy_orders=buy_orders,
-                    sell_orders=sell_orders,
-                    forced_reduce_orders=forced_reduce_orders,
-                    tail_cleanup_active=True,
-                    min_qty=min_qty,
-                    min_notional=min_notional,
-                )
+                if not synthetic_neutral or risk_state != "normal":
+                    return _finalize_inventory_grid_plan(
+                        risk_state=risk_state,
+                        bootstrap_orders=bootstrap_orders,
+                        buy_orders=buy_orders,
+                        sell_orders=sell_orders,
+                        forced_reduce_orders=forced_reduce_orders,
+                        tail_cleanup_active=True,
+                        min_qty=min_qty,
+                        min_notional=min_notional,
+                    )
+                tail_cleanup_planned_qty = cleanup_qty
 
         closeable_qty = _round_order_qty(max(held_qty, 0.0), step_size)
-        planned_closing_qty = 0.0
+        planned_closing_qty = tail_cleanup_planned_qty
         sell_reference_price = anchor_price
         if synthetic_neutral:
             sell_reference_price = max(_safe_float(ask_price), 0.0) - max(float(step_price), 0.0)
         elif market_type == "spot":
             sell_reference_price = max(sell_reference_price, max(_safe_float(ask_price), 0.0) - max(float(step_price), 0.0))
         raw_sell_orders: list[dict[str, Any]]
-        if warmup_top_of_book_active:
+        if tail_cleanup_planned_qty > EPSILON:
+            raw_sell_orders = []
+        elif warmup_top_of_book_active:
             raw_sell_orders = []
             top_book_sell_price = _round_order_price(ask_price, tick_size, "SELL")
             if _order_meets_mins(
@@ -1071,7 +1076,11 @@ def build_inventory_grid_orders(
             )
         else:
             sell_orders.extend(raw_sell_orders)
-        planned_closing_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in sell_orders if item.get("role") == "grid_exit")
+        planned_closing_qty += sum(
+            max(_safe_float(item.get("qty")), 0.0)
+            for item in sell_orders
+            if item.get("role") == "grid_exit"
+        )
 
         if risk_state == "normal":
             remaining_entry_notional_cap = None
@@ -1197,6 +1206,7 @@ def build_inventory_grid_orders(
                         forced_reduce_orders.append(order)
 
     elif direction_state == "short_active":
+        tail_cleanup_planned_qty = 0.0
         if tail_cleanup_active:
             cleanup_qty = _round_order_qty(held_qty, step_size)
             cleanup_price = _round_order_price(bid_price, tick_size, "BUY")
@@ -1212,16 +1222,18 @@ def build_inventory_grid_orders(
                         role="tail_cleanup",
                     )
                 )
-                return _finalize_inventory_grid_plan(
-                    risk_state=risk_state,
-                    bootstrap_orders=bootstrap_orders,
-                    buy_orders=buy_orders,
-                    sell_orders=sell_orders,
-                    forced_reduce_orders=forced_reduce_orders,
-                    tail_cleanup_active=True,
-                    min_qty=min_qty,
-                    min_notional=min_notional,
-                )
+                if not synthetic_neutral or risk_state != "normal":
+                    return _finalize_inventory_grid_plan(
+                        risk_state=risk_state,
+                        bootstrap_orders=bootstrap_orders,
+                        buy_orders=buy_orders,
+                        sell_orders=sell_orders,
+                        forced_reduce_orders=forced_reduce_orders,
+                        tail_cleanup_active=True,
+                        min_qty=min_qty,
+                        min_notional=min_notional,
+                    )
+                tail_cleanup_planned_qty = cleanup_qty
 
         exit_price = _round_order_price(anchor_price - step_price, tick_size, "BUY")
         if synthetic_neutral:
@@ -1229,8 +1241,13 @@ def build_inventory_grid_orders(
         exit_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(exit_price, EPSILON), step_size)
         closeable_qty = _round_order_qty(max(held_qty, 0.0), step_size)
         exit_qty = min(exit_qty, closeable_qty)
-        planned_closing_qty = 0.0
-        if _order_meets_mins(qty=exit_qty, price=exit_price, min_qty=min_qty, min_notional=min_notional):
+        planned_closing_qty = tail_cleanup_planned_qty
+        if tail_cleanup_planned_qty <= EPSILON and _order_meets_mins(
+            qty=exit_qty,
+            price=exit_price,
+            min_qty=min_qty,
+            min_notional=min_notional,
+        ):
             buy_orders.append(_build_order(side="BUY", price=exit_price, qty=exit_qty, role="grid_exit"))
             planned_closing_qty = exit_qty
 

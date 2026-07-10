@@ -1677,6 +1677,136 @@ def test_tail_cleanup_below_exchange_mins_keeps_grid_entries_live() -> None:
     assert [item["role"] for item in plan["buy_orders"]] == ["grid_entry"]
 
 
+def test_synthetic_neutral_short_tail_keeps_sell_entry_live() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "short_active"
+    runtime["grid_anchor_price"] = 1.677
+    runtime["position_lots"] = [
+        {
+            "lot_id": "short_tail",
+            "side": "short",
+            "qty": 32.0,
+            "entry_price": 1.677,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=1.677,
+        ask_price=1.678,
+        step_price=0.001,
+        per_order_notional=80.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=220.0,
+        threshold_reduce_target_notional=220.0,
+        max_order_position_notional=240.0,
+        max_position_notional=240.0,
+        max_short_order_position_notional=240.0,
+        max_short_position_notional=240.0,
+        buy_levels=3,
+        sell_levels=3,
+        tick_size=0.001,
+        step_size=0.01,
+        min_qty=0.01,
+        min_notional=5.0,
+    )
+
+    assert [(item["side"], item["role"]) for item in plan["buy_orders"]] == [("BUY", "tail_cleanup")]
+    assert [(item["side"], item["role"]) for item in plan["sell_orders"]] == [("SELL", "grid_entry")]
+    assert sum(item["qty"] for item in plan["buy_orders"]) == 32.0
+
+
+def test_synthetic_neutral_long_tail_keeps_buy_entry_live() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 1.677
+    runtime["position_lots"] = [
+        {
+            "lot_id": "long_tail",
+            "side": "long",
+            "qty": 32.0,
+            "entry_price": 1.677,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=1.677,
+        ask_price=1.678,
+        step_price=0.001,
+        per_order_notional=80.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=220.0,
+        threshold_reduce_target_notional=220.0,
+        max_order_position_notional=240.0,
+        max_position_notional=240.0,
+        max_short_order_position_notional=240.0,
+        max_short_position_notional=240.0,
+        buy_levels=3,
+        sell_levels=3,
+        tick_size=0.001,
+        step_size=0.01,
+        min_qty=0.01,
+        min_notional=5.0,
+    )
+
+    assert [(item["side"], item["role"]) for item in plan["sell_orders"]] == [("SELL", "tail_cleanup")]
+    assert [(item["side"], item["role"]) for item in plan["buy_orders"]] == [
+        ("BUY", "grid_entry"),
+        ("BUY", "grid_entry"),
+    ]
+    assert sum(item["qty"] for item in plan["sell_orders"]) == 32.0
+
+
+def test_synthetic_neutral_tail_stays_reduce_only_above_threshold() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 1.677
+    runtime["position_lots"] = [
+        {
+            "lot_id": "long_tail",
+            "side": "long",
+            "qty": 32.0,
+            "entry_price": 1.677,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=1.677,
+        ask_price=1.678,
+        step_price=0.001,
+        per_order_notional=80.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=50.0,
+        threshold_reduce_target_notional=40.0,
+        max_order_position_notional=240.0,
+        max_position_notional=240.0,
+        max_short_order_position_notional=240.0,
+        max_short_position_notional=240.0,
+        buy_levels=3,
+        sell_levels=3,
+        tick_size=0.001,
+        step_size=0.01,
+        min_qty=0.01,
+        min_notional=5.0,
+    )
+
+    assert plan["risk_state"] == "threshold_reduce_only"
+    assert [(item["side"], item["role"]) for item in plan["sell_orders"]] == [("SELL", "tail_cleanup")]
+    assert plan["buy_orders"] == []
+    assert plan["forced_reduce_orders"] == []
+
+
 def test_tail_cleanup_overrides_threshold_reduce_only() -> None:
     runtime = new_inventory_grid_runtime(market_type="spot")
     runtime["direction_state"] = "long_active"

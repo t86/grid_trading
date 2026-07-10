@@ -272,7 +272,9 @@ PYTHONPATH=src PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/anaconda3/bin/python3 -m py
   tests/test_inventory_grid_plan.py tests/test_spot_loop_runner.py -q
 ```
 
-Expected: all tests pass after Task 1 aligns the known baseline mismatch.
+Expected: every planner test passes. The combined run may retain the six
+pre-existing `test_spot_loop_runner.py` failures reproduced unchanged at
+baseline commit `6bcb1c0`; the failure set must not grow or change.
 
 - [ ] **Step 5: Commit the implementation**
 
