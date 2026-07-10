@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -586,6 +587,393 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(result["action"], "raise_cycle_budget_for_volume")
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 60.0)
             self.assertEqual(restarts, ["REUSDT"])
+
+    def test_reapplies_non_loss_recovery_control_after_external_override(self) -> None:
+        now = datetime(2026, 6, 26, 8, 25, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_cycle_budget_notional": 48.0},
+                long_notional=800.0,
+                short_notional=700.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_started_at": (now - timedelta(minutes=2)).isoformat(),
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 48.0,
+                        },
+                        "guard_recovery_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 60.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                max_recovery_seconds=300,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["action"], "reapply_recovery_controls_after_drift")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 60.0)
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_times_out_non_loss_recovery_and_restores_original_control(self) -> None:
+        now = datetime(2026, 6, 26, 8, 30, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_cycle_budget_notional": 60.0},
+                long_notional=800.0,
+                short_notional=700.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_started_at": (now - timedelta(minutes=6)).isoformat(),
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 48.0,
+                        },
+                        "guard_recovery_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 60.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                max_recovery_seconds=300,
+                cooldown_seconds=600,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            item = state["symbols"]["REUSDT"]
+
+            self.assertEqual(result["action"], "recovery_timeout_cooldown")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 48.0)
+            self.assertEqual(item["status"], "cooldown")
+            self.assertNotIn("guard_recovery_controls", item)
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_recovered_volume_clears_recovery_instead_of_reapplying_drifted_control(self) -> None:
+        now = datetime(2026, 6, 26, 8, 35, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_cycle_budget_notional": 48.0},
+                long_notional=800.0,
+                short_notional=700.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+                recent_trade_notional=80.0,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_started_at": (now - timedelta(minutes=2)).isoformat(),
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 48.0,
+                        },
+                        "guard_recovery_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 60.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                recover_min_volume_notional=10,
+                max_recovery_seconds=300,
+                restart_runner=restarts.append,
+            )
+
+            item = state["symbols"]["REUSDT"]
+
+            self.assertEqual(result["action"], "restore_recovery_controls")
+            self.assertEqual(item["status"], "normal")
+            self.assertNotIn("guard_recovery_controls", item)
+            self.assertEqual(restarts, [])
+
+    def test_stale_inputs_do_not_bypass_non_loss_recovery_timeout(self) -> None:
+        now = datetime(2026, 6, 26, 8, 40, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now - timedelta(minutes=10),
+                control={"best_quote_maker_volume_cycle_budget_notional": 60.0},
+                long_notional=800.0,
+                short_notional=700.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_started_at": (now - timedelta(minutes=6)).isoformat(),
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 48.0,
+                        },
+                        "guard_recovery_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 60.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                max_recovery_seconds=300,
+                cooldown_seconds=600,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["action"], "recovery_timeout_cooldown")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 48.0)
+            self.assertEqual(state["symbols"]["REUSDT"]["status"], "cooldown")
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_restart_failure_still_records_non_loss_recovery_start_time(self) -> None:
+        now = datetime(2026, 6, 26, 8, 45, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_cycle_budget_notional": 48.0},
+                long_notional=800.0,
+                short_notional=700.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+
+            def fail_restart(symbol: str) -> None:
+                raise subprocess.CalledProcessError(1, ["restart", symbol])
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                volume_recovery_cycle_budget_increment=12,
+                restart_runner=fail_restart,
+            )
+
+            item = state["symbols"]["REUSDT"]
+
+            self.assertEqual(result["action"], "restart_failed")
+            self.assertEqual(item["status"], "recovery_active")
+            self.assertEqual(item["recovery_started_at"], now.isoformat())
+            self.assertEqual(
+                item["guard_recovery_controls"]["best_quote_maker_volume_cycle_budget_notional"],
+                60.0,
+            )
+
+    def test_cost_gate_recovery_records_expected_disabled_target(self) -> None:
+        now = datetime(2026, 6, 26, 8, 50, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_inventory_cost_gate_enabled": True},
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "inventory_cost_gate": {"blocked_buy_orders": 1, "blocked_sell_orders": 0}
+            }
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                restart_runner=restarts.append,
+            )
+
+            item = state["symbols"]["REUSDT"]
+
+            self.assertEqual(result["action"], "disable_inventory_cost_gate")
+            self.assertEqual(
+                item["guard_recovery_controls"]["best_quote_maker_volume_inventory_cost_gate_enabled"],
+                False,
+            )
+            self.assertEqual(item["recovery_started_at"], now.isoformat())
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_bias_restart_failure_still_records_recovery_start_and_target(self) -> None:
+        now = datetime(2026, 6, 26, 8, 55, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_inventory_bias_min_notional_gap": 80.0},
+                long_notional=990.0,
+                short_notional=850.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+
+            def fail_restart(symbol: str) -> None:
+                raise subprocess.CalledProcessError(1, ["restart", symbol])
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                inventory_bias_relief_notional_margin=24,
+                restart_runner=fail_restart,
+            )
+
+            item = state["symbols"]["REUSDT"]
+
+            self.assertEqual(result["action"], "restart_failed")
+            self.assertEqual(item["status"], "recovery_active")
+            self.assertEqual(item["recovery_started_at"], now.isoformat())
+            self.assertEqual(
+                item["guard_recovery_controls"]["best_quote_maker_volume_inventory_bias_min_notional_gap"],
+                164.0,
+            )
+
+    def test_loss_reduce_restart_failure_still_records_recovery_start(self) -> None:
+        now = datetime(2026, 6, 26, 9, 0, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_inventory_bias_min_notional_gap": 200.0},
+                long_notional=990.0,
+                short_notional=850.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+
+            def fail_restart(symbol: str) -> None:
+                raise subprocess.CalledProcessError(1, ["restart", symbol])
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                inventory_bias_relief_notional_margin=24,
+                restart_runner=fail_restart,
+            )
+
+            item = state["symbols"]["REUSDT"]
+
+            self.assertEqual(result["action"], "restart_failed")
+            self.assertEqual(item["status"], "recovery_active")
+            self.assertEqual(item["recovery_started_at"], now.isoformat())
 
 
 if __name__ == "__main__":

@@ -221,6 +221,15 @@ def _remember_recovery_controls(item: dict[str, Any], control: dict[str, Any], k
     item["guard_original_controls"] = originals
 
 
+def _remember_recovery_updates(item: dict[str, Any], updates: dict[str, Any]) -> None:
+    existing = item.get("guard_recovery_controls")
+    expected = dict(existing) if isinstance(existing, dict) else {}
+    for key, value in updates.items():
+        if key in _RECOVERY_CONTROL_KEYS:
+            expected[key] = value
+    item["guard_recovery_controls"] = expected
+
+
 def _restore_recovery_controls(item: dict[str, Any]) -> dict[str, Any]:
     original = item.get("guard_original_controls")
     updates = {"best_quote_maker_volume_allow_loss_reduce_only": False}
@@ -504,9 +513,27 @@ def check_symbol(
     cooldown_until = _parse_time(item.get("cooldown_until"))
     recovery_original_controls = item.get("guard_original_controls")
     recovery_has_original_controls = isinstance(recovery_original_controls, dict) and bool(recovery_original_controls)
+    recovery_expected_controls = item.get("guard_recovery_controls")
+    recovery_expected_controls = (
+        {
+            key: value
+            for key, value in recovery_expected_controls.items()
+            if key in _RECOVERY_CONTROL_KEYS
+        }
+        if isinstance(recovery_expected_controls, dict)
+        else {}
+    )
+    recovery_started_at = _parse_time(item.get("recovery_started_at"))
+    recovery_timed_out = (
+        recovery_started_at is not None
+        and (now - recovery_started_at).total_seconds() >= max(float(max_recovery_seconds), 0.0)
+    )
+    recovery_timeout_required = recovery_timed_out and (
+        recovery_has_original_controls or bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+    )
 
     try:
-        if stale_or_missing:
+        if stale_or_missing and not recovery_timeout_required:
             action = "skip_stale_or_missing_inputs"
         elif cooldown_until is not None and now < cooldown_until:
             action = "cooldown"
@@ -523,7 +550,59 @@ def check_symbol(
                 and _safe_int(assessment.get("near_market_order_count")) > 0
                 and cap_buffer_ok
             )
-            if restore_ready:
+            drifted_updates = {
+                key: value
+                for key, value in recovery_expected_controls.items()
+                if control.get(key) != value
+            }
+            if recovery_timed_out:
+                updates = _restore_recovery_controls(item)
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = "dry_run_recovery_timeout_cooldown" if dry_run else "recovery_timeout_cooldown"
+                item.update(
+                    {
+                        "status": "cooldown",
+                        "cooldown_until": (now + timedelta(seconds=max(float(cooldown_seconds), 0.0))).isoformat(),
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+                item.pop("guard_original_controls", None)
+                item.pop("guard_recovery_controls", None)
+                item.pop("recovery_started_at", None)
+                item.pop("recovery_owned", None)
+            elif drifted_updates and not restore_ready:
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=drifted_updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = (
+                    "dry_run_reapply_recovery_controls_after_drift"
+                    if dry_run
+                    else "reapply_recovery_controls_after_drift"
+                )
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_recovery_check_at": now.isoformat(),
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+            elif restore_ready:
                 updates = _restore_recovery_controls(item)
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
@@ -537,6 +616,7 @@ def check_symbol(
                 action = "dry_run_restore_recovery_controls" if dry_run else "restore_recovery_controls"
                 item.update({"status": "normal", "last_normal_at": now.isoformat()})
                 item.pop("guard_original_controls", None)
+                item.pop("guard_recovery_controls", None)
                 item.pop("recovery_started_at", None)
                 item.pop("recovery_owned", None)
             else:
@@ -596,6 +676,7 @@ def check_symbol(
                     }
                 )
                 item.pop("guard_original_controls", None)
+                item.pop("guard_recovery_controls", None)
                 item.pop("recovery_started_at", None)
                 item.pop("recovery_owned", None)
                 return_result = {
@@ -640,6 +721,7 @@ def check_symbol(
                     action = "dry_run_disable_allow_loss_after_recovery" if dry_run else "disable_allow_loss_after_recovery"
                 item.update({"status": "normal", "last_normal_at": now.isoformat()})
                 item.pop("guard_original_controls", None)
+                item.pop("guard_recovery_controls", None)
                 item.pop("recovery_started_at", None)
                 item.pop("recovery_owned", None)
             elif not cap_buffer_ok:
@@ -679,14 +761,9 @@ def check_symbol(
                         "best_quote_maker_volume_net_loss_reduce_enabled": False,
                         "best_quote_maker_volume_cycle_budget_notional": current_budget + increment,
                     }
-                    changed, backup_path = _apply_control_update(
-                        symbol=normalized_symbol,
-                        control_path=control_path,
-                        control=control,
-                        updates=updates,
-                        now=now,
-                        dry_run=dry_run,
-                        restart_runner=restart,
+                    _remember_recovery_updates(
+                        item,
+                        {"best_quote_maker_volume_cycle_budget_notional": current_budget + increment},
                     )
                     action = "dry_run_raise_cycle_budget_for_volume" if dry_run else "raise_cycle_budget_for_volume"
                     item.update(
@@ -697,6 +774,15 @@ def check_symbol(
                             "last_recovery_action_at": now.isoformat(),
                             "last_recovery_action": action,
                         }
+                    )
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
                     )
                 else:
                     action = "low_volume_not_near_cap"
@@ -719,14 +805,9 @@ def check_symbol(
                         "best_quote_maker_volume_net_loss_reduce_enabled": False,
                         "best_quote_maker_volume_inventory_bias_min_notional_gap": relief_gap,
                     }
-                    changed, backup_path = _apply_control_update(
-                        symbol=normalized_symbol,
-                        control_path=control_path,
-                        control=control,
-                        updates=updates,
-                        now=now,
-                        dry_run=dry_run,
-                        restart_runner=restart,
+                    _remember_recovery_updates(
+                        item,
+                        {"best_quote_maker_volume_inventory_bias_min_notional_gap": relief_gap},
                     )
                     action = "dry_run_relax_inventory_bias_for_volume" if dry_run else "relax_inventory_bias_for_volume"
                     item.update(
@@ -738,6 +819,15 @@ def check_symbol(
                             "last_recovery_action": action,
                         }
                     )
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
                 else:
                     _remember_recovery_controls(
                         item,
@@ -748,15 +838,6 @@ def check_symbol(
                         "best_quote_maker_volume_net_loss_reduce_enabled": False,
                         "best_quote_maker_volume_allow_loss_reduce_only": True,
                     }
-                    changed, backup_path = _apply_control_update(
-                        symbol=normalized_symbol,
-                        control_path=control_path,
-                        control=control,
-                        updates=updates,
-                        now=now,
-                        dry_run=dry_run,
-                        restart_runner=restart,
-                    )
                     action = "dry_run_enable_allow_loss_reduce_only" if dry_run else "enable_allow_loss_reduce_only"
                     item.update(
                         {
@@ -767,6 +848,15 @@ def check_symbol(
                             "last_recovery_action": action,
                         }
                     )
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
             else:
                 updates = {"best_quote_maker_volume_net_loss_reduce_enabled": False}
                 if (
@@ -776,20 +866,15 @@ def check_symbol(
                 ):
                     _remember_recovery_controls(item, control, ("best_quote_maker_volume_inventory_cost_gate_enabled",))
                     updates["best_quote_maker_volume_inventory_cost_gate_enabled"] = False
+                    _remember_recovery_updates(
+                        item,
+                        {"best_quote_maker_volume_inventory_cost_gate_enabled": False},
+                    )
                     chosen_action = "disable_inventory_cost_gate"
                 else:
                     _remember_recovery_controls(item, control, ("best_quote_maker_volume_allow_loss_reduce_only",))
                     updates["best_quote_maker_volume_allow_loss_reduce_only"] = True
                     chosen_action = "enable_allow_loss_reduce_only"
-                changed, backup_path = _apply_control_update(
-                    symbol=normalized_symbol,
-                    control_path=control_path,
-                    control=control,
-                    updates=updates,
-                    now=now,
-                    dry_run=dry_run,
-                    restart_runner=restart,
-                )
                 action = f"dry_run_{chosen_action}" if dry_run else chosen_action
                 item.update(
                     {
@@ -799,6 +884,15 @@ def check_symbol(
                         "last_recovery_action_at": now.isoformat(),
                         "last_recovery_action": action,
                     }
+                )
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
                 )
     except subprocess.CalledProcessError as exc:
         restart_failed = str(exc)
