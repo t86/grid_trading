@@ -175,6 +175,48 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(restarts, ["REUSDT"])
             self.assertEqual(len(backups), 1)
 
+    def test_enables_temporary_allow_loss_when_recent_volume_masks_zero_active_orders(self) -> None:
+        now = datetime(2026, 6, 26, 7, 5, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                long_notional=500.0,
+                short_notional=550.0,
+                open_order_count=0,
+                active_order_count=0,
+                recent_trade_notional=100.0,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["action"], "enable_allow_loss_reduce_only")
+            self.assertIn("no_active_orders", result["assessment"]["reasons"])
+            self.assertTrue(result["assessment"]["low_volume"])
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_keeps_allow_loss_enabled_until_inventory_has_recovered_buffer(self) -> None:
         now = datetime(2026, 6, 26, 7, 10, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

@@ -346,10 +346,6 @@ def assess_symbol(
         reasons.append("latest_submit_stale")
 
     gross = _safe_float(volume_summary.get("gross_notional"))
-    low_volume = gross < max(float(min_volume_notional), 0.0)
-    if low_volume:
-        reasons.append("low_volume")
-
     bid, ask = _live_book(plan, submit)
     tick = _tick_size(plan, control)
     orders = _planned_orders(plan, submit)
@@ -359,6 +355,9 @@ def assess_symbol(
         if _order_is_near_market(item, bid=bid, ask=ask, tick_size=tick, far_ticks=far_ticks)
     ]
     active_count = _active_order_count(plan, submit)
+    low_volume = gross < max(float(min_volume_notional), 0.0) or active_count <= 0
+    if low_volume:
+        reasons.append("low_volume")
     all_orders_far = bool(orders) and not near_orders
     ineffective_orders = active_count <= 0 or all_orders_far
     if active_count <= 0:
@@ -818,7 +817,11 @@ def check_symbol(
                     )
                 else:
                     action = "low_volume_not_near_cap"
-            elif not bool(assessment.get("near_cap")):
+            elif (
+                not bool(assessment.get("near_cap"))
+                and _safe_float(assessment.get("current_long_notional")) <= 0
+                and _safe_float(assessment.get("current_short_notional")) <= 0
+            ):
                 action = "low_volume_not_near_cap"
             elif not bool(assessment.get("ineffective_orders")):
                 current_gap = abs(
