@@ -17,6 +17,7 @@ _RECOVERY_CONTROL_KEYS = (
     "best_quote_maker_volume_allow_loss_reduce_only",
     "best_quote_maker_volume_inventory_cost_gate_enabled",
     "best_quote_maker_volume_inventory_bias_min_notional_gap",
+    "best_quote_maker_volume_cycle_budget_notional",
 )
 
 
@@ -455,6 +456,7 @@ def check_symbol(
     max_recovery_seconds: float = 300.0,
     cooldown_seconds: float = 600.0,
     inventory_bias_relief_notional_margin: float = 24.0,
+    volume_recovery_cycle_budget_increment: float = 12.0,
     trade_rows: list[dict[str, Any]] | None = None,
     volume_source: str = "local_audit",
     dry_run: bool = False,
@@ -664,6 +666,40 @@ def check_symbol(
             )
             if elapsed < max(float(trigger_seconds), 0.0):
                 action = "wait_low_volume_confirmation"
+            elif not bool(assessment.get("near_cap")) and not bool(assessment.get("ineffective_orders")):
+                current_budget = _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
+                increment = max(float(volume_recovery_cycle_budget_increment), 0.0)
+                if current_budget > 0 and increment > 0:
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        ("best_quote_maker_volume_cycle_budget_notional",),
+                    )
+                    updates = {
+                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                        "best_quote_maker_volume_cycle_budget_notional": current_budget + increment,
+                    }
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
+                    action = "dry_run_raise_cycle_budget_for_volume" if dry_run else "raise_cycle_budget_for_volume"
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                            "recovery_owned": True,
+                            "last_recovery_action_at": now.isoformat(),
+                            "last_recovery_action": action,
+                        }
+                    )
+                else:
+                    action = "low_volume_not_near_cap"
             elif not bool(assessment.get("near_cap")):
                 action = "low_volume_not_near_cap"
             elif not bool(assessment.get("ineffective_orders")):
@@ -804,6 +840,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-recovery-seconds", type=float, default=300.0)
     parser.add_argument("--cooldown-seconds", type=float, default=600.0)
     parser.add_argument("--inventory-bias-relief-notional-margin", type=float, default=24.0)
+    parser.add_argument("--volume-recovery-cycle-budget-increment", type=float, default=12.0)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
@@ -852,6 +889,7 @@ def main(argv: list[str] | None = None) -> int:
             max_recovery_seconds=args.max_recovery_seconds,
             cooldown_seconds=args.cooldown_seconds,
             inventory_bias_relief_notional_margin=args.inventory_bias_relief_notional_margin,
+            volume_recovery_cycle_budget_increment=args.volume_recovery_cycle_budget_increment,
             trade_rows=trade_rows,
             volume_source="exchange_user_trades",
             dry_run=args.dry_run,

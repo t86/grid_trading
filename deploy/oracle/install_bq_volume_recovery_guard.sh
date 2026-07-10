@@ -23,6 +23,8 @@ PLAN_STALE_SECONDS="${PLAN_STALE_SECONDS:-300}"
 ALLOW_INVENTORY_COST_GATE_DISABLE="${ALLOW_INVENTORY_COST_GATE_DISABLE:-true}"
 MAX_RECOVERY_SECONDS="${MAX_RECOVERY_SECONDS:-300}"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-600}"
+INVENTORY_BIAS_RELIEF_NOTIONAL_MARGIN="${INVENTORY_BIAS_RELIEF_NOTIONAL_MARGIN:-24}"
+VOLUME_RECOVERY_CYCLE_BUDGET_INCREMENT="${VOLUME_RECOVERY_CYCLE_BUDGET_INCREMENT:-12}"
 ON_UNIT_ACTIVE_SEC="${ON_UNIT_ACTIVE_SEC:-1min}"
 
 if ! command -v sudo >/dev/null 2>&1; then
@@ -73,7 +75,7 @@ WorkingDirectory=${APP_DIR}
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=${PYTHONPATH_VALUE}
 EnvironmentFile=${ENV_FILE}
-ExecStart=${PYTHON_BIN} -m grid_optimizer.bq_volume_recovery_guard --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --state-path ${STATE_PATH} --runner-wrapper ${RUNNER_WRAPPER} --window-seconds ${WINDOW_SECONDS} --min-volume-notional ${MIN_VOLUME_NOTIONAL} --trigger-seconds ${TRIGGER_SECONDS} --recover-min-volume-notional ${RECOVER_MIN_VOLUME_NOTIONAL} --near-cap-ratio ${NEAR_CAP_RATIO} --recover-cap-ratio ${RECOVER_CAP_RATIO} --far-ticks ${FAR_TICKS} --plan-stale-seconds ${PLAN_STALE_SECONDS} --max-recovery-seconds ${MAX_RECOVERY_SECONDS} --cooldown-seconds ${COOLDOWN_SECONDS} ${COST_GATE_FLAG}
+ExecStart=${PYTHON_BIN} -m grid_optimizer.bq_volume_recovery_guard --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --state-path ${STATE_PATH} --runner-wrapper ${RUNNER_WRAPPER} --window-seconds ${WINDOW_SECONDS} --min-volume-notional ${MIN_VOLUME_NOTIONAL} --trigger-seconds ${TRIGGER_SECONDS} --recover-min-volume-notional ${RECOVER_MIN_VOLUME_NOTIONAL} --near-cap-ratio ${NEAR_CAP_RATIO} --recover-cap-ratio ${RECOVER_CAP_RATIO} --far-ticks ${FAR_TICKS} --plan-stale-seconds ${PLAN_STALE_SECONDS} --max-recovery-seconds ${MAX_RECOVERY_SECONDS} --cooldown-seconds ${COOLDOWN_SECONDS} --inventory-bias-relief-notional-margin ${INVENTORY_BIAS_RELIEF_NOTIONAL_MARGIN} --volume-recovery-cycle-budget-increment ${VOLUME_RECOVERY_CYCLE_BUDGET_INCREMENT} ${COST_GATE_FLAG}
 EOF
 
 sudo tee "$TIMER_FILE" >/dev/null <<EOF
