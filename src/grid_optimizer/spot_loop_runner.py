@@ -2339,6 +2339,7 @@ def _run_same_price_take_exits(
     min_notional: float | None,
     step_size: float | None,
     start_time_ms: int = 0,
+    base_restore_active: bool = False,
     submit_ioc_sell: Callable[[float, float], dict[str, Any]],
     base_asset: str = "",
 ) -> dict[str, Any]:
@@ -2355,6 +2356,9 @@ def _run_same_price_take_exits(
         "skipped": [],
         "errors": [],
     }
+    if base_restore_active:
+        result["reason"] = "base_restore_active"
+        return result
     for trade in sorted(trades, key=lambda row: (_safe_int(row.get("time")), _safe_int(row.get("id")))):
         trade_id = _safe_int(trade.get("id"))
         if trade_id <= 0 or trade_id in processed_ids:
@@ -5254,8 +5258,12 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         )
         controls = {}
 
+    account_info = fetch_spot_account_info(api_key, api_secret)
     same_price_take_exit: dict[str, Any] = {"enabled": strategy_mode == "spot_competition_synthetic_neutral_grid", "reason": "no_candidate"}
     if strategy_mode == "spot_competition_synthetic_neutral_grid" and _truthy(args.apply):
+        actual_base_qty = _total_base_balance(account_info, base_asset)
+        neutral_base_qty = max(_safe_float(getattr(args, "neutral_base_qty", 0.0)), 0.0)
+        base_restore_active = actual_base_qty + _qty_zero_tolerance(actual_base_qty, neutral_base_qty) < neutral_base_qty
         processed_ids = {_safe_int(trade_id) for trade_id in state.get("same_price_take_exit_trade_ids", [])}
         known_orders = state.get("known_orders") if isinstance(state.get("known_orders"), dict) else {}
         has_candidate = any(
@@ -5291,6 +5299,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
                 min_notional=symbol_info.get("min_notional"),
                 step_size=symbol_info.get("step_size"),
                 start_time_ms=_safe_int(state.get("same_price_take_exit_start_time_ms")),
+                base_restore_active=base_restore_active,
                 submit_ioc_sell=_submit_same_price_take_exit,
                 base_asset=base_asset,
             )
@@ -5299,7 +5308,6 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
     elif strategy_mode == "spot_competition_synthetic_neutral_grid":
         same_price_take_exit["reason"] = "dry_run"
 
-    account_info = fetch_spot_account_info(api_key, api_secret)
     if open_orders is None:
         open_orders = fetch_spot_open_orders(symbol, api_key, api_secret)
         strategy_open_orders = _strategy_open_orders(open_orders, str(args.client_order_prefix))

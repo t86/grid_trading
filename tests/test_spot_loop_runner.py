@@ -175,6 +175,24 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(result["executed_qty"], 0.0)
         self.assertEqual(result["skipped"], [{"trade_id": 701, "reason": "before_activation"}])
 
+    def test_same_price_take_exit_skips_while_base_restore_is_active(self) -> None:
+        state = {"known_orders": {"88": {"side": "BUY"}}}
+
+        result = _run_same_price_take_exits(
+            state=state,
+            trades=[{"id": 701, "orderId": 88, "qty": "6", "price": "1.62", "isBuyer": True}],
+            bid_price=1.62,
+            bid_qty=10.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=0.01,
+            base_restore_active=True,
+            submit_ioc_sell=lambda qty, price: self.fail(f"unexpected sell {qty} at {price}"),
+        )
+
+        self.assertEqual(result["executed_qty"], 0.0)
+        self.assertEqual(result["reason"], "base_restore_active")
+
     def test_client_order_id_stays_within_binance_limit_for_spot_freeze_tag(self) -> None:
         with patch("grid_optimizer.spot_loop_runner.time.time", return_value=1782349765.432):
             client_order_id = _build_client_order_id("sgxpl114", "spot_freeze_short", "BUY")
