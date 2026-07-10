@@ -795,7 +795,7 @@ def check_symbol(
                 )
                 configured_gap = _safe_float(control.get("best_quote_maker_volume_inventory_bias_min_notional_gap"))
                 relief_gap = current_gap + max(float(inventory_bias_relief_notional_margin), 0.0)
-                if relief_gap > configured_gap:
+                if current_gap >= configured_gap and relief_gap > configured_gap:
                     _remember_recovery_controls(
                         item,
                         control,
