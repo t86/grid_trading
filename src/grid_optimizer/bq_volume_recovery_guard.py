@@ -18,6 +18,8 @@ _RECOVERY_CONTROL_KEYS = (
     "best_quote_maker_volume_inventory_cost_gate_enabled",
     "best_quote_maker_volume_inventory_bias_min_notional_gap",
     "best_quote_maker_volume_cycle_budget_notional",
+    "pause_buy_position_notional",
+    "pause_short_position_notional",
 )
 
 
@@ -238,6 +240,31 @@ def _restore_recovery_controls(item: dict[str, Any]) -> dict[str, Any]:
             if key in _RECOVERY_CONTROL_KEYS:
                 updates[key] = value
     updates["best_quote_maker_volume_net_loss_reduce_enabled"] = False
+    return updates
+
+
+def _loss_reduce_recovery_updates(
+    *,
+    control: dict[str, Any],
+    assessment: dict[str, Any],
+) -> dict[str, Any]:
+    updates: dict[str, Any] = {
+        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+        "best_quote_maker_volume_allow_loss_reduce_only": True,
+    }
+    buffer_notional = max(_safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")), 0.0)
+    if buffer_notional <= 0:
+        return updates
+    for current_key, pause_key in (
+        ("current_long_notional", "pause_buy_position_notional"),
+        ("current_short_notional", "pause_short_position_notional"),
+    ):
+        if pause_key not in control:
+            continue
+        current_notional = max(_safe_float(assessment.get(current_key)), 0.0)
+        recovery_pause = max(current_notional - buffer_notional, 0.0)
+        if current_notional > 0 and _safe_float(control.get(pause_key)) > recovery_pause:
+            updates[pause_key] = recovery_pause
     return updates
 
 
@@ -866,15 +893,13 @@ def check_symbol(
                 elif effective_near_market_flow:
                     action = "hold_effective_near_market_flow"
                 else:
+                    updates = _loss_reduce_recovery_updates(control=control, assessment=assessment)
                     _remember_recovery_controls(
                         item,
                         control,
-                        ("best_quote_maker_volume_allow_loss_reduce_only",),
+                        tuple(key for key in updates if key != "best_quote_maker_volume_net_loss_reduce_enabled"),
                     )
-                    updates = {
-                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
-                        "best_quote_maker_volume_allow_loss_reduce_only": True,
-                    }
+                    _remember_recovery_updates(item, updates)
                     action = "dry_run_enable_allow_loss_reduce_only" if dry_run else "enable_allow_loss_reduce_only"
                     item.update(
                         {
@@ -909,8 +934,13 @@ def check_symbol(
                     )
                     chosen_action = "disable_inventory_cost_gate"
                 else:
-                    _remember_recovery_controls(item, control, ("best_quote_maker_volume_allow_loss_reduce_only",))
-                    updates["best_quote_maker_volume_allow_loss_reduce_only"] = True
+                    updates = _loss_reduce_recovery_updates(control=control, assessment=assessment)
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        tuple(key for key in updates if key != "best_quote_maker_volume_net_loss_reduce_enabled"),
+                    )
+                    _remember_recovery_updates(item, updates)
                     chosen_action = "enable_allow_loss_reduce_only"
                 action = f"dry_run_{chosen_action}" if dry_run else chosen_action
                 item.update(

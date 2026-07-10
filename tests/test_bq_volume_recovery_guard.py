@@ -182,6 +182,11 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self._write_common_files(
                 output_dir,
                 now=now,
+                control={
+                    "best_quote_maker_volume_min_cycle_budget_notional": 24.0,
+                    "pause_buy_position_notional": 900.0,
+                    "pause_short_position_notional": 900.0,
+                },
                 long_notional=500.0,
                 short_notional=550.0,
                 open_order_count=0,
@@ -215,6 +220,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertIn("no_active_orders", result["assessment"]["reasons"])
             self.assertTrue(result["assessment"]["low_volume"])
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(control["pause_buy_position_notional"], 476.0)
+            self.assertEqual(control["pause_short_position_notional"], 526.0)
             self.assertEqual(restarts, ["REUSDT"])
 
     def test_keeps_allow_loss_enabled_until_inventory_has_recovered_buffer(self) -> None:
