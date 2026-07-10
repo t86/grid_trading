@@ -3757,12 +3757,12 @@ def _build_spot_competition_inventory_grid_orders(
                 if isinstance(order, dict)
             }
             added = 0
-            for level in range(1, max(int(buy_levels or 0), 0) + 1):
+            for level in range(max(int(buy_levels or 0), 0)):
                 if buy_budget_notional <= EPSILON:
                     break
                 raw_price = max(_safe_float(bid_price) - (effective_step_price * level), 0.0)
                 price = _round_order_price(raw_price, tick_size, "BUY")
-                if price <= EPSILON or price >= _safe_float(bid_price) - EPSILON:
+                if price <= EPSILON or price > _safe_float(bid_price) + EPSILON:
                     continue
                 notional_budget = min(max(_safe_float(per_order_notional), 0.0), buy_budget_notional)
                 qty = _round_order_qty(notional_budget / price if price > EPSILON else 0.0, step_size)
