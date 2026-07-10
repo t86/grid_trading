@@ -463,6 +463,18 @@ def _default_restart_runner(symbol: str, *, runner_wrapper: str) -> object:
     return subprocess.run([runner_wrapper, "restart", symbol], check=True)
 
 
+def _runner_is_active(symbol: str) -> bool:
+    service = f"grid-loop@{symbol}.service"
+    return (
+        subprocess.run(
+            ["systemctl", "is-active", service],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "active"
+    )
+
+
 def _normalize_symbols(items: list[str]) -> list[str]:
     symbols: list[str] = []
     for item in items:
@@ -1013,6 +1025,21 @@ def main(argv: list[str] | None = None) -> int:
     results = []
     exit_code = 0
     for symbol in _normalize_symbols(args.symbols):
+        if not _runner_is_active(symbol):
+            result = {
+                "symbol": symbol,
+                "action": "skip_runner_inactive",
+                "changed_keys": [],
+                "backup_path": None,
+                "dry_run": args.dry_run,
+                "restart_failed": None,
+            }
+            _append_jsonl(
+                output_dir / "bq_volume_recovery_guard_events.jsonl",
+                {"ts": now.isoformat(), **result},
+            )
+            results.append(result)
+            continue
         try:
             trade_rows = _fetch_exchange_user_trades(
                 symbol=symbol,

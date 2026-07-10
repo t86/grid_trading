@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 import subprocess
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+from grid_optimizer import bq_volume_recovery_guard
 from grid_optimizer.bq_volume_recovery_guard import (
     check_symbol,
     fetch_recent_user_trades,
@@ -26,6 +30,132 @@ def _append_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class BqVolumeRecoveryGuardTests(unittest.TestCase):
+    def test_main_checks_active_runner_normally(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            stdout = StringIO()
+            service = "grid-loop@ARXUSDT.service"
+            active = subprocess.CompletedProcess(
+                ["systemctl", "is-active", service],
+                returncode=0,
+                stdout="active\n",
+                stderr="",
+            )
+            trades = [{"id": 1, "time": 1, "quoteQty": "10"}]
+            checked_result = {
+                "symbol": "ARXUSDT",
+                "action": "healthy",
+                "restart_failed": None,
+            }
+
+            with (
+                patch.object(
+                    bq_volume_recovery_guard.subprocess,
+                    "run",
+                    return_value=active,
+                ) as run,
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "_fetch_exchange_user_trades",
+                    return_value=trades,
+                ) as fetch_trades,
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "check_symbol",
+                    return_value=checked_result,
+                ) as check_symbol_mock,
+                redirect_stdout(stdout),
+            ):
+                exit_code = bq_volume_recovery_guard.main(
+                    [
+                        "--output-dir",
+                        str(output_dir),
+                        "--state-path",
+                        str(output_dir / "state.json"),
+                        "--symbols",
+                        "ARXUSDT",
+                        "--dry-run",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            run.assert_called_once_with(
+                ["systemctl", "is-active", service],
+                capture_output=True,
+                text=True,
+            )
+            fetch_trades.assert_called_once()
+            check_symbol_mock.assert_called_once()
+            self.assertEqual(check_symbol_mock.call_args.kwargs["trade_rows"], trades)
+            self.assertEqual(
+                check_symbol_mock.call_args.kwargs["volume_source"],
+                "exchange_user_trades",
+            )
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["results"], [checked_result])
+
+    def test_main_skips_inactive_runner_before_exchange_fetch(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            stdout = StringIO()
+            service = "grid-loop@ARXUSDT.service"
+            inactive = subprocess.CompletedProcess(
+                ["systemctl", "is-active", service],
+                returncode=3,
+                stdout="inactive\n",
+                stderr="",
+            )
+            unexpected_result = {
+                "symbol": "ARXUSDT",
+                "action": "unexpected_check_symbol",
+                "restart_failed": None,
+            }
+
+            with (
+                patch.object(
+                    bq_volume_recovery_guard.subprocess,
+                    "run",
+                    return_value=inactive,
+                ) as run,
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "_fetch_exchange_user_trades",
+                    return_value=[],
+                ) as fetch_trades,
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "check_symbol",
+                    return_value=unexpected_result,
+                ) as check_symbol_mock,
+                redirect_stdout(stdout),
+            ):
+                exit_code = bq_volume_recovery_guard.main(
+                    [
+                        "--output-dir",
+                        str(output_dir),
+                        "--state-path",
+                        str(output_dir / "state.json"),
+                        "--symbols",
+                        "ARXUSDT",
+                        "--dry-run",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            run.assert_called_once_with(
+                ["systemctl", "is-active", service],
+                capture_output=True,
+                text=True,
+            )
+            fetch_trades.assert_not_called()
+            check_symbol_mock.assert_not_called()
+            payload = json.loads(stdout.getvalue())
+            event = json.loads(
+                (output_dir / "bq_volume_recovery_guard_events.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["results"][0]["action"], "skip_runner_inactive")
+            self.assertEqual(event["action"], "skip_runner_inactive")
+
     def test_recent_volume_deduplicates_exchange_trade_ids(self) -> None:
         now = datetime(2026, 6, 26, 7, 0, tzinfo=timezone.utc)
         rows = [
