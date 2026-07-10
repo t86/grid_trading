@@ -511,6 +511,12 @@ def check_symbol(
     status_reasons = set(assessment.get("reasons") or [])
     stale_or_missing = bool({"missing_control", "latest_plan_stale", "latest_submit_stale"} & status_reasons)
     cooldown_until = _parse_time(item.get("cooldown_until"))
+    effective_near_market_flow = (
+        _safe_float(volume_summary.get("gross_notional")) > 0
+        and _safe_int(assessment.get("active_order_count")) > 0
+        and _safe_int(assessment.get("near_market_order_count")) > 0
+        and not bool(assessment.get("ineffective_orders"))
+    )
     recovery_original_controls = item.get("guard_original_controls")
     recovery_has_original_controls = isinstance(recovery_original_controls, dict) and bool(recovery_original_controls)
     recovery_expected_controls = item.get("guard_recovery_controls")
@@ -575,6 +581,32 @@ def check_symbol(
                         "last_recovery_action": action,
                     }
                 )
+                item.pop("guard_original_controls", None)
+                item.pop("guard_recovery_controls", None)
+                item.pop("recovery_started_at", None)
+                item.pop("recovery_owned", None)
+            elif (
+                drifted_updates
+                and effective_near_market_flow
+                and bool(recovery_expected_controls.get("best_quote_maker_volume_allow_loss_reduce_only"))
+                and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            ):
+                updates = _restore_recovery_controls(item)
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = (
+                    "dry_run_abandon_loss_reduce_for_effective_flow"
+                    if dry_run
+                    else "abandon_loss_reduce_for_effective_flow"
+                )
+                item.update({"status": "normal", "last_normal_at": now.isoformat()})
                 item.pop("guard_original_controls", None)
                 item.pop("guard_recovery_controls", None)
                 item.pop("recovery_started_at", None)
@@ -828,6 +860,8 @@ def check_symbol(
                         dry_run=dry_run,
                         restart_runner=restart,
                     )
+                elif effective_near_market_flow:
+                    action = "hold_effective_near_market_flow"
                 else:
                     _remember_recovery_controls(
                         item,

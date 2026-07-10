@@ -546,6 +546,107 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_keeps_loss_reduce_off_when_near_market_orders_are_still_filling(self) -> None:
+        now = datetime(2026, 6, 26, 8, 12, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_inventory_bias_min_notional_gap": 200.0},
+                long_notional=990.0,
+                short_notional=850.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+                recent_trade_notional=70.0,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                inventory_bias_relief_notional_margin=24,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["action"], "hold_effective_near_market_flow")
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, [])
+
+    def test_manual_loss_reduce_close_wins_when_near_market_flow_is_effective(self) -> None:
+        now = datetime(2026, 6, 26, 8, 13, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_inventory_bias_min_notional_gap": 164.0,
+                },
+                long_notional=990.0,
+                short_notional=850.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+                recent_trade_notional=70.0,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_allow_loss_reduce_only": False,
+                            "best_quote_maker_volume_inventory_bias_min_notional_gap": 80.0,
+                        },
+                        "guard_recovery_controls": {
+                            "best_quote_maker_volume_allow_loss_reduce_only": True,
+                            "best_quote_maker_volume_inventory_bias_min_notional_gap": 164.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                recover_min_volume_notional=100,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            item = state["symbols"]["REUSDT"]
+
+            self.assertEqual(result["action"], "abandon_loss_reduce_for_effective_flow")
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(control["best_quote_maker_volume_inventory_bias_min_notional_gap"], 80.0)
+            self.assertEqual(item["status"], "normal")
+            self.assertNotIn("guard_recovery_controls", item)
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_does_not_relax_inventory_bias_when_current_gap_is_below_threshold(self) -> None:
         now = datetime(2026, 6, 26, 8, 15, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
