@@ -107,7 +107,7 @@ def test_spot_flat_warmup_mode_places_only_top_of_book_buy() -> None:
     assert plan["bootstrap_orders"][0]["role"] == "bootstrap_entry"
 
 
-def test_synthetic_neutral_flat_defaults_to_one_tick_away_from_book() -> None:
+def test_synthetic_neutral_flat_starts_at_top_of_book() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["synthetic_neutral"] = True
 
@@ -131,8 +131,8 @@ def test_synthetic_neutral_flat_defaults_to_one_tick_away_from_book() -> None:
         min_notional=5.0,
     )
 
-    assert [order["price"] for order in plan["bootstrap_orders"] if order["side"] == "BUY"] == [0.0879, 0.0878]
-    assert [order["price"] for order in plan["bootstrap_orders"] if order["side"] == "SELL"] == [0.0882, 0.0883]
+    assert [order["price"] for order in plan["bootstrap_orders"] if order["side"] == "BUY"] == [0.0880, 0.0879]
+    assert [order["price"] for order in plan["bootstrap_orders"] if order["side"] == "SELL"] == [0.0881, 0.0882]
 
 
 def test_synthetic_neutral_flat_warmup_places_top_of_book_maker_orders() -> None:

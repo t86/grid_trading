@@ -10,19 +10,20 @@
 
 ---
 
-### Task 1: Align The Existing Best-Bid Baseline Test
+### Task 1: Align The Existing Top-Of-Book Baseline Test
 
 **Files:**
 - Modify: `tests/test_inventory_grid_plan.py:111-138`
 
-- [ ] **Step 1: Rename the stale test and update its expected synthetic-neutral flat BUY prices**
+- [ ] **Step 1: Rename the stale test and update its expected synthetic-neutral flat prices**
 
-The deployed planner now starts the first BUY at best bid. Rename the test to
-`test_synthetic_neutral_flat_starts_buy_at_best_bid` and change only the stale
-BUY-price assertion:
+The deployed planner starts the first BUY at best bid and the first SELL at best
+ask. Rename the test to `test_synthetic_neutral_flat_starts_at_top_of_book` and
+change the two stale price assertions:
 
 ```python
 assert [order["price"] for order in plan["bootstrap_orders"] if order["side"] == "BUY"] == [0.0880, 0.0879]
+assert [order["price"] for order in plan["bootstrap_orders"] if order["side"] == "SELL"] == [0.0881, 0.0882]
 ```
 
 - [ ] **Step 2: Run the baseline test**
@@ -31,7 +32,7 @@ Run:
 
 ```bash
 PYTHONPATH=src PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/anaconda3/bin/python3 -m pytest \
-  tests/test_inventory_grid_plan.py::test_synthetic_neutral_flat_starts_buy_at_best_bid -q
+  tests/test_inventory_grid_plan.py::test_synthetic_neutral_flat_starts_at_top_of_book -q
 ```
 
 Expected: PASS.
