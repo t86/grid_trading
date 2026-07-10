@@ -703,7 +703,34 @@ def check_symbol(
                         }
                     )
                 else:
-                    action = "low_volume_orders_effective"
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        ("best_quote_maker_volume_allow_loss_reduce_only",),
+                    )
+                    updates = {
+                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                        "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    }
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
+                    action = "dry_run_enable_allow_loss_reduce_only" if dry_run else "enable_allow_loss_reduce_only"
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                            "recovery_owned": True,
+                            "last_recovery_action_at": now.isoformat(),
+                            "last_recovery_action": action,
+                        }
+                    )
             else:
                 updates = {"best_quote_maker_volume_net_loss_reduce_enabled": False}
                 if (
