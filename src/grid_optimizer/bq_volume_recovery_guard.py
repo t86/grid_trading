@@ -551,6 +551,7 @@ def check_symbol(
     cooldown_until = _parse_time(item.get("cooldown_until"))
     effective_near_market_flow = (
         _safe_float(volume_summary.get("gross_notional")) > 0
+        and _safe_float(volume_summary.get("gross_notional")) >= recover_floor
         and _safe_int(assessment.get("active_order_count")) > 0
         and _safe_int(assessment.get("near_market_order_count")) > 0
         and not bool(assessment.get("ineffective_orders"))

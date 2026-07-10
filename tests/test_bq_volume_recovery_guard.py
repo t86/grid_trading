@@ -725,7 +725,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["REUSDT"])
 
-    def test_keeps_loss_reduce_off_when_near_market_orders_are_still_filling(self) -> None:
+    def test_enables_loss_reduce_when_near_market_fills_stay_below_volume_floor(self) -> None:
         now = datetime(2026, 6, 26, 8, 12, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -764,6 +764,50 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
 
             control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
 
+            self.assertEqual(result["action"], "enable_allow_loss_reduce_only")
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_holds_near_market_flow_at_recovery_floor(self) -> None:
+        now = datetime(2026, 6, 26, 8, 12, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_inventory_bias_min_notional_gap": 200.0},
+                long_notional=990.0,
+                short_notional=850.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+                recent_trade_notional=70.0,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                recover_min_volume_notional=70,
+                trigger_seconds=120,
+                inventory_bias_relief_notional_margin=24,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+
             self.assertEqual(result["action"], "hold_effective_near_market_flow")
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, [])
@@ -784,7 +828,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 open_order_count=1,
                 active_order_count=1,
                 orders_near_market=True,
-                recent_trade_notional=70.0,
+                recent_trade_notional=120.0,
             )
             state: dict[str, object] = {
                 "symbols": {
