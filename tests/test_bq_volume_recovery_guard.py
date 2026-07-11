@@ -13,6 +13,7 @@ from unittest.mock import patch
 from grid_optimizer import bq_volume_recovery_guard
 from grid_optimizer.bq_volume_recovery_guard import (
     apply_daily_target_pace_floor,
+    apply_target_pace_cycle_budget_floor,
     check_symbol,
     fetch_recent_user_trades,
     recover_inactive_runner,
@@ -1262,6 +1263,155 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(result["action"], "raise_cycle_budget_for_volume")
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
             self.assertEqual(restarts, ["REUSDT"])
+
+    def test_target_pace_cycle_floor_raises_one_bounded_step(self) -> None:
+        now = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
+        rows = [
+            {
+                "id": 1,
+                "time": int((now - timedelta(hours=2)).timestamp() * 1000),
+                "quoteQty": "80000",
+            },
+            {
+                "id": 2,
+                "time": int((now - timedelta(minutes=30)).timestamp() * 1000),
+                "quoteQty": "4000",
+            },
+        ]
+        volume_summary = {
+            "required_hourly_notional": 11000.0,
+        }
+        floor = apply_target_pace_cycle_budget_floor(
+            volume_summary=volume_summary,
+            rows=rows,
+            now=now,
+            control={
+                "best_quote_maker_volume_cycle_budget_notional": 128.0,
+                "per_order_notional": 32.0,
+                "maker_order_notional": 32.0,
+                "buy_levels": 4,
+                "sell_levels": 4,
+            },
+            assessment={
+                "actual_long_notional": 400.0,
+                "actual_short_notional": 350.0,
+                "frozen_total_notional": 0.0,
+                "max_long_notional": 700.0,
+                "max_short_notional": 700.0,
+            },
+            static_floor_notional=108.0,
+            target_pace_fraction=0.9,
+            cycle_budget_increment=12.0,
+        )
+
+        self.assertEqual(floor, 192.0)
+        self.assertEqual(volume_summary["trailing_60m_gross_notional"], 4000.0)
+        self.assertEqual(volume_summary["target_cycle_budget_ladder_capacity"], 256.0)
+
+    def test_target_pace_budget_can_increase_during_bounded_loss_reduce(self) -> None:
+        now = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 108.0,
+                    "per_order_notional": 18.0,
+                    "maker_order_notional": 18.0,
+                    "buy_levels": 4,
+                    "sell_levels": 4,
+                },
+                long_notional=400.0,
+                short_notional=700.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {}
+            restarts: list[str] = []
+            rows = [
+                {
+                    "id": 1,
+                    "time": int((now - timedelta(hours=2)).timestamp() * 1000),
+                    "quoteQty": "80000",
+                },
+                {
+                    "id": 2,
+                    "time": int((now - timedelta(minutes=30)).timestamp() * 1000),
+                    "quoteQty": "3000",
+                },
+            ]
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                daily_target_notional=180000,
+                target_completion_buffer_seconds=10800,
+                cycle_budget_floor_notional=108,
+                volume_recovery_cycle_budget_increment=12,
+                trade_rows=rows,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "raise_target_pace_budget_during_loss_reduce")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 144.0)
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_target_pace_raise_respects_validation_safety_gate(self) -> None:
+        now = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 108.0,
+                    "per_order_notional": 18.0,
+                    "maker_order_notional": 18.0,
+                    "buy_levels": 4,
+                    "sell_levels": 4,
+                },
+                long_notional=400.0,
+                short_notional=350.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+            )
+            submit_path = output_dir / "reusdt_loop_latest_submit.json"
+            submit = json.loads(submit_path.read_text(encoding="utf-8"))
+            submit["validation"] = {"ok": False, "errors": ["invalid order"]}
+            _write_json(submit_path, submit)
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state={},
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                daily_target_notional=180000,
+                target_completion_buffer_seconds=10800,
+                cycle_budget_floor_notional=108,
+                trade_rows=[],
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "skip_recovery_safety_gate")
+            self.assertIn("latest_validation_failed", result["recovery_gate"]["reasons"])
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
+            self.assertEqual(restarts, [])
 
     def test_reapplies_non_loss_recovery_control_after_external_override(self) -> None:
         now = datetime(2026, 6, 26, 8, 25, tzinfo=timezone.utc)

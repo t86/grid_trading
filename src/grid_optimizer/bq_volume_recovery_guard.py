@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 from datetime import datetime, timedelta, timezone
+from math import ceil
 from pathlib import Path
 from typing import Any, Callable
 
@@ -236,6 +237,89 @@ def apply_daily_target_pace_floor(
         }
     )
     return effective_floor
+
+
+def apply_target_pace_cycle_budget_floor(
+    *,
+    volume_summary: dict[str, Any],
+    rows: list[dict[str, Any]],
+    now: datetime,
+    control: dict[str, Any],
+    assessment: dict[str, Any],
+    static_floor_notional: float,
+    target_pace_fraction: float,
+    cycle_budget_increment: float,
+) -> float:
+    static_floor = max(float(static_floor_notional), 0.0)
+    current_budget = max(_safe_float(control.get("best_quote_maker_volume_cycle_budget_notional")), 0.0)
+    required_hourly = max(_safe_float(volume_summary.get("required_hourly_notional")), 0.0)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    trailing_seconds = min(max((now - day_start).total_seconds(), 1.0), 3600.0)
+    trailing_summary = summarize_recent_volume(rows=rows, now=now, window_seconds=trailing_seconds)
+    trailing_gross = max(_safe_float(trailing_summary.get("gross_notional")), 0.0)
+    trailing_hourly = trailing_gross * 3600.0 / trailing_seconds
+    desired_hourly = required_hourly * max(float(target_pace_fraction), 0.0)
+    pace_ratio = desired_hourly / trailing_hourly if trailing_hourly > 0 else 4.0
+
+    volume_summary.update(
+        {
+            "trailing_60m_gross_notional": trailing_gross,
+            "trailing_60m_hourly_notional": trailing_hourly,
+            "target_cycle_budget_pace_ratio": pace_ratio,
+            "static_cycle_budget_floor_notional": static_floor,
+        }
+    )
+    if static_floor <= 0 or required_hourly <= 0 or trailing_hourly >= desired_hourly:
+        volume_summary["target_cycle_budget_floor_notional"] = static_floor
+        return static_floor
+
+    per_order = max(
+        _safe_float(control.get("per_order_notional")),
+        _safe_float(control.get("maker_order_notional")),
+    )
+    buy_levels = max(_safe_int(control.get("buy_levels")), 0)
+    sell_levels = max(_safe_int(control.get("sell_levels")), 0)
+    ladder_levels = min(value for value in (buy_levels, sell_levels) if value > 0) if buy_levels and sell_levels else 0
+    if current_budget <= 0 or per_order <= 0 or ladder_levels <= 0:
+        volume_summary["target_cycle_budget_floor_notional"] = static_floor
+        return static_floor
+
+    increment = max(float(cycle_budget_increment), 1.0)
+    raw_target = static_floor * max(pace_ratio, 1.0)
+    rounded_target = ceil(raw_target / increment) * increment
+    ladder_capacity = per_order * ladder_levels * 2.0
+    one_step_capacity = current_budget + max(increment, current_budget * 0.5)
+
+    frozen_total = max(_safe_float(assessment.get("frozen_total_notional")), 0.0)
+    use_actual = (
+        frozen_total <= 0
+        and assessment.get("actual_long_notional") is not None
+        and assessment.get("actual_short_notional") is not None
+    )
+    current_long = _safe_float(
+        assessment.get("actual_long_notional") if use_actual else assessment.get("current_long_notional")
+    )
+    current_short = _safe_float(
+        assessment.get("actual_short_notional") if use_actual else assessment.get("current_short_notional")
+    )
+    long_headroom = max(_safe_float(assessment.get("max_long_notional")) - current_long, 0.0)
+    short_headroom = max(_safe_float(assessment.get("max_short_notional")) - current_short, 0.0)
+    headroom_capacity = min(long_headroom, short_headroom) * 2.0
+
+    upper_bound = min(ladder_capacity, one_step_capacity)
+    if headroom_capacity > 0:
+        upper_bound = min(upper_bound, headroom_capacity)
+    upper_bound = max(upper_bound, current_budget, static_floor)
+    target_floor = max(static_floor, min(rounded_target, upper_bound))
+    volume_summary.update(
+        {
+            "target_cycle_budget_floor_notional": target_floor,
+            "target_cycle_budget_ladder_capacity": ladder_capacity,
+            "target_cycle_budget_headroom_capacity": headroom_capacity,
+            "target_cycle_budget_one_step_capacity": one_step_capacity,
+        }
+    )
+    return target_floor
 
 
 def _control_path(output_dir: Path, symbol: str) -> Path:
@@ -925,6 +1009,16 @@ def check_symbol(
         far_ticks=far_ticks,
         plan_stale_seconds=plan_stale_seconds,
     )
+    cycle_budget_floor_notional = apply_target_pace_cycle_budget_floor(
+        volume_summary=volume_summary,
+        rows=rows,
+        now=now,
+        control=control,
+        assessment=assessment,
+        static_floor_notional=cycle_budget_floor_notional,
+        target_pace_fraction=target_pace_fraction,
+        cycle_budget_increment=volume_recovery_cycle_budget_increment,
+    )
     item = _symbol_state(state, normalized_symbol)
     restart = restart_runner or (lambda item_symbol: _default_restart_runner(item_symbol, runner_wrapper=runner_wrapper))
     recover_floor = (
@@ -940,6 +1034,13 @@ def check_symbol(
     restart_failed: str | None = None
     status_reasons = set(assessment.get("reasons") or [])
     stale_or_missing = bool({"missing_control", "latest_plan_stale", "latest_submit_stale"} & status_reasons)
+    recovery_gate = _inactive_restart_gate(
+        control=control,
+        plan=plan,
+        submit=submit,
+        now=now,
+        max_snapshot_age_seconds=plan_stale_seconds,
+    )
     cooldown_until = _parse_time(item.get("cooldown_until"))
     effective_near_market_flow = (
         _safe_float(volume_summary.get("gross_notional")) > 0
@@ -986,8 +1087,8 @@ def check_symbol(
     try:
         if stale_or_missing and not recovery_timeout_required:
             action = "skip_stale_or_missing_inputs"
-        elif cooldown_until is not None and now < cooldown_until:
-            action = "cooldown"
+        elif not bool(recovery_gate.get("ok")) and not recovery_timeout_required:
+            action = "skip_recovery_safety_gate"
         elif (
             bool(assessment.get("low_volume"))
             and max(float(cycle_budget_floor_notional), 0.0)
@@ -1032,6 +1133,65 @@ def check_symbol(
                 dry_run=dry_run,
                 restart_runner=restart,
             )
+        elif (
+            bool(assessment.get("low_volume"))
+            and max(float(cycle_budget_floor_notional), 0.0)
+            > _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
+            and _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional")) > 0
+            and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and _safe_int(assessment.get("active_order_count")) > 0
+            and _safe_int(assessment.get("near_market_order_count")) > 0
+            and not bool(assessment.get("ineffective_orders"))
+            and not bool(assessment.get("volatility_entry_pause_active"))
+            and not (
+                recovery_has_original_controls
+                and recovery_hold_satisfied
+                and _recovery_inventory_buffer_ok(
+                    assessment,
+                    recover_cap_ratio=recover_cap_ratio,
+                    original_controls=recovery_original_controls,
+                )
+            )
+        ):
+            budget_floor = max(float(cycle_budget_floor_notional), 0.0)
+            updates = {
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "best_quote_maker_volume_cycle_budget_notional": budget_floor,
+            }
+            _remember_recovery_controls(
+                item,
+                control,
+                ("best_quote_maker_volume_cycle_budget_notional",),
+            )
+            _remember_recovery_updates(
+                item,
+                {"best_quote_maker_volume_cycle_budget_notional": budget_floor},
+            )
+            action = (
+                "dry_run_raise_target_pace_budget_during_loss_reduce"
+                if dry_run
+                else "raise_target_pace_budget_during_loss_reduce"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif cooldown_until is not None and now < cooldown_until:
+            action = "cooldown"
         elif recovery_has_original_controls and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only")):
             cap_buffer_ok = _recovery_inventory_buffer_ok(
                 assessment,
@@ -1925,6 +2085,7 @@ def check_symbol(
         "backup_path": backup_path,
         "dry_run": dry_run,
         "restart_failed": restart_failed,
+        "recovery_gate": recovery_gate,
         "volume_summary": volume_summary,
         "assessment": assessment,
     }
