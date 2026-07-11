@@ -677,6 +677,21 @@ def assess_symbol(
     volatility_entry_pause_active = bool(
         volatility_entry_pause.get("active") if isinstance(volatility_entry_pause, dict) else False
     )
+    active_pair_reduce = (
+        plan.get("best_quote_active_pair_reduce")
+        if isinstance(plan.get("best_quote_active_pair_reduce"), dict)
+        else {}
+    )
+    active_pair_reduce_suppression_deadlock = (
+        bool(active_pair_reduce.get("enabled"))
+        and bool(active_pair_reduce.get("active"))
+        and str(active_pair_reduce.get("reason") or "") == "no_valid_reduce_order"
+        and _safe_int(active_pair_reduce.get("order_count")) <= 0
+        and _safe_int(active_pair_reduce.get("suppressed_entry_order_count")) > 0
+        and active_count <= 0
+    )
+    if active_pair_reduce_suppression_deadlock:
+        reasons.append("active_pair_reduce_suppression_deadlock")
 
     return {
         "symbol": symbol,
@@ -705,6 +720,7 @@ def assess_symbol(
         "pause_reasons": sorted(pause_reasons),
         "one_sided_inventory_bias": one_sided_inventory_bias,
         "volatility_entry_pause_active": volatility_entry_pause_active,
+        "active_pair_reduce_suppression_deadlock": active_pair_reduce_suppression_deadlock,
         "current_long_notional": current_long,
         "current_short_notional": current_short,
         "actual_long_notional": actual_long,
@@ -948,6 +964,22 @@ def _parse_symbol_notionals(items: list[str]) -> dict[str, float]:
     return values
 
 
+def _parse_symbol_pause_baselines(items: list[str]) -> dict[str, tuple[float, float]]:
+    values: dict[str, tuple[float, float]] = {}
+    for item in items:
+        for token in str(item).split(","):
+            raw_symbol, separator, raw_pair = token.strip().partition("=")
+            normalized_symbol = raw_symbol.upper().strip()
+            if not separator or not normalized_symbol:
+                continue
+            raw_long, pair_separator, raw_short = raw_pair.partition(":")
+            long_value = _safe_float(raw_long, -1.0)
+            short_value = _safe_float(raw_short if pair_separator else raw_long, -1.0)
+            if long_value > 0 and short_value > 0:
+                values[normalized_symbol] = (long_value, short_value)
+    return values
+
+
 def check_symbol(
     *,
     symbol: str,
@@ -976,6 +1008,8 @@ def check_symbol(
     inventory_bias_relief_notional_margin: float = 24.0,
     volume_recovery_cycle_budget_increment: float = 12.0,
     cycle_budget_floor_notional: float = 0.0,
+    pause_baseline_long_notional: float = 0.0,
+    pause_baseline_short_notional: float = 0.0,
     trade_rows: list[dict[str, Any]] | None = None,
     volume_source: str = "local_audit",
     dry_run: bool = False,
@@ -1030,6 +1064,15 @@ def check_symbol(
         cycle_budget_increment=volume_recovery_cycle_budget_increment,
     )
     item = _symbol_state(state, normalized_symbol)
+    original_controls = item.get("guard_original_controls")
+    if isinstance(original_controls, dict):
+        for key, baseline in (
+            ("pause_buy_position_notional", pause_baseline_long_notional),
+            ("pause_short_position_notional", pause_baseline_short_notional),
+        ):
+            if baseline > 0 and _safe_float(original_controls.get(key)) < baseline:
+                original_controls[key] = baseline
+        item["guard_original_controls"] = original_controls
     restart = restart_runner or (lambda item_symbol: _default_restart_runner(item_symbol, runner_wrapper=runner_wrapper))
     recover_floor = (
         float(recover_min_volume_notional)
@@ -1093,6 +1136,14 @@ def check_symbol(
         last_recovery_action_at is not None
         and (now - last_recovery_action_at).total_seconds() < max(float(recovery_reapply_min_seconds), 0.0)
     )
+    pause_baseline_updates: dict[str, Any] = {}
+    if not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only")):
+        for key, baseline in (
+            ("pause_buy_position_notional", pause_baseline_long_notional),
+            ("pause_short_position_notional", pause_baseline_short_notional),
+        ):
+            if baseline > 0 and _safe_float(control.get(key)) < baseline:
+                pause_baseline_updates[key] = baseline
     loss_reduce_cycle_budget_cap = max(
         static_cycle_budget_floor_notional,
         max(
@@ -1107,6 +1158,59 @@ def check_symbol(
             action = "skip_stale_or_missing_inputs"
         elif not bool(recovery_gate.get("ok")) and not recovery_timeout_required:
             action = "skip_recovery_safety_gate"
+        elif bool(assessment.get("active_pair_reduce_suppression_deadlock")):
+            updates = {
+                "best_quote_maker_volume_active_pair_reduce_enabled": False,
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+            }
+            _remember_recovery_controls(
+                item,
+                control,
+                ("best_quote_maker_volume_active_pair_reduce_enabled",),
+            )
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_disable_stalled_active_pair_reduce_suppression"
+                if dry_run
+                else "disable_stalled_active_pair_reduce_suppression"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif pause_baseline_updates:
+            updates = {
+                **pause_baseline_updates,
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+            }
+            action = (
+                "dry_run_restore_pause_baseline_after_recovery_drift"
+                if dry_run
+                else "restore_pause_baseline_after_recovery_drift"
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
         elif (
             bool(assessment.get("low_volume"))
             and max(float(cycle_budget_floor_notional), 0.0)
@@ -1126,7 +1230,15 @@ def check_symbol(
             _remember_recovery_controls(
                 item,
                 control,
-                ("best_quote_maker_volume_cycle_budget_notional",),
+                tuple(
+                    key
+                    for key in updates
+                    if key
+                    not in {
+                        "best_quote_maker_volume_allow_loss_reduce_only",
+                        "best_quote_maker_volume_net_loss_reduce_enabled",
+                    }
+                ),
             )
             _remember_recovery_updates(
                 item,
@@ -2157,6 +2269,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--inventory-bias-relief-notional-margin", type=float, default=24.0)
     parser.add_argument("--volume-recovery-cycle-budget-increment", type=float, default=12.0)
     parser.add_argument("--cycle-budget-floors", nargs="*", default=[])
+    parser.add_argument("--pause-baselines", nargs="*", default=[])
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
@@ -2167,6 +2280,7 @@ def main(argv: list[str] | None = None) -> int:
     now = datetime.now(timezone.utc)
     daily_targets = _parse_symbol_notionals(args.daily_targets)
     cycle_budget_floors = _parse_symbol_notionals(args.cycle_budget_floors)
+    pause_baselines = _parse_symbol_pause_baselines(args.pause_baselines)
     results = []
     exit_code = 0
     for symbol in _normalize_symbols(args.symbols):
@@ -2242,6 +2356,8 @@ def main(argv: list[str] | None = None) -> int:
             inventory_bias_relief_notional_margin=args.inventory_bias_relief_notional_margin,
             volume_recovery_cycle_budget_increment=args.volume_recovery_cycle_budget_increment,
             cycle_budget_floor_notional=cycle_budget_floors.get(symbol, 0.0),
+            pause_baseline_long_notional=pause_baselines.get(symbol, (0.0, 0.0))[0],
+            pause_baseline_short_notional=pause_baselines.get(symbol, (0.0, 0.0))[1],
             trade_rows=trade_rows,
             volume_source="exchange_user_trades",
             dry_run=args.dry_run,
