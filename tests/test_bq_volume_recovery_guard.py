@@ -838,6 +838,10 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["pause_short_position_notional"], 800.0)
             self.assertEqual(state["symbols"]["REUSDT"]["status"], "normal")
             self.assertIn("cooldown_until", state["symbols"]["REUSDT"])
+            self.assertEqual(
+                state["symbols"]["REUSDT"]["post_restore_budget_cooldown_until"],
+                state["symbols"]["REUSDT"]["cooldown_until"],
+            )
             self.assertEqual(restarts, ["REUSDT"])
 
     def test_frozen_inventory_prevents_actual_position_recovery_fallback(self) -> None:
@@ -1896,6 +1900,59 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 120.0)
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["REUSDT"])
+
+    def test_post_restore_cooldown_blocks_target_pace_budget_raise(self) -> None:
+        now = datetime(2026, 7, 11, 12, 14, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 108.0,
+                    "pause_buy_position_notional": 800.0,
+                    "pause_short_position_notional": 800.0,
+                },
+                long_notional=500.0,
+                short_notional=450.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+                recent_trade_notional=20.0,
+            )
+            cooldown_until = (now + timedelta(minutes=5)).isoformat()
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "normal",
+                        "cooldown_until": cooldown_until,
+                        "post_restore_budget_cooldown_until": cooldown_until,
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                daily_target_notional=10_000.0,
+                target_pace_fraction=1.05,
+                target_pace_max_multiplier=1.0,
+                cycle_budget_floor_notional=108.0,
+                volume_recovery_cycle_budget_increment=12.0,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertNotEqual(result["action"], "raise_cycle_budget_for_volume")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
+            self.assertEqual(restarts, [])
 
     def test_keeps_loss_reduce_eligible_when_frozen_inventory_exists(self) -> None:
         now = datetime(2026, 7, 11, 12, 15, tzinfo=timezone.utc)

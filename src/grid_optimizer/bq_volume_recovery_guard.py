@@ -1102,9 +1102,12 @@ def _set_post_restore_cooldown(
     item.update({"last_normal_at": now.isoformat()})
     item.update({"status": "normal"})
     if seconds > 0:
-        item["cooldown_until"] = (now + timedelta(seconds=seconds)).isoformat()
+        cooldown_until = (now + timedelta(seconds=seconds)).isoformat()
+        item["cooldown_until"] = cooldown_until
+        item["post_restore_budget_cooldown_until"] = cooldown_until
     else:
         item.pop("cooldown_until", None)
+        item.pop("post_restore_budget_cooldown_until", None)
 
 
 def _normalize_symbols(items: list[str]) -> list[str]:
@@ -1273,6 +1276,11 @@ def check_symbol(
         max_snapshot_age_seconds=plan_stale_seconds,
     )
     cooldown_until = _parse_time(item.get("cooldown_until"))
+    post_restore_budget_cooldown_until = _parse_time(item.get("post_restore_budget_cooldown_until"))
+    post_restore_budget_cooldown_active = (
+        post_restore_budget_cooldown_until is not None
+        and now < post_restore_budget_cooldown_until
+    )
     effective_near_market_flow = (
         _safe_float(volume_summary.get("gross_notional")) > 0
         and _safe_float(volume_summary.get("gross_notional")) >= recover_floor
@@ -1454,6 +1462,7 @@ def check_symbol(
             )
         elif (
             recovery_low_volume
+            and not post_restore_budget_cooldown_active
             and max(float(cycle_budget_floor_notional), 0.0)
             > _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
             and _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional")) > 0
@@ -2312,6 +2321,7 @@ def check_symbol(
                 not bool(assessment.get("near_cap"))
                 and not bool(assessment.get("ineffective_orders"))
                 and "inventory_bias" not in set(assessment.get("pause_reasons") or [])
+                and not post_restore_budget_cooldown_active
             ):
                 current_budget = _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
                 increment = max(float(volume_recovery_cycle_budget_increment), 0.0)
