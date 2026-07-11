@@ -14,6 +14,7 @@ from grid_optimizer import bq_volume_recovery_guard
 from grid_optimizer.bq_volume_recovery_guard import (
     check_symbol,
     fetch_recent_user_trades,
+    recover_inactive_runner,
     summarize_recent_volume,
 )
 
@@ -153,8 +154,9 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             event = json.loads(
                 (output_dir / "bq_volume_recovery_guard_events.jsonl").read_text(encoding="utf-8")
             )
-            self.assertEqual(payload["results"][0]["action"], "skip_runner_inactive")
-            self.assertEqual(event["action"], "skip_runner_inactive")
+            self.assertEqual(payload["results"][0]["action"], "skip_runner_inactive_safety_gate")
+            self.assertEqual(event["action"], "skip_runner_inactive_safety_gate")
+            self.assertIn("missing_control", event["inactive_restart_gate"]["reasons"])
 
     def test_recent_volume_deduplicates_exchange_trade_ids(self) -> None:
         now = datetime(2026, 6, 26, 7, 0, tzinfo=timezone.utc)
@@ -168,6 +170,88 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
 
         self.assertEqual(summary["trade_count"], 2)
         self.assertEqual(summary["gross_notional"], 70.0)
+
+    def test_inactive_runner_restarts_after_safe_confirmation(self) -> None:
+        now = datetime(2026, 6, 26, 7, 0, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "run_start_time": (now - timedelta(hours=1)).isoformat(),
+                    "run_end_time": (now + timedelta(hours=1)).isoformat(),
+                },
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "first_inactive_at": (now - timedelta(seconds=130)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = recover_inactive_runner(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                trigger_seconds=120,
+                restart_cooldown_seconds=600,
+                max_snapshot_age_seconds=300,
+                runner_wrapper="/usr/local/bin/grid-saved-runner",
+                dry_run=False,
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(result["action"], "restart_runner_inactive")
+            self.assertTrue(result["inactive_restart_gate"]["ok"])
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_inactive_runner_does_not_restart_outside_run_window(self) -> None:
+        now = datetime(2026, 6, 26, 7, 0, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "run_start_time": (now - timedelta(hours=2)).isoformat(),
+                    "run_end_time": (now - timedelta(seconds=1)).isoformat(),
+                },
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "first_inactive_at": (now - timedelta(seconds=130)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = recover_inactive_runner(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                trigger_seconds=120,
+                restart_cooldown_seconds=600,
+                max_snapshot_age_seconds=300,
+                runner_wrapper="/usr/local/bin/grid-saved-runner",
+                dry_run=False,
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(result["action"], "skip_runner_inactive_safety_gate")
+            self.assertIn("after_run_window", result["inactive_restart_gate"]["reasons"])
+            self.assertEqual(restarts, [])
 
     def test_fetch_recent_user_trades_pages_and_deduplicates_ids(self) -> None:
         now = datetime(2026, 6, 26, 7, 0, tzinfo=timezone.utc)
@@ -1341,6 +1425,98 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(result["action"], "restart_failed")
             self.assertEqual(item["status"], "recovery_active")
             self.assertEqual(item["recovery_started_at"], now.isoformat())
+
+    def test_recovery_holds_before_restoring_controls(self) -> None:
+        now = datetime(2026, 6, 26, 9, 10, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_allow_loss_reduce_only": True},
+                long_notional=800.0,
+                short_notional=700.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+                recent_trade_notional=80.0,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_started_at": (now - timedelta(seconds=60)).isoformat(),
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_allow_loss_reduce_only": False,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                recover_min_volume_notional=10,
+                recovery_min_hold_seconds=120,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "hold_recovery_min_duration")
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, [])
+
+    def test_recovery_control_drift_is_debounced(self) -> None:
+        now = datetime(2026, 6, 26, 9, 20, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_cycle_budget_notional": 48.0},
+                long_notional=800.0,
+                short_notional=700.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_started_at": (now - timedelta(seconds=60)).isoformat(),
+                        "last_recovery_action_at": (now - timedelta(seconds=60)).isoformat(),
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 48.0,
+                        },
+                        "guard_recovery_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 60.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                recovery_reapply_min_seconds=180,
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(result["action"], "hold_recovery_control_drift_debounce")
+            self.assertEqual(restarts, [])
 
 
 if __name__ == "__main__":

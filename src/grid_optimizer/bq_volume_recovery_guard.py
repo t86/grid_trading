@@ -475,6 +475,162 @@ def _runner_is_active(symbol: str) -> bool:
     )
 
 
+def _clear_inactive_observation(item: dict[str, Any]) -> None:
+    for key in ("first_inactive_at", "last_inactive_at", "inactive_gate_reasons"):
+        item.pop(key, None)
+
+
+def _inactive_restart_gate(
+    *,
+    control: dict[str, Any],
+    plan: dict[str, Any],
+    submit: dict[str, Any],
+    now: datetime,
+    max_snapshot_age_seconds: float,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    if not control:
+        reasons.append("missing_control")
+
+    run_start = _parse_time(control.get("run_start_time"))
+    run_end = _parse_time(control.get("run_end_time"))
+    if run_start is not None and now < run_start:
+        reasons.append("before_run_window")
+    if run_end is not None and now >= run_end:
+        reasons.append("after_run_window")
+
+    if not _plan_time_is_fresh(plan, now=now, max_age_seconds=max_snapshot_age_seconds):
+        reasons.append("latest_plan_stale")
+    if not _plan_time_is_fresh(submit, now=now, max_age_seconds=max_snapshot_age_seconds):
+        reasons.append("latest_submit_stale")
+
+    stop_reason = str(plan.get("stop_reason") or submit.get("stop_reason") or "").strip()
+    runtime_status = str(plan.get("runtime_status") or submit.get("runtime_status") or "").strip().lower()
+    if stop_reason:
+        reasons.append("explicit_stop_reason")
+    if runtime_status in {"stopped", "complete", "completed", "after_end_window", "target_reached"}:
+        reasons.append(f"runtime_status_{runtime_status}")
+    if submit.get("error"):
+        reasons.append("latest_submit_error")
+
+    validation = submit.get("validation") if isinstance(submit.get("validation"), dict) else {}
+    if validation.get("ok") is False or list(validation.get("errors") or []):
+        reasons.append("latest_validation_failed")
+
+    observed = (
+        submit.get("observed_strategy_open_order_state", {})
+        if isinstance(submit.get("observed_strategy_open_order_state"), dict)
+        else {}
+    )
+    plan_summary = submit.get("plan_summary", {}) if isinstance(submit.get("plan_summary"), dict) else {}
+    planned_open = max(
+        _safe_int(plan.get("open_order_count")),
+        _safe_int(plan.get("total_open_order_count")),
+        _safe_int(plan_summary.get("open_order_count")),
+    )
+    observed_open = _safe_int(observed.get("active_order_count"))
+    open_order_drift = abs(observed_open - planned_open)
+    if open_order_drift > 10:
+        reasons.append("open_order_reconcile_drift_gt_10")
+
+    return {
+        "ok": not reasons,
+        "reasons": reasons,
+        "run_start_time": run_start.isoformat() if run_start else None,
+        "run_end_time": run_end.isoformat() if run_end else None,
+        "planned_open_order_count": planned_open,
+        "observed_open_order_count": observed_open,
+        "open_order_drift": open_order_drift,
+    }
+
+
+def recover_inactive_runner(
+    *,
+    symbol: str,
+    output_dir: Path,
+    state: dict[str, Any],
+    now: datetime,
+    trigger_seconds: float,
+    restart_cooldown_seconds: float,
+    max_snapshot_age_seconds: float,
+    runner_wrapper: str,
+    dry_run: bool,
+    restart_runner: RestartRunner | None = None,
+) -> dict[str, Any]:
+    normalized_symbol = symbol.upper().strip()
+    output_dir = Path(output_dir)
+    item = _symbol_state(state, normalized_symbol)
+    first_inactive = _parse_time(item.get("first_inactive_at")) or now
+    elapsed = max((now - first_inactive).total_seconds(), 0.0)
+    item.update(
+        {
+            "first_inactive_at": first_inactive.isoformat(),
+            "last_inactive_at": now.isoformat(),
+        }
+    )
+    gate = _inactive_restart_gate(
+        control=_read_json(_control_path(output_dir, normalized_symbol)),
+        plan=_read_json(_plan_path(output_dir, normalized_symbol)),
+        submit=_read_json(_submit_path(output_dir, normalized_symbol)),
+        now=now,
+        max_snapshot_age_seconds=max_snapshot_age_seconds,
+    )
+    item["inactive_gate_reasons"] = list(gate["reasons"])
+    action = "wait_runner_inactive_confirmation"
+    restart_failed: str | None = None
+
+    last_restart_at = _parse_time(item.get("last_inactive_restart_at"))
+    restart_cooldown_active = (
+        last_restart_at is not None
+        and (now - last_restart_at).total_seconds() < max(float(restart_cooldown_seconds), 0.0)
+    )
+    if not gate["ok"]:
+        action = "skip_runner_inactive_safety_gate"
+    elif restart_cooldown_active:
+        action = "runner_inactive_restart_cooldown"
+    elif elapsed >= max(float(trigger_seconds), 0.0):
+        if dry_run:
+            action = "dry_run_restart_runner_inactive"
+        else:
+            restart = restart_runner or (
+                lambda item_symbol: _default_restart_runner(item_symbol, runner_wrapper=runner_wrapper)
+            )
+            try:
+                restart(normalized_symbol)
+                action = "restart_runner_inactive"
+                item["last_inactive_restart_at"] = now.isoformat()
+                item["status"] = "runner_restart_requested"
+            except subprocess.CalledProcessError as exc:
+                action = "restart_runner_inactive_failed"
+                restart_failed = str(exc)
+
+    return {
+        "symbol": normalized_symbol,
+        "action": action,
+        "changed_keys": [],
+        "backup_path": None,
+        "dry_run": dry_run,
+        "restart_failed": restart_failed,
+        "inactive_seconds": elapsed,
+        "inactive_restart_gate": gate,
+    }
+
+
+def _set_post_restore_cooldown(
+    item: dict[str, Any],
+    *,
+    now: datetime,
+    cooldown_seconds: float,
+) -> None:
+    seconds = max(float(cooldown_seconds), 0.0)
+    item.update({"last_normal_at": now.isoformat()})
+    item.update({"status": "normal"})
+    if seconds > 0:
+        item["cooldown_until"] = (now + timedelta(seconds=seconds)).isoformat()
+    else:
+        item.pop("cooldown_until", None)
+
+
 def _normalize_symbols(items: list[str]) -> list[str]:
     symbols: list[str] = []
     for item in items:
@@ -502,6 +658,9 @@ def check_symbol(
     allow_inventory_cost_gate_disable: bool = True,
     max_recovery_seconds: float = 300.0,
     cooldown_seconds: float = 600.0,
+    recovery_min_hold_seconds: float = 120.0,
+    recovery_reapply_min_seconds: float = 180.0,
+    post_restore_cooldown_seconds: float = 300.0,
     inventory_bias_relief_notional_margin: float = 24.0,
     volume_recovery_cycle_budget_increment: float = 12.0,
     trade_rows: list[dict[str, Any]] | None = None,
@@ -576,6 +735,15 @@ def check_symbol(
     recovery_timeout_required = recovery_timed_out and (
         recovery_has_original_controls or bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
     )
+    recovery_hold_satisfied = (
+        recovery_started_at is None
+        or (now - recovery_started_at).total_seconds() >= max(float(recovery_min_hold_seconds), 0.0)
+    )
+    last_recovery_action_at = _parse_time(item.get("last_recovery_action_at"))
+    recovery_reapply_debounced = (
+        last_recovery_action_at is not None
+        and (now - last_recovery_action_at).total_seconds() < max(float(recovery_reapply_min_seconds), 0.0)
+    )
 
     try:
         if stale_or_missing and not recovery_timeout_required:
@@ -627,6 +795,7 @@ def check_symbol(
             elif (
                 drifted_updates
                 and effective_near_market_flow
+                and recovery_hold_satisfied
                 and bool(recovery_expected_controls.get("best_quote_maker_volume_allow_loss_reduce_only"))
                 and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             ):
@@ -645,11 +814,18 @@ def check_symbol(
                     if dry_run
                     else "abandon_loss_reduce_for_effective_flow"
                 )
-                item.update({"status": "normal", "last_normal_at": now.isoformat()})
+                _set_post_restore_cooldown(
+                    item,
+                    now=now,
+                    cooldown_seconds=post_restore_cooldown_seconds,
+                )
                 item.pop("guard_original_controls", None)
                 item.pop("guard_recovery_controls", None)
                 item.pop("recovery_started_at", None)
                 item.pop("recovery_owned", None)
+            elif drifted_updates and not restore_ready and recovery_reapply_debounced:
+                action = "hold_recovery_control_drift_debounce"
+                item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
             elif drifted_updates and not restore_ready:
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
@@ -673,6 +849,9 @@ def check_symbol(
                         "last_recovery_action": action,
                     }
                 )
+            elif restore_ready and not recovery_hold_satisfied:
+                action = "hold_recovery_min_duration"
+                item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
             elif restore_ready:
                 updates = _restore_recovery_controls(item)
                 changed, backup_path = _apply_control_update(
@@ -685,7 +864,11 @@ def check_symbol(
                     restart_runner=restart,
                 )
                 action = "dry_run_restore_recovery_controls" if dry_run else "restore_recovery_controls"
-                item.update({"status": "normal", "last_normal_at": now.isoformat()})
+                _set_post_restore_cooldown(
+                    item,
+                    now=now,
+                    cooldown_seconds=post_restore_cooldown_seconds,
+                )
                 item.pop("guard_original_controls", None)
                 item.pop("guard_recovery_controls", None)
                 item.pop("recovery_started_at", None)
@@ -774,7 +957,10 @@ def check_symbol(
                 and _safe_int(assessment.get("near_market_order_count")) > 0
                 and cap_buffer_ok
             )
-            if restore_ready:
+            if restore_ready and not recovery_hold_satisfied:
+                action = "hold_recovery_min_duration"
+                item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+            elif restore_ready:
                 has_original_controls = bool(item.get("guard_original_controls"))
                 updates = _restore_recovery_controls(item)
                 changed, backup_path = _apply_control_update(
@@ -790,7 +976,11 @@ def check_symbol(
                     action = "dry_run_restore_recovery_controls" if dry_run else "restore_recovery_controls"
                 else:
                     action = "dry_run_disable_allow_loss_after_recovery" if dry_run else "disable_allow_loss_after_recovery"
-                item.update({"status": "normal", "last_normal_at": now.isoformat()})
+                _set_post_restore_cooldown(
+                    item,
+                    now=now,
+                    cooldown_seconds=post_restore_cooldown_seconds,
+                )
                 item.pop("guard_original_controls", None)
                 item.pop("guard_recovery_controls", None)
                 item.pop("recovery_started_at", None)
@@ -1013,6 +1203,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-inventory-cost-gate-disable", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-recovery-seconds", type=float, default=300.0)
     parser.add_argument("--cooldown-seconds", type=float, default=600.0)
+    parser.add_argument("--recovery-min-hold-seconds", type=float, default=120.0)
+    parser.add_argument("--recovery-reapply-min-seconds", type=float, default=180.0)
+    parser.add_argument("--post-restore-cooldown-seconds", type=float, default=300.0)
+    parser.add_argument("--inactive-trigger-seconds", type=float, default=120.0)
+    parser.add_argument("--inactive-restart-cooldown-seconds", type=float, default=600.0)
+    parser.add_argument("--inactive-max-snapshot-age-seconds", type=float, default=300.0)
     parser.add_argument("--inventory-bias-relief-notional-margin", type=float, default=24.0)
     parser.add_argument("--volume-recovery-cycle-budget-increment", type=float, default=12.0)
     parser.add_argument("--dry-run", action="store_true")
@@ -1027,20 +1223,26 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 0
     for symbol in _normalize_symbols(args.symbols):
         if not _runner_is_active(symbol):
-            result = {
-                "symbol": symbol,
-                "action": "skip_runner_inactive",
-                "changed_keys": [],
-                "backup_path": None,
-                "dry_run": args.dry_run,
-                "restart_failed": None,
-            }
+            result = recover_inactive_runner(
+                symbol=symbol,
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                trigger_seconds=args.inactive_trigger_seconds,
+                restart_cooldown_seconds=args.inactive_restart_cooldown_seconds,
+                max_snapshot_age_seconds=args.inactive_max_snapshot_age_seconds,
+                runner_wrapper=args.runner_wrapper,
+                dry_run=args.dry_run,
+            )
             _append_jsonl(
                 output_dir / "bq_volume_recovery_guard_events.jsonl",
                 {"ts": now.isoformat(), **result},
             )
             results.append(result)
+            if result.get("restart_failed"):
+                exit_code = 1
             continue
+        _clear_inactive_observation(_symbol_state(state, symbol))
         try:
             trade_rows = _fetch_exchange_user_trades(
                 symbol=symbol,
@@ -1077,6 +1279,9 @@ def main(argv: list[str] | None = None) -> int:
             allow_inventory_cost_gate_disable=args.allow_inventory_cost_gate_disable,
             max_recovery_seconds=args.max_recovery_seconds,
             cooldown_seconds=args.cooldown_seconds,
+            recovery_min_hold_seconds=args.recovery_min_hold_seconds,
+            recovery_reapply_min_seconds=args.recovery_reapply_min_seconds,
+            post_restore_cooldown_seconds=args.post_restore_cooldown_seconds,
             inventory_bias_relief_notional_margin=args.inventory_bias_relief_notional_margin,
             volume_recovery_cycle_budget_increment=args.volume_recovery_cycle_budget_increment,
             trade_rows=trade_rows,
