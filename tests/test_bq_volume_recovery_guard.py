@@ -1492,6 +1492,115 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(control["best_quote_maker_volume_active_pair_reduce_enabled"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_disables_stale_soft_pair_reduce_after_actual_inventory_recovers(self) -> None:
+        now = datetime(2026, 7, 11, 12, 12, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_active_pair_reduce_enabled": True,
+                    "pause_buy_position_notional": 740.0,
+                    "pause_short_position_notional": 740.0,
+                },
+                long_notional=760.0,
+                short_notional=510.0,
+                open_order_count=1,
+                active_order_count=1,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 300.0,
+                    "actual_short_notional": 510.0,
+                    "frozen_long_notional": 0.0,
+                    "frozen_short_notional": 0.0,
+                }
+            }
+            plan["best_quote_active_pair_reduce"] = {
+                "enabled": True,
+                "active": True,
+                "reason": "soft_pair_reduce",
+                "order_count": 1,
+                "normal_entry_suppressed": True,
+                "suppressed_entry_order_count": 2,
+                "completed": False,
+            }
+            _write_json(plan_path, plan)
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state={},
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "disable_stalled_active_pair_reduce_suppression")
+            self.assertTrue(result["assessment"]["active_pair_reduce_below_soft_deadlock"])
+            self.assertFalse(control["best_quote_maker_volume_active_pair_reduce_enabled"])
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_keeps_soft_pair_reduce_when_actual_inventory_is_not_below_soft(self) -> None:
+        now = datetime(2026, 7, 11, 12, 13, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_active_pair_reduce_enabled": True,
+                    "pause_buy_position_notional": 740.0,
+                    "pause_short_position_notional": 740.0,
+                },
+                long_notional=760.0,
+                short_notional=510.0,
+                open_order_count=1,
+                active_order_count=1,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 760.0,
+                    "actual_short_notional": 510.0,
+                    "frozen_long_notional": 0.0,
+                    "frozen_short_notional": 0.0,
+                }
+            }
+            plan["best_quote_active_pair_reduce"] = {
+                "enabled": True,
+                "active": True,
+                "reason": "soft_pair_reduce",
+                "order_count": 1,
+                "normal_entry_suppressed": True,
+                "suppressed_entry_order_count": 2,
+                "completed": False,
+            }
+            _write_json(plan_path, plan)
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state={},
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                restart_runner=lambda _: None,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertFalse(result["assessment"]["active_pair_reduce_below_soft_deadlock"])
+            self.assertTrue(control["best_quote_maker_volume_active_pair_reduce_enabled"])
+
     def test_does_not_enable_loss_reduce_when_hourly_target_pace_is_ahead(self) -> None:
         now = datetime(2026, 7, 11, 12, 15, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

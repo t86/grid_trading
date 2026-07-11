@@ -690,7 +690,26 @@ def assess_symbol(
         and _safe_int(active_pair_reduce.get("suppressed_entry_order_count")) > 0
         and active_count <= 0
     )
-    if active_pair_reduce_suppression_deadlock:
+    active_pair_reduce_below_soft_deadlock = (
+        bool(active_pair_reduce.get("enabled"))
+        and bool(active_pair_reduce.get("active"))
+        and str(active_pair_reduce.get("reason") or "") == "soft_pair_reduce"
+        and bool(active_pair_reduce.get("normal_entry_suppressed"))
+        and _safe_int(active_pair_reduce.get("suppressed_entry_order_count")) > 0
+        and not bool(active_pair_reduce.get("completed"))
+        and _safe_int(active_pair_reduce.get("order_count")) <= 1
+        and active_count <= 1
+        and low_volume
+        and actual_long is not None
+        and actual_short is not None
+        and long_soft > 0
+        and short_soft > 0
+        and actual_long < long_soft
+        and actual_short < short_soft
+        and frozen_total <= 0
+        and (current_long >= long_soft or current_short >= short_soft)
+    )
+    if active_pair_reduce_suppression_deadlock or active_pair_reduce_below_soft_deadlock:
         reasons.append("active_pair_reduce_suppression_deadlock")
 
     return {
@@ -721,6 +740,7 @@ def assess_symbol(
         "one_sided_inventory_bias": one_sided_inventory_bias,
         "volatility_entry_pause_active": volatility_entry_pause_active,
         "active_pair_reduce_suppression_deadlock": active_pair_reduce_suppression_deadlock,
+        "active_pair_reduce_below_soft_deadlock": active_pair_reduce_below_soft_deadlock,
         "current_long_notional": current_long,
         "current_short_notional": current_short,
         "actual_long_notional": actual_long,
@@ -1165,7 +1185,9 @@ def check_symbol(
             action = "skip_stale_or_missing_inputs"
         elif not bool(recovery_gate.get("ok")) and not recovery_timeout_required:
             action = "skip_recovery_safety_gate"
-        elif bool(assessment.get("active_pair_reduce_suppression_deadlock")):
+        elif bool(assessment.get("active_pair_reduce_suppression_deadlock")) or bool(
+            assessment.get("active_pair_reduce_below_soft_deadlock")
+        ):
             updates = {
                 "best_quote_maker_volume_active_pair_reduce_enabled": False,
                 "best_quote_maker_volume_net_loss_reduce_enabled": False,
