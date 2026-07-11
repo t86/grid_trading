@@ -34,6 +34,37 @@ def _append_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class BqVolumeRecoveryGuardTests(unittest.TestCase):
+    def test_main_never_restarts_symbol_after_target_gate_done(self) -> None:
+        now = datetime.now(timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            marker = output_dir / f"arxusdt_target_gate_done_{now.strftime('%Y%m%d')}.flag"
+            marker.write_text(now.isoformat(), encoding="utf-8")
+            stdout = StringIO()
+
+            with (
+                patch.object(bq_volume_recovery_guard, "_runner_is_active") as runner_active,
+                patch.object(bq_volume_recovery_guard, "_fetch_exchange_user_trades") as fetch_trades,
+                redirect_stdout(stdout),
+            ):
+                exit_code = bq_volume_recovery_guard.main(
+                    [
+                        "--output-dir",
+                        str(output_dir),
+                        "--state-path",
+                        str(output_dir / "state.json"),
+                        "--symbols",
+                        "ARXUSDT",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            runner_active.assert_not_called()
+            fetch_trades.assert_not_called()
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["results"][0]["action"], "skip_target_gate_done_terminal")
+            self.assertEqual(payload["results"][0]["target_gate_done_marker"], str(marker.resolve()))
+
     def test_restores_persistent_corrupt_state_from_recent_valid_backup(self) -> None:
         now = datetime(2026, 7, 11, 11, 20, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

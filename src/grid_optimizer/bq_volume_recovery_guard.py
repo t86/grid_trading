@@ -51,6 +51,10 @@ def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
         handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _target_gate_done_marker(output_dir: Path, symbol: str, now: datetime) -> Path:
+    return output_dir / f"{symbol.lower()}_target_gate_done_{now.strftime('%Y%m%d')}.flag"
+
+
 def recover_corrupt_loop_state(
     *,
     symbol: str,
@@ -2507,6 +2511,23 @@ def main(argv: list[str] | None = None) -> int:
     results = []
     exit_code = 0
     for symbol in _normalize_symbols(args.symbols):
+        target_done_marker = _target_gate_done_marker(output_dir, symbol, now)
+        if target_done_marker.exists():
+            result = {
+                "symbol": symbol,
+                "action": "skip_target_gate_done_terminal",
+                "changed_keys": [],
+                "backup_path": None,
+                "dry_run": args.dry_run,
+                "restart_failed": None,
+                "target_gate_done_marker": str(target_done_marker),
+            }
+            _append_jsonl(
+                output_dir / "bq_volume_recovery_guard_events.jsonl",
+                {"ts": now.isoformat(), **result},
+            )
+            results.append(result)
+            continue
         corrupt_state_result = recover_corrupt_loop_state(
             symbol=symbol,
             output_dir=output_dir,
