@@ -1956,6 +1956,66 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(control["best_quote_maker_volume_active_pair_reduce_enabled"])
             self.assertEqual(restarts, [])
 
+    def test_timed_out_loss_recovery_restores_after_both_sides_clear_original_soft_limits(self) -> None:
+        now = datetime(2026, 6, 26, 10, 9, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_active_pair_reduce_enabled": True,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.8,
+                    "pause_buy_position_notional": 600.0,
+                    "pause_short_position_notional": 600.0,
+                },
+                long_notional=750.0,
+                short_notional=700.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+                recent_trade_notional=20.0,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_started_at": (now - timedelta(minutes=6)).isoformat(),
+                        "last_recovery_action_at": (now - timedelta(minutes=4)).isoformat(),
+                        "soft_recovery_extension_count": 1,
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_allow_loss_reduce_only": False,
+                            "best_quote_maker_volume_active_pair_reduce_enabled": False,
+                            "pause_buy_position_notional": 800.0,
+                            "pause_short_position_notional": 800.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                max_recovery_seconds=300,
+                max_soft_recovery_extensions=1,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "recovery_timeout_cooldown")
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertFalse(control["best_quote_maker_volume_active_pair_reduce_enabled"])
+            self.assertEqual(control["pause_buy_position_notional"], 800.0)
+            self.assertEqual(control["pause_short_position_notional"], 800.0)
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_one_sided_inventory_bias_stall_tightens_entry_sticky(self) -> None:
         now = datetime(2026, 6, 26, 10, 10, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

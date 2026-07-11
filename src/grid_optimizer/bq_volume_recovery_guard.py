@@ -319,15 +319,27 @@ def _recovery_inventory_buffer_ok(
     assessment: dict[str, Any],
     *,
     recover_cap_ratio: float,
+    original_controls: dict[str, Any] | None = None,
 ) -> bool:
-    def threshold(max_key: str, soft_key: str) -> float:
+    originals = original_controls if isinstance(original_controls, dict) else {}
+    soft_ratio = max(_safe_float(assessment.get("inventory_soft_ratio")), 0.0)
+
+    def threshold(max_key: str, soft_key: str, pause_key: str) -> float:
         cap_limit = _safe_float(assessment.get(max_key)) * max(float(recover_cap_ratio), 0.0)
-        soft_limit = _safe_float(assessment.get(soft_key))
+        max_notional = max(_safe_float(assessment.get(max_key)), 0.0)
+        ratio_limit = max_notional * soft_ratio if max_notional > 0 and soft_ratio > 0 else 0.0
+        original_pause = max(_safe_float(originals.get(pause_key)), 0.0)
+        baseline_candidates = [value for value in (original_pause, ratio_limit) if value > 0]
+        soft_limit = (
+            min(baseline_candidates)
+            if baseline_candidates
+            else _safe_float(assessment.get(soft_key))
+        )
         candidates = [value for value in (cap_limit, soft_limit) if value > 0]
         return min(candidates) if candidates else 0.0
 
-    long_limit = threshold("max_long_notional", "long_soft_limit_notional")
-    short_limit = threshold("max_short_notional", "short_soft_limit_notional")
+    long_limit = threshold("max_long_notional", "long_soft_limit_notional", "pause_buy_position_notional")
+    short_limit = threshold("max_short_notional", "short_soft_limit_notional", "pause_short_position_notional")
     return (
         long_limit > 0
         and short_limit > 0
@@ -553,6 +565,7 @@ def assess_symbol(
         "short_near_soft": near_short_soft,
         "long_soft_limit_notional": long_soft,
         "short_soft_limit_notional": short_soft,
+        "inventory_soft_ratio": _safe_float(control.get("best_quote_maker_volume_inventory_soft_ratio")),
         "buy_paused": buy_paused,
         "short_paused": short_paused,
         "pause_reasons": sorted(pause_reasons),
@@ -932,6 +945,7 @@ def check_symbol(
             cap_buffer_ok = _recovery_inventory_buffer_ok(
                 assessment,
                 recover_cap_ratio=recover_cap_ratio,
+                original_controls=recovery_original_controls,
             )
             restore_ready = (
                 _safe_float(volume_summary.get("gross_notional")) >= recover_floor
@@ -1164,6 +1178,11 @@ def check_symbol(
                 and (now - recovery_started_at).total_seconds() >= max(float(max_recovery_seconds), 0.0)
             )
             extension_count = _safe_int(item.get("soft_recovery_extension_count"))
+            cap_buffer_ok = _recovery_inventory_buffer_ok(
+                assessment,
+                recover_cap_ratio=recover_cap_ratio,
+                original_controls=recovery_original_controls,
+            )
             current_long = max(_safe_float(assessment.get("current_long_notional")), 0.0)
             current_short = max(_safe_float(assessment.get("current_short_notional")), 0.0)
             heavier_inventory = max(current_long, current_short)
@@ -1183,6 +1202,7 @@ def check_symbol(
                 and not bool(assessment.get("volatility_entry_pause_active"))
                 and not bool(control.get("best_quote_maker_volume_active_pair_reduce_enabled"))
                 and extension_count >= max(int(max_soft_recovery_extensions), 0)
+                and not cap_buffer_ok
                 and recovery_hold_satisfied
                 and last_recovery_action_at is not None
                 and not recovery_reapply_debounced
@@ -1234,6 +1254,7 @@ def check_symbol(
                 and _safe_int(assessment.get("active_order_count")) > 0
                 and _safe_int(assessment.get("near_market_order_count")) > 0
                 and not bool(assessment.get("ineffective_orders"))
+                and not cap_buffer_ok
                 and extension_count < max(int(max_soft_recovery_extensions), 0)
             )
             if can_extend_soft_recovery:
@@ -1269,6 +1290,7 @@ def check_symbol(
                 and _safe_int(assessment.get("active_order_count")) > 0
                 and _safe_int(assessment.get("near_market_order_count")) > 0
                 and not bool(assessment.get("ineffective_orders"))
+                and not cap_buffer_ok
             )
             if hold_exhausted_soft_recovery:
                 action = "hold_soft_inventory_loss_recovery_until_both_below"
@@ -1330,10 +1352,6 @@ def check_symbol(
                 }
                 _append_jsonl(output_dir / "bq_volume_recovery_guard_events.jsonl", {"ts": now.isoformat(), **return_result})
                 return return_result
-            cap_buffer_ok = _recovery_inventory_buffer_ok(
-                assessment,
-                recover_cap_ratio=recover_cap_ratio,
-            )
             restore_ready = (
                 _safe_float(volume_summary.get("gross_notional")) >= recover_floor
                 and _safe_int(assessment.get("active_order_count")) > 0
