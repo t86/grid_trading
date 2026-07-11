@@ -1664,8 +1664,48 @@ def check_symbol(
                 bool(assessment.get("planned_reduce_only_only"))
                 and _safe_int(assessment.get("near_market_order_count")) > 0
             ):
-                action = "hold_near_market_reduce_only_flow"
-                item.update({"status": "low_volume", "last_recovery_check_at": now.isoformat()})
+                current_budget = _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
+                budget_floor = max(float(cycle_budget_floor_notional), 0.0)
+                if current_budget > 0 and budget_floor > current_budget:
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        ("best_quote_maker_volume_cycle_budget_notional",),
+                    )
+                    updates = {
+                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                        "best_quote_maker_volume_cycle_budget_notional": budget_floor,
+                    }
+                    _remember_recovery_updates(
+                        item,
+                        {"best_quote_maker_volume_cycle_budget_notional": budget_floor},
+                    )
+                    action = (
+                        "dry_run_raise_cycle_budget_floor_for_reduce_only_flow"
+                        if dry_run
+                        else "raise_cycle_budget_floor_for_reduce_only_flow"
+                    )
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                            "recovery_owned": True,
+                            "last_recovery_action_at": now.isoformat(),
+                            "last_recovery_action": action,
+                        }
+                    )
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
+                else:
+                    action = "hold_near_market_reduce_only_flow"
+                    item.update({"status": "low_volume", "last_recovery_check_at": now.isoformat()})
             elif (
                 not bool(assessment.get("near_cap"))
                 and not bool(assessment.get("ineffective_orders"))

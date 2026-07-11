@@ -2611,6 +2611,23 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 72.0)
             self.assertEqual(restarts, [])
 
+            floor_result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                cycle_budget_floor_notional=108,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(floor_result["action"], "raise_cycle_budget_floor_for_reduce_only_flow")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
+            self.assertEqual(restarts, ["REUSDT"])
+
 
 if __name__ == "__main__":
     unittest.main()
