@@ -1234,6 +1234,35 @@ def check_symbol(
     )
     assessment["actual_inventory_below_soft"] = actual_inventory_below_soft
     assessment["effective_inventory_soft_pressure"] = effective_inventory_soft_pressure
+    ledger_drift_threshold = max(
+        100.0,
+        max(
+            _safe_float(assessment.get("max_long_notional")),
+            _safe_float(assessment.get("max_short_notional")),
+        )
+        * 0.2,
+    )
+    ledger_position_drift_notional = 0.0
+    if (
+        _safe_float(assessment.get("frozen_total_notional")) <= 0
+        and assessment.get("actual_long_notional") is not None
+        and assessment.get("actual_short_notional") is not None
+    ):
+        ledger_position_drift_notional = max(
+            abs(
+                _safe_float(assessment.get("current_long_notional"))
+                - _safe_float(assessment.get("actual_long_notional"))
+            ),
+            abs(
+                _safe_float(assessment.get("current_short_notional"))
+                - _safe_float(assessment.get("actual_short_notional"))
+            ),
+        )
+    assessment["ledger_position_drift_notional"] = ledger_position_drift_notional
+    assessment["ledger_position_drift_threshold_notional"] = ledger_drift_threshold
+    assessment["ledger_position_drift_blocked"] = (
+        ledger_position_drift_notional > ledger_drift_threshold
+    )
     static_cycle_budget_floor_notional = max(float(cycle_budget_floor_notional), 0.0)
     cycle_budget_floor_notional = apply_target_pace_cycle_budget_floor(
         volume_summary=volume_summary,
@@ -1359,6 +1388,11 @@ def check_symbol(
             action = "skip_stale_or_missing_inputs"
         elif not bool(recovery_gate.get("ok")) and not recovery_timeout_required:
             action = "skip_recovery_safety_gate"
+        elif (
+            bool(assessment.get("ledger_position_drift_blocked"))
+            and _safe_int(assessment.get("active_order_count")) > 0
+        ):
+            action = "hold_ledger_position_drift_safety_gate"
         elif bool(assessment.get("active_pair_reduce_suppression_deadlock")) or bool(
             assessment.get("active_pair_reduce_below_soft_deadlock")
         ):

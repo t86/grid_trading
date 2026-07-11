@@ -1449,6 +1449,60 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(state["symbols"]["REUSDT"]["recovery_started_at"], now.isoformat())
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_blocks_recovery_changes_when_active_ledger_drift_is_large(self) -> None:
+        now = datetime(2026, 6, 26, 8, 21, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_cycle_budget_notional": 48.0},
+                long_notional=500.0,
+                short_notional=700.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 500.0,
+                    "actual_short_notional": 300.0,
+                    "frozen_long_notional": 0.0,
+                    "frozen_short_notional": 0.0,
+                }
+            }
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                volume_recovery_cycle_budget_increment=12,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "hold_ledger_position_drift_safety_gate")
+            self.assertTrue(result["assessment"]["ledger_position_drift_blocked"])
+            self.assertEqual(result["assessment"]["ledger_position_drift_notional"], 400.0)
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 48.0)
+            self.assertEqual(restarts, [])
+
     def test_cycle_budget_floor_recovers_external_budget_override_in_one_step(self) -> None:
         now = datetime(2026, 6, 26, 8, 22, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
@@ -1934,13 +1988,13 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
 
             control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
-            self.assertEqual(result["action"], "relax_inventory_bias_for_volume")
+            self.assertEqual(result["action"], "hold_ledger_position_drift_safety_gate")
             self.assertFalse(result["assessment"]["low_volume"])
             self.assertTrue(result["assessment"]["target_pace_behind"])
             self.assertTrue(result["assessment"]["inventory_soft_pressure"])
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
-            self.assertEqual(restarts, ["REUSDT"])
+            self.assertEqual(restarts, [])
 
     def test_post_restore_cooldown_blocks_target_pace_budget_raise(self) -> None:
         now = datetime(2026, 7, 11, 12, 14, tzinfo=timezone.utc)
