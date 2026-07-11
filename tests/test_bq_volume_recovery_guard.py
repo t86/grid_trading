@@ -650,6 +650,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 now=now,
                 control={
                     "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
                     "best_quote_maker_volume_inventory_soft_ratio": 0.8,
                     "pause_buy_position_notional": 600.0,
                     "pause_short_position_notional": 600.0,
@@ -680,6 +681,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                         "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
                         "guard_original_controls": {
                             "best_quote_maker_volume_allow_loss_reduce_only": False,
+                            "best_quote_maker_volume_cycle_budget_notional": 72.0,
                             "pause_buy_position_notional": 800.0,
                             "pause_short_position_notional": 800.0,
                         },
@@ -697,12 +699,14 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 min_volume_notional=100,
                 trigger_seconds=120,
                 recovery_min_hold_seconds=120,
+                cycle_budget_floor_notional=108,
                 restart_runner=restarts.append,
             )
 
             control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
             self.assertEqual(result["action"], "restore_after_inventory_below_soft")
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
             self.assertEqual(control["pause_buy_position_notional"], 800.0)
             self.assertEqual(control["pause_short_position_notional"], 800.0)
             self.assertEqual(state["symbols"]["REUSDT"]["status"], "normal")

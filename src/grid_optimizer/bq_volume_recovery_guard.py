@@ -79,7 +79,9 @@ def _trade_time(row: dict[str, Any]) -> datetime | None:
     time_ms = _safe_float(row.get("time"))
     if time_ms > 0:
         return datetime.fromtimestamp(time_ms / 1000.0, tz=timezone.utc)
-    return _parse_time(row.get("audit_synced_at") or row.get("ts") or row.get("transactTime"))
+    return _parse_time(
+        row.get("audit_synced_at") or row.get("ts") or row.get("transactTime")
+    )
 
 
 def _iter_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -139,7 +141,9 @@ def fetch_recent_user_trades(
     return rows
 
 
-def _fetch_exchange_user_trades(*, symbol: str, now: datetime, window_seconds: float) -> list[dict[str, Any]]:
+def _fetch_exchange_user_trades(
+    *, symbol: str, now: datetime, window_seconds: float
+) -> list[dict[str, Any]]:
     from .data import fetch_futures_user_trades
 
     api_key = os.environ["BINANCE_API_KEY"]
@@ -156,7 +160,9 @@ def _fetch_exchange_user_trades(*, symbol: str, now: datetime, window_seconds: f
     )
 
 
-def summarize_recent_volume(*, rows: list[dict[str, Any]], now: datetime, window_seconds: float) -> dict[str, Any]:
+def summarize_recent_volume(
+    *, rows: list[dict[str, Any]], now: datetime, window_seconds: float
+) -> dict[str, Any]:
     window_start = now.timestamp() - max(float(window_seconds), 1.0)
     gross_notional = 0.0
     trade_count = 0
@@ -172,14 +178,22 @@ def summarize_recent_volume(*, rows: list[dict[str, Any]], now: datetime, window
         trade_at = _trade_time(row)
         if trade_at is None or trade_at.timestamp() < window_start or trade_at > now:
             continue
-        notional = _safe_float(row.get("quoteQty") or row.get("quote_qty") or row.get("notional"))
+        notional = _safe_float(
+            row.get("quoteQty") or row.get("quote_qty") or row.get("notional")
+        )
         if notional <= 0:
-            notional = _safe_float(row.get("price")) * _safe_float(row.get("qty") or row.get("quantity"))
+            notional = _safe_float(row.get("price")) * _safe_float(
+                row.get("qty") or row.get("quantity")
+            )
         if notional <= 0:
             continue
         gross_notional += abs(notional)
         trade_count += 1
-        latest_trade_at = trade_at if latest_trade_at is None or trade_at > latest_trade_at else latest_trade_at
+        latest_trade_at = (
+            trade_at
+            if latest_trade_at is None or trade_at > latest_trade_at
+            else latest_trade_at
+        )
     return {
         "gross_notional": gross_notional,
         "trade_count": trade_count,
@@ -212,7 +226,9 @@ def apply_daily_target_pace_floor(
     target_deadline = day_end - timedelta(seconds=completion_buffer)
     elapsed_seconds = max((now - day_start).total_seconds(), 1.0)
     remaining_seconds = max((target_deadline - now).total_seconds(), 1.0)
-    day_summary = summarize_recent_volume(rows=rows, now=now, window_seconds=elapsed_seconds)
+    day_summary = summarize_recent_volume(
+        rows=rows, now=now, window_seconds=elapsed_seconds
+    )
     day_gross = _safe_float(day_summary.get("gross_notional"))
     remaining_target = max(target - day_gross, 0.0)
     required_hourly = remaining_target * 3600.0 / remaining_seconds
@@ -266,7 +282,9 @@ def _symbol_state(state: dict[str, Any], symbol: str) -> dict[str, Any]:
     return item
 
 
-def _remember_recovery_controls(item: dict[str, Any], control: dict[str, Any], keys: tuple[str, ...]) -> None:
+def _remember_recovery_controls(
+    item: dict[str, Any], control: dict[str, Any], keys: tuple[str, ...]
+) -> None:
     original = item.get("guard_original_controls")
     originals = dict(original) if isinstance(original, dict) else {}
     for key in keys:
@@ -284,13 +302,29 @@ def _remember_recovery_updates(item: dict[str, Any], updates: dict[str, Any]) ->
     item["guard_recovery_controls"] = expected
 
 
-def _restore_recovery_controls(item: dict[str, Any]) -> dict[str, Any]:
+def _restore_recovery_controls(
+    item: dict[str, Any],
+    *,
+    control: dict[str, Any] | None = None,
+    cycle_budget_floor_notional: float = 0.0,
+) -> dict[str, Any]:
     original = item.get("guard_original_controls")
     updates = {"best_quote_maker_volume_allow_loss_reduce_only": False}
     if isinstance(original, dict):
         for key, value in original.items():
             if key in _RECOVERY_CONTROL_KEYS:
                 updates[key] = value
+    budget_key = "best_quote_maker_volume_cycle_budget_notional"
+    budget_floor = max(float(cycle_budget_floor_notional), 0.0)
+    current_budget = updates.get(budget_key)
+    if current_budget is None and isinstance(control, dict):
+        current_budget = control.get(budget_key)
+    if (
+        budget_floor > 0
+        and current_budget is not None
+        and _safe_float(current_budget) < budget_floor
+    ):
+        updates[budget_key] = budget_floor
     updates["best_quote_maker_volume_net_loss_reduce_enabled"] = False
     return updates
 
@@ -304,7 +338,10 @@ def _loss_reduce_recovery_updates(
         "best_quote_maker_volume_net_loss_reduce_enabled": False,
         "best_quote_maker_volume_allow_loss_reduce_only": True,
     }
-    buffer_notional = max(_safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")), 0.0)
+    buffer_notional = max(
+        _safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")),
+        0.0,
+    )
     if buffer_notional <= 0:
         return updates
     for current_key, pause_key in (
@@ -315,7 +352,10 @@ def _loss_reduce_recovery_updates(
             continue
         current_notional = max(_safe_float(assessment.get(current_key)), 0.0)
         recovery_pause = max(current_notional - buffer_notional, 0.0)
-        if current_notional > 0 and _safe_float(control.get(pause_key)) > recovery_pause:
+        if (
+            current_notional > 0
+            and _safe_float(control.get(pause_key)) > recovery_pause
+        ):
             updates[pause_key] = recovery_pause
     return updates
 
@@ -330,11 +370,17 @@ def _recovery_inventory_buffer_ok(
     soft_ratio = max(_safe_float(assessment.get("inventory_soft_ratio")), 0.0)
 
     def threshold(max_key: str, soft_key: str, pause_key: str) -> float:
-        cap_limit = _safe_float(assessment.get(max_key)) * max(float(recover_cap_ratio), 0.0)
+        cap_limit = _safe_float(assessment.get(max_key)) * max(
+            float(recover_cap_ratio), 0.0
+        )
         max_notional = max(_safe_float(assessment.get(max_key)), 0.0)
-        ratio_limit = max_notional * soft_ratio if max_notional > 0 and soft_ratio > 0 else 0.0
+        ratio_limit = (
+            max_notional * soft_ratio if max_notional > 0 and soft_ratio > 0 else 0.0
+        )
         original_pause = max(_safe_float(originals.get(pause_key)), 0.0)
-        baseline_candidates = [value for value in (original_pause, ratio_limit) if value > 0]
+        baseline_candidates = [
+            value for value in (original_pause, ratio_limit) if value > 0
+        ]
         soft_limit = (
             min(baseline_candidates)
             if baseline_candidates
@@ -343,14 +389,30 @@ def _recovery_inventory_buffer_ok(
         candidates = [value for value in (cap_limit, soft_limit) if value > 0]
         return min(candidates) if candidates else 0.0
 
-    long_limit = threshold("max_long_notional", "long_soft_limit_notional", "pause_buy_position_notional")
-    short_limit = threshold("max_short_notional", "short_soft_limit_notional", "pause_short_position_notional")
+    long_limit = threshold(
+        "max_long_notional", "long_soft_limit_notional", "pause_buy_position_notional"
+    )
+    short_limit = threshold(
+        "max_short_notional",
+        "short_soft_limit_notional",
+        "pause_short_position_notional",
+    )
     frozen_total = max(_safe_float(assessment.get("frozen_total_notional")), 0.0)
     actual_long = assessment.get("actual_long_notional")
     actual_short = assessment.get("actual_short_notional")
-    use_actual = frozen_total <= 0 and actual_long is not None and actual_short is not None
-    current_long = _safe_float(actual_long) if use_actual else _safe_float(assessment.get("current_long_notional"))
-    current_short = _safe_float(actual_short) if use_actual else _safe_float(assessment.get("current_short_notional"))
+    use_actual = (
+        frozen_total <= 0 and actual_long is not None and actual_short is not None
+    )
+    current_long = (
+        _safe_float(actual_long)
+        if use_actual
+        else _safe_float(assessment.get("current_long_notional"))
+    )
+    current_short = (
+        _safe_float(actual_short)
+        if use_actual
+        else _safe_float(assessment.get("current_short_notional"))
+    )
     return (
         long_limit > 0
         and short_limit > 0
@@ -359,7 +421,9 @@ def _recovery_inventory_buffer_ok(
     )
 
 
-def _plan_time_is_fresh(payload: dict[str, Any], *, now: datetime, max_age_seconds: float) -> bool:
+def _plan_time_is_fresh(
+    payload: dict[str, Any], *, now: datetime, max_age_seconds: float
+) -> bool:
     generated_at = _parse_time(payload.get("generated_at"))
     if generated_at is None:
         return False
@@ -367,9 +431,15 @@ def _plan_time_is_fresh(payload: dict[str, Any], *, now: datetime, max_age_secon
 
 
 def _live_book(plan: dict[str, Any], submit: dict[str, Any]) -> tuple[float, float]:
-    submit_book = submit.get("live_book") if isinstance(submit.get("live_book"), dict) else {}
-    bid = _safe_float(plan.get("best_bid") or plan.get("bid_price") or submit_book.get("bid_price"))
-    ask = _safe_float(plan.get("best_ask") or plan.get("ask_price") or submit_book.get("ask_price"))
+    submit_book = (
+        submit.get("live_book") if isinstance(submit.get("live_book"), dict) else {}
+    )
+    bid = _safe_float(
+        plan.get("best_bid") or plan.get("bid_price") or submit_book.get("bid_price")
+    )
+    ask = _safe_float(
+        plan.get("best_ask") or plan.get("ask_price") or submit_book.get("ask_price")
+    )
     return bid, ask
 
 
@@ -378,13 +448,19 @@ def _tick_size(plan: dict[str, Any], control: dict[str, Any]) -> float:
     return _safe_float(info.get("tick_size") or control.get("step_price"), 0.0)
 
 
-def _planned_orders(plan: dict[str, Any], submit: dict[str, Any]) -> list[dict[str, Any]]:
+def _planned_orders(
+    plan: dict[str, Any], submit: dict[str, Any]
+) -> list[dict[str, Any]]:
     orders: list[dict[str, Any]] = []
     for key in ("buy_orders", "sell_orders", "forced_reduce_orders"):
         for item in list(plan.get(key) or []):
             if isinstance(item, dict):
                 orders.append(item)
-    actions = submit.get("validation", {}).get("actions", {}) if isinstance(submit.get("validation"), dict) else {}
+    actions = (
+        submit.get("validation", {}).get("actions", {})
+        if isinstance(submit.get("validation"), dict)
+        else {}
+    )
     if isinstance(actions, dict):
         for item in list(actions.get("place_orders") or []):
             if isinstance(item, dict):
@@ -392,7 +468,9 @@ def _planned_orders(plan: dict[str, Any], submit: dict[str, Any]) -> list[dict[s
     return orders
 
 
-def _order_is_near_market(order: dict[str, Any], *, bid: float, ask: float, tick_size: float, far_ticks: int) -> bool:
+def _order_is_near_market(
+    order: dict[str, Any], *, bid: float, ask: float, tick_size: float, far_ticks: int
+) -> bool:
     if bid <= 0 or ask <= 0 or tick_size <= 0:
         return False
     side = str(order.get("side") or "").upper().strip()
@@ -408,7 +486,11 @@ def _order_is_near_market(order: dict[str, Any], *, bid: float, ask: float, tick
 
 
 def _order_is_reduce_only(order: dict[str, Any]) -> bool:
-    if bool(order.get("reduce_only") or order.get("reduceOnly") or order.get("force_reduce_only")):
+    if bool(
+        order.get("reduce_only")
+        or order.get("reduceOnly")
+        or order.get("force_reduce_only")
+    ):
         return True
     role = str(order.get("role") or order.get("execution_type") or "").lower()
     return "reduce" in role
@@ -420,7 +502,11 @@ def _active_order_count(plan: dict[str, Any], submit: dict[str, Any]) -> int:
         if isinstance(submit.get("observed_strategy_open_order_state"), dict)
         else {}
     )
-    plan_summary = submit.get("plan_summary", {}) if isinstance(submit.get("plan_summary"), dict) else {}
+    plan_summary = (
+        submit.get("plan_summary", {})
+        if isinstance(submit.get("plan_summary"), dict)
+        else {}
+    )
     return max(
         _safe_int(plan.get("open_order_count")),
         _safe_int(plan.get("total_open_order_count")),
@@ -429,7 +515,9 @@ def _active_order_count(plan: dict[str, Any], submit: dict[str, Any]) -> int:
     )
 
 
-def _position_caps(plan: dict[str, Any], control: dict[str, Any]) -> tuple[float, float]:
+def _position_caps(
+    plan: dict[str, Any], control: dict[str, Any]
+) -> tuple[float, float]:
     long_cap = _safe_float(
         plan.get("effective_max_position_notional")
         or control.get("best_quote_maker_volume_max_long_notional")
@@ -450,14 +538,18 @@ def _position_soft_limits(
     long_cap: float,
     short_cap: float,
 ) -> tuple[float, float]:
-    soft_ratio = _safe_float(control.get("best_quote_maker_volume_inventory_soft_ratio"))
+    soft_ratio = _safe_float(
+        control.get("best_quote_maker_volume_inventory_soft_ratio")
+    )
     ratio_long = long_cap * soft_ratio if long_cap > 0 and soft_ratio > 0 else 0.0
     ratio_short = short_cap * soft_ratio if short_cap > 0 and soft_ratio > 0 else 0.0
     configured_long = _safe_float(
-        control.get("pause_buy_position_notional") or plan.get("effective_pause_buy_position_notional")
+        control.get("pause_buy_position_notional")
+        or plan.get("effective_pause_buy_position_notional")
     )
     configured_short = _safe_float(
-        control.get("pause_short_position_notional") or plan.get("effective_pause_short_position_notional")
+        control.get("pause_short_position_notional")
+        or plan.get("effective_pause_short_position_notional")
     )
 
     def choose(configured: float, ratio_limit: float) -> float:
@@ -468,9 +560,20 @@ def _position_soft_limits(
 
 
 def _cost_gate_blocked(plan: dict[str, Any]) -> bool:
-    best_quote = plan.get("best_quote_maker_volume") if isinstance(plan.get("best_quote_maker_volume"), dict) else {}
-    gate = best_quote.get("inventory_cost_gate") if isinstance(best_quote.get("inventory_cost_gate"), dict) else {}
-    return _safe_int(gate.get("blocked_buy_orders")) > 0 or _safe_int(gate.get("blocked_sell_orders")) > 0
+    best_quote = (
+        plan.get("best_quote_maker_volume")
+        if isinstance(plan.get("best_quote_maker_volume"), dict)
+        else {}
+    )
+    gate = (
+        best_quote.get("inventory_cost_gate")
+        if isinstance(best_quote.get("inventory_cost_gate"), dict)
+        else {}
+    )
+    return (
+        _safe_int(gate.get("blocked_buy_orders")) > 0
+        or _safe_int(gate.get("blocked_sell_orders")) > 0
+    )
 
 
 def assess_symbol(
@@ -504,7 +607,9 @@ def assess_symbol(
     near_orders = [
         item
         for item in orders
-        if _order_is_near_market(item, bid=bid, ask=ask, tick_size=tick, far_ticks=far_ticks)
+        if _order_is_near_market(
+            item, bid=bid, ask=ask, tick_size=tick, far_ticks=far_ticks
+        )
     ]
     active_count = _active_order_count(plan, submit)
     low_volume = gross < max(float(min_volume_notional), 0.0) or active_count <= 0
@@ -520,9 +625,21 @@ def assess_symbol(
     long_cap, short_cap = _position_caps(plan, control)
     current_long = _safe_float(plan.get("current_long_notional"))
     current_short = _safe_float(plan.get("current_short_notional"))
-    best_quote = plan.get("best_quote_maker_volume") if isinstance(plan.get("best_quote_maker_volume"), dict) else {}
-    reduce_freeze = best_quote.get("reduce_freeze") if isinstance(best_quote.get("reduce_freeze"), dict) else {}
-    frozen_v2 = best_quote.get("frozen_v2") if isinstance(best_quote.get("frozen_v2"), dict) else {}
+    best_quote = (
+        plan.get("best_quote_maker_volume")
+        if isinstance(plan.get("best_quote_maker_volume"), dict)
+        else {}
+    )
+    reduce_freeze = (
+        best_quote.get("reduce_freeze")
+        if isinstance(best_quote.get("reduce_freeze"), dict)
+        else {}
+    )
+    frozen_v2 = (
+        best_quote.get("frozen_v2")
+        if isinstance(best_quote.get("frozen_v2"), dict)
+        else {}
+    )
     actual_long = (
         _safe_float(reduce_freeze.get("actual_long_notional"))
         if "actual_long_notional" in reduce_freeze
@@ -539,8 +656,12 @@ def assess_symbol(
         _safe_float(frozen_v2.get("frozen_total_notional")),
         0.0,
     )
-    near_long_cap = long_cap > 0 and current_long >= long_cap * max(float(near_cap_ratio), 0.0)
-    near_short_cap = short_cap > 0 and current_short >= short_cap * max(float(near_cap_ratio), 0.0)
+    near_long_cap = long_cap > 0 and current_long >= long_cap * max(
+        float(near_cap_ratio), 0.0
+    )
+    near_short_cap = short_cap > 0 and current_short >= short_cap * max(
+        float(near_cap_ratio), 0.0
+    )
     if near_long_cap:
         reasons.append("long_near_cap")
     if near_short_cap:
@@ -561,7 +682,8 @@ def assess_symbol(
     short_paused = bool(plan.get("short_paused"))
     pause_reasons = {
         str(reason).strip()
-        for reason in list(plan.get("pause_reasons") or []) + list(plan.get("short_pause_reasons") or [])
+        for reason in list(plan.get("pause_reasons") or [])
+        + list(plan.get("short_pause_reasons") or [])
         if str(reason).strip()
     }
     one_sided_inventory_bias = (
@@ -571,7 +693,9 @@ def assess_symbol(
     )
     volatility_entry_pause = plan.get("volatility_entry_pause")
     volatility_entry_pause_active = bool(
-        volatility_entry_pause.get("active") if isinstance(volatility_entry_pause, dict) else False
+        volatility_entry_pause.get("active")
+        if isinstance(volatility_entry_pause, dict)
+        else False
     )
 
     return {
@@ -595,7 +719,9 @@ def assess_symbol(
         "short_near_soft": near_short_soft,
         "long_soft_limit_notional": long_soft,
         "short_soft_limit_notional": short_soft,
-        "inventory_soft_ratio": _safe_float(control.get("best_quote_maker_volume_inventory_soft_ratio")),
+        "inventory_soft_ratio": _safe_float(
+            control.get("best_quote_maker_volume_inventory_soft_ratio")
+        ),
         "buy_paused": buy_paused,
         "short_paused": short_paused,
         "pause_reasons": sorted(pause_reasons),
@@ -617,7 +743,9 @@ def assess_symbol(
 
 def _backup_control(control_path: Path, control: dict[str, Any], now: datetime) -> Path:
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
-    backup_path = control_path.with_name(control_path.name + f".bak_bq_volume_recovery_{stamp}")
+    backup_path = control_path.with_name(
+        control_path.name + f".bak_bq_volume_recovery_{stamp}"
+    )
     backup_path.write_text(
         json.dumps(control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -690,19 +818,35 @@ def _inactive_restart_gate(
 
     if not _plan_time_is_fresh(plan, now=now, max_age_seconds=max_snapshot_age_seconds):
         reasons.append("latest_plan_stale")
-    if not _plan_time_is_fresh(submit, now=now, max_age_seconds=max_snapshot_age_seconds):
+    if not _plan_time_is_fresh(
+        submit, now=now, max_age_seconds=max_snapshot_age_seconds
+    ):
         reasons.append("latest_submit_stale")
 
-    stop_reason = str(plan.get("stop_reason") or submit.get("stop_reason") or "").strip()
-    runtime_status = str(plan.get("runtime_status") or submit.get("runtime_status") or "").strip().lower()
+    stop_reason = str(
+        plan.get("stop_reason") or submit.get("stop_reason") or ""
+    ).strip()
+    runtime_status = (
+        str(plan.get("runtime_status") or submit.get("runtime_status") or "")
+        .strip()
+        .lower()
+    )
     if stop_reason:
         reasons.append("explicit_stop_reason")
-    if runtime_status in {"stopped", "complete", "completed", "after_end_window", "target_reached"}:
+    if runtime_status in {
+        "stopped",
+        "complete",
+        "completed",
+        "after_end_window",
+        "target_reached",
+    }:
         reasons.append(f"runtime_status_{runtime_status}")
     if submit.get("error"):
         reasons.append("latest_submit_error")
 
-    validation = submit.get("validation") if isinstance(submit.get("validation"), dict) else {}
+    validation = (
+        submit.get("validation") if isinstance(submit.get("validation"), dict) else {}
+    )
     if validation.get("ok") is False or list(validation.get("errors") or []):
         reasons.append("latest_validation_failed")
 
@@ -711,7 +855,11 @@ def _inactive_restart_gate(
         if isinstance(submit.get("observed_strategy_open_order_state"), dict)
         else {}
     )
-    plan_summary = submit.get("plan_summary", {}) if isinstance(submit.get("plan_summary"), dict) else {}
+    plan_summary = (
+        submit.get("plan_summary", {})
+        if isinstance(submit.get("plan_summary"), dict)
+        else {}
+    )
     planned_open = max(
         _safe_int(plan.get("open_order_count")),
         _safe_int(plan.get("total_open_order_count")),
@@ -769,10 +917,9 @@ def recover_inactive_runner(
     restart_failed: str | None = None
 
     last_restart_at = _parse_time(item.get("last_inactive_restart_at"))
-    restart_cooldown_active = (
-        last_restart_at is not None
-        and (now - last_restart_at).total_seconds() < max(float(restart_cooldown_seconds), 0.0)
-    )
+    restart_cooldown_active = last_restart_at is not None and (
+        now - last_restart_at
+    ).total_seconds() < max(float(restart_cooldown_seconds), 0.0)
     if not gate["ok"]:
         action = "skip_runner_inactive_safety_gate"
     elif restart_cooldown_active:
@@ -782,7 +929,9 @@ def recover_inactive_runner(
             action = "dry_run_restart_runner_inactive"
         else:
             restart = restart_runner or (
-                lambda item_symbol: _default_restart_runner(item_symbol, runner_wrapper=runner_wrapper)
+                lambda item_symbol: _default_restart_runner(
+                    item_symbol, runner_wrapper=runner_wrapper
+                )
             )
             try:
                 restart(normalized_symbol)
@@ -884,7 +1033,11 @@ def check_symbol(
     control = _read_json(control_path)
     plan = _read_json(_plan_path(output_dir, normalized_symbol))
     submit = _read_json(_submit_path(output_dir, normalized_symbol))
-    rows = trade_rows if trade_rows is not None else _iter_jsonl(_trade_path(output_dir, normalized_symbol))
+    rows = (
+        trade_rows
+        if trade_rows is not None
+        else _iter_jsonl(_trade_path(output_dir, normalized_symbol))
+    )
     volume_summary = summarize_recent_volume(
         rows=rows,
         now=now,
@@ -915,20 +1068,28 @@ def check_symbol(
         plan_stale_seconds=plan_stale_seconds,
     )
     item = _symbol_state(state, normalized_symbol)
-    restart = restart_runner or (lambda item_symbol: _default_restart_runner(item_symbol, runner_wrapper=runner_wrapper))
+    restart = restart_runner or (
+        lambda item_symbol: _default_restart_runner(
+            item_symbol, runner_wrapper=runner_wrapper
+        )
+    )
     recover_floor = (
         float(recover_min_volume_notional)
         if recover_min_volume_notional is not None
         else max(float(effective_min_volume_notional), 0.0)
     )
-    recover_floor = max(recover_floor, _safe_float(volume_summary.get("target_pace_floor_notional")))
+    recover_floor = max(
+        recover_floor, _safe_float(volume_summary.get("target_pace_floor_notional"))
+    )
 
     action = "none"
     backup_path: str | None = None
     changed: list[str] = []
     restart_failed: str | None = None
     status_reasons = set(assessment.get("reasons") or [])
-    stale_or_missing = bool({"missing_control", "latest_plan_stale", "latest_submit_stale"} & status_reasons)
+    stale_or_missing = bool(
+        {"missing_control", "latest_plan_stale", "latest_submit_stale"} & status_reasons
+    )
     cooldown_until = _parse_time(item.get("cooldown_until"))
     effective_near_market_flow = (
         _safe_float(volume_summary.get("gross_notional")) > 0
@@ -940,10 +1101,13 @@ def check_symbol(
     severe_one_sided_stall = (
         bool(assessment.get("one_sided_inventory_bias"))
         and _safe_float(volume_summary.get("gross_notional"))
-        <= max(_safe_float(volume_summary.get("effective_min_volume_notional")), 0.0) * 0.5
+        <= max(_safe_float(volume_summary.get("effective_min_volume_notional")), 0.0)
+        * 0.5
     )
     recovery_original_controls = item.get("guard_original_controls")
-    recovery_has_original_controls = isinstance(recovery_original_controls, dict) and bool(recovery_original_controls)
+    recovery_has_original_controls = isinstance(
+        recovery_original_controls, dict
+    ) and bool(recovery_original_controls)
     recovery_expected_controls = item.get("guard_recovery_controls")
     recovery_expected_controls = (
         {
@@ -955,29 +1119,29 @@ def check_symbol(
         else {}
     )
     recovery_started_at = _parse_time(item.get("recovery_started_at"))
-    recovery_timed_out = (
-        recovery_started_at is not None
-        and (now - recovery_started_at).total_seconds() >= max(float(max_recovery_seconds), 0.0)
-    )
+    recovery_timed_out = recovery_started_at is not None and (
+        now - recovery_started_at
+    ).total_seconds() >= max(float(max_recovery_seconds), 0.0)
     recovery_timeout_required = recovery_timed_out and (
-        recovery_has_original_controls or bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+        recovery_has_original_controls
+        or bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
     )
-    recovery_hold_satisfied = (
-        recovery_started_at is None
-        or (now - recovery_started_at).total_seconds() >= max(float(recovery_min_hold_seconds), 0.0)
-    )
+    recovery_hold_satisfied = recovery_started_at is None or (
+        now - recovery_started_at
+    ).total_seconds() >= max(float(recovery_min_hold_seconds), 0.0)
     last_recovery_action_at = _parse_time(item.get("last_recovery_action_at"))
-    recovery_reapply_debounced = (
-        last_recovery_action_at is not None
-        and (now - last_recovery_action_at).total_seconds() < max(float(recovery_reapply_min_seconds), 0.0)
-    )
+    recovery_reapply_debounced = last_recovery_action_at is not None and (
+        now - last_recovery_action_at
+    ).total_seconds() < max(float(recovery_reapply_min_seconds), 0.0)
 
     try:
         if stale_or_missing and not recovery_timeout_required:
             action = "skip_stale_or_missing_inputs"
         elif cooldown_until is not None and now < cooldown_until:
             action = "cooldown"
-        elif recovery_has_original_controls and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only")):
+        elif recovery_has_original_controls and not bool(
+            control.get("best_quote_maker_volume_allow_loss_reduce_only")
+        ):
             cap_buffer_ok = _recovery_inventory_buffer_ok(
                 assessment,
                 recover_cap_ratio=recover_cap_ratio,
@@ -998,15 +1162,29 @@ def check_symbol(
                 bool(assessment.get("low_volume"))
                 and bool(assessment.get("inventory_soft_pressure"))
                 and recovery_hold_satisfied
-                and not bool(recovery_expected_controls.get("best_quote_maker_volume_allow_loss_reduce_only"))
+                and not bool(
+                    recovery_expected_controls.get(
+                        "best_quote_maker_volume_allow_loss_reduce_only"
+                    )
+                )
             ):
-                loss_updates = _loss_reduce_recovery_updates(control=control, assessment=assessment)
+                loss_updates = _loss_reduce_recovery_updates(
+                    control=control, assessment=assessment
+                )
                 _remember_recovery_controls(
                     item,
                     control,
-                    tuple(key for key in loss_updates if key != "best_quote_maker_volume_net_loss_reduce_enabled"),
+                    tuple(
+                        key
+                        for key in loss_updates
+                        if key != "best_quote_maker_volume_net_loss_reduce_enabled"
+                    ),
                 )
-                updates = _restore_recovery_controls(item)
+                updates = _restore_recovery_controls(
+                    item,
+                    control=control,
+                    cycle_budget_floor_notional=cycle_budget_floor_notional,
+                )
                 updates.update(loss_updates)
                 item["guard_recovery_controls"] = {}
                 _remember_recovery_updates(item, updates)
@@ -1044,7 +1222,11 @@ def check_symbol(
                     control,
                     ("sticky_entry_price_tolerance_steps",),
                 )
-                updates = _restore_recovery_controls(item)
+                updates = _restore_recovery_controls(
+                    item,
+                    control=control,
+                    cycle_budget_floor_notional=cycle_budget_floor_notional,
+                )
                 updates["sticky_entry_price_tolerance_steps"] = 1.0
                 item["guard_recovery_controls"] = {}
                 _remember_recovery_updates(item, updates)
@@ -1074,16 +1256,21 @@ def check_symbol(
             elif (
                 severe_one_sided_stall
                 and recovery_hold_satisfied
-                and _safe_float(control.get("sticky_entry_price_tolerance_steps")) <= 1.0
+                and _safe_float(control.get("sticky_entry_price_tolerance_steps"))
+                <= 1.0
             ):
                 current_gap = abs(
                     _safe_float(assessment.get("current_long_notional"))
                     - _safe_float(assessment.get("current_short_notional"))
                 )
                 configured_gap = _safe_float(
-                    control.get("best_quote_maker_volume_inventory_bias_min_notional_gap")
+                    control.get(
+                        "best_quote_maker_volume_inventory_bias_min_notional_gap"
+                    )
                 )
-                relief_gap = current_gap + max(float(inventory_bias_relief_notional_margin), 0.0)
+                relief_gap = current_gap + max(
+                    float(inventory_bias_relief_notional_margin), 0.0
+                )
                 if current_gap >= configured_gap and relief_gap > configured_gap:
                     updates = {
                         "best_quote_maker_volume_inventory_bias_min_notional_gap": relief_gap,
@@ -1114,7 +1301,12 @@ def check_symbol(
                     )
                 else:
                     action = "hold_tight_sticky_inventory_bias_relief"
-                    item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "last_recovery_check_at": now.isoformat(),
+                        }
+                    )
             elif (
                 bool(assessment.get("low_volume"))
                 and recovery_hold_satisfied
@@ -1133,7 +1325,9 @@ def check_symbol(
                 and not bool(assessment.get("ineffective_orders"))
                 and not bool(assessment.get("planned_reduce_only_only"))
             ):
-                current_budget = _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
+                current_budget = _safe_float(
+                    control.get("best_quote_maker_volume_cycle_budget_notional")
+                )
                 increment = max(float(volume_recovery_cycle_budget_increment), 0.0)
                 if current_budget > 0 and increment > 0:
                     _remember_recovery_controls(
@@ -1141,7 +1335,11 @@ def check_symbol(
                         control,
                         ("best_quote_maker_volume_cycle_budget_notional",),
                     )
-                    updates = _restore_recovery_controls(item)
+                    updates = _restore_recovery_controls(
+                        item,
+                        control=control,
+                        cycle_budget_floor_notional=cycle_budget_floor_notional,
+                    )
                     updates["best_quote_maker_volume_cycle_budget_notional"] = max(
                         current_budget + increment,
                         max(float(cycle_budget_floor_notional), 0.0),
@@ -1172,9 +1370,18 @@ def check_symbol(
                     )
                 else:
                     action = "hold_inventory_relief_without_budget"
-                    item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "last_recovery_check_at": now.isoformat(),
+                        }
+                    )
             elif recovery_timed_out:
-                updates = _restore_recovery_controls(item)
+                updates = _restore_recovery_controls(
+                    item,
+                    control=control,
+                    cycle_budget_floor_notional=cycle_budget_floor_notional,
+                )
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
@@ -1184,11 +1391,17 @@ def check_symbol(
                     dry_run=dry_run,
                     restart_runner=restart,
                 )
-                action = "dry_run_recovery_timeout_cooldown" if dry_run else "recovery_timeout_cooldown"
+                action = (
+                    "dry_run_recovery_timeout_cooldown"
+                    if dry_run
+                    else "recovery_timeout_cooldown"
+                )
                 item.update(
                     {
                         "status": "cooldown",
-                        "cooldown_until": (now + timedelta(seconds=max(float(cooldown_seconds), 0.0))).isoformat(),
+                        "cooldown_until": (
+                            now + timedelta(seconds=max(float(cooldown_seconds), 0.0))
+                        ).isoformat(),
                         "last_recovery_action_at": now.isoformat(),
                         "last_recovery_action": action,
                     }
@@ -1201,10 +1414,20 @@ def check_symbol(
                 drifted_updates
                 and effective_near_market_flow
                 and recovery_hold_satisfied
-                and bool(recovery_expected_controls.get("best_quote_maker_volume_allow_loss_reduce_only"))
-                and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+                and bool(
+                    recovery_expected_controls.get(
+                        "best_quote_maker_volume_allow_loss_reduce_only"
+                    )
+                )
+                and not bool(
+                    control.get("best_quote_maker_volume_allow_loss_reduce_only")
+                )
             ):
-                updates = _restore_recovery_controls(item)
+                updates = _restore_recovery_controls(
+                    item,
+                    control=control,
+                    cycle_budget_floor_notional=cycle_budget_floor_notional,
+                )
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
@@ -1230,7 +1453,12 @@ def check_symbol(
                 item.pop("recovery_owned", None)
             elif drifted_updates and not restore_ready and recovery_reapply_debounced:
                 action = "hold_recovery_control_drift_debounce"
-                item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_recovery_check_at": now.isoformat(),
+                    }
+                )
             elif drifted_updates and not restore_ready:
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
@@ -1256,9 +1484,18 @@ def check_symbol(
                 )
             elif restore_ready and not recovery_hold_satisfied:
                 action = "hold_recovery_min_duration"
-                item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_recovery_check_at": now.isoformat(),
+                    }
+                )
             elif restore_ready:
-                updates = _restore_recovery_controls(item)
+                updates = _restore_recovery_controls(
+                    item,
+                    control=control,
+                    cycle_budget_floor_notional=cycle_budget_floor_notional,
+                )
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
@@ -1268,7 +1505,11 @@ def check_symbol(
                     dry_run=dry_run,
                     restart_runner=restart,
                 )
-                action = "dry_run_restore_recovery_controls" if dry_run else "restore_recovery_controls"
+                action = (
+                    "dry_run_restore_recovery_controls"
+                    if dry_run
+                    else "restore_recovery_controls"
+                )
                 _set_post_restore_cooldown(
                     item,
                     now=now,
@@ -1280,7 +1521,12 @@ def check_symbol(
                 item.pop("recovery_owned", None)
             else:
                 action = "hold_inventory_bias_relief"
-                item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_recovery_check_at": now.isoformat(),
+                    }
+                )
         elif bool(control.get("best_quote_maker_volume_allow_loss_reduce_only")):
             if bool(control.get("best_quote_maker_volume_net_loss_reduce_enabled")):
                 updates = {"best_quote_maker_volume_net_loss_reduce_enabled": False}
@@ -1293,8 +1539,17 @@ def check_symbol(
                     dry_run=dry_run,
                     restart_runner=restart,
                 )
-                action = "dry_run_disable_net_loss_reduce" if dry_run else "disable_net_loss_reduce"
-                item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+                action = (
+                    "dry_run_disable_net_loss_reduce"
+                    if dry_run
+                    else "disable_net_loss_reduce"
+                )
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_recovery_check_at": now.isoformat(),
+                    }
+                )
                 result = {
                     "symbol": normalized_symbol,
                     "action": action,
@@ -1311,18 +1566,25 @@ def check_symbol(
                 )
                 return result
             recovery_started_at = _parse_time(item.get("recovery_started_at"))
-            recovery_stage_timed_out = (
-                recovery_started_at is not None
-                and (now - recovery_started_at).total_seconds() >= max(float(max_recovery_seconds), 0.0)
-            )
+            recovery_stage_timed_out = recovery_started_at is not None and (
+                now - recovery_started_at
+            ).total_seconds() >= max(float(max_recovery_seconds), 0.0)
             extension_count = _safe_int(item.get("soft_recovery_extension_count"))
             cap_buffer_ok = _recovery_inventory_buffer_ok(
                 assessment,
                 recover_cap_ratio=recover_cap_ratio,
                 original_controls=recovery_original_controls,
             )
-            if bool(item.get("recovery_owned")) and cap_buffer_ok and recovery_hold_satisfied:
-                updates = _restore_recovery_controls(item)
+            if (
+                bool(item.get("recovery_owned"))
+                and cap_buffer_ok
+                and recovery_hold_satisfied
+            ):
+                updates = _restore_recovery_controls(
+                    item,
+                    control=control,
+                    cycle_budget_floor_notional=cycle_budget_floor_notional,
+                )
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
@@ -1361,12 +1623,20 @@ def check_symbol(
                     {"ts": now.isoformat(), **result},
                 )
                 return result
-            current_long = max(_safe_float(assessment.get("current_long_notional")), 0.0)
-            current_short = max(_safe_float(assessment.get("current_short_notional")), 0.0)
+            current_long = max(
+                _safe_float(assessment.get("current_long_notional")), 0.0
+            )
+            current_short = max(
+                _safe_float(assessment.get("current_short_notional")), 0.0
+            )
             heavier_inventory = max(current_long, current_short)
             lighter_inventory = min(current_long, current_short)
             pair_reduce_min_side = max(
-                _safe_float(control.get("best_quote_maker_volume_active_pair_reduce_min_side_notional")),
+                _safe_float(
+                    control.get(
+                        "best_quote_maker_volume_active_pair_reduce_min_side_notional"
+                    )
+                ),
                 0.0,
             )
             stalled_loss_reduce_plan = (
@@ -1378,7 +1648,9 @@ def check_symbol(
                 and lighter_inventory >= pair_reduce_min_side
                 and lighter_inventory >= heavier_inventory * 0.5
                 and not bool(assessment.get("volatility_entry_pause_active"))
-                and not bool(control.get("best_quote_maker_volume_active_pair_reduce_enabled"))
+                and not bool(
+                    control.get("best_quote_maker_volume_active_pair_reduce_enabled")
+                )
                 and extension_count >= max(int(max_soft_recovery_extensions), 0)
                 and not cap_buffer_ok
                 and recovery_hold_satisfied
@@ -1495,7 +1767,11 @@ def check_symbol(
                 )
                 return result
             if recovery_stage_timed_out:
-                updates = _restore_recovery_controls(item)
+                updates = _restore_recovery_controls(
+                    item,
+                    control=control,
+                    cycle_budget_floor_notional=cycle_budget_floor_notional,
+                )
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
@@ -1505,11 +1781,17 @@ def check_symbol(
                     dry_run=dry_run,
                     restart_runner=restart,
                 )
-                action = "dry_run_recovery_timeout_cooldown" if dry_run else "recovery_timeout_cooldown"
+                action = (
+                    "dry_run_recovery_timeout_cooldown"
+                    if dry_run
+                    else "recovery_timeout_cooldown"
+                )
                 item.update(
                     {
                         "status": "cooldown",
-                        "cooldown_until": (now + timedelta(seconds=max(float(cooldown_seconds), 0.0))).isoformat(),
+                        "cooldown_until": (
+                            now + timedelta(seconds=max(float(cooldown_seconds), 0.0))
+                        ).isoformat(),
                         "last_recovery_action_at": now.isoformat(),
                         "last_recovery_action": action,
                     }
@@ -1528,7 +1810,10 @@ def check_symbol(
                     "volume_summary": volume_summary,
                     "assessment": assessment,
                 }
-                _append_jsonl(output_dir / "bq_volume_recovery_guard_events.jsonl", {"ts": now.isoformat(), **return_result})
+                _append_jsonl(
+                    output_dir / "bq_volume_recovery_guard_events.jsonl",
+                    {"ts": now.isoformat(), **return_result},
+                )
                 return return_result
             restore_ready = (
                 _safe_float(volume_summary.get("gross_notional")) >= recover_floor
@@ -1538,10 +1823,19 @@ def check_symbol(
             )
             if restore_ready and not recovery_hold_satisfied:
                 action = "hold_recovery_min_duration"
-                item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_recovery_check_at": now.isoformat(),
+                    }
+                )
             elif restore_ready:
                 has_original_controls = bool(item.get("guard_original_controls"))
-                updates = _restore_recovery_controls(item)
+                updates = _restore_recovery_controls(
+                    item,
+                    control=control,
+                    cycle_budget_floor_notional=cycle_budget_floor_notional,
+                )
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
@@ -1552,9 +1846,17 @@ def check_symbol(
                     restart_runner=restart,
                 )
                 if has_original_controls:
-                    action = "dry_run_restore_recovery_controls" if dry_run else "restore_recovery_controls"
+                    action = (
+                        "dry_run_restore_recovery_controls"
+                        if dry_run
+                        else "restore_recovery_controls"
+                    )
                 else:
-                    action = "dry_run_disable_allow_loss_after_recovery" if dry_run else "disable_allow_loss_after_recovery"
+                    action = (
+                        "dry_run_disable_allow_loss_after_recovery"
+                        if dry_run
+                        else "disable_allow_loss_after_recovery"
+                    )
                 _set_post_restore_cooldown(
                     item,
                     now=now,
@@ -1566,14 +1868,30 @@ def check_symbol(
                 item.pop("recovery_owned", None)
             elif not cap_buffer_ok:
                 action = "hold_recovery_until_cap_buffer"
-                item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_recovery_check_at": now.isoformat(),
+                    }
+                )
             else:
                 action = "hold_recovery_until_volume_or_orders"
-                item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_recovery_check_at": now.isoformat(),
+                    }
+                )
         elif not bool(assessment.get("low_volume")):
             action = "volume_normal"
             item.clear()
-            item.update({"status": "normal", "last_normal_at": now.isoformat(), "last_assessment": assessment})
+            item.update(
+                {
+                    "status": "normal",
+                    "last_normal_at": now.isoformat(),
+                    "last_assessment": assessment,
+                }
+            )
         else:
             first_low = _parse_time(item.get("first_low_volume_at")) or now
             elapsed = (now - first_low).total_seconds()
@@ -1602,11 +1920,16 @@ def check_symbol(
                     "sticky_entry_price_tolerance_steps": 1.0,
                 }
                 _remember_recovery_updates(item, updates)
-                action = "dry_run_tighten_sticky_for_one_sided_stall" if dry_run else "tighten_sticky_for_one_sided_stall"
+                action = (
+                    "dry_run_tighten_sticky_for_one_sided_stall"
+                    if dry_run
+                    else "tighten_sticky_for_one_sided_stall"
+                )
                 item.update(
                     {
                         "status": "recovery_active",
-                        "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                        "recovery_started_at": item.get("recovery_started_at")
+                        or now.isoformat(),
                         "recovery_owned": True,
                         "last_recovery_action_at": now.isoformat(),
                         "last_recovery_action": action,
@@ -1622,18 +1945,29 @@ def check_symbol(
                     restart_runner=restart,
                 )
             elif bool(assessment.get("inventory_soft_pressure")):
-                updates = _loss_reduce_recovery_updates(control=control, assessment=assessment)
+                updates = _loss_reduce_recovery_updates(
+                    control=control, assessment=assessment
+                )
                 _remember_recovery_controls(
                     item,
                     control,
-                    tuple(key for key in updates if key != "best_quote_maker_volume_net_loss_reduce_enabled"),
+                    tuple(
+                        key
+                        for key in updates
+                        if key != "best_quote_maker_volume_net_loss_reduce_enabled"
+                    ),
                 )
                 _remember_recovery_updates(item, updates)
-                action = "dry_run_enable_soft_inventory_loss_reduce" if dry_run else "enable_soft_inventory_loss_reduce"
+                action = (
+                    "dry_run_enable_soft_inventory_loss_reduce"
+                    if dry_run
+                    else "enable_soft_inventory_loss_reduce"
+                )
                 item.update(
                     {
                         "status": "recovery_active",
-                        "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                        "recovery_started_at": item.get("recovery_started_at")
+                        or now.isoformat(),
                         "soft_recovery_extension_count": 0,
                         "recovery_owned": True,
                         "last_recovery_action_at": now.isoformat(),
@@ -1654,13 +1988,17 @@ def check_symbol(
                 and _safe_int(assessment.get("near_market_order_count")) > 0
             ):
                 action = "hold_near_market_reduce_only_flow"
-                item.update({"status": "low_volume", "last_recovery_check_at": now.isoformat()})
+                item.update(
+                    {"status": "low_volume", "last_recovery_check_at": now.isoformat()}
+                )
             elif (
                 not bool(assessment.get("near_cap"))
                 and not bool(assessment.get("ineffective_orders"))
                 and "inventory_bias" not in set(assessment.get("pause_reasons") or [])
             ):
-                current_budget = _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
+                current_budget = _safe_float(
+                    control.get("best_quote_maker_volume_cycle_budget_notional")
+                )
                 increment = max(float(volume_recovery_cycle_budget_increment), 0.0)
                 if current_budget > 0 and increment > 0:
                     _remember_recovery_controls(
@@ -1678,13 +2016,20 @@ def check_symbol(
                     }
                     _remember_recovery_updates(
                         item,
-                        {"best_quote_maker_volume_cycle_budget_notional": target_budget},
+                        {
+                            "best_quote_maker_volume_cycle_budget_notional": target_budget
+                        },
                     )
-                    action = "dry_run_raise_cycle_budget_for_volume" if dry_run else "raise_cycle_budget_for_volume"
+                    action = (
+                        "dry_run_raise_cycle_budget_for_volume"
+                        if dry_run
+                        else "raise_cycle_budget_for_volume"
+                    )
                     item.update(
                         {
                             "status": "recovery_active",
-                            "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                            "recovery_started_at": item.get("recovery_started_at")
+                            or now.isoformat(),
                             "recovery_owned": True,
                             "last_recovery_action_at": now.isoformat(),
                             "last_recovery_action": action,
@@ -1712,8 +2057,14 @@ def check_symbol(
                     _safe_float(assessment.get("current_long_notional"))
                     - _safe_float(assessment.get("current_short_notional"))
                 )
-                configured_gap = _safe_float(control.get("best_quote_maker_volume_inventory_bias_min_notional_gap"))
-                relief_gap = current_gap + max(float(inventory_bias_relief_notional_margin), 0.0)
+                configured_gap = _safe_float(
+                    control.get(
+                        "best_quote_maker_volume_inventory_bias_min_notional_gap"
+                    )
+                )
+                relief_gap = current_gap + max(
+                    float(inventory_bias_relief_notional_margin), 0.0
+                )
                 if current_gap >= configured_gap and relief_gap > configured_gap:
                     _remember_recovery_controls(
                         item,
@@ -1726,13 +2077,20 @@ def check_symbol(
                     }
                     _remember_recovery_updates(
                         item,
-                        {"best_quote_maker_volume_inventory_bias_min_notional_gap": relief_gap},
+                        {
+                            "best_quote_maker_volume_inventory_bias_min_notional_gap": relief_gap
+                        },
                     )
-                    action = "dry_run_relax_inventory_bias_for_volume" if dry_run else "relax_inventory_bias_for_volume"
+                    action = (
+                        "dry_run_relax_inventory_bias_for_volume"
+                        if dry_run
+                        else "relax_inventory_bias_for_volume"
+                    )
                     item.update(
                         {
                             "status": "recovery_active",
-                            "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                            "recovery_started_at": item.get("recovery_started_at")
+                            or now.isoformat(),
                             "recovery_owned": True,
                             "last_recovery_action_at": now.isoformat(),
                             "last_recovery_action": action,
@@ -1750,18 +2108,29 @@ def check_symbol(
                 elif effective_near_market_flow:
                     action = "hold_effective_near_market_flow"
                 else:
-                    updates = _loss_reduce_recovery_updates(control=control, assessment=assessment)
+                    updates = _loss_reduce_recovery_updates(
+                        control=control, assessment=assessment
+                    )
                     _remember_recovery_controls(
                         item,
                         control,
-                        tuple(key for key in updates if key != "best_quote_maker_volume_net_loss_reduce_enabled"),
+                        tuple(
+                            key
+                            for key in updates
+                            if key != "best_quote_maker_volume_net_loss_reduce_enabled"
+                        ),
                     )
                     _remember_recovery_updates(item, updates)
-                    action = "dry_run_enable_allow_loss_reduce_only" if dry_run else "enable_allow_loss_reduce_only"
+                    action = (
+                        "dry_run_enable_allow_loss_reduce_only"
+                        if dry_run
+                        else "enable_allow_loss_reduce_only"
+                    )
                     item.update(
                         {
                             "status": "recovery_active",
-                            "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                            "recovery_started_at": item.get("recovery_started_at")
+                            or now.isoformat(),
                             "recovery_owned": True,
                             "last_recovery_action_at": now.isoformat(),
                             "last_recovery_action": action,
@@ -1781,21 +2150,37 @@ def check_symbol(
                 if (
                     allow_inventory_cost_gate_disable
                     and bool(assessment.get("cost_gate_blocked"))
-                    and bool(control.get("best_quote_maker_volume_inventory_cost_gate_enabled"))
+                    and bool(
+                        control.get(
+                            "best_quote_maker_volume_inventory_cost_gate_enabled"
+                        )
+                    )
                 ):
-                    _remember_recovery_controls(item, control, ("best_quote_maker_volume_inventory_cost_gate_enabled",))
-                    updates["best_quote_maker_volume_inventory_cost_gate_enabled"] = False
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        ("best_quote_maker_volume_inventory_cost_gate_enabled",),
+                    )
+                    updates["best_quote_maker_volume_inventory_cost_gate_enabled"] = (
+                        False
+                    )
                     _remember_recovery_updates(
                         item,
                         {"best_quote_maker_volume_inventory_cost_gate_enabled": False},
                     )
                     chosen_action = "disable_inventory_cost_gate"
                 else:
-                    updates = _loss_reduce_recovery_updates(control=control, assessment=assessment)
+                    updates = _loss_reduce_recovery_updates(
+                        control=control, assessment=assessment
+                    )
                     _remember_recovery_controls(
                         item,
                         control,
-                        tuple(key for key in updates if key != "best_quote_maker_volume_net_loss_reduce_enabled"),
+                        tuple(
+                            key
+                            for key in updates
+                            if key != "best_quote_maker_volume_net_loss_reduce_enabled"
+                        ),
                     )
                     _remember_recovery_updates(item, updates)
                     chosen_action = "enable_allow_loss_reduce_only"
@@ -1803,7 +2188,8 @@ def check_symbol(
                 item.update(
                     {
                         "status": "recovery_active",
-                        "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                        "recovery_started_at": item.get("recovery_started_at")
+                        or now.isoformat(),
                         "soft_recovery_extension_count": 0,
                         "recovery_owned": True,
                         "last_recovery_action_at": now.isoformat(),
@@ -1841,7 +2227,9 @@ def check_symbol(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Recover stalled best-quote maker-volume saved runners.")
+    parser = argparse.ArgumentParser(
+        description="Recover stalled best-quote maker-volume saved runners."
+    )
     parser.add_argument("--app-dir", default="/home/ubuntu/wangge")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--state-path", default=None)
@@ -1859,7 +2247,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--recover-cap-ratio", type=float, default=0.96)
     parser.add_argument("--far-ticks", type=int, default=8)
     parser.add_argument("--plan-stale-seconds", type=float, default=300.0)
-    parser.add_argument("--allow-inventory-cost-gate-disable", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--allow-inventory-cost-gate-disable",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--max-recovery-seconds", type=float, default=300.0)
     parser.add_argument("--cooldown-seconds", type=float, default=600.0)
     parser.add_argument("--recovery-min-hold-seconds", type=float, default=120.0)
@@ -1867,17 +2259,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--post-restore-cooldown-seconds", type=float, default=300.0)
     parser.add_argument("--max-soft-recovery-extensions", type=int, default=1)
     parser.add_argument("--inactive-trigger-seconds", type=float, default=120.0)
-    parser.add_argument("--inactive-restart-cooldown-seconds", type=float, default=600.0)
-    parser.add_argument("--inactive-max-snapshot-age-seconds", type=float, default=300.0)
-    parser.add_argument("--inventory-bias-relief-notional-margin", type=float, default=24.0)
-    parser.add_argument("--volume-recovery-cycle-budget-increment", type=float, default=12.0)
+    parser.add_argument(
+        "--inactive-restart-cooldown-seconds", type=float, default=600.0
+    )
+    parser.add_argument(
+        "--inactive-max-snapshot-age-seconds", type=float, default=300.0
+    )
+    parser.add_argument(
+        "--inventory-bias-relief-notional-margin", type=float, default=24.0
+    )
+    parser.add_argument(
+        "--volume-recovery-cycle-budget-increment", type=float, default=12.0
+    )
     parser.add_argument("--cycle-budget-floors", nargs="*", default=[])
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
     app_dir = Path(args.app_dir).resolve()
-    output_dir = Path(args.output_dir).resolve() if args.output_dir else app_dir / "output"
-    state_path = Path(args.state_path).resolve() if args.state_path else output_dir / "bq_volume_recovery_guard_state.json"
+    output_dir = (
+        Path(args.output_dir).resolve() if args.output_dir else app_dir / "output"
+    )
+    state_path = (
+        Path(args.state_path).resolve()
+        if args.state_path
+        else output_dir / "bq_volume_recovery_guard_state.json"
+    )
     state = _read_json(state_path)
     now = datetime.now(timezone.utc)
     daily_targets = _parse_symbol_notionals(args.daily_targets)
@@ -1910,7 +2316,9 @@ def main(argv: list[str] | None = None) -> int:
             fetch_window_seconds = args.window_seconds
             if symbol in daily_targets:
                 day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                fetch_window_seconds = max(fetch_window_seconds, (now - day_start).total_seconds())
+                fetch_window_seconds = max(
+                    fetch_window_seconds, (now - day_start).total_seconds()
+                )
             trade_rows = _fetch_exchange_user_trades(
                 symbol=symbol,
                 now=now,
@@ -1926,7 +2334,10 @@ def main(argv: list[str] | None = None) -> int:
                 "restart_failed": None,
                 "exchange_trade_fetch_failed": str(exc),
             }
-            _append_jsonl(output_dir / "bq_volume_recovery_guard_events.jsonl", {"ts": now.isoformat(), **result})
+            _append_jsonl(
+                output_dir / "bq_volume_recovery_guard_events.jsonl",
+                {"ts": now.isoformat(), **result},
+            )
             results.append(result)
             exit_code = 1
             continue
@@ -1968,7 +2379,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.dry_run:
         _write_json(state_path, state)
-    print(json.dumps({"ok": exit_code == 0, "checked_at": now.isoformat(), "results": results}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {"ok": exit_code == 0, "checked_at": now.isoformat(), "results": results},
+            ensure_ascii=False,
+        )
+    )
     return exit_code
 
 
