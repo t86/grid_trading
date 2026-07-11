@@ -465,7 +465,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
 
             self.assertEqual(result["action"], "skip_runner_inactive_safety_gate")
             self.assertIn("after_run_window", result["inactive_restart_gate"]["reasons"])
-            self.assertEqual(restarts, [])
+            self.assertEqual(restarts, [], result)
 
     def test_fetch_recent_user_trades_pages_and_deduplicates_ids(self) -> None:
         now = datetime(2026, 6, 26, 7, 0, tzinfo=timezone.utc)
@@ -1954,6 +1954,67 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertNotEqual(result["action"], "raise_cycle_budget_for_volume")
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
             self.assertEqual(restarts, [])
+
+    def test_recent_non_safety_action_debounces_budget_raise(self) -> None:
+        now = datetime(2026, 7, 11, 12, 14, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 108.0,
+                    "pause_buy_position_notional": 800.0,
+                    "pause_short_position_notional": 800.0,
+                },
+                long_notional=500.0,
+                short_notional=450.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+                recent_trade_notional=20.0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 500.0,
+                    "actual_short_notional": 450.0,
+                    "frozen_long_notional": 0.0,
+                    "frozen_short_notional": 0.0,
+                }
+            }
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                        "last_recovery_action": "relax_inventory_bias_for_volume",
+                        "last_recovery_action_at": (now - timedelta(seconds=60)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                daily_target_notional=10_000.0,
+                cycle_budget_floor_notional=120.0,
+                volume_recovery_cycle_budget_increment=12.0,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertNotEqual(result["action"], "raise_cycle_budget_for_volume")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
+            self.assertEqual(restarts, [], result)
 
     def test_keeps_loss_reduce_eligible_when_frozen_inventory_exists(self) -> None:
         now = datetime(2026, 7, 11, 12, 15, tzinfo=timezone.utc)

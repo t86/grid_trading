@@ -1463,6 +1463,7 @@ def check_symbol(
         elif (
             recovery_low_volume
             and not post_restore_budget_cooldown_active
+            and not recovery_reapply_debounced
             and max(float(cycle_budget_floor_notional), 0.0)
             > _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
             and _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional")) > 0
@@ -1646,6 +1647,7 @@ def check_symbol(
             elif (
                 severe_one_sided_stall
                 and recovery_hold_satisfied
+                and not recovery_reapply_debounced
                 and _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0
             ):
                 _remember_recovery_controls(
@@ -1683,6 +1685,7 @@ def check_symbol(
             elif (
                 severe_one_sided_stall
                 and recovery_hold_satisfied
+                and not recovery_reapply_debounced
                 and _safe_float(control.get("sticky_entry_price_tolerance_steps")) <= 1.0
             ):
                 current_gap = abs(
@@ -1727,6 +1730,7 @@ def check_symbol(
             elif (
                 bool(assessment.get("low_volume"))
                 and recovery_hold_satisfied
+                and not recovery_reapply_debounced
                 and not recovery_timed_out
                 and not drifted_updates
                 and any(
@@ -2197,8 +2201,11 @@ def check_symbol(
             )
             if elapsed < max(float(trigger_seconds), 0.0):
                 action = "wait_low_volume_confirmation"
+            elif recovery_reapply_debounced and not effective_inventory_soft_pressure:
+                action = "hold_non_safety_recovery_debounce"
             elif (
                 severe_one_sided_stall
+                and not recovery_reapply_debounced
                 and _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0
             ):
                 _remember_recovery_controls(
@@ -2324,6 +2331,7 @@ def check_symbol(
                 and not bool(assessment.get("ineffective_orders"))
                 and "inventory_bias" not in set(assessment.get("pause_reasons") or [])
                 and not post_restore_budget_cooldown_active
+                and not recovery_reapply_debounced
             ):
                 current_budget = _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
                 increment = max(float(volume_recovery_cycle_budget_increment), 0.0)
@@ -2379,7 +2387,11 @@ def check_symbol(
                 )
                 configured_gap = _safe_float(control.get("best_quote_maker_volume_inventory_bias_min_notional_gap"))
                 relief_gap = current_gap + max(float(inventory_bias_relief_notional_margin), 0.0)
-                if current_gap >= configured_gap and relief_gap > configured_gap:
+                if (
+                    current_gap >= configured_gap
+                    and relief_gap > configured_gap
+                    and not recovery_reapply_debounced
+                ):
                     _remember_recovery_controls(
                         item,
                         control,
