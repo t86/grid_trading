@@ -723,6 +723,7 @@ def check_symbol(
     recovery_min_hold_seconds: float = 120.0,
     recovery_reapply_min_seconds: float = 180.0,
     post_restore_cooldown_seconds: float = 300.0,
+    max_soft_recovery_extensions: int = 1,
     inventory_bias_relief_notional_margin: float = 24.0,
     volume_recovery_cycle_budget_increment: float = 12.0,
     trade_rows: list[dict[str, Any]] | None = None,
@@ -862,6 +863,7 @@ def check_symbol(
                     {
                         "status": "recovery_active",
                         "recovery_started_at": now.isoformat(),
+                        "soft_recovery_extension_count": 0,
                         "recovery_owned": True,
                         "last_recovery_action_at": now.isoformat(),
                         "last_recovery_action": action,
@@ -1005,10 +1007,47 @@ def check_symbol(
                 )
                 return result
             recovery_started_at = _parse_time(item.get("recovery_started_at"))
-            if (
+            recovery_stage_timed_out = (
                 recovery_started_at is not None
                 and (now - recovery_started_at).total_seconds() >= max(float(max_recovery_seconds), 0.0)
-            ):
+            )
+            extension_count = _safe_int(item.get("soft_recovery_extension_count"))
+            can_extend_soft_recovery = (
+                recovery_stage_timed_out
+                and bool(assessment.get("inventory_soft_pressure"))
+                and _safe_int(assessment.get("active_order_count")) > 0
+                and _safe_int(assessment.get("near_market_order_count")) > 0
+                and not bool(assessment.get("ineffective_orders"))
+                and extension_count < max(int(max_soft_recovery_extensions), 0)
+            )
+            if can_extend_soft_recovery:
+                action = "extend_soft_inventory_loss_recovery"
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "recovery_started_at": now.isoformat(),
+                        "soft_recovery_extension_count": extension_count + 1,
+                        "last_recovery_check_at": now.isoformat(),
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+                result = {
+                    "symbol": normalized_symbol,
+                    "action": action,
+                    "changed_keys": changed,
+                    "backup_path": backup_path,
+                    "dry_run": dry_run,
+                    "restart_failed": restart_failed,
+                    "volume_summary": volume_summary,
+                    "assessment": assessment,
+                }
+                _append_jsonl(
+                    output_dir / "bq_volume_recovery_guard_events.jsonl",
+                    {"ts": now.isoformat(), **result},
+                )
+                return result
+            if recovery_stage_timed_out:
                 updates = _restore_recovery_controls(item)
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
@@ -1119,6 +1158,7 @@ def check_symbol(
                     {
                         "status": "recovery_active",
                         "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                        "soft_recovery_extension_count": 0,
                         "recovery_owned": True,
                         "last_recovery_action_at": now.isoformat(),
                         "last_recovery_action": action,
@@ -1274,6 +1314,7 @@ def check_symbol(
                     {
                         "status": "recovery_active",
                         "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                        "soft_recovery_extension_count": 0,
                         "recovery_owned": True,
                         "last_recovery_action_at": now.isoformat(),
                         "last_recovery_action": action,
@@ -1330,6 +1371,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--recovery-min-hold-seconds", type=float, default=120.0)
     parser.add_argument("--recovery-reapply-min-seconds", type=float, default=180.0)
     parser.add_argument("--post-restore-cooldown-seconds", type=float, default=300.0)
+    parser.add_argument("--max-soft-recovery-extensions", type=int, default=1)
     parser.add_argument("--inactive-trigger-seconds", type=float, default=120.0)
     parser.add_argument("--inactive-restart-cooldown-seconds", type=float, default=600.0)
     parser.add_argument("--inactive-max-snapshot-age-seconds", type=float, default=300.0)
@@ -1406,6 +1448,7 @@ def main(argv: list[str] | None = None) -> int:
             recovery_min_hold_seconds=args.recovery_min_hold_seconds,
             recovery_reapply_min_seconds=args.recovery_reapply_min_seconds,
             post_restore_cooldown_seconds=args.post_restore_cooldown_seconds,
+            max_soft_recovery_extensions=args.max_soft_recovery_extensions,
             inventory_bias_relief_notional_margin=args.inventory_bias_relief_notional_margin,
             volume_recovery_cycle_budget_increment=args.volume_recovery_cycle_budget_increment,
             trade_rows=trade_rows,
