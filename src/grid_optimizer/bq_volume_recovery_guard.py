@@ -15,6 +15,7 @@ UserTradesPageFetcher = Callable[..., list[dict[str, Any]]]
 
 _RECOVERY_CONTROL_KEYS = (
     "best_quote_maker_volume_allow_loss_reduce_only",
+    "best_quote_maker_volume_active_pair_reduce_enabled",
     "best_quote_maker_volume_inventory_cost_gate_enabled",
     "best_quote_maker_volume_inventory_bias_min_notional_gap",
     "best_quote_maker_volume_cycle_budget_notional",
@@ -526,6 +527,10 @@ def assess_symbol(
         and buy_paused != short_paused
         and "inventory_bias" in pause_reasons
     )
+    volatility_entry_pause = plan.get("volatility_entry_pause")
+    volatility_entry_pause_active = bool(
+        volatility_entry_pause.get("active") if isinstance(volatility_entry_pause, dict) else False
+    )
 
     return {
         "symbol": symbol,
@@ -552,6 +557,7 @@ def assess_symbol(
         "short_paused": short_paused,
         "pause_reasons": sorted(pause_reasons),
         "one_sided_inventory_bias": one_sided_inventory_bias,
+        "volatility_entry_pause_active": volatility_entry_pause_active,
         "current_long_notional": current_long,
         "current_short_notional": current_short,
         "max_long_notional": long_cap,
@@ -1158,6 +1164,70 @@ def check_symbol(
                 and (now - recovery_started_at).total_seconds() >= max(float(max_recovery_seconds), 0.0)
             )
             extension_count = _safe_int(item.get("soft_recovery_extension_count"))
+            current_long = max(_safe_float(assessment.get("current_long_notional")), 0.0)
+            current_short = max(_safe_float(assessment.get("current_short_notional")), 0.0)
+            heavier_inventory = max(current_long, current_short)
+            lighter_inventory = min(current_long, current_short)
+            pair_reduce_min_side = max(
+                _safe_float(control.get("best_quote_maker_volume_active_pair_reduce_min_side_notional")),
+                0.0,
+            )
+            stalled_loss_reduce_plan = (
+                bool(assessment.get("low_volume"))
+                and bool(assessment.get("inventory_soft_pressure"))
+                and _safe_int(assessment.get("planned_reduce_only_order_count")) <= 0
+                and current_long > 0
+                and current_short > 0
+                and lighter_inventory >= pair_reduce_min_side
+                and lighter_inventory >= heavier_inventory * 0.5
+                and not bool(assessment.get("volatility_entry_pause_active"))
+                and not bool(control.get("best_quote_maker_volume_active_pair_reduce_enabled"))
+                and extension_count >= max(int(max_soft_recovery_extensions), 0)
+                and recovery_hold_satisfied
+                and last_recovery_action_at is not None
+                and not recovery_reapply_debounced
+            )
+            if stalled_loss_reduce_plan:
+                updates = {"best_quote_maker_volume_active_pair_reduce_enabled": True}
+                _remember_recovery_controls(item, control, tuple(updates))
+                _remember_recovery_updates(item, updates)
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = (
+                    "dry_run_enable_bounded_pair_reduce_for_stalled_loss_recovery"
+                    if dry_run
+                    else "enable_bounded_pair_reduce_for_stalled_loss_recovery"
+                )
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_recovery_check_at": now.isoformat(),
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+                result = {
+                    "symbol": normalized_symbol,
+                    "action": action,
+                    "changed_keys": changed,
+                    "backup_path": backup_path,
+                    "dry_run": dry_run,
+                    "restart_failed": restart_failed,
+                    "volume_summary": volume_summary,
+                    "assessment": assessment,
+                }
+                _append_jsonl(
+                    output_dir / "bq_volume_recovery_guard_events.jsonl",
+                    {"ts": now.isoformat(), **result},
+                )
+                return result
             can_extend_soft_recovery = (
                 recovery_stage_timed_out
                 and bool(assessment.get("inventory_soft_pressure"))
