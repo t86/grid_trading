@@ -20,6 +20,7 @@ _RECOVERY_CONTROL_KEYS = (
     "best_quote_maker_volume_cycle_budget_notional",
     "pause_buy_position_notional",
     "pause_short_position_notional",
+    "sticky_entry_price_tolerance_steps",
 )
 
 
@@ -458,6 +459,18 @@ def assess_symbol(
         reasons.append("long_near_soft_limit")
     if near_short_soft and not near_short_cap:
         reasons.append("short_near_soft_limit")
+    buy_paused = bool(plan.get("buy_paused"))
+    short_paused = bool(plan.get("short_paused"))
+    pause_reasons = {
+        str(reason).strip()
+        for reason in list(plan.get("pause_reasons") or []) + list(plan.get("short_pause_reasons") or [])
+        if str(reason).strip()
+    }
+    one_sided_inventory_bias = (
+        active_count == 1
+        and buy_paused != short_paused
+        and "inventory_bias" in pause_reasons
+    )
 
     return {
         "symbol": symbol,
@@ -477,6 +490,10 @@ def assess_symbol(
         "short_near_soft": near_short_soft,
         "long_soft_limit_notional": long_soft,
         "short_soft_limit_notional": short_soft,
+        "buy_paused": buy_paused,
+        "short_paused": short_paused,
+        "pause_reasons": sorted(pause_reasons),
+        "one_sided_inventory_bias": one_sided_inventory_bias,
         "current_long_notional": current_long,
         "current_short_notional": current_short,
         "max_long_notional": long_cap,
@@ -1145,6 +1162,40 @@ def check_symbol(
             )
             if elapsed < max(float(trigger_seconds), 0.0):
                 action = "wait_low_volume_confirmation"
+            elif (
+                bool(assessment.get("one_sided_inventory_bias"))
+                and _safe_float(volume_summary.get("gross_notional")) <= 0
+                and _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0
+            ):
+                _remember_recovery_controls(
+                    item,
+                    control,
+                    ("sticky_entry_price_tolerance_steps",),
+                )
+                updates = {
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "sticky_entry_price_tolerance_steps": 1.0,
+                }
+                _remember_recovery_updates(item, updates)
+                action = "dry_run_tighten_sticky_for_one_sided_stall" if dry_run else "tighten_sticky_for_one_sided_stall"
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                        "recovery_owned": True,
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
             elif bool(assessment.get("inventory_soft_pressure")):
                 updates = _loss_reduce_recovery_updates(control=control, assessment=assessment)
                 _remember_recovery_controls(
