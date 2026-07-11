@@ -654,13 +654,24 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "pause_buy_position_notional": 600.0,
                     "pause_short_position_notional": 600.0,
                 },
-                long_notional=750.0,
-                short_notional=700.0,
+                long_notional=850.0,
+                short_notional=820.0,
                 open_order_count=1,
                 active_order_count=1,
                 orders_near_market=True,
                 recent_trade_notional=20.0,
             )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 750.0,
+                    "actual_short_notional": 700.0,
+                    "frozen_long_notional": 0.0,
+                    "frozen_short_notional": 0.0,
+                }
+            }
+            _write_json(plan_path, plan)
             state: dict[str, object] = {
                 "symbols": {
                     "REUSDT": {
@@ -697,6 +708,29 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(state["symbols"]["REUSDT"]["status"], "normal")
             self.assertIn("cooldown_until", state["symbols"]["REUSDT"])
             self.assertEqual(restarts, ["REUSDT"])
+
+    def test_frozen_inventory_prevents_actual_position_recovery_fallback(self) -> None:
+        recovered = bq_volume_recovery_guard._recovery_inventory_buffer_ok(
+            {
+                "current_long_notional": 850.0,
+                "current_short_notional": 820.0,
+                "actual_long_notional": 750.0,
+                "actual_short_notional": 700.0,
+                "frozen_total_notional": 100.0,
+                "max_long_notional": 1000.0,
+                "max_short_notional": 1000.0,
+                "long_soft_limit_notional": 600.0,
+                "short_soft_limit_notional": 600.0,
+                "inventory_soft_ratio": 0.8,
+            },
+            recover_cap_ratio=0.96,
+            original_controls={
+                "pause_buy_position_notional": 800.0,
+                "pause_short_position_notional": 800.0,
+            },
+        )
+
+        self.assertFalse(recovered)
 
     def test_dry_run_reports_recovery_without_mutating_control(self) -> None:
         now = datetime(2026, 6, 26, 7, 20, tzinfo=timezone.utc)

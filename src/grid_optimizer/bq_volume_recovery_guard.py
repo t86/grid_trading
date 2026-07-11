@@ -345,11 +345,17 @@ def _recovery_inventory_buffer_ok(
 
     long_limit = threshold("max_long_notional", "long_soft_limit_notional", "pause_buy_position_notional")
     short_limit = threshold("max_short_notional", "short_soft_limit_notional", "pause_short_position_notional")
+    frozen_total = max(_safe_float(assessment.get("frozen_total_notional")), 0.0)
+    actual_long = assessment.get("actual_long_notional")
+    actual_short = assessment.get("actual_short_notional")
+    use_actual = frozen_total <= 0 and actual_long is not None and actual_short is not None
+    current_long = _safe_float(actual_long) if use_actual else _safe_float(assessment.get("current_long_notional"))
+    current_short = _safe_float(actual_short) if use_actual else _safe_float(assessment.get("current_short_notional"))
     return (
         long_limit > 0
         and short_limit > 0
-        and _safe_float(assessment.get("current_long_notional")) < long_limit
-        and _safe_float(assessment.get("current_short_notional")) < short_limit
+        and current_long < long_limit
+        and current_short < short_limit
     )
 
 
@@ -514,6 +520,25 @@ def assess_symbol(
     long_cap, short_cap = _position_caps(plan, control)
     current_long = _safe_float(plan.get("current_long_notional"))
     current_short = _safe_float(plan.get("current_short_notional"))
+    best_quote = plan.get("best_quote_maker_volume") if isinstance(plan.get("best_quote_maker_volume"), dict) else {}
+    reduce_freeze = best_quote.get("reduce_freeze") if isinstance(best_quote.get("reduce_freeze"), dict) else {}
+    frozen_v2 = best_quote.get("frozen_v2") if isinstance(best_quote.get("frozen_v2"), dict) else {}
+    actual_long = (
+        _safe_float(reduce_freeze.get("actual_long_notional"))
+        if "actual_long_notional" in reduce_freeze
+        else None
+    )
+    actual_short = (
+        _safe_float(reduce_freeze.get("actual_short_notional"))
+        if "actual_short_notional" in reduce_freeze
+        else None
+    )
+    frozen_total = max(
+        _safe_float(reduce_freeze.get("frozen_long_notional"))
+        + _safe_float(reduce_freeze.get("frozen_short_notional")),
+        _safe_float(frozen_v2.get("frozen_total_notional")),
+        0.0,
+    )
     near_long_cap = long_cap > 0 and current_long >= long_cap * max(float(near_cap_ratio), 0.0)
     near_short_cap = short_cap > 0 and current_short >= short_cap * max(float(near_cap_ratio), 0.0)
     if near_long_cap:
@@ -578,6 +603,9 @@ def assess_symbol(
         "volatility_entry_pause_active": volatility_entry_pause_active,
         "current_long_notional": current_long,
         "current_short_notional": current_short,
+        "actual_long_notional": actual_long,
+        "actual_short_notional": actual_short,
+        "frozen_total_notional": frozen_total,
         "max_long_notional": long_cap,
         "max_short_notional": short_cap,
         "cost_gate_blocked": _cost_gate_blocked(plan),
