@@ -1836,7 +1836,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(result["action"], "hold_loss_reduce_when_actual_inventory_below_soft")
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
 
-    def test_actual_inventory_below_soft_can_raise_budget_when_target_pace_is_behind(self) -> None:
+    def test_soft_pressure_blocks_budget_raise_when_target_pace_is_behind(self) -> None:
         now = datetime(2026, 7, 11, 12, 14, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -1894,10 +1894,11 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
 
             control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
-            self.assertEqual(result["action"], "raise_cycle_budget_for_volume")
+            self.assertEqual(result["action"], "relax_inventory_bias_for_volume")
             self.assertFalse(result["assessment"]["low_volume"])
             self.assertTrue(result["assessment"]["target_pace_behind"])
-            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 120.0)
+            self.assertTrue(result["assessment"]["inventory_soft_pressure"])
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["REUSDT"])
 

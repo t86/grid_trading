@@ -1468,6 +1468,7 @@ def check_symbol(
             and _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional")) > 0
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and not effective_inventory_soft_pressure
+            and not bool(assessment.get("inventory_soft_pressure"))
             and not bool(assessment.get("near_cap"))
             and not bool(assessment.get("ineffective_orders"))
             and not bool(assessment.get("volatility_entry_pause_active"))
@@ -2319,6 +2320,7 @@ def check_symbol(
                     item.update({"status": "low_volume", "last_recovery_check_at": now.isoformat()})
             elif (
                 not bool(assessment.get("near_cap"))
+                and not bool(assessment.get("inventory_soft_pressure"))
                 and not bool(assessment.get("ineffective_orders"))
                 and "inventory_bias" not in set(assessment.get("pause_reasons") or [])
                 and not post_restore_budget_cooldown_active
