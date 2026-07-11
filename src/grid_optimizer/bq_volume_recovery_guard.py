@@ -1535,7 +1535,7 @@ def check_symbol(
                 dry_run=dry_run,
                 restart_runner=restart,
             )
-        elif cooldown_until is not None and now < cooldown_until:
+        elif cooldown_until is not None and now < cooldown_until and not severe_one_sided_stall:
             action = "cooldown"
         elif recovery_has_original_controls and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only")):
             cap_buffer_ok = _recovery_inventory_buffer_ok(
