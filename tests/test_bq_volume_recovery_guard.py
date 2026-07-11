@@ -2964,6 +2964,53 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["sticky_entry_price_tolerance_steps"], 1.0)
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_soft_inventory_low_volume_bypasses_general_cooldown_after_confirmation(self) -> None:
+        now = datetime(2026, 6, 26, 10, 10, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                    "pause_buy_position_notional": 700.0,
+                    "pause_short_position_notional": 700.0,
+                },
+                long_notional=750.0,
+                short_notional=350.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+                recent_trade_notional=40.0,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "cooldown",
+                        "cooldown_until": (now + timedelta(minutes=5)).isoformat(),
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "enable_soft_inventory_loss_reduce")
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_multiple_same_direction_entries_are_still_one_sided_inventory_bias(self) -> None:
         now = datetime(2026, 6, 26, 10, 15, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
