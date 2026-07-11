@@ -16,6 +16,7 @@ from grid_optimizer.bq_volume_recovery_guard import (
     apply_target_pace_cycle_budget_floor,
     check_symbol,
     fetch_recent_user_trades,
+    recover_corrupt_loop_state,
     recover_inactive_runner,
     summarize_recent_volume,
 )
@@ -33,6 +34,69 @@ def _append_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class BqVolumeRecoveryGuardTests(unittest.TestCase):
+    def test_restores_persistent_corrupt_state_from_recent_valid_backup(self) -> None:
+        now = datetime(2026, 7, 11, 11, 20, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(output_dir, now=now - timedelta(minutes=10))
+            state_path = output_dir / "reusdt_loop_state.json"
+            state_path.write_text('{"broken":', encoding="utf-8")
+            backup_path = output_dir / "reusdt_loop_state.json.bak_autorealign_123"
+            _write_json(backup_path, {"best_quote_volume_ledger": {"long_lots": []}})
+
+            result = recover_corrupt_loop_state(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                now=now,
+                max_backup_age_seconds=3600,
+                min_corrupt_age_seconds=0,
+                max_snapshot_age_seconds=300,
+                dry_run=False,
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual(result["action"], "restore_corrupt_state_from_autorealign_backup")
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8")),
+                {"best_quote_volume_ledger": {"long_lots": []}},
+            )
+            self.assertTrue(Path(result["corrupt_archive_path"]).exists())
+            self.assertTrue(Path(result["archived_plan_path"]).exists())
+
+    def test_corrupt_state_recovery_respects_explicit_stop_reason(self) -> None:
+        now = datetime(2026, 7, 11, 11, 21, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(output_dir, now=now - timedelta(minutes=10))
+            state_path = output_dir / "reusdt_loop_state.json"
+            state_path.write_text('{"broken":', encoding="utf-8")
+            _write_json(
+                output_dir / "reusdt_loop_state.json.bak_autorealign_123",
+                {"best_quote_volume_ledger": {"long_lots": []}},
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["stop_reason"] = "manual_stop"
+            _write_json(plan_path, plan)
+
+            result = recover_corrupt_loop_state(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                now=now,
+                max_backup_age_seconds=3600,
+                min_corrupt_age_seconds=0,
+                max_snapshot_age_seconds=300,
+                dry_run=False,
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual(result["action"], "skip_corrupt_state_recovery_safety_gate")
+            self.assertIn("explicit_stop_reason", result["state_corruption"]["blocking_reasons"])
+            with self.assertRaises(json.JSONDecodeError):
+                json.loads(state_path.read_text(encoding="utf-8"))
+
     def test_main_checks_active_runner_normally(self) -> None:
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)

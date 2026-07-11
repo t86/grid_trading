@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
 from math import ceil
@@ -48,6 +49,106 @@ def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def recover_corrupt_loop_state(
+    *,
+    symbol: str,
+    output_dir: Path,
+    now: datetime,
+    max_backup_age_seconds: float,
+    min_corrupt_age_seconds: float,
+    max_snapshot_age_seconds: float,
+    dry_run: bool,
+) -> dict[str, Any] | None:
+    normalized_symbol = symbol.upper().strip()
+    slug = normalized_symbol.lower()
+    state_path = output_dir / f"{slug}_loop_state.json"
+    if not state_path.exists():
+        return None
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            return None
+        decode_error = "loop state is not a JSON object"
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        decode_error = str(exc)
+
+    try:
+        corrupt_age_seconds = max(now.timestamp() - state_path.stat().st_mtime, 0.0)
+    except OSError:
+        corrupt_age_seconds = 0.0
+    gate = _inactive_restart_gate(
+        control=_read_json(_control_path(output_dir, normalized_symbol)),
+        plan=_read_json(_plan_path(output_dir, normalized_symbol)),
+        submit=_read_json(_submit_path(output_dir, normalized_symbol)),
+        now=now,
+        max_snapshot_age_seconds=max_snapshot_age_seconds,
+    )
+    blocking_reasons = [
+        reason
+        for reason in gate["reasons"]
+        if reason not in {"latest_plan_stale", "latest_submit_stale"}
+    ]
+    if corrupt_age_seconds < max(float(min_corrupt_age_seconds), 0.0):
+        blocking_reasons.append("corrupt_state_not_persistent")
+
+    backup_path: Path | None = None
+    backup_payload: dict[str, Any] | None = None
+    for candidate in sorted(
+        output_dir.glob(f"{slug}_loop_state.json.bak_autorealign_*"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    ):
+        try:
+            backup_age = max(now.timestamp() - candidate.stat().st_mtime, 0.0)
+        except OSError:
+            continue
+        if backup_age > max(float(max_backup_age_seconds), 0.0):
+            continue
+        candidate_payload = _read_json(candidate)
+        if candidate_payload:
+            backup_path = candidate
+            backup_payload = candidate_payload
+            break
+    if backup_payload is None:
+        blocking_reasons.append("no_recent_valid_autorealign_backup")
+
+    result: dict[str, Any] = {
+        "symbol": normalized_symbol,
+        "changed_keys": [],
+        "backup_path": str(backup_path) if backup_path else None,
+        "dry_run": dry_run,
+        "restart_failed": None,
+        "state_corruption": {
+            "path": str(state_path),
+            "error": decode_error[:240],
+            "age_seconds": round(corrupt_age_seconds, 3),
+            "blocking_reasons": blocking_reasons,
+            "snapshot_gate": gate,
+        },
+    }
+    if blocking_reasons:
+        result["action"] = "skip_corrupt_state_recovery_safety_gate"
+        return result
+    if dry_run:
+        result["action"] = "dry_run_restore_corrupt_state_from_autorealign_backup"
+        return result
+
+    stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    corrupt_archive = state_path.with_name(state_path.name + f".corrupt_bq_recovery_{stamp}")
+    shutil.copy2(state_path, corrupt_archive)
+    _write_json(state_path, backup_payload)
+    plan_path = _plan_path(output_dir, normalized_symbol)
+    archived_plan: str | None = None
+    if plan_path.exists():
+        stale_plan_path = plan_path.with_name(plan_path.name + f".stale_state_recovery_{stamp}")
+        plan_path.replace(stale_plan_path)
+        archived_plan = str(stale_plan_path)
+    result["action"] = "restore_corrupt_state_from_autorealign_backup"
+    result["corrupt_archive_path"] = str(corrupt_archive)
+    result["archived_plan_path"] = archived_plan
+    return result
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -2386,6 +2487,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--inactive-trigger-seconds", type=float, default=120.0)
     parser.add_argument("--inactive-restart-cooldown-seconds", type=float, default=600.0)
     parser.add_argument("--inactive-max-snapshot-age-seconds", type=float, default=300.0)
+    parser.add_argument("--corrupt-state-max-backup-age-seconds", type=float, default=3600.0)
+    parser.add_argument("--corrupt-state-min-age-seconds", type=float, default=30.0)
     parser.add_argument("--inventory-bias-relief-notional-margin", type=float, default=24.0)
     parser.add_argument("--volume-recovery-cycle-budget-increment", type=float, default=12.0)
     parser.add_argument("--cycle-budget-floors", nargs="*", default=[])
@@ -2404,6 +2507,22 @@ def main(argv: list[str] | None = None) -> int:
     results = []
     exit_code = 0
     for symbol in _normalize_symbols(args.symbols):
+        corrupt_state_result = recover_corrupt_loop_state(
+            symbol=symbol,
+            output_dir=output_dir,
+            now=now,
+            max_backup_age_seconds=args.corrupt_state_max_backup_age_seconds,
+            min_corrupt_age_seconds=args.corrupt_state_min_age_seconds,
+            max_snapshot_age_seconds=args.inactive_max_snapshot_age_seconds,
+            dry_run=args.dry_run,
+        )
+        if corrupt_state_result is not None:
+            _append_jsonl(
+                output_dir / "bq_volume_recovery_guard_events.jsonl",
+                {"ts": now.isoformat(), **corrupt_state_result},
+            )
+            results.append(corrupt_state_result)
+            continue
         if not _runner_is_active(symbol):
             result = recover_inactive_runner(
                 symbol=symbol,
