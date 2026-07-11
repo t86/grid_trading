@@ -1180,6 +1180,37 @@ def check_symbol(
                     {"ts": now.isoformat(), **result},
                 )
                 return result
+            hold_exhausted_soft_recovery = (
+                recovery_stage_timed_out
+                and bool(assessment.get("inventory_soft_pressure"))
+                and _safe_int(assessment.get("active_order_count")) > 0
+                and _safe_int(assessment.get("near_market_order_count")) > 0
+                and not bool(assessment.get("ineffective_orders"))
+            )
+            if hold_exhausted_soft_recovery:
+                action = "hold_soft_inventory_loss_recovery_until_both_below"
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_recovery_check_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+                result = {
+                    "symbol": normalized_symbol,
+                    "action": action,
+                    "changed_keys": changed,
+                    "backup_path": backup_path,
+                    "dry_run": dry_run,
+                    "restart_failed": restart_failed,
+                    "volume_summary": volume_summary,
+                    "assessment": assessment,
+                }
+                _append_jsonl(
+                    output_dir / "bq_volume_recovery_guard_events.jsonl",
+                    {"ts": now.isoformat(), **result},
+                )
+                return result
             if recovery_stage_timed_out:
                 updates = _restore_recovery_controls(item)
                 changed, backup_path = _apply_control_update(
