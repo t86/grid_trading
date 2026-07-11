@@ -1508,6 +1508,7 @@ def check_symbol(
             and not bool(assessment.get("near_cap"))
             and not bool(assessment.get("ineffective_orders"))
             and not bool(assessment.get("volatility_entry_pause_active"))
+            and "inventory_bias" not in set(assessment.get("pause_reasons") or [])
         ):
             budget_floor = max(float(cycle_budget_floor_notional), 0.0)
             updates = {

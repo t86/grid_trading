@@ -3460,6 +3460,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 window_seconds=60,
                 min_volume_notional=100,
                 trigger_seconds=120,
+                cycle_budget_floor_notional=108.0,
                 restart_runner=restarts.append,
             )
 
