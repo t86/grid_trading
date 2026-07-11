@@ -1035,6 +1035,50 @@ def check_symbol(
                         "last_recovery_action": action,
                     }
                 )
+            elif (
+                severe_one_sided_stall
+                and recovery_hold_satisfied
+                and _safe_float(control.get("sticky_entry_price_tolerance_steps")) <= 1.0
+            ):
+                current_gap = abs(
+                    _safe_float(assessment.get("current_long_notional"))
+                    - _safe_float(assessment.get("current_short_notional"))
+                )
+                configured_gap = _safe_float(
+                    control.get("best_quote_maker_volume_inventory_bias_min_notional_gap")
+                )
+                relief_gap = current_gap + max(float(inventory_bias_relief_notional_margin), 0.0)
+                if current_gap >= configured_gap and relief_gap > configured_gap:
+                    updates = {
+                        "best_quote_maker_volume_inventory_bias_min_notional_gap": relief_gap,
+                    }
+                    _remember_recovery_controls(item, control, tuple(updates))
+                    _remember_recovery_updates(item, updates)
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
+                    action = (
+                        "dry_run_relax_inventory_bias_after_sticky_stall"
+                        if dry_run
+                        else "relax_inventory_bias_after_sticky_stall"
+                    )
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "recovery_started_at": now.isoformat(),
+                            "last_recovery_action_at": now.isoformat(),
+                            "last_recovery_action": action,
+                        }
+                    )
+                else:
+                    action = "hold_tight_sticky_inventory_bias_relief"
+                    item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
             elif recovery_timed_out:
                 updates = _restore_recovery_controls(item)
                 changed, backup_path = _apply_control_update(

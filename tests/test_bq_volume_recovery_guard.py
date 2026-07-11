@@ -2258,6 +2258,81 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["sticky_entry_price_tolerance_steps"], 1.0)
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_active_sticky_recovery_escalates_to_inventory_bias_relief(self) -> None:
+        now = datetime(2026, 6, 26, 10, 25, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                    "best_quote_maker_volume_inventory_bias_min_notional_gap": 150.0,
+                    "sticky_entry_price_tolerance_steps": 1.0,
+                },
+                long_notional=340.0,
+                short_notional=179.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan.update(
+                {
+                    "buy_orders": [],
+                    "sell_orders": [
+                        {"side": "SELL", "price": 0.5972, "qty": 16.0, "role": "best_quote_entry_short"},
+                        {"side": "SELL", "price": 0.5973, "qty": 16.0, "role": "best_quote_entry_short"},
+                    ],
+                    "buy_paused": True,
+                    "short_paused": False,
+                    "pause_reasons": ["inventory_bias"],
+                    "short_pause_reasons": ["inventory_bias"],
+                }
+            )
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
+                        "last_recovery_action_at": (now - timedelta(minutes=3)).isoformat(),
+                        "guard_original_controls": {
+                            "sticky_entry_price_tolerance_steps": 8.0,
+                        },
+                        "guard_recovery_controls": {
+                            "sticky_entry_price_tolerance_steps": 1.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                recovery_min_hold_seconds=120,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            item = state["symbols"]["REUSDT"]
+            self.assertEqual(result["action"], "relax_inventory_bias_after_sticky_stall")
+            self.assertEqual(control["sticky_entry_price_tolerance_steps"], 1.0)
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 72.0)
+            self.assertEqual(control["best_quote_maker_volume_inventory_bias_min_notional_gap"], 185.0)
+            self.assertEqual(
+                item["guard_original_controls"]["best_quote_maker_volume_inventory_bias_min_notional_gap"],
+                150.0,
+            )
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_near_market_reduce_only_flow_does_not_raise_cycle_budget(self) -> None:
         now = datetime(2026, 6, 26, 10, 30, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
