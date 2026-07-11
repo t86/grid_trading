@@ -1492,6 +1492,119 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(control["best_quote_maker_volume_active_pair_reduce_enabled"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_does_not_enable_loss_reduce_when_hourly_target_pace_is_ahead(self) -> None:
+        now = datetime(2026, 7, 11, 12, 15, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.8,
+                    "pause_buy_position_notional": 800.0,
+                    "pause_short_position_notional": 800.0,
+                },
+                long_notional=850.0,
+                short_notional=700.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            rows = [
+                {
+                    "id": 1,
+                    "time": int((now - timedelta(minutes=30)).timestamp() * 1000),
+                    "quoteQty": "5000",
+                }
+            ]
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                daily_target_notional=6000,
+                target_pace_fraction=1.05,
+                trade_rows=rows,
+                restart_runner=lambda symbol: self.fail(f"unexpected restart: {symbol}"),
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "hold_loss_reduce_while_target_pace_ahead")
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+
+    def test_closes_owned_loss_reduce_when_hourly_target_pace_is_ahead(self) -> None:
+        now = datetime(2026, 7, 11, 12, 20, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "pause_buy_position_notional": 760.0,
+                    "pause_short_position_notional": 760.0,
+                },
+                long_notional=850.0,
+                short_notional=700.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_owned": True,
+                        "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_allow_loss_reduce_only": False,
+                            "pause_buy_position_notional": 800.0,
+                            "pause_short_position_notional": 800.0,
+                        },
+                    }
+                }
+            }
+            rows = [
+                {
+                    "id": 1,
+                    "time": int((now - timedelta(minutes=30)).timestamp() * 1000),
+                    "quoteQty": "5000",
+                }
+            ]
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                daily_target_notional=6000,
+                target_pace_fraction=1.05,
+                trade_rows=rows,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "restore_loss_reduce_when_target_pace_ahead")
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(control["pause_buy_position_notional"], 800.0)
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_reapplies_non_loss_recovery_control_after_external_override(self) -> None:
         now = datetime(2026, 6, 26, 8, 25, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

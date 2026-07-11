@@ -1152,6 +1152,13 @@ def check_symbol(
         )
         * 4.0,
     )
+    required_hourly_notional = max(_safe_float(volume_summary.get("required_hourly_notional")), 0.0)
+    trailing_hourly_notional = max(_safe_float(volume_summary.get("trailing_60m_hourly_notional")), 0.0)
+    target_pace_ahead = (
+        required_hourly_notional > 0
+        and trailing_hourly_notional
+        >= required_hourly_notional * max(float(target_pace_fraction), 0.0)
+    )
 
     try:
         if stale_or_missing and not recovery_timeout_required:
@@ -1210,6 +1217,53 @@ def check_symbol(
                 now=now,
                 dry_run=dry_run,
                 restart_runner=restart,
+            )
+        elif (
+            target_pace_ahead
+            and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and _safe_float(assessment.get("current_long_notional"))
+            < _safe_float(assessment.get("max_long_notional"))
+            and _safe_float(assessment.get("current_short_notional"))
+            < _safe_float(assessment.get("max_short_notional"))
+        ):
+            updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+            action = (
+                "dry_run_restore_loss_reduce_when_target_pace_ahead"
+                if dry_run
+                else "restore_loss_reduce_when_target_pace_ahead"
+            )
+            _set_post_restore_cooldown(
+                item,
+                now=now,
+                cooldown_seconds=post_restore_cooldown_seconds,
+            )
+            item.pop("guard_original_controls", None)
+            item.pop("guard_recovery_controls", None)
+            item.pop("recovery_started_at", None)
+            item.pop("recovery_owned", None)
+        elif (
+            target_pace_ahead
+            and not recovery_has_original_controls
+            and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and bool(assessment.get("inventory_soft_pressure"))
+            and _safe_int(assessment.get("active_order_count")) > 0
+        ):
+            action = "hold_loss_reduce_while_target_pace_ahead"
+            item.update(
+                {
+                    "status": "normal",
+                    "last_recovery_check_at": now.isoformat(),
+                    "last_normal_at": now.isoformat(),
+                }
             )
         elif (
             bool(assessment.get("low_volume"))
