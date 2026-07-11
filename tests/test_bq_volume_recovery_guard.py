@@ -863,6 +863,63 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
 
         self.assertFalse(recovered)
 
+    def test_recovery_buffer_applies_below_soft_boundary(self) -> None:
+        assessment = {
+            "current_long_notional": 790.0,
+            "current_short_notional": 700.0,
+            "actual_long_notional": 790.0,
+            "actual_short_notional": 700.0,
+            "frozen_total_notional": 0.0,
+            "max_long_notional": 1000.0,
+            "max_short_notional": 1000.0,
+            "long_soft_limit_notional": 800.0,
+            "short_soft_limit_notional": 800.0,
+            "inventory_soft_ratio": 0.8,
+        }
+
+        self.assertFalse(
+            bq_volume_recovery_guard._recovery_inventory_buffer_ok(
+                assessment,
+                recover_cap_ratio=0.96,
+                original_controls={
+                    "pause_buy_position_notional": 800.0,
+                    "pause_short_position_notional": 800.0,
+                },
+            )
+        )
+        assessment["actual_long_notional"] = 760.0
+        self.assertTrue(
+            bq_volume_recovery_guard._recovery_inventory_buffer_ok(
+                assessment,
+                recover_cap_ratio=0.96,
+                original_controls={
+                    "pause_buy_position_notional": 800.0,
+                    "pause_short_position_notional": 800.0,
+                },
+            )
+        )
+
+    def test_loss_reduce_temporarily_adds_one_quote_offset_tick_without_ratchet(self) -> None:
+        updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
+            control={
+                "best_quote_maker_volume_allow_loss_reduce_only": False,
+                "best_quote_maker_volume_quote_offset_ticks": 0,
+            },
+            assessment={},
+            quote_offset_extra_ticks=1,
+        )
+        self.assertEqual(updates["best_quote_maker_volume_quote_offset_ticks"], 1)
+
+        already_active = bq_volume_recovery_guard._loss_reduce_recovery_updates(
+            control={
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
+                "best_quote_maker_volume_quote_offset_ticks": 1,
+            },
+            assessment={},
+            quote_offset_extra_ticks=1,
+        )
+        self.assertNotIn("best_quote_maker_volume_quote_offset_ticks", already_active)
+
     def test_dry_run_reports_recovery_without_mutating_control(self) -> None:
         now = datetime(2026, 6, 26, 7, 20, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

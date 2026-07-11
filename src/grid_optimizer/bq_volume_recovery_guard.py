@@ -21,6 +21,7 @@ _RECOVERY_CONTROL_KEYS = (
     "best_quote_maker_volume_inventory_cost_gate_enabled",
     "best_quote_maker_volume_inventory_bias_min_notional_gap",
     "best_quote_maker_volume_cycle_budget_notional",
+    "best_quote_maker_volume_quote_offset_ticks",
     "pause_buy_position_notional",
     "pause_short_position_notional",
     "sticky_entry_price_tolerance_steps",
@@ -500,11 +501,18 @@ def _loss_reduce_recovery_updates(
     control: dict[str, Any],
     assessment: dict[str, Any],
     static_cycle_budget_floor_notional: float = 0.0,
+    quote_offset_extra_ticks: int = 0,
 ) -> dict[str, Any]:
     updates: dict[str, Any] = {
         "best_quote_maker_volume_net_loss_reduce_enabled": False,
         "best_quote_maker_volume_allow_loss_reduce_only": True,
     }
+    if not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only")):
+        extra_ticks = max(int(quote_offset_extra_ticks), 0)
+        if extra_ticks > 0:
+            updates["best_quote_maker_volume_quote_offset_ticks"] = (
+                max(_safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")), 0) + extra_ticks
+            )
     per_order = max(
         _safe_float(control.get("per_order_notional")),
         _safe_float(control.get("maker_order_notional")),
@@ -537,9 +545,10 @@ def _recovery_inventory_buffer_ok(
 ) -> bool:
     originals = original_controls if isinstance(original_controls, dict) else {}
     soft_ratio = max(_safe_float(assessment.get("inventory_soft_ratio")), 0.0)
+    recovery_ratio = min(max(float(recover_cap_ratio), 0.0), 1.0)
 
     def threshold(max_key: str, soft_key: str, pause_key: str) -> float:
-        cap_limit = _safe_float(assessment.get(max_key)) * max(float(recover_cap_ratio), 0.0)
+        cap_limit = _safe_float(assessment.get(max_key)) * recovery_ratio
         max_notional = max(_safe_float(assessment.get(max_key)), 0.0)
         ratio_limit = max_notional * soft_ratio if max_notional > 0 and soft_ratio > 0 else 0.0
         original_pause = max(_safe_float(originals.get(pause_key)), 0.0)
@@ -549,7 +558,11 @@ def _recovery_inventory_buffer_ok(
             if baseline_candidates
             else _safe_float(assessment.get(soft_key))
         )
-        candidates = [value for value in (cap_limit, soft_limit) if value > 0]
+        # Apply the recovery ratio to the soft boundary too. Otherwise a soft limit
+        # below the hard-cap buffer wins the min() and recovery closes immediately
+        # below soft, causing repeated loss-reduce cycles around the same boundary.
+        buffered_soft_limit = soft_limit * recovery_ratio
+        candidates = [value for value in (cap_limit, buffered_soft_limit) if value > 0]
         return min(candidates) if candidates else 0.0
 
     long_limit = threshold("max_long_notional", "long_soft_limit_notional", "pause_buy_position_notional")
@@ -1164,6 +1177,7 @@ def check_symbol(
     cycle_budget_floor_notional: float = 0.0,
     pause_baseline_long_notional: float = 0.0,
     pause_baseline_short_notional: float = 0.0,
+    loss_reduce_quote_offset_extra_ticks: int = 0,
     trade_rows: list[dict[str, Any]] | None = None,
     volume_source: str = "local_audit",
     dry_run: bool = False,
@@ -1509,6 +1523,7 @@ def check_symbol(
                 control=control,
                 assessment=assessment,
                 static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+                quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
             )
             _remember_recovery_controls(
                 item,
@@ -1583,6 +1598,7 @@ def check_symbol(
                     control=control,
                     assessment=assessment,
                     static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+                    quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
                 )
                 _remember_recovery_controls(
                     item,
@@ -2209,6 +2225,7 @@ def check_symbol(
                     control=control,
                     assessment=assessment,
                     static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+                    quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
                 )
                 _remember_recovery_controls(
                     item,
@@ -2390,6 +2407,7 @@ def check_symbol(
                         control=control,
                         assessment=assessment,
                         static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+                        quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
                     )
                     _remember_recovery_controls(
                         item,
@@ -2435,6 +2453,7 @@ def check_symbol(
                         control=control,
                         assessment=assessment,
                         static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+                        quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
                     )
                     _remember_recovery_controls(
                         item,
@@ -2520,6 +2539,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--volume-recovery-cycle-budget-increment", type=float, default=12.0)
     parser.add_argument("--cycle-budget-floors", nargs="*", default=[])
     parser.add_argument("--pause-baselines", nargs="*", default=[])
+    parser.add_argument("--loss-reduce-quote-offset-extra-ticks", nargs="*", default=[])
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
@@ -2531,6 +2551,9 @@ def main(argv: list[str] | None = None) -> int:
     daily_targets = _parse_symbol_notionals(args.daily_targets)
     cycle_budget_floors = _parse_symbol_notionals(args.cycle_budget_floors)
     pause_baselines = _parse_symbol_pause_baselines(args.pause_baselines)
+    loss_reduce_quote_offset_extra_ticks = _parse_symbol_notionals(
+        args.loss_reduce_quote_offset_extra_ticks
+    )
     results = []
     exit_code = 0
     for symbol in _normalize_symbols(args.symbols):
@@ -2655,6 +2678,9 @@ def main(argv: list[str] | None = None) -> int:
             cycle_budget_floor_notional=cycle_budget_floors.get(symbol, 0.0),
             pause_baseline_long_notional=pause_baselines.get(symbol, (0.0, 0.0))[0],
             pause_baseline_short_notional=pause_baselines.get(symbol, (0.0, 0.0))[1],
+            loss_reduce_quote_offset_extra_ticks=int(
+                loss_reduce_quote_offset_extra_ticks.get(symbol, 0.0)
+            ),
             trade_rows=trade_rows,
             volume_source="exchange_user_trades",
             dry_run=args.dry_run,

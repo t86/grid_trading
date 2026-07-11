@@ -31,6 +31,7 @@ INVENTORY_BIAS_RELIEF_NOTIONAL_MARGIN="${INVENTORY_BIAS_RELIEF_NOTIONAL_MARGIN:-
 VOLUME_RECOVERY_CYCLE_BUDGET_INCREMENT="${VOLUME_RECOVERY_CYCLE_BUDGET_INCREMENT:-12}"
 CYCLE_BUDGET_FLOORS="${CYCLE_BUDGET_FLOORS:-ARXUSDT=108}"
 PAUSE_BASELINES="${PAUSE_BASELINES:-}"
+LOSS_REDUCE_QUOTE_OFFSET_EXTRA_TICKS="${LOSS_REDUCE_QUOTE_OFFSET_EXTRA_TICKS:-ARXUSDT=1}"
 ON_UNIT_ACTIVE_SEC="${ON_UNIT_ACTIVE_SEC:-1min}"
 
 if ! command -v sudo >/dev/null 2>&1; then
@@ -87,7 +88,7 @@ WorkingDirectory=${APP_DIR}
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=${PYTHONPATH_VALUE}
 EnvironmentFile=${ENV_FILE}
-ExecStart=${PYTHON_BIN} -m grid_optimizer.bq_volume_recovery_guard --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --state-path ${STATE_PATH} --runner-wrapper ${RUNNER_WRAPPER} --window-seconds ${WINDOW_SECONDS} --min-volume-notional ${MIN_VOLUME_NOTIONAL} --trigger-seconds ${TRIGGER_SECONDS} --recover-min-volume-notional ${RECOVER_MIN_VOLUME_NOTIONAL} --daily-targets ${DAILY_TARGETS} --target-pace-fraction ${TARGET_PACE_FRACTION} --target-pace-max-multiplier ${TARGET_PACE_MAX_MULTIPLIER} --target-completion-buffer-seconds ${TARGET_COMPLETION_BUFFER_SECONDS} --near-cap-ratio ${NEAR_CAP_RATIO} --recover-cap-ratio ${RECOVER_CAP_RATIO} --far-ticks ${FAR_TICKS} --plan-stale-seconds ${PLAN_STALE_SECONDS} --max-recovery-seconds ${MAX_RECOVERY_SECONDS} --cooldown-seconds ${COOLDOWN_SECONDS} --inventory-bias-relief-notional-margin ${INVENTORY_BIAS_RELIEF_NOTIONAL_MARGIN} --volume-recovery-cycle-budget-increment ${VOLUME_RECOVERY_CYCLE_BUDGET_INCREMENT} --cycle-budget-floors ${CYCLE_BUDGET_FLOORS} ${PAUSE_BASELINES_FLAG} ${COST_GATE_FLAG}
+ExecStart=${PYTHON_BIN} -m grid_optimizer.bq_volume_recovery_guard --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --state-path ${STATE_PATH} --runner-wrapper ${RUNNER_WRAPPER} --window-seconds ${WINDOW_SECONDS} --min-volume-notional ${MIN_VOLUME_NOTIONAL} --trigger-seconds ${TRIGGER_SECONDS} --recover-min-volume-notional ${RECOVER_MIN_VOLUME_NOTIONAL} --daily-targets ${DAILY_TARGETS} --target-pace-fraction ${TARGET_PACE_FRACTION} --target-pace-max-multiplier ${TARGET_PACE_MAX_MULTIPLIER} --target-completion-buffer-seconds ${TARGET_COMPLETION_BUFFER_SECONDS} --near-cap-ratio ${NEAR_CAP_RATIO} --recover-cap-ratio ${RECOVER_CAP_RATIO} --far-ticks ${FAR_TICKS} --plan-stale-seconds ${PLAN_STALE_SECONDS} --max-recovery-seconds ${MAX_RECOVERY_SECONDS} --cooldown-seconds ${COOLDOWN_SECONDS} --inventory-bias-relief-notional-margin ${INVENTORY_BIAS_RELIEF_NOTIONAL_MARGIN} --volume-recovery-cycle-budget-increment ${VOLUME_RECOVERY_CYCLE_BUDGET_INCREMENT} --cycle-budget-floors ${CYCLE_BUDGET_FLOORS} --loss-reduce-quote-offset-extra-ticks ${LOSS_REDUCE_QUOTE_OFFSET_EXTRA_TICKS} ${PAUSE_BASELINES_FLAG} ${COST_GATE_FLAG}
 EOF
 
 sudo tee "$TIMER_FILE" >/dev/null <<EOF
