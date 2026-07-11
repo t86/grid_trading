@@ -1323,6 +1323,13 @@ def check_symbol(
         and trailing_hourly_notional
         >= required_hourly_notional * max(float(target_pace_fraction), 0.0)
     )
+    target_pace_behind = (
+        required_hourly_notional > 0
+        and trailing_hourly_notional
+        < required_hourly_notional * max(float(target_pace_fraction), 0.0)
+    )
+    recovery_low_volume = bool(assessment.get("low_volume")) or target_pace_behind
+    assessment["target_pace_behind"] = target_pace_behind
 
     try:
         if stale_or_missing and not recovery_timeout_required:
@@ -1432,7 +1439,7 @@ def check_symbol(
                 }
             )
         elif (
-            bool(assessment.get("low_volume"))
+            recovery_low_volume
             and max(float(cycle_budget_floor_notional), 0.0)
             > _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
             and _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional")) > 0
@@ -1539,9 +1546,9 @@ def check_symbol(
             cooldown_until is not None
             and now < cooldown_until
             and not severe_one_sided_stall
-            and not (bool(assessment.get("low_volume")) and effective_inventory_soft_pressure)
+            and not (recovery_low_volume and effective_inventory_soft_pressure)
             and not (
-                bool(assessment.get("low_volume"))
+                recovery_low_volume
                 and actual_inventory_below_soft
                 and required_hourly_notional > 0
                 and not target_pace_ahead
@@ -1559,6 +1566,7 @@ def check_symbol(
                 and _safe_int(assessment.get("active_order_count")) > 0
                 and _safe_int(assessment.get("near_market_order_count")) > 0
                 and cap_buffer_ok
+                and not target_pace_behind
             )
             drifted_updates = {
                 key: value
@@ -2145,7 +2153,7 @@ def check_symbol(
             else:
                 action = "hold_recovery_until_volume_or_orders"
                 item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
-        elif not bool(assessment.get("low_volume")):
+        elif not recovery_low_volume:
             action = "volume_normal"
             item.clear()
             item.update({"status": "normal", "last_normal_at": now.isoformat(), "last_assessment": assessment})

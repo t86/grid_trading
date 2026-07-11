@@ -1783,7 +1783,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 output_dir,
                 now=now,
                 control={
-                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                    "best_quote_maker_volume_cycle_budget_notional": 108.0,
                     "pause_buy_position_notional": 800.0,
                     "pause_short_position_notional": 800.0,
                 },
@@ -1792,7 +1792,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 open_order_count=1,
                 active_order_count=1,
                 orders_near_market=True,
-                recent_trade_notional=40.0,
+                recent_trade_notional=120.0,
             )
             plan_path = output_dir / "reusdt_loop_latest_plan.json"
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -1826,14 +1826,17 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 trigger_seconds=120,
                 daily_target_notional=10_000.0,
                 target_pace_fraction=1.05,
-                cycle_budget_floor_notional=72.0,
+                target_pace_max_multiplier=1.0,
+                cycle_budget_floor_notional=108.0,
                 volume_recovery_cycle_budget_increment=12.0,
                 restart_runner=restarts.append,
             )
 
             control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
             self.assertEqual(result["action"], "raise_cycle_budget_for_volume")
-            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 84.0)
+            self.assertFalse(result["assessment"]["low_volume"])
+            self.assertTrue(result["assessment"]["target_pace_behind"])
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 120.0)
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["REUSDT"])
 
