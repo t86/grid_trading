@@ -988,6 +988,50 @@ def check_symbol(
             action = "skip_stale_or_missing_inputs"
         elif cooldown_until is not None and now < cooldown_until:
             action = "cooldown"
+        elif (
+            bool(assessment.get("low_volume"))
+            and max(float(cycle_budget_floor_notional), 0.0)
+            > _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
+            and _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional")) > 0
+            and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and not bool(assessment.get("inventory_soft_pressure"))
+            and not bool(assessment.get("near_cap"))
+            and not bool(assessment.get("ineffective_orders"))
+            and not bool(assessment.get("volatility_entry_pause_active"))
+        ):
+            budget_floor = max(float(cycle_budget_floor_notional), 0.0)
+            updates = {
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "best_quote_maker_volume_cycle_budget_notional": budget_floor,
+            }
+            _remember_recovery_controls(
+                item,
+                control,
+                ("best_quote_maker_volume_cycle_budget_notional",),
+            )
+            _remember_recovery_updates(
+                item,
+                {"best_quote_maker_volume_cycle_budget_notional": budget_floor},
+            )
+            action = "dry_run_raise_cycle_budget_for_volume" if dry_run else "raise_cycle_budget_for_volume"
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
         elif recovery_has_original_controls and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only")):
             cap_buffer_ok = _recovery_inventory_buffer_ok(
                 assessment,

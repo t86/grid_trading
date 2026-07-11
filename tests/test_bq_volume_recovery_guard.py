@@ -2624,7 +2624,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
 
             control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
-            self.assertEqual(floor_result["action"], "raise_cycle_budget_floor_for_reduce_only_flow")
+            self.assertEqual(floor_result["action"], "raise_cycle_budget_for_volume")
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
             self.assertEqual(restarts, ["REUSDT"])
 
