@@ -725,8 +725,6 @@ def assess_symbol(
         and bool(active_pair_reduce.get("normal_entry_suppressed"))
         and _safe_int(active_pair_reduce.get("suppressed_entry_order_count")) > 0
         and not bool(active_pair_reduce.get("completed"))
-        and _safe_int(active_pair_reduce.get("order_count")) <= 1
-        and active_count <= 1
         and low_volume
         and actual_long is not None
         and actual_short is not None

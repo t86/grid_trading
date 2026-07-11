@@ -1506,8 +1506,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 },
                 long_notional=470.0,
                 short_notional=450.0,
-                open_order_count=1,
-                active_order_count=1,
+                open_order_count=4,
+                active_order_count=2,
             )
             plan_path = output_dir / "reusdt_loop_latest_plan.json"
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -1523,7 +1523,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 "enabled": True,
                 "active": True,
                 "reason": "soft_pair_reduce",
-                "order_count": 1,
+                "order_count": 4,
                 "normal_entry_suppressed": True,
                 "suppressed_entry_order_count": 2,
                 "completed": False,
