@@ -268,6 +268,27 @@ def _loss_reduce_recovery_updates(
     return updates
 
 
+def _recovery_inventory_buffer_ok(
+    assessment: dict[str, Any],
+    *,
+    recover_cap_ratio: float,
+) -> bool:
+    def threshold(max_key: str, soft_key: str) -> float:
+        cap_limit = _safe_float(assessment.get(max_key)) * max(float(recover_cap_ratio), 0.0)
+        soft_limit = _safe_float(assessment.get(soft_key))
+        candidates = [value for value in (cap_limit, soft_limit) if value > 0]
+        return min(candidates) if candidates else 0.0
+
+    long_limit = threshold("max_long_notional", "long_soft_limit_notional")
+    short_limit = threshold("max_short_notional", "short_soft_limit_notional")
+    return (
+        long_limit > 0
+        and short_limit > 0
+        and _safe_float(assessment.get("current_long_notional")) < long_limit
+        and _safe_float(assessment.get("current_short_notional")) < short_limit
+    )
+
+
 def _plan_time_is_fresh(payload: dict[str, Any], *, now: datetime, max_age_seconds: float) -> bool:
     generated_at = _parse_time(payload.get("generated_at"))
     if generated_at is None:
@@ -792,11 +813,9 @@ def check_symbol(
         elif cooldown_until is not None and now < cooldown_until:
             action = "cooldown"
         elif recovery_has_original_controls and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only")):
-            cap_buffer_ok = (
-                _safe_float(assessment.get("current_long_notional"))
-                < _safe_float(assessment.get("max_long_notional")) * max(float(recover_cap_ratio), 0.0)
-                and _safe_float(assessment.get("current_short_notional"))
-                < _safe_float(assessment.get("max_short_notional")) * max(float(recover_cap_ratio), 0.0)
+            cap_buffer_ok = _recovery_inventory_buffer_ok(
+                assessment,
+                recover_cap_ratio=recover_cap_ratio,
             )
             restore_ready = (
                 _safe_float(volume_summary.get("gross_notional")) >= recover_floor
@@ -1025,11 +1044,9 @@ def check_symbol(
                 }
                 _append_jsonl(output_dir / "bq_volume_recovery_guard_events.jsonl", {"ts": now.isoformat(), **return_result})
                 return return_result
-            cap_buffer_ok = (
-                _safe_float(assessment.get("current_long_notional"))
-                < _safe_float(assessment.get("max_long_notional")) * max(float(recover_cap_ratio), 0.0)
-                and _safe_float(assessment.get("current_short_notional"))
-                < _safe_float(assessment.get("max_short_notional")) * max(float(recover_cap_ratio), 0.0)
+            cap_buffer_ok = _recovery_inventory_buffer_ok(
+                assessment,
+                recover_cap_ratio=recover_cap_ratio,
             )
             restore_ready = (
                 _safe_float(volume_summary.get("gross_notional")) >= recover_floor
