@@ -222,6 +222,35 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(summary["target_pace_floor_notional"], 250.0)
         self.assertEqual(floor, 250.0)
 
+    def test_daily_target_pace_floor_supports_early_completion_deadline(self) -> None:
+        now = datetime(2026, 7, 11, 4, 0, tzinfo=timezone.utc)
+        rows = [
+            {
+                "id": 1,
+                "time": int((now - timedelta(hours=3)).timestamp() * 1000),
+                "quoteQty": "20000",
+            }
+        ]
+        summary = summarize_recent_volume(rows=rows, now=now, window_seconds=180)
+
+        floor = apply_daily_target_pace_floor(
+            volume_summary=summary,
+            rows=rows,
+            now=now,
+            window_seconds=180,
+            min_volume_notional=125,
+            daily_target_notional=100000,
+            target_pace_fraction=0.9,
+            target_pace_max_multiplier=5.0,
+            target_completion_buffer_seconds=10800,
+        )
+
+        self.assertAlmostEqual(summary["required_hourly_notional"], 80000 / 17)
+        self.assertAlmostEqual(summary["target_pace_floor_notional"], (80000 / 17) * 0.05 * 0.9)
+        self.assertEqual(summary["target_completion_buffer_seconds"], 10800.0)
+        self.assertEqual(summary["target_deadline"], "2026-07-11T21:00:00+00:00")
+        self.assertAlmostEqual(floor, (80000 / 17) * 0.05 * 0.9)
+
     def test_parse_symbol_notionals_accepts_comma_separated_targets(self) -> None:
         targets = bq_volume_recovery_guard._parse_symbol_notionals(
             ["ARXUSDT=100000,OUSDT=60000", "INVALID", "BAD=0"]
@@ -2331,6 +2360,64 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 item["guard_original_controls"]["best_quote_maker_volume_inventory_bias_min_notional_gap"],
                 150.0,
             )
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_resolved_inventory_relief_switches_to_cycle_budget_recovery(self) -> None:
+        now = datetime(2026, 6, 26, 10, 28, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                    "best_quote_maker_volume_inventory_bias_min_notional_gap": 185.0,
+                    "sticky_entry_price_tolerance_steps": 1.0,
+                },
+                long_notional=400.0,
+                short_notional=380.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+                recent_trade_notional=40.0,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
+                        "last_recovery_action_at": (now - timedelta(minutes=3)).isoformat(),
+                        "guard_original_controls": {
+                            "sticky_entry_price_tolerance_steps": 8.0,
+                            "best_quote_maker_volume_inventory_bias_min_notional_gap": 150.0,
+                        },
+                        "guard_recovery_controls": {
+                            "sticky_entry_price_tolerance_steps": 1.0,
+                            "best_quote_maker_volume_inventory_bias_min_notional_gap": 185.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                recovery_min_hold_seconds=120,
+                volume_recovery_cycle_budget_increment=12,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "switch_to_cycle_budget_after_inventory_relief")
+            self.assertEqual(control["sticky_entry_price_tolerance_steps"], 8.0)
+            self.assertEqual(control["best_quote_maker_volume_inventory_bias_min_notional_gap"], 150.0)
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 84.0)
             self.assertEqual(restarts, ["REUSDT"])
 
     def test_near_market_reduce_only_flow_does_not_raise_cycle_budget(self) -> None:

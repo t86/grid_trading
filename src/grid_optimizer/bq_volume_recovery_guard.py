@@ -198,6 +198,7 @@ def apply_daily_target_pace_floor(
     daily_target_notional: float | None,
     target_pace_fraction: float,
     target_pace_max_multiplier: float,
+    target_completion_buffer_seconds: float = 0.0,
 ) -> float:
     static_floor = max(float(min_volume_notional), 0.0)
     target = max(float(daily_target_notional or 0.0), 0.0)
@@ -207,8 +208,10 @@ def apply_daily_target_pace_floor(
 
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     day_end = day_start + timedelta(days=1)
+    completion_buffer = max(float(target_completion_buffer_seconds), 0.0)
+    target_deadline = day_end - timedelta(seconds=completion_buffer)
     elapsed_seconds = max((now - day_start).total_seconds(), 1.0)
-    remaining_seconds = max((day_end - now).total_seconds(), 1.0)
+    remaining_seconds = max((target_deadline - now).total_seconds(), 1.0)
     day_summary = summarize_recent_volume(rows=rows, now=now, window_seconds=elapsed_seconds)
     day_gross = _safe_float(day_summary.get("gross_notional"))
     remaining_target = max(target - day_gross, 0.0)
@@ -225,6 +228,8 @@ def apply_daily_target_pace_floor(
             "daily_gross_notional": day_gross,
             "remaining_target_notional": remaining_target,
             "remaining_target_seconds": remaining_seconds,
+            "target_completion_buffer_seconds": completion_buffer,
+            "target_deadline": target_deadline.isoformat(),
             "required_hourly_notional": required_hourly,
             "target_pace_floor_notional": target_floor,
             "effective_min_volume_notional": effective_floor,
@@ -823,6 +828,7 @@ def check_symbol(
     daily_target_notional: float | None = None,
     target_pace_fraction: float = 0.9,
     target_pace_max_multiplier: float = 2.0,
+    target_completion_buffer_seconds: float = 0.0,
     recover_min_volume_notional: float | None = None,
     near_cap_ratio: float = 0.95,
     recover_cap_ratio: float = 0.96,
@@ -865,6 +871,7 @@ def check_symbol(
         daily_target_notional=daily_target_notional,
         target_pace_fraction=target_pace_fraction,
         target_pace_max_multiplier=target_pace_max_multiplier,
+        target_completion_buffer_seconds=target_completion_buffer_seconds,
     )
     assessment = assess_symbol(
         symbol=normalized_symbol,
@@ -1078,6 +1085,61 @@ def check_symbol(
                     )
                 else:
                     action = "hold_tight_sticky_inventory_bias_relief"
+                    item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+            elif (
+                bool(assessment.get("low_volume"))
+                and recovery_hold_satisfied
+                and not recovery_timed_out
+                and not drifted_updates
+                and any(
+                    key in recovery_expected_controls
+                    for key in (
+                        "sticky_entry_price_tolerance_steps",
+                        "best_quote_maker_volume_inventory_bias_min_notional_gap",
+                    )
+                )
+                and not bool(assessment.get("inventory_soft_pressure"))
+                and not bool(assessment.get("one_sided_inventory_bias"))
+                and not bool(assessment.get("near_cap"))
+                and not bool(assessment.get("ineffective_orders"))
+                and not bool(assessment.get("planned_reduce_only_only"))
+            ):
+                current_budget = _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
+                increment = max(float(volume_recovery_cycle_budget_increment), 0.0)
+                if current_budget > 0 and increment > 0:
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        ("best_quote_maker_volume_cycle_budget_notional",),
+                    )
+                    updates = _restore_recovery_controls(item)
+                    updates["best_quote_maker_volume_cycle_budget_notional"] = current_budget + increment
+                    item["guard_recovery_controls"] = {}
+                    _remember_recovery_updates(item, updates)
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
+                    action = (
+                        "dry_run_switch_to_cycle_budget_after_inventory_relief"
+                        if dry_run
+                        else "switch_to_cycle_budget_after_inventory_relief"
+                    )
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "recovery_started_at": now.isoformat(),
+                            "last_recovery_action_at": now.isoformat(),
+                            "last_recovery_action": action,
+                        }
+                    )
+                else:
+                    action = "hold_inventory_relief_without_budget"
                     item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
             elif recovery_timed_out:
                 updates = _restore_recovery_controls(item)
@@ -1716,6 +1778,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--daily-targets", nargs="*", default=[])
     parser.add_argument("--target-pace-fraction", type=float, default=0.9)
     parser.add_argument("--target-pace-max-multiplier", type=float, default=2.0)
+    parser.add_argument("--target-completion-buffer-seconds", type=float, default=0.0)
     parser.add_argument("--near-cap-ratio", type=float, default=0.95)
     parser.add_argument("--recover-cap-ratio", type=float, default=0.96)
     parser.add_argument("--far-ticks", type=int, default=8)
@@ -1800,6 +1863,7 @@ def main(argv: list[str] | None = None) -> int:
             daily_target_notional=daily_targets.get(symbol),
             target_pace_fraction=args.target_pace_fraction,
             target_pace_max_multiplier=args.target_pace_max_multiplier,
+            target_completion_buffer_seconds=args.target_completion_buffer_seconds,
             recover_min_volume_notional=args.recover_min_volume_notional,
             near_cap_ratio=args.near_cap_ratio,
             recover_cap_ratio=args.recover_cap_ratio,
