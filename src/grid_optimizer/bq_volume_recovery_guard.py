@@ -1181,6 +1181,7 @@ def check_symbol(
     pause_baseline_long_notional: float = 0.0,
     pause_baseline_short_notional: float = 0.0,
     loss_reduce_quote_offset_extra_ticks: int = 0,
+    require_soft_pressure_for_allow_loss: bool = False,
     trade_rows: list[dict[str, Any]] | None = None,
     volume_source: str = "local_audit",
     dry_run: bool = False,
@@ -2426,6 +2427,8 @@ def check_symbol(
                     )
                 elif effective_near_market_flow:
                     action = "hold_effective_near_market_flow"
+                elif require_soft_pressure_for_allow_loss and not effective_inventory_soft_pressure:
+                    action = "hold_low_volume_without_soft_pressure"
                 else:
                     updates = _loss_reduce_recovery_updates(
                         control=control,
@@ -2460,6 +2463,7 @@ def check_symbol(
                     )
             else:
                 updates = {"best_quote_maker_volume_net_loss_reduce_enabled": False}
+                chosen_action: str | None = None
                 if (
                     allow_inventory_cost_gate_disable
                     and bool(assessment.get("cost_gate_blocked"))
@@ -2472,7 +2476,7 @@ def check_symbol(
                         {"best_quote_maker_volume_inventory_cost_gate_enabled": False},
                     )
                     chosen_action = "disable_inventory_cost_gate"
-                else:
+                elif effective_inventory_soft_pressure or not require_soft_pressure_for_allow_loss:
                     updates = _loss_reduce_recovery_updates(
                         control=control,
                         assessment=assessment,
@@ -2486,26 +2490,29 @@ def check_symbol(
                     )
                     _remember_recovery_updates(item, updates)
                     chosen_action = "enable_allow_loss_reduce_only"
-                action = f"dry_run_{chosen_action}" if dry_run else chosen_action
-                item.update(
-                    {
-                        "status": "recovery_active",
-                        "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
-                        "soft_recovery_extension_count": 0,
-                        "recovery_owned": True,
-                        "last_recovery_action_at": now.isoformat(),
-                        "last_recovery_action": action,
-                    }
-                )
-                changed, backup_path = _apply_control_update(
-                    symbol=normalized_symbol,
-                    control_path=control_path,
-                    control=control,
-                    updates=updates,
-                    now=now,
-                    dry_run=dry_run,
-                    restart_runner=restart,
-                )
+                if chosen_action is None:
+                    action = "hold_ineffective_orders_without_soft_pressure"
+                else:
+                    action = f"dry_run_{chosen_action}" if dry_run else chosen_action
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                            "soft_recovery_extension_count": 0,
+                            "recovery_owned": True,
+                            "last_recovery_action_at": now.isoformat(),
+                            "last_recovery_action": action,
+                        }
+                    )
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
     except subprocess.CalledProcessError as exc:
         restart_failed = str(exc)
         action = "restart_failed"
@@ -2564,6 +2571,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cycle-budget-floors", nargs="*", default=[])
     parser.add_argument("--pause-baselines", nargs="*", default=[])
     parser.add_argument("--loss-reduce-quote-offset-extra-ticks", nargs="*", default=[])
+    parser.add_argument("--require-soft-pressure-for-allow-loss-symbols", nargs="*", default=[])
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
@@ -2577,6 +2585,9 @@ def main(argv: list[str] | None = None) -> int:
     pause_baselines = _parse_symbol_pause_baselines(args.pause_baselines)
     loss_reduce_quote_offset_extra_ticks = _parse_symbol_notionals(
         args.loss_reduce_quote_offset_extra_ticks
+    )
+    require_soft_pressure_for_allow_loss_symbols = set(
+        _normalize_symbols(args.require_soft_pressure_for_allow_loss_symbols)
     )
     results = []
     exit_code = 0
@@ -2704,6 +2715,9 @@ def main(argv: list[str] | None = None) -> int:
             pause_baseline_short_notional=pause_baselines.get(symbol, (0.0, 0.0))[1],
             loss_reduce_quote_offset_extra_ticks=int(
                 loss_reduce_quote_offset_extra_ticks.get(symbol, 0.0)
+            ),
+            require_soft_pressure_for_allow_loss=(
+                symbol in require_soft_pressure_for_allow_loss_symbols
             ),
             trade_rows=trade_rows,
             volume_source="exchange_user_trades",
