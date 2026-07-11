@@ -1424,6 +1424,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "REUSDT": {
                         "status": "low_volume",
                         "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                        "recovery_started_at": (now - timedelta(minutes=20)).isoformat(),
                     }
                 }
             }
@@ -1445,6 +1446,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
 
             self.assertEqual(result["action"], "raise_cycle_budget_for_volume")
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 60.0)
+            self.assertEqual(state["symbols"]["REUSDT"]["recovery_started_at"], now.isoformat())
             self.assertEqual(restarts, ["REUSDT"])
 
     def test_cycle_budget_floor_recovers_external_budget_override_in_one_step(self) -> None:

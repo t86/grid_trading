@@ -1501,7 +1501,7 @@ def check_symbol(
             item.update(
                 {
                     "status": "recovery_active",
-                    "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                    "recovery_started_at": now.isoformat(),
                     "recovery_owned": True,
                     "last_recovery_action_at": now.isoformat(),
                     "last_recovery_action": action,
@@ -2308,7 +2308,7 @@ def check_symbol(
                     item.update(
                         {
                             "status": "recovery_active",
-                            "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                            "recovery_started_at": now.isoformat(),
                             "recovery_owned": True,
                             "last_recovery_action_at": now.isoformat(),
                             "last_recovery_action": action,
@@ -2358,7 +2358,7 @@ def check_symbol(
                     item.update(
                         {
                             "status": "recovery_active",
-                            "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                            "recovery_started_at": now.isoformat(),
                             "recovery_owned": True,
                             "last_recovery_action_at": now.isoformat(),
                             "last_recovery_action": action,
