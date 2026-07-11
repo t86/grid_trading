@@ -707,7 +707,6 @@ def assess_symbol(
         and actual_long < long_soft
         and actual_short < short_soft
         and frozen_total <= 0
-        and (current_long >= long_soft or current_short >= short_soft)
     )
     if active_pair_reduce_suppression_deadlock or active_pair_reduce_below_soft_deadlock:
         reasons.append("active_pair_reduce_suppression_deadlock")
