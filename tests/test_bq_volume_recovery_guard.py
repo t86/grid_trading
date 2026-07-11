@@ -1799,6 +1799,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 open_order_count=1,
                 active_order_count=1,
                 orders_near_market=True,
+                recent_trade_notional=40.0,
             )
             plan_path = output_dir / "reusdt_loop_latest_plan.json"
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -1837,6 +1838,68 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertTrue(result["assessment"]["one_sided_inventory_bias"])
             self.assertEqual(control["sticky_entry_price_tolerance_steps"], 1.0)
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 72.0)
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_active_budget_recovery_switches_to_one_sided_sticky_requote(self) -> None:
+        now = datetime(2026, 6, 26, 10, 20, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 84.0,
+                    "sticky_entry_price_tolerance_steps": 8.0,
+                },
+                long_notional=650.0,
+                short_notional=350.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+                recent_trade_notional=40.0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan.update(
+                {
+                    "buy_paused": True,
+                    "short_paused": False,
+                    "pause_reasons": ["inventory_bias"],
+                }
+            )
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                        },
+                        "guard_recovery_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 84.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                recovery_min_hold_seconds=120,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "switch_to_one_sided_sticky_requote")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 72.0)
+            self.assertEqual(control["sticky_entry_price_tolerance_steps"], 1.0)
             self.assertEqual(restarts, ["REUSDT"])
 
 

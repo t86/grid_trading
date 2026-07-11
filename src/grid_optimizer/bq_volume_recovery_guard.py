@@ -201,6 +201,7 @@ def apply_daily_target_pace_floor(
     static_floor = max(float(min_volume_notional), 0.0)
     target = max(float(daily_target_notional or 0.0), 0.0)
     if target <= 0:
+        volume_summary["effective_min_volume_notional"] = static_floor
         return static_floor
 
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -868,6 +869,11 @@ def check_symbol(
         and _safe_int(assessment.get("near_market_order_count")) > 0
         and not bool(assessment.get("ineffective_orders"))
     )
+    severe_one_sided_stall = (
+        bool(assessment.get("one_sided_inventory_bias"))
+        and _safe_float(volume_summary.get("gross_notional"))
+        <= max(_safe_float(volume_summary.get("effective_min_volume_notional")), 0.0) * 0.5
+    )
     recovery_original_controls = item.get("guard_original_controls")
     recovery_has_original_controls = isinstance(recovery_original_controls, dict) and bool(recovery_original_controls)
     recovery_expected_controls = item.get("guard_recovery_controls")
@@ -954,6 +960,43 @@ def check_symbol(
                         "status": "recovery_active",
                         "recovery_started_at": now.isoformat(),
                         "soft_recovery_extension_count": 0,
+                        "recovery_owned": True,
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+            elif (
+                severe_one_sided_stall
+                and recovery_hold_satisfied
+                and _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0
+            ):
+                _remember_recovery_controls(
+                    item,
+                    control,
+                    ("sticky_entry_price_tolerance_steps",),
+                )
+                updates = _restore_recovery_controls(item)
+                updates["sticky_entry_price_tolerance_steps"] = 1.0
+                item["guard_recovery_controls"] = {}
+                _remember_recovery_updates(item, updates)
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = (
+                    "dry_run_switch_to_one_sided_sticky_requote"
+                    if dry_run
+                    else "switch_to_one_sided_sticky_requote"
+                )
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "recovery_started_at": now.isoformat(),
                         "recovery_owned": True,
                         "last_recovery_action_at": now.isoformat(),
                         "last_recovery_action": action,
@@ -1236,8 +1279,7 @@ def check_symbol(
             if elapsed < max(float(trigger_seconds), 0.0):
                 action = "wait_low_volume_confirmation"
             elif (
-                bool(assessment.get("one_sided_inventory_bias"))
-                and _safe_float(volume_summary.get("gross_notional")) <= 0
+                severe_one_sided_stall
                 and _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0
             ):
                 _remember_recovery_controls(
