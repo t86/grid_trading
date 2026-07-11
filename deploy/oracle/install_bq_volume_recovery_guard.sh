@@ -16,6 +16,9 @@ WINDOW_SECONDS="${WINDOW_SECONDS:-180}"
 MIN_VOLUME_NOTIONAL="${MIN_VOLUME_NOTIONAL:-125}"
 TRIGGER_SECONDS="${TRIGGER_SECONDS:-180}"
 RECOVER_MIN_VOLUME_NOTIONAL="${RECOVER_MIN_VOLUME_NOTIONAL:-${MIN_VOLUME_NOTIONAL}}"
+DAILY_TARGETS="${DAILY_TARGETS:-ARXUSDT=100000,OUSDT=60000}"
+TARGET_PACE_FRACTION="${TARGET_PACE_FRACTION:-0.9}"
+TARGET_PACE_MAX_MULTIPLIER="${TARGET_PACE_MAX_MULTIPLIER:-2.0}"
 NEAR_CAP_RATIO="${NEAR_CAP_RATIO:-0.95}"
 RECOVER_CAP_RATIO="${RECOVER_CAP_RATIO:-0.96}"
 FAR_TICKS="${FAR_TICKS:-8}"
@@ -75,7 +78,7 @@ WorkingDirectory=${APP_DIR}
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=${PYTHONPATH_VALUE}
 EnvironmentFile=${ENV_FILE}
-ExecStart=${PYTHON_BIN} -m grid_optimizer.bq_volume_recovery_guard --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --state-path ${STATE_PATH} --runner-wrapper ${RUNNER_WRAPPER} --window-seconds ${WINDOW_SECONDS} --min-volume-notional ${MIN_VOLUME_NOTIONAL} --trigger-seconds ${TRIGGER_SECONDS} --recover-min-volume-notional ${RECOVER_MIN_VOLUME_NOTIONAL} --near-cap-ratio ${NEAR_CAP_RATIO} --recover-cap-ratio ${RECOVER_CAP_RATIO} --far-ticks ${FAR_TICKS} --plan-stale-seconds ${PLAN_STALE_SECONDS} --max-recovery-seconds ${MAX_RECOVERY_SECONDS} --cooldown-seconds ${COOLDOWN_SECONDS} --inventory-bias-relief-notional-margin ${INVENTORY_BIAS_RELIEF_NOTIONAL_MARGIN} --volume-recovery-cycle-budget-increment ${VOLUME_RECOVERY_CYCLE_BUDGET_INCREMENT} ${COST_GATE_FLAG}
+ExecStart=${PYTHON_BIN} -m grid_optimizer.bq_volume_recovery_guard --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --state-path ${STATE_PATH} --runner-wrapper ${RUNNER_WRAPPER} --window-seconds ${WINDOW_SECONDS} --min-volume-notional ${MIN_VOLUME_NOTIONAL} --trigger-seconds ${TRIGGER_SECONDS} --recover-min-volume-notional ${RECOVER_MIN_VOLUME_NOTIONAL} --daily-targets ${DAILY_TARGETS} --target-pace-fraction ${TARGET_PACE_FRACTION} --target-pace-max-multiplier ${TARGET_PACE_MAX_MULTIPLIER} --near-cap-ratio ${NEAR_CAP_RATIO} --recover-cap-ratio ${RECOVER_CAP_RATIO} --far-ticks ${FAR_TICKS} --plan-stale-seconds ${PLAN_STALE_SECONDS} --max-recovery-seconds ${MAX_RECOVERY_SECONDS} --cooldown-seconds ${COOLDOWN_SECONDS} --inventory-bias-relief-notional-margin ${INVENTORY_BIAS_RELIEF_NOTIONAL_MARGIN} --volume-recovery-cycle-budget-increment ${VOLUME_RECOVERY_CYCLE_BUDGET_INCREMENT} ${COST_GATE_FLAG}
 EOF
 
 sudo tee "$TIMER_FILE" >/dev/null <<EOF

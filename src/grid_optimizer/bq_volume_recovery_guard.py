@@ -187,6 +187,50 @@ def summarize_recent_volume(*, rows: list[dict[str, Any]], now: datetime, window
     }
 
 
+def apply_daily_target_pace_floor(
+    *,
+    volume_summary: dict[str, Any],
+    rows: list[dict[str, Any]],
+    now: datetime,
+    window_seconds: float,
+    min_volume_notional: float,
+    daily_target_notional: float | None,
+    target_pace_fraction: float,
+    target_pace_max_multiplier: float,
+) -> float:
+    static_floor = max(float(min_volume_notional), 0.0)
+    target = max(float(daily_target_notional or 0.0), 0.0)
+    if target <= 0:
+        return static_floor
+
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+    elapsed_seconds = max((now - day_start).total_seconds(), 1.0)
+    remaining_seconds = max((day_end - now).total_seconds(), 1.0)
+    day_summary = summarize_recent_volume(rows=rows, now=now, window_seconds=elapsed_seconds)
+    day_gross = _safe_float(day_summary.get("gross_notional"))
+    remaining_target = max(target - day_gross, 0.0)
+    required_hourly = remaining_target * 3600.0 / remaining_seconds
+    target_floor = required_hourly * max(float(window_seconds), 1.0) / 3600.0
+    target_floor *= max(float(target_pace_fraction), 0.0)
+    max_multiplier = max(float(target_pace_max_multiplier), 1.0)
+    if static_floor > 0:
+        target_floor = min(target_floor, static_floor * max_multiplier)
+    effective_floor = max(static_floor, target_floor)
+    volume_summary.update(
+        {
+            "daily_target_notional": target,
+            "daily_gross_notional": day_gross,
+            "remaining_target_notional": remaining_target,
+            "remaining_target_seconds": remaining_seconds,
+            "required_hourly_notional": required_hourly,
+            "target_pace_floor_notional": target_floor,
+            "effective_min_volume_notional": effective_floor,
+        }
+    )
+    return effective_floor
+
+
 def _control_path(output_dir: Path, symbol: str) -> Path:
     return output_dir / f"{symbol.lower()}_loop_runner_control.json"
 
@@ -720,6 +764,20 @@ def _normalize_symbols(items: list[str]) -> list[str]:
     return symbols
 
 
+def _parse_symbol_notionals(items: list[str]) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for item in items:
+        for part in str(item).split(","):
+            symbol, separator, raw_value = part.strip().partition("=")
+            normalized_symbol = symbol.strip().upper()
+            if not separator or not normalized_symbol:
+                continue
+            value = _safe_float(raw_value, -1.0)
+            if value > 0:
+                values[normalized_symbol] = value
+    return values
+
+
 def check_symbol(
     *,
     symbol: str,
@@ -729,6 +787,9 @@ def check_symbol(
     window_seconds: float,
     min_volume_notional: float,
     trigger_seconds: float,
+    daily_target_notional: float | None = None,
+    target_pace_fraction: float = 0.9,
+    target_pace_max_multiplier: float = 2.0,
     recover_min_volume_notional: float | None = None,
     near_cap_ratio: float = 0.95,
     recover_cap_ratio: float = 0.96,
@@ -755,12 +816,23 @@ def check_symbol(
     control = _read_json(control_path)
     plan = _read_json(_plan_path(output_dir, normalized_symbol))
     submit = _read_json(_submit_path(output_dir, normalized_symbol))
+    rows = trade_rows if trade_rows is not None else _iter_jsonl(_trade_path(output_dir, normalized_symbol))
     volume_summary = summarize_recent_volume(
-        rows=trade_rows if trade_rows is not None else _iter_jsonl(_trade_path(output_dir, normalized_symbol)),
+        rows=rows,
         now=now,
         window_seconds=window_seconds,
     )
     volume_summary["source"] = volume_source
+    effective_min_volume_notional = apply_daily_target_pace_floor(
+        volume_summary=volume_summary,
+        rows=rows,
+        now=now,
+        window_seconds=window_seconds,
+        min_volume_notional=min_volume_notional,
+        daily_target_notional=daily_target_notional,
+        target_pace_fraction=target_pace_fraction,
+        target_pace_max_multiplier=target_pace_max_multiplier,
+    )
     assessment = assess_symbol(
         symbol=normalized_symbol,
         control=control,
@@ -768,7 +840,7 @@ def check_symbol(
         submit=submit,
         volume_summary=volume_summary,
         now=now,
-        min_volume_notional=min_volume_notional,
+        min_volume_notional=effective_min_volume_notional,
         near_cap_ratio=near_cap_ratio,
         far_ticks=far_ticks,
         plan_stale_seconds=plan_stale_seconds,
@@ -778,8 +850,9 @@ def check_symbol(
     recover_floor = (
         float(recover_min_volume_notional)
         if recover_min_volume_notional is not None
-        else max(float(min_volume_notional), 0.0)
+        else max(float(effective_min_volume_notional), 0.0)
     )
+    recover_floor = max(recover_floor, _safe_float(volume_summary.get("target_pace_floor_notional")))
 
     action = "none"
     backup_path: str | None = None
@@ -1412,6 +1485,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-volume-notional", type=float, default=10.0)
     parser.add_argument("--trigger-seconds", type=float, default=180.0)
     parser.add_argument("--recover-min-volume-notional", type=float, default=None)
+    parser.add_argument("--daily-targets", nargs="*", default=[])
+    parser.add_argument("--target-pace-fraction", type=float, default=0.9)
+    parser.add_argument("--target-pace-max-multiplier", type=float, default=2.0)
     parser.add_argument("--near-cap-ratio", type=float, default=0.95)
     parser.add_argument("--recover-cap-ratio", type=float, default=0.96)
     parser.add_argument("--far-ticks", type=int, default=8)
@@ -1436,6 +1512,7 @@ def main(argv: list[str] | None = None) -> int:
     state_path = Path(args.state_path).resolve() if args.state_path else output_dir / "bq_volume_recovery_guard_state.json"
     state = _read_json(state_path)
     now = datetime.now(timezone.utc)
+    daily_targets = _parse_symbol_notionals(args.daily_targets)
     results = []
     exit_code = 0
     for symbol in _normalize_symbols(args.symbols):
@@ -1461,10 +1538,14 @@ def main(argv: list[str] | None = None) -> int:
             continue
         _clear_inactive_observation(_symbol_state(state, symbol))
         try:
+            fetch_window_seconds = args.window_seconds
+            if symbol in daily_targets:
+                day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                fetch_window_seconds = max(fetch_window_seconds, (now - day_start).total_seconds())
             trade_rows = _fetch_exchange_user_trades(
                 symbol=symbol,
                 now=now,
-                window_seconds=args.window_seconds,
+                window_seconds=fetch_window_seconds,
             )
         except (KeyError, OSError, RuntimeError, ValueError) as exc:
             result = {
@@ -1488,6 +1569,9 @@ def main(argv: list[str] | None = None) -> int:
             window_seconds=args.window_seconds,
             min_volume_notional=args.min_volume_notional,
             trigger_seconds=args.trigger_seconds,
+            daily_target_notional=daily_targets.get(symbol),
+            target_pace_fraction=args.target_pace_fraction,
+            target_pace_max_multiplier=args.target_pace_max_multiplier,
             recover_min_volume_notional=args.recover_min_volume_notional,
             near_cap_ratio=args.near_cap_ratio,
             recover_cap_ratio=args.recover_cap_ratio,

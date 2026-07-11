@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from grid_optimizer import bq_volume_recovery_guard
 from grid_optimizer.bq_volume_recovery_guard import (
+    apply_daily_target_pace_floor,
     check_symbol,
     fetch_recent_user_trades,
     recover_inactive_runner,
@@ -170,6 +171,63 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
 
         self.assertEqual(summary["trade_count"], 2)
         self.assertEqual(summary["gross_notional"], 70.0)
+
+    def test_daily_target_pace_floor_raises_fixed_low_volume_threshold(self) -> None:
+        now = datetime(2026, 7, 11, 4, 0, tzinfo=timezone.utc)
+        rows = [
+            {
+                "id": 1,
+                "time": int((now - timedelta(hours=3)).timestamp() * 1000),
+                "quoteQty": "19840",
+            },
+            {
+                "id": 2,
+                "time": int((now - timedelta(seconds=30)).timestamp() * 1000),
+                "quoteQty": "160",
+            },
+        ]
+        summary = summarize_recent_volume(rows=rows, now=now, window_seconds=180)
+
+        floor = apply_daily_target_pace_floor(
+            volume_summary=summary,
+            rows=rows,
+            now=now,
+            window_seconds=180,
+            min_volume_notional=125,
+            daily_target_notional=100000,
+            target_pace_fraction=0.9,
+            target_pace_max_multiplier=2.0,
+        )
+
+        self.assertEqual(summary["daily_gross_notional"], 20000.0)
+        self.assertEqual(summary["required_hourly_notional"], 4000.0)
+        self.assertEqual(summary["target_pace_floor_notional"], 180.0)
+        self.assertEqual(floor, 180.0)
+
+    def test_daily_target_pace_floor_is_bounded_by_static_multiplier(self) -> None:
+        now = datetime(2026, 7, 11, 23, 0, tzinfo=timezone.utc)
+        summary: dict[str, object] = {}
+
+        floor = apply_daily_target_pace_floor(
+            volume_summary=summary,
+            rows=[],
+            now=now,
+            window_seconds=180,
+            min_volume_notional=125,
+            daily_target_notional=100000,
+            target_pace_fraction=0.9,
+            target_pace_max_multiplier=2.0,
+        )
+
+        self.assertEqual(summary["target_pace_floor_notional"], 250.0)
+        self.assertEqual(floor, 250.0)
+
+    def test_parse_symbol_notionals_accepts_comma_separated_targets(self) -> None:
+        targets = bq_volume_recovery_guard._parse_symbol_notionals(
+            ["ARXUSDT=100000,OUSDT=60000", "INVALID", "BAD=0"]
+        )
+
+        self.assertEqual(targets, {"ARXUSDT": 100000.0, "OUSDT": 60000.0})
 
     def test_inactive_runner_restarts_after_safe_confirmation(self) -> None:
         now = datetime(2026, 6, 26, 7, 0, tzinfo=timezone.utc)
