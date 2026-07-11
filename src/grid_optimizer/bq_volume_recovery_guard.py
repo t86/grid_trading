@@ -463,6 +463,34 @@ def _recovery_inventory_buffer_ok(
     )
 
 
+def _actual_inventory_below_soft_limits(
+    assessment: dict[str, Any],
+    *,
+    pause_baseline_long_notional: float,
+    pause_baseline_short_notional: float,
+) -> bool:
+    if _safe_float(assessment.get("frozen_total_notional")) > 0:
+        return False
+    actual_long = assessment.get("actual_long_notional")
+    actual_short = assessment.get("actual_short_notional")
+    if actual_long is None or actual_short is None:
+        return False
+    long_limit = max(
+        float(pause_baseline_long_notional),
+        _safe_float(assessment.get("long_soft_limit_notional")),
+    )
+    short_limit = max(
+        float(pause_baseline_short_notional),
+        _safe_float(assessment.get("short_soft_limit_notional")),
+    )
+    return (
+        long_limit > 0
+        and short_limit > 0
+        and _safe_float(actual_long) < long_limit
+        and _safe_float(actual_short) < short_limit
+    )
+
+
 def _plan_time_is_fresh(payload: dict[str, Any], *, now: datetime, max_age_seconds: float) -> bool:
     generated_at = _parse_time(payload.get("generated_at"))
     if generated_at is None:
@@ -1071,6 +1099,16 @@ def check_symbol(
         far_ticks=far_ticks,
         plan_stale_seconds=plan_stale_seconds,
     )
+    actual_inventory_below_soft = _actual_inventory_below_soft_limits(
+        assessment,
+        pause_baseline_long_notional=pause_baseline_long_notional,
+        pause_baseline_short_notional=pause_baseline_short_notional,
+    )
+    effective_inventory_soft_pressure = bool(assessment.get("inventory_soft_pressure")) and not (
+        actual_inventory_below_soft
+    )
+    assessment["actual_inventory_below_soft"] = actual_inventory_below_soft
+    assessment["effective_inventory_soft_pressure"] = effective_inventory_soft_pressure
     static_cycle_budget_floor_notional = max(float(cycle_budget_floor_notional), 0.0)
     cycle_budget_floor_notional = apply_target_pace_cycle_budget_floor(
         volume_summary=volume_summary,
@@ -1275,7 +1313,7 @@ def check_symbol(
             target_pace_ahead
             and not recovery_has_original_controls
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
-            and bool(assessment.get("inventory_soft_pressure"))
+            and effective_inventory_soft_pressure
             and _safe_int(assessment.get("active_order_count")) > 0
         ):
             action = "hold_loss_reduce_while_target_pace_ahead"
@@ -1292,7 +1330,7 @@ def check_symbol(
             > _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
             and _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional")) > 0
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
-            and not bool(assessment.get("inventory_soft_pressure"))
+            and not effective_inventory_soft_pressure
             and not bool(assessment.get("near_cap"))
             and not bool(assessment.get("ineffective_orders"))
             and not bool(assessment.get("volatility_entry_pause_active"))
@@ -1411,7 +1449,7 @@ def check_symbol(
             }
             if (
                 bool(assessment.get("low_volume"))
-                and bool(assessment.get("inventory_soft_pressure"))
+                and effective_inventory_soft_pressure
                 and recovery_hold_satisfied
                 and not bool(recovery_expected_controls.get("best_quote_maker_volume_allow_loss_reduce_only"))
             ):
@@ -1546,7 +1584,7 @@ def check_symbol(
                         "best_quote_maker_volume_inventory_bias_min_notional_gap",
                     )
                 )
-                and not bool(assessment.get("inventory_soft_pressure"))
+                and not effective_inventory_soft_pressure
                 and not bool(assessment.get("one_sided_inventory_bias"))
                 and not bool(assessment.get("near_cap"))
                 and not bool(assessment.get("ineffective_orders"))
@@ -1790,7 +1828,7 @@ def check_symbol(
             )
             stalled_loss_reduce_plan = (
                 bool(assessment.get("low_volume"))
-                and bool(assessment.get("inventory_soft_pressure"))
+                and effective_inventory_soft_pressure
                 and _safe_int(assessment.get("planned_reduce_only_order_count")) <= 0
                 and current_long > 0
                 and current_short > 0
@@ -1847,7 +1885,7 @@ def check_symbol(
                 return result
             can_extend_soft_recovery = (
                 recovery_stage_timed_out
-                and bool(assessment.get("inventory_soft_pressure"))
+                and effective_inventory_soft_pressure
                 and _safe_int(assessment.get("active_order_count")) > 0
                 and _safe_int(assessment.get("near_market_order_count")) > 0
                 and not bool(assessment.get("ineffective_orders"))
@@ -1883,7 +1921,7 @@ def check_symbol(
                 return result
             hold_exhausted_soft_recovery = (
                 recovery_stage_timed_out
-                and bool(assessment.get("inventory_soft_pressure"))
+                and effective_inventory_soft_pressure
                 and _safe_int(assessment.get("active_order_count")) > 0
                 and _safe_int(assessment.get("near_market_order_count")) > 0
                 and not bool(assessment.get("ineffective_orders"))
@@ -2040,7 +2078,7 @@ def check_symbol(
                     dry_run=dry_run,
                     restart_runner=restart,
                 )
-            elif bool(assessment.get("inventory_soft_pressure")):
+            elif effective_inventory_soft_pressure:
                 updates = _loss_reduce_recovery_updates(
                     control=control,
                     assessment=assessment,
@@ -2071,6 +2109,15 @@ def check_symbol(
                     now=now,
                     dry_run=dry_run,
                     restart_runner=restart,
+                )
+            elif actual_inventory_below_soft:
+                action = "hold_loss_reduce_when_actual_inventory_below_soft"
+                item.update(
+                    {
+                        "status": "low_volume",
+                        "last_recovery_check_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
                 )
             elif (
                 bool(assessment.get("planned_reduce_only_only"))

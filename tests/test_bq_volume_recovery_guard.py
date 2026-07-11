@@ -1601,6 +1601,98 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(result["assessment"]["active_pair_reduce_below_soft_deadlock"])
             self.assertTrue(control["best_quote_maker_volume_active_pair_reduce_enabled"])
 
+    def test_does_not_enable_loss_reduce_for_stale_ledger_soft_pressure(self) -> None:
+        now = datetime(2026, 7, 11, 12, 14, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "pause_buy_position_notional": 800.0,
+                    "pause_short_position_notional": 800.0,
+                },
+                long_notional=810.0,
+                short_notional=805.0,
+                open_order_count=0,
+                active_order_count=0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 500.0,
+                    "actual_short_notional": 450.0,
+                    "frozen_long_notional": 0.0,
+                    "frozen_short_notional": 0.0,
+                }
+            }
+            _write_json(plan_path, plan)
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state={},
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=0,
+                pause_baseline_long_notional=800.0,
+                pause_baseline_short_notional=800.0,
+                restart_runner=lambda _: None,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertTrue(result["assessment"]["inventory_soft_pressure"])
+            self.assertTrue(result["assessment"]["actual_inventory_below_soft"])
+            self.assertFalse(result["assessment"]["effective_inventory_soft_pressure"])
+            self.assertEqual(result["action"], "hold_loss_reduce_when_actual_inventory_below_soft")
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+
+    def test_keeps_loss_reduce_eligible_when_frozen_inventory_exists(self) -> None:
+        now = datetime(2026, 7, 11, 12, 15, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "pause_buy_position_notional": 800.0,
+                    "pause_short_position_notional": 800.0,
+                },
+                long_notional=810.0,
+                short_notional=805.0,
+                open_order_count=0,
+                active_order_count=0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 500.0,
+                    "actual_short_notional": 450.0,
+                    "frozen_long_notional": 0.0,
+                    "frozen_short_notional": 100.0,
+                }
+            }
+            _write_json(plan_path, plan)
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state={},
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=0,
+                pause_baseline_long_notional=800.0,
+                pause_baseline_short_notional=800.0,
+                restart_runner=lambda _: None,
+            )
+
+            self.assertFalse(result["assessment"]["actual_inventory_below_soft"])
+            self.assertTrue(result["assessment"]["effective_inventory_soft_pressure"])
+
     def test_does_not_enable_loss_reduce_when_hourly_target_pace_is_ahead(self) -> None:
         now = datetime(2026, 7, 11, 12, 15, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
