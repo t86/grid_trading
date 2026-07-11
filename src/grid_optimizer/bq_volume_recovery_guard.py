@@ -1289,6 +1289,46 @@ def check_symbol(
                 recover_cap_ratio=recover_cap_ratio,
                 original_controls=recovery_original_controls,
             )
+            if bool(item.get("recovery_owned")) and cap_buffer_ok and recovery_hold_satisfied:
+                updates = _restore_recovery_controls(item)
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = (
+                    "dry_run_restore_after_inventory_below_soft"
+                    if dry_run
+                    else "restore_after_inventory_below_soft"
+                )
+                _set_post_restore_cooldown(
+                    item,
+                    now=now,
+                    cooldown_seconds=post_restore_cooldown_seconds,
+                )
+                item.pop("guard_original_controls", None)
+                item.pop("guard_recovery_controls", None)
+                item.pop("recovery_started_at", None)
+                item.pop("recovery_owned", None)
+                result = {
+                    "symbol": normalized_symbol,
+                    "action": action,
+                    "changed_keys": changed,
+                    "backup_path": backup_path,
+                    "dry_run": dry_run,
+                    "restart_failed": restart_failed,
+                    "volume_summary": volume_summary,
+                    "assessment": assessment,
+                }
+                _append_jsonl(
+                    output_dir / "bq_volume_recovery_guard_events.jsonl",
+                    {"ts": now.isoformat(), **result},
+                )
+                return result
             current_long = max(_safe_float(assessment.get("current_long_notional")), 0.0)
             current_short = max(_safe_float(assessment.get("current_short_notional")), 0.0)
             heavier_inventory = max(current_long, current_short)
