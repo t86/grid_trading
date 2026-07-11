@@ -1217,6 +1217,48 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 60.0)
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_cycle_budget_floor_recovers_external_budget_override_in_one_step(self) -> None:
+        now = datetime(2026, 6, 26, 8, 22, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_cycle_budget_notional": 72.0},
+                long_notional=400.0,
+                short_notional=350.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                volume_recovery_cycle_budget_increment=12,
+                cycle_budget_floor_notional=108,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "raise_cycle_budget_for_volume")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_reapplies_non_loss_recovery_control_after_external_override(self) -> None:
         now = datetime(2026, 6, 26, 8, 25, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

@@ -871,6 +871,7 @@ def check_symbol(
     max_soft_recovery_extensions: int = 1,
     inventory_bias_relief_notional_margin: float = 24.0,
     volume_recovery_cycle_budget_increment: float = 12.0,
+    cycle_budget_floor_notional: float = 0.0,
     trade_rows: list[dict[str, Any]] | None = None,
     volume_source: str = "local_audit",
     dry_run: bool = False,
@@ -1141,7 +1142,10 @@ def check_symbol(
                         ("best_quote_maker_volume_cycle_budget_notional",),
                     )
                     updates = _restore_recovery_controls(item)
-                    updates["best_quote_maker_volume_cycle_budget_notional"] = current_budget + increment
+                    updates["best_quote_maker_volume_cycle_budget_notional"] = max(
+                        current_budget + increment,
+                        max(float(cycle_budget_floor_notional), 0.0),
+                    )
                     item["guard_recovery_controls"] = {}
                     _remember_recovery_updates(item, updates)
                     changed, backup_path = _apply_control_update(
@@ -1664,13 +1668,17 @@ def check_symbol(
                         control,
                         ("best_quote_maker_volume_cycle_budget_notional",),
                     )
+                    target_budget = max(
+                        current_budget + increment,
+                        max(float(cycle_budget_floor_notional), 0.0),
+                    )
                     updates = {
                         "best_quote_maker_volume_net_loss_reduce_enabled": False,
-                        "best_quote_maker_volume_cycle_budget_notional": current_budget + increment,
+                        "best_quote_maker_volume_cycle_budget_notional": target_budget,
                     }
                     _remember_recovery_updates(
                         item,
-                        {"best_quote_maker_volume_cycle_budget_notional": current_budget + increment},
+                        {"best_quote_maker_volume_cycle_budget_notional": target_budget},
                     )
                     action = "dry_run_raise_cycle_budget_for_volume" if dry_run else "raise_cycle_budget_for_volume"
                     item.update(
@@ -1863,6 +1871,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--inactive-max-snapshot-age-seconds", type=float, default=300.0)
     parser.add_argument("--inventory-bias-relief-notional-margin", type=float, default=24.0)
     parser.add_argument("--volume-recovery-cycle-budget-increment", type=float, default=12.0)
+    parser.add_argument("--cycle-budget-floors", nargs="*", default=[])
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
@@ -1872,6 +1881,7 @@ def main(argv: list[str] | None = None) -> int:
     state = _read_json(state_path)
     now = datetime.now(timezone.utc)
     daily_targets = _parse_symbol_notionals(args.daily_targets)
+    cycle_budget_floors = _parse_symbol_notionals(args.cycle_budget_floors)
     results = []
     exit_code = 0
     for symbol in _normalize_symbols(args.symbols):
@@ -1946,6 +1956,7 @@ def main(argv: list[str] | None = None) -> int:
             max_soft_recovery_extensions=args.max_soft_recovery_extensions,
             inventory_bias_relief_notional_margin=args.inventory_bias_relief_notional_margin,
             volume_recovery_cycle_budget_increment=args.volume_recovery_cycle_budget_increment,
+            cycle_budget_floor_notional=cycle_budget_floors.get(symbol, 0.0),
             trade_rows=trade_rows,
             volume_source="exchange_user_trades",
             dry_run=args.dry_run,
