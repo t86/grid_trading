@@ -1518,6 +1518,107 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(result["action"], "hold_recovery_control_drift_debounce")
             self.assertEqual(restarts, [])
 
+    def test_soft_inventory_pressure_uses_loss_reduce_before_budget_increase(self) -> None:
+        now = datetime(2026, 6, 26, 9, 30, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 48.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.8,
+                    "pause_buy_position_notional": 800.0,
+                    "pause_short_position_notional": 800.0,
+                },
+                long_notional=850.0,
+                short_notional=700.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "enable_soft_inventory_loss_reduce")
+            self.assertTrue(result["assessment"]["long_near_soft"])
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 48.0)
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_budget_recovery_switches_to_soft_inventory_loss_reduce(self) -> None:
+        now = datetime(2026, 6, 26, 9, 40, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 60.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.8,
+                    "pause_buy_position_notional": 800.0,
+                    "pause_short_position_notional": 800.0,
+                },
+                long_notional=850.0,
+                short_notional=700.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
+                        "last_recovery_action_at": (now - timedelta(minutes=3)).isoformat(),
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 48.0,
+                        },
+                        "guard_recovery_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 60.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "switch_to_soft_inventory_loss_reduce")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 48.0)
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(state["symbols"]["REUSDT"]["recovery_started_at"], now.isoformat())
+            self.assertEqual(restarts, ["REUSDT"])
+
 
 if __name__ == "__main__":
     unittest.main()
