@@ -284,13 +284,24 @@ def _remember_recovery_updates(item: dict[str, Any], updates: dict[str, Any]) ->
     item["guard_recovery_controls"] = expected
 
 
-def _restore_recovery_controls(item: dict[str, Any]) -> dict[str, Any]:
+def _restore_recovery_controls(
+    item: dict[str, Any],
+    control: dict[str, Any] | None = None,
+    cycle_budget_floor_notional: float = 0.0,
+) -> dict[str, Any]:
     original = item.get("guard_original_controls")
     updates = {"best_quote_maker_volume_allow_loss_reduce_only": False}
     if isinstance(original, dict):
         for key, value in original.items():
             if key in _RECOVERY_CONTROL_KEYS:
                 updates[key] = value
+    budget_key = "best_quote_maker_volume_cycle_budget_notional"
+    budget_floor = max(float(cycle_budget_floor_notional), 0.0)
+    current_budget = updates.get(budget_key)
+    if current_budget is None and isinstance(control, dict):
+        current_budget = control.get(budget_key)
+    if budget_floor > 0 and current_budget is not None and _safe_float(current_budget) < budget_floor:
+        updates[budget_key] = budget_floor
     updates["best_quote_maker_volume_net_loss_reduce_enabled"] = False
     return updates
 
@@ -1006,7 +1017,7 @@ def check_symbol(
                     control,
                     tuple(key for key in loss_updates if key != "best_quote_maker_volume_net_loss_reduce_enabled"),
                 )
-                updates = _restore_recovery_controls(item)
+                updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
                 updates.update(loss_updates)
                 item["guard_recovery_controls"] = {}
                 _remember_recovery_updates(item, updates)
@@ -1044,7 +1055,7 @@ def check_symbol(
                     control,
                     ("sticky_entry_price_tolerance_steps",),
                 )
-                updates = _restore_recovery_controls(item)
+                updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
                 updates["sticky_entry_price_tolerance_steps"] = 1.0
                 item["guard_recovery_controls"] = {}
                 _remember_recovery_updates(item, updates)
@@ -1141,7 +1152,7 @@ def check_symbol(
                         control,
                         ("best_quote_maker_volume_cycle_budget_notional",),
                     )
-                    updates = _restore_recovery_controls(item)
+                    updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
                     updates["best_quote_maker_volume_cycle_budget_notional"] = max(
                         current_budget + increment,
                         max(float(cycle_budget_floor_notional), 0.0),
@@ -1174,7 +1185,7 @@ def check_symbol(
                     action = "hold_inventory_relief_without_budget"
                     item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
             elif recovery_timed_out:
-                updates = _restore_recovery_controls(item)
+                updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
@@ -1204,7 +1215,7 @@ def check_symbol(
                 and bool(recovery_expected_controls.get("best_quote_maker_volume_allow_loss_reduce_only"))
                 and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             ):
-                updates = _restore_recovery_controls(item)
+                updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
@@ -1258,7 +1269,7 @@ def check_symbol(
                 action = "hold_recovery_min_duration"
                 item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
             elif restore_ready:
-                updates = _restore_recovery_controls(item)
+                updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
@@ -1322,7 +1333,7 @@ def check_symbol(
                 original_controls=recovery_original_controls,
             )
             if bool(item.get("recovery_owned")) and cap_buffer_ok and recovery_hold_satisfied:
-                updates = _restore_recovery_controls(item)
+                updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
@@ -1495,7 +1506,7 @@ def check_symbol(
                 )
                 return result
             if recovery_stage_timed_out:
-                updates = _restore_recovery_controls(item)
+                updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
@@ -1541,7 +1552,7 @@ def check_symbol(
                 item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
             elif restore_ready:
                 has_original_controls = bool(item.get("guard_original_controls"))
-                updates = _restore_recovery_controls(item)
+                updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
