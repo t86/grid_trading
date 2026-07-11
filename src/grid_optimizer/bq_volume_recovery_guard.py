@@ -535,7 +535,7 @@ def assess_symbol(
         if str(reason).strip()
     }
     one_sided_inventory_bias = (
-        active_count == 1
+        entry_order_count > 0
         and buy_paused != short_paused
         and "inventory_bias" in pause_reasons
     )
@@ -1477,7 +1477,11 @@ def check_symbol(
             ):
                 action = "hold_near_market_reduce_only_flow"
                 item.update({"status": "low_volume", "last_recovery_check_at": now.isoformat()})
-            elif not bool(assessment.get("near_cap")) and not bool(assessment.get("ineffective_orders")):
+            elif (
+                not bool(assessment.get("near_cap"))
+                and not bool(assessment.get("ineffective_orders"))
+                and "inventory_bias" not in set(assessment.get("pause_reasons") or [])
+            ):
                 current_budget = _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
                 increment = max(float(volume_recovery_cycle_budget_increment), 0.0)
                 if current_budget > 0 and increment > 0:
