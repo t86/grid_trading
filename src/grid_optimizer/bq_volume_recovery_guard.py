@@ -1540,6 +1540,12 @@ def check_symbol(
             and now < cooldown_until
             and not severe_one_sided_stall
             and not (bool(assessment.get("low_volume")) and effective_inventory_soft_pressure)
+            and not (
+                bool(assessment.get("low_volume"))
+                and actual_inventory_below_soft
+                and required_hourly_notional > 0
+                and not target_pace_ahead
+            )
         ):
             action = "cooldown"
         elif recovery_has_original_controls and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only")):

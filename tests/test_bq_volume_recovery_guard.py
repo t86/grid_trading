@@ -1787,17 +1787,29 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "pause_buy_position_notional": 800.0,
                     "pause_short_position_notional": 800.0,
                 },
-                long_notional=500.0,
-                short_notional=450.0,
+                long_notional=850.0,
+                short_notional=850.0,
                 open_order_count=1,
                 active_order_count=1,
                 orders_near_market=True,
                 recent_trade_notional=40.0,
             )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 500.0,
+                    "actual_short_notional": 450.0,
+                    "frozen_long_notional": 0.0,
+                    "frozen_short_notional": 0.0,
+                }
+            }
+            _write_json(plan_path, plan)
             state: dict[str, object] = {
                 "symbols": {
                     "REUSDT": {
-                        "status": "low_volume",
+                        "status": "cooldown",
+                        "cooldown_until": (now + timedelta(minutes=5)).isoformat(),
                         "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
                     }
                 }
