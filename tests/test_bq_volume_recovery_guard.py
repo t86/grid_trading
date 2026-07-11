@@ -1958,6 +1958,60 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["sticky_entry_price_tolerance_steps"], 1.0)
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_near_market_reduce_only_flow_does_not_raise_cycle_budget(self) -> None:
+        now = datetime(2026, 6, 26, 10, 30, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"best_quote_maker_volume_cycle_budget_notional": 72.0},
+                long_notional=650.0,
+                short_notional=620.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["buy_orders"] = []
+            plan["sell_orders"] = [
+                {
+                    "side": "SELL",
+                    "price": 0.5972,
+                    "qty": 16.0,
+                    "role": "best_quote_active_pair_reduce_long",
+                    "force_reduce_only": True,
+                }
+            ]
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "hold_near_market_reduce_only_flow")
+            self.assertTrue(result["assessment"]["planned_reduce_only_only"])
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 72.0)
+            self.assertEqual(restarts, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -383,6 +383,13 @@ def _order_is_near_market(order: dict[str, Any], *, bid: float, ask: float, tick
     return False
 
 
+def _order_is_reduce_only(order: dict[str, Any]) -> bool:
+    if bool(order.get("reduce_only") or order.get("reduceOnly") or order.get("force_reduce_only")):
+        return True
+    role = str(order.get("role") or order.get("execution_type") or "").lower()
+    return "reduce" in role
+
+
 def _active_order_count(plan: dict[str, Any], submit: dict[str, Any]) -> int:
     observed = (
         submit.get("observed_strategy_open_order_state", {})
@@ -467,6 +474,9 @@ def assess_symbol(
     bid, ask = _live_book(plan, submit)
     tick = _tick_size(plan, control)
     orders = _planned_orders(plan, submit)
+    reduce_only_order_count = sum(1 for item in orders if _order_is_reduce_only(item))
+    entry_order_count = max(len(orders) - reduce_only_order_count, 0)
+    reduce_only_only = bool(orders) and entry_order_count == 0
     near_orders = [
         item
         for item in orders
@@ -524,6 +534,9 @@ def assess_symbol(
         "gross_notional": gross,
         "active_order_count": active_count,
         "planned_order_count": len(orders),
+        "planned_entry_order_count": entry_order_count,
+        "planned_reduce_only_order_count": reduce_only_order_count,
+        "planned_reduce_only_only": reduce_only_only,
         "near_market_order_count": len(near_orders),
         "ineffective_orders": ineffective_orders,
         "all_orders_far": all_orders_far,
@@ -1370,6 +1383,12 @@ def check_symbol(
                     dry_run=dry_run,
                     restart_runner=restart,
                 )
+            elif (
+                bool(assessment.get("planned_reduce_only_only"))
+                and _safe_int(assessment.get("near_market_order_count")) > 0
+            ):
+                action = "hold_near_market_reduce_only_flow"
+                item.update({"status": "low_volume", "last_recovery_check_at": now.isoformat()})
             elif not bool(assessment.get("near_cap")) and not bool(assessment.get("ineffective_orders")):
                 current_budget = _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
                 increment = max(float(volume_recovery_cycle_budget_increment), 0.0)
