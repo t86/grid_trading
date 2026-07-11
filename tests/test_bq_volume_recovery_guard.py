@@ -43,7 +43,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             stdout = StringIO()
 
             with (
-                patch.object(bq_volume_recovery_guard, "_runner_is_active") as runner_active,
+                patch.object(bq_volume_recovery_guard, "_runner_is_active", return_value=False) as runner_active,
                 patch.object(bq_volume_recovery_guard, "_fetch_exchange_user_trades") as fetch_trades,
                 redirect_stdout(stdout),
             ):
@@ -59,11 +59,42 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 )
 
             self.assertEqual(exit_code, 0)
-            runner_active.assert_not_called()
+            runner_active.assert_called_once_with("ARXUSDT")
             fetch_trades.assert_not_called()
             payload = json.loads(stdout.getvalue())
             self.assertEqual(payload["results"][0]["action"], "skip_target_gate_done_terminal")
             self.assertEqual(payload["results"][0]["target_gate_done_marker"], str(marker.resolve()))
+
+    def test_main_stops_active_runner_after_target_gate_done(self) -> None:
+        now = datetime.now(timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            marker = output_dir / f"ousdt_target_gate_done_{now.strftime('%Y%m%d')}.flag"
+            marker.write_text(now.isoformat(), encoding="utf-8")
+            stdout = StringIO()
+
+            with (
+                patch.object(bq_volume_recovery_guard, "_runner_is_active", return_value=True),
+                patch.object(bq_volume_recovery_guard, "_default_stop_runner") as stop_runner,
+                redirect_stdout(stdout),
+            ):
+                exit_code = bq_volume_recovery_guard.main(
+                    [
+                        "--output-dir",
+                        str(output_dir),
+                        "--state-path",
+                        str(output_dir / "state.json"),
+                        "--runner-wrapper",
+                        "/usr/local/bin/test-wrapper",
+                        "--symbols",
+                        "OUSDT",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            stop_runner.assert_called_once_with("OUSDT", runner_wrapper="/usr/local/bin/test-wrapper")
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["results"][0]["action"], "stop_runner_target_gate_done")
 
     def test_restores_persistent_corrupt_state_from_recent_valid_backup(self) -> None:
         now = datetime(2026, 7, 11, 11, 20, tzinfo=timezone.utc)

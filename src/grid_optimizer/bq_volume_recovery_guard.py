@@ -922,6 +922,10 @@ def _default_restart_runner(symbol: str, *, runner_wrapper: str) -> object:
     return subprocess.run([runner_wrapper, "restart", symbol], check=True)
 
 
+def _default_stop_runner(symbol: str, *, runner_wrapper: str) -> object:
+    return subprocess.run([runner_wrapper, "stop", symbol], check=True)
+
+
 def _runner_is_active(symbol: str) -> bool:
     service = f"grid-loop@{symbol}.service"
     return (
@@ -2513,13 +2517,27 @@ def main(argv: list[str] | None = None) -> int:
     for symbol in _normalize_symbols(args.symbols):
         target_done_marker = _target_gate_done_marker(output_dir, symbol, now)
         if target_done_marker.exists():
+            runner_active = _runner_is_active(symbol)
+            stop_failed: str | None = None
+            if runner_active and args.dry_run:
+                action = "dry_run_stop_runner_target_gate_done"
+            elif runner_active:
+                try:
+                    _default_stop_runner(symbol, runner_wrapper=args.runner_wrapper)
+                    action = "stop_runner_target_gate_done"
+                except subprocess.CalledProcessError as exc:
+                    action = "stop_runner_target_gate_done_failed"
+                    stop_failed = str(exc)
+                    exit_code = 1
+            else:
+                action = "skip_target_gate_done_terminal"
             result = {
                 "symbol": symbol,
-                "action": "skip_target_gate_done_terminal",
+                "action": action,
                 "changed_keys": [],
                 "backup_path": None,
                 "dry_run": args.dry_run,
-                "restart_failed": None,
+                "restart_failed": stop_failed,
                 "target_gate_done_marker": str(target_done_marker),
             }
             _append_jsonl(
