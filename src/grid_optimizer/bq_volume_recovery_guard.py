@@ -394,11 +394,20 @@ def _loss_reduce_recovery_updates(
     *,
     control: dict[str, Any],
     assessment: dict[str, Any],
+    static_cycle_budget_floor_notional: float = 0.0,
 ) -> dict[str, Any]:
     updates: dict[str, Any] = {
         "best_quote_maker_volume_net_loss_reduce_enabled": False,
         "best_quote_maker_volume_allow_loss_reduce_only": True,
     }
+    per_order = max(
+        _safe_float(control.get("per_order_notional")),
+        _safe_float(control.get("maker_order_notional")),
+    )
+    loss_reduce_budget_cap = max(float(static_cycle_budget_floor_notional), per_order * 4.0)
+    current_budget = _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
+    if loss_reduce_budget_cap > 0 and current_budget > loss_reduce_budget_cap:
+        updates["best_quote_maker_volume_cycle_budget_notional"] = loss_reduce_budget_cap
     buffer_notional = max(_safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")), 0.0)
     if buffer_notional <= 0:
         return updates
@@ -1009,6 +1018,7 @@ def check_symbol(
         far_ticks=far_ticks,
         plan_stale_seconds=plan_stale_seconds,
     )
+    static_cycle_budget_floor_notional = max(float(cycle_budget_floor_notional), 0.0)
     cycle_budget_floor_notional = apply_target_pace_cycle_budget_floor(
         volume_summary=volume_summary,
         rows=rows,
@@ -1083,6 +1093,14 @@ def check_symbol(
         last_recovery_action_at is not None
         and (now - last_recovery_action_at).total_seconds() < max(float(recovery_reapply_min_seconds), 0.0)
     )
+    loss_reduce_cycle_budget_cap = max(
+        static_cycle_budget_floor_notional,
+        max(
+            _safe_float(control.get("per_order_notional")),
+            _safe_float(control.get("maker_order_notional")),
+        )
+        * 4.0,
+    )
 
     try:
         if stale_or_missing and not recovery_timeout_required:
@@ -1134,15 +1152,10 @@ def check_symbol(
                 restart_runner=restart,
             )
         elif (
-            bool(assessment.get("low_volume"))
-            and max(float(cycle_budget_floor_notional), 0.0)
-            > _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
-            and _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional")) > 0
-            and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
-            and _safe_int(assessment.get("active_order_count")) > 0
-            and _safe_int(assessment.get("near_market_order_count")) > 0
-            and not bool(assessment.get("ineffective_orders"))
-            and not bool(assessment.get("volatility_entry_pause_active"))
+            bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and loss_reduce_cycle_budget_cap > 0
+            and _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
+            > loss_reduce_cycle_budget_cap
             and not (
                 recovery_has_original_controls
                 and recovery_hold_satisfied
@@ -1153,11 +1166,11 @@ def check_symbol(
                 )
             )
         ):
-            budget_floor = max(float(cycle_budget_floor_notional), 0.0)
-            updates = {
-                "best_quote_maker_volume_net_loss_reduce_enabled": False,
-                "best_quote_maker_volume_cycle_budget_notional": budget_floor,
-            }
+            updates = _loss_reduce_recovery_updates(
+                control=control,
+                assessment=assessment,
+                static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+            )
             _remember_recovery_controls(
                 item,
                 control,
@@ -1165,12 +1178,12 @@ def check_symbol(
             )
             _remember_recovery_updates(
                 item,
-                {"best_quote_maker_volume_cycle_budget_notional": budget_floor},
+                updates,
             )
             action = (
-                "dry_run_raise_target_pace_budget_during_loss_reduce"
+                "dry_run_cap_loss_reduce_budget_for_wear"
                 if dry_run
-                else "raise_target_pace_budget_during_loss_reduce"
+                else "cap_loss_reduce_budget_for_wear"
             )
             item.update(
                 {
@@ -1215,7 +1228,11 @@ def check_symbol(
                 and recovery_hold_satisfied
                 and not bool(recovery_expected_controls.get("best_quote_maker_volume_allow_loss_reduce_only"))
             ):
-                loss_updates = _loss_reduce_recovery_updates(control=control, assessment=assessment)
+                loss_updates = _loss_reduce_recovery_updates(
+                    control=control,
+                    assessment=assessment,
+                    static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+                )
                 _remember_recovery_controls(
                     item,
                     control,
@@ -1837,7 +1854,11 @@ def check_symbol(
                     restart_runner=restart,
                 )
             elif bool(assessment.get("inventory_soft_pressure")):
-                updates = _loss_reduce_recovery_updates(control=control, assessment=assessment)
+                updates = _loss_reduce_recovery_updates(
+                    control=control,
+                    assessment=assessment,
+                    static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+                )
                 _remember_recovery_controls(
                     item,
                     control,
@@ -2005,7 +2026,11 @@ def check_symbol(
                 elif effective_near_market_flow:
                     action = "hold_effective_near_market_flow"
                 else:
-                    updates = _loss_reduce_recovery_updates(control=control, assessment=assessment)
+                    updates = _loss_reduce_recovery_updates(
+                        control=control,
+                        assessment=assessment,
+                        static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+                    )
                     _remember_recovery_controls(
                         item,
                         control,
@@ -2046,7 +2071,11 @@ def check_symbol(
                     )
                     chosen_action = "disable_inventory_cost_gate"
                 else:
-                    updates = _loss_reduce_recovery_updates(control=control, assessment=assessment)
+                    updates = _loss_reduce_recovery_updates(
+                        control=control,
+                        assessment=assessment,
+                        static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+                    )
                     _remember_recovery_controls(
                         item,
                         control,

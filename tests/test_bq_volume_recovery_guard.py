@@ -1308,7 +1308,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(volume_summary["trailing_60m_gross_notional"], 4000.0)
         self.assertEqual(volume_summary["target_cycle_budget_ladder_capacity"], 256.0)
 
-    def test_target_pace_budget_can_increase_during_bounded_loss_reduce(self) -> None:
+    def test_target_pace_budget_is_capped_during_bounded_loss_reduce(self) -> None:
         now = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -1317,7 +1317,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 now=now,
                 control={
                     "best_quote_maker_volume_allow_loss_reduce_only": True,
-                    "best_quote_maker_volume_cycle_budget_notional": 108.0,
+                    "best_quote_maker_volume_cycle_budget_notional": 144.0,
                     "per_order_notional": 18.0,
                     "maker_order_notional": 18.0,
                     "buy_levels": 4,
@@ -1361,8 +1361,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
 
             control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
-            self.assertEqual(result["action"], "raise_target_pace_budget_during_loss_reduce")
-            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 144.0)
+            self.assertEqual(result["action"], "cap_loss_reduce_budget_for_wear")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["REUSDT"])
 
