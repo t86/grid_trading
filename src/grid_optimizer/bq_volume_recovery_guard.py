@@ -2222,7 +2222,7 @@ def check_symbol(
                     dry_run=dry_run,
                     restart_runner=restart,
                 )
-            elif actual_inventory_below_soft:
+            elif actual_inventory_below_soft and (required_hourly_notional <= 0 or target_pace_ahead):
                 action = "hold_loss_reduce_when_actual_inventory_below_soft"
                 item.update(
                     {
