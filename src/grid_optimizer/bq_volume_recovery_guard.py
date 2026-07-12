@@ -1624,6 +1624,49 @@ def check_symbol(
             )
         elif (
             bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and effective_inventory_soft_pressure
+            and loss_reduce_quote_offset_extra_ticks > 0
+            and not bool(assessment.get("dynamic_quote_offset_applied"))
+            and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks"))
+            < int(loss_reduce_quote_offset_extra_ticks)
+        ):
+            updates = {
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "best_quote_maker_volume_quote_offset_ticks": int(
+                    loss_reduce_quote_offset_extra_ticks
+                ),
+            }
+            _remember_recovery_controls(
+                item,
+                control,
+                ("best_quote_maker_volume_quote_offset_ticks",),
+            )
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_add_loss_reduce_offset_for_wear"
+                if dry_run
+                else "add_loss_reduce_offset_for_wear"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif (
+            bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and bool(assessment.get("dynamic_quote_offset_applied"))
             and _safe_int(assessment.get("planned_entry_order_count")) > 0
             and _safe_int(assessment.get("dynamic_quote_offset_ticks"))

@@ -924,6 +924,46 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         )
         self.assertNotIn("best_quote_maker_volume_quote_offset_ticks", already_active)
 
+    def test_active_loss_reduce_repairs_missing_configured_offset_tick(self) -> None:
+        now = datetime(2026, 7, 12, 4, 16, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_quote_offset_ticks": 0,
+                    "pause_buy_position_notional": 800.0,
+                    "pause_short_position_notional": 800.0,
+                },
+                long_notional=810.0,
+                short_notional=700.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+                recent_trade_notional=20.0,
+            )
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state={},
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=0,
+                loss_reduce_quote_offset_extra_ticks=1,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "add_loss_reduce_offset_for_wear")
+            self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 1)
+            self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_loss_reduce_only_lowers_dominant_leg_pause(self) -> None:
         updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
             control={
