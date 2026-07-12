@@ -1985,6 +1985,63 @@ def check_symbol(
                 restart_runner=restart,
             )
         elif (
+            sla_recovery_due
+            and not high_recovery_wear
+            and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and _safe_int(assessment.get("active_order_count")) <= 0
+            and _safe_int(assessment.get("planned_order_count")) <= 0
+            and bool(assessment.get("inventory_soft_pressure"))
+            and _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
+            < max(
+                _safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")),
+                _safe_float(control.get("per_order_notional")),
+                _safe_float(control.get("maker_order_notional")),
+            )
+        ):
+            minimum_budget = max(
+                _safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")),
+                _safe_float(control.get("per_order_notional")),
+                _safe_float(control.get("maker_order_notional")),
+            )
+            updates = {
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "best_quote_maker_volume_cycle_budget_notional": minimum_budget,
+                "best_quote_maker_volume_quote_offset_ticks": 0,
+            }
+            _remember_recovery_controls(
+                item,
+                control,
+                (
+                    "best_quote_maker_volume_cycle_budget_notional",
+                    "best_quote_maker_volume_quote_offset_ticks",
+                ),
+            )
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_fund_zero_order_loss_recovery"
+                if dry_run
+                else "fund_zero_order_loss_recovery"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                    "last_sla_action_at": now.isoformat(),
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif (
             bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and effective_inventory_soft_pressure
             and not sla_recovery_due
