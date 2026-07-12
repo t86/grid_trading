@@ -851,7 +851,13 @@ def _loss_reduce_recovery_updates(
         _safe_float(control.get("per_order_notional")),
         _safe_float(control.get("maker_order_notional")),
     )
-    loss_reduce_budget_cap = max(float(static_cycle_budget_floor_notional), per_order * 4.0)
+    loss_reduce_budget_cap = max(
+        float(static_cycle_budget_floor_notional),
+        _safe_float(
+            control.get("best_quote_maker_volume_min_cycle_budget_notional")
+        ),
+        per_order * 4.0,
+    )
     loss_reduce_budget_floor = (
         min(
             max(
