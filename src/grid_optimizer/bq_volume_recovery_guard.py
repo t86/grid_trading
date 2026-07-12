@@ -172,6 +172,19 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _is_high_recovery_wear(volume_summary: dict[str, Any]) -> bool:
+    trailing_5m_wear = _safe_float(
+        volume_summary.get("trailing_5m_realized_wear_per_10k")
+    )
+    trailing_15m_wear = _safe_float(
+        volume_summary.get("trailing_15m_realized_wear_per_10k")
+    )
+    return (
+        _safe_float(volume_summary.get("trailing_15m_gross_notional")) >= 100.0
+        and (trailing_15m_wear > 3.0 or trailing_5m_wear > 80.0)
+    )
+
+
 def _parse_time(value: Any) -> datetime | None:
     if not value:
         return None
@@ -1636,14 +1649,7 @@ def check_symbol(
     trailing_15m_realized_wear_per_10k = _safe_float(
         volume_summary.get("trailing_15m_realized_wear_per_10k")
     )
-    high_recovery_wear = (
-        _safe_float(volume_summary.get("trailing_15m_gross_notional")) >= 100.0
-        and max(
-            trailing_5m_realized_wear_per_10k,
-            trailing_15m_realized_wear_per_10k,
-        )
-        > 3.0
-    )
+    high_recovery_wear = _is_high_recovery_wear(volume_summary)
     assessment["high_recovery_wear"] = high_recovery_wear
     two_sided_stale_no_fill = (
         _safe_float(volume_summary.get("gross_notional")) <= 0

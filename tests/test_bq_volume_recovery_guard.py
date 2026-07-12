@@ -35,6 +35,35 @@ def _append_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class BqVolumeRecoveryGuardTests(unittest.TestCase):
+    def test_high_recovery_wear_requires_15m_confirmation_or_extreme_5m(self) -> None:
+        self.assertFalse(
+            bq_volume_recovery_guard._is_high_recovery_wear(
+                {
+                    "trailing_15m_gross_notional": 217.0,
+                    "trailing_5m_realized_wear_per_10k": 26.7,
+                    "trailing_15m_realized_wear_per_10k": -19.1,
+                }
+            )
+        )
+        self.assertTrue(
+            bq_volume_recovery_guard._is_high_recovery_wear(
+                {
+                    "trailing_15m_gross_notional": 217.0,
+                    "trailing_5m_realized_wear_per_10k": 4.0,
+                    "trailing_15m_realized_wear_per_10k": 3.1,
+                }
+            )
+        )
+        self.assertTrue(
+            bq_volume_recovery_guard._is_high_recovery_wear(
+                {
+                    "trailing_15m_gross_notional": 217.0,
+                    "trailing_5m_realized_wear_per_10k": 80.1,
+                    "trailing_15m_realized_wear_per_10k": -10.0,
+                }
+            )
+        )
+
     def test_arx_independent_freeze_policy_only_disables_pair_gate_for_arx(self) -> None:
         control = {
             "best_quote_maker_volume_reduce_freeze_enabled": True,
