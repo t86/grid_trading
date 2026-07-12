@@ -1657,6 +1657,60 @@ def check_symbol(
                 restart_runner=restart,
             )
         elif (
+            target_pace_behind
+            and not recovery_reapply_debounced
+            and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and _safe_int(assessment.get("planned_entry_order_count")) > 0
+            and _safe_float(assessment.get("inventory_notional_gap"))
+            >= min(
+                _safe_float(assessment.get("long_soft_limit_notional")),
+                _safe_float(assessment.get("short_soft_limit_notional")),
+            )
+            * 0.25
+            and required_hourly_notional > 0
+            and trailing_hourly_notional < required_hourly_notional * 0.75
+            and _safe_float(volume_summary.get("trailing_15m_gross_notional")) >= 100.0
+            and trailing_5m_realized_wear_per_10k <= 3.0
+            and trailing_15m_realized_wear_per_10k <= 3.0
+            and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) > 0
+        ):
+            updates = {
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "best_quote_maker_volume_quote_offset_ticks": max(
+                    _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) - 1,
+                    0,
+                ),
+            }
+            _remember_recovery_controls(
+                item,
+                control,
+                ("best_quote_maker_volume_quote_offset_ticks",),
+            )
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_pull_imbalanced_entry_one_tick_closer_for_pace"
+                if dry_run
+                else "pull_imbalanced_entry_one_tick_closer_for_pace"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif (
             target_pace_ahead
             and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and _safe_float(assessment.get("current_long_notional"))
