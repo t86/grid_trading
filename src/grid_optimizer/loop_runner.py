@@ -4041,6 +4041,17 @@ def _apply_best_quote_reduce_freeze(
     frozen_total_cap_notional: float = 0.0,
     frozen_long_cap_notional: float = 0.0,
     frozen_short_cap_notional: float = 0.0,
+    quality_gate_enabled: bool = False,
+    quality_max_loss_ratio: float = 0.0,
+    quality_release_profit_ratio: float = 0.0,
+    quality_max_atr_multiple: float = 0.0,
+    quality_atr_floor_ratio: float = 0.0,
+    quality_volatility_ratio: float = 0.0,
+    quality_return_30s: float = 0.0,
+    quality_return_1m: float = 0.0,
+    quality_easy_bucket_notional: float = 0.0,
+    quality_medium_bucket_notional: float = 0.0,
+    quality_hard_bucket_notional: float = 0.0,
     current_long_qty: float,
     current_short_qty: float,
     current_long_avg_price: float,
@@ -4166,6 +4177,21 @@ def _apply_best_quote_reduce_freeze(
     if side_cap_reasons:
         frozen_side_cap_report["reason"] = "; ".join(side_cap_reasons)
     report["frozen_side_cap"] = frozen_side_cap_report
+    safe_quality_atr = max(_safe_float(quality_volatility_ratio), _safe_float(quality_atr_floor_ratio), 0.0)
+    safe_quality_max_distance = safe_quality_atr * max(_safe_float(quality_max_atr_multiple), 0.0)
+    quality_report: dict[str, Any] = {
+        "enabled": bool(quality_gate_enabled),
+        "max_loss_ratio": max(_safe_float(quality_max_loss_ratio), 0.0),
+        "release_profit_ratio": max(_safe_float(quality_release_profit_ratio), 0.0),
+        "atr_ratio": safe_quality_atr,
+        "max_atr_multiple": max(_safe_float(quality_max_atr_multiple), 0.0),
+        "max_release_distance_ratio": safe_quality_max_distance,
+        "return_30s": _safe_float(quality_return_30s),
+        "return_1m": _safe_float(quality_return_1m),
+        "long": {"blocked_lots": 0, "blocked_notional": 0.0},
+        "short": {"blocked_lots": 0, "blocked_notional": 0.0},
+    }
+    report["quality_gate"] = quality_report
     dynamic_threshold_scale = max(_safe_float(dynamic_threshold_loss_ratio_scale), 0.0)
     dynamic_threshold_max_extra = max(_safe_float(dynamic_threshold_max_extra_ratio), 0.0)
     dynamic_threshold_frozen_start = max(_safe_float(dynamic_threshold_frozen_notional_start), 0.0)
@@ -4363,18 +4389,66 @@ def _apply_best_quote_reduce_freeze(
                 continue
             if str(side).upper() == "LONG":
                 loss_ratio = max((price - _safe_float(mid_price)) / price, 0.0)
+                release_price = price * (1.0 + max(_safe_float(quality_release_profit_ratio), 0.0))
+                release_distance = max((release_price - _safe_float(mid_price)) / _safe_float(mid_price), 0.0)
             else:
                 loss_ratio = max((_safe_float(mid_price) - price) / price, 0.0)
+                release_price = price * (1.0 - max(_safe_float(quality_release_profit_ratio), 0.0))
+                release_distance = max((_safe_float(mid_price) - release_price) / _safe_float(mid_price), 0.0)
             notional = qty * _safe_float(mid_price)
             if loss_ratio < side_threshold or notional <= 1e-12:
                 continue
+            if bool(quality_gate_enabled):
+                side_quality = quality_report[str(side).lower()]
+                max_loss = max(_safe_float(quality_max_loss_ratio), 0.0)
+                distance_blocked = safe_quality_max_distance > 0 and release_distance > safe_quality_max_distance
+                loss_blocked = max_loss > 0 and loss_ratio > max_loss
+                adverse_momentum = (
+                    str(side).upper() == "LONG"
+                    and _safe_float(quality_return_30s) < 0
+                    and _safe_float(quality_return_1m) < 0
+                ) or (
+                    str(side).upper() == "SHORT"
+                    and _safe_float(quality_return_30s) > 0
+                    and _safe_float(quality_return_1m) > 0
+                )
+                if distance_blocked or loss_blocked or adverse_momentum:
+                    side_quality["blocked_lots"] += 1
+                    side_quality["blocked_notional"] += notional
+                    reasons = side_quality.setdefault("blocked_reasons", [])
+                    reason = "loss_too_deep" if loss_blocked else "release_too_far" if distance_blocked else "adverse_momentum"
+                    if reason not in reasons:
+                        reasons.append(reason)
+                    continue
             lot = dict(raw_lot)
             lot["freeze_loss_ratio"] = loss_ratio
+            lot["freeze_release_price"] = release_price
+            lot["freeze_release_distance_ratio"] = release_distance
             candidates.append(lot)
             total_qty += qty
             total_notional += notional
             max_loss_ratio = max(max_loss_ratio, loss_ratio)
+        candidates.sort(
+            key=lambda item: (
+                _safe_float(item.get("freeze_release_distance_ratio")),
+                _safe_float(item.get("price", item.get("entry_price"))),
+            )
+        )
         return candidates, total_qty, total_notional, max_loss_ratio
+
+    def _quality_bucket_notional(candidates: list[dict[str, Any]]) -> float:
+        if not bool(quality_gate_enabled) or not candidates:
+            return 0.0
+        distance = min(_safe_float(item.get("freeze_release_distance_ratio")) for item in candidates)
+        if safe_quality_atr > 0 and distance <= safe_quality_atr + 1e-12:
+            return max(_safe_float(quality_easy_bucket_notional), 0.0)
+        if safe_quality_atr > 0 and distance <= safe_quality_atr * 2.0 + 1e-12:
+            return max(_safe_float(quality_medium_bucket_notional), 0.0)
+        return max(_safe_float(quality_hard_bucket_notional), 0.0)
+
+    def _take_quality_lots(candidates: list[dict[str, Any]], qty: float) -> list[dict[str, Any]]:
+        _, consumed, _ = _best_quote_volume_consume_fifo(candidates, max(_safe_float(qty), 0.0))
+        return consumed
 
     def _record_protected(side: str, qty: float, loss_ratio: float, notional: float, reduce_planned: bool) -> None:
         if not hard_freeze_enabled:
@@ -4518,6 +4592,18 @@ def _apply_best_quote_reduce_freeze(
     short_confirm_qty = short_candidate_qty if use_lot_candidates else managed_short_qty
     short_confirm_notional = short_candidate_notional if use_lot_candidates else managed_short_notional
     short_confirm_loss_ratio = short_candidate_loss_ratio if use_lot_candidates else short_loss_ratio
+    long_quality_bucket_notional = _quality_bucket_notional(long_candidate_lots)
+    short_quality_bucket_notional = _quality_bucket_notional(short_candidate_lots)
+    quality_report["long"]["bucket_notional"] = long_quality_bucket_notional
+    quality_report["short"]["bucket_notional"] = short_quality_bucket_notional
+    if long_quality_bucket_notional > 0 and _safe_float(mid_price) > 0:
+        long_confirm_qty = min(long_confirm_qty, long_quality_bucket_notional / _safe_float(mid_price))
+        long_candidate_lots = _take_quality_lots(long_candidate_lots, long_confirm_qty)
+        long_confirm_notional = long_confirm_qty * _safe_float(mid_price)
+    if short_quality_bucket_notional > 0 and _safe_float(mid_price) > 0:
+        short_confirm_qty = min(short_confirm_qty, short_quality_bucket_notional / _safe_float(mid_price))
+        short_candidate_lots = _take_quality_lots(short_candidate_lots, short_confirm_qty)
+        short_confirm_notional = short_confirm_qty * _safe_float(mid_price)
 
     _record_protected("LONG", long_confirm_qty, long_confirm_loss_ratio, long_confirm_notional, reduce_long_planned)
     _record_protected("SHORT", short_confirm_qty, short_confirm_loss_ratio, short_confirm_notional, reduce_short_planned)
@@ -4647,6 +4733,7 @@ def _apply_best_quote_reduce_freeze(
         report["stress_loss_ratio"] = max(_safe_float(stress_loss_ratio), 0.0)
         report["stress_active"] = bool(stress_active)
         report["profitable_pair_gate_enabled"] = bool(profitable_pair_gate_enabled)
+        report["quality_gate"] = quality_report
         report["dynamic_threshold"] = {
             "enabled": bool(dynamic_threshold_enabled),
             "active": dynamic_threshold_active,
@@ -18807,6 +18894,37 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             0.0,
         )
+        best_quote_reduce_freeze_quality_gate_enabled = bool(
+            getattr(effective_args, "best_quote_maker_volume_reduce_freeze_quality_gate_enabled", False)
+        )
+        best_quote_reduce_freeze_quality_max_loss_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_quality_max_loss_ratio", 0.0)),
+            0.0,
+        )
+        best_quote_reduce_freeze_quality_release_profit_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_quality_release_profit_ratio", 0.0)),
+            0.0,
+        )
+        best_quote_reduce_freeze_quality_max_atr_multiple = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_quality_max_atr_multiple", 0.0)),
+            0.0,
+        )
+        best_quote_reduce_freeze_quality_atr_floor_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_quality_atr_floor_ratio", 0.0)),
+            0.0,
+        )
+        best_quote_reduce_freeze_quality_easy_bucket_notional = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_quality_easy_bucket_notional", 0.0)),
+            0.0,
+        )
+        best_quote_reduce_freeze_quality_medium_bucket_notional = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_quality_medium_bucket_notional", 0.0)),
+            0.0,
+        )
+        best_quote_reduce_freeze_quality_hard_bucket_notional = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_quality_hard_bucket_notional", 0.0)),
+            0.0,
+        )
         best_quote_frozen_pair_release_enabled = bool(
             getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_enabled", False)
         )
@@ -18975,6 +19093,20 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             frozen_total_cap_notional=best_quote_frozen_total_cap_notional,
             frozen_long_cap_notional=best_quote_frozen_long_cap_notional,
             frozen_short_cap_notional=best_quote_frozen_short_cap_notional,
+            quality_gate_enabled=best_quote_reduce_freeze_quality_gate_enabled,
+            quality_max_loss_ratio=best_quote_reduce_freeze_quality_max_loss_ratio,
+            quality_release_profit_ratio=best_quote_reduce_freeze_quality_release_profit_ratio,
+            quality_max_atr_multiple=best_quote_reduce_freeze_quality_max_atr_multiple,
+            quality_atr_floor_ratio=best_quote_reduce_freeze_quality_atr_floor_ratio,
+            quality_volatility_ratio=max(
+                _adaptive_window_metric("window_1m", "amplitude_ratio"),
+                _adaptive_window_metric("window_5m", "amplitude_ratio") / math.sqrt(5.0),
+            ),
+            quality_return_30s=_adaptive_window_metric("window_30s", "return_ratio"),
+            quality_return_1m=_adaptive_window_metric("window_1m", "return_ratio"),
+            quality_easy_bucket_notional=best_quote_reduce_freeze_quality_easy_bucket_notional,
+            quality_medium_bucket_notional=best_quote_reduce_freeze_quality_medium_bucket_notional,
+            quality_hard_bucket_notional=best_quote_reduce_freeze_quality_hard_bucket_notional,
             profitable_pair_gate_enabled=best_quote_reduce_freeze_profitable_pair_gate_enabled,
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
@@ -19318,6 +19450,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 same_side_entry_price_guard_enabled=bool(
                     getattr(effective_args, "best_quote_maker_volume_same_side_entry_price_guard_enabled", False)
+                ),
+                same_side_entry_price_guard_report_only=bool(
+                    getattr(effective_args, "best_quote_maker_volume_same_side_entry_price_guard_report_only", True)
                 ),
                 same_side_entry_price_guard_min_notional=float(
                     getattr(effective_args, "best_quote_maker_volume_same_side_entry_price_guard_min_notional", 0.0)
@@ -22475,6 +22610,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-band-budget-recover-ratio", type=float, default=0.5)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-band-budget-emergency-loss-ratio-scale", type=float, default=0.75)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-band-budget-emergency-notional-ratio", type=float, default=0.85)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-quality-gate-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-quality-max-loss-ratio", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-quality-release-profit-ratio", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-quality-max-atr-multiple", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-quality-atr-floor-ratio", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-quality-easy-bucket-notional", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-quality-medium-bucket-notional", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-quality-hard-bucket-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-frozen-total-cap-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-frozen-long-cap-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-frozen-short-cap-notional", type=float, default=0.0)
@@ -22527,6 +22670,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.0035,
     )
     parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-report-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-min-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-gap-ticks", type=int, default=0)
     parser.add_argument("--best-quote-maker-volume-dynamic-tick-enabled", action=argparse.BooleanOptionalAction, default=False)
@@ -23727,6 +23871,13 @@ def main() -> None:
         or args.best_quote_maker_volume_reduce_freeze_band_budget_emergency_extra_ratio < 0
         or args.best_quote_maker_volume_reduce_freeze_band_budget_emergency_loss_ratio_scale < 0
         or args.best_quote_maker_volume_reduce_freeze_band_budget_emergency_notional_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_quality_max_loss_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_quality_release_profit_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_quality_max_atr_multiple < 0
+        or args.best_quote_maker_volume_reduce_freeze_quality_atr_floor_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_quality_easy_bucket_notional < 0
+        or args.best_quote_maker_volume_reduce_freeze_quality_medium_bucket_notional < 0
+        or args.best_quote_maker_volume_reduce_freeze_quality_hard_bucket_notional < 0
         or args.best_quote_maker_volume_frozen_total_cap_notional < 0
         or args.best_quote_maker_volume_frozen_long_cap_notional < 0
         or args.best_quote_maker_volume_frozen_short_cap_notional < 0

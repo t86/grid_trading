@@ -3127,6 +3127,14 @@ class WebSecurityTests(unittest.TestCase):
                 "best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_start": 500.0,
                 "best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_full": 3000.0,
                 "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.7,
+                "best_quote_maker_volume_reduce_freeze_quality_gate_enabled": True,
+                "best_quote_maker_volume_reduce_freeze_quality_max_loss_ratio": 0.03,
+                "best_quote_maker_volume_reduce_freeze_quality_release_profit_ratio": 0.002,
+                "best_quote_maker_volume_reduce_freeze_quality_max_atr_multiple": 3.0,
+                "best_quote_maker_volume_reduce_freeze_quality_atr_floor_ratio": 0.004,
+                "best_quote_maker_volume_reduce_freeze_quality_easy_bucket_notional": 100.0,
+                "best_quote_maker_volume_reduce_freeze_quality_medium_bucket_notional": 50.0,
+                "best_quote_maker_volume_reduce_freeze_quality_hard_bucket_notional": 25.0,
                 "best_quote_maker_volume_frozen_pair_release_enabled": True,
                 "best_quote_maker_volume_frozen_pair_release_max_notional": 20.0,
                 "best_quote_maker_volume_frozen_pair_release_min_side_notional": 100.0,
@@ -3136,6 +3144,7 @@ class WebSecurityTests(unittest.TestCase):
                 "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio": 0.0025,
                 "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio": 0.0035,
                 "best_quote_maker_volume_same_side_entry_price_guard_enabled": True,
+                "best_quote_maker_volume_same_side_entry_price_guard_report_only": False,
                 "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 10.0,
                 "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 1,
                 "volatility_entry_pause_tiny_inventory_ignore_notional": 10.0,
@@ -3215,6 +3224,13 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(command[dynamic_full_index + 1], "3000.0")
         reduce_freeze_soft_index = command.index("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale")
         self.assertEqual(command[reduce_freeze_soft_index + 1], "0.7")
+        self.assertIn("--best-quote-maker-volume-reduce-freeze-quality-gate-enabled", command)
+        quality_max_loss_index = command.index("--best-quote-maker-volume-reduce-freeze-quality-max-loss-ratio")
+        self.assertEqual(command[quality_max_loss_index + 1], "0.03")
+        quality_hard_bucket_index = command.index(
+            "--best-quote-maker-volume-reduce-freeze-quality-hard-bucket-notional"
+        )
+        self.assertEqual(command[quality_hard_bucket_index + 1], "25.0")
         self.assertIn("--best-quote-maker-volume-frozen-pair-release-enabled", command)
         pair_release_max_index = command.index("--best-quote-maker-volume-frozen-pair-release-max-notional")
         self.assertEqual(command[pair_release_max_index + 1], "20.0")
@@ -3231,6 +3247,7 @@ class WebSecurityTests(unittest.TestCase):
         pair_release_1m_amp_index = command.index("--best-quote-maker-volume-frozen-pair-release-max-1m-amplitude-ratio")
         self.assertEqual(command[pair_release_1m_amp_index + 1], "0.0035")
         self.assertIn("--best-quote-maker-volume-same-side-entry-price-guard-enabled", command)
+        self.assertIn("--no-best-quote-maker-volume-same-side-entry-price-guard-report-only", command)
         same_side_min_index = command.index("--best-quote-maker-volume-same-side-entry-price-guard-min-notional")
         self.assertEqual(command[same_side_min_index + 1], "10.0")
         same_side_gap_index = command.index("--best-quote-maker-volume-same-side-entry-price-guard-gap-ticks")

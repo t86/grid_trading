@@ -80,6 +80,7 @@ class BestQuoteMakerVolumeConfig:
     net_loss_reduce_realized_credit_ratio: float = 1.0
     net_loss_reduce_min_inventory_notional: float = 0.0
     same_side_entry_price_guard_enabled: bool = False
+    same_side_entry_price_guard_report_only: bool = True
     same_side_entry_price_guard_min_notional: float = 0.0
     same_side_entry_price_guard_gap_ticks: int = 0
     frozen_v2_enabled: bool = False
@@ -1553,7 +1554,7 @@ def build_best_quote_maker_volume_plan(
     same_side_entry_price_guard_report = {
         "enabled": bool(config.same_side_entry_price_guard_enabled),
         "applied": False,
-        "report_only": True,
+        "report_only": bool(config.same_side_entry_price_guard_report_only),
         "blocked_long_entry": False,
         "blocked_short_entry": False,
         "would_block_long_entry": False,
@@ -1594,6 +1595,12 @@ def build_best_quote_maker_volume_plan(
                 same_side_entry_price_guard_report["would_block_long_entry"] = True
                 same_side_entry_price_guard_report["would_block_buy_orders"] = len(blocked_buy_orders)
                 same_side_entry_price_guard_report["max_long_entry_price"] = max_long_entry_price
+                if not config.same_side_entry_price_guard_report_only:
+                    blocked_ids = {id(order) for order in blocked_buy_orders}
+                    buy_orders = [order for order in buy_orders if id(order) not in blocked_ids]
+                    same_side_entry_price_guard_report["applied"] = True
+                    same_side_entry_price_guard_report["blocked_long_entry"] = True
+                    same_side_entry_price_guard_report["blocked_buy_orders"] = len(blocked_buy_orders)
         if short_notional >= min_guard_notional and short_reference_price > 0:
             min_short_entry_price = short_reference_price + guard_gap
             blocked_sell_orders: list[dict[str, Any]] = []
@@ -1607,6 +1614,12 @@ def build_best_quote_maker_volume_plan(
                 same_side_entry_price_guard_report["would_block_short_entry"] = True
                 same_side_entry_price_guard_report["would_block_sell_orders"] = len(blocked_sell_orders)
                 same_side_entry_price_guard_report["min_short_entry_price"] = min_short_entry_price
+                if not config.same_side_entry_price_guard_report_only:
+                    blocked_ids = {id(order) for order in blocked_sell_orders}
+                    sell_orders = [order for order in sell_orders if id(order) not in blocked_ids]
+                    same_side_entry_price_guard_report["applied"] = True
+                    same_side_entry_price_guard_report["blocked_short_entry"] = True
+                    same_side_entry_price_guard_report["blocked_sell_orders"] = len(blocked_sell_orders)
         if guard_gap > 0:
             buy_orders, pruned_buy_orders = _prune_clustered_same_side_entry_orders(
                 buy_orders,

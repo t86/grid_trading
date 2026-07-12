@@ -209,6 +209,37 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual(guard["cluster_pruned_buy_orders"], 1)
         self.assertEqual(guard["cluster_pruned_sell_orders"], 1)
 
+    def test_same_side_entry_price_guard_can_enforce_anti_chase(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                same_side_entry_price_guard_enabled=True,
+                same_side_entry_price_guard_report_only=False,
+                same_side_entry_price_guard_min_notional=200.0,
+                same_side_entry_price_guard_gap_ticks=1,
+            ),
+            inputs=_inputs(
+                bid_price=0.15968,
+                ask_price=0.15969,
+                mid_price=0.159685,
+                tick_size=0.00001,
+                step_size=1.0,
+                current_long_qty=2_000.0,
+                current_short_qty=2_000.0,
+                current_long_avg_price=0.1590,
+                current_short_avg_price=0.1600,
+                position_side_mode="hedge",
+            ),
+        )
+
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(plan["sell_orders"], [])
+        guard = plan["metrics"]["same_side_entry_price_guard"]
+        self.assertTrue(guard["applied"])
+        self.assertFalse(guard["report_only"])
+        self.assertTrue(guard["blocked_long_entry"])
+        self.assertTrue(guard["blocked_short_entry"])
+
     def test_same_side_entry_cluster_pruning_keeps_reduce_only_over_entry(self) -> None:
         orders = [
             {
