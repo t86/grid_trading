@@ -1881,15 +1881,22 @@ def check_symbol(
     )
     required_hourly_notional = max(_safe_float(volume_summary.get("required_hourly_notional")), 0.0)
     trailing_hourly_notional = max(_safe_float(volume_summary.get("trailing_60m_hourly_notional")), 0.0)
+    trailing_15m_notional = max(
+        _safe_float(volume_summary.get("trailing_15m_gross_notional")), 0.0
+    )
+    trailing_5m_notional = max(
+        _safe_float(volume_summary.get("trailing_5m_gross_notional")), 0.0
+    )
+    pace_fraction = max(float(target_pace_fraction), 0.0)
     target_pace_ahead = (
         required_hourly_notional > 0
-        and trailing_hourly_notional
-        >= required_hourly_notional * max(float(target_pace_fraction), 0.0)
+        and trailing_hourly_notional >= required_hourly_notional * pace_fraction
+        and trailing_15m_notional >= required_hourly_notional * 0.25 * pace_fraction
+        and trailing_5m_notional >= required_hourly_notional / 12.0 * pace_fraction * 0.5
     )
     target_pace_behind = (
         required_hourly_notional > 0
-        and trailing_hourly_notional
-        < required_hourly_notional * max(float(target_pace_fraction), 0.0)
+        and not target_pace_ahead
     )
     recovery_low_volume = bool(assessment.get("low_volume")) or target_pace_behind
     assessment["target_pace_behind"] = target_pace_behind

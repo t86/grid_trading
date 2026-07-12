@@ -3836,7 +3836,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(result["action"], "cooldown")
             self.assertEqual(restarts, [])
 
-    def test_does_not_enable_loss_reduce_when_hourly_target_pace_is_ahead(self) -> None:
+    def test_stale_hourly_pace_does_not_mask_recent_zero_volume(self) -> None:
         now = datetime(2026, 7, 11, 12, 15, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -3870,6 +3870,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 }
             ]
 
+            restarts: list[str] = []
             result = check_symbol(
                 symbol="REUSDT",
                 output_dir=output_dir,
@@ -3881,12 +3882,13 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 daily_target_notional=6000,
                 target_pace_fraction=1.05,
                 trade_rows=rows,
-                restart_runner=lambda symbol: self.fail(f"unexpected restart: {symbol}"),
+                restart_runner=restarts.append,
             )
 
             control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
-            self.assertEqual(result["action"], "hold_loss_reduce_while_target_pace_ahead")
-            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(result["action"], "enable_soft_inventory_loss_reduce")
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, ["REUSDT"])
 
     def test_closes_owned_loss_reduce_when_hourly_target_pace_is_ahead(self) -> None:
         now = datetime(2026, 7, 11, 12, 20, tzinfo=timezone.utc)
@@ -3924,7 +3926,12 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 {
                     "id": 1,
                     "time": int((now - timedelta(minutes=30)).timestamp() * 1000),
-                    "quoteQty": "5000",
+                    "quoteQty": "4500",
+                },
+                {
+                    "id": 2,
+                    "time": int((now - timedelta(minutes=1)).timestamp() * 1000),
+                    "quoteQty": "500",
                 }
             ]
             restarts: list[str] = []
