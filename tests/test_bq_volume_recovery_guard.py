@@ -1700,7 +1700,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
             self.assertEqual(restarts, ["REUSDT"])
 
-    def test_raises_directional_recovery_budget_when_short_wear_is_controlled(self) -> None:
+    def test_raises_directional_recovery_budget_to_floor_for_severe_pace_deficit(self) -> None:
         now = datetime(2026, 7, 12, 3, 5, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -1758,8 +1758,9 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
 
             control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
-            self.assertEqual(result["action"], "raise_directional_recovery_budget_for_pace")
-            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 84.0)
+            self.assertEqual(result["action"], "raise_directional_recovery_budget_to_floor_for_pace")
+            self.assertTrue(result["volume_summary"]["severe_target_pace_deficit"])
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
             self.assertEqual(restarts, ["REUSDT"])
 
     def test_pulls_far_directional_entry_closer_when_reduce_order_is_near(self) -> None:

@@ -2053,13 +2053,24 @@ def check_symbol(
             < static_cycle_budget_floor_notional
         ):
             current_budget = _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
-            updates = {
-                "best_quote_maker_volume_net_loss_reduce_enabled": False,
-                "best_quote_maker_volume_cycle_budget_notional": min(
+            severe_target_pace_deficit = (
+                required_hourly_notional > 0
+                and trailing_hourly_notional < required_hourly_notional * 0.5
+            )
+            target_recovery_budget = (
+                static_cycle_budget_floor_notional
+                if severe_target_pace_deficit
+                else min(
                     static_cycle_budget_floor_notional,
                     current_budget + max(float(volume_recovery_cycle_budget_increment), 0.0),
-                ),
+                )
+            )
+            updates = {
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "best_quote_maker_volume_cycle_budget_notional": target_recovery_budget,
             }
+            volume_summary["severe_target_pace_deficit"] = severe_target_pace_deficit
+            volume_summary["directional_recovery_target_budget_notional"] = target_recovery_budget
             _remember_recovery_controls(
                 item,
                 control,
@@ -2067,7 +2078,11 @@ def check_symbol(
             )
             _remember_recovery_updates(item, updates)
             action = (
-                "dry_run_raise_directional_recovery_budget_for_pace"
+                "dry_run_raise_directional_recovery_budget_to_floor_for_pace"
+                if dry_run and severe_target_pace_deficit
+                else "raise_directional_recovery_budget_to_floor_for_pace"
+                if severe_target_pace_deficit
+                else "dry_run_raise_directional_recovery_budget_for_pace"
                 if dry_run
                 else "raise_directional_recovery_budget_for_pace"
             )
