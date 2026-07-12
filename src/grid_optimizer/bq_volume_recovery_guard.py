@@ -3963,6 +3963,70 @@ def check_symbol(
                     {"ts": now.isoformat(), **result},
                 )
                 return result
+            hold_soft_hysteresis_bridge = (
+                recovery_stage_timed_out
+                and target_pace_behind
+                and not high_recovery_wear
+                and actual_inventory_below_soft
+                and not cap_buffer_ok
+                and (
+                    _safe_float(control.get("pause_buy_position_notional"))
+                    < pause_baseline_long_notional
+                    or _safe_float(control.get("pause_short_position_notional"))
+                    < pause_baseline_short_notional
+                )
+            )
+            if hold_soft_hysteresis_bridge:
+                updates = {"best_quote_maker_volume_net_loss_reduce_enabled": False}
+                if (
+                    bool(assessment.get("balancing_entry_only"))
+                    and _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0
+                ):
+                    updates["sticky_entry_price_tolerance_steps"] = 1.0
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        ("sticky_entry_price_tolerance_steps",),
+                    )
+                    _remember_recovery_updates(item, updates)
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = (
+                    "dry_run_hold_soft_hysteresis_bridge_until_buffer"
+                    if dry_run
+                    else "hold_soft_hysteresis_bridge_until_buffer"
+                )
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "recovery_started_at": now.isoformat(),
+                        "last_recovery_check_at": now.isoformat(),
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+                return_result = {
+                    "symbol": normalized_symbol,
+                    "action": action,
+                    "changed_keys": changed,
+                    "backup_path": backup_path,
+                    "dry_run": dry_run,
+                    "restart_failed": restart_failed,
+                    "volume_summary": volume_summary,
+                    "assessment": assessment,
+                }
+                _append_jsonl(
+                    output_dir / "bq_volume_recovery_guard_events.jsonl",
+                    {"ts": now.isoformat(), **return_result},
+                )
+                return return_result
             if recovery_stage_timed_out:
                 updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
                 changed, backup_path = _apply_control_update(
