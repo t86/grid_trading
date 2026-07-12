@@ -20,6 +20,7 @@ _RECOVERY_CONTROL_KEYS = (
     "best_quote_maker_volume_active_pair_reduce_enabled",
     "best_quote_maker_volume_inventory_cost_gate_enabled",
     "best_quote_maker_volume_inventory_bias_min_notional_gap",
+    "best_quote_maker_volume_inventory_bias_reduce_share",
     "best_quote_maker_volume_cycle_budget_notional",
     "best_quote_maker_volume_quote_offset_ticks",
     "pause_buy_position_notional",
@@ -2463,6 +2464,67 @@ def check_symbol(
                 _safe_float(control.get("best_quote_maker_volume_active_pair_reduce_min_side_notional")),
                 0.0,
             )
+            current_bias_reduce_share = max(
+                _safe_float(control.get("best_quote_maker_volume_inventory_bias_reduce_share")),
+                0.0,
+            )
+            stalled_directional_loss_reduce_plan = (
+                bool(assessment.get("low_volume"))
+                and effective_inventory_soft_pressure
+                and _safe_int(assessment.get("planned_reduce_only_order_count")) <= 0
+                and current_long > 0
+                and current_short > 0
+                and lighter_inventory < heavier_inventory * 0.5
+                and not bool(assessment.get("volatility_entry_pause_active"))
+                and "best_quote_maker_volume_inventory_bias_reduce_share" in control
+                and current_bias_reduce_share < 0.25
+                and extension_count >= max(int(max_soft_recovery_extensions), 0)
+                and not cap_buffer_ok
+                and recovery_hold_satisfied
+                and last_recovery_action_at is not None
+                and not recovery_reapply_debounced
+            )
+            if stalled_directional_loss_reduce_plan:
+                updates = {"best_quote_maker_volume_inventory_bias_reduce_share": 0.25}
+                _remember_recovery_controls(item, control, tuple(updates))
+                _remember_recovery_updates(item, updates)
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = (
+                    "dry_run_enable_bounded_dominant_leg_reduce_for_stalled_loss_recovery"
+                    if dry_run
+                    else "enable_bounded_dominant_leg_reduce_for_stalled_loss_recovery"
+                )
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_recovery_check_at": now.isoformat(),
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+                result = {
+                    "symbol": normalized_symbol,
+                    "action": action,
+                    "changed_keys": changed,
+                    "backup_path": backup_path,
+                    "dry_run": dry_run,
+                    "restart_failed": restart_failed,
+                    "volume_summary": volume_summary,
+                    "assessment": assessment,
+                }
+                _append_jsonl(
+                    output_dir / "bq_volume_recovery_guard_events.jsonl",
+                    {"ts": now.isoformat(), **result},
+                )
+                return result
             stalled_loss_reduce_plan = (
                 bool(assessment.get("low_volume"))
                 and effective_inventory_soft_pressure
