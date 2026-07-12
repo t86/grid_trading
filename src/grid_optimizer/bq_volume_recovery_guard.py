@@ -572,8 +572,21 @@ def _loss_reduce_recovery_updates(
         _safe_float(control.get("maker_order_notional")),
     )
     loss_reduce_budget_cap = max(float(static_cycle_budget_floor_notional), per_order * 4.0)
+    loss_reduce_budget_floor = (
+        min(
+            max(
+                _safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")),
+                per_order,
+            ),
+            loss_reduce_budget_cap,
+        )
+        if loss_reduce_budget_cap > 0
+        else 0.0
+    )
     current_budget = _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
-    if loss_reduce_budget_cap > 0 and current_budget > loss_reduce_budget_cap:
+    if loss_reduce_budget_floor > 0 and current_budget < loss_reduce_budget_floor:
+        updates["best_quote_maker_volume_cycle_budget_notional"] = loss_reduce_budget_floor
+    elif loss_reduce_budget_cap > 0 and current_budget > loss_reduce_budget_cap:
         updates["best_quote_maker_volume_cycle_budget_notional"] = loss_reduce_budget_cap
     buffer_notional = max(_safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")), 0.0)
     if buffer_notional <= 0:

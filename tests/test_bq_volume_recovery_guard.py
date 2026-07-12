@@ -3853,7 +3853,10 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 output_dir,
                 now=now,
                 control={
-                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                    "best_quote_maker_volume_cycle_budget_notional": 12.0,
+                    "best_quote_maker_volume_min_cycle_budget_notional": 24.0,
+                    "per_order_notional": 8.0,
+                    "maker_order_notional": 8.0,
                     "pause_buy_position_notional": 361.0,
                     "pause_short_position_notional": 361.0,
                     "best_quote_maker_volume_max_long_notional": 380.0,
@@ -3882,7 +3885,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                         "recovery_started_at": (now - timedelta(minutes=5)).isoformat(),
                         "last_recovery_action_at": (now - timedelta(minutes=5)).isoformat(),
                         "guard_original_controls": {
-                            "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                            "best_quote_maker_volume_cycle_budget_notional": 12.0,
                         },
                         "guard_recovery_controls": {
                             "best_quote_maker_volume_inventory_bias_min_notional_gap": 40.0,
@@ -3924,6 +3927,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertTrue(result["assessment"]["inventory_soft_pressure"])
             self.assertEqual(result["action"], "switch_to_soft_inventory_loss_reduce")
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 24.0)
             self.assertEqual(restarts, ["REUSDT"])
 
     def test_recovered_volume_does_not_close_loss_reduce_above_soft_limit(self) -> None:
