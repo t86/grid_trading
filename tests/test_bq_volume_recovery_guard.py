@@ -3304,6 +3304,69 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 1)
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_high_wear_cooldown_restores_safe_normal_entry_pace(self) -> None:
+        now = datetime(2026, 7, 12, 6, 16, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 2,
+                    "per_order_notional": 18.0,
+                    "pause_buy_position_notional": 620.0,
+                    "pause_short_position_notional": 620.0,
+                },
+                long_notional=140.0,
+                short_notional=150.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "normal",
+                        "cooldown_until": (now + timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            trade_rows = [
+                {
+                    "id": 1,
+                    "time": int((now - timedelta(minutes=2)).timestamp() * 1000),
+                    "quoteQty": "1000",
+                    "realizedPnl": "-4",
+                }
+            ]
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                daily_target_notional=120_000.0,
+                target_completion_buffer_seconds=10_800.0,
+                cycle_budget_floor_notional=108.0,
+                trade_rows=trade_rows,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(result["action"], "restore_normal_entry_pace_after_high_wear")
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
+            self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 1)
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_budget_recovery_switches_to_soft_inventory_loss_reduce(self) -> None:
         now = datetime(2026, 6, 26, 9, 40, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
