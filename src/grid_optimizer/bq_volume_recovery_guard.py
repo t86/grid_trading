@@ -3708,6 +3708,91 @@ def check_symbol(
                 and not cap_buffer_ok
             )
             if hold_exhausted_soft_recovery:
+                current_budget = _safe_float(
+                    control.get("best_quote_maker_volume_cycle_budget_notional")
+                )
+                target_budget_floor = max(
+                    _safe_float(volume_summary.get("target_cycle_budget_floor_notional")),
+                    float(cycle_budget_floor_notional),
+                )
+                target_budget = min(
+                    target_budget_floor,
+                    current_budget
+                    + max(float(volume_recovery_cycle_budget_increment), 0.0),
+                )
+                dominant_side_reduce_present = (
+                    current_long > current_short
+                    and _safe_int(assessment.get("planned_reduce_long_order_count")) > 0
+                ) or (
+                    current_short > current_long
+                    and _safe_int(assessment.get("planned_reduce_short_order_count")) > 0
+                )
+                exhausted_balancing_flow = (
+                    bool(assessment.get("balancing_entry_only"))
+                    and dominant_side_reduce_present
+                    and _safe_int(assessment.get("near_market_entry_order_count")) > 0
+                    and _safe_int(assessment.get("near_market_reduce_only_order_count")) > 0
+                )
+                can_raise_exhausted_recovery_budget = (
+                    target_pace_behind
+                    and not confirmed_loss_reduce_wear
+                    and not recovery_reapply_debounced
+                    and (
+                        bool(assessment.get("planned_reduce_only_only"))
+                        or exhausted_balancing_flow
+                    )
+                    and _safe_int(assessment.get("near_market_reduce_only_order_count")) > 0
+                    and target_budget > current_budget
+                )
+                if can_raise_exhausted_recovery_budget:
+                    updates = {
+                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                        "best_quote_maker_volume_cycle_budget_notional": target_budget,
+                    }
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        ("best_quote_maker_volume_cycle_budget_notional",),
+                    )
+                    _remember_recovery_updates(item, updates)
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
+                    action = (
+                        "dry_run_raise_exhausted_soft_recovery_budget_for_pace"
+                        if dry_run
+                        else "raise_exhausted_soft_recovery_budget_for_pace"
+                    )
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "recovery_started_at": now.isoformat(),
+                            "last_recovery_check_at": now.isoformat(),
+                            "last_recovery_action_at": now.isoformat(),
+                            "last_recovery_action": action,
+                        }
+                    )
+                    result = {
+                        "symbol": normalized_symbol,
+                        "action": action,
+                        "changed_keys": changed,
+                        "backup_path": backup_path,
+                        "dry_run": dry_run,
+                        "restart_failed": restart_failed,
+                        "volume_summary": volume_summary,
+                        "assessment": assessment,
+                    }
+                    _append_jsonl(
+                        output_dir / "bq_volume_recovery_guard_events.jsonl",
+                        {"ts": now.isoformat(), **result},
+                    )
+                    return result
                 can_tighten_exhausted_recovery = (
                     target_pace_behind
                     and (sla_recovery_due or no_fill_seconds >= 300.0)

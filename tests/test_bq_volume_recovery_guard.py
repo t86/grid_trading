@@ -1104,7 +1104,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "REUSDT": {
                         "status": "recovery_active",
                         "recovery_owned": True,
-                        "recovery_started_at": (now - timedelta(minutes=4)).isoformat(),
+                        "recovery_started_at": (now - timedelta(minutes=30)).isoformat(),
+                        "soft_recovery_extension_count": 1,
                     }
                 }
             }
@@ -1118,6 +1119,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 window_seconds=180,
                 min_volume_notional=400,
                 trigger_seconds=120,
+                max_recovery_seconds=300,
+                max_soft_recovery_extensions=1,
                 cycle_budget_floor_notional=132.0,
                 volume_recovery_cycle_budget_increment=12.0,
                 daily_target_notional=120_000.0,
@@ -1135,7 +1138,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
 
             self.assertEqual(
                 result["action"],
-                "raise_cap_pressure_balancing_budget_for_pace",
+                "raise_exhausted_soft_recovery_budget_for_pace",
                 result,
             )
             control = json.loads(
