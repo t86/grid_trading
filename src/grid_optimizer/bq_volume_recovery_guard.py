@@ -3510,6 +3510,9 @@ def check_symbol(
                 target_budget_floor = max(
                     _safe_float(volume_summary.get("target_cycle_budget_floor_notional")),
                     float(cycle_budget_floor_notional),
+                    _safe_float(
+                        control.get("best_quote_maker_volume_min_cycle_budget_notional")
+                    ),
                 )
                 target_budget = min(
                     target_budget_floor,
@@ -4355,6 +4358,9 @@ def check_symbol(
                 target_budget_floor = max(
                     _safe_float(volume_summary.get("target_cycle_budget_floor_notional")),
                     float(cycle_budget_floor_notional),
+                    _safe_float(
+                        control.get("best_quote_maker_volume_min_cycle_budget_notional")
+                    ),
                 )
                 target_budget = min(
                     target_budget_floor,
@@ -4658,6 +4664,9 @@ def check_symbol(
                 target_budget_floor = max(
                     _safe_float(volume_summary.get("target_cycle_budget_floor_notional")),
                     float(cycle_budget_floor_notional),
+                    _safe_float(
+                        control.get("best_quote_maker_volume_min_cycle_budget_notional")
+                    ),
                 )
                 target_budget = min(
                     target_budget_floor,
