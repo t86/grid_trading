@@ -838,6 +838,12 @@ def assess_symbol(
         1 for item in reduce_only_orders if _order_reduce_position_side(item) == "SHORT"
     )
     entry_order_count = len(entry_orders)
+    entry_buy_order_count = sum(
+        1 for item in entry_orders if str(item.get("side") or "").upper().strip() == "BUY"
+    )
+    entry_sell_order_count = sum(
+        1 for item in entry_orders if str(item.get("side") or "").upper().strip() == "SELL"
+    )
     reduce_only_only = bool(orders) and entry_order_count == 0
     near_orders = [
         item
@@ -907,6 +913,18 @@ def assess_symbol(
     near_long_soft = long_soft > 0 and current_long >= long_soft
     near_short_soft = short_soft > 0 and current_short >= short_soft
     inventory_notional_gap = abs(current_long - current_short)
+    balancing_entry_only = (
+        current_short > current_long
+        and entry_buy_order_count > 0
+        and entry_sell_order_count == 0
+    ) or (
+        current_long > current_short
+        and entry_sell_order_count > 0
+        and entry_buy_order_count == 0
+    )
+    balancing_budget_raise_safe = balancing_entry_only and _safe_float(
+        control.get("sticky_entry_price_tolerance_steps")
+    ) > 1.0
     budget_raise_inventory_buffer_blocked = (
         (long_soft > 0 and current_long >= long_soft * 0.85)
         or (short_soft > 0 and current_short >= short_soft * 0.85)
@@ -986,6 +1004,10 @@ def assess_symbol(
         "active_order_count": active_count,
         "planned_order_count": len(orders),
         "planned_entry_order_count": entry_order_count,
+        "planned_entry_buy_order_count": entry_buy_order_count,
+        "planned_entry_sell_order_count": entry_sell_order_count,
+        "balancing_entry_only": balancing_entry_only,
+        "balancing_budget_raise_safe": balancing_budget_raise_safe,
         "planned_reduce_only_order_count": reduce_only_order_count,
         "planned_reduce_long_order_count": reduce_long_order_count,
         "planned_reduce_short_order_count": reduce_short_order_count,
@@ -2253,6 +2275,7 @@ def check_symbol(
             and not effective_inventory_soft_pressure
             and not bool(assessment.get("inventory_soft_pressure"))
             and bool(assessment.get("budget_raise_inventory_buffer_blocked"))
+            and not bool(assessment.get("balancing_budget_raise_safe"))
         ):
             action = "hold_budget_raise_for_inventory_imbalance"
         elif (
@@ -2268,8 +2291,14 @@ def check_symbol(
             and not bool(assessment.get("near_cap"))
             and not bool(assessment.get("ineffective_orders"))
             and not bool(assessment.get("volatility_entry_pause_active"))
-            and not bool(assessment.get("budget_raise_inventory_buffer_blocked"))
-            and "inventory_bias" not in set(assessment.get("pause_reasons") or [])
+            and (
+                not bool(assessment.get("budget_raise_inventory_buffer_blocked"))
+                or bool(assessment.get("balancing_budget_raise_safe"))
+            )
+            and (
+                "inventory_bias" not in set(assessment.get("pause_reasons") or [])
+                or bool(assessment.get("balancing_budget_raise_safe"))
+            )
         ):
             budget_floor = max(float(cycle_budget_floor_notional), 0.0)
             updates = {

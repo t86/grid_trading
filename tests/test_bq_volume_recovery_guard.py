@@ -1711,6 +1711,63 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_inventory_imbalance_allows_budget_raise_for_balancing_entry_only(self) -> None:
+        now = datetime(2026, 7, 12, 6, 55, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                    "pause_buy_position_notional": 620.0,
+                    "pause_short_position_notional": 620.0,
+                    "sticky_entry_price_tolerance_steps": 8.0,
+                },
+                long_notional=230.0,
+                short_notional=595.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["buy_orders"] = [
+                {"side": "BUY", "position_side": "LONG", "price": 0.5968, "qty": 120.0}
+            ]
+            plan["sell_orders"] = []
+            plan["pause_reasons"] = ["inventory_bias"]
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                cycle_budget_floor_notional=108.0,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(result["assessment"]["balancing_entry_only"])
+            self.assertEqual(result["action"], "raise_cycle_budget_for_volume")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_raises_directional_recovery_budget_to_floor_for_severe_pace_deficit(self) -> None:
         now = datetime(2026, 7, 12, 3, 5, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
