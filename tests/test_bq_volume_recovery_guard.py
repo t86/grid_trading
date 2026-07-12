@@ -6170,6 +6170,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                         "status": "low_volume",
                         "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
                         "low_pace_since": (now - timedelta(minutes=4)).isoformat(),
+                        "no_fill_since": (now - timedelta(minutes=10)).isoformat(),
                         "last_recovery_action_at": (now - timedelta(seconds=30)).isoformat(),
                     }
                 }
@@ -6191,11 +6192,6 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                         "quoteQty": 500.0,
                         "realizedPnl": -0.5,
                     },
-                    {
-                        "time": int((now - timedelta(minutes=1)).timestamp() * 1000),
-                        "quoteQty": 120.0,
-                        "realizedPnl": -0.1,
-                    },
                 ],
                 volume_source="exchange_user_trades",
                 restart_runner=restarts.append,
@@ -6204,10 +6200,10 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             control = json.loads(control_path.read_text(encoding="utf-8"))
             self.assertEqual(result["action"], "relax_arx_v3_anti_chase_for_missing_entry_leg", result)
             self.assertTrue(result["assessment"]["high_recovery_wear"])
-            self.assertTrue(result["assessment"]["confirmed_loss_reduce_wear"])
+            self.assertFalse(result["assessment"]["confirmed_loss_reduce_wear"])
             self.assertEqual(
                 control["best_quote_maker_volume_same_side_entry_price_guard_min_notional"],
-                353.0,
+                525.0,
             )
             self.assertEqual(
                 control["best_quote_maker_volume_same_side_entry_price_guard_gap_ticks"],

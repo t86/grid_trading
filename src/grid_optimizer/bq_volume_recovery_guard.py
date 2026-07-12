@@ -2963,14 +2963,28 @@ def check_symbol(
             )
             key = "best_quote_maker_volume_same_side_entry_price_guard_min_notional"
             current_gate = max(_safe_float(control.get(key)), 200.0)
-            target_gate = float(
-                ceil(
-                    min(
-                        max(lighter_inventory + order_notional, current_gate + order_notional),
-                        max(heavier_inventory - 1.0, current_gate),
+            if no_fill_seconds >= 300.0 and pace_ratio < 0.1:
+                max_inventory = max(
+                    _safe_float(assessment.get("max_long_notional")),
+                    _safe_float(assessment.get("max_short_notional")),
+                )
+                target_gate = float(
+                    ceil(
+                        min(
+                            heavier_inventory + order_notional,
+                            max(max_inventory - 1.0, current_gate),
+                        )
                     )
                 )
-            )
+            else:
+                target_gate = float(
+                    ceil(
+                        min(
+                            max(lighter_inventory + order_notional, current_gate + order_notional),
+                            max(heavier_inventory - 1.0, current_gate),
+                        )
+                    )
+                )
             if target_gate > current_gate:
                 gap_key = "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks"
                 updates = {
