@@ -1748,6 +1748,13 @@ def check_symbol(
             and _safe_int(assessment.get("planned_entry_buy_order_count")) > 0
             and bool(same_side_entry_guard.get("blocked_short_entry"))
         )
+        or (
+            _safe_int(assessment.get("planned_entry_order_count")) == 0
+            and (
+                bool(same_side_entry_guard.get("blocked_long_entry"))
+                or bool(same_side_entry_guard.get("blocked_short_entry"))
+            )
+        )
     )
 
     try:

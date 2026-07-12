@@ -5077,7 +5077,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
             self.assertEqual(restarts, ["ARXUSDT"])
 
-    def test_arx_v3_relaxes_anti_chase_when_it_blocks_missing_entry_leg(self) -> None:
+    def test_arx_v3_relaxes_anti_chase_when_it_blocks_all_entry_orders(self) -> None:
         now = datetime(2026, 7, 12, 9, 45, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -5109,15 +5109,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             plan_path = output_dir / "arxusdt_loop_latest_plan.json"
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
             plan["buy_orders"] = []
-            plan["sell_orders"] = [
-                {
-                    "side": "SELL",
-                    "price": 0.5972,
-                    "qty": 16.0,
-                    "role": "best_quote_entry_short",
-                    "force_reduce_only": False,
-                }
-            ]
+            plan["sell_orders"] = []
             plan["best_quote_maker_volume"] = {
                 "metrics": {
                     "same_side_entry_price_guard": {
