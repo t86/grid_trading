@@ -2209,6 +2209,18 @@ def check_symbol(
     assessment["critical_arx_inventory_pace_override"] = (
         critical_arx_inventory_pace_override
     )
+    critical_ousdt_reduce_budget_ramp = (
+        normalized_symbol == "OUSDT"
+        and target_pace_behind
+        and pace_ratio < 0.25
+        and not high_recovery_wear
+        and not confirmed_loss_reduce_wear
+        and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+        and _safe_int(assessment.get("near_market_reduce_only_order_count")) > 0
+    )
+    assessment["critical_ousdt_reduce_budget_ramp"] = (
+        critical_ousdt_reduce_budget_ramp
+    )
     low_pace_since = _parse_time(item.get("low_pace_since"))
     if pace_ratio >= 0.75:
         item.pop("low_pace_since", None)
@@ -4720,7 +4732,10 @@ def check_symbol(
                 )
                 if (
                     target_pace_behind
-                    and not recovery_reapply_debounced
+                    and (
+                        not recovery_reapply_debounced
+                        or critical_ousdt_reduce_budget_ramp
+                    )
                     and not high_recovery_wear
                     and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
                     and (
