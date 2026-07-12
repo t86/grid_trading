@@ -2248,7 +2248,7 @@ def check_symbol(
             item.pop("recovery_started_at", None)
             item.pop("recovery_owned", None)
         elif (
-            high_recovery_wear
+            (high_recovery_wear or confirmed_loss_reduce_wear)
             and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and not recovery_hold_satisfied
         ):
@@ -2272,8 +2272,7 @@ def check_symbol(
                 }
             )
         elif (
-            high_recovery_wear
-            and confirmed_loss_reduce_wear
+            confirmed_loss_reduce_wear
             and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
         ):
             current_budget = _safe_float(
