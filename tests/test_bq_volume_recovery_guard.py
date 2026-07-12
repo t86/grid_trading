@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import unittest
 from contextlib import redirect_stdout
@@ -274,6 +275,101 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertIn("explicit_stop_reason", result["state_corruption"]["blocking_reasons"])
             with self.assertRaises(json.JSONDecodeError):
                 json.loads(state_path.read_text(encoding="utf-8"))
+
+    def test_salvages_terminal_order_refs_with_zero_exchange_orders(self) -> None:
+        now = datetime(2026, 7, 12, 12, 30, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(output_dir, now=now)
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["generated_at"] = now.isoformat()
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 100.0,
+                    "actual_short_notional": 200.0,
+                    "ledger": {"long_lots": [{"qty": 2.0}], "short_lots": []},
+                }
+            }
+            _write_json(plan_path, plan)
+            state_path = output_dir / "reusdt_loop_state.json"
+            state_path.write_text(
+                '{\n  "version": 1,\n  "best_quote_volume_ledger": {"long_qty": 5},'
+                '\n  "best_quote_volume_order_refs": {\n    "123": {"role": "bro',
+                encoding="utf-8",
+            )
+            os.utime(state_path, (now.timestamp(), now.timestamp()))
+
+            result = recover_corrupt_loop_state(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                now=now + timedelta(minutes=1),
+                max_backup_age_seconds=3600,
+                min_corrupt_age_seconds=30,
+                max_snapshot_age_seconds=300,
+                dry_run=False,
+                exchange_snapshot_fetcher=lambda _symbol: {
+                    "open_order_count": 0,
+                    "long_notional": 105.0,
+                    "short_notional": 205.0,
+                },
+            )
+
+            assert result is not None
+            self.assertEqual(result["action"], "salvage_corrupt_state_order_refs")
+            restored = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(restored["best_quote_volume_ledger"], {"long_qty": 5})
+            self.assertEqual(restored["best_quote_volume_order_refs"], {})
+            self.assertEqual(
+                restored["best_quote_frozen_inventory"],
+                {"long_lots": [{"qty": 2.0}], "short_lots": []},
+            )
+
+    def test_terminal_order_refs_salvage_blocks_with_exchange_orders(self) -> None:
+        now = datetime(2026, 7, 12, 12, 31, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(output_dir, now=now)
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["generated_at"] = now.isoformat()
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 0.0,
+                    "actual_short_notional": 0.0,
+                    "ledger": {"long_lots": [], "short_lots": []},
+                }
+            }
+            _write_json(plan_path, plan)
+            state_path = output_dir / "reusdt_loop_state.json"
+            state_path.write_text(
+                '{\n  "best_quote_volume_ledger": {},'
+                '\n  "best_quote_volume_order_refs": {"123": "bro',
+                encoding="utf-8",
+            )
+            os.utime(state_path, (now.timestamp(), now.timestamp()))
+
+            result = recover_corrupt_loop_state(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                now=now + timedelta(minutes=1),
+                max_backup_age_seconds=3600,
+                min_corrupt_age_seconds=30,
+                max_snapshot_age_seconds=300,
+                dry_run=False,
+                exchange_snapshot_fetcher=lambda _symbol: {
+                    "open_order_count": 1,
+                    "long_notional": 0.0,
+                    "short_notional": 0.0,
+                },
+            )
+
+            assert result is not None
+            self.assertEqual(result["action"], "skip_corrupt_state_recovery_safety_gate")
+            self.assertIn(
+                "exchange_open_orders_present",
+                result["state_corruption"]["blocking_reasons"],
+            )
 
     def test_main_checks_active_runner_normally(self) -> None:
         with TemporaryDirectory() as tmpdir:

@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 RestartRunner = Callable[[str], object]
 UserTradesPageFetcher = Callable[..., list[dict[str, Any]]]
+CorruptStateExchangeFetcher = Callable[[str], dict[str, Any]]
 
 
 _RECOVERY_CONTROL_KEYS = (
@@ -58,6 +59,120 @@ def _target_gate_done_marker(output_dir: Path, symbol: str, now: datetime) -> Pa
     return output_dir / f"{symbol.lower()}_target_gate_done_{now.strftime('%Y%m%d')}.flag"
 
 
+def _fetch_corrupt_state_exchange_snapshot(symbol: str) -> dict[str, Any]:
+    from .data import fetch_futures_open_orders, fetch_futures_position_risk_v3
+
+    api_key = os.environ["BINANCE_API_KEY"]
+    api_secret = os.environ["BINANCE_API_SECRET"]
+    positions = fetch_futures_position_risk_v3(api_key, api_secret, symbol)
+    return {
+        "open_order_count": len(
+            fetch_futures_open_orders(symbol, api_key, api_secret, use_cache=False)
+        ),
+        "long_notional": sum(
+            abs(_safe_float(row.get("notional")))
+            for row in positions
+            if str(row.get("positionSide", "")).upper() == "LONG"
+        ),
+        "short_notional": sum(
+            abs(_safe_float(row.get("notional")))
+            for row in positions
+            if str(row.get("positionSide", "")).upper() == "SHORT"
+        ),
+    }
+
+
+def _salvage_truncated_order_refs_state(
+    *,
+    state_path: Path,
+    plan: dict[str, Any],
+    state_mtime: float,
+    exchange_snapshot_fetcher: CorruptStateExchangeFetcher,
+    symbol: str,
+) -> tuple[dict[str, Any] | None, list[str], dict[str, Any]]:
+    reasons: list[str] = []
+    details: dict[str, Any] = {}
+    try:
+        raw = state_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, ["corrupt_state_unreadable"], {"salvage_error": str(exc)[:240]}
+    marker = '\n  "best_quote_volume_order_refs": {'
+    marker_at = raw.rfind(marker)
+    if marker_at < 0:
+        return None, ["corruption_not_in_terminal_order_refs"], details
+    prefix = raw[:marker_at].rstrip()
+    if prefix.endswith(","):
+        prefix = prefix[:-1]
+    try:
+        salvaged = json.loads(prefix + "\n}\n")
+    except json.JSONDecodeError as exc:
+        return None, ["state_prefix_not_salvageable"], {"salvage_error": str(exc)[:240]}
+    if not isinstance(salvaged, dict) or not isinstance(
+        salvaged.get("best_quote_volume_ledger"), dict
+    ):
+        reasons.append("salvaged_state_missing_active_ledger")
+
+    best_quote = plan.get("best_quote_maker_volume")
+    reduce_freeze = (
+        best_quote.get("reduce_freeze") if isinstance(best_quote, dict) else None
+    )
+    frozen_ledger = reduce_freeze.get("ledger") if isinstance(reduce_freeze, dict) else None
+    if not isinstance(frozen_ledger, dict):
+        reasons.append("pre_corruption_snapshot_missing_frozen_ledger")
+
+    generated_at = _parse_time(plan.get("generated_at"))
+    snapshot_delta_seconds = (
+        abs(state_mtime - generated_at.timestamp()) if generated_at is not None else float("inf")
+    )
+    details["pre_corruption_snapshot_delta_seconds"] = round(snapshot_delta_seconds, 3)
+    if snapshot_delta_seconds > 30.0:
+        reasons.append("pre_corruption_snapshot_not_adjacent")
+
+    try:
+        exchange = exchange_snapshot_fetcher(symbol)
+    except Exception as exc:
+        exchange = {}
+        reasons.append("exchange_snapshot_error")
+        details["exchange_snapshot_error"] = str(exc)[:240]
+    open_order_count = _safe_int(exchange.get("open_order_count"), -1)
+    details["exchange_open_order_count"] = open_order_count
+    if open_order_count != 0:
+        reasons.append("exchange_open_orders_present")
+
+    planned_long = _safe_float(
+        reduce_freeze.get("actual_long_notional") if isinstance(reduce_freeze, dict) else None
+    )
+    planned_short = _safe_float(
+        reduce_freeze.get("actual_short_notional") if isinstance(reduce_freeze, dict) else None
+    )
+    exchange_long = _safe_float(exchange.get("long_notional"))
+    exchange_short = _safe_float(exchange.get("short_notional"))
+    position_drift = abs(exchange_long - planned_long) + abs(exchange_short - planned_short)
+    drift_threshold = max(
+        _safe_float(plan.get("hedge_bq_position_drift_tolerance_notional")),
+        100.0,
+    )
+    details.update(
+        {
+            "exchange_long_notional": exchange_long,
+            "exchange_short_notional": exchange_short,
+            "snapshot_long_notional": planned_long,
+            "snapshot_short_notional": planned_short,
+            "position_drift_notional": position_drift,
+            "position_drift_threshold_notional": drift_threshold,
+        }
+    )
+    if position_drift > drift_threshold:
+        reasons.append("exchange_position_drift_too_large")
+
+    if reasons:
+        return None, reasons, details
+    salvaged["best_quote_volume_order_refs"] = {}
+    salvaged["best_quote_frozen_inventory"] = frozen_ledger
+    salvaged["updated_by"] = "bq_volume_recovery_guard_order_refs_salvage"
+    return salvaged, [], details
+
+
 def recover_corrupt_loop_state(
     *,
     symbol: str,
@@ -67,6 +182,7 @@ def recover_corrupt_loop_state(
     min_corrupt_age_seconds: float,
     max_snapshot_age_seconds: float,
     dry_run: bool,
+    exchange_snapshot_fetcher: CorruptStateExchangeFetcher | None = None,
 ) -> dict[str, Any] | None:
     normalized_symbol = symbol.upper().strip()
     slug = normalized_symbol.lower()
@@ -82,12 +198,15 @@ def recover_corrupt_loop_state(
         decode_error = str(exc)
 
     try:
-        corrupt_age_seconds = max(now.timestamp() - state_path.stat().st_mtime, 0.0)
+        state_mtime = state_path.stat().st_mtime
+        corrupt_age_seconds = max(now.timestamp() - state_mtime, 0.0)
     except OSError:
+        state_mtime = 0.0
         corrupt_age_seconds = 0.0
+    plan = _read_json(_plan_path(output_dir, normalized_symbol))
     gate = _inactive_restart_gate(
         control=_read_json(_control_path(output_dir, normalized_symbol)),
-        plan=_read_json(_plan_path(output_dir, normalized_symbol)),
+        plan=plan,
         submit=_read_json(_submit_path(output_dir, normalized_symbol)),
         now=now,
         max_snapshot_age_seconds=max_snapshot_age_seconds,
@@ -118,8 +237,18 @@ def recover_corrupt_loop_state(
             backup_path = candidate
             backup_payload = candidate_payload
             break
-    if backup_payload is None:
+    salvage_payload, salvage_reasons, salvage_details = _salvage_truncated_order_refs_state(
+        state_path=state_path,
+        plan=plan,
+        state_mtime=state_mtime,
+        exchange_snapshot_fetcher=(
+            exchange_snapshot_fetcher or _fetch_corrupt_state_exchange_snapshot
+        ),
+        symbol=normalized_symbol,
+    )
+    if backup_payload is None and salvage_payload is None:
         blocking_reasons.append("no_recent_valid_autorealign_backup")
+        blocking_reasons.extend(salvage_reasons)
 
     result: dict[str, Any] = {
         "symbol": normalized_symbol,
@@ -133,26 +262,35 @@ def recover_corrupt_loop_state(
             "age_seconds": round(corrupt_age_seconds, 3),
             "blocking_reasons": blocking_reasons,
             "snapshot_gate": gate,
+            "order_refs_salvage": salvage_details,
         },
     }
     if blocking_reasons:
         result["action"] = "skip_corrupt_state_recovery_safety_gate"
         return result
     if dry_run:
-        result["action"] = "dry_run_restore_corrupt_state_from_autorealign_backup"
+        result["action"] = (
+            "dry_run_salvage_corrupt_state_order_refs"
+            if salvage_payload is not None
+            else "dry_run_restore_corrupt_state_from_autorealign_backup"
+        )
         return result
 
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     corrupt_archive = state_path.with_name(state_path.name + f".corrupt_bq_recovery_{stamp}")
     shutil.copy2(state_path, corrupt_archive)
-    _write_json(state_path, backup_payload)
+    _write_json(state_path, salvage_payload or backup_payload or {})
     plan_path = _plan_path(output_dir, normalized_symbol)
     archived_plan: str | None = None
     if plan_path.exists():
         stale_plan_path = plan_path.with_name(plan_path.name + f".stale_state_recovery_{stamp}")
         plan_path.replace(stale_plan_path)
         archived_plan = str(stale_plan_path)
-    result["action"] = "restore_corrupt_state_from_autorealign_backup"
+    result["action"] = (
+        "salvage_corrupt_state_order_refs"
+        if salvage_payload is not None
+        else "restore_corrupt_state_from_autorealign_backup"
+    )
     result["corrupt_archive_path"] = str(corrupt_archive)
     result["archived_plan_path"] = archived_plan
     return result
