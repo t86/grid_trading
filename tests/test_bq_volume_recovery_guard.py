@@ -143,6 +143,10 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
 
         control["best_quote_maker_volume_same_side_entry_price_guard_min_notional"] = 450.0
         self.assertEqual(
+            _arx_independent_freeze_policy_updates(symbol="ARXUSDT", control=control),
+            {},
+        )
+        self.assertEqual(
             _arx_independent_freeze_policy_updates(
                 symbol="ARXUSDT",
                 control=control,

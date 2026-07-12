@@ -1274,6 +1274,14 @@ def _arx_independent_freeze_policy_updates(
         return {}
     if not bool(control.get("best_quote_maker_volume_reduce_freeze_enabled")):
         return {}
+    anti_chase_min_key = "best_quote_maker_volume_same_side_entry_price_guard_min_notional"
+    anti_chase_gap_key = "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks"
+    configured_anti_chase_min = control.get(anti_chase_min_key)
+    if configured_anti_chase_min is None:
+        configured_anti_chase_min = 200.0
+    configured_anti_chase_gap = control.get(anti_chase_gap_key)
+    if configured_anti_chase_gap is None:
+        configured_anti_chase_gap = 1
     expected = {
         "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
         "best_quote_maker_volume_reduce_freeze_band_budget_enabled": True,
@@ -1297,13 +1305,13 @@ def _arx_independent_freeze_policy_updates(
         "best_quote_maker_volume_frozen_pair_release_allow_loss": False,
         "best_quote_maker_volume_same_side_entry_price_guard_enabled": True,
         "best_quote_maker_volume_same_side_entry_price_guard_report_only": False,
-        "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 200.0,
-        "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 1,
+        anti_chase_min_key: configured_anti_chase_min,
+        anti_chase_gap_key: configured_anti_chase_gap,
         "best_quote_maker_volume_net_loss_reduce_enabled": False,
     }
     if temporary_anti_chase_relief:
-        expected.pop("best_quote_maker_volume_same_side_entry_price_guard_min_notional")
-        expected.pop("best_quote_maker_volume_same_side_entry_price_guard_gap_ticks")
+        expected.pop(anti_chase_min_key)
+        expected.pop(anti_chase_gap_key)
     return {key: value for key, value in expected.items() if control.get(key) != value}
 
 
