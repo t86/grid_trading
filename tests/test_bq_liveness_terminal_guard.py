@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
-from grid_optimizer.bq_liveness_terminal_guard import invalid_state_reason, main, target_done_marker
+from grid_optimizer.bq_liveness_terminal_guard import (
+    clear_stale_drift_flag_if_reconciled,
+    invalid_state_reason,
+    main,
+    target_done_marker,
+)
 
 
 class BqLivenessTerminalGuardTests(TestCase):
@@ -56,3 +62,56 @@ class BqLivenessTerminalGuardTests(TestCase):
             with patch("grid_optimizer.bq_liveness_terminal_guard.runpy.run_path") as run_path:
                 self.assertEqual(main(["--symbol", "OUSDT", "--workdir", str(workdir), "--enforce"]), 0)
             run_path.assert_called_once()
+
+    def test_clears_stale_drift_flag_after_fresh_safe_reconcile(self) -> None:
+        now = datetime(2026, 7, 12, 19, 30, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir)
+            output_dir = workdir / "output"
+            output_dir.mkdir(parents=True)
+            flag_path = output_dir / "OUSDT_DRIFT_ALERT.flag"
+            flag_path.write_text("historical drift\n", encoding="utf-8")
+            flag_time = now.timestamp() - 600
+            flag_path.touch()
+            os.utime(flag_path, (flag_time, flag_time))
+            (output_dir / "ousdt_loop_state.json").write_text(
+                '{"updated_at":"2026-07-12T19:29:30+00:00",'
+                '"last_reconcile":{"open_order_diff":1,"actual_net_qty_diff":0,'
+                '"protective_stop_required":false}}',
+                encoding="utf-8",
+            )
+
+            cleared = clear_stale_drift_flag_if_reconciled(
+                workdir=workdir,
+                symbol="OUSDT",
+                now=now,
+            )
+
+            self.assertEqual(cleared, flag_path)
+            self.assertFalse(flag_path.exists())
+
+    def test_keeps_stale_drift_flag_when_current_reconcile_is_unsafe(self) -> None:
+        now = datetime(2026, 7, 12, 19, 30, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir)
+            output_dir = workdir / "output"
+            output_dir.mkdir(parents=True)
+            flag_path = output_dir / "OUSDT_DRIFT_ALERT.flag"
+            flag_path.write_text("current drift\n", encoding="utf-8")
+            flag_time = now.timestamp() - 600
+            os.utime(flag_path, (flag_time, flag_time))
+            (output_dir / "ousdt_loop_state.json").write_text(
+                '{"updated_at":"2026-07-12T19:29:30+00:00",'
+                '"last_reconcile":{"open_order_diff":11,"actual_net_qty_diff":0,'
+                '"protective_stop_required":false}}',
+                encoding="utf-8",
+            )
+
+            cleared = clear_stale_drift_flag_if_reconciled(
+                workdir=workdir,
+                symbol="OUSDT",
+                now=now,
+            )
+
+            self.assertIsNone(cleared)
+            self.assertTrue(flag_path.exists())

@@ -26,6 +26,44 @@ def invalid_state_reason(*, workdir: Path, symbol: str) -> dict[str, str] | None
     return None
 
 
+def clear_stale_drift_flag_if_reconciled(
+    *,
+    workdir: Path,
+    symbol: str,
+    now: datetime,
+    max_flag_age_seconds: float = 300.0,
+    max_state_age_seconds: float = 120.0,
+) -> Path | None:
+    flag_path = workdir / "output" / f"{symbol.upper()}_DRIFT_ALERT.flag"
+    state_path = workdir / "output" / f"{symbol.lower()}_loop_state.json"
+    if not flag_path.exists() or not state_path.exists():
+        return None
+    try:
+        if now.timestamp() - flag_path.stat().st_mtime <= max(float(max_flag_age_seconds), 0.0):
+            return None
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        updated_at = datetime.fromisoformat(str(payload.get("updated_at") or ""))
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        if (now - updated_at.astimezone(timezone.utc)).total_seconds() > max(
+            float(max_state_age_seconds), 0.0
+        ):
+            return None
+        reconcile = payload.get("last_reconcile")
+        if not isinstance(reconcile, dict):
+            return None
+        if abs(float(reconcile.get("open_order_diff") or 0.0)) > 10.0:
+            return None
+        if abs(float(reconcile.get("actual_net_qty_diff") or 0.0)) > 1e-9:
+            return None
+        if bool(reconcile.get("protective_stop_required")):
+            return None
+        flag_path.unlink()
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return flag_path
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--symbol", required=True)
@@ -46,6 +84,13 @@ def main(argv: list[str] | None = None) -> int:
     if invalid_state is not None:
         print(json.dumps({"action": "skip_invalid_state_safety_gate", **invalid_state}))
         return 0
+
+
+    clear_stale_drift_flag_if_reconciled(
+        workdir=workdir,
+        symbol=symbol,
+        now=datetime.now(timezone.utc),
+    )
 
     legacy = workdir / "output" / "ops" / "bq_liveness_watchdog.py"
     if not legacy.exists():
