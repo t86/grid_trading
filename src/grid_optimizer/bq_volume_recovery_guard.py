@@ -4669,7 +4669,12 @@ def check_symbol(
                     dry_run=dry_run,
                     restart_runner=restart,
                 )
-            elif effective_inventory_soft_pressure and not high_recovery_wear:
+            elif (
+                effective_inventory_soft_pressure
+                and not high_recovery_wear
+                and not confirmed_loss_reduce_wear
+                and not recovery_reapply_debounced
+            ):
                 updates = _loss_reduce_recovery_updates(
                     control=control,
                     assessment=assessment,
@@ -4992,6 +4997,8 @@ def check_symbol(
                     action = "hold_low_volume_without_soft_pressure"
                 elif confirmed_loss_reduce_wear:
                     action = "hold_confirmed_wear_without_loss_reduce"
+                elif recovery_reapply_debounced:
+                    action = "hold_loss_reduce_reapply_debounce"
                 else:
                     updates = _loss_reduce_recovery_updates(
                         control=control,
@@ -5043,6 +5050,7 @@ def check_symbol(
                     chosen_action = "disable_inventory_cost_gate"
                 elif (
                     not confirmed_loss_reduce_wear
+                    and not recovery_reapply_debounced
                     and (
                     effective_inventory_soft_pressure
                     or bool(assessment.get("volatility_inventory_reduce_deadlock"))
