@@ -4580,7 +4580,10 @@ def check_symbol(
                         ("best_quote_maker_volume_cycle_budget_notional",),
                     )
                 if (
-                    bool(assessment.get("balancing_entry_only"))
+                    (
+                        bool(assessment.get("balancing_entry_only"))
+                        or critical_ousdt_reduce_budget_ramp
+                    )
                     and _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0
                 ):
                     updates["sticky_entry_price_tolerance_steps"] = 1.0
