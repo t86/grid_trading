@@ -295,6 +295,26 @@ def summarize_recent_volume(*, rows: list[dict[str, Any]], now: datetime, window
     }
 
 
+def summarize_recent_realized_pnl(
+    *, rows: list[dict[str, Any]], now: datetime, window_seconds: float
+) -> float:
+    window_start = now.timestamp() - max(float(window_seconds), 1.0)
+    realized_pnl = 0.0
+    seen_trade_ids: set[str] = set()
+    for row in rows:
+        trade_id = row.get("id")
+        if trade_id is not None:
+            normalized_id = str(trade_id)
+            if normalized_id in seen_trade_ids:
+                continue
+            seen_trade_ids.add(normalized_id)
+        trade_at = _trade_time(row)
+        if trade_at is None or trade_at.timestamp() < window_start or trade_at > now:
+            continue
+        realized_pnl += _safe_float(row.get("realizedPnl") or row.get("realized_pnl"))
+    return realized_pnl
+
+
 def apply_daily_target_pace_floor(
     *,
     volume_summary: dict[str, Any],
@@ -364,6 +384,14 @@ def apply_target_pace_cycle_budget_floor(
     trailing_summary = summarize_recent_volume(rows=rows, now=now, window_seconds=trailing_seconds)
     trailing_gross = max(_safe_float(trailing_summary.get("gross_notional")), 0.0)
     trailing_hourly = trailing_gross * 3600.0 / trailing_seconds
+    trailing_realized_pnl = summarize_recent_realized_pnl(
+        rows=rows,
+        now=now,
+        window_seconds=trailing_seconds,
+    )
+    trailing_realized_wear_per_10k = (
+        -trailing_realized_pnl / trailing_gross * 10_000.0 if trailing_gross > 0 else 0.0
+    )
     desired_hourly = required_hourly * max(float(target_pace_fraction), 0.0)
     pace_ratio = desired_hourly / trailing_hourly if trailing_hourly > 0 else 4.0
 
@@ -371,6 +399,8 @@ def apply_target_pace_cycle_budget_floor(
         {
             "trailing_60m_gross_notional": trailing_gross,
             "trailing_60m_hourly_notional": trailing_hourly,
+            "trailing_60m_realized_pnl": trailing_realized_pnl,
+            "trailing_60m_realized_wear_per_10k": trailing_realized_wear_per_10k,
             "target_cycle_budget_pace_ratio": pace_ratio,
             "static_cycle_budget_floor_notional": static_floor,
         }
@@ -805,11 +835,11 @@ def assess_symbol(
     near_short_soft = short_soft > 0 and current_short >= short_soft
     inventory_notional_gap = abs(current_long - current_short)
     budget_raise_inventory_buffer_blocked = (
-        (long_soft > 0 and current_long >= long_soft * 0.90)
-        or (short_soft > 0 and current_short >= short_soft * 0.90)
+        (long_soft > 0 and current_long >= long_soft * 0.85)
+        or (short_soft > 0 and current_short >= short_soft * 0.85)
         or (
             min(long_soft, short_soft) > 0
-            and inventory_notional_gap >= min(long_soft, short_soft) * 0.35
+            and inventory_notional_gap >= min(long_soft, short_soft) * 0.25
         )
     )
     if near_long_soft and not near_long_cap:
@@ -1406,6 +1436,17 @@ def check_symbol(
     )
     recovery_low_volume = bool(assessment.get("low_volume")) or target_pace_behind
     assessment["target_pace_behind"] = target_pace_behind
+    trailing_realized_wear_per_10k = _safe_float(
+        volume_summary.get("trailing_60m_realized_wear_per_10k")
+    )
+    wear_backoff_floor = max(
+        static_cycle_budget_floor_notional,
+        max(
+            _safe_float(control.get("per_order_notional")),
+            _safe_float(control.get("maker_order_notional")),
+        )
+        * 4.0,
+    )
 
     try:
         if stale_or_missing and not recovery_timeout_required:
@@ -1518,6 +1559,59 @@ def check_symbol(
                     "last_recovery_check_at": now.isoformat(),
                     "last_normal_at": now.isoformat(),
                 }
+            )
+        elif (
+            _safe_float(volume_summary.get("trailing_60m_gross_notional")) >= 500.0
+            and trailing_realized_wear_per_10k > 3.0
+            and not recovery_reapply_debounced
+            and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and not effective_inventory_soft_pressure
+            and not bool(assessment.get("inventory_soft_pressure"))
+            and (
+                _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
+                > wear_backoff_floor
+                or _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) < 1
+            )
+        ):
+            current_budget = _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
+            updates = {
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "best_quote_maker_volume_cycle_budget_notional": max(
+                    wear_backoff_floor,
+                    current_budget - max(float(volume_recovery_cycle_budget_increment), 0.0),
+                ),
+                "best_quote_maker_volume_quote_offset_ticks": max(
+                    _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")),
+                    1,
+                ),
+            }
+            _remember_recovery_controls(
+                item,
+                control,
+                (
+                    "best_quote_maker_volume_cycle_budget_notional",
+                    "best_quote_maker_volume_quote_offset_ticks",
+                ),
+            )
+            _remember_recovery_updates(item, updates)
+            action = "dry_run_backoff_cycle_budget_for_wear" if dry_run else "backoff_cycle_budget_for_wear"
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
             )
         elif (
             recovery_low_volume
