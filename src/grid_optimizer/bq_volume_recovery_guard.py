@@ -2328,6 +2328,62 @@ def check_symbol(
         elif (
             high_recovery_wear
             and target_pace_behind
+            and confirmed_loss_reduce_wear
+            and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and bool(control.get("best_quote_maker_volume_active_pair_reduce_enabled"))
+            and _safe_int(assessment.get("planned_reduce_only_order_count")) > 0
+        ):
+            current_budget = _safe_float(
+                control.get("best_quote_maker_volume_cycle_budget_notional")
+            )
+            updates = {
+                "best_quote_maker_volume_allow_loss_reduce_only": False,
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "best_quote_maker_volume_active_pair_reduce_enabled": False,
+                "best_quote_maker_volume_cycle_budget_notional": max(
+                    wear_backoff_floor,
+                    current_budget
+                    - max(float(volume_recovery_cycle_budget_increment), 0.0),
+                ),
+                "best_quote_maker_volume_quote_offset_ticks": max(
+                    _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")),
+                    1,
+                ),
+            }
+            _remember_recovery_controls(
+                item,
+                control,
+                (
+                    "best_quote_maker_volume_active_pair_reduce_enabled",
+                    "best_quote_maker_volume_cycle_budget_notional",
+                    "best_quote_maker_volume_quote_offset_ticks",
+                ),
+            )
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_suppress_active_pair_reduce_for_high_wear"
+                if dry_run
+                else "suppress_active_pair_reduce_for_high_wear"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif (
+            high_recovery_wear
+            and target_pace_behind
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and not bool(assessment.get("inventory_soft_pressure"))
             and not bool(assessment.get("near_cap"))
