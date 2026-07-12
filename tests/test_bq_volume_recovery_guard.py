@@ -749,6 +749,30 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(summary["target_deadline"], "2026-07-11T21:00:00+00:00")
         self.assertAlmostEqual(floor, (80000 / 17) * 0.05 * 0.9)
 
+    def test_daily_target_pace_floor_uses_day_end_after_buffer_expires(self) -> None:
+        now = datetime(2026, 7, 11, 21, 5, tzinfo=timezone.utc)
+        summary: dict[str, object] = {}
+
+        apply_daily_target_pace_floor(
+            volume_summary=summary,
+            rows=[],
+            now=now,
+            window_seconds=180,
+            min_volume_notional=125,
+            daily_target_notional=100000,
+            target_pace_fraction=0.9,
+            target_pace_max_multiplier=5.0,
+            target_completion_buffer_seconds=10800,
+        )
+
+        self.assertEqual(summary["target_deadline"], "2026-07-11T21:00:00+00:00")
+        self.assertEqual(
+            summary["effective_target_deadline"], "2026-07-12T00:00:00+00:00"
+        )
+        self.assertTrue(summary["completion_buffer_expired"])
+        self.assertEqual(summary["remaining_target_seconds"], 10500.0)
+        self.assertAlmostEqual(summary["required_hourly_notional"], 100000 * 3600 / 10500)
+
     def test_parse_symbol_notionals_accepts_comma_separated_targets(self) -> None:
         targets = bq_volume_recovery_guard._parse_symbol_notionals(
             ["ARXUSDT=100000,OUSDT=60000", "INVALID", "BAD=0"]

@@ -496,8 +496,9 @@ def apply_daily_target_pace_floor(
     day_end = day_start + timedelta(days=1)
     completion_buffer = max(float(target_completion_buffer_seconds), 0.0)
     target_deadline = day_end - timedelta(seconds=completion_buffer)
+    effective_target_deadline = target_deadline if now < target_deadline else day_end
     elapsed_seconds = max((now - day_start).total_seconds(), 1.0)
-    remaining_seconds = max((target_deadline - now).total_seconds(), 1.0)
+    remaining_seconds = max((effective_target_deadline - now).total_seconds(), 1.0)
     day_summary = summarize_recent_volume(rows=rows, now=now, window_seconds=elapsed_seconds)
     day_gross = _safe_float(day_summary.get("gross_notional"))
     remaining_target = max(target - day_gross, 0.0)
@@ -516,6 +517,8 @@ def apply_daily_target_pace_floor(
             "remaining_target_seconds": remaining_seconds,
             "target_completion_buffer_seconds": completion_buffer,
             "target_deadline": target_deadline.isoformat(),
+            "effective_target_deadline": effective_target_deadline.isoformat(),
+            "completion_buffer_expired": now >= target_deadline,
             "required_hourly_notional": required_hourly,
             "target_pace_floor_notional": target_floor,
             "effective_min_volume_notional": effective_floor,
