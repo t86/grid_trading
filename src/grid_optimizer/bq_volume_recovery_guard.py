@@ -2837,7 +2837,6 @@ def check_symbol(
                 and bool(assessment.get("one_sided_inventory_bias"))
                 and bool(assessment.get("balancing_entry_requote_safe"))
                 and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) <= 0
-                and _safe_float(control.get("sticky_entry_price_tolerance_steps")) <= 1.0
             )
         ):
             current_budget = _safe_float(
