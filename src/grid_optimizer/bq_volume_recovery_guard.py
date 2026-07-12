@@ -1793,7 +1793,7 @@ def check_symbol(
                     "best_quote_maker_volume_allow_loss_reduce_only": False,
                     "best_quote_maker_volume_net_loss_reduce_enabled": False,
                     "best_quote_maker_volume_cycle_budget_notional": max(
-                        cycle_budget_floor_notional,
+                        wear_backoff_floor,
                         current_budget
                         - max(float(volume_recovery_cycle_budget_increment), 0.0),
                     ),
@@ -1803,10 +1803,6 @@ def check_symbol(
                     ),
                 }
             )
-            item.pop("guard_recovery_controls", None)
-            item.pop("recovery_started_at", None)
-            item.pop("recovery_owned", None)
-            _remember_recovery_updates(item, updates)
             action = (
                 "dry_run_disable_loss_reduce_for_high_wear"
                 if dry_run
@@ -1832,6 +1828,10 @@ def check_symbol(
                 dry_run=dry_run,
                 restart_runner=restart,
             )
+            item.pop("guard_original_controls", None)
+            item.pop("guard_recovery_controls", None)
+            item.pop("recovery_started_at", None)
+            item.pop("recovery_owned", None)
         elif (
             high_recovery_wear
             and target_pace_behind
