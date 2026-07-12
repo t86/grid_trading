@@ -1797,6 +1797,34 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             1000.0 / 1350.0,
         )
 
+    def test_active_loss_reduce_converges_only_flow_controls(self) -> None:
+        desired = {
+            "best_quote_maker_volume_allow_loss_reduce_only": True,
+            "best_quote_maker_volume_cycle_budget_notional": 200.0,
+            "best_quote_maker_volume_active_pair_reduce_enabled": True,
+            "best_quote_maker_volume_active_pair_reduce_order_notional": 50.0,
+            "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 100.0,
+            "best_quote_maker_volume_inventory_soft_ratio": 0.74,
+        }
+
+        self.assertEqual(
+            bq_volume_recovery_guard._loss_reduce_flow_control_updates(
+                {
+                    "best_quote_maker_volume_active_pair_reduce_enabled": False,
+                    "best_quote_maker_volume_active_pair_reduce_order_notional": 24.0,
+                    "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 48.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.92,
+                },
+                desired,
+            ),
+            {
+                "best_quote_maker_volume_active_pair_reduce_enabled": True,
+                "best_quote_maker_volume_active_pair_reduce_order_notional": 50.0,
+                "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 100.0,
+                "best_quote_maker_volume_inventory_soft_ratio": 0.74,
+            },
+        )
+
     def test_loss_reduce_does_not_stack_offset_on_dynamic_widening(self) -> None:
         updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
             control={

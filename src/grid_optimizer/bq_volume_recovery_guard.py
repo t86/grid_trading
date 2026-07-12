@@ -809,6 +809,18 @@ def _loss_reduce_recovery_updates(
     return updates
 
 
+def _loss_reduce_flow_control_updates(
+    control: dict[str, Any], desired: dict[str, Any]
+) -> dict[str, Any]:
+    keys = (
+        "best_quote_maker_volume_active_pair_reduce_enabled",
+        "best_quote_maker_volume_active_pair_reduce_order_notional",
+        "best_quote_maker_volume_active_pair_reduce_max_notional_per_side",
+        "best_quote_maker_volume_inventory_soft_ratio",
+    )
+    return {key: desired[key] for key in keys if key in desired and control.get(key) != desired[key]}
+
+
 def _recovery_inventory_buffer_ok(
     assessment: dict[str, Any],
     *,
@@ -1977,6 +1989,23 @@ def check_symbol(
             )
         )
     )
+    loss_reduce_flow_updates: dict[str, Any] = {}
+    if (
+        bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+        and effective_inventory_soft_pressure
+    ):
+        desired_loss_reduce_updates = _loss_reduce_recovery_updates(
+            control=control,
+            assessment=assessment,
+            static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+            quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
+            pause_baseline_long_notional=pause_baseline_long_notional,
+            pause_baseline_short_notional=pause_baseline_short_notional,
+        )
+        loss_reduce_flow_updates = _loss_reduce_flow_control_updates(
+            control,
+            desired_loss_reduce_updates,
+        )
 
     try:
         if stale_or_missing and not recovery_timeout_required:
@@ -2468,13 +2497,14 @@ def check_symbol(
                 "best_quote_maker_volume_quote_offset_ticks": 0,
                 "sticky_entry_price_tolerance_steps": 1.0,
             }
+            updates.update(loss_reduce_flow_updates)
             _remember_recovery_controls(
                 item,
                 control,
-                (
-                    "best_quote_maker_volume_cycle_budget_notional",
-                    "best_quote_maker_volume_quote_offset_ticks",
-                    "sticky_entry_price_tolerance_steps",
+                tuple(
+                    key
+                    for key in updates
+                    if key != "best_quote_maker_volume_net_loss_reduce_enabled"
                 ),
             )
             _remember_recovery_updates(item, updates)
@@ -3848,6 +3878,22 @@ def check_symbol(
             )
             if can_extend_soft_recovery:
                 action = "extend_soft_inventory_loss_recovery"
+                if loss_reduce_flow_updates:
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        tuple(loss_reduce_flow_updates),
+                    )
+                    _remember_recovery_updates(item, loss_reduce_flow_updates)
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=loss_reduce_flow_updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
                 item.update(
                     {
                         "status": "recovery_active",
