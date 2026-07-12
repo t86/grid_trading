@@ -111,6 +111,16 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             {},
         )
 
+        control["best_quote_maker_volume_same_side_entry_price_guard_min_notional"] = 450.0
+        self.assertEqual(
+            _arx_independent_freeze_policy_updates(
+                symbol="ARXUSDT",
+                control=control,
+                temporary_anti_chase_relief=True,
+            ),
+            {},
+        )
+
     def test_main_never_restarts_symbol_after_target_gate_done(self) -> None:
         now = datetime.now(timezone.utc)
         with TemporaryDirectory() as tmpdir:
@@ -4980,6 +4990,92 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(floor_result["action"], "raise_cycle_budget_for_volume")
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
             self.assertEqual(restarts, ["REUSDT"])
+
+    def test_arx_v3_relaxes_anti_chase_for_target_behind_no_fill_reduce_only_sla(self) -> None:
+        now = datetime(2026, 7, 12, 9, 20, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_reduce_freeze_enabled": True,
+                    "best_quote_maker_volume_same_side_entry_price_guard_enabled": True,
+                    "best_quote_maker_volume_same_side_entry_price_guard_report_only": False,
+                    "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 200.0,
+                    "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 1,
+                    "per_order_notional": 25.0,
+                },
+                long_notional=400.0,
+                short_notional=620.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            for path in list(output_dir.glob("reusdt_*")):
+                path.rename(output_dir / path.name.replace("reusdt", "arxusdt", 1))
+
+            control_path = output_dir / "arxusdt_loop_runner_control.json"
+            control = json.loads(control_path.read_text(encoding="utf-8"))
+            control.update(_arx_independent_freeze_policy_updates(symbol="ARXUSDT", control=control))
+            _write_json(control_path, control)
+
+            plan_path = output_dir / "arxusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["buy_orders"] = []
+            plan["sell_orders"] = [
+                {
+                    "side": "SELL",
+                    "price": 0.5972,
+                    "qty": 16.0,
+                    "role": "best_quote_reduce_long",
+                    "force_reduce_only": True,
+                }
+            ]
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "ARXUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+            trade_rows = [
+                {
+                    "time": int((now - timedelta(minutes=10)).timestamp() * 1000),
+                    "quoteQty": 500.0,
+                }
+            ]
+
+            result = check_symbol(
+                symbol="ARXUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100.0,
+                daily_target_notional=120_000.0,
+                trigger_seconds=120,
+                trade_rows=trade_rows,
+                volume_source="exchange_user_trades",
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(control_path.read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "relax_arx_v3_anti_chase_for_no_fill_sla")
+            self.assertEqual(
+                control["best_quote_maker_volume_same_side_entry_price_guard_min_notional"],
+                425.0,
+            )
+            self.assertEqual(
+                state["symbols"]["ARXUSDT"]["guard_original_controls"][
+                    "best_quote_maker_volume_same_side_entry_price_guard_min_notional"
+                ],
+                200.0,
+            )
+            self.assertEqual(restarts, ["ARXUSDT"])
 
 
 if __name__ == "__main__":

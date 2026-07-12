@@ -23,6 +23,7 @@ _RECOVERY_CONTROL_KEYS = (
     "best_quote_maker_volume_inventory_bias_reduce_share",
     "best_quote_maker_volume_cycle_budget_notional",
     "best_quote_maker_volume_quote_offset_ticks",
+    "best_quote_maker_volume_same_side_entry_price_guard_min_notional",
     "pause_buy_position_notional",
     "pause_short_position_notional",
     "sticky_entry_price_tolerance_steps",
@@ -1108,7 +1109,10 @@ def _apply_control_update(
 
 
 def _arx_independent_freeze_policy_updates(
-    *, symbol: str, control: dict[str, Any]
+    *,
+    symbol: str,
+    control: dict[str, Any],
+    temporary_anti_chase_relief: bool = False,
 ) -> dict[str, Any]:
     if symbol.upper().strip() != "ARXUSDT":
         return {}
@@ -1141,6 +1145,8 @@ def _arx_independent_freeze_policy_updates(
         "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 1,
         "best_quote_maker_volume_net_loss_reduce_enabled": False,
     }
+    if temporary_anti_chase_relief:
+        expected.pop("best_quote_maker_volume_same_side_entry_price_guard_min_notional")
     return {key: value for key, value in expected.items() if control.get(key) != value}
 
 
@@ -1706,6 +1712,14 @@ def check_symbol(
     arx_freeze_policy_updates = _arx_independent_freeze_policy_updates(
         symbol=normalized_symbol,
         control=control,
+        temporary_anti_chase_relief=(
+            _safe_float(
+                recovery_expected_controls.get(
+                    "best_quote_maker_volume_same_side_entry_price_guard_min_notional"
+                )
+            )
+            > 200.0
+        ),
     )
 
     try:
@@ -3514,6 +3528,73 @@ def check_symbol(
                         "last_recovery_action": action,
                     }
                 )
+            elif (
+                normalized_symbol == "ARXUSDT"
+                and target_pace_behind
+                and sla_recovery_due
+                and no_fill_seconds >= 180.0
+                and bool(assessment.get("planned_reduce_only_only"))
+                and _safe_int(assessment.get("near_market_order_count")) > 0
+                and bool(control.get("best_quote_maker_volume_same_side_entry_price_guard_enabled"))
+                and not bool(control.get("best_quote_maker_volume_same_side_entry_price_guard_report_only"))
+                and not bool(assessment.get("near_cap"))
+                and not high_recovery_wear
+                and not recovery_reapply_debounced
+            ):
+                current_long = max(_safe_float(assessment.get("current_long_notional")), 0.0)
+                current_short = max(_safe_float(assessment.get("current_short_notional")), 0.0)
+                lighter_inventory = min(current_long, current_short)
+                heavier_inventory = max(current_long, current_short)
+                order_notional = max(
+                    _safe_float(control.get("per_order_notional")),
+                    _safe_float(control.get("maker_order_notional")),
+                    25.0,
+                )
+                current_gate = max(
+                    _safe_float(
+                        control.get("best_quote_maker_volume_same_side_entry_price_guard_min_notional")
+                    ),
+                    200.0,
+                )
+                target_gate = min(
+                    max(lighter_inventory + order_notional, current_gate + order_notional),
+                    max(heavier_inventory - 1.0, current_gate),
+                )
+                target_gate = float(ceil(target_gate))
+                if target_gate > current_gate:
+                    key = "best_quote_maker_volume_same_side_entry_price_guard_min_notional"
+                    updates = {
+                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                        key: target_gate,
+                    }
+                    _remember_recovery_controls(item, control, (key,))
+                    _remember_recovery_updates(item, updates)
+                    action = (
+                        "dry_run_relax_arx_v3_anti_chase_for_no_fill_sla"
+                        if dry_run
+                        else "relax_arx_v3_anti_chase_for_no_fill_sla"
+                    )
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                            "recovery_owned": True,
+                            "last_recovery_action_at": now.isoformat(),
+                            "last_recovery_action": action,
+                        }
+                    )
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
+                else:
+                    action = "hold_arx_v3_anti_chase_heavier_leg_boundary"
+                    item.update({"status": "low_volume", "last_recovery_check_at": now.isoformat()})
             elif (
                 bool(assessment.get("planned_reduce_only_only"))
                 and _safe_int(assessment.get("near_market_order_count")) > 0
