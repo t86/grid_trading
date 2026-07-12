@@ -2944,7 +2944,6 @@ def check_symbol(
             and not bool(assessment.get("inventory_soft_pressure"))
             and not bool(assessment.get("near_cap"))
             and anti_chase_blocks_missing_entry_leg
-            and not recovery_reapply_debounced
         ):
             current_long = max(_safe_float(assessment.get("current_long_notional")), 0.0)
             current_short = max(_safe_float(assessment.get("current_short_notional")), 0.0)

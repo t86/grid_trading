@@ -6108,6 +6108,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "ARXUSDT": {
                         "status": "low_volume",
                         "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                        "last_recovery_action_at": (now - timedelta(seconds=30)).isoformat(),
                     }
                 }
             }
