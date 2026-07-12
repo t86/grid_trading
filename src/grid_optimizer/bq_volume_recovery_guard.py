@@ -2996,7 +2996,31 @@ def check_symbol(
                     key: target_gate,
                     gap_key: 0,
                 }
-                _remember_recovery_controls(item, control, (key, gap_key))
+                current_budget = _safe_float(
+                    control.get("best_quote_maker_volume_cycle_budget_notional")
+                )
+                target_budget_floor = max(
+                    _safe_float(volume_summary.get("target_cycle_budget_floor_notional")),
+                    float(cycle_budget_floor_notional),
+                )
+                target_budget = min(
+                    target_budget_floor,
+                    current_budget
+                    + max(float(volume_recovery_cycle_budget_increment), 0.0),
+                )
+                if target_budget > current_budget:
+                    updates["best_quote_maker_volume_cycle_budget_notional"] = target_budget
+                if _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0:
+                    updates["sticky_entry_price_tolerance_steps"] = 1.0
+                _remember_recovery_controls(
+                    item,
+                    control,
+                    tuple(
+                        update_key
+                        for update_key in updates
+                        if update_key != "best_quote_maker_volume_net_loss_reduce_enabled"
+                    ),
+                )
                 _remember_recovery_updates(item, updates)
                 action = (
                     "dry_run_relax_arx_v3_anti_chase_for_missing_entry_leg"

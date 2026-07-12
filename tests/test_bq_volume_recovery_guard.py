@@ -6383,6 +6383,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "best_quote_maker_volume_same_side_entry_price_guard_report_only": False,
                     "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 200.0,
                     "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 1,
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                    "sticky_entry_price_tolerance_steps": 8.0,
                     "per_order_notional": 25.0,
                 },
                 long_notional=500.0,
@@ -6436,6 +6438,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 min_volume_notional=100.0,
                 daily_target_notional=120_000.0,
                 trigger_seconds=120,
+                cycle_budget_floor_notional=108.0,
+                volume_recovery_cycle_budget_increment=36.0,
                 trade_rows=[
                     {
                         "time": int((now - timedelta(minutes=10)).timestamp() * 1000),
@@ -6459,6 +6463,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 control["best_quote_maker_volume_same_side_entry_price_guard_gap_ticks"],
                 0,
             )
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
+            self.assertEqual(control["sticky_entry_price_tolerance_steps"], 1.0)
             self.assertEqual(restarts, ["ARXUSDT"])
 
 
