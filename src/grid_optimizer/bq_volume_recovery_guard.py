@@ -3487,6 +3487,66 @@ def check_symbol(
                 and not cap_buffer_ok
             )
             if hold_exhausted_soft_recovery:
+                can_tighten_exhausted_recovery = (
+                    target_pace_behind
+                    and (sla_recovery_due or no_fill_seconds >= 300.0)
+                    and not high_recovery_wear
+                    and not recovery_reapply_debounced
+                    and _safe_int(assessment.get("planned_reduce_only_order_count")) > 0
+                    and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) > 1
+                )
+                if can_tighten_exhausted_recovery:
+                    updates = {
+                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                        "best_quote_maker_volume_quote_offset_ticks": max(
+                            _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) - 1,
+                            1,
+                        ),
+                    }
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        ("best_quote_maker_volume_quote_offset_ticks",),
+                    )
+                    _remember_recovery_updates(item, updates)
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
+                    action = (
+                        "dry_run_tighten_exhausted_soft_recovery_one_tick"
+                        if dry_run
+                        else "tighten_exhausted_soft_recovery_one_tick"
+                    )
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "recovery_started_at": now.isoformat(),
+                            "last_recovery_check_at": now.isoformat(),
+                            "last_recovery_action_at": now.isoformat(),
+                            "last_recovery_action": action,
+                        }
+                    )
+                    result = {
+                        "symbol": normalized_symbol,
+                        "action": action,
+                        "changed_keys": changed,
+                        "backup_path": backup_path,
+                        "dry_run": dry_run,
+                        "restart_failed": restart_failed,
+                        "volume_summary": volume_summary,
+                        "assessment": assessment,
+                    }
+                    _append_jsonl(
+                        output_dir / "bq_volume_recovery_guard_events.jsonl",
+                        {"ts": now.isoformat(), **result},
+                    )
+                    return result
                 action = "hold_soft_inventory_loss_recovery_until_both_below"
                 item.update(
                     {

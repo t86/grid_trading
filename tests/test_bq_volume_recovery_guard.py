@@ -4626,6 +4626,98 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(control["best_quote_maker_volume_active_pair_reduce_enabled"])
             self.assertEqual(restarts, [])
 
+    def test_exhausted_soft_recovery_tightens_reduce_offset_one_tick(self) -> None:
+        now = datetime(2026, 7, 12, 11, 2, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 108.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 2,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.8,
+                    "best_quote_maker_volume_max_long_notional": 700.0,
+                    "best_quote_maker_volume_max_short_notional": 700.0,
+                    "pause_buy_position_notional": 620.0,
+                    "pause_short_position_notional": 620.0,
+                },
+                long_notional=690.0,
+                short_notional=10.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["buy_orders"][0].update(
+                {"role": "best_quote_reduce_short", "force_reduce_only": True}
+            )
+            plan["sell_orders"][0].update(
+                {"role": "best_quote_reduce_long", "force_reduce_only": True}
+            )
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_owned": True,
+                        "low_pace_since": (now - timedelta(minutes=10)).isoformat(),
+                        "no_fill_since": (now - timedelta(minutes=10)).isoformat(),
+                        "recovery_started_at": (now - timedelta(minutes=6)).isoformat(),
+                        "last_recovery_action_at": (now - timedelta(minutes=4)).isoformat(),
+                        "last_sla_action_at": (now - timedelta(seconds=60)).isoformat(),
+                        "soft_recovery_extension_count": 1,
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_allow_loss_reduce_only": False,
+                            "best_quote_maker_volume_quote_offset_ticks": 1,
+                            "pause_buy_position_notional": 620.0,
+                            "pause_short_position_notional": 620.0,
+                        },
+                        "guard_recovery_controls": {
+                            "best_quote_maker_volume_allow_loss_reduce_only": True,
+                            "best_quote_maker_volume_quote_offset_ticks": 2,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                daily_target_notional=120_000.0,
+                max_recovery_seconds=300,
+                max_soft_recovery_extensions=1,
+                trade_rows=[
+                    {
+                        "id": 1,
+                        "time": int((now - timedelta(minutes=15)).timestamp() * 1000),
+                        "quoteQty": "100",
+                    }
+                ],
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                result["action"],
+                "tighten_exhausted_soft_recovery_one_tick",
+                msg=json.dumps(result, sort_keys=True),
+            )
+            self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 1)
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(state["symbols"]["REUSDT"]["recovery_started_at"], now.isoformat())
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_timed_out_loss_recovery_restores_after_both_sides_clear_original_soft_limits(self) -> None:
         now = datetime(2026, 6, 26, 10, 9, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
