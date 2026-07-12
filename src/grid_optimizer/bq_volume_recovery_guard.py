@@ -1065,6 +1065,21 @@ def _apply_control_update(
     return changed, str(backup_path)
 
 
+def _arx_independent_freeze_policy_updates(
+    *, symbol: str, control: dict[str, Any]
+) -> dict[str, Any]:
+    if symbol.upper().strip() != "ARXUSDT":
+        return {}
+    if not bool(control.get("best_quote_maker_volume_reduce_freeze_enabled")):
+        return {}
+    if not bool(control.get("best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled", True)):
+        return {}
+    return {
+        "best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled": False,
+        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+    }
+
+
 def _default_restart_runner(symbol: str, *, runner_wrapper: str) -> object:
     return subprocess.run([runner_wrapper, "restart", symbol], check=True)
 
@@ -1559,12 +1574,31 @@ def check_symbol(
         )
         * 4.0,
     )
+    arx_freeze_policy_updates = _arx_independent_freeze_policy_updates(
+        symbol=normalized_symbol,
+        control=control,
+    )
 
     try:
         if stale_or_missing and not recovery_timeout_required:
             action = "skip_stale_or_missing_inputs"
         elif not bool(recovery_gate.get("ok")) and not recovery_timeout_required:
             action = "skip_recovery_safety_gate"
+        elif arx_freeze_policy_updates:
+            action = (
+                "dry_run_enable_arx_independent_freeze_first"
+                if dry_run
+                else "enable_arx_independent_freeze_first"
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=arx_freeze_policy_updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
         elif (
             bool(assessment.get("ledger_position_drift_blocked"))
             and _safe_int(assessment.get("active_order_count")) > 0

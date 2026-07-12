@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from grid_optimizer import bq_volume_recovery_guard
 from grid_optimizer.bq_volume_recovery_guard import (
+    _arx_independent_freeze_policy_updates,
     apply_daily_target_pace_floor,
     apply_target_pace_cycle_budget_floor,
     check_symbol,
@@ -34,6 +35,25 @@ def _append_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class BqVolumeRecoveryGuardTests(unittest.TestCase):
+    def test_arx_independent_freeze_policy_only_disables_pair_gate_for_arx(self) -> None:
+        control = {
+            "best_quote_maker_volume_reduce_freeze_enabled": True,
+            "best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled": True,
+            "best_quote_maker_volume_net_loss_reduce_enabled": False,
+        }
+
+        self.assertEqual(
+            _arx_independent_freeze_policy_updates(symbol="ARXUSDT", control=control),
+            {
+                "best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled": False,
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+            },
+        )
+        self.assertEqual(
+            _arx_independent_freeze_policy_updates(symbol="OUSDT", control=control),
+            {},
+        )
+
     def test_main_never_restarts_symbol_after_target_gate_done(self) -> None:
         now = datetime.now(timezone.utc)
         with TemporaryDirectory() as tmpdir:

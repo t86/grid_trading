@@ -7382,6 +7382,79 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["stall_count"], 1)
         self.assertEqual(plan["sell_orders"], [])
 
+    def test_inventory_unlock_release_yields_to_independent_reduce_freeze_candidate(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+        state = {"inventory_unlock_release": {"side": "long", "stall_count": 12}}
+
+        report = apply_inventory_unlock_release(
+            plan=plan,
+            state=state,
+            side="long",
+            entry_paused=True,
+            take_profit_guard={"enabled": True, "long_active": True, "long_floor_price": 1.05},
+            current_qty=2500.0,
+            current_notional=2500.0,
+            pause_notional=2000.0,
+            release_cap_notional=300.0,
+            per_order_notional=120.0,
+            step_price=0.001,
+            tick_size=0.0001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            bid_price=0.998,
+            ask_price=1.0,
+            reduce_freeze_report={
+                "enabled": True,
+                "profitable_pair_gate_enabled": False,
+                "threshold_loss_ratio": 0.01,
+                "long_freeze_threshold_loss_ratio": 0.01,
+                "managed_long_loss_ratio": 0.012,
+                "freeze_entry_pair_gate": {"long": {"allowed_qty": 100.0}},
+            },
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report["reason"], "reduce_freeze_candidate_protected")
+        self.assertTrue(report["reduce_freeze_first"]["active"])
+        self.assertNotIn("inventory_unlock_release", state)
+        self.assertEqual(plan["sell_orders"], [])
+
+    def test_inventory_unlock_release_keeps_paired_freeze_behavior_unchanged(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+        state = {"inventory_unlock_release": {"side": "long", "stall_count": 2}}
+
+        report = apply_inventory_unlock_release(
+            plan=plan,
+            state=state,
+            side="long",
+            entry_paused=True,
+            take_profit_guard={"enabled": True, "long_active": True, "long_floor_price": 1.05},
+            current_qty=2500.0,
+            current_notional=2500.0,
+            pause_notional=2000.0,
+            release_cap_notional=300.0,
+            per_order_notional=120.0,
+            step_price=0.001,
+            tick_size=0.0001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            bid_price=0.998,
+            ask_price=1.0,
+            reduce_freeze_report={
+                "enabled": True,
+                "profitable_pair_gate_enabled": True,
+                "threshold_loss_ratio": 0.01,
+                "managed_long_loss_ratio": 0.012,
+                "freeze_entry_pair_gate": {"long": {"allowed_qty": 100.0}},
+            },
+        )
+
+        self.assertTrue(report["active"])
+        self.assertFalse(report["reduce_freeze_first"]["enabled"])
+        self.assertEqual(plan["sell_orders"][0]["role"], "inventory_unlock_reduce_long")
+
     def test_best_quote_active_pair_reduce_soft_trigger_adds_maker_reduces(self) -> None:
         plan = {"buy_orders": [], "sell_orders": []}
         state: dict[str, object] = {}

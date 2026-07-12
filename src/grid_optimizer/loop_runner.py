@@ -12561,6 +12561,7 @@ def apply_inventory_unlock_release(
     ask_price: float,
     position_side: str = "BOTH",
     confirm_cycles: int = 3,
+    reduce_freeze_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     report = _inventory_unlock_default_report()
     normalized_side = str(side or "").strip().lower()
@@ -12579,6 +12580,51 @@ def apply_inventory_unlock_release(
             "release_cap_notional": safe_cap_notional,
         }
     )
+
+    freeze_report = dict(reduce_freeze_report or {})
+    independent_freeze_first = (
+        bool(freeze_report.get("enabled"))
+        and not bool(freeze_report.get("profitable_pair_gate_enabled", True))
+    )
+    freeze_side = normalized_side.upper()
+    pair_gate = dict(freeze_report.get("freeze_entry_pair_gate") or {})
+    side_gate = dict(pair_gate.get(normalized_side) or {})
+    confirmations = dict(freeze_report.get("confirmations") or {})
+    side_confirmation = confirmations.get(normalized_side)
+    candidate_qty = max(_safe_float(side_gate.get("allowed_qty")), 0.0)
+    side_loss_ratio = max(
+        _safe_float(freeze_report.get(f"managed_{normalized_side}_loss_ratio")),
+        _safe_float((freeze_report.get("dynamic_threshold") or {}).get(f"{normalized_side}_loss_ratio")),
+        0.0,
+    )
+    side_threshold = max(
+        _safe_float(freeze_report.get(f"{normalized_side}_freeze_threshold_loss_ratio")),
+        _safe_float(freeze_report.get("threshold_loss_ratio")),
+        0.0,
+    )
+    freeze_candidate_protected = independent_freeze_first and (
+        candidate_qty > 1e-12
+        or isinstance(side_confirmation, dict)
+        or (side_threshold > 0 and side_loss_ratio >= side_threshold)
+    )
+    report["reduce_freeze_first"] = {
+        "enabled": independent_freeze_first,
+        "active": freeze_candidate_protected,
+        "side": freeze_side if normalized_side in {"long", "short"} else None,
+        "candidate_qty": candidate_qty,
+        "loss_ratio": side_loss_ratio,
+        "threshold_loss_ratio": side_threshold,
+        "confirmation_active": isinstance(side_confirmation, dict),
+        "total_cap_blocked": bool(
+            (freeze_report.get("frozen_total_cap") or {}).get("blocks_new_freeze")
+        ),
+    }
+    if freeze_candidate_protected:
+        existing_state = state.get("inventory_unlock_release")
+        if isinstance(existing_state, dict) and existing_state.get("side") == normalized_side:
+            state.pop("inventory_unlock_release", None)
+        report["reason"] = "reduce_freeze_candidate_protected"
+        return report
 
     existing_state = state.get("inventory_unlock_release")
     runtime_state = dict(existing_state) if isinstance(existing_state, dict) else {}
@@ -20839,6 +20885,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             bid_price=bid_price,
             ask_price=ask_price,
             position_side="LONG" if hedge_best_quote else "BOTH",
+            reduce_freeze_report=best_quote_reduce_freeze,
         )
     elif unlock_short_side:
         inventory_unlock_release = apply_inventory_unlock_release(
@@ -20860,6 +20907,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             bid_price=bid_price,
             ask_price=ask_price,
             position_side="SHORT" if hedge_best_quote else "BOTH",
+            reduce_freeze_report=best_quote_reduce_freeze,
         )
     else:
         state.pop("inventory_unlock_release", None)
