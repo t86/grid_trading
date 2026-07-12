@@ -2940,7 +2940,13 @@ def check_symbol(
             and sla_recovery_due
             and target_pace_behind
             and (no_fill_seconds >= 180.0 or pace_ratio < 0.5)
-            and not confirmed_loss_reduce_wear
+            and (
+                not confirmed_loss_reduce_wear
+                or (
+                    _safe_float(assessment.get("inventory_notional_gap")) >= 150.0
+                    and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+                )
+            )
             and not bool(assessment.get("inventory_soft_pressure"))
             and not bool(assessment.get("near_cap"))
             and anti_chase_blocks_missing_entry_leg
