@@ -2029,7 +2029,7 @@ def check_symbol(
                 _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) > 0
                 or _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0
                 or _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
-                > loss_reduce_cycle_budget_cap
+                != loss_reduce_cycle_budget_cap
             )
         ):
             updates = {

@@ -1062,7 +1062,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 now=now,
                 control={
                     "best_quote_maker_volume_allow_loss_reduce_only": True,
-                    "best_quote_maker_volume_cycle_budget_notional": 144.0,
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
                     "best_quote_maker_volume_quote_offset_ticks": 1,
                     "sticky_entry_price_tolerance_steps": 8.0,
                     "pause_buy_position_notional": 620.0,
@@ -1959,7 +1959,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             trade_rows = [
                 {
                     "id": 1,
-                    "time": int((now - timedelta(minutes=4)).timestamp() * 1000),
+                    "time": int((now - timedelta(minutes=2)).timestamp() * 1000),
                     "quoteQty": "200",
                     "realizedPnl": "-0.02",
                 }
