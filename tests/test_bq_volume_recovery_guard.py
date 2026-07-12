@@ -1005,6 +1005,54 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_recent_sla_action_prevents_immediate_loss_reduce_offset_reversal(self) -> None:
+        now = datetime(2026, 7, 12, 7, 53, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_quote_offset_ticks": 0,
+                    "sticky_entry_price_tolerance_steps": 1.0,
+                    "pause_buy_position_notional": 620.0,
+                    "pause_short_position_notional": 620.0,
+                },
+                long_notional=648.0,
+                short_notional=526.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+                recent_trade_notional=20.0,
+            )
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state={
+                    "symbols": {
+                        "REUSDT": {
+                            "last_sla_action_at": (now - timedelta(seconds=60)).isoformat(),
+                        }
+                    }
+                },
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=0,
+                loss_reduce_quote_offset_extra_ticks=1,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertNotEqual(result["action"], "add_loss_reduce_offset_for_wear")
+            self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 0)
+            self.assertEqual(restarts, [])
+
     def test_no_fill_sla_pulls_bounded_loss_reduce_to_best_quote(self) -> None:
         now = datetime(2026, 7, 12, 7, 52, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

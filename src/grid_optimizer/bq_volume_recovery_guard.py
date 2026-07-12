@@ -1975,6 +1975,7 @@ def check_symbol(
             bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and effective_inventory_soft_pressure
             and not sla_recovery_due
+            and not sla_action_debounced
             and loss_reduce_quote_offset_extra_ticks > 0
             and not bool(assessment.get("dynamic_quote_offset_applied"))
             and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks"))
@@ -2034,10 +2035,7 @@ def check_symbol(
             updates = {
                 "best_quote_maker_volume_allow_loss_reduce_only": True,
                 "best_quote_maker_volume_net_loss_reduce_enabled": False,
-                "best_quote_maker_volume_cycle_budget_notional": min(
-                    _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional")),
-                    loss_reduce_cycle_budget_cap,
-                ),
+                "best_quote_maker_volume_cycle_budget_notional": loss_reduce_cycle_budget_cap,
                 "best_quote_maker_volume_quote_offset_ticks": 0,
                 "sticky_entry_price_tolerance_steps": 1.0,
             }
