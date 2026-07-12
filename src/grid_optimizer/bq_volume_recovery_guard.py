@@ -19,9 +19,12 @@ CorruptStateExchangeFetcher = Callable[[str], dict[str, Any]]
 _RECOVERY_CONTROL_KEYS = (
     "best_quote_maker_volume_allow_loss_reduce_only",
     "best_quote_maker_volume_active_pair_reduce_enabled",
+    "best_quote_maker_volume_active_pair_reduce_order_notional",
+    "best_quote_maker_volume_active_pair_reduce_max_notional_per_side",
     "best_quote_maker_volume_inventory_cost_gate_enabled",
     "best_quote_maker_volume_inventory_bias_min_notional_gap",
     "best_quote_maker_volume_inventory_bias_reduce_share",
+    "best_quote_maker_volume_inventory_soft_ratio",
     "best_quote_maker_volume_cycle_budget_notional",
     "best_quote_maker_volume_quote_offset_ticks",
     "best_quote_maker_volume_same_side_entry_price_guard_min_notional",
@@ -740,6 +743,44 @@ def _loss_reduce_recovery_updates(
         updates["best_quote_maker_volume_cycle_budget_notional"] = loss_reduce_budget_floor
     elif loss_reduce_budget_cap > 0 and current_budget > loss_reduce_budget_cap:
         updates["best_quote_maker_volume_cycle_budget_notional"] = loss_reduce_budget_cap
+    effective_budget = current_budget
+    if loss_reduce_budget_cap > 0:
+        effective_budget = min(effective_budget, loss_reduce_budget_cap)
+    pair_order_notional = max(
+        per_order,
+        _safe_float(control.get("best_quote_maker_volume_active_pair_reduce_order_notional")),
+    )
+    pair_max_notional = max(
+        pair_order_notional,
+        effective_budget * 0.5,
+        _safe_float(
+            control.get("best_quote_maker_volume_active_pair_reduce_max_notional_per_side")
+        ),
+    )
+    if pair_order_notional > 0:
+        updates.update(
+            {
+                "best_quote_maker_volume_active_pair_reduce_enabled": True,
+                "best_quote_maker_volume_active_pair_reduce_order_notional": pair_order_notional,
+                "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": pair_max_notional,
+            }
+        )
+    soft_ratio_candidates: list[float] = []
+    for baseline, max_key in (
+        (pause_baseline_long_notional, "max_long_notional"),
+        (pause_baseline_short_notional, "max_short_notional"),
+    ):
+        max_notional = max(_safe_float(assessment.get(max_key)), 0.0)
+        if baseline > 0 and max_notional > 0:
+            soft_ratio_candidates.append(min(float(baseline) / max_notional, 1.0))
+    if soft_ratio_candidates:
+        current_soft_ratio = max(
+            _safe_float(control.get("best_quote_maker_volume_inventory_soft_ratio")),
+            0.0,
+        )
+        target_soft_ratio = min(soft_ratio_candidates)
+        if current_soft_ratio <= 0 or target_soft_ratio < current_soft_ratio:
+            updates["best_quote_maker_volume_inventory_soft_ratio"] = target_soft_ratio
     buffer_notional = max(_safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")), 0.0)
     if buffer_notional <= 0:
         return updates

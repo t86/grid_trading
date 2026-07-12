@@ -1759,6 +1759,44 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(updates["pause_buy_position_notional"], 701.0)
         self.assertEqual(updates["pause_short_position_notional"], 620.0)
 
+    def test_loss_reduce_uses_pair_reducer_and_aligns_soft_to_pause(self) -> None:
+        updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
+            control={
+                "best_quote_maker_volume_allow_loss_reduce_only": False,
+                "best_quote_maker_volume_cycle_budget_notional": 400.0,
+                "best_quote_maker_volume_min_cycle_budget_notional": 120.0,
+                "best_quote_maker_volume_inventory_soft_ratio": 0.95,
+                "best_quote_maker_volume_active_pair_reduce_enabled": False,
+                "best_quote_maker_volume_active_pair_reduce_order_notional": 24.0,
+                "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 48.0,
+                "per_order_notional": 50.0,
+                "pause_buy_position_notional": 1000.0,
+                "pause_short_position_notional": 1000.0,
+            },
+            assessment={
+                "current_long_notional": 1150.0,
+                "current_short_notional": 1120.0,
+                "max_long_notional": 1350.0,
+                "max_short_notional": 1350.0,
+            },
+            pause_baseline_long_notional=1000.0,
+            pause_baseline_short_notional=1000.0,
+        )
+
+        self.assertTrue(updates["best_quote_maker_volume_active_pair_reduce_enabled"])
+        self.assertEqual(
+            updates["best_quote_maker_volume_active_pair_reduce_order_notional"],
+            50.0,
+        )
+        self.assertEqual(
+            updates["best_quote_maker_volume_active_pair_reduce_max_notional_per_side"],
+            100.0,
+        )
+        self.assertAlmostEqual(
+            updates["best_quote_maker_volume_inventory_soft_ratio"],
+            1000.0 / 1350.0,
+        )
+
     def test_loss_reduce_does_not_stack_offset_on_dynamic_widening(self) -> None:
         updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
             control={
