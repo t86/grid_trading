@@ -4261,6 +4261,8 @@ def check_symbol(
                     action = "hold_effective_near_market_flow"
                 elif require_soft_pressure_for_allow_loss and not effective_inventory_soft_pressure:
                     action = "hold_low_volume_without_soft_pressure"
+                elif confirmed_loss_reduce_wear:
+                    action = "hold_confirmed_wear_without_loss_reduce"
                 else:
                     updates = _loss_reduce_recovery_updates(
                         control=control,
@@ -4311,9 +4313,12 @@ def check_symbol(
                     )
                     chosen_action = "disable_inventory_cost_gate"
                 elif (
+                    not confirmed_loss_reduce_wear
+                    and (
                     effective_inventory_soft_pressure
                     or bool(assessment.get("volatility_inventory_reduce_deadlock"))
                     or not require_soft_pressure_for_allow_loss
+                    )
                 ):
                     updates = _loss_reduce_recovery_updates(
                         control=control,
