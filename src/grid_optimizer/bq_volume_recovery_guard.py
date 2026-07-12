@@ -4557,6 +4557,7 @@ def check_symbol(
             and pace_ratio < 0.75
             and not recovery_reapply_debounced
             and not high_recovery_wear
+            and not confirmed_loss_reduce_wear
             and effective_inventory_soft_pressure
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and _safe_int(assessment.get("planned_reduce_only_order_count")) > 0
