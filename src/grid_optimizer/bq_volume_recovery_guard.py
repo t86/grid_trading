@@ -730,6 +730,20 @@ def _order_is_reduce_only(order: dict[str, Any]) -> bool:
     return "reduce" in role
 
 
+def _order_reduce_position_side(order: dict[str, Any]) -> str:
+    if not _order_is_reduce_only(order):
+        return ""
+    position_side = str(order.get("position_side") or order.get("positionSide") or "").upper().strip()
+    if position_side in {"LONG", "SHORT"}:
+        return position_side
+    role = str(order.get("role") or order.get("execution_type") or "").lower()
+    if "reduce_long" in role:
+        return "LONG"
+    if "reduce_short" in role:
+        return "SHORT"
+    return ""
+
+
 def _active_order_count(plan: dict[str, Any], submit: dict[str, Any]) -> int:
     observed = (
         submit.get("observed_strategy_open_order_state", {})
@@ -817,6 +831,12 @@ def assess_symbol(
     reduce_only_orders = [item for item in orders if _order_is_reduce_only(item)]
     entry_orders = [item for item in orders if not _order_is_reduce_only(item)]
     reduce_only_order_count = len(reduce_only_orders)
+    reduce_long_order_count = sum(
+        1 for item in reduce_only_orders if _order_reduce_position_side(item) == "LONG"
+    )
+    reduce_short_order_count = sum(
+        1 for item in reduce_only_orders if _order_reduce_position_side(item) == "SHORT"
+    )
     entry_order_count = len(entry_orders)
     reduce_only_only = bool(orders) and entry_order_count == 0
     near_orders = [
@@ -967,6 +987,8 @@ def assess_symbol(
         "planned_order_count": len(orders),
         "planned_entry_order_count": entry_order_count,
         "planned_reduce_only_order_count": reduce_only_order_count,
+        "planned_reduce_long_order_count": reduce_long_order_count,
+        "planned_reduce_short_order_count": reduce_short_order_count,
         "planned_reduce_only_only": reduce_only_only,
         "near_market_order_count": len(near_orders),
         "near_market_entry_order_count": len(near_entry_orders),
@@ -1612,6 +1634,73 @@ def check_symbol(
                 "dry_run_correct_loss_reduce_to_dominant_side"
                 if dry_run
                 else "correct_loss_reduce_to_dominant_side"
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif (
+            bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and recovery_low_volume
+            and effective_inventory_soft_pressure
+            and max(
+                _safe_float(assessment.get("current_long_notional")),
+                _safe_float(assessment.get("current_short_notional")),
+            )
+            > min(
+                _safe_float(assessment.get("current_long_notional")),
+                _safe_float(assessment.get("current_short_notional")),
+            )
+            * 2.0
+            and (
+                (
+                    _safe_float(assessment.get("current_long_notional"))
+                    > _safe_float(assessment.get("long_soft_limit_notional"))
+                    and _safe_int(assessment.get("planned_reduce_long_order_count")) <= 0
+                )
+                or (
+                    _safe_float(assessment.get("current_short_notional"))
+                    > _safe_float(assessment.get("short_soft_limit_notional"))
+                    and _safe_int(assessment.get("planned_reduce_short_order_count")) <= 0
+                )
+            )
+            and "best_quote_maker_volume_inventory_bias_reduce_share" in control
+            and _safe_float(control.get("best_quote_maker_volume_inventory_bias_reduce_share")) < 0.25
+            and not bool(assessment.get("volatility_entry_pause_active"))
+        ):
+            updates = {
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "best_quote_maker_volume_inventory_bias_reduce_share": 0.25,
+            }
+            if (
+                loss_reduce_quote_offset_extra_ticks > 0
+                and not bool(assessment.get("dynamic_quote_offset_applied"))
+                and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks"))
+                < int(loss_reduce_quote_offset_extra_ticks)
+            ):
+                updates["best_quote_maker_volume_quote_offset_ticks"] = int(
+                    loss_reduce_quote_offset_extra_ticks
+                )
+            _remember_recovery_controls(item, control, tuple(updates))
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_enable_dominant_leg_reduce_share_for_wrong_way_recovery"
+                if dry_run
+                else "enable_dominant_leg_reduce_share_for_wrong_way_recovery"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
             )
             changed, backup_path = _apply_control_update(
                 symbol=normalized_symbol,
