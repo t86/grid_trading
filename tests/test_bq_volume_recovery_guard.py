@@ -704,6 +704,97 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertTrue(result["inactive_restart_gate"]["ok"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_loss_reduce_pause_threshold_never_becomes_zero(self) -> None:
+        updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
+            control={
+                "best_quote_maker_volume_allow_loss_reduce_only": False,
+                "best_quote_maker_volume_min_cycle_budget_notional": 72.0,
+                "best_quote_maker_volume_cycle_budget_notional": 120.0,
+                "per_order_notional": 50.0,
+                "pause_buy_position_notional": 380.0,
+                "pause_short_position_notional": 380.0,
+            },
+            assessment={
+                "current_long_notional": 0.0,
+                "current_short_notional": 32.0,
+                "max_long_notional": 1350.0,
+                "max_short_notional": 1350.0,
+            },
+            pause_baseline_long_notional=380.0,
+            pause_baseline_short_notional=380.0,
+        )
+
+        self.assertEqual(updates["pause_short_position_notional"], 1.0)
+
+    def test_inactive_runner_repairs_recovery_owned_zero_pause_with_live_gate(self) -> None:
+        now = datetime(2026, 7, 12, 18, 30, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now - timedelta(minutes=10),
+                control={
+                    "run_start_time": (now - timedelta(hours=1)).isoformat(),
+                    "run_end_time": (now + timedelta(hours=1)).isoformat(),
+                    "pause_buy_position_notional": 380.0,
+                    "pause_short_position_notional": 0.0,
+                },
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 100.0,
+                    "actual_short_notional": 200.0,
+                }
+            }
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "first_inactive_at": (now - timedelta(minutes=5)).isoformat(),
+                        "recovery_owned": True,
+                        "guard_original_controls": {
+                            "pause_buy_position_notional": 380.0,
+                            "pause_short_position_notional": 380.0,
+                        },
+                        "last_assessment": {
+                            "ledger_position_drift_threshold_notional": 270.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = recover_inactive_runner(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                trigger_seconds=120,
+                restart_cooldown_seconds=600,
+                max_snapshot_age_seconds=300,
+                runner_wrapper="/usr/local/bin/grid-saved-runner",
+                dry_run=False,
+                restart_runner=restarts.append,
+                exchange_snapshot_fetcher=lambda _symbol: {
+                    "open_order_count": 0,
+                    "long_notional": 105.0,
+                    "short_notional": 205.0,
+                },
+            )
+
+            self.assertEqual(result["action"], "repair_invalid_recovery_pause_and_restart")
+            self.assertTrue(result["invalid_control_live_gate"]["ok"])
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(control["pause_short_position_notional"], 380.0)
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_inactive_runner_does_not_restart_outside_run_window(self) -> None:
         now = datetime(2026, 6, 26, 7, 0, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

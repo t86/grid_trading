@@ -806,7 +806,7 @@ def _loss_reduce_recovery_updates(
                 updates[pause_key] = baseline
             continue
         current_notional = max(_safe_float(assessment.get(current_key)), 0.0)
-        recovery_pause = max(current_notional - buffer_notional, 0.0)
+        recovery_pause = max(current_notional - buffer_notional, 1.0)
         if current_notional > 0 and _safe_float(control.get(pause_key)) > recovery_pause:
             updates[pause_key] = recovery_pause
     return updates
@@ -1511,6 +1511,7 @@ def recover_inactive_runner(
     runner_wrapper: str,
     dry_run: bool,
     restart_runner: RestartRunner | None = None,
+    exchange_snapshot_fetcher: CorruptStateExchangeFetcher | None = None,
 ) -> dict[str, Any]:
     normalized_symbol = symbol.upper().strip()
     output_dir = Path(output_dir)
@@ -1523,9 +1524,12 @@ def recover_inactive_runner(
             "last_inactive_at": now.isoformat(),
         }
     )
+    control_path = _control_path(output_dir, normalized_symbol)
+    control = _read_json(control_path)
+    plan = _read_json(_plan_path(output_dir, normalized_symbol))
     gate = _inactive_restart_gate(
-        control=_read_json(_control_path(output_dir, normalized_symbol)),
-        plan=_read_json(_plan_path(output_dir, normalized_symbol)),
+        control=control,
+        plan=plan,
         submit=_read_json(_submit_path(output_dir, normalized_symbol)),
         now=now,
         max_snapshot_age_seconds=max_snapshot_age_seconds,
@@ -1533,6 +1537,90 @@ def recover_inactive_runner(
     item["inactive_gate_reasons"] = list(gate["reasons"])
     action = "wait_runner_inactive_confirmation"
     restart_failed: str | None = None
+
+    original_controls = item.get("guard_original_controls")
+    invalid_pause_updates: dict[str, Any] = {}
+    if bool(item.get("recovery_owned")) and isinstance(original_controls, dict):
+        for key in ("pause_buy_position_notional", "pause_short_position_notional"):
+            baseline = _safe_float(original_controls.get(key))
+            if _safe_float(control.get(key)) <= 0 and baseline > 0:
+                invalid_pause_updates[key] = baseline
+    stale_only = set(gate["reasons"]).issubset(
+        {"latest_plan_stale", "latest_submit_stale"}
+    )
+    invalid_control_live_gate: dict[str, Any] | None = None
+    if invalid_pause_updates and stale_only:
+        try:
+            exchange = (exchange_snapshot_fetcher or _fetch_corrupt_state_exchange_snapshot)(
+                normalized_symbol
+            )
+        except Exception as exc:
+            exchange = {}
+            invalid_control_live_gate = {"ok": False, "error": str(exc)[:240]}
+        if invalid_control_live_gate is None:
+            best_quote = plan.get("best_quote_maker_volume")
+            reduce_freeze = (
+                best_quote.get("reduce_freeze") if isinstance(best_quote, dict) else {}
+            )
+            expected_long = _safe_float(reduce_freeze.get("actual_long_notional"))
+            expected_short = _safe_float(reduce_freeze.get("actual_short_notional"))
+            position_drift = abs(
+                _safe_float(exchange.get("long_notional")) - expected_long
+            ) + abs(_safe_float(exchange.get("short_notional")) - expected_short)
+            drift_threshold = max(
+                _safe_float(
+                    (item.get("last_assessment") or {}).get(
+                        "ledger_position_drift_threshold_notional"
+                    )
+                ),
+                100.0,
+            )
+            invalid_control_live_gate = {
+                "ok": _safe_int(exchange.get("open_order_count"), -1) == 0
+                and position_drift <= drift_threshold,
+                "open_order_count": _safe_int(exchange.get("open_order_count"), -1),
+                "position_drift_notional": position_drift,
+                "position_drift_threshold_notional": drift_threshold,
+            }
+    if invalid_pause_updates and invalid_control_live_gate and invalid_control_live_gate["ok"]:
+        restart = restart_runner or (
+            lambda item_symbol: _default_restart_runner(
+                item_symbol, runner_wrapper=runner_wrapper
+            )
+        )
+        if dry_run:
+            action = "dry_run_repair_invalid_recovery_pause_and_restart"
+            changed = list(invalid_pause_updates)
+            backup_path = None
+        else:
+            try:
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=invalid_pause_updates,
+                    now=now,
+                    dry_run=False,
+                    restart_runner=restart,
+                )
+                action = "repair_invalid_recovery_pause_and_restart"
+                item["last_inactive_restart_at"] = now.isoformat()
+                item["status"] = "runner_restart_requested"
+            except subprocess.CalledProcessError as exc:
+                changed, backup_path = list(invalid_pause_updates), None
+                action = "repair_invalid_recovery_pause_restart_failed"
+                restart_failed = str(exc)
+        return {
+            "symbol": normalized_symbol,
+            "action": action,
+            "changed_keys": changed,
+            "backup_path": backup_path,
+            "dry_run": dry_run,
+            "restart_failed": restart_failed,
+            "inactive_seconds": elapsed,
+            "inactive_restart_gate": gate,
+            "invalid_control_live_gate": invalid_control_live_gate,
+        }
 
     last_restart_at = _parse_time(item.get("last_inactive_restart_at"))
     restart_cooldown_active = (
