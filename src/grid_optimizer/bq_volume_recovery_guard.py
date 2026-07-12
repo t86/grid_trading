@@ -3873,13 +3873,36 @@ def check_symbol(
                     target_budget_floor,
                     current_budget + max(float(volume_recovery_cycle_budget_increment), 0.0),
                 )
+                current_long = _safe_float(assessment.get("current_long_notional"))
+                current_short = _safe_float(assessment.get("current_short_notional"))
+                dominant_side_reduce_present = (
+                    current_long > current_short
+                    and _safe_int(assessment.get("planned_reduce_long_order_count")) > 0
+                ) or (
+                    current_short > current_long
+                    and _safe_int(assessment.get("planned_reduce_short_order_count")) > 0
+                )
+                cap_pressure_balancing_flow = (
+                    bool(assessment.get("balancing_entry_only"))
+                    and dominant_side_reduce_present
+                    and _safe_int(assessment.get("near_market_entry_order_count")) > 0
+                    and _safe_int(assessment.get("near_market_reduce_only_order_count")) > 0
+                )
                 if (
                     target_pace_behind
                     and not recovery_reapply_debounced
                     and not high_recovery_wear
                     and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
-                    and bool(assessment.get("planned_reduce_only_only"))
-                    and _safe_int(assessment.get("near_market_reduce_only_order_count")) > 0
+                    and (
+                        (
+                            bool(assessment.get("planned_reduce_only_only"))
+                            and _safe_int(
+                                assessment.get("near_market_reduce_only_order_count")
+                            )
+                            > 0
+                        )
+                        or cap_pressure_balancing_flow
+                    )
                     and target_budget > current_budget
                 ):
                     updates = {
@@ -3893,7 +3916,11 @@ def check_symbol(
                     )
                     _remember_recovery_updates(item, updates)
                     action = (
-                        "dry_run_raise_cap_pressure_reduce_budget_for_pace"
+                        "dry_run_raise_cap_pressure_balancing_budget_for_pace"
+                        if dry_run and cap_pressure_balancing_flow
+                        else "raise_cap_pressure_balancing_budget_for_pace"
+                        if cap_pressure_balancing_flow
+                        else "dry_run_raise_cap_pressure_reduce_budget_for_pace"
                         if dry_run
                         else "raise_cap_pressure_reduce_budget_for_pace"
                     )
