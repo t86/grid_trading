@@ -648,7 +648,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertIn("no_active_orders", result["assessment"]["reasons"])
             self.assertTrue(result["assessment"]["low_volume"])
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
-            self.assertEqual(control["pause_buy_position_notional"], 476.0)
+            self.assertEqual(control["pause_buy_position_notional"], 900.0)
             self.assertEqual(control["pause_short_position_notional"], 526.0)
             self.assertEqual(restarts, ["REUSDT"])
 
@@ -923,6 +923,25 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             quote_offset_extra_ticks=1,
         )
         self.assertNotIn("best_quote_maker_volume_quote_offset_ticks", already_active)
+
+    def test_loss_reduce_only_lowers_dominant_leg_pause(self) -> None:
+        updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
+            control={
+                "best_quote_maker_volume_allow_loss_reduce_only": False,
+                "best_quote_maker_volume_min_cycle_budget_notional": 24.0,
+                "pause_buy_position_notional": 740.0,
+                "pause_short_position_notional": 144.0,
+            },
+            assessment={
+                "current_long_notional": 725.0,
+                "current_short_notional": 168.0,
+            },
+            pause_baseline_long_notional=620.0,
+            pause_baseline_short_notional=620.0,
+        )
+
+        self.assertEqual(updates["pause_buy_position_notional"], 701.0)
+        self.assertEqual(updates["pause_short_position_notional"], 620.0)
 
     def test_dry_run_reports_recovery_without_mutating_control(self) -> None:
         now = datetime(2026, 6, 26, 7, 20, tzinfo=timezone.utc)

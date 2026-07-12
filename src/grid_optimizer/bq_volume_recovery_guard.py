@@ -532,6 +532,8 @@ def _loss_reduce_recovery_updates(
     assessment: dict[str, Any],
     static_cycle_budget_floor_notional: float = 0.0,
     quote_offset_extra_ticks: int = 0,
+    pause_baseline_long_notional: float = 0.0,
+    pause_baseline_short_notional: float = 0.0,
 ) -> dict[str, Any]:
     updates: dict[str, Any] = {
         "best_quote_maker_volume_net_loss_reduce_enabled": False,
@@ -554,11 +556,23 @@ def _loss_reduce_recovery_updates(
     buffer_notional = max(_safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")), 0.0)
     if buffer_notional <= 0:
         return updates
-    for current_key, pause_key in (
-        ("current_long_notional", "pause_buy_position_notional"),
-        ("current_short_notional", "pause_short_position_notional"),
+    current_long = max(_safe_float(assessment.get("current_long_notional")), 0.0)
+    current_short = max(_safe_float(assessment.get("current_short_notional")), 0.0)
+    if current_long > current_short + buffer_notional:
+        reducible_sides = {"LONG"}
+    elif current_short > current_long + buffer_notional:
+        reducible_sides = {"SHORT"}
+    else:
+        reducible_sides = {"LONG", "SHORT"}
+    for side, current_key, pause_key, baseline in (
+        ("LONG", "current_long_notional", "pause_buy_position_notional", pause_baseline_long_notional),
+        ("SHORT", "current_short_notional", "pause_short_position_notional", pause_baseline_short_notional),
     ):
         if pause_key not in control:
+            continue
+        if side not in reducible_sides:
+            if baseline > 0 and _safe_float(control.get(pause_key)) < baseline:
+                updates[pause_key] = baseline
             continue
         current_notional = max(_safe_float(assessment.get(current_key)), 0.0)
         recovery_pause = max(current_notional - buffer_notional, 0.0)
@@ -1414,6 +1428,32 @@ def check_symbol(
         ):
             if baseline > 0 and _safe_float(control.get(key)) < baseline:
                 pause_baseline_updates[key] = baseline
+    directional_loss_reduce_pause_updates: dict[str, Any] = {}
+    if bool(control.get("best_quote_maker_volume_allow_loss_reduce_only")):
+        current_long = max(_safe_float(assessment.get("current_long_notional")), 0.0)
+        current_short = max(_safe_float(assessment.get("current_short_notional")), 0.0)
+        direction_buffer = max(
+            _safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")),
+            1.0,
+        )
+        if current_long > current_short + direction_buffer:
+            if (
+                pause_baseline_short_notional > 0
+                and _safe_float(control.get("pause_short_position_notional"))
+                < pause_baseline_short_notional
+            ):
+                directional_loss_reduce_pause_updates["pause_short_position_notional"] = (
+                    pause_baseline_short_notional
+                )
+        elif current_short > current_long + direction_buffer:
+            if (
+                pause_baseline_long_notional > 0
+                and _safe_float(control.get("pause_buy_position_notional"))
+                < pause_baseline_long_notional
+            ):
+                directional_loss_reduce_pause_updates["pause_buy_position_notional"] = (
+                    pause_baseline_long_notional
+                )
     loss_reduce_cycle_budget_cap = max(
         static_cycle_budget_floor_notional,
         max(
@@ -1503,6 +1543,25 @@ def check_symbol(
                 "dry_run_restore_pause_baseline_after_recovery_drift"
                 if dry_run
                 else "restore_pause_baseline_after_recovery_drift"
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif directional_loss_reduce_pause_updates:
+            updates = {
+                **directional_loss_reduce_pause_updates,
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+            }
+            action = (
+                "dry_run_correct_loss_reduce_to_dominant_side"
+                if dry_run
+                else "correct_loss_reduce_to_dominant_side"
             )
             changed, backup_path = _apply_control_update(
                 symbol=normalized_symbol,
@@ -1703,6 +1762,8 @@ def check_symbol(
                 assessment=assessment,
                 static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
                 quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
+                pause_baseline_long_notional=pause_baseline_long_notional,
+                pause_baseline_short_notional=pause_baseline_short_notional,
             )
             _remember_recovery_controls(
                 item,
@@ -1778,6 +1839,8 @@ def check_symbol(
                     assessment=assessment,
                     static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
                     quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
+                    pause_baseline_long_notional=pause_baseline_long_notional,
+                    pause_baseline_short_notional=pause_baseline_short_notional,
                 )
                 _remember_recovery_controls(
                     item,
@@ -2411,6 +2474,8 @@ def check_symbol(
                     assessment=assessment,
                     static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
                     quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
+                    pause_baseline_long_notional=pause_baseline_long_notional,
+                    pause_baseline_short_notional=pause_baseline_short_notional,
                 )
                 _remember_recovery_controls(
                     item,
@@ -2606,6 +2671,8 @@ def check_symbol(
                         assessment=assessment,
                         static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
                         quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
+                        pause_baseline_long_notional=pause_baseline_long_notional,
+                        pause_baseline_short_notional=pause_baseline_short_notional,
                     )
                     _remember_recovery_controls(
                         item,
@@ -2657,6 +2724,8 @@ def check_symbol(
                         assessment=assessment,
                         static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
                         quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
+                        pause_baseline_long_notional=pause_baseline_long_notional,
+                        pause_baseline_short_notional=pause_baseline_short_notional,
                     )
                     _remember_recovery_controls(
                         item,
