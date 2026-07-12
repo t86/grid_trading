@@ -1638,6 +1638,47 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["band_budget"]["short"]["min_price"], 0.5)
         self.assertEqual(state["best_quote_frozen_inventory"]["short_lots"], [])
 
+    def test_best_quote_reduce_freeze_band_budget_supports_low_price_symbols(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_volume_ledger": {
+                "long_lots": [{"qty": 1_000.0, "price": 0.182}],
+                "long_qty": 1_000.0,
+                "long_avg_price": 0.182,
+                "initialized": True,
+            },
+        }
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=1_000.0,
+            current_short_qty=0.0,
+            current_long_avg_price=0.182,
+            current_short_avg_price=0.0,
+            mid_price=0.178,
+            bq_ledger_report=state["best_quote_volume_ledger"],
+        )
+
+        report = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [{"role": "best_quote_reduce_long"}], "buy_orders": []},
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=6.0,
+            current_long_qty=1_000.0,
+            current_short_qty=0.0,
+            current_long_avg_price=0.182,
+            current_short_avg_price=0.0,
+            mid_price=0.178,
+            bq_ledger_report=state["best_quote_volume_ledger"],
+            band_budget_enabled=True,
+            band_budget_price_ratio=0.1,
+            band_budget_base_notional=100.0,
+        )
+
+        self.assertTrue(report["applied"])
+        self.assertGreater(report["frozen_long_notional"], 0.0)
+        self.assertIsNone(report["band_budget"]["long"]["blocked_reason"])
+
     def test_best_quote_freeze_band_budget_revolves_with_active_qty(self) -> None:
         # Regression: band budget is occupied by the qty CURRENTLY frozen in the band
         # (active_frozen_qty), not the cumulative-ever-frozen counter. A band whose
