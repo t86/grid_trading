@@ -2874,9 +2874,17 @@ def check_symbol(
                     effective_inventory_soft_pressure
                     or (
                         sla_recovery_due
-                        and _safe_int(assessment.get("active_order_count")) <= 0
-                        and _safe_int(assessment.get("planned_order_count")) <= 0
                         and bool(assessment.get("inventory_soft_pressure"))
+                        and (
+                            (
+                                _safe_int(assessment.get("active_order_count")) <= 0
+                                and _safe_int(assessment.get("planned_order_count")) <= 0
+                            )
+                            or (
+                                bool(assessment.get("planned_reduce_only_only"))
+                                and no_fill_seconds >= max(float(trigger_seconds), 0.0)
+                            )
+                        )
                     )
                 )
                 and recovery_hold_satisfied
