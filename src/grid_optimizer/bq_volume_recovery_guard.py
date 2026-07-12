@@ -2466,6 +2466,7 @@ def check_symbol(
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and not effective_inventory_soft_pressure
             and not bool(assessment.get("inventory_soft_pressure"))
+            and not bool(assessment.get("balancing_budget_raise_safe"))
             and (
                 _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
                 > wear_backoff_floor
