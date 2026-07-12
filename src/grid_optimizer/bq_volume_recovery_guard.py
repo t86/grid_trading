@@ -1303,6 +1303,7 @@ def _arx_independent_freeze_policy_updates(
     }
     if temporary_anti_chase_relief:
         expected.pop("best_quote_maker_volume_same_side_entry_price_guard_min_notional")
+        expected.pop("best_quote_maker_volume_same_side_entry_price_guard_gap_ticks")
     return {key: value for key, value in expected.items() if control.get(key) != value}
 
 
@@ -2971,11 +2972,13 @@ def check_symbol(
                 )
             )
             if target_gate > current_gate:
+                gap_key = "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks"
                 updates = {
                     "best_quote_maker_volume_net_loss_reduce_enabled": False,
                     key: target_gate,
+                    gap_key: 0,
                 }
-                _remember_recovery_controls(item, control, (key,))
+                _remember_recovery_controls(item, control, (key, gap_key))
                 _remember_recovery_updates(item, updates)
                 action = (
                     "dry_run_relax_arx_v3_anti_chase_for_missing_entry_leg"
@@ -4042,11 +4045,13 @@ def check_symbol(
                 target_gate = float(ceil(target_gate))
                 if target_gate > current_gate:
                     key = "best_quote_maker_volume_same_side_entry_price_guard_min_notional"
+                    gap_key = "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks"
                     updates = {
                         "best_quote_maker_volume_net_loss_reduce_enabled": False,
                         key: target_gate,
+                        gap_key: 0,
                     }
-                    _remember_recovery_controls(item, control, (key,))
+                    _remember_recovery_controls(item, control, (key, gap_key))
                     _remember_recovery_updates(item, updates)
                     action = (
                         "dry_run_relax_arx_v3_anti_chase_for_no_fill_sla"

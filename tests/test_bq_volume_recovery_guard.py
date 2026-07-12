@@ -6209,6 +6209,10 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 control["best_quote_maker_volume_same_side_entry_price_guard_min_notional"],
                 353.0,
             )
+            self.assertEqual(
+                control["best_quote_maker_volume_same_side_entry_price_guard_gap_ticks"],
+                0,
+            )
             self.assertEqual(restarts, ["ARXUSDT"])
 
 
