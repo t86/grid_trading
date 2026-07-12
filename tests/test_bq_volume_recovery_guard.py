@@ -341,6 +341,53 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 "skip_corrupt_state_recovery_safety_gate",
             )
 
+    def test_main_restarts_runner_after_live_validated_state_salvage(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            stdout = StringIO()
+            corrupt_result = {
+                "symbol": "OUSDT",
+                "action": "salvage_corrupt_state_applied_trade_fill_keys",
+                "changed_keys": [],
+                "backup_path": None,
+                "dry_run": False,
+                "restart_failed": None,
+                "safe_restart_after_salvage": True,
+                "state_corruption": {"blocking_reasons": []},
+            }
+            with (
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_corrupt_loop_state",
+                    return_value=corrupt_result,
+                ),
+                patch.object(bq_volume_recovery_guard, "_runner_is_active", return_value=False),
+                patch.object(bq_volume_recovery_guard, "_default_restart_runner") as restart_runner,
+                redirect_stdout(stdout),
+            ):
+                exit_code = bq_volume_recovery_guard.main(
+                    [
+                        "--output-dir",
+                        str(output_dir),
+                        "--state-path",
+                        str(output_dir / "guard_state.json"),
+                        "--runner-wrapper",
+                        "/usr/local/bin/test-wrapper",
+                        "--symbols",
+                        "OUSDT",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            restart_runner.assert_called_once_with(
+                "OUSDT", runner_wrapper="/usr/local/bin/test-wrapper"
+            )
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(
+                payload["results"][0]["action"],
+                "salvage_corrupt_state_applied_trade_fill_keys_and_restart_runner",
+            )
+
     def test_control_update_snapshots_valid_loop_state_before_restart(self) -> None:
         now = datetime(2026, 7, 12, 16, 30, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
@@ -482,6 +529,63 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(
                 restored["best_quote_frozen_inventory"],
                 {"long_lots": [{"qty": 2.0}], "short_lots": []},
+            )
+
+    def test_salvages_terminal_applied_trade_fill_key_with_live_position_gate(self) -> None:
+        now = datetime(2026, 7, 12, 22, 40, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(output_dir, now=now)
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["generated_at"] = now.isoformat()
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 125.0,
+                    "actual_short_notional": 500.0,
+                }
+            }
+            _write_json(plan_path, plan)
+            state_path = output_dir / "reusdt_loop_state.json"
+            state_path.write_text(
+                '{\n  "best_quote_frozen_inventory": {"long_lots": [], "short_lots": []},'
+                '\n  "best_quote_volume_ledger": {'
+                '\n    "applied_trade_count_total": 2,'
+                '\n    "applied_trade_fill_keys": ['
+                '\n      "119803013:SELL:SHORT:1783486084005:4:0.5588",'
+                '\n      "119804106:SELL:SHORT:1783486088243:17:0.5587',
+                encoding="utf-8",
+            )
+            os.utime(state_path, (now.timestamp(), now.timestamp()))
+
+            result = recover_corrupt_loop_state(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                now=now + timedelta(minutes=1),
+                max_backup_age_seconds=3600,
+                min_corrupt_age_seconds=30,
+                max_snapshot_age_seconds=300,
+                dry_run=False,
+                exchange_snapshot_fetcher=lambda _symbol: {
+                    "open_order_count": 0,
+                    "long_notional": 124.7,
+                    "short_notional": 500.6,
+                },
+            )
+
+            assert result is not None
+            self.assertEqual(
+                result["action"], "salvage_corrupt_state_applied_trade_fill_keys"
+            )
+            self.assertTrue(result["safe_restart_after_salvage"])
+            restored = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                restored["best_quote_volume_ledger"]["applied_trade_fill_keys"][-1],
+                "119804106:SELL:SHORT:1783486088243:17:0.5587",
+            )
+            self.assertEqual(
+                restored["updated_by"],
+                "bq_volume_recovery_guard_applied_trade_keys_salvage",
             )
 
     def test_terminal_order_refs_salvage_blocks_with_exchange_orders(self) -> None:

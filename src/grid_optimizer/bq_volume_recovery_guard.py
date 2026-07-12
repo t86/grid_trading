@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -176,6 +177,106 @@ def _salvage_truncated_order_refs_state(
     return salvaged, [], details
 
 
+def _salvage_truncated_applied_trade_keys_state(
+    *,
+    state_path: Path,
+    plan: dict[str, Any],
+    state_mtime: float,
+    exchange_snapshot_fetcher: CorruptStateExchangeFetcher,
+    symbol: str,
+) -> tuple[dict[str, Any] | None, list[str], dict[str, Any]]:
+    details: dict[str, Any] = {}
+    try:
+        raw = state_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, ["corrupt_state_unreadable"], {"salvage_error": str(exc)[:240]}
+    marker = '\n    "applied_trade_fill_keys": ['
+    marker_at = raw.rfind(marker)
+    if marker_at < 0:
+        return None, ["corruption_not_in_terminal_applied_trade_keys"], details
+    tail_match = re.search(
+        r'\n      "(\d+:(?:BUY|SELL):(?:LONG|SHORT):\d+:[0-9.]+:[0-9.]+)$',
+        raw,
+    )
+    if tail_match is None:
+        return None, ["terminal_applied_trade_key_incomplete"], details
+    repaired_raw = raw + '"\n    ]\n  }\n}\n'
+    try:
+        salvaged = json.loads(repaired_raw)
+    except json.JSONDecodeError as exc:
+        return None, ["applied_trade_keys_state_not_salvageable"], {
+            "salvage_error": str(exc)[:240]
+        }
+    ledger = salvaged.get("best_quote_volume_ledger")
+    frozen = salvaged.get("best_quote_frozen_inventory")
+    fill_keys = ledger.get("applied_trade_fill_keys") if isinstance(ledger, dict) else None
+    reasons: list[str] = []
+    if not isinstance(ledger, dict):
+        reasons.append("salvaged_state_missing_active_ledger")
+    if not isinstance(frozen, dict):
+        reasons.append("salvaged_state_missing_frozen_ledger")
+    if not isinstance(fill_keys, list) or not fill_keys:
+        reasons.append("salvaged_state_missing_applied_trade_keys")
+    elif fill_keys[-1] != tail_match.group(1):
+        reasons.append("salvaged_terminal_trade_key_mismatch")
+
+    best_quote = plan.get("best_quote_maker_volume")
+    reduce_freeze = (
+        best_quote.get("reduce_freeze") if isinstance(best_quote, dict) else None
+    )
+    generated_at = _parse_time(plan.get("generated_at"))
+    snapshot_delta_seconds = (
+        abs(state_mtime - generated_at.timestamp())
+        if generated_at is not None
+        else float("inf")
+    )
+    details["pre_corruption_snapshot_delta_seconds"] = round(snapshot_delta_seconds, 3)
+    if snapshot_delta_seconds > 30.0:
+        reasons.append("pre_corruption_snapshot_not_adjacent")
+
+    try:
+        exchange = exchange_snapshot_fetcher(symbol)
+    except Exception as exc:
+        exchange = {}
+        reasons.append("exchange_snapshot_error")
+        details["exchange_snapshot_error"] = str(exc)[:240]
+    open_order_count = _safe_int(exchange.get("open_order_count"), -1)
+    details["exchange_open_order_count"] = open_order_count
+    if open_order_count != 0:
+        reasons.append("exchange_open_orders_present")
+
+    planned_long = _safe_float(
+        reduce_freeze.get("actual_long_notional") if isinstance(reduce_freeze, dict) else None
+    )
+    planned_short = _safe_float(
+        reduce_freeze.get("actual_short_notional") if isinstance(reduce_freeze, dict) else None
+    )
+    exchange_long = _safe_float(exchange.get("long_notional"))
+    exchange_short = _safe_float(exchange.get("short_notional"))
+    position_drift = abs(exchange_long - planned_long) + abs(exchange_short - planned_short)
+    drift_threshold = max(
+        _safe_float(plan.get("hedge_bq_position_drift_tolerance_notional")),
+        100.0,
+    )
+    details.update(
+        {
+            "terminal_trade_key": tail_match.group(1),
+            "exchange_long_notional": exchange_long,
+            "exchange_short_notional": exchange_short,
+            "snapshot_long_notional": planned_long,
+            "snapshot_short_notional": planned_short,
+            "position_drift_notional": position_drift,
+            "position_drift_threshold_notional": drift_threshold,
+        }
+    )
+    if position_drift > drift_threshold:
+        reasons.append("exchange_position_drift_too_large")
+    if reasons:
+        return None, reasons, details
+    salvaged["updated_by"] = "bq_volume_recovery_guard_applied_trade_keys_salvage"
+    return salvaged, [], details
+
+
 def recover_corrupt_loop_state(
     *,
     symbol: str,
@@ -243,7 +344,7 @@ def recover_corrupt_loop_state(
             backup_path = candidate
             backup_payload = candidate_payload
             break
-    salvage_payload, salvage_reasons, salvage_details = _salvage_truncated_order_refs_state(
+    order_refs_payload, order_refs_reasons, order_refs_details = _salvage_truncated_order_refs_state(
         state_path=state_path,
         plan=plan,
         state_mtime=state_mtime,
@@ -252,9 +353,25 @@ def recover_corrupt_loop_state(
         ),
         symbol=normalized_symbol,
     )
+    applied_keys_payload, applied_keys_reasons, applied_keys_details = (
+        _salvage_truncated_applied_trade_keys_state(
+            state_path=state_path,
+            plan=plan,
+            state_mtime=state_mtime,
+            exchange_snapshot_fetcher=(
+                exchange_snapshot_fetcher or _fetch_corrupt_state_exchange_snapshot
+            ),
+            symbol=normalized_symbol,
+        )
+    )
+    salvage_payload = order_refs_payload or applied_keys_payload
+    salvage_kind = (
+        "order_refs" if order_refs_payload is not None else "applied_trade_fill_keys"
+    )
     if backup_payload is None and salvage_payload is None:
         blocking_reasons.append("no_recent_valid_autorealign_backup")
-        blocking_reasons.extend(salvage_reasons)
+        blocking_reasons.extend(order_refs_reasons)
+        blocking_reasons.extend(applied_keys_reasons)
 
     result: dict[str, Any] = {
         "symbol": normalized_symbol,
@@ -268,7 +385,8 @@ def recover_corrupt_loop_state(
             "age_seconds": round(corrupt_age_seconds, 3),
             "blocking_reasons": blocking_reasons,
             "snapshot_gate": gate,
-            "order_refs_salvage": salvage_details,
+            "order_refs_salvage": order_refs_details,
+            "applied_trade_fill_keys_salvage": applied_keys_details,
         },
     }
     if blocking_reasons:
@@ -276,7 +394,7 @@ def recover_corrupt_loop_state(
         return result
     if dry_run:
         result["action"] = (
-            "dry_run_salvage_corrupt_state_order_refs"
+            f"dry_run_salvage_corrupt_state_{salvage_kind}"
             if salvage_payload is not None
             else "dry_run_restore_corrupt_state_from_autorealign_backup"
         )
@@ -293,12 +411,13 @@ def recover_corrupt_loop_state(
         plan_path.replace(stale_plan_path)
         archived_plan = str(stale_plan_path)
     result["action"] = (
-        "salvage_corrupt_state_order_refs"
+        f"salvage_corrupt_state_{salvage_kind}"
         if salvage_payload is not None
         else "restore_corrupt_state_from_autorealign_backup"
     )
     result["corrupt_archive_path"] = str(corrupt_archive)
     result["archived_plan_path"] = archived_plan
+    result["safe_restart_after_salvage"] = salvage_payload is not None
     return result
 
 
@@ -5262,6 +5381,22 @@ def main(argv: list[str] | None = None) -> int:
                         )
                         corrupt_state_result["restart_failed"] = str(exc)
                         exit_code = 1
+            elif (
+                bool(corrupt_state_result.get("safe_restart_after_salvage"))
+                and not args.dry_run
+                and not _runner_is_active(symbol)
+            ):
+                try:
+                    _default_restart_runner(symbol, runner_wrapper=args.runner_wrapper)
+                    corrupt_state_result["action"] = (
+                        str(corrupt_state_result.get("action")) + "_and_restart_runner"
+                    )
+                except subprocess.CalledProcessError as exc:
+                    corrupt_state_result["action"] = (
+                        str(corrupt_state_result.get("action")) + "_restart_failed"
+                    )
+                    corrupt_state_result["restart_failed"] = str(exc)
+                    exit_code = 1
             _append_jsonl(
                 output_dir / "bq_volume_recovery_guard_events.jsonl",
                 {"ts": now.isoformat(), **corrupt_state_result},
