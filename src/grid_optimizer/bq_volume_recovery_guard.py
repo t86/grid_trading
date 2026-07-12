@@ -2963,7 +2963,11 @@ def check_symbol(
             )
             key = "best_quote_maker_volume_same_side_entry_price_guard_min_notional"
             current_gate = max(_safe_float(control.get(key)), 200.0)
-            if no_fill_seconds >= 300.0 and pace_ratio < 0.1:
+            balanced_burst = (
+                pace_ratio < 0.25
+                and _safe_float(assessment.get("inventory_notional_gap")) < 150.0
+            )
+            if (no_fill_seconds >= 300.0 and pace_ratio < 0.1) or balanced_burst:
                 max_inventory = max(
                     _safe_float(assessment.get("max_long_notional")),
                     _safe_float(assessment.get("max_short_notional")),
