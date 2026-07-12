@@ -773,6 +773,7 @@ def _recovery_inventory_buffer_ok(
     *,
     recover_cap_ratio: float,
     original_controls: dict[str, Any] | None = None,
+    entry_reserve_notional: float = 0.0,
 ) -> bool:
     originals = original_controls if isinstance(original_controls, dict) else {}
     soft_ratio = max(_safe_float(assessment.get("inventory_soft_ratio")), 0.0)
@@ -794,7 +795,11 @@ def _recovery_inventory_buffer_ok(
         # below soft, causing repeated loss-reduce cycles around the same boundary.
         buffered_soft_limit = soft_limit * recovery_ratio
         candidates = [value for value in (cap_limit, buffered_soft_limit) if value > 0]
-        return min(candidates) if candidates else 0.0
+        boundary = min(candidates) if candidates else 0.0
+        # Keep enough room for one normal entry cycle after loss-reduce closes.
+        # Without this reserve, larger cycle budgets immediately push inventory
+        # back over soft and cause allow-loss on/off oscillation.
+        return max(boundary - max(float(entry_reserve_notional), 0.0), 0.0)
 
     long_limit = threshold("max_long_notional", "long_soft_limit_notional", "pause_buy_position_notional")
     short_limit = threshold("max_short_notional", "short_soft_limit_notional", "pause_short_position_notional")
@@ -1618,6 +1623,12 @@ def check_symbol(
     )
     assessment["actual_inventory_below_soft"] = actual_inventory_below_soft
     assessment["effective_inventory_soft_pressure"] = effective_inventory_soft_pressure
+    recovery_entry_reserve_notional = max(
+        _safe_float(control.get("per_order_notional")),
+        _safe_float(control.get("maker_order_notional")),
+        _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional")) * 0.5,
+    )
+    assessment["recovery_entry_reserve_notional"] = recovery_entry_reserve_notional
     ledger_drift_threshold = max(
         100.0,
         max(
@@ -2862,6 +2873,7 @@ def check_symbol(
                     assessment,
                     recover_cap_ratio=recover_cap_ratio,
                     original_controls=recovery_original_controls,
+                    entry_reserve_notional=recovery_entry_reserve_notional,
                 )
             )
         ):
@@ -3156,6 +3168,7 @@ def check_symbol(
                 assessment,
                 recover_cap_ratio=recover_cap_ratio,
                 original_controls=recovery_original_controls,
+                entry_reserve_notional=recovery_entry_reserve_notional,
             )
             restore_ready = (
                 _safe_float(volume_summary.get("gross_notional")) >= recover_floor
@@ -3532,6 +3545,7 @@ def check_symbol(
                 assessment,
                 recover_cap_ratio=recover_cap_ratio,
                 original_controls=recovery_original_controls,
+                entry_reserve_notional=recovery_entry_reserve_notional,
             )
             if bool(item.get("recovery_owned")) and cap_buffer_ok and recovery_hold_satisfied:
                 updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)

@@ -1343,8 +1343,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
             plan["best_quote_maker_volume"] = {
                 "reduce_freeze": {
-                    "actual_long_notional": 750.0,
-                    "actual_short_notional": 700.0,
+                    "actual_long_notional": 700.0,
+                    "actual_short_notional": 680.0,
                     "frozen_long_notional": 0.0,
                     "frozen_short_notional": 0.0,
                 }
@@ -1450,6 +1450,29 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "pause_buy_position_notional": 800.0,
                     "pause_short_position_notional": 800.0,
                 },
+            )
+        )
+        self.assertFalse(
+            bq_volume_recovery_guard._recovery_inventory_buffer_ok(
+                assessment,
+                recover_cap_ratio=0.96,
+                original_controls={
+                    "pause_buy_position_notional": 800.0,
+                    "pause_short_position_notional": 800.0,
+                },
+                entry_reserve_notional=36.0,
+            )
+        )
+        assessment["actual_long_notional"] = 730.0
+        self.assertTrue(
+            bq_volume_recovery_guard._recovery_inventory_buffer_ok(
+                assessment,
+                recover_cap_ratio=0.96,
+                original_controls={
+                    "pause_buy_position_notional": 800.0,
+                    "pause_short_position_notional": 800.0,
+                },
+                entry_reserve_notional=36.0,
             )
         )
 
