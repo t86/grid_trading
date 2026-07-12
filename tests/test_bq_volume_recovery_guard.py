@@ -901,6 +901,90 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, [])
 
+    def test_cap_pressure_reduce_only_flow_gets_one_bounded_budget_step(self) -> None:
+        now = datetime(2026, 7, 12, 12, 45, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 108.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 0,
+                    "pause_buy_position_notional": 620.0,
+                    "pause_short_position_notional": 620.0,
+                    "per_order_notional": 18.0,
+                    "buy_levels": 4,
+                    "sell_levels": 4,
+                    "best_quote_maker_volume_max_long_notional": 780.0,
+                    "best_quote_maker_volume_max_short_notional": 780.0,
+                },
+                long_notional=688.0,
+                short_notional=396.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["buy_orders"] = []
+            plan["sell_orders"] = [
+                {
+                    "side": "SELL",
+                    "price": 0.5972,
+                    "qty": 89.0,
+                    "role": "inventory_unlock_reduce_long",
+                    "position_side": "LONG",
+                    "force_reduce_only": True,
+                }
+            ]
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_owned": True,
+                        "recovery_started_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=400,
+                trigger_seconds=120,
+                cycle_budget_floor_notional=108.0,
+                volume_recovery_cycle_budget_increment=36.0,
+                daily_target_notional=120_000.0,
+                target_completion_buffer_seconds=10_800.0,
+                trade_rows=[
+                    {
+                        "id": 1,
+                        "time": int((now - timedelta(seconds=20)).timestamp() * 1000),
+                        "quoteQty": "20",
+                        "realizedPnl": "0",
+                    }
+                ],
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(
+                result["action"], "raise_cap_pressure_reduce_budget_for_pace", result
+            )
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 144.0)
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_forces_net_loss_reduce_off_while_holding_recovery(self) -> None:
         now = datetime(2026, 6, 26, 7, 11, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

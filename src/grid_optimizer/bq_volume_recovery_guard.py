@@ -3815,8 +3815,63 @@ def check_symbol(
                 item.pop("recovery_started_at", None)
                 item.pop("recovery_owned", None)
             elif not cap_buffer_ok:
-                action = "hold_recovery_until_cap_buffer"
-                item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+                current_budget = _safe_float(
+                    control.get("best_quote_maker_volume_cycle_budget_notional")
+                )
+                target_budget_floor = max(
+                    _safe_float(volume_summary.get("target_cycle_budget_floor_notional")),
+                    float(cycle_budget_floor_notional),
+                )
+                target_budget = min(
+                    target_budget_floor,
+                    current_budget + max(float(volume_recovery_cycle_budget_increment), 0.0),
+                )
+                if (
+                    target_pace_behind
+                    and not recovery_reapply_debounced
+                    and not high_recovery_wear
+                    and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+                    and bool(assessment.get("planned_reduce_only_only"))
+                    and _safe_int(assessment.get("near_market_reduce_only_order_count")) > 0
+                    and target_budget > current_budget
+                ):
+                    updates = {
+                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                        "best_quote_maker_volume_cycle_budget_notional": target_budget,
+                    }
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        ("best_quote_maker_volume_cycle_budget_notional",),
+                    )
+                    _remember_recovery_updates(item, updates)
+                    action = (
+                        "dry_run_raise_cap_pressure_reduce_budget_for_pace"
+                        if dry_run
+                        else "raise_cap_pressure_reduce_budget_for_pace"
+                    )
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "last_recovery_check_at": now.isoformat(),
+                            "last_recovery_action_at": now.isoformat(),
+                            "last_recovery_action": action,
+                        }
+                    )
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
+                else:
+                    action = "hold_recovery_until_cap_buffer"
+                    item.update(
+                        {"status": "recovery_active", "last_recovery_check_at": now.isoformat()}
+                    )
             else:
                 action = "hold_recovery_until_volume_or_orders"
                 item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
