@@ -821,6 +821,22 @@ def _loss_reduce_flow_control_updates(
     return {key: desired[key] for key in keys if key in desired and control.get(key) != desired[key]}
 
 
+def _normal_entry_wear_backoff_confirmed(
+    volume_summary: dict[str, Any], *, target_pace_behind: bool
+) -> bool:
+    wear_5m = _safe_float(volume_summary.get("trailing_5m_realized_wear_per_10k"))
+    wear_15m = _safe_float(volume_summary.get("trailing_15m_realized_wear_per_10k"))
+    volume_5m = _safe_float(volume_summary.get("trailing_5m_gross_notional"))
+    volume_15m = _safe_float(volume_summary.get("trailing_15m_gross_notional"))
+    if volume_15m < 100.0 or max(wear_5m, wear_15m) <= 3.0:
+        return False
+    if not target_pace_behind:
+        return True
+    # While badly behind target, stale loss-reduce wear in the 15m window must
+    # not immediately throttle newly restored normal entry flow.
+    return volume_5m >= 100.0 and wear_5m > 3.0
+
+
 def _recovery_inventory_buffer_ok(
     assessment: dict[str, Any],
     *,
@@ -2731,12 +2747,10 @@ def check_symbol(
                 }
             )
         elif (
-            _safe_float(volume_summary.get("trailing_15m_gross_notional")) >= 100.0
-            and max(
-                trailing_5m_realized_wear_per_10k,
-                trailing_15m_realized_wear_per_10k,
+            _normal_entry_wear_backoff_confirmed(
+                volume_summary,
+                target_pace_behind=target_pace_behind,
             )
-            > 3.0
             and not recovery_reapply_debounced
             and not post_restore_budget_cooldown_active
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))

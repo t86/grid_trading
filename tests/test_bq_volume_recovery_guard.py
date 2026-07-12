@@ -2466,6 +2466,34 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_target_pace_behind_ignores_stale_15m_loss_reduce_wear(self) -> None:
+        summary = {
+            "trailing_5m_gross_notional": 220.0,
+            "trailing_5m_realized_wear_per_10k": 0.0,
+            "trailing_15m_gross_notional": 1700.0,
+            "trailing_15m_realized_wear_per_10k": 5.2,
+        }
+
+        self.assertFalse(
+            bq_volume_recovery_guard._normal_entry_wear_backoff_confirmed(
+                summary,
+                target_pace_behind=True,
+            )
+        )
+        self.assertTrue(
+            bq_volume_recovery_guard._normal_entry_wear_backoff_confirmed(
+                summary,
+                target_pace_behind=False,
+            )
+        )
+        summary["trailing_5m_realized_wear_per_10k"] = 3.5
+        self.assertTrue(
+            bq_volume_recovery_guard._normal_entry_wear_backoff_confirmed(
+                summary,
+                target_pace_behind=True,
+            )
+        )
+
     def test_inventory_imbalance_allows_budget_raise_for_balancing_entry_only(self) -> None:
         now = datetime(2026, 7, 12, 6, 55, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
