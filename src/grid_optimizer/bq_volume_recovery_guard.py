@@ -556,7 +556,13 @@ def _loss_reduce_recovery_updates(
     }
     if not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only")):
         extra_ticks = max(int(quote_offset_extra_ticks), 0)
-        if extra_ticks > 0:
+        if (
+            extra_ticks > 0
+            and not (
+                bool(assessment.get("dynamic_quote_offset_applied"))
+                and _safe_int(assessment.get("planned_entry_order_count")) > 0
+            )
+        ):
             updates["best_quote_maker_volume_quote_offset_ticks"] = (
                 max(_safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")), 0) + extra_ticks
             )
@@ -842,6 +848,11 @@ def assess_symbol(
     current_long = _safe_float(plan.get("current_long_notional"))
     current_short = _safe_float(plan.get("current_short_notional"))
     best_quote = plan.get("best_quote_maker_volume") if isinstance(plan.get("best_quote_maker_volume"), dict) else {}
+    dynamic_offsets = (
+        best_quote.get("dynamic_offsets")
+        if isinstance(best_quote.get("dynamic_offsets"), dict)
+        else {}
+    )
     reduce_freeze = best_quote.get("reduce_freeze") if isinstance(best_quote.get("reduce_freeze"), dict) else {}
     frozen_v2 = best_quote.get("frozen_v2") if isinstance(best_quote.get("frozen_v2"), dict) else {}
     actual_long = (
@@ -960,6 +971,8 @@ def assess_symbol(
         "near_market_entry_order_count": len(near_entry_orders),
         "near_market_reduce_only_order_count": len(near_reduce_only_orders),
         "all_entry_orders_far": bool(entry_orders) and not near_entry_orders,
+        "dynamic_quote_offset_applied": bool(dynamic_offsets.get("dynamic_quote_offset_applied")),
+        "dynamic_quote_offset_ticks": _safe_int(dynamic_offsets.get("quote_offset_ticks")),
         "ineffective_orders": ineffective_orders,
         "all_orders_far": all_orders_far,
         "near_cap": near_long_cap or near_short_cap,
@@ -1598,6 +1611,50 @@ def check_symbol(
                 "dry_run_correct_loss_reduce_to_dominant_side"
                 if dry_run
                 else "correct_loss_reduce_to_dominant_side"
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif (
+            bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and bool(assessment.get("dynamic_quote_offset_applied"))
+            and _safe_int(assessment.get("planned_entry_order_count")) > 0
+            and _safe_int(assessment.get("dynamic_quote_offset_ticks"))
+            >= _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) + 4
+            and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) > 0
+        ):
+            updates = {
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "best_quote_maker_volume_quote_offset_ticks": max(
+                    _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) - 1,
+                    0,
+                ),
+            }
+            _remember_recovery_controls(
+                item,
+                control,
+                ("best_quote_maker_volume_quote_offset_ticks",),
+            )
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_remove_loss_reduce_offset_under_dynamic_widening"
+                if dry_run
+                else "remove_loss_reduce_offset_under_dynamic_widening"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
             )
             changed, backup_path = _apply_control_update(
                 symbol=normalized_symbol,

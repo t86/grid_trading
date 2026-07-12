@@ -943,6 +943,21 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(updates["pause_buy_position_notional"], 701.0)
         self.assertEqual(updates["pause_short_position_notional"], 620.0)
 
+    def test_loss_reduce_does_not_stack_offset_on_dynamic_widening(self) -> None:
+        updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
+            control={
+                "best_quote_maker_volume_allow_loss_reduce_only": False,
+                "best_quote_maker_volume_quote_offset_ticks": 1,
+            },
+            assessment={
+                "dynamic_quote_offset_applied": True,
+                "planned_entry_order_count": 2,
+            },
+            quote_offset_extra_ticks=1,
+        )
+
+        self.assertNotIn("best_quote_maker_volume_quote_offset_ticks", updates)
+
     def test_dry_run_reports_recovery_without_mutating_control(self) -> None:
         now = datetime(2026, 6, 26, 7, 20, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
