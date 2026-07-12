@@ -3689,7 +3689,7 @@ def check_symbol(
                 can_tighten_exhausted_recovery = (
                     target_pace_behind
                     and (sla_recovery_due or no_fill_seconds >= 300.0)
-                    and not high_recovery_wear
+                    and not confirmed_loss_reduce_wear
                     and not recovery_reapply_debounced
                     and _safe_int(assessment.get("planned_reduce_only_order_count")) > 0
                     and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) > 1
@@ -4079,7 +4079,7 @@ def check_symbol(
                     target_pace_behind
                     and no_fill_seconds >= max(float(trigger_seconds), 0.0)
                     and bool(assessment.get("inventory_soft_pressure"))
-                    and not high_recovery_wear
+                    and not confirmed_loss_reduce_wear
                     and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
                 ):
                     updates = {

@@ -5927,10 +5927,16 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             trade_rows = [
                 {
                     "id": 1,
-                    "time": int((now - timedelta(minutes=30)).timestamp() * 1000),
-                    "quoteQty": "20",
+                    "time": int((now - timedelta(minutes=10)).timestamp() * 1000),
+                    "quoteQty": "120",
+                    "realizedPnl": "-0.3",
+                },
+                {
+                    "id": 2,
+                    "time": int((now - timedelta(minutes=4)).timestamp() * 1000),
+                    "quoteQty": "120",
                     "realizedPnl": "0",
-                }
+                },
             ]
             state: dict[str, object] = {
                 "symbols": {
@@ -5960,6 +5966,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
             )
             self.assertEqual(result["action"], "enable_stalled_reduce_only_loss_recovery", result)
+            self.assertTrue(result["assessment"]["high_recovery_wear"])
+            self.assertFalse(result["assessment"]["confirmed_loss_reduce_wear"])
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 2)
             self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
