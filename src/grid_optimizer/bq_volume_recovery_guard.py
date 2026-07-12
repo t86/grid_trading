@@ -4538,6 +4538,32 @@ def check_symbol(
             )
             if hold_soft_hysteresis_bridge:
                 updates = {"best_quote_maker_volume_net_loss_reduce_enabled": False}
+                current_budget = _safe_float(
+                    control.get("best_quote_maker_volume_cycle_budget_notional")
+                )
+                configured_budget_floor = max(
+                    _safe_float(
+                        control.get("best_quote_maker_volume_min_cycle_budget_notional")
+                    ),
+                    _safe_float(volume_summary.get("target_cycle_budget_floor_notional")),
+                    float(cycle_budget_floor_notional),
+                )
+                target_budget = min(
+                    configured_budget_floor,
+                    current_budget
+                    + max(float(volume_recovery_cycle_budget_increment), 0.0),
+                )
+                if (
+                    _safe_int(assessment.get("planned_entry_order_count")) <= 0
+                    and _safe_int(assessment.get("near_market_reduce_only_order_count")) > 0
+                    and target_budget > current_budget
+                ):
+                    updates["best_quote_maker_volume_cycle_budget_notional"] = target_budget
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        ("best_quote_maker_volume_cycle_budget_notional",),
+                    )
                 if (
                     bool(assessment.get("balancing_entry_only"))
                     and _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0
@@ -4548,7 +4574,7 @@ def check_symbol(
                         control,
                         ("sticky_entry_price_tolerance_steps",),
                     )
-                    _remember_recovery_updates(item, updates)
+                _remember_recovery_updates(item, updates)
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
@@ -4559,7 +4585,12 @@ def check_symbol(
                     restart_runner=restart,
                 )
                 action = (
-                    "dry_run_hold_soft_hysteresis_bridge_until_buffer"
+                    "dry_run_raise_budget_while_holding_soft_hysteresis_bridge"
+                    if dry_run
+                    and "best_quote_maker_volume_cycle_budget_notional" in updates
+                    else "raise_budget_while_holding_soft_hysteresis_bridge"
+                    if "best_quote_maker_volume_cycle_budget_notional" in updates
+                    else "dry_run_hold_soft_hysteresis_bridge_until_buffer"
                     if dry_run
                     else "hold_soft_hysteresis_bridge_until_buffer"
                 )
