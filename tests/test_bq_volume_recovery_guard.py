@@ -5293,6 +5293,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 now=now,
                 control={
                     "best_quote_maker_volume_cycle_budget_notional": 84.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 0,
                     "sticky_entry_price_tolerance_steps": 8.0,
                 },
                 long_notional=650.0,
@@ -5319,9 +5320,11 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                         "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
                         "guard_original_controls": {
                             "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                            "best_quote_maker_volume_quote_offset_ticks": 2,
                         },
                         "guard_recovery_controls": {
                             "best_quote_maker_volume_cycle_budget_notional": 84.0,
+                            "best_quote_maker_volume_quote_offset_ticks": 0,
                         },
                     }
                 }
@@ -5342,7 +5345,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
 
             control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
             self.assertEqual(result["action"], "switch_to_one_sided_sticky_requote")
-            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 72.0)
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 84.0)
+            self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 0)
             self.assertEqual(control["sticky_entry_price_tolerance_steps"], 1.0)
             self.assertEqual(restarts, ["REUSDT"])
 

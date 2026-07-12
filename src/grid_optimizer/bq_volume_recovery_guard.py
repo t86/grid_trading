@@ -3020,9 +3020,10 @@ def check_symbol(
                     control,
                     ("sticky_entry_price_tolerance_steps",),
                 )
-                updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
-                updates["sticky_entry_price_tolerance_steps"] = 1.0
-                item["guard_recovery_controls"] = {}
+                updates = {
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "sticky_entry_price_tolerance_steps": 1.0,
+                }
                 _remember_recovery_updates(item, updates)
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
