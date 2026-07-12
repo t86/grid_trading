@@ -248,6 +248,99 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertTrue(Path(result["corrupt_archive_path"]).exists())
             self.assertTrue(Path(result["archived_plan_path"]).exists())
 
+    def test_main_stops_active_runner_with_persistent_unrecoverable_corrupt_state(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            stdout = StringIO()
+            corrupt_result = {
+                "symbol": "OUSDT",
+                "action": "skip_corrupt_state_recovery_safety_gate",
+                "changed_keys": [],
+                "backup_path": None,
+                "dry_run": False,
+                "restart_failed": None,
+                "state_corruption": {
+                    "blocking_reasons": ["no_recent_valid_autorealign_backup"],
+                },
+            }
+            with (
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_corrupt_loop_state",
+                    return_value=corrupt_result,
+                ),
+                patch.object(bq_volume_recovery_guard, "_runner_is_active", return_value=True),
+                patch.object(bq_volume_recovery_guard, "_default_stop_runner") as stop_runner,
+                redirect_stdout(stdout),
+            ):
+                exit_code = bq_volume_recovery_guard.main(
+                    [
+                        "--output-dir",
+                        str(output_dir),
+                        "--state-path",
+                        str(output_dir / "guard_state.json"),
+                        "--runner-wrapper",
+                        "/usr/local/bin/test-wrapper",
+                        "--symbols",
+                        "OUSDT",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            stop_runner.assert_called_once_with(
+                "OUSDT", runner_wrapper="/usr/local/bin/test-wrapper"
+            )
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(
+                payload["results"][0]["action"],
+                "stop_runner_persistent_corrupt_state",
+            )
+
+    def test_main_does_not_stop_runner_for_transient_corrupt_state(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            stdout = StringIO()
+            corrupt_result = {
+                "symbol": "OUSDT",
+                "action": "skip_corrupt_state_recovery_safety_gate",
+                "changed_keys": [],
+                "backup_path": None,
+                "dry_run": False,
+                "restart_failed": None,
+                "state_corruption": {
+                    "blocking_reasons": ["corrupt_state_not_persistent"],
+                },
+            }
+            with (
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_corrupt_loop_state",
+                    return_value=corrupt_result,
+                ),
+                patch.object(bq_volume_recovery_guard, "_runner_is_active") as runner_active,
+                patch.object(bq_volume_recovery_guard, "_default_stop_runner") as stop_runner,
+                redirect_stdout(stdout),
+            ):
+                exit_code = bq_volume_recovery_guard.main(
+                    [
+                        "--output-dir",
+                        str(output_dir),
+                        "--state-path",
+                        str(output_dir / "guard_state.json"),
+                        "--symbols",
+                        "OUSDT",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            runner_active.assert_not_called()
+            stop_runner.assert_not_called()
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(
+                payload["results"][0]["action"],
+                "skip_corrupt_state_recovery_safety_gate",
+            )
+
     def test_control_update_snapshots_valid_loop_state_before_restart(self) -> None:
         now = datetime(2026, 7, 12, 16, 30, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

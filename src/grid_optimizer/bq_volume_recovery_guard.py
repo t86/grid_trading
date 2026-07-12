@@ -5025,6 +5025,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--inactive-max-snapshot-age-seconds", type=float, default=300.0)
     parser.add_argument("--corrupt-state-max-backup-age-seconds", type=float, default=3600.0)
     parser.add_argument("--corrupt-state-min-age-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--stop-persistent-corrupt-runner",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--inventory-bias-relief-notional-margin", type=float, default=24.0)
     parser.add_argument("--volume-recovery-cycle-budget-increment", type=float, default=12.0)
     parser.add_argument("--cycle-budget-floors", nargs="*", default=[])
@@ -5092,6 +5097,35 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
         )
         if corrupt_state_result is not None:
+            corruption = corrupt_state_result.get("state_corruption")
+            blocking_reasons = (
+                corruption.get("blocking_reasons") if isinstance(corruption, dict) else []
+            )
+            persistent_corruption = (
+                corrupt_state_result.get("action") == "skip_corrupt_state_recovery_safety_gate"
+                and "corrupt_state_not_persistent" not in blocking_reasons
+            )
+            if (
+                args.stop_persistent_corrupt_runner
+                and persistent_corruption
+                and _runner_is_active(symbol)
+            ):
+                if args.dry_run:
+                    corrupt_state_result["action"] = (
+                        "dry_run_stop_runner_persistent_corrupt_state"
+                    )
+                else:
+                    try:
+                        _default_stop_runner(symbol, runner_wrapper=args.runner_wrapper)
+                        corrupt_state_result["action"] = (
+                            "stop_runner_persistent_corrupt_state"
+                        )
+                    except subprocess.CalledProcessError as exc:
+                        corrupt_state_result["action"] = (
+                            "stop_runner_persistent_corrupt_state_failed"
+                        )
+                        corrupt_state_result["restart_failed"] = str(exc)
+                        exit_code = 1
             _append_jsonl(
                 output_dir / "bq_volume_recovery_guard_events.jsonl",
                 {"ts": now.isoformat(), **corrupt_state_result},
