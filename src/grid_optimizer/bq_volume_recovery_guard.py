@@ -1947,6 +1947,41 @@ def check_symbol(
         item["no_fill_since"] = no_fill_since.isoformat()
     no_fill_seconds = max((now - no_fill_since).total_seconds(), 0.0) if no_fill_since else 0.0
 
+    planned_entry_buy_count = _safe_int(
+        assessment.get("planned_entry_buy_order_count")
+    )
+    planned_entry_sell_count = _safe_int(
+        assessment.get("planned_entry_sell_order_count")
+    )
+    planned_entry_one_sided = (planned_entry_buy_count > 0) != (
+        planned_entry_sell_count > 0
+    )
+    one_sided_entry_unprotected = (
+        planned_entry_one_sided
+        and not effective_inventory_soft_pressure
+        and not bool(assessment.get("near_cap"))
+        and not bool(assessment.get("volatility_entry_pause_active"))
+        and not bool(assessment.get("volatility_inventory_gate_active"))
+    )
+    one_sided_entry_since = _parse_time(item.get("one_sided_entry_since"))
+    if not one_sided_entry_unprotected:
+        item.pop("one_sided_entry_since", None)
+        one_sided_entry_since = None
+    elif one_sided_entry_since is None:
+        one_sided_entry_since = now
+        item["one_sided_entry_since"] = now.isoformat()
+    one_sided_entry_seconds = (
+        max((now - one_sided_entry_since).total_seconds(), 0.0)
+        if one_sided_entry_since
+        else 0.0
+    )
+    fast_sla_seconds = min(max(float(trigger_seconds), 120.0), 300.0)
+    severe_one_sided_stall = severe_one_sided_stall or (
+        one_sided_entry_unprotected
+        and one_sided_entry_seconds >= fast_sla_seconds
+        and target_pace_behind
+    )
+
     pace_ratio = (
         trailing_hourly_notional / required_hourly_notional
         if required_hourly_notional > 0
@@ -1966,12 +2001,17 @@ def check_symbol(
         and (now - last_sla_action_at).total_seconds() < 120.0
     )
     sla_recovery_due = (
-        no_fill_seconds >= 180.0
+        no_fill_seconds >= fast_sla_seconds
+        or one_sided_entry_seconds >= fast_sla_seconds
         or (required_hourly_notional > 0 and pace_ratio < 0.75 and low_pace_seconds >= 120.0)
     ) and not sla_action_debounced
     assessment.update(
         {
             "no_fill_seconds": no_fill_seconds,
+            "planned_entry_one_sided": planned_entry_one_sided,
+            "one_sided_entry_unprotected": one_sided_entry_unprotected,
+            "one_sided_entry_seconds": one_sided_entry_seconds,
+            "fast_sla_seconds": fast_sla_seconds,
             "pace_ratio": pace_ratio,
             "low_pace_seconds": low_pace_seconds,
             "sla_recovery_due": sla_recovery_due,
@@ -2521,6 +2561,10 @@ def check_symbol(
         elif (
             sla_recovery_due
             and target_pace_behind
+            and (
+                no_fill_seconds >= 180.0
+                or one_sided_entry_seconds >= fast_sla_seconds
+            )
             and not high_recovery_wear
             and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and effective_inventory_soft_pressure
@@ -3073,7 +3117,10 @@ def check_symbol(
             normalized_symbol == "ARXUSDT"
             and sla_recovery_due
             and target_pace_behind
-            and (no_fill_seconds >= 180.0 or pace_ratio < 0.5)
+            and (
+                no_fill_seconds >= 180.0
+                or (pace_ratio < 0.5 and low_pace_seconds >= fast_sla_seconds)
+            )
             and (
                 not confirmed_loss_reduce_wear
                 or (
@@ -3190,6 +3237,7 @@ def check_symbol(
             and not bool(assessment.get("near_cap"))
             and _safe_int(assessment.get("active_order_count")) > 0
             and _safe_int(assessment.get("planned_entry_order_count")) > 0
+            and not (severe_one_sided_stall and one_sided_entry_unprotected)
             and not (
                 severe_one_sided_stall
                 and bool(assessment.get("one_sided_inventory_bias"))
@@ -4477,7 +4525,7 @@ def check_symbol(
                 normalized_symbol == "ARXUSDT"
                 and target_pace_behind
                 and sla_recovery_due
-                and no_fill_seconds >= 180.0
+                and no_fill_seconds >= fast_sla_seconds
                 and bool(assessment.get("planned_reduce_only_only"))
                 and _safe_int(assessment.get("near_market_order_count")) > 0
                 and bool(control.get("best_quote_maker_volume_same_side_entry_price_guard_enabled"))

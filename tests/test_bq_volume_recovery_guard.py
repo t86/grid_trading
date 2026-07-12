@@ -3890,6 +3890,62 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_persistent_unprotected_one_sided_entries_trigger_fast_requote(self) -> None:
+        now = datetime(2026, 7, 12, 12, 18, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={"sticky_entry_price_tolerance_steps": 8.0},
+                long_notional=100.0,
+                short_notional=100.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["buy_orders"] = [
+                {"side": "BUY", "price": 0.5969, "qty": 30.0, "role": "best_quote_entry_long"}
+            ]
+            plan["sell_orders"] = []
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=3)).isoformat(),
+                        "one_sided_entry_since": (now - timedelta(minutes=2)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                daily_target_notional=120_000,
+                trade_rows=[
+                    {
+                        "id": 1,
+                        "time": int((now - timedelta(minutes=1)).timestamp() * 1000),
+                        "quoteQty": "200",
+                    }
+                ],
+                restart_runner=restarts.append,
+            )
+
+            self.assertTrue(result["assessment"]["planned_entry_one_sided"])
+            self.assertEqual(result["assessment"]["one_sided_entry_seconds"], 120.0)
+            self.assertEqual(result["action"], "tighten_sticky_for_one_sided_stall")
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_closes_owned_loss_reduce_when_hourly_target_pace_is_ahead(self) -> None:
         now = datetime(2026, 7, 11, 12, 20, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
