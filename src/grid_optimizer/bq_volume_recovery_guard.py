@@ -2287,6 +2287,7 @@ def check_symbol(
                 {
                     "best_quote_maker_volume_allow_loss_reduce_only": False,
                     "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "best_quote_maker_volume_active_pair_reduce_enabled": False,
                     "best_quote_maker_volume_cycle_budget_notional": max(
                         wear_backoff_floor,
                         current_budget

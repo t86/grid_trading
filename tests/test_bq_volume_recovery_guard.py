@@ -4918,6 +4918,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                         "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
                         "guard_original_controls": {
                             "best_quote_maker_volume_allow_loss_reduce_only": False,
+                            "best_quote_maker_volume_active_pair_reduce_enabled": True,
                             "best_quote_maker_volume_cycle_budget_notional": 108.0,
                         },
                     }
@@ -4953,6 +4954,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertTrue(result["assessment"]["high_recovery_wear"])
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
+            self.assertFalse(control["best_quote_maker_volume_active_pair_reduce_enabled"])
             self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 1)
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 96.0)
             self.assertNotIn("guard_original_controls", state["symbols"]["REUSDT"])
