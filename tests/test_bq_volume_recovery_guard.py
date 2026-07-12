@@ -1005,6 +1005,94 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_no_fill_sla_pulls_bounded_loss_reduce_to_best_quote(self) -> None:
+        now = datetime(2026, 7, 12, 7, 52, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 144.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 1,
+                    "sticky_entry_price_tolerance_steps": 8.0,
+                    "pause_buy_position_notional": 620.0,
+                    "pause_short_position_notional": 620.0,
+                    "per_order_notional": 18.0,
+                    "maker_order_notional": 18.0,
+                    "buy_levels": 4,
+                    "sell_levels": 4,
+                },
+                long_notional=648.0,
+                short_notional=526.0,
+                open_order_count=3,
+                active_order_count=3,
+                orders_near_market=True,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["buy_orders"] = [
+                {
+                    "side": "BUY",
+                    "price": 0.5968,
+                    "qty": 16.0,
+                    "role": "best_quote_entry_long",
+                    "position_side": "LONG",
+                }
+            ]
+            plan["sell_orders"] = [
+                {
+                    "side": "SELL",
+                    "price": 0.5972,
+                    "qty": 16.0,
+                    "role": "best_quote_reduce_long",
+                    "position_side": "LONG",
+                    "force_reduce_only": True,
+                },
+                {
+                    "side": "SELL",
+                    "price": 0.5972,
+                    "qty": 16.0,
+                    "role": "best_quote_entry_short",
+                    "position_side": "SHORT",
+                },
+            ]
+            _write_json(plan_path, plan)
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state={},
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=0,
+                daily_target_notional=120_000.0,
+                cycle_budget_floor_notional=108.0,
+                trade_rows=[
+                    {
+                        "id": 1,
+                        "time": int((now - timedelta(minutes=10)).timestamp() * 1000),
+                        "quoteQty": "100",
+                        "realizedPnl": "0",
+                    }
+                ],
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(result["action"], "accelerate_loss_reduce_for_no_fill_sla")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
+            self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 0)
+            self.assertEqual(control["sticky_entry_price_tolerance_steps"], 1.0)
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_wrong_way_loss_recovery_enables_dominant_leg_reduce_share(self) -> None:
         now = datetime(2026, 7, 12, 4, 21, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

@@ -1974,6 +1974,7 @@ def check_symbol(
         elif (
             bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and effective_inventory_soft_pressure
+            and not sla_recovery_due
             and loss_reduce_quote_offset_extra_ticks > 0
             and not bool(assessment.get("dynamic_quote_offset_applied"))
             and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks"))
@@ -2003,6 +2004,66 @@ def check_symbol(
                     "recovery_owned": True,
                     "last_recovery_action_at": now.isoformat(),
                     "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif (
+            sla_recovery_due
+            and target_pace_behind
+            and not high_recovery_wear
+            and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and effective_inventory_soft_pressure
+            and _safe_int(assessment.get("active_order_count")) > 0
+            and _safe_int(assessment.get("planned_reduce_only_order_count")) > 0
+            and not bool(assessment.get("all_entry_orders_far"))
+            and (
+                _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) > 0
+                or _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0
+                or _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
+                > loss_reduce_cycle_budget_cap
+            )
+        ):
+            updates = {
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "best_quote_maker_volume_cycle_budget_notional": min(
+                    _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional")),
+                    loss_reduce_cycle_budget_cap,
+                ),
+                "best_quote_maker_volume_quote_offset_ticks": 0,
+                "sticky_entry_price_tolerance_steps": 1.0,
+            }
+            _remember_recovery_controls(
+                item,
+                control,
+                (
+                    "best_quote_maker_volume_cycle_budget_notional",
+                    "best_quote_maker_volume_quote_offset_ticks",
+                    "sticky_entry_price_tolerance_steps",
+                ),
+            )
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_accelerate_loss_reduce_for_no_fill_sla"
+                if dry_run
+                else "accelerate_loss_reduce_for_no_fill_sla"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                    "last_sla_action_at": now.isoformat(),
                 }
             )
             changed, backup_path = _apply_control_update(
