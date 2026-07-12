@@ -1711,6 +1711,20 @@ def check_symbol(
                 "best_quote_maker_volume_net_loss_reduce_enabled": False,
                 "best_quote_maker_volume_inventory_bias_reduce_share": 0.25,
             }
+            expected_recovery_budget = max(
+                _safe_float(
+                    recovery_expected_controls.get(
+                        "best_quote_maker_volume_cycle_budget_notional"
+                    )
+                ),
+                0.0,
+            )
+            if expected_recovery_budget > _safe_float(
+                control.get("best_quote_maker_volume_cycle_budget_notional")
+            ):
+                updates["best_quote_maker_volume_cycle_budget_notional"] = (
+                    expected_recovery_budget
+                )
             if (
                 loss_reduce_quote_offset_extra_ticks > 0
                 and not bool(assessment.get("dynamic_quote_offset_applied"))

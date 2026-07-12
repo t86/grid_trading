@@ -993,6 +993,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 now=now,
                 control={
                     "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
                     "best_quote_maker_volume_inventory_bias_reduce_share": 0.0,
                     "best_quote_maker_volume_quote_offset_ticks": 0,
                     "best_quote_maker_volume_inventory_soft_ratio": 0.95,
@@ -1020,7 +1021,16 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             result = check_symbol(
                 symbol="REUSDT",
                 output_dir=output_dir,
-                state={},
+                state={
+                    "symbols": {
+                        "REUSDT": {
+                            "status": "recovery_active",
+                            "guard_recovery_controls": {
+                                "best_quote_maker_volume_cycle_budget_notional": 108.0,
+                            },
+                        }
+                    }
+                },
                 now=now,
                 window_seconds=180,
                 min_volume_notional=100,
@@ -1038,6 +1048,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(result["assessment"]["planned_reduce_short_order_count"], 0)
             self.assertEqual(control["best_quote_maker_volume_inventory_bias_reduce_share"], 0.25)
             self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 1)
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
             self.assertEqual(restarts, ["REUSDT"])
 
     def test_loss_reduce_only_lowers_dominant_leg_pause(self) -> None:
