@@ -1721,6 +1721,34 @@ def check_symbol(
             > 200.0
         ),
     )
+    bq_volume_plan = plan.get("best_quote_maker_volume")
+    bq_volume_metrics = (
+        bq_volume_plan.get("metrics")
+        if isinstance(bq_volume_plan, dict)
+        else {}
+    )
+    same_side_entry_guard = (
+        bq_volume_metrics.get("same_side_entry_price_guard")
+        if isinstance(bq_volume_metrics, dict)
+        else {}
+    )
+    same_side_entry_guard = (
+        same_side_entry_guard if isinstance(same_side_entry_guard, dict) else {}
+    )
+    anti_chase_blocks_missing_entry_leg = bool(
+        same_side_entry_guard.get("enabled")
+    ) and not bool(same_side_entry_guard.get("report_only")) and (
+        (
+            _safe_int(assessment.get("planned_entry_buy_order_count")) == 0
+            and _safe_int(assessment.get("planned_entry_sell_order_count")) > 0
+            and bool(same_side_entry_guard.get("blocked_long_entry"))
+        )
+        or (
+            _safe_int(assessment.get("planned_entry_sell_order_count")) == 0
+            and _safe_int(assessment.get("planned_entry_buy_order_count")) > 0
+            and bool(same_side_entry_guard.get("blocked_short_entry"))
+        )
+    )
 
     try:
         if stale_or_missing and not recovery_timeout_required:
@@ -2663,6 +2691,69 @@ def check_symbol(
                 restart_runner=restart,
             )
             item["last_sla_action_at"] = now.isoformat()
+        elif (
+            normalized_symbol == "ARXUSDT"
+            and sla_recovery_due
+            and target_pace_behind
+            and no_fill_seconds >= 180.0
+            and not high_recovery_wear
+            and not bool(assessment.get("inventory_soft_pressure"))
+            and not bool(assessment.get("near_cap"))
+            and anti_chase_blocks_missing_entry_leg
+            and not recovery_reapply_debounced
+        ):
+            current_long = max(_safe_float(assessment.get("current_long_notional")), 0.0)
+            current_short = max(_safe_float(assessment.get("current_short_notional")), 0.0)
+            lighter_inventory = min(current_long, current_short)
+            heavier_inventory = max(current_long, current_short)
+            order_notional = max(
+                _safe_float(control.get("per_order_notional")),
+                _safe_float(control.get("maker_order_notional")),
+                25.0,
+            )
+            key = "best_quote_maker_volume_same_side_entry_price_guard_min_notional"
+            current_gate = max(_safe_float(control.get(key)), 200.0)
+            target_gate = float(
+                ceil(
+                    min(
+                        max(lighter_inventory + order_notional, current_gate + order_notional),
+                        max(heavier_inventory - 1.0, current_gate),
+                    )
+                )
+            )
+            if target_gate > current_gate:
+                updates = {
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    key: target_gate,
+                }
+                _remember_recovery_controls(item, control, (key,))
+                _remember_recovery_updates(item, updates)
+                action = (
+                    "dry_run_relax_arx_v3_anti_chase_for_missing_entry_leg"
+                    if dry_run
+                    else "relax_arx_v3_anti_chase_for_missing_entry_leg"
+                )
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "recovery_started_at": now.isoformat(),
+                        "recovery_owned": True,
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                        "last_sla_action_at": now.isoformat(),
+                    }
+                )
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+            else:
+                action = "hold_arx_v3_anti_chase_heavier_leg_boundary"
         elif (
             sla_recovery_due
             and target_pace_behind
