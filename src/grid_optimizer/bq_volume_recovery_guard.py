@@ -4092,7 +4092,18 @@ def check_symbol(
                 updates = _loss_reduce_recovery_updates(
                     control=control,
                     assessment=assessment,
-                    static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+                    static_cycle_budget_floor_notional=(
+                        max(
+                            cycle_budget_floor_notional,
+                            _safe_float(
+                                control.get(
+                                    "best_quote_maker_volume_cycle_budget_notional"
+                                )
+                            ),
+                        )
+                        if target_pace_behind
+                        else static_cycle_budget_floor_notional
+                    ),
                     quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
                     pause_baseline_long_notional=pause_baseline_long_notional,
                     pause_baseline_short_notional=pause_baseline_short_notional,
