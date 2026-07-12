@@ -653,11 +653,14 @@ def _actual_inventory_below_soft_limits(
     pause_baseline_long_notional: float,
     pause_baseline_short_notional: float,
 ) -> bool:
-    if _safe_float(assessment.get("frozen_total_notional")) > 0:
-        return False
-    actual_long = assessment.get("actual_long_notional")
-    actual_short = assessment.get("actual_short_notional")
-    if actual_long is None or actual_short is None:
+    has_frozen = _safe_float(assessment.get("frozen_total_notional")) > 0
+    if has_frozen:
+        inventory_long = assessment.get("current_long_notional")
+        inventory_short = assessment.get("current_short_notional")
+    else:
+        inventory_long = assessment.get("actual_long_notional")
+        inventory_short = assessment.get("actual_short_notional")
+    if inventory_long is None or inventory_short is None:
         return False
     long_limit = max(
         float(pause_baseline_long_notional),
@@ -670,8 +673,8 @@ def _actual_inventory_below_soft_limits(
     return (
         long_limit > 0
         and short_limit > 0
-        and _safe_float(actual_long) < long_limit
-        and _safe_float(actual_short) < short_limit
+        and _safe_float(inventory_long) < long_limit
+        and _safe_float(inventory_short) < short_limit
     )
 
 
@@ -844,6 +847,8 @@ def assess_symbol(
     entry_sell_order_count = sum(
         1 for item in entry_orders if str(item.get("side") or "").upper().strip() == "SELL"
     )
+    stale_order_count = len(list(plan.get("stale_orders") or []))
+    missing_order_count = len(list(plan.get("missing_orders") or []))
     reduce_only_only = bool(orders) and entry_order_count == 0
     near_orders = [
         item
@@ -1006,6 +1011,8 @@ def assess_symbol(
         "planned_entry_order_count": entry_order_count,
         "planned_entry_buy_order_count": entry_buy_order_count,
         "planned_entry_sell_order_count": entry_sell_order_count,
+        "stale_order_count": stale_order_count,
+        "missing_order_count": missing_order_count,
         "balancing_entry_only": balancing_entry_only,
         "balancing_budget_raise_safe": balancing_budget_raise_safe,
         "planned_reduce_only_order_count": reduce_only_order_count,
@@ -1597,6 +1604,16 @@ def check_symbol(
         > 3.0
     )
     assessment["high_recovery_wear"] = high_recovery_wear
+    two_sided_stale_no_fill = (
+        _safe_float(volume_summary.get("gross_notional")) <= 0
+        and _safe_int(assessment.get("planned_entry_buy_order_count")) > 0
+        and _safe_int(assessment.get("planned_entry_sell_order_count")) > 0
+        and _safe_int(assessment.get("stale_order_count")) > 0
+        and _safe_int(assessment.get("missing_order_count")) > 0
+        and _safe_int(assessment.get("active_order_count")) > 0
+        and not bool(assessment.get("inventory_soft_pressure"))
+    )
+    assessment["two_sided_stale_no_fill"] = two_sided_stale_no_fill
     wear_backoff_floor = max(
         static_cycle_budget_floor_notional,
         max(
@@ -2377,6 +2394,44 @@ def check_symbol(
                 "dry_run_cap_loss_reduce_budget_for_wear"
                 if dry_run
                 else "cap_loss_reduce_budget_for_wear"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif (
+            two_sided_stale_no_fill
+            and not recovery_reapply_debounced
+            and _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0
+        ):
+            updates = {
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "sticky_entry_price_tolerance_steps": 1.0,
+            }
+            _remember_recovery_controls(
+                item,
+                control,
+                ("sticky_entry_price_tolerance_steps",),
+            )
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_refresh_stale_two_sided_entries"
+                if dry_run
+                else "refresh_stale_two_sided_entries"
             )
             item.update(
                 {
