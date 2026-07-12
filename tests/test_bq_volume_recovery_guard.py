@@ -3243,6 +3243,70 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 72.0)
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_volatility_inventory_deadlock_enables_reduce_only_below_soft(self) -> None:
+        now = datetime(2026, 7, 12, 2, 25, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "pause_buy_position_notional": 800.0,
+                    "pause_short_position_notional": 800.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.8,
+                },
+                long_notional=650.0,
+                short_notional=70.0,
+                open_order_count=0,
+                active_order_count=0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["volatility_entry_pause"] = {
+                "active": True,
+                "inventory_gate_active": True,
+            }
+            plan["pause_reasons"] = ["volatility_entry_pause"]
+            plan["short_pause_reasons"] = ["volatility_entry_pause"]
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 650.0,
+                    "actual_short_notional": 70.0,
+                    "frozen_long_notional": 0.0,
+                    "frozen_short_notional": 0.0,
+                }
+            }
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                require_soft_pressure_for_allow_loss=True,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "enable_volatility_inventory_reduce_only")
+            self.assertTrue(result["assessment"]["volatility_inventory_reduce_deadlock"])
+            self.assertFalse(result["assessment"]["effective_inventory_soft_pressure"])
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_severe_one_sided_stall_bypasses_general_cooldown(self) -> None:
         now = datetime(2026, 6, 26, 10, 10, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

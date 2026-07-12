@@ -823,6 +823,17 @@ def assess_symbol(
     volatility_entry_pause_active = bool(
         volatility_entry_pause.get("active") if isinstance(volatility_entry_pause, dict) else False
     )
+    volatility_inventory_gate_active = bool(
+        volatility_entry_pause.get("inventory_gate_active")
+        if isinstance(volatility_entry_pause, dict)
+        else False
+    )
+    volatility_inventory_reduce_deadlock = (
+        volatility_entry_pause_active
+        and volatility_inventory_gate_active
+        and active_count <= 0
+        and max(current_long, current_short) > 0
+    )
     active_pair_reduce = (
         plan.get("best_quote_active_pair_reduce")
         if isinstance(plan.get("best_quote_active_pair_reduce"), dict)
@@ -882,6 +893,8 @@ def assess_symbol(
         "pause_reasons": sorted(pause_reasons),
         "one_sided_inventory_bias": one_sided_inventory_bias,
         "volatility_entry_pause_active": volatility_entry_pause_active,
+        "volatility_inventory_gate_active": volatility_inventory_gate_active,
+        "volatility_inventory_reduce_deadlock": volatility_inventory_reduce_deadlock,
         "active_pair_reduce_suppression_deadlock": active_pair_reduce_suppression_deadlock,
         "active_pair_reduce_below_soft_deadlock": active_pair_reduce_below_soft_deadlock,
         "current_long_notional": current_long,
@@ -2306,7 +2319,11 @@ def check_symbol(
                     dry_run=dry_run,
                     restart_runner=restart,
                 )
-            elif actual_inventory_below_soft and (required_hourly_notional <= 0 or target_pace_ahead):
+            elif (
+                actual_inventory_below_soft
+                and not bool(assessment.get("volatility_inventory_reduce_deadlock"))
+                and (required_hourly_notional <= 0 or target_pace_ahead)
+            ):
                 action = "hold_loss_reduce_when_actual_inventory_below_soft"
                 item.update(
                     {
@@ -2511,7 +2528,11 @@ def check_symbol(
                         {"best_quote_maker_volume_inventory_cost_gate_enabled": False},
                     )
                     chosen_action = "disable_inventory_cost_gate"
-                elif effective_inventory_soft_pressure or not require_soft_pressure_for_allow_loss:
+                elif (
+                    effective_inventory_soft_pressure
+                    or bool(assessment.get("volatility_inventory_reduce_deadlock"))
+                    or not require_soft_pressure_for_allow_loss
+                ):
                     updates = _loss_reduce_recovery_updates(
                         control=control,
                         assessment=assessment,
@@ -2524,7 +2545,11 @@ def check_symbol(
                         tuple(key for key in updates if key != "best_quote_maker_volume_net_loss_reduce_enabled"),
                     )
                     _remember_recovery_updates(item, updates)
-                    chosen_action = "enable_allow_loss_reduce_only"
+                    chosen_action = (
+                        "enable_volatility_inventory_reduce_only"
+                        if bool(assessment.get("volatility_inventory_reduce_deadlock"))
+                        else "enable_allow_loss_reduce_only"
+                    )
                 if chosen_action is None:
                     action = "hold_ineffective_orders_without_soft_pressure"
                 else:
