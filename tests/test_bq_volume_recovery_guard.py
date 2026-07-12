@@ -45,12 +45,33 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(
             _arx_independent_freeze_policy_updates(symbol="ARXUSDT", control=control),
             {
+                "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
+                "best_quote_maker_volume_reduce_freeze_band_budget_enabled": True,
+                "best_quote_maker_volume_reduce_freeze_band_budget_price_ratio": 0.01,
+                "best_quote_maker_volume_reduce_freeze_band_budget_base_notional": 100.0,
+                "best_quote_maker_volume_frozen_total_cap_notional": 400.0,
                 "best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled": False,
-                "best_quote_maker_volume_net_loss_reduce_enabled": False,
             },
         )
         self.assertEqual(
             _arx_independent_freeze_policy_updates(symbol="OUSDT", control=control),
+            {},
+        )
+
+    def test_arx_independent_freeze_policy_is_stable_at_expected_values(self) -> None:
+        control = {
+            "best_quote_maker_volume_reduce_freeze_enabled": True,
+            "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
+            "best_quote_maker_volume_reduce_freeze_band_budget_enabled": True,
+            "best_quote_maker_volume_reduce_freeze_band_budget_price_ratio": 0.01,
+            "best_quote_maker_volume_reduce_freeze_band_budget_base_notional": 100.0,
+            "best_quote_maker_volume_frozen_total_cap_notional": 400.0,
+            "best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled": False,
+            "best_quote_maker_volume_net_loss_reduce_enabled": False,
+        }
+
+        self.assertEqual(
+            _arx_independent_freeze_policy_updates(symbol="ARXUSDT", control=control),
             {},
         )
 

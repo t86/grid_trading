@@ -1101,12 +1101,16 @@ def _arx_independent_freeze_policy_updates(
         return {}
     if not bool(control.get("best_quote_maker_volume_reduce_freeze_enabled")):
         return {}
-    if not bool(control.get("best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled", True)):
-        return {}
-    return {
+    expected = {
+        "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
+        "best_quote_maker_volume_reduce_freeze_band_budget_enabled": True,
+        "best_quote_maker_volume_reduce_freeze_band_budget_price_ratio": 0.01,
+        "best_quote_maker_volume_reduce_freeze_band_budget_base_notional": 100.0,
+        "best_quote_maker_volume_frozen_total_cap_notional": 400.0,
         "best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled": False,
         "best_quote_maker_volume_net_loss_reduce_enabled": False,
     }
+    return {key: value for key, value in expected.items() if control.get(key) != value}
 
 
 def _default_restart_runner(symbol: str, *, runner_wrapper: str) -> object:
