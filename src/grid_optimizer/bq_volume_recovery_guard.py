@@ -1614,6 +1614,52 @@ def check_symbol(
         and not bool(assessment.get("inventory_soft_pressure"))
     )
     assessment["two_sided_stale_no_fill"] = two_sided_stale_no_fill
+    gross_in_recovery_window = _safe_float(volume_summary.get("gross_notional"))
+    no_fill_since = _parse_time(item.get("no_fill_since"))
+    if gross_in_recovery_window > 0:
+        item.pop("no_fill_since", None)
+        no_fill_since = None
+    elif no_fill_since is None:
+        observed_trade_times = [
+            trade_at
+            for row in rows
+            if (trade_at := _trade_time(row)) is not None and trade_at <= now
+        ]
+        no_fill_since = max(observed_trade_times, default=now)
+        item["no_fill_since"] = no_fill_since.isoformat()
+    no_fill_seconds = max((now - no_fill_since).total_seconds(), 0.0) if no_fill_since else 0.0
+
+    pace_ratio = (
+        trailing_hourly_notional / required_hourly_notional
+        if required_hourly_notional > 0
+        else 1.0
+    )
+    low_pace_since = _parse_time(item.get("low_pace_since"))
+    if pace_ratio >= 0.75:
+        item.pop("low_pace_since", None)
+        low_pace_since = None
+    elif low_pace_since is None:
+        low_pace_since = now
+        item["low_pace_since"] = now.isoformat()
+    low_pace_seconds = max((now - low_pace_since).total_seconds(), 0.0) if low_pace_since else 0.0
+    last_sla_action_at = _parse_time(item.get("last_sla_action_at"))
+    sla_action_debounced = bool(
+        last_sla_action_at is not None
+        and (now - last_sla_action_at).total_seconds() < 120.0
+    )
+    sla_recovery_due = (
+        no_fill_seconds >= 180.0
+        or (required_hourly_notional > 0 and pace_ratio < 0.75 and low_pace_seconds >= 120.0)
+    ) and not sla_action_debounced
+    assessment.update(
+        {
+            "no_fill_seconds": no_fill_seconds,
+            "pace_ratio": pace_ratio,
+            "low_pace_seconds": low_pace_seconds,
+            "sla_recovery_due": sla_recovery_due,
+            "sla_action_debounced": sla_action_debounced,
+        }
+    )
     wear_backoff_floor = max(
         static_cycle_budget_floor_notional,
         max(
@@ -2415,7 +2461,7 @@ def check_symbol(
             )
         elif (
             two_sided_stale_no_fill
-            and not recovery_reapply_debounced
+            and (not recovery_reapply_debounced or sla_recovery_due)
             and _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0
         ):
             updates = {
@@ -2440,6 +2486,83 @@ def check_symbol(
                     "recovery_owned": True,
                     "last_recovery_action_at": now.isoformat(),
                     "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+            item["last_sla_action_at"] = now.isoformat()
+        elif (
+            sla_recovery_due
+            and target_pace_behind
+            and not high_recovery_wear
+            and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and not bool(assessment.get("inventory_soft_pressure"))
+            and not bool(assessment.get("near_cap"))
+            and _safe_int(assessment.get("active_order_count")) > 0
+            and _safe_int(assessment.get("planned_entry_order_count")) > 0
+        ):
+            current_budget = _safe_float(
+                control.get("best_quote_maker_volume_cycle_budget_notional")
+            )
+            ladder_capacity = max(
+                _safe_float(volume_summary.get("target_cycle_budget_ladder_capacity")),
+                cycle_budget_floor_notional,
+            )
+            target_budget = min(
+                ladder_capacity,
+                max(
+                    cycle_budget_floor_notional,
+                    current_budget + max(float(volume_recovery_cycle_budget_increment), 0.0),
+                ),
+            )
+            current_offset = _safe_int(
+                control.get("best_quote_maker_volume_quote_offset_ticks")
+            )
+            updates: dict[str, Any] = {
+                "best_quote_maker_volume_allow_loss_reduce_only": False,
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+            }
+            if target_budget > current_budget:
+                updates["best_quote_maker_volume_cycle_budget_notional"] = target_budget
+            if current_offset > 0:
+                updates["best_quote_maker_volume_quote_offset_ticks"] = current_offset - 1
+            if len(updates) == 2 and _safe_float(
+                control.get("sticky_entry_price_tolerance_steps")
+            ) > 1.0:
+                updates["sticky_entry_price_tolerance_steps"] = 1.0
+            _remember_recovery_controls(
+                item,
+                control,
+                tuple(
+                    key
+                    for key in updates
+                    if key
+                    not in {
+                        "best_quote_maker_volume_allow_loss_reduce_only",
+                        "best_quote_maker_volume_net_loss_reduce_enabled",
+                    }
+                ),
+            )
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_escalate_normal_entry_for_sla"
+                if dry_run
+                else "escalate_normal_entry_for_sla"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                    "last_sla_action_at": now.isoformat(),
                 }
             )
             changed, backup_path = _apply_control_update(

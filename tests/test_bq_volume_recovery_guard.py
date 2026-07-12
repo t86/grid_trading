@@ -2737,6 +2737,131 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["sticky_entry_price_tolerance_steps"], 1.0)
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_no_fill_sla_escalates_normal_entry_through_cooldown(self) -> None:
+        now = datetime(2026, 7, 12, 7, 30, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 1,
+                    "sticky_entry_price_tolerance_steps": 8.0,
+                    "pause_buy_position_notional": 620.0,
+                    "pause_short_position_notional": 620.0,
+                    "per_order_notional": 18.0,
+                    "buy_levels": 2,
+                    "sell_levels": 2,
+                },
+                long_notional=300.0,
+                short_notional=320.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "normal",
+                        "cooldown_until": (now + timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=0,
+                daily_target_notional=120_000.0,
+                cycle_budget_floor_notional=72.0,
+                volume_recovery_cycle_budget_increment=36.0,
+                trade_rows=[
+                    {
+                        "id": 1,
+                        "time": int((now - timedelta(minutes=10)).timestamp() * 1000),
+                        "quoteQty": "100",
+                        "realizedPnl": "0",
+                    }
+                ],
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(result["assessment"]["sla_recovery_due"])
+            self.assertGreaterEqual(result["assessment"]["no_fill_seconds"], 600.0)
+            self.assertEqual(result["action"], "escalate_normal_entry_for_sla")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 72.0)
+            self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 0)
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_sla_action_is_debounced_for_two_minutes(self) -> None:
+        now = datetime(2026, 7, 12, 7, 30, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 1,
+                    "pause_buy_position_notional": 620.0,
+                    "pause_short_position_notional": 620.0,
+                    "per_order_notional": 18.0,
+                    "buy_levels": 2,
+                    "sell_levels": 2,
+                },
+                long_notional=300.0,
+                short_notional=320.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "normal",
+                        "cooldown_until": (now + timedelta(minutes=4)).isoformat(),
+                        "last_sla_action_at": (now - timedelta(seconds=60)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=0,
+                daily_target_notional=120_000.0,
+                cycle_budget_floor_notional=72.0,
+                volume_recovery_cycle_budget_increment=36.0,
+                trade_rows=[
+                    {
+                        "id": 1,
+                        "time": int((now - timedelta(minutes=10)).timestamp() * 1000),
+                        "quoteQty": "100",
+                    }
+                ],
+                restart_runner=restarts.append,
+            )
+
+            self.assertTrue(result["assessment"]["sla_action_debounced"])
+            self.assertFalse(result["assessment"]["sla_recovery_due"])
+            self.assertEqual(result["action"], "cooldown")
+            self.assertEqual(restarts, [])
+
     def test_does_not_enable_loss_reduce_when_hourly_target_pace_is_ahead(self) -> None:
         now = datetime(2026, 7, 11, 12, 15, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
