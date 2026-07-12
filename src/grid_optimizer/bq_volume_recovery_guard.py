@@ -2950,6 +2950,10 @@ def check_symbol(
             )
             and not bool(assessment.get("inventory_soft_pressure"))
             and not bool(assessment.get("near_cap"))
+            and not (
+                bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+                and actual_inventory_below_soft
+            )
             and anti_chase_blocks_missing_entry_leg
         ):
             current_long = max(_safe_float(assessment.get("current_long_notional")), 0.0)
@@ -3554,7 +3558,7 @@ def check_symbol(
                 target_pace_behind
                 and recovery_hold_satisfied
                 and not high_recovery_wear
-                and not recovery_reapply_debounced
+                and (not recovery_reapply_debounced or no_fill_seconds >= 300.0)
                 and actual_inventory_below_soft
                 and not cap_buffer_ok
                 and _safe_int(assessment.get("planned_reduce_only_order_count")) <= 0
