@@ -6136,7 +6136,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "per_order_notional": 25.0,
                 },
                 long_notional=500.0,
-                short_notional=400.0,
+                short_notional=328.0,
                 open_order_count=1,
                 active_order_count=1,
                 orders_near_market=True,
@@ -6170,6 +6170,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                         "status": "low_volume",
                         "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
                         "low_pace_since": (now - timedelta(minutes=4)).isoformat(),
+                        "no_fill_since": (now - timedelta(minutes=10)).isoformat(),
                         "last_recovery_action_at": (now - timedelta(seconds=30)).isoformat(),
                     }
                 }
@@ -6190,11 +6191,6 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                         "time": int((now - timedelta(minutes=10)).timestamp() * 1000),
                         "quoteQty": 500.0,
                         "realizedPnl": -0.5,
-                    },
-                    {
-                        "time": int((now - timedelta(minutes=1)).timestamp() * 1000),
-                        "quoteQty": 50.0,
-                        "realizedPnl": 0.0,
                     },
                 ],
                 volume_source="exchange_user_trades",
