@@ -1971,6 +1971,18 @@ def check_symbol(
             item.pop("guard_recovery_controls", None)
             item.pop("recovery_started_at", None)
             item.pop("recovery_owned", None)
+        elif (
+            high_recovery_wear
+            and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and not recovery_hold_satisfied
+        ):
+            action = "hold_loss_reduce_min_duration_before_wear_judgement"
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "last_recovery_check_at": now.isoformat(),
+                }
+            )
         elif high_recovery_wear and bool(
             control.get("best_quote_maker_volume_allow_loss_reduce_only")
         ):

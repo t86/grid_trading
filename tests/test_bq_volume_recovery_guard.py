@@ -4027,6 +4027,75 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertNotIn("guard_recovery_controls", state["symbols"]["REUSDT"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_high_wear_waits_for_loss_reduce_minimum_observation_period(self) -> None:
+        now = datetime(2026, 7, 12, 12, 40, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 24.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 0,
+                    "per_order_notional": 8.0,
+                    "pause_buy_position_notional": 361.0,
+                    "pause_short_position_notional": 361.0,
+                },
+                long_notional=370.0,
+                short_notional=250.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_owned": True,
+                        "recovery_started_at": (now - timedelta(seconds=60)).isoformat(),
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_allow_loss_reduce_only": False,
+                            "best_quote_maker_volume_cycle_budget_notional": 24.0,
+                        },
+                    }
+                }
+            }
+            trade_rows = [
+                {
+                    "id": 1,
+                    "time": int((now - timedelta(minutes=2)).timestamp() * 1000),
+                    "quoteQty": "1000",
+                    "realizedPnl": "-4",
+                }
+            ]
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                cycle_budget_floor_notional=24.0,
+                trade_rows=trade_rows,
+                restart_runner=restarts.append,
+                recovery_min_hold_seconds=120.0,
+            )
+
+            self.assertEqual(
+                result["action"],
+                "hold_loss_reduce_min_duration_before_wear_judgement",
+            )
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 24.0)
+            self.assertEqual(restarts, [])
+
     def test_high_wear_backoff_keeps_cycle_budget_runnable(self) -> None:
         now = datetime(2026, 7, 12, 10, 30, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
