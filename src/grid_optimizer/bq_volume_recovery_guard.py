@@ -2670,7 +2670,15 @@ def check_symbol(
             }
             if (
                 bool(assessment.get("low_volume"))
-                and effective_inventory_soft_pressure
+                and (
+                    effective_inventory_soft_pressure
+                    or (
+                        sla_recovery_due
+                        and _safe_int(assessment.get("active_order_count")) <= 0
+                        and _safe_int(assessment.get("planned_order_count")) <= 0
+                        and bool(assessment.get("inventory_soft_pressure"))
+                    )
+                )
                 and recovery_hold_satisfied
                 and not high_recovery_wear
                 and not bool(recovery_expected_controls.get("best_quote_maker_volume_allow_loss_reduce_only"))
