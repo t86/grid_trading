@@ -3365,6 +3365,10 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
             self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 1)
+            self.assertEqual(
+                state["symbols"]["REUSDT"]["post_restore_budget_cooldown_until"],
+                (now + timedelta(minutes=5)).isoformat(),
+            )
             self.assertEqual(restarts, ["REUSDT"])
 
     def test_budget_recovery_switches_to_soft_inventory_loss_reduce(self) -> None:

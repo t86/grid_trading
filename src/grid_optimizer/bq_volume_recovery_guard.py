@@ -1703,6 +1703,14 @@ def check_symbol(
                     "recovery_owned": True,
                     "last_recovery_action_at": now.isoformat(),
                     "last_recovery_action": action,
+                    "cooldown_until": (
+                        now
+                        + timedelta(seconds=max(float(post_restore_cooldown_seconds), 0.0))
+                    ).isoformat(),
+                    "post_restore_budget_cooldown_until": (
+                        now
+                        + timedelta(seconds=max(float(post_restore_cooldown_seconds), 0.0))
+                    ).isoformat(),
                 }
             )
             changed, backup_path = _apply_control_update(
@@ -2118,6 +2126,7 @@ def check_symbol(
             )
             > 3.0
             and not recovery_reapply_debounced
+            and not post_restore_budget_cooldown_active
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and not effective_inventory_soft_pressure
             and not bool(assessment.get("inventory_soft_pressure"))
