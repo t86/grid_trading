@@ -3860,8 +3860,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 "symbols": {
                     "REUSDT": {
                         "status": "recovery_active",
-                        "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
-                        "last_recovery_action_at": (now - timedelta(minutes=3)).isoformat(),
+                        "recovery_started_at": (now - timedelta(minutes=5)).isoformat(),
+                        "last_recovery_action_at": (now - timedelta(minutes=5)).isoformat(),
                         "guard_original_controls": {
                             "best_quote_maker_volume_cycle_budget_notional": 48.0,
                         },
@@ -3928,8 +3928,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 "symbols": {
                     "REUSDT": {
                         "status": "recovery_active",
-                        "recovery_started_at": (now - timedelta(minutes=5)).isoformat(),
-                        "last_recovery_action_at": (now - timedelta(minutes=5)).isoformat(),
+                        "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
+                        "last_recovery_action_at": (now - timedelta(minutes=3)).isoformat(),
                         "guard_original_controls": {
                             "best_quote_maker_volume_cycle_budget_notional": 12.0,
                         },
@@ -4057,6 +4057,93 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(result["assessment"]["effective_inventory_soft_pressure"])
             self.assertTrue(result["assessment"]["inventory_soft_pressure"])
             self.assertTrue(result["assessment"]["planned_reduce_only_only"])
+            self.assertEqual(result["action"], "switch_to_soft_inventory_loss_reduce")
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_target_lag_uses_managed_soft_pressure_for_optional_loss_reduce(self) -> None:
+        now = datetime(2026, 7, 12, 10, 22, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 24.0,
+                    "best_quote_maker_volume_inventory_bias_min_notional_gap": 48.0,
+                    "pause_buy_position_notional": 361.0,
+                    "pause_short_position_notional": 361.0,
+                    "best_quote_maker_volume_max_long_notional": 380.0,
+                    "best_quote_maker_volume_max_short_notional": 380.0,
+                },
+                long_notional=364.0,
+                short_notional=332.0,
+                open_order_count=3,
+                active_order_count=3,
+                orders_near_market=True,
+                recent_trade_notional=120.0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 370.0,
+                    "actual_short_notional": 923.0,
+                    "frozen_long_notional": 6.0,
+                    "frozen_short_notional": 591.0,
+                }
+            }
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "first_low_volume_at": (now - timedelta(minutes=5)).isoformat(),
+                        "low_pace_since": (now - timedelta(minutes=5)).isoformat(),
+                        "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
+                        "last_recovery_action_at": (now - timedelta(minutes=3)).isoformat(),
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_inventory_bias_min_notional_gap": 40.0,
+                        },
+                        "guard_recovery_controls": {
+                            "best_quote_maker_volume_inventory_bias_min_notional_gap": 48.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            with patch.object(
+                bq_volume_recovery_guard,
+                "_actual_inventory_below_soft_limits",
+                return_value=True,
+            ):
+                result = check_symbol(
+                    symbol="REUSDT",
+                    output_dir=output_dir,
+                    state=state,
+                    now=now,
+                    window_seconds=180,
+                    min_volume_notional=400,
+                    trigger_seconds=120,
+                    daily_target_notional=100_000.0,
+                    trade_rows=[
+                        {
+                            "id": 1,
+                            "time": int((now - timedelta(seconds=20)).timestamp() * 1000),
+                            "quoteQty": "120",
+                        }
+                    ],
+                    restart_runner=restarts.append,
+                )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(result["assessment"]["target_pace_behind"])
+            self.assertFalse(result["assessment"]["effective_inventory_soft_pressure"])
+            self.assertTrue(result["assessment"]["inventory_soft_pressure"])
             self.assertEqual(result["action"], "switch_to_soft_inventory_loss_reduce")
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])

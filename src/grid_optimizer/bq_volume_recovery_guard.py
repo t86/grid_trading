@@ -2874,6 +2874,15 @@ def check_symbol(
                     effective_inventory_soft_pressure
                     or (
                         sla_recovery_due
+                        and target_pace_behind
+                        and bool(assessment.get("inventory_soft_pressure"))
+                        and (
+                            effective_inventory_soft_pressure
+                            or not require_soft_pressure_for_allow_loss
+                        )
+                    )
+                    or (
+                        sla_recovery_due
                         and bool(assessment.get("inventory_soft_pressure"))
                         and (
                             (
