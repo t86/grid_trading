@@ -1449,6 +1449,53 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(state["symbols"]["REUSDT"]["recovery_started_at"], now.isoformat())
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_does_not_raise_cycle_budget_with_large_active_inventory_imbalance(self) -> None:
+        now = datetime(2026, 7, 12, 2, 39, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 96.0,
+                    "pause_buy_position_notional": 780.0,
+                    "pause_short_position_notional": 780.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.92,
+                },
+                long_notional=673.0,
+                short_notional=169.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                cycle_budget_floor_notional=108.0,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["action"], "hold_budget_raise_for_inventory_imbalance")
+            self.assertTrue(result["assessment"]["budget_raise_inventory_buffer_blocked"])
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 96.0)
+            self.assertEqual(restarts, [])
+
     def test_blocks_recovery_changes_when_active_ledger_drift_is_large(self) -> None:
         now = datetime(2026, 6, 26, 8, 21, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

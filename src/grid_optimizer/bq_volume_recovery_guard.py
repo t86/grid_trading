@@ -803,6 +803,15 @@ def assess_symbol(
     )
     near_long_soft = long_soft > 0 and current_long >= long_soft
     near_short_soft = short_soft > 0 and current_short >= short_soft
+    inventory_notional_gap = abs(current_long - current_short)
+    budget_raise_inventory_buffer_blocked = (
+        (long_soft > 0 and current_long >= long_soft * 0.90)
+        or (short_soft > 0 and current_short >= short_soft * 0.90)
+        or (
+            min(long_soft, short_soft) > 0
+            and inventory_notional_gap >= min(long_soft, short_soft) * 0.35
+        )
+    )
     if near_long_soft and not near_long_cap:
         reasons.append("long_near_soft_limit")
     if near_short_soft and not near_short_cap:
@@ -885,6 +894,8 @@ def assess_symbol(
         "short_near_cap": near_short_cap,
         "long_near_soft": near_long_soft,
         "short_near_soft": near_short_soft,
+        "inventory_notional_gap": inventory_notional_gap,
+        "budget_raise_inventory_buffer_blocked": budget_raise_inventory_buffer_blocked,
         "long_soft_limit_notional": long_soft,
         "short_soft_limit_notional": short_soft,
         "inventory_soft_ratio": _safe_float(control.get("best_quote_maker_volume_inventory_soft_ratio")),
@@ -1518,9 +1529,23 @@ def check_symbol(
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and not effective_inventory_soft_pressure
             and not bool(assessment.get("inventory_soft_pressure"))
+            and bool(assessment.get("budget_raise_inventory_buffer_blocked"))
+        ):
+            action = "hold_budget_raise_for_inventory_imbalance"
+        elif (
+            recovery_low_volume
+            and not post_restore_budget_cooldown_active
+            and not recovery_reapply_debounced
+            and max(float(cycle_budget_floor_notional), 0.0)
+            > _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
+            and _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional")) > 0
+            and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and not effective_inventory_soft_pressure
+            and not bool(assessment.get("inventory_soft_pressure"))
             and not bool(assessment.get("near_cap"))
             and not bool(assessment.get("ineffective_orders"))
             and not bool(assessment.get("volatility_entry_pause_active"))
+            and not bool(assessment.get("budget_raise_inventory_buffer_blocked"))
             and "inventory_bias" not in set(assessment.get("pause_reasons") or [])
         ):
             budget_floor = max(float(cycle_budget_floor_notional), 0.0)
