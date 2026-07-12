@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 import json
 from collections import deque
 from datetime import datetime, timezone
@@ -265,6 +266,17 @@ def trade_row_time_ms(row: dict[str, Any]) -> int:
     return epoch_ms(row.get("time"))
 
 
+def _canonical_decimal(value: Any) -> str:
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return ""
+    try:
+        normalized = Decimal(text).normalize()
+    except InvalidOperation:
+        return text
+    return format(normalized, "f")
+
+
 def trade_row_key(row: dict[str, Any]) -> str:
     raw_id = str(row.get("id", "")).strip()
     if raw_id:
@@ -272,9 +284,10 @@ def trade_row_key(row: dict[str, Any]) -> str:
     return ":".join(
         [
             str(row.get("time", "")).strip(),
+            str(row.get("orderId", row.get("order_id", ""))).strip(),
             str(row.get("side", "")).upper().strip(),
-            str(row.get("price", "")).strip(),
-            str(row.get("qty", "")).strip(),
+            _canonical_decimal(row.get("price")),
+            _canonical_decimal(row.get("qty", row.get("quantity"))),
         ]
     )
 

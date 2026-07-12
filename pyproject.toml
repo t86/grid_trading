@@ -32,6 +32,7 @@ grid-trade-db-backfill = "grid_optimizer.trade_database_backfill:main"
 grid-recovery-stall-monitor = "grid_optimizer.recovery_stall_monitor:main"
 grid-low-volume-monitor = "grid_optimizer.low_volume_monitor:main"
 grid-volume-spike-monitor = "grid_optimizer.volume_spike_monitor:main"
+grid-production-volume-snapshot = "grid_optimizer.production_volume_snapshot:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

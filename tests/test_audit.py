@@ -82,6 +82,12 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(last_time_ms, 2000)
         self.assertEqual(last_keys, ["3"])
 
+    def test_trade_row_key_normalizes_numeric_fallback_fields(self) -> None:
+        integer_row = {"time": 1000, "orderId": 7, "side": "BUY", "price": "0.1800", "qty": "88"}
+        decimal_row = {"time": "1000", "orderId": "7", "side": "buy", "price": 0.18, "qty": "88.0"}
+
+        self.assertEqual(trade_row_key(integer_row), trade_row_key(decimal_row))
+
     def test_collect_new_rows_tracks_income_rows_by_tran_id(self) -> None:
         rows = [
             {"tranId": 10, "time": 1000, "income": "0.1", "incomeType": "FUNDING_FEE"},
