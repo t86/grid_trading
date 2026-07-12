@@ -2334,6 +2334,56 @@ def check_symbol(
                 restart_runner=restart,
             )
         elif (
+            normalized_symbol == "OUSDT"
+            and target_pace_behind
+            and bool(assessment.get("low_volume"))
+            and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and _safe_int(assessment.get("active_order_count")) <= 0
+            and _safe_int(assessment.get("planned_order_count")) <= 0
+            and "budget_below_minimum" in set(assessment.get("pause_reasons") or [])
+        ):
+            updates = _loss_reduce_recovery_updates(
+                control=control,
+                assessment=assessment,
+                static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+                quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
+                pause_baseline_long_notional=pause_baseline_long_notional,
+                pause_baseline_short_notional=pause_baseline_short_notional,
+            )
+            _remember_recovery_controls(
+                item,
+                control,
+                tuple(
+                    key
+                    for key in updates
+                    if key != "best_quote_maker_volume_net_loss_reduce_enabled"
+                ),
+            )
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_enable_ousdt_budget_deadlock_loss_reduce"
+                if dry_run
+                else "enable_ousdt_budget_deadlock_loss_reduce"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif (
             target_pace_behind
             and bool(assessment.get("low_volume"))
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))

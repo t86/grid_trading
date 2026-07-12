@@ -1666,6 +1666,67 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 240.0)
             self.assertEqual(restarts, ["ARXUSDT"])
 
+    def test_ousdt_budget_below_minimum_deadlock_opens_bounded_loss_reduce(self) -> None:
+        now = datetime(2026, 7, 12, 23, 30, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "best_quote_maker_volume_cycle_budget_notional": 60.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 1,
+                    "pause_buy_position_notional": 380.0,
+                    "pause_short_position_notional": 380.0,
+                    "per_order_notional": 60.0,
+                    "best_quote_maker_volume_max_long_notional": 380.0,
+                    "best_quote_maker_volume_max_short_notional": 380.0,
+                },
+                long_notional=324.0,
+                short_notional=189.0,
+                open_order_count=0,
+                active_order_count=0,
+            )
+            for suffix in ("runner_control.json", "latest_plan.json", "latest_submit.json"):
+                source = output_dir / f"reusdt_loop_{suffix}"
+                target = output_dir / f"ousdt_loop_{suffix}"
+                target.write_text(
+                    source.read_text(encoding="utf-8").replace("REUSDT", "OUSDT"),
+                    encoding="utf-8",
+                )
+            plan_path = output_dir / "ousdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["pause_reasons"] = ["budget_below_minimum"]
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {"symbols": {"OUSDT": {"status": "normal"}}}
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="OUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=400,
+                trigger_seconds=120,
+                daily_target_notional=100_000.0,
+                target_completion_buffer_seconds=10_800.0,
+                trade_rows=[],
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(
+                result["action"], "enable_ousdt_budget_deadlock_loss_reduce", result
+            )
+            control = json.loads(
+                (output_dir / "ousdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
+            self.assertEqual(restarts, ["OUSDT"])
+
     def test_cap_pressure_balancing_flow_gets_one_bounded_budget_step(self) -> None:
         now = datetime(2026, 7, 12, 13, 55, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
