@@ -2832,6 +2832,13 @@ def check_symbol(
             and not bool(assessment.get("near_cap"))
             and _safe_int(assessment.get("active_order_count")) > 0
             and _safe_int(assessment.get("planned_entry_order_count")) > 0
+            and not (
+                severe_one_sided_stall
+                and bool(assessment.get("one_sided_inventory_bias"))
+                and bool(assessment.get("balancing_entry_requote_safe"))
+                and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) <= 0
+                and _safe_float(control.get("sticky_entry_price_tolerance_steps")) <= 1.0
+            )
         ):
             current_budget = _safe_float(
                 control.get("best_quote_maker_volume_cycle_budget_notional")
