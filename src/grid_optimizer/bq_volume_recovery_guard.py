@@ -956,7 +956,6 @@ def assess_symbol(
     )
     balancing_entry_requote_safe = (
         balancing_entry_only
-        and len(near_entry_orders) > 0
         and reduce_only_order_count == 0
     )
     balancing_budget_raise_safe = balancing_entry_only and _safe_float(
