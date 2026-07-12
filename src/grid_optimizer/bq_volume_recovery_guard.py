@@ -4552,6 +4552,65 @@ def check_symbol(
             else:
                 action = "hold_recovery_until_volume_or_orders"
                 item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+        elif (
+            target_pace_behind
+            and pace_ratio < 0.75
+            and not recovery_reapply_debounced
+            and not high_recovery_wear
+            and effective_inventory_soft_pressure
+            and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and _safe_int(assessment.get("planned_reduce_only_order_count")) > 0
+            and _safe_int(assessment.get("near_market_reduce_only_order_count")) > 0
+        ):
+            current_budget = _safe_float(
+                control.get("best_quote_maker_volume_cycle_budget_notional")
+            )
+            updates = _loss_reduce_recovery_updates(
+                control=control,
+                assessment=assessment,
+                static_cycle_budget_floor_notional=max(
+                    float(cycle_budget_floor_notional),
+                    current_budget,
+                ),
+                quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
+                pause_baseline_long_notional=pause_baseline_long_notional,
+                pause_baseline_short_notional=pause_baseline_short_notional,
+            )
+            _remember_recovery_controls(
+                item,
+                control,
+                tuple(
+                    key
+                    for key in updates
+                    if key != "best_quote_maker_volume_net_loss_reduce_enabled"
+                ),
+            )
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_enable_cap_pressure_loss_reduce_for_pace"
+                if dry_run
+                else "enable_cap_pressure_loss_reduce_for_pace"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": now.isoformat(),
+                    "soft_recovery_extension_count": 0,
+                    "recovery_owned": True,
+                    "last_recovery_check_at": now.isoformat(),
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
         elif not recovery_low_volume:
             action = "volume_normal"
             item.clear()
