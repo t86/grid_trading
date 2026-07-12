@@ -954,6 +954,11 @@ def assess_symbol(
         and entry_sell_order_count > 0
         and entry_buy_order_count == 0
     )
+    balancing_entry_requote_safe = (
+        balancing_entry_only
+        and len(near_entry_orders) > 0
+        and reduce_only_order_count == 0
+    )
     balancing_budget_raise_safe = balancing_entry_only and _safe_float(
         control.get("sticky_entry_price_tolerance_steps")
     ) > 1.0
@@ -1041,6 +1046,7 @@ def assess_symbol(
         "stale_order_count": stale_order_count,
         "missing_order_count": missing_order_count,
         "balancing_entry_only": balancing_entry_only,
+        "balancing_entry_requote_safe": balancing_entry_requote_safe,
         "balancing_budget_raise_safe": balancing_budget_raise_safe,
         "planned_reduce_only_order_count": reduce_only_order_count,
         "planned_reduce_long_order_count": reduce_long_order_count,
@@ -2367,8 +2373,13 @@ def check_symbol(
             and required_hourly_notional > 0
             and trailing_hourly_notional < required_hourly_notional * 0.75
             and _safe_float(volume_summary.get("trailing_15m_gross_notional")) >= 100.0
-            and trailing_5m_realized_wear_per_10k <= 3.0
-            and trailing_15m_realized_wear_per_10k <= 3.0
+            and (
+                bool(assessment.get("balancing_entry_requote_safe"))
+                or (
+                    trailing_5m_realized_wear_per_10k <= 3.0
+                    and trailing_15m_realized_wear_per_10k <= 3.0
+                )
+            )
             and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) > 0
         ):
             updates = {
@@ -2466,7 +2477,7 @@ def check_symbol(
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and not effective_inventory_soft_pressure
             and not bool(assessment.get("inventory_soft_pressure"))
-            and not bool(assessment.get("balancing_budget_raise_safe"))
+            and not bool(assessment.get("balancing_entry_requote_safe"))
             and (
                 _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
                 > wear_backoff_floor
