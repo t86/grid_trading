@@ -3520,6 +3520,9 @@ def check_symbol(
                 )
                 and recovery_hold_satisfied
                 and not high_recovery_wear
+                and not confirmed_loss_reduce_wear
+                and not recovery_reapply_debounced
+                and not post_restore_budget_cooldown_active
                 and not bool(recovery_expected_controls.get("best_quote_maker_volume_allow_loss_reduce_only"))
             ):
                 loss_updates = _loss_reduce_recovery_updates(
@@ -4559,6 +4562,7 @@ def check_symbol(
             target_pace_behind
             and pace_ratio < 0.75
             and not recovery_reapply_debounced
+            and not post_restore_budget_cooldown_active
             and not high_recovery_wear
             and not confirmed_loss_reduce_wear
             and effective_inventory_soft_pressure
@@ -4674,6 +4678,7 @@ def check_symbol(
                 and not high_recovery_wear
                 and not confirmed_loss_reduce_wear
                 and not recovery_reapply_debounced
+                and not post_restore_budget_cooldown_active
             ):
                 updates = _loss_reduce_recovery_updates(
                     control=control,
@@ -4813,6 +4818,7 @@ def check_symbol(
                     and no_fill_seconds >= max(float(trigger_seconds), 0.0)
                     and bool(assessment.get("inventory_soft_pressure"))
                     and not confirmed_loss_reduce_wear
+                    and not post_restore_budget_cooldown_active
                     and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
                 ):
                     updates = {
@@ -4999,6 +5005,8 @@ def check_symbol(
                     action = "hold_confirmed_wear_without_loss_reduce"
                 elif recovery_reapply_debounced:
                     action = "hold_loss_reduce_reapply_debounce"
+                elif post_restore_budget_cooldown_active:
+                    action = "hold_loss_reduce_post_restore_cooldown"
                 else:
                     updates = _loss_reduce_recovery_updates(
                         control=control,
@@ -5051,6 +5059,7 @@ def check_symbol(
                 elif (
                     not confirmed_loss_reduce_wear
                     and not recovery_reapply_debounced
+                    and not post_restore_budget_cooldown_active
                     and (
                     effective_inventory_soft_pressure
                     or bool(assessment.get("volatility_inventory_reduce_deadlock"))

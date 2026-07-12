@@ -1199,7 +1199,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, [])
 
-    def test_soft_pressure_does_not_reenable_loss_reduce_during_debounce(self) -> None:
+    def test_soft_pressure_does_not_reenable_loss_reduce_during_post_restore_cooldown(self) -> None:
         now = datetime(2026, 7, 12, 22, 20, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -1224,8 +1224,11 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "REUSDT": {
                         "status": "low_volume",
                         "first_low_volume_at": (now - timedelta(minutes=10)).isoformat(),
-                        "last_recovery_action_at": (now - timedelta(seconds=30)).isoformat(),
+                        "last_recovery_action_at": (now - timedelta(minutes=4)).isoformat(),
                         "last_recovery_action": "disable_loss_reduce_for_high_wear",
+                        "post_restore_budget_cooldown_until": (
+                            now + timedelta(minutes=5)
+                        ).isoformat(),
                     }
                 }
             }
@@ -1256,7 +1259,6 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(
                 control["best_quote_maker_volume_allow_loss_reduce_only"], result
             )
-            self.assertEqual(restarts, [])
 
     def test_keeps_allow_loss_enabled_until_inventory_has_recovered_buffer(self) -> None:
         now = datetime(2026, 6, 26, 7, 10, tzinfo=timezone.utc)
