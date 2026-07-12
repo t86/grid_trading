@@ -1793,7 +1793,18 @@ def check_symbol(
         volume_summary.get("trailing_15m_realized_wear_per_10k")
     )
     high_recovery_wear = _is_high_recovery_wear(volume_summary)
+    trailing_5m_gross_notional = _safe_float(
+        volume_summary.get("trailing_5m_gross_notional")
+    )
+    confirmed_loss_reduce_wear = (
+        trailing_5m_realized_wear_per_10k > 80.0
+        or (
+            trailing_5m_gross_notional >= 100.0
+            and trailing_5m_realized_wear_per_10k > 3.0
+        )
+    )
     assessment["high_recovery_wear"] = high_recovery_wear
+    assessment["confirmed_loss_reduce_wear"] = confirmed_loss_reduce_wear
     two_sided_stale_no_fill = (
         _safe_float(volume_summary.get("gross_notional")) <= 0
         and _safe_int(assessment.get("planned_entry_buy_order_count")) > 0
@@ -1983,8 +1994,22 @@ def check_symbol(
                     "last_recovery_check_at": now.isoformat(),
                 }
             )
-        elif high_recovery_wear and bool(
-            control.get("best_quote_maker_volume_allow_loss_reduce_only")
+        elif (
+            high_recovery_wear
+            and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and not confirmed_loss_reduce_wear
+        ):
+            action = "hold_loss_reduce_until_fresh_wear_confirmation"
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "last_recovery_check_at": now.isoformat(),
+                }
+            )
+        elif (
+            high_recovery_wear
+            and confirmed_loss_reduce_wear
+            and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
         ):
             current_budget = _safe_float(
                 control.get("best_quote_maker_volume_cycle_budget_notional")
