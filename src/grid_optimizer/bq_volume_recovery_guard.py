@@ -2083,6 +2083,9 @@ def check_symbol(
                 )
     loss_reduce_cycle_budget_cap = max(
         static_cycle_budget_floor_notional,
+        _safe_float(
+            control.get("best_quote_maker_volume_min_cycle_budget_notional")
+        ),
         max(
             _safe_float(control.get("per_order_notional")),
             _safe_float(control.get("maker_order_notional")),
