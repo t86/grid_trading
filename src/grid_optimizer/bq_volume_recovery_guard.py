@@ -1777,6 +1777,51 @@ def check_symbol(
                 dry_run=dry_run,
                 restart_runner=restart,
             )
+        elif (
+            target_pace_behind
+            and bool(assessment.get("low_volume"))
+            and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and _safe_int(assessment.get("active_order_count")) <= 0
+            and _safe_int(assessment.get("planned_order_count")) <= 0
+            and "budget_below_minimum" in set(assessment.get("pause_reasons") or [])
+            and _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
+            < wear_backoff_floor
+        ):
+            updates = {
+                "best_quote_maker_volume_allow_loss_reduce_only": False,
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "best_quote_maker_volume_cycle_budget_notional": wear_backoff_floor,
+            }
+            action = (
+                "dry_run_restore_runnable_budget_after_wear_backoff"
+                if dry_run
+                else "restore_runnable_budget_after_wear_backoff"
+            )
+            item.update(
+                {
+                    "status": "normal",
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            _set_post_restore_cooldown(
+                item,
+                now=now,
+                cooldown_seconds=post_restore_cooldown_seconds,
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+            item.pop("guard_original_controls", None)
+            item.pop("guard_recovery_controls", None)
+            item.pop("recovery_started_at", None)
+            item.pop("recovery_owned", None)
         elif high_recovery_wear and bool(
             control.get("best_quote_maker_volume_allow_loss_reduce_only")
         ):
