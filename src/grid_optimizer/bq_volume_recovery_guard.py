@@ -3541,6 +3541,89 @@ def check_symbol(
             current_short = max(_safe_float(assessment.get("current_short_notional")), 0.0)
             heavier_inventory = max(current_long, current_short)
             lighter_inventory = min(current_long, current_short)
+            buffered_long_soft = max(
+                float(pause_baseline_long_notional),
+                _safe_float(assessment.get("long_soft_limit_notional")),
+            ) * min(max(float(recover_cap_ratio), 0.0), 1.0)
+            buffered_short_soft = max(
+                float(pause_baseline_short_notional),
+                _safe_float(assessment.get("short_soft_limit_notional")),
+            ) * min(max(float(recover_cap_ratio), 0.0), 1.0)
+            soft_hysteresis_bridge_updates: dict[str, Any] = {}
+            if (
+                target_pace_behind
+                and recovery_hold_satisfied
+                and not high_recovery_wear
+                and not recovery_reapply_debounced
+                and actual_inventory_below_soft
+                and not cap_buffer_ok
+                and _safe_int(assessment.get("planned_reduce_only_order_count")) <= 0
+                and not bool(assessment.get("volatility_entry_pause_active"))
+            ):
+                if (
+                    buffered_long_soft > 0
+                    and current_long >= buffered_long_soft
+                    and current_long > current_short
+                    and _safe_float(control.get("pause_buy_position_notional"))
+                    > buffered_long_soft
+                ):
+                    soft_hysteresis_bridge_updates["pause_buy_position_notional"] = (
+                        buffered_long_soft
+                    )
+                elif (
+                    buffered_short_soft > 0
+                    and current_short >= buffered_short_soft
+                    and current_short > current_long
+                    and _safe_float(control.get("pause_short_position_notional"))
+                    > buffered_short_soft
+                ):
+                    soft_hysteresis_bridge_updates["pause_short_position_notional"] = (
+                        buffered_short_soft
+                    )
+            if soft_hysteresis_bridge_updates:
+                updates = {
+                    **soft_hysteresis_bridge_updates,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                }
+                _remember_recovery_controls(item, control, tuple(soft_hysteresis_bridge_updates))
+                _remember_recovery_updates(item, updates)
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = (
+                    "dry_run_bridge_soft_hysteresis_gap_for_recovery"
+                    if dry_run
+                    else "bridge_soft_hysteresis_gap_for_recovery"
+                )
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_recovery_check_at": now.isoformat(),
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+                result = {
+                    "symbol": normalized_symbol,
+                    "action": action,
+                    "changed_keys": changed,
+                    "backup_path": backup_path,
+                    "dry_run": dry_run,
+                    "restart_failed": restart_failed,
+                    "volume_summary": volume_summary,
+                    "assessment": assessment,
+                }
+                _append_jsonl(
+                    output_dir / "bq_volume_recovery_guard_events.jsonl",
+                    {"ts": now.isoformat(), **result},
+                )
+                return result
             pair_reduce_min_side = max(
                 _safe_float(control.get("best_quote_maker_volume_active_pair_reduce_min_side_notional")),
                 0.0,
