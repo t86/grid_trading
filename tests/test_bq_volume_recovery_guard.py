@@ -5554,6 +5554,94 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_stalled_reduce_only_flow_enables_bounded_active_loss_recovery(self) -> None:
+        now = datetime(2026, 7, 12, 11, 56, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_cycle_budget_notional": 24.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 3,
+                    "pause_buy_position_notional": 380.0,
+                    "pause_short_position_notional": 380.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.95,
+                },
+                long_notional=385.0,
+                short_notional=354.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+                recent_trade_notional=0.0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["buy_orders"] = [
+                {
+                    "side": "BUY",
+                    "price": 0.5507,
+                    "qty": 24.0,
+                    "role": "best_quote_reduce_short",
+                    "force_reduce_only": True,
+                }
+            ]
+            plan["sell_orders"] = [
+                {
+                    "side": "SELL",
+                    "price": 0.5509,
+                    "qty": 24.0,
+                    "role": "best_quote_reduce_long",
+                    "force_reduce_only": True,
+                }
+            ]
+            plan["pause_reasons"] = ["inventory_soft"]
+            plan.setdefault("best_quote_maker_volume", {}).setdefault("reduce_freeze", {}).update(
+                {"actual_long_notional": 300.0, "actual_short_notional": 300.0}
+            )
+            _write_json(plan_path, plan)
+            trade_rows = [
+                {
+                    "id": 1,
+                    "time": int((now - timedelta(minutes=30)).timestamp() * 1000),
+                    "quoteQty": "20",
+                    "realizedPnl": "0",
+                }
+            ]
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=30)).isoformat(),
+                        "no_fill_since": (now - timedelta(minutes=30)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                daily_target_notional=100_000.0,
+                trade_rows=trade_rows,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(result["action"], "enable_stalled_reduce_only_loss_recovery", result)
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 2)
+            self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_arx_v3_relaxes_anti_chase_for_target_behind_no_fill_reduce_only_sla(self) -> None:
         now = datetime(2026, 7, 12, 9, 20, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

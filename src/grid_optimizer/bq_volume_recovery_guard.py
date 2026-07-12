@@ -3845,7 +3845,51 @@ def check_symbol(
             ):
                 current_budget = _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
                 budget_floor = max(float(cycle_budget_floor_notional), 0.0)
-                if current_budget > 0 and budget_floor > current_budget:
+                if (
+                    target_pace_behind
+                    and no_fill_seconds >= max(float(trigger_seconds), 0.0)
+                    and bool(assessment.get("inventory_soft_pressure"))
+                    and not high_recovery_wear
+                    and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+                ):
+                    updates = {
+                        "best_quote_maker_volume_allow_loss_reduce_only": True,
+                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                        "best_quote_maker_volume_quote_offset_ticks": max(
+                            _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) - 1,
+                            0,
+                        ),
+                    }
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        ("best_quote_maker_volume_quote_offset_ticks",),
+                    )
+                    _remember_recovery_updates(item, updates)
+                    action = (
+                        "dry_run_enable_stalled_reduce_only_loss_recovery"
+                        if dry_run
+                        else "enable_stalled_reduce_only_loss_recovery"
+                    )
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "recovery_started_at": now.isoformat(),
+                            "recovery_owned": True,
+                            "last_recovery_action_at": now.isoformat(),
+                            "last_recovery_action": action,
+                        }
+                    )
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
+                elif current_budget > 0 and budget_floor > current_budget:
                     _remember_recovery_controls(
                         item,
                         control,
