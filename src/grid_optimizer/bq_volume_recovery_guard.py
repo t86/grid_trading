@@ -1566,6 +1566,15 @@ def check_symbol(
     trailing_15m_realized_wear_per_10k = _safe_float(
         volume_summary.get("trailing_15m_realized_wear_per_10k")
     )
+    high_recovery_wear = (
+        _safe_float(volume_summary.get("trailing_15m_gross_notional")) >= 100.0
+        and max(
+            trailing_5m_realized_wear_per_10k,
+            trailing_15m_realized_wear_per_10k,
+        )
+        > 3.0
+    )
+    assessment["high_recovery_wear"] = high_recovery_wear
     wear_backoff_floor = max(
         static_cycle_budget_floor_notional,
         max(
@@ -1595,6 +1604,61 @@ def check_symbol(
                 control_path=control_path,
                 control=control,
                 updates=arx_freeze_policy_updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif high_recovery_wear and bool(
+            control.get("best_quote_maker_volume_allow_loss_reduce_only")
+        ):
+            current_budget = _safe_float(
+                control.get("best_quote_maker_volume_cycle_budget_notional")
+            )
+            updates = _restore_recovery_controls(
+                item,
+                control,
+                wear_backoff_floor,
+            )
+            updates.update(
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "best_quote_maker_volume_cycle_budget_notional": max(
+                        wear_backoff_floor,
+                        current_budget
+                        - max(float(volume_recovery_cycle_budget_increment), 0.0),
+                    ),
+                    "best_quote_maker_volume_quote_offset_ticks": max(
+                        _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")),
+                        1,
+                    ),
+                }
+            )
+            item.pop("guard_recovery_controls", None)
+            item.pop("recovery_started_at", None)
+            item.pop("recovery_owned", None)
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_disable_loss_reduce_for_high_wear"
+                if dry_run
+                else "disable_loss_reduce_for_high_wear"
+            )
+            item.update(
+                {
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            _set_post_restore_cooldown(
+                item,
+                now=now,
+                cooldown_seconds=post_restore_cooldown_seconds,
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
                 now=now,
                 dry_run=dry_run,
                 restart_runner=restart,
@@ -2278,6 +2342,7 @@ def check_symbol(
                 bool(assessment.get("low_volume"))
                 and effective_inventory_soft_pressure
                 and recovery_hold_satisfied
+                and not high_recovery_wear
                 and not bool(recovery_expected_controls.get("best_quote_maker_volume_allow_loss_reduce_only"))
             ):
                 loss_updates = _loss_reduce_recovery_updates(
@@ -2975,7 +3040,7 @@ def check_symbol(
                     dry_run=dry_run,
                     restart_runner=restart,
                 )
-            elif effective_inventory_soft_pressure:
+            elif effective_inventory_soft_pressure and not high_recovery_wear:
                 updates = _loss_reduce_recovery_updates(
                     control=control,
                     assessment=assessment,
