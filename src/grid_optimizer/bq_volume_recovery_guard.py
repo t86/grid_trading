@@ -2197,6 +2197,18 @@ def check_symbol(
         if required_hourly_notional > 0
         else 1.0
     )
+    critical_arx_inventory_pace_override = (
+        normalized_symbol == "ARXUSDT"
+        and bool(volume_summary.get("completion_buffer_expired"))
+        and _safe_float(volume_summary.get("remaining_target_notional")) > 0
+        and pace_ratio < 0.65
+        and effective_inventory_soft_pressure
+        and _safe_int(assessment.get("planned_reduce_only_order_count")) > 0
+        and _safe_int(assessment.get("near_market_reduce_only_order_count")) > 0
+    )
+    assessment["critical_arx_inventory_pace_override"] = (
+        critical_arx_inventory_pace_override
+    )
     low_pace_since = _parse_time(item.get("low_pace_since"))
     if pace_ratio >= 0.75:
         item.pop("low_pace_since", None)
@@ -4682,8 +4694,10 @@ def check_symbol(
             and pace_ratio < 0.75
             and not recovery_reapply_debounced
             and not post_restore_budget_cooldown_active
-            and not high_recovery_wear
-            and not confirmed_loss_reduce_wear
+            and (
+                critical_arx_inventory_pace_override
+                or (not high_recovery_wear and not confirmed_loss_reduce_wear)
+            )
             and effective_inventory_soft_pressure
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and _safe_int(assessment.get("planned_reduce_only_order_count")) > 0
@@ -4713,11 +4727,12 @@ def check_symbol(
                 ),
             )
             _remember_recovery_updates(item, updates)
-            action = (
-                "dry_run_enable_cap_pressure_loss_reduce_for_pace"
-                if dry_run
+            action_name = (
+                "enable_critical_arx_inventory_loss_reduce_for_pace"
+                if critical_arx_inventory_pace_override
                 else "enable_cap_pressure_loss_reduce_for_pace"
             )
+            action = f"dry_run_{action_name}" if dry_run else action_name
             item.update(
                 {
                     "status": "recovery_active",

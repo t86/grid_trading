@@ -1568,6 +1568,104 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 240.0)
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_critical_arx_pace_can_open_bounded_loss_reduce_despite_wear(self) -> None:
+        now = datetime(2026, 7, 12, 23, 20, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "best_quote_maker_volume_cycle_budget_notional": 240.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 1,
+                    "pause_buy_position_notional": 620.0,
+                    "pause_short_position_notional": 620.0,
+                    "per_order_notional": 50.0,
+                    "best_quote_maker_volume_max_long_notional": 1350.0,
+                    "best_quote_maker_volume_max_short_notional": 1350.0,
+                },
+                long_notional=1275.0,
+                short_notional=425.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+            )
+            for stem in ("runner_control", "latest_plan", "latest_submit", "trade_audit"):
+                source = output_dir / f"reusdt_loop_{stem}.json"
+                if stem == "trade_audit":
+                    source = output_dir / "reusdt_loop_trade_audit.jsonl"
+                    target = output_dir / "arxusdt_loop_trade_audit.jsonl"
+                else:
+                    target = output_dir / f"arxusdt_loop_{stem}.json"
+                target.write_text(
+                    source.read_text(encoding="utf-8").replace("REUSDT", "ARXUSDT"),
+                    encoding="utf-8",
+                )
+            plan_path = output_dir / "arxusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["buy_orders"] = [{"side": "BUY", "price": 0.5968, "qty": 16.0}]
+            plan["sell_orders"] = [
+                {
+                    "side": "SELL",
+                    "price": 0.5972,
+                    "qty": 89.0,
+                    "role": "inventory_unlock_reduce_long",
+                    "position_side": "LONG",
+                    "force_reduce_only": True,
+                }
+            ]
+            plan["pause_reasons"] = ["inventory_soft"]
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "ARXUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=5)).isoformat(),
+                        "low_pace_since": (now - timedelta(minutes=5)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="ARXUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=400,
+                trigger_seconds=120,
+                cycle_budget_floor_notional=108.0,
+                daily_target_notional=120_000.0,
+                target_completion_buffer_seconds=10_800.0,
+                trade_rows=[
+                    {
+                        "id": 1,
+                        "time": int((now - timedelta(seconds=20)).timestamp() * 1000),
+                        "quoteQty": "600",
+                        "realizedPnl": "-0.6",
+                    }
+                ],
+                restart_runner=restarts.append,
+            )
+
+            self.assertTrue(result["assessment"]["confirmed_loss_reduce_wear"])
+            self.assertTrue(result["assessment"]["critical_arx_inventory_pace_override"])
+            self.assertEqual(
+                result["action"],
+                "enable_critical_arx_inventory_loss_reduce_for_pace",
+                result,
+            )
+            control = json.loads(
+                (output_dir / "arxusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 240.0)
+            self.assertEqual(restarts, ["ARXUSDT"])
+
     def test_cap_pressure_balancing_flow_gets_one_bounded_budget_step(self) -> None:
         now = datetime(2026, 7, 12, 13, 55, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
