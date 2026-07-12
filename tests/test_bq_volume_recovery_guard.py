@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from grid_optimizer import bq_volume_recovery_guard
 from grid_optimizer.bq_volume_recovery_guard import (
+    _apply_control_update,
     _arx_independent_freeze_policy_updates,
     apply_daily_target_pace_floor,
     apply_target_pace_cycle_budget_floor,
@@ -246,6 +247,67 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
             self.assertTrue(Path(result["corrupt_archive_path"]).exists())
             self.assertTrue(Path(result["archived_plan_path"]).exists())
+
+    def test_control_update_snapshots_valid_loop_state_before_restart(self) -> None:
+        now = datetime(2026, 7, 12, 16, 30, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "arxusdt_loop_runner_control.json"
+            state_path = output_dir / "arxusdt_loop_state.json"
+            control = {"best_quote_maker_volume_cycle_budget_notional": 120.0}
+            _write_json(control_path, control)
+            _write_json(state_path, {"best_quote_volume_ledger": {"long_lots": []}})
+            restarted: list[str] = []
+
+            changed, _ = _apply_control_update(
+                symbol="ARXUSDT",
+                control_path=control_path,
+                control=control,
+                updates={"best_quote_maker_volume_cycle_budget_notional": 160.0},
+                now=now,
+                dry_run=False,
+                restart_runner=restarted.append,
+            )
+
+            self.assertEqual(changed, ["best_quote_maker_volume_cycle_budget_notional"])
+            self.assertEqual(restarted, ["ARXUSDT"])
+            backup = output_dir / "arxusdt_loop_state.json.bak_bq_recovery_restart"
+            self.assertEqual(
+                json.loads(backup.read_text(encoding="utf-8")),
+                {"best_quote_volume_ledger": {"long_lots": []}},
+            )
+            self.assertEqual(backup.stat().st_mtime, now.timestamp())
+
+    def test_restores_corrupt_state_from_recovery_restart_snapshot(self) -> None:
+        now = datetime(2026, 7, 12, 16, 31, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(output_dir, now=now)
+            state_path = output_dir / "reusdt_loop_state.json"
+            state_path.write_text('{"broken":', encoding="utf-8")
+            backup_path = state_path.with_name(
+                state_path.name + ".bak_bq_recovery_restart"
+            )
+            _write_json(backup_path, {"best_quote_volume_ledger": {"short_lots": []}})
+            os.utime(backup_path, (now.timestamp(), now.timestamp()))
+
+            result = recover_corrupt_loop_state(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                now=now + timedelta(minutes=1),
+                max_backup_age_seconds=3600,
+                min_corrupt_age_seconds=0,
+                max_snapshot_age_seconds=300,
+                dry_run=False,
+            )
+
+            assert result is not None
+            self.assertEqual(result["action"], "restore_corrupt_state_from_autorealign_backup")
+            self.assertEqual(result["backup_path"], str(backup_path))
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8")),
+                {"best_quote_volume_ledger": {"short_lots": []}},
+            )
 
     def test_corrupt_state_recovery_respects_explicit_stop_reason(self) -> None:
         now = datetime(2026, 7, 11, 11, 21, tzinfo=timezone.utc)

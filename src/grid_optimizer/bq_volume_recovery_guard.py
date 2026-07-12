@@ -224,8 +224,11 @@ def recover_corrupt_loop_state(
 
     backup_path: Path | None = None
     backup_payload: dict[str, Any] | None = None
+    backup_candidates = list(
+        output_dir.glob(f"{slug}_loop_state.json.bak_autorealign_*")
+    ) + list(output_dir.glob(f"{slug}_loop_state.json.bak_bq_recovery_restart"))
     for candidate in sorted(
-        output_dir.glob(f"{slug}_loop_state.json.bak_autorealign_*"),
+        backup_candidates,
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     ):
@@ -1315,6 +1318,19 @@ def _backup_control(control_path: Path, control: dict[str, Any], now: datetime) 
     return backup_path
 
 
+def _backup_valid_loop_state_before_restart(
+    *, symbol: str, control_path: Path, now: datetime
+) -> Path | None:
+    state_path = control_path.parent / f"{symbol.lower()}_loop_state.json"
+    payload = _read_json(state_path)
+    if not payload:
+        return None
+    backup_path = state_path.with_name(state_path.name + ".bak_bq_recovery_restart")
+    _write_json(backup_path, payload)
+    os.utime(backup_path, (now.timestamp(), now.timestamp()))
+    return backup_path
+
+
 def _apply_control_update(
     *,
     symbol: str,
@@ -1333,6 +1349,11 @@ def _apply_control_update(
     updated = dict(control)
     updated.update(updates)
     backup_path = _backup_control(control_path, control, now)
+    _backup_valid_loop_state_before_restart(
+        symbol=symbol,
+        control_path=control_path,
+        now=now,
+    )
     _write_json(control_path, updated)
     restart_runner(symbol)
     return changed, str(backup_path)
