@@ -4200,10 +4200,26 @@ def check_symbol(
                     pause_baseline_long_notional=pause_baseline_long_notional,
                     pause_baseline_short_notional=pause_baseline_short_notional,
                 )
+                if (
+                    bool(control.get("best_quote_maker_volume_suppress_short_reduce_enabled"))
+                    and _safe_float(item.get("net_guard_recovery_baseline_notional")) <= 0
+                ):
+                    # A directional net-long rescue may have left this switch
+                    # behind.  Ordinary soft recovery needs both reduce legs;
+                    # do not persist the stale directional suppression.
+                    loss_updates["best_quote_maker_volume_suppress_short_reduce_enabled"] = False
                 _remember_recovery_controls(
                     item,
                     control,
-                    tuple(key for key in loss_updates if key != "best_quote_maker_volume_net_loss_reduce_enabled"),
+                    tuple(
+                        key
+                        for key in loss_updates
+                        if key
+                        not in {
+                            "best_quote_maker_volume_net_loss_reduce_enabled",
+                            "best_quote_maker_volume_suppress_short_reduce_enabled",
+                        }
+                    ),
                 )
                 updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
                 updates.update(loss_updates)
@@ -4485,6 +4501,55 @@ def check_symbol(
                 action = "hold_inventory_bias_relief"
                 item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
         elif bool(control.get("best_quote_maker_volume_allow_loss_reduce_only")):
+            if (
+                bool(control.get("best_quote_maker_volume_suppress_short_reduce_enabled"))
+                and _safe_float(item.get("net_guard_recovery_baseline_notional")) <= 0
+            ):
+                for key in ("guard_original_controls", "guard_recovery_controls"):
+                    values = item.get(key)
+                    if isinstance(values, dict):
+                        values.pop("best_quote_maker_volume_suppress_short_reduce_enabled", None)
+                        item[key] = values
+                updates = {
+                    "best_quote_maker_volume_suppress_short_reduce_enabled": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                }
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = (
+                    "dry_run_clear_stale_short_reduce_suppression"
+                    if dry_run
+                    else "clear_stale_short_reduce_suppression"
+                )
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+                result = {
+                    "symbol": normalized_symbol,
+                    "action": action,
+                    "changed_keys": changed,
+                    "backup_path": backup_path,
+                    "dry_run": dry_run,
+                    "restart_failed": restart_failed,
+                    "volume_summary": volume_summary,
+                    "assessment": assessment,
+                }
+                _append_jsonl(
+                    output_dir / "bq_volume_recovery_guard_events.jsonl",
+                    {"ts": now.isoformat(), **result},
+                )
+                return result
             if bool(control.get("best_quote_maker_volume_net_loss_reduce_enabled")):
                 updates = {"best_quote_maker_volume_net_loss_reduce_enabled": False}
                 changed, backup_path = _apply_control_update(
