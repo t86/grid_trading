@@ -4545,6 +4545,88 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_target_buffer_does_not_enable_loss_reduce_with_effective_raw_target_flow(self) -> None:
+        now = datetime(2026, 7, 13, 4, 48, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.8,
+                    "best_quote_maker_volume_inventory_bias_min_notional_gap": 200.0,
+                    "pause_buy_position_notional": 800.0,
+                    "pause_short_position_notional": 800.0,
+                },
+                long_notional=850.0,
+                short_notional=700.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            rows = [
+                {
+                    "id": index,
+                    "time": int((now - age).timestamp() * 1000),
+                    "quoteQty": str(notional),
+                    "realizedPnl": "0",
+                }
+                for index, (age, notional) in enumerate(
+                    (
+                        (timedelta(seconds=20), 600.0),
+                        (timedelta(minutes=4), 400.0),
+                        (timedelta(minutes=10), 2000.0),
+                        (timedelta(minutes=30), 6200.0),
+                        (timedelta(hours=2), 17800.0),
+                    ),
+                    start=1,
+                )
+            ]
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                daily_target_notional=200_000.0,
+                target_pace_fraction=1.05,
+                trade_rows=rows,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(result["assessment"]["low_volume"])
+            self.assertTrue(result["assessment"]["target_pace_behind"])
+            required_hourly = result["volume_summary"]["required_hourly_notional"]
+            self.assertGreaterEqual(
+                result["volume_summary"]["trailing_60m_hourly_notional"], required_hourly
+            )
+            self.assertGreaterEqual(
+                result["volume_summary"]["trailing_15m_gross_notional"],
+                required_hourly * 0.25,
+            )
+            self.assertGreaterEqual(
+                result["volume_summary"]["trailing_5m_gross_notional"],
+                required_hourly / 12.0 * 0.5,
+            )
+            self.assertEqual(result["action"], "hold_effective_near_market_flow")
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, [])
+
     def test_persistent_unprotected_one_sided_entries_trigger_fast_requote(self) -> None:
         now = datetime(2026, 7, 12, 12, 18, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

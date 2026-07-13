@@ -4971,6 +4971,7 @@ def check_symbol(
                 )
             elif (
                 effective_inventory_soft_pressure
+                and not effective_near_market_flow
                 and not high_recovery_wear
                 and not confirmed_loss_reduce_wear
                 and not recovery_reapply_debounced
