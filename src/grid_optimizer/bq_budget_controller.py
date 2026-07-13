@@ -303,6 +303,15 @@ def _import_data():
         return data
 
 
+def _is_recovery_managed(symbol: str, control: dict[str, Any]) -> bool:
+    """Keep this controller read-only for recovery-owned symbols in both run forms."""
+    try:
+        from .recovery_control_ownership import is_recovery_managed
+    except ImportError:
+        from grid_optimizer.recovery_control_ownership import is_recovery_managed
+    return is_recovery_managed(symbol, control)
+
+
 def _fetch_day_trades(symbol: str, api_key: str, api_secret: str, day_start_ms: int):
     # NOTE: keeps v1 ops pagination verbatim (cursor on max trade time, page
     # cap 90, no explicit end_time_ms) for behavioural parity with the
@@ -350,14 +359,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--enforce", action="store_true")
     a = ap.parse_args(argv)
 
-    api_key = os.environ["BINANCE_API_KEY"]
-    api_secret = os.environ["BINANCE_API_SECRET"]
     now = datetime.now(timezone.utc)
     prefix = a.symbol.lower()
     control_path = os.path.join(a.workdir, "output", f"{prefix}_loop_runner_control.json")
     plan_path = os.path.join(a.workdir, "output", f"{prefix}_loop_latest_plan.json")
     with open(control_path, encoding="utf-8") as f:
         control = json.load(f)
+    if _is_recovery_managed(a.symbol, control):
+        print(json.dumps({"symbol": a.symbol.upper(), "ts": now.isoformat(), "action": "observe_only_recovery_managed_symbol"}))
+        return 0
+    api_key = os.environ["BINANCE_API_KEY"]
+    api_secret = os.environ["BINANCE_API_SECRET"]
     budgets_raw, budget_source = resolve_budget_tiers(control, a.budgets)
     min_cycle = resolve_min_cycle(control, a.min_cycle)
 

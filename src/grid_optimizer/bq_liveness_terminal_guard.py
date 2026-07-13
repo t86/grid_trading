@@ -7,6 +7,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .recovery_control_ownership import is_recovery_managed
+
 
 def target_done_marker(*, workdir: Path, symbol: str, now: datetime) -> Path:
     day = now.astimezone(timezone.utc).strftime("%Y%m%d")
@@ -83,6 +85,15 @@ def main(argv: list[str] | None = None) -> int:
     invalid_state = invalid_state_reason(workdir=workdir, symbol=symbol)
     if invalid_state is not None:
         print(json.dumps({"action": "skip_invalid_state_safety_gate", **invalid_state}))
+        return 0
+
+    control_path = workdir / "output" / f"{symbol.lower()}_loop_runner_control.json"
+    try:
+        control = json.loads(control_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        control = {}
+    if is_recovery_managed(symbol, control if isinstance(control, dict) else {}):
+        print(json.dumps({"action": "observe_only_recovery_managed_symbol", "symbol": symbol}))
         return 0
 
 

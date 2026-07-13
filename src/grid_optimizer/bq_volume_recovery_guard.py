@@ -12,6 +12,8 @@ from math import ceil
 from pathlib import Path
 from typing import Any, Callable
 
+from .recovery_control_ownership import exclusive_control_lock, mark_recovery_owned
+
 
 RestartRunner = Callable[[str], object]
 UserTradesPageFetcher = Callable[..., list[dict[str, Any]]]
@@ -1536,22 +1538,30 @@ def _apply_control_update(
     dry_run: bool,
     restart_runner: RestartRunner,
 ) -> tuple[list[str], str | None]:
-    changed = [key for key, value in updates.items() if control.get(key) != value]
-    if not changed:
-        return [], None
     if dry_run:
+        changed = [key for key, value in updates.items() if control.get(key) != value]
         return changed, None
-    updated = dict(control)
-    updated.update(updates)
-    backup_path = _backup_control(control_path, control, now)
-    _backup_valid_loop_state_before_restart(
-        symbol=symbol,
-        control_path=control_path,
-        now=now,
-    )
-    _write_json(control_path, updated)
-    restart_runner(symbol)
-    return changed, str(backup_path)
+    # The decision was made from ``control`` earlier in this cycle.  Re-read
+    # under the symbol lock so a concurrent observer/writer cannot be erased
+    # by a stale whole-document write, then keep the lock through restart.
+    with exclusive_control_lock(control_path):
+        current = _read_json(control_path) or dict(control)
+        changed = [key for key, value in updates.items() if current.get(key) != value]
+        if not changed:
+            return [], None
+        updated = dict(current)
+        updated.update(updates)
+        mark_recovery_owned(updated)
+        updated["recovery_control_updated_at"] = now.isoformat()
+        backup_path = _backup_control(control_path, current, now)
+        _backup_valid_loop_state_before_restart(
+            symbol=symbol,
+            control_path=control_path,
+            now=now,
+        )
+        _write_json(control_path, updated)
+        restart_runner(symbol)
+        return changed, str(backup_path)
 
 
 def _arx_independent_freeze_policy_updates(
@@ -1606,11 +1616,100 @@ def _arx_independent_freeze_policy_updates(
 
 
 def _default_restart_runner(symbol: str, *, runner_wrapper: str) -> object:
-    return subprocess.run([runner_wrapper, "restart", symbol], check=True)
+    command = [runner_wrapper, "restart", symbol]
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            timeout=120,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise subprocess.CalledProcessError(
+            124, command, output=exc.output, stderr=exc.stderr
+        ) from exc
+    if not _runner_is_active(symbol):
+        raise subprocess.CalledProcessError(
+            1,
+            command,
+            output=result.stdout,
+            stderr=f"runner restart completed but {symbol} is not active",
+        )
+    return result
 
 
 def _default_stop_runner(symbol: str, *, runner_wrapper: str) -> object:
     return subprocess.run([runner_wrapper, "stop", symbol], check=True)
+
+
+def should_enter_loss_reduce(
+    *,
+    low_volume: bool,
+    effective_inventory_soft_pressure: bool,
+    sla_recovery_due: bool,
+    target_pace_behind: bool,
+    inventory_soft_pressure: bool,
+    active_order_count: int,
+    planned_order_count: int,
+    planned_reduce_only_only: bool,
+    no_fill_seconds: float,
+    trigger_seconds: float,
+    recovery_hold_satisfied: bool,
+    high_recovery_wear: bool,
+    confirmed_loss_reduce_wear: bool,
+    recovery_reapply_debounced: bool,
+    post_restore_budget_cooldown_active: bool,
+    recovery_expected_allow_loss: bool,
+    require_soft_pressure_for_allow_loss: bool,
+    effective_near_market_flow: bool,
+) -> bool:
+    """Pure entry decision for the loss-reduce recovery profile.
+
+    The invariant is intentionally at the profile boundary: a live,
+    near-market maker book wins over a low-volume sample.  That prevents the
+    next guard minute from replacing usable flow with an opposing profile.
+    """
+    recovery_signal = effective_inventory_soft_pressure or (
+        sla_recovery_due
+        and target_pace_behind
+        and inventory_soft_pressure
+        and (effective_inventory_soft_pressure or not require_soft_pressure_for_allow_loss)
+    ) or (
+        sla_recovery_due
+        and inventory_soft_pressure
+        and (
+            (active_order_count <= 0 and planned_order_count <= 0)
+            or (planned_reduce_only_only and no_fill_seconds >= max(float(trigger_seconds), 0.0))
+        )
+    )
+    return (
+        low_volume
+        and recovery_signal
+        and not effective_near_market_flow
+        and recovery_hold_satisfied
+        and not high_recovery_wear
+        and not confirmed_loss_reduce_wear
+        and not recovery_reapply_debounced
+        and not post_restore_budget_cooldown_active
+        and not recovery_expected_allow_loss
+    )
+
+
+def evaluate_action_verification(
+    *,
+    action_age_seconds: float,
+    plan_is_fresh: bool,
+    open_order_drift: int,
+    prior_failures: int,
+) -> tuple[str, int]:
+    """Classify one post-actuation feedback cycle without side effects."""
+    if plan_is_fresh and abs(int(open_order_drift)) == 0:
+        return "confirmed", 0
+    failures = max(int(prior_failures), 0) + 1
+    if failures >= 2 or action_age_seconds >= 120.0:
+        return "failed", failures
+    return "pending", failures
 
 
 def _runner_is_active(symbol: str) -> bool:
@@ -2426,11 +2525,34 @@ def check_symbol(
             desired_loss_reduce_updates,
         )
 
+    action_verification: str | None = None
+    control_updated_at = _parse_time(control.get("recovery_control_updated_at"))
+    if (
+        control_updated_at is not None
+        and control_updated_at <= now
+        and item.get("last_verified_control_update_at") != control_updated_at.isoformat()
+    ):
+        action_verification, failures = evaluate_action_verification(
+            action_age_seconds=max((now - control_updated_at).total_seconds(), 0.0),
+            plan_is_fresh=_plan_time_is_fresh(plan, now=now, max_age_seconds=120.0),
+            open_order_drift=_safe_int(recovery_gate.get("open_order_drift")),
+            prior_failures=_safe_int(item.get("action_verification_failures")),
+        )
+        item["action_verification_failures"] = failures
+        item["last_action_verification"] = action_verification
+        if action_verification == "confirmed":
+            item["last_verified_control_update_at"] = control_updated_at.isoformat()
+
     try:
         if stale_or_missing and not recovery_timeout_required:
             action = "skip_stale_or_missing_inputs"
         elif not bool(recovery_gate.get("ok")) and not recovery_timeout_required:
             action = "skip_recovery_safety_gate"
+        elif action_verification == "pending":
+            action = "hold_recovery_action_verification_pending"
+        elif action_verification == "failed":
+            action = "recovery_action_verification_failed_hold"
+            item["status"] = "recovery_verification_failed"
         elif arx_freeze_policy_updates:
             action = (
                 "dry_run_enable_arx_independent_freeze_first"
@@ -3773,40 +3895,27 @@ def check_symbol(
                 for key, value in recovery_expected_controls.items()
                 if control.get(key) != value
             }
-            if (
-                bool(assessment.get("low_volume"))
-                and (
-                    effective_inventory_soft_pressure
-                    or (
-                        sla_recovery_due
-                        and target_pace_behind
-                        and bool(assessment.get("inventory_soft_pressure"))
-                        and (
-                            effective_inventory_soft_pressure
-                            or not require_soft_pressure_for_allow_loss
-                        )
-                    )
-                    or (
-                        sla_recovery_due
-                        and bool(assessment.get("inventory_soft_pressure"))
-                        and (
-                            (
-                                _safe_int(assessment.get("active_order_count")) <= 0
-                                and _safe_int(assessment.get("planned_order_count")) <= 0
-                            )
-                            or (
-                                bool(assessment.get("planned_reduce_only_only"))
-                                and no_fill_seconds >= max(float(trigger_seconds), 0.0)
-                            )
-                        )
-                    )
-                )
-                and recovery_hold_satisfied
-                and not high_recovery_wear
-                and not confirmed_loss_reduce_wear
-                and not recovery_reapply_debounced
-                and not post_restore_budget_cooldown_active
-                and not bool(recovery_expected_controls.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            if should_enter_loss_reduce(
+                low_volume=bool(assessment.get("low_volume")),
+                effective_inventory_soft_pressure=effective_inventory_soft_pressure,
+                sla_recovery_due=sla_recovery_due,
+                target_pace_behind=target_pace_behind,
+                inventory_soft_pressure=bool(assessment.get("inventory_soft_pressure")),
+                active_order_count=_safe_int(assessment.get("active_order_count")),
+                planned_order_count=_safe_int(assessment.get("planned_order_count")),
+                planned_reduce_only_only=bool(assessment.get("planned_reduce_only_only")),
+                no_fill_seconds=no_fill_seconds,
+                trigger_seconds=trigger_seconds,
+                recovery_hold_satisfied=recovery_hold_satisfied,
+                high_recovery_wear=high_recovery_wear,
+                confirmed_loss_reduce_wear=confirmed_loss_reduce_wear,
+                recovery_reapply_debounced=recovery_reapply_debounced,
+                post_restore_budget_cooldown_active=post_restore_budget_cooldown_active,
+                recovery_expected_allow_loss=bool(
+                    recovery_expected_controls.get("best_quote_maker_volume_allow_loss_reduce_only")
+                ),
+                require_soft_pressure_for_allow_loss=require_soft_pressure_for_allow_loss,
+                effective_near_market_flow=effective_near_market_flow,
             ):
                 loss_updates = _loss_reduce_recovery_updates(
                     control=control,

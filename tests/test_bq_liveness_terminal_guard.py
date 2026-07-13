@@ -51,17 +51,29 @@ class BqLivenessTerminalGuardTests(TestCase):
             self.assertIsNotNone(reason)
             self.assertEqual(reason["state_path"], str(state_path))
 
-    def test_valid_state_allows_legacy_watchdog(self) -> None:
+    def test_valid_state_allows_legacy_watchdog_for_unmanaged_symbol(self) -> None:
         with TemporaryDirectory() as tmpdir:
             workdir = Path(tmpdir)
             output_dir = workdir / "output"
             legacy = output_dir / "ops" / "bq_liveness_watchdog.py"
             legacy.parent.mkdir(parents=True)
             legacy.write_text("", encoding="utf-8")
-            (output_dir / "ousdt_loop_state.json").write_text("{}", encoding="utf-8")
+            (output_dir / "reusdt_loop_state.json").write_text("{}", encoding="utf-8")
             with patch("grid_optimizer.bq_liveness_terminal_guard.runpy.run_path") as run_path:
-                self.assertEqual(main(["--symbol", "OUSDT", "--workdir", str(workdir), "--enforce"]), 0)
+                self.assertEqual(main(["--symbol", "REUSDT", "--workdir", str(workdir), "--enforce"]), 0)
             run_path.assert_called_once()
+
+    def test_managed_symbol_never_executes_untracked_legacy_watchdog(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir)
+            output_dir = workdir / "output"
+            legacy = output_dir / "ops" / "bq_liveness_watchdog.py"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text("raise AssertionError('must not run')", encoding="utf-8")
+            (output_dir / "arxusdt_loop_state.json").write_text("{}", encoding="utf-8")
+            with patch("grid_optimizer.bq_liveness_terminal_guard.runpy.run_path") as run_path:
+                self.assertEqual(main(["--symbol", "ARXUSDT", "--workdir", str(workdir), "--enforce"]), 0)
+            run_path.assert_not_called()
 
     def test_clears_stale_drift_flag_after_fresh_safe_reconcile(self) -> None:
         now = datetime(2026, 7, 12, 19, 30, tzinfo=timezone.utc)

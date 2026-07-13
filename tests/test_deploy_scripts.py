@@ -167,6 +167,19 @@ def test_runner_watchdog_never_revives_an_intended_stop() -> None:
     assert stale_guard < final_restart
     # The inactive-start knob stays available.
     assert "RUNNER_WATCHDOG_START_INACTIVE" in script
+    assert "recovery_control_owner" in script
+    assert "recovery-managed" in script
+
+
+def test_single_writer_installer_disables_only_legacy_arx_o_actuators() -> None:
+    script = Path("deploy/oracle/install_recovery_single_writer.sh").read_text(encoding="utf-8")
+
+    assert "arxusdt_ledger_drift_monitor\\.py" in script
+    assert "ousdt_ledger_drift_monitor\\.py" in script
+    assert "rollover_daily_window\\.py" in script
+    assert "--symbols OUSDT,ARXUSDT" in script
+    assert "recovery-single-writer disabled" in script
+    assert "crontab -" in script
 
 
 def test_runner_systemd_installer_narrows_restart_to_failures() -> None:

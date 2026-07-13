@@ -32,6 +32,28 @@ if [ ! -f "$CONTROL_PATH" ]; then
   exit 0
 fi
 
+# ARXUSDT/OUSDT are recovery-managed during the single-writer rollout.  The
+# watchdog remains an observer: it must not start/restart a runner that the
+# recovery actuator is reconciling.  The owner marker extends this rule to
+# later managed symbols without another shell change.
+if python3 - "$SYMBOL" "$CONTROL_PATH" <<'PY'
+import json
+import sys
+
+symbol, control_path = sys.argv[1:]
+try:
+    with open(control_path, encoding="utf-8") as handle:
+        control = json.load(handle)
+except (OSError, ValueError):
+    control = {}
+managed = symbol in {"ARXUSDT", "OUSDT"} or control.get("recovery_control_owner") == "bq_volume_recovery_guard"
+raise SystemExit(0 if managed else 1)
+PY
+then
+  echo "runner_watchdog: $SYMBOL is recovery-managed; skip actuator"
+  exit 0
+fi
+
 # Echoes a reason and returns 0 when the runner's stop is INTENDED (target gate done
 # today, or the last event carries a stop_reason such as a runtime-guard risk stop).
 # EVERY restart-capable path below must consult this — a guard-stopped runner can be

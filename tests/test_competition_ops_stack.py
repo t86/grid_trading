@@ -12,6 +12,7 @@ from pathlib import Path
 import grid_optimizer.competition_health_monitor as hm
 import grid_optimizer.competition_state_realign as ra
 import grid_optimizer.competition_target_gate as tg
+from grid_optimizer.recovery_control_ownership import is_recovery_managed
 
 
 def _write_state(workdir: Path, slug: str, short_lots: list[dict]) -> None:
@@ -173,6 +174,13 @@ def test_get_offset_prefers_bq_key_then_falls_back(tmp_path: Path) -> None:
     b = tmp_path / "b.json"
     b.write_text(json.dumps({"quote_offset_ticks": 4}))
     assert hm.get_offset(str(b)) == ("quote_offset_ticks", 4)
+
+
+def test_recovery_managed_symbols_make_external_controllers_read_only() -> None:
+    assert is_recovery_managed("ARXUSDT", {}) is True
+    assert is_recovery_managed("OUSDT", {}) is True
+    assert is_recovery_managed("REUSDT", {}) is False
+    assert is_recovery_managed("REUSDT", {"recovery_control_owner": "bq_volume_recovery_guard"}) is True
 
 
 def test_placed_sum_parses_journal_lines() -> None:

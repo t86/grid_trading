@@ -39,6 +39,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .recovery_control_ownership import is_recovery_managed
+
 # A matched-hedge close is only allowed to auto-fire when it realizes no worse than
 # this small amount (a near net-neutral hedge). A spread hedge (long-high/short-low)
 # would realize the spread as a loss, so the deadlock self-heal leaves it for the user.
@@ -269,6 +271,13 @@ def main() -> None:
     rec: dict[str, Any] = {"ts": _now().isoformat(), "symbol": sym, "enforce": a.enforce}
     did_restart = False
 
+    try:
+        control = json.load(open(cfg, encoding="utf-8"))
+    except Exception:
+        control = {}
+    recovery_managed = is_recovery_managed(sym, control if isinstance(control, dict) else {})
+    enforce_actions = a.enforce and not recovery_managed
+
     active = is_active(a.service)
     jout = journal(a.service, a.watchdog_min)
     placed = placed_sum(jout)
@@ -281,12 +290,14 @@ def main() -> None:
                                                         "reduce_only", "inventory_recover"))
     rec.update({"active": active, "looping": looping, f"placed_{a.watchdog_min}m": placed,
                 "intended_stop": intended, "terminal_stop": terminal_stop})
+    if recovery_managed:
+        rec["action"] = "observe_only_recovery_managed_symbol"
 
     # --- 1. liveness watchdog (only when alive+looping but not placing; rate-limited) ---
     last_wd = float(st.get("last_watchdog_ts") or 0)
     if active and looping and placed == 0 and not intended and (tnow - last_wd) >= a.watchdog_min * 60:
         rec["watchdog"] = "restart_not_placing"
-        if a.enforce:
+        if enforce_actions:
             rr = restart(a.service)
             rec["watchdog_restart"] = rr
             if rr["ok"]:                      # a failed restart is retried next cycle, not swallowed
@@ -306,7 +317,7 @@ def main() -> None:
             deadlock = {f"placed_{a.deadlock_min}m": placed_dl, "terminal": terminal}
             last_dl = float(st.get("last_deadlock_ts") or 0)
             if placed_dl == 0 and not terminal and (tnow - last_dl) >= a.deadlock_cooldown_min * 60:
-                if a.enforce:
+                if enforce_actions:
                     kk = os.environ["BINANCE_API_KEY"]
                     ss = os.environ["BINANCE_API_SECRET"]
                     deadlock["unstick"] = deadlock_unstick(
@@ -344,7 +355,7 @@ def main() -> None:
                 streak += 1
                 if streak >= 2 and off < a.max_offset and gov_cooled:
                     gov["action"] = "brake_%d->%d" % (off, off + 1)
-                    if a.enforce:
+                    if enforce_actions:
                         apply_offset(cfg, okey, off + 1, "health_governor_brake")
                         rr = restart(a.service)
                         gov["restart"] = rr
@@ -354,7 +365,7 @@ def main() -> None:
                     streak = 0
             elif off > a.min_offset and (rwear < a.release_wear or day_wear < a.brake_day_wear - 0.2) and gov_cooled:
                 gov["action"] = "release_%d->%d" % (off, off - 1)
-                if a.enforce:
+                if enforce_actions:
                     apply_offset(cfg, okey, off - 1, "health_governor_release")
                     rr = restart(a.service)
                     gov["restart"] = rr

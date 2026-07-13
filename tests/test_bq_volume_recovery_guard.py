@@ -418,6 +418,99 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
             self.assertEqual(backup.stat().st_mtime, now.timestamp())
 
+    def test_control_update_reconciles_against_latest_external_control(self) -> None:
+        """A guard decision must not erase a newer non-owned control field.
+
+        This is the regression seam for the 114 multi-controller race: the
+        guard reads a snapshot, another monitor writes a newer offset, then
+        the guard applies only its own budget change.
+        """
+        now = datetime(2026, 7, 13, 6, 10, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "arxusdt_loop_runner_control.json"
+            stale_control = {
+                "best_quote_maker_volume_cycle_budget_notional": 120.0,
+                "best_quote_maker_volume_quote_offset_ticks": 2,
+            }
+            _write_json(control_path, stale_control)
+            _write_json(
+                control_path,
+                {
+                    "best_quote_maker_volume_cycle_budget_notional": 120.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 1,
+                    "external_monitor_generation": 9,
+                },
+            )
+
+            changed, _ = _apply_control_update(
+                symbol="ARXUSDT",
+                control_path=control_path,
+                control=stale_control,
+                updates={"best_quote_maker_volume_cycle_budget_notional": 180.0},
+                now=now,
+                dry_run=False,
+                restart_runner=lambda _symbol: None,
+            )
+
+            self.assertEqual(changed, ["best_quote_maker_volume_cycle_budget_notional"])
+            actual = json.loads(control_path.read_text(encoding="utf-8"))
+            self.assertEqual(actual["best_quote_maker_volume_cycle_budget_notional"], 180.0)
+            self.assertEqual(actual["best_quote_maker_volume_quote_offset_ticks"], 1)
+            self.assertEqual(actual["external_monitor_generation"], 9)
+
+    def test_effective_near_market_flow_blocks_loss_reduce_for_twelve_cycles(self) -> None:
+        """Existing maker flow is never replaced by loss-reduce on a noisy window."""
+        decide = bq_volume_recovery_guard.should_enter_loss_reduce
+        for _cycle in range(12):
+            self.assertFalse(
+                decide(
+                    low_volume=True,
+                    effective_inventory_soft_pressure=True,
+                    sla_recovery_due=True,
+                    target_pace_behind=True,
+                    inventory_soft_pressure=True,
+                    active_order_count=4,
+                    planned_order_count=4,
+                    planned_reduce_only_only=False,
+                    no_fill_seconds=0.0,
+                    trigger_seconds=120.0,
+                    recovery_hold_satisfied=True,
+                    high_recovery_wear=False,
+                    confirmed_loss_reduce_wear=False,
+                    recovery_reapply_debounced=False,
+                    post_restore_budget_cooldown_active=False,
+                    recovery_expected_allow_loss=False,
+                    require_soft_pressure_for_allow_loss=True,
+                    effective_near_market_flow=True,
+                )
+            )
+
+    def test_action_verification_escalates_after_two_unconfirmed_cycles(self) -> None:
+        verify = bq_volume_recovery_guard.evaluate_action_verification
+        pending = verify(
+            action_age_seconds=60.0,
+            plan_is_fresh=False,
+            open_order_drift=3,
+            prior_failures=0,
+        )
+        self.assertEqual(pending, ("pending", 1))
+        failed = verify(
+            action_age_seconds=120.0,
+            plan_is_fresh=False,
+            open_order_drift=3,
+            prior_failures=1,
+        )
+        self.assertEqual(failed, ("failed", 2))
+        self.assertEqual(
+            verify(
+                action_age_seconds=60.0,
+                plan_is_fresh=True,
+                open_order_drift=0,
+                prior_failures=1,
+            ),
+            ("confirmed", 0),
+        )
+
     def test_restores_corrupt_state_from_recovery_restart_snapshot(self) -> None:
         now = datetime(2026, 7, 12, 16, 31, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
