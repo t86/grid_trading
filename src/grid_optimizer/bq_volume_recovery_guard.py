@@ -1600,24 +1600,28 @@ def _arx_independent_freeze_policy_updates(
 ) -> dict[str, Any]:
     if symbol.upper().strip() != "ARXUSDT":
         return {}
-    if not bool(control.get("best_quote_maker_volume_reduce_freeze_enabled")):
-        return {}
+    freeze_was_enabled = bool(
+        control.get("best_quote_maker_volume_reduce_freeze_enabled")
+    )
     anti_chase_min_key = "best_quote_maker_volume_same_side_entry_price_guard_min_notional"
     anti_chase_gap_key = "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks"
-    configured_anti_chase_min = control.get(anti_chase_min_key)
+    # Retain a bounded recovery relaxation while it is active. A migration from
+    # freeze-off is different: it must start from the canonical v3 guard.
+    configured_anti_chase_min = control.get(anti_chase_min_key) if freeze_was_enabled else 200.0
     if configured_anti_chase_min is None:
         configured_anti_chase_min = 200.0
-    configured_anti_chase_gap = control.get(anti_chase_gap_key)
+    configured_anti_chase_gap = control.get(anti_chase_gap_key) if freeze_was_enabled else 1
     if configured_anti_chase_gap is None:
         configured_anti_chase_gap = 1
     expected = {
+        "best_quote_maker_volume_reduce_freeze_enabled": True,
         "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
         "best_quote_maker_volume_reduce_freeze_band_budget_enabled": True,
         "best_quote_maker_volume_reduce_freeze_band_budget_price_ratio": 0.01,
         "best_quote_maker_volume_reduce_freeze_band_budget_base_notional": 100.0,
-        "best_quote_maker_volume_frozen_total_cap_notional": 800.0,
-        "best_quote_maker_volume_frozen_long_cap_notional": 800.0,
-        "best_quote_maker_volume_frozen_short_cap_notional": 800.0,
+        "best_quote_maker_volume_frozen_total_cap_notional": 400.0,
+        "best_quote_maker_volume_frozen_long_cap_notional": 200.0,
+        "best_quote_maker_volume_frozen_short_cap_notional": 200.0,
         "best_quote_maker_volume_reduce_freeze_quality_gate_enabled": True,
         "best_quote_maker_volume_reduce_freeze_quality_max_loss_ratio": 0.03,
         "best_quote_maker_volume_reduce_freeze_quality_release_profit_ratio": 0.002,
@@ -1636,6 +1640,7 @@ def _arx_independent_freeze_policy_updates(
         anti_chase_min_key: configured_anti_chase_min,
         anti_chase_gap_key: configured_anti_chase_gap,
         "best_quote_maker_volume_net_loss_reduce_enabled": False,
+        "hard_loss_forced_reduce_enabled": False,
     }
     if temporary_anti_chase_relief:
         expected.pop(anti_chase_min_key)

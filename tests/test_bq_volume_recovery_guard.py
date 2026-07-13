@@ -66,23 +66,25 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
         )
 
-    def test_arx_independent_freeze_policy_only_disables_pair_gate_for_arx(self) -> None:
+    def test_arx_independent_freeze_policy_enables_v3_for_arx(self) -> None:
         control = {
-            "best_quote_maker_volume_reduce_freeze_enabled": True,
+            "best_quote_maker_volume_reduce_freeze_enabled": False,
             "best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled": True,
             "best_quote_maker_volume_net_loss_reduce_enabled": False,
+            "hard_loss_forced_reduce_enabled": False,
         }
 
         self.assertEqual(
             _arx_independent_freeze_policy_updates(symbol="ARXUSDT", control=control),
             {
+                "best_quote_maker_volume_reduce_freeze_enabled": True,
                 "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
                 "best_quote_maker_volume_reduce_freeze_band_budget_enabled": True,
                 "best_quote_maker_volume_reduce_freeze_band_budget_price_ratio": 0.01,
                 "best_quote_maker_volume_reduce_freeze_band_budget_base_notional": 100.0,
-                "best_quote_maker_volume_frozen_total_cap_notional": 800.0,
-                "best_quote_maker_volume_frozen_long_cap_notional": 800.0,
-                "best_quote_maker_volume_frozen_short_cap_notional": 800.0,
+                "best_quote_maker_volume_frozen_total_cap_notional": 400.0,
+                "best_quote_maker_volume_frozen_long_cap_notional": 200.0,
+                "best_quote_maker_volume_frozen_short_cap_notional": 200.0,
                 "best_quote_maker_volume_reduce_freeze_quality_gate_enabled": True,
                 "best_quote_maker_volume_reduce_freeze_quality_max_loss_ratio": 0.03,
                 "best_quote_maker_volume_reduce_freeze_quality_release_profit_ratio": 0.002,
@@ -114,9 +116,9 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             "best_quote_maker_volume_reduce_freeze_band_budget_enabled": True,
             "best_quote_maker_volume_reduce_freeze_band_budget_price_ratio": 0.01,
             "best_quote_maker_volume_reduce_freeze_band_budget_base_notional": 100.0,
-            "best_quote_maker_volume_frozen_total_cap_notional": 800.0,
-            "best_quote_maker_volume_frozen_long_cap_notional": 800.0,
-            "best_quote_maker_volume_frozen_short_cap_notional": 800.0,
+            "best_quote_maker_volume_frozen_total_cap_notional": 400.0,
+            "best_quote_maker_volume_frozen_long_cap_notional": 200.0,
+            "best_quote_maker_volume_frozen_short_cap_notional": 200.0,
             "best_quote_maker_volume_reduce_freeze_quality_gate_enabled": True,
             "best_quote_maker_volume_reduce_freeze_quality_max_loss_ratio": 0.03,
             "best_quote_maker_volume_reduce_freeze_quality_release_profit_ratio": 0.002,
@@ -135,6 +137,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 200.0,
             "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 1,
             "best_quote_maker_volume_net_loss_reduce_enabled": False,
+            "hard_loss_forced_reduce_enabled": False,
         }
 
         self.assertEqual(
@@ -2419,6 +2422,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 output_dir,
                 now=now,
                 control={
+                    "best_quote_maker_volume_reduce_freeze_enabled": True,
                     "best_quote_maker_volume_allow_loss_reduce_only": False,
                     "best_quote_maker_volume_net_loss_reduce_enabled": False,
                     "best_quote_maker_volume_cycle_budget_notional": 240.0,
@@ -2446,6 +2450,10 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     source.read_text(encoding="utf-8").replace("REUSDT", "ARXUSDT"),
                     encoding="utf-8",
                 )
+            control_path = output_dir / "arxusdt_loop_runner_control.json"
+            control = json.loads(control_path.read_text(encoding="utf-8"))
+            control.update(_arx_independent_freeze_policy_updates(symbol="ARXUSDT", control=control))
+            _write_json(control_path, control)
             plan_path = output_dir / "arxusdt_loop_latest_plan.json"
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
             plan["buy_orders"] = [{"side": "BUY", "price": 0.5968, "qty": 16.0}]
