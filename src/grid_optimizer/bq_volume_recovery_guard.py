@@ -3371,6 +3371,12 @@ def check_symbol(
             and not bool(assessment.get("inventory_soft_pressure"))
             and bool(assessment.get("budget_raise_inventory_buffer_blocked"))
             and not bool(assessment.get("balancing_budget_raise_safe"))
+            and not (
+                normalized_symbol == "ARXUSDT"
+                and sla_recovery_due
+                and target_pace_behind
+                and anti_chase_blocks_missing_entry_leg
+            )
         ):
             action = "hold_budget_raise_for_inventory_imbalance"
         elif (
@@ -3565,7 +3571,14 @@ def check_symbol(
             )
             key = "best_quote_maker_volume_same_side_entry_price_guard_min_notional"
             current_gate = max(_safe_float(control.get(key)), 200.0)
-            if no_fill_seconds >= 300.0 and pace_ratio < 0.1:
+            recovery_gate_already_raised = (
+                key in recovery_expected_controls
+                and current_gate
+                > _safe_float(recovery_original_controls.get(key))
+            )
+            if recovery_gate_already_raised:
+                target_gate = float(ceil(max(heavier_inventory - 1.0, current_gate)))
+            elif no_fill_seconds >= 300.0 and pace_ratio < 0.1:
                 max_inventory = max(
                     _safe_float(assessment.get("max_long_notional")),
                     _safe_float(assessment.get("max_short_notional")),
