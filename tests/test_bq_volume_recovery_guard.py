@@ -7890,6 +7890,118 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
             self.assertEqual(restarts, ["ARXUSDT"])
 
+    def test_arx_v3_budget_hold_is_not_skipped_before_anti_chase_sla_is_due(self) -> None:
+        now = datetime(2026, 7, 12, 9, 50, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_reduce_freeze_enabled": True,
+                    "best_quote_maker_volume_same_side_entry_price_guard_enabled": True,
+                    "best_quote_maker_volume_same_side_entry_price_guard_report_only": False,
+                    "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 370.0,
+                    "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 0,
+                    "best_quote_maker_volume_cycle_budget_notional": 172.0,
+                    "best_quote_maker_volume_min_cycle_budget_notional": 128.0,
+                    "best_quote_maker_volume_max_long_notional": 800.0,
+                    "best_quote_maker_volume_max_short_notional": 800.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.75,
+                    "best_quote_maker_volume_quote_offset_ticks": 0,
+                    "sticky_entry_price_tolerance_steps": 1.0,
+                    "per_order_notional": 40.0,
+                },
+                long_notional=590.0,
+                short_notional=370.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            for path in list(output_dir.glob("reusdt_*")):
+                path.rename(output_dir / path.name.replace("reusdt", "arxusdt", 1))
+
+            control_path = output_dir / "arxusdt_loop_runner_control.json"
+            control = json.loads(control_path.read_text(encoding="utf-8"))
+            control.update(_arx_independent_freeze_policy_updates(symbol="ARXUSDT", control=control))
+            _write_json(control_path, control)
+
+            plan_path = output_dir / "arxusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["buy_orders"] = [
+                {
+                    "side": "BUY",
+                    "price": 0.5968,
+                    "qty": 16.0,
+                    "role": "best_quote_entry_long",
+                    "position_side": "LONG",
+                }
+            ]
+            plan["sell_orders"] = []
+            plan["best_quote_maker_volume"] = {
+                "metrics": {
+                    "same_side_entry_price_guard": {
+                        "enabled": True,
+                        "report_only": False,
+                        "blocked_long_entry": False,
+                        "blocked_short_entry": True,
+                    }
+                }
+            }
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "ARXUSDT": {
+                        "status": "recovery_active",
+                        "first_low_volume_at": (now - timedelta(minutes=10)).isoformat(),
+                        "low_pace_since": (now - timedelta(minutes=10)).isoformat(),
+                        "no_fill_since": (now - timedelta(seconds=60)).isoformat(),
+                        "recovery_started_at": (now - timedelta(minutes=4)).isoformat(),
+                        "recovery_owned": True,
+                        "last_recovery_action_at": (now - timedelta(minutes=3)).isoformat(),
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 160.0,
+                            "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 200.0,
+                            "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 1,
+                        },
+                        "guard_recovery_controls": {
+                            "best_quote_maker_volume_cycle_budget_notional": 172.0,
+                            "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 370.0,
+                            "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="ARXUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100.0,
+                daily_target_notional=120_000.0,
+                trigger_seconds=120,
+                cycle_budget_floor_notional=204.0,
+                volume_recovery_cycle_budget_increment=12.0,
+                trade_rows=[
+                    {
+                        "time": int((now - timedelta(minutes=10)).timestamp() * 1000),
+                        "quoteQty": 5_200.0,
+                    },
+                ],
+                volume_source="exchange_user_trades",
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(control_path.read_text(encoding="utf-8"))
+            self.assertGreater(result["assessment"]["pace_ratio"], 0.5)
+            self.assertLess(result["assessment"]["no_fill_seconds"], 180.0)
+            self.assertTrue(result["assessment"]["budget_raise_inventory_buffer_blocked"])
+            self.assertEqual(result["action"], "hold_budget_raise_for_inventory_imbalance", result)
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 172.0)
+            self.assertEqual(restarts, [])
 
 if __name__ == "__main__":
     unittest.main()

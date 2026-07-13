@@ -2385,6 +2385,29 @@ def check_symbol(
             )
         )
     )
+    arx_missing_entry_anti_chase_recovery_due = (
+        normalized_symbol == "ARXUSDT"
+        and sla_recovery_due
+        and target_pace_behind
+        and (
+            no_fill_seconds >= 180.0
+            or (pace_ratio < 0.5 and low_pace_seconds >= fast_sla_seconds)
+        )
+        and (
+            not confirmed_loss_reduce_wear
+            or (
+                _safe_float(assessment.get("inventory_notional_gap")) >= 150.0
+                and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            )
+        )
+        and not bool(assessment.get("inventory_soft_pressure"))
+        and not bool(assessment.get("near_cap"))
+        and not (
+            bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and actual_inventory_below_soft
+        )
+        and anti_chase_blocks_missing_entry_leg
+    )
     loss_reduce_flow_updates: dict[str, Any] = {}
     if (
         bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
@@ -3371,12 +3394,7 @@ def check_symbol(
             and not bool(assessment.get("inventory_soft_pressure"))
             and bool(assessment.get("budget_raise_inventory_buffer_blocked"))
             and not bool(assessment.get("balancing_budget_raise_safe"))
-            and not (
-                normalized_symbol == "ARXUSDT"
-                and sla_recovery_due
-                and target_pace_behind
-                and anti_chase_blocks_missing_entry_leg
-            )
+            and not arx_missing_entry_anti_chase_recovery_due
         ):
             action = "hold_budget_raise_for_inventory_imbalance"
         elif (
@@ -3537,29 +3555,7 @@ def check_symbol(
                 restart_runner=restart,
             )
             item["last_sla_action_at"] = now.isoformat()
-        elif (
-            normalized_symbol == "ARXUSDT"
-            and sla_recovery_due
-            and target_pace_behind
-            and (
-                no_fill_seconds >= 180.0
-                or (pace_ratio < 0.5 and low_pace_seconds >= fast_sla_seconds)
-            )
-            and (
-                not confirmed_loss_reduce_wear
-                or (
-                    _safe_float(assessment.get("inventory_notional_gap")) >= 150.0
-                    and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
-                )
-            )
-            and not bool(assessment.get("inventory_soft_pressure"))
-            and not bool(assessment.get("near_cap"))
-            and not (
-                bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
-                and actual_inventory_below_soft
-            )
-            and anti_chase_blocks_missing_entry_leg
-        ):
+        elif arx_missing_entry_anti_chase_recovery_due:
             current_long = max(_safe_float(assessment.get("current_long_notional")), 0.0)
             current_short = max(_safe_float(assessment.get("current_short_notional")), 0.0)
             lighter_inventory = min(current_long, current_short)
