@@ -2440,6 +2440,59 @@ def check_symbol(
             {"ts": now.isoformat(), **result},
         )
         return result
+    actual_long = assessment.get("actual_long_notional")
+    actual_short = assessment.get("actual_short_notional")
+    directional_long = _safe_float(
+        actual_long if actual_long is not None else assessment.get("current_long_notional")
+    )
+    directional_short = _safe_float(
+        actual_short if actual_short is not None else assessment.get("current_short_notional")
+    )
+    directional_buffer = max(parameters.per_order_notional, 1.0)
+    if (
+        bool(control.get("best_quote_maker_volume_suppress_short_reduce_enabled"))
+        and directional_long <= directional_short + directional_buffer
+    ):
+        updates = {
+            "best_quote_maker_volume_suppress_short_reduce_enabled": False,
+            "best_quote_maker_volume_net_loss_reduce_enabled": False,
+        }
+        changed, backup_path = _apply_control_update(
+            symbol=normalized_symbol,
+            control_path=control_path,
+            control=control,
+            updates=updates,
+            now=now,
+            dry_run=dry_run,
+            restart_runner=restart,
+        )
+        action = (
+            "dry_run_clear_stale_short_reduce_suppression"
+            if dry_run
+            else "clear_stale_short_reduce_suppression"
+        )
+        item.update(
+            {
+                "status": "recovery_active",
+                "last_recovery_action_at": now.isoformat(),
+                "last_recovery_action": action,
+            }
+        )
+        result = {
+            "symbol": normalized_symbol,
+            "action": action,
+            "changed_keys": changed,
+            "backup_path": backup_path,
+            "dry_run": dry_run,
+            "restart_failed": restart_failed,
+            "volume_summary": volume_summary,
+            "assessment": assessment,
+        }
+        _append_jsonl(
+            output_dir / "bq_volume_recovery_guard_events.jsonl",
+            {"ts": now.isoformat(), **result},
+        )
+        return result
     recover_floor = (
         float(recover_min_volume_notional)
         if recover_min_volume_notional is not None

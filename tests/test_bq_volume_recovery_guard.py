@@ -1939,7 +1939,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "pause_short_position_notional": 380.0,
                     "per_order_notional": 50.0,
                 },
-                long_notional=1240.0,
+                long_notional=1300.0,
                 short_notional=1210.0,
                 open_order_count=1,
                 active_order_count=1,
@@ -2021,8 +2021,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "best_quote_maker_volume_net_loss_reduce_enabled": False,
                     "best_quote_maker_volume_suppress_short_reduce_enabled": True,
                 },
-                long_notional=1240.0,
-                short_notional=1210.0,
+                long_notional=1210.0,
+                short_notional=1240.0,
                 open_order_count=1,
                 active_order_count=1,
                 orders_near_market=True,
@@ -2044,6 +2044,43 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 symbol="REUSDT",
                 output_dir=output_dir,
                 state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=400,
+                trigger_seconds=120,
+                trade_rows=[],
+                restart_runner=lambda _symbol: None,
+            )
+
+            self.assertEqual(result["action"], "clear_stale_short_reduce_suppression")
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(control["best_quote_maker_volume_suppress_short_reduce_enabled"])
+
+    def test_non_net_long_clears_stale_short_reduce_suppression(self) -> None:
+        now = datetime(2026, 7, 13, 9, 46, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_suppress_short_reduce_enabled": True,
+                    "per_order_notional": 50.0,
+                },
+                long_notional=1210.0,
+                short_notional=1240.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state={},
                 now=now,
                 window_seconds=180,
                 min_volume_notional=400,
