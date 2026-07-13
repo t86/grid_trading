@@ -2531,6 +2531,70 @@ def _apply_best_quote_directional_net_guard_to_actions(
     return result
 
 
+def _ensure_best_quote_directional_net_guard_reduce_order(
+    plan: dict[str, Any],
+    *,
+    direction: str,
+    bid_price: float,
+    ask_price: float,
+    current_long_qty: float,
+    current_short_qty: float,
+    max_order_notional: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> dict[str, Any]:
+    """Supply one near-touch maker reduction when the guarded plan has none."""
+    normalized_direction = str(direction or "off").lower().strip()
+    specs = {
+        "net_long": ("sell_orders", "SELL", "LONG", "best_quote_reduce_long", current_long_qty, ask_price),
+        "net_short": ("buy_orders", "BUY", "SHORT", "best_quote_reduce_short", current_short_qty, bid_price),
+    }
+    spec = specs.get(normalized_direction)
+    result = {
+        "enabled": bool(spec),
+        "direction": normalized_direction if spec else "off",
+        "added": False,
+        "reason": "off" if not spec else "already_present",
+        "order": None,
+    }
+    if not spec:
+        return result
+    order_key, side, position_side, role, position_qty, anchor_price = spec
+    if any(_order_role(item) == role for item in list(plan.get(order_key) or []) if isinstance(item, dict)):
+        return result
+    price = _round_order_price(max(_safe_float(anchor_price), 0.0), tick_size, side)
+    safe_notional = min(max(_safe_float(position_qty), 0.0) * price, max(_safe_float(max_order_notional), 0.0))
+    qty = _round_order_qty(safe_notional / price if price > 0 else 0.0, step_size)
+    notional = qty * price
+    if price <= 0 or qty <= 0:
+        result["reason"] = "missing_price_or_qty"
+        return result
+    if min_qty is not None and qty + 1e-12 < _safe_float(min_qty):
+        result["reason"] = "below_min_qty"
+        return result
+    if min_notional is not None and notional + 1e-12 < _safe_float(min_notional):
+        result["reason"] = "below_min_notional"
+        return result
+    order = {
+        "side": side,
+        "price": price,
+        "qty": qty,
+        "notional": notional,
+        "role": role,
+        "position_side": position_side,
+        "force_reduce_only": True,
+        "execution_type": "maker",
+        "time_in_force": "GTX",
+        "post_only": True,
+        "directional_net_guard_fallback": True,
+    }
+    plan[order_key] = [order, *list(plan.get(order_key) or [])]
+    result.update({"added": True, "reason": "missing_directional_reduce", "order": dict(order)})
+    return result
+
+
 def _best_quote_trade_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> str:
     explicit_role = str((row or {}).get("role") or "").lower().strip()
     if explicit_role in {
@@ -22340,6 +22404,22 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 getattr(effective_args, "best_quote_maker_volume_directional_net_guard", "off")
                 or "off"
             ),
+        )
+        best_quote_directional_net_guard["fallback"] = _ensure_best_quote_directional_net_guard_reduce_order(
+            plan,
+            direction=str(best_quote_directional_net_guard.get("direction") or "off"),
+            bid_price=bid_price,
+            ask_price=ask_price,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            max_order_notional=max(
+                _safe_float(getattr(effective_args, "per_order_notional", 0.0)),
+                _safe_float(getattr(effective_args, "maker_order_notional", 0.0)),
+            ),
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
         )
         best_quote_maker_volume["directional_net_guard"] = dict(best_quote_directional_net_guard)
         desired_orders = [

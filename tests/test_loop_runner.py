@@ -140,6 +140,7 @@ from grid_optimizer.loop_runner import (
     _apply_best_quote_entry_inventory_cap_guard,
     _apply_best_quote_entry_level_guard,
     _apply_best_quote_directional_net_guard_to_actions,
+    _ensure_best_quote_directional_net_guard_reduce_order,
     _apply_best_quote_directional_net_guard,
 )
 from grid_optimizer.submit_plan import (
@@ -342,6 +343,32 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(guarded["place_count"], 1)
         self.assertEqual(guarded["place_notional"], 5.0)
         self.assertEqual(guarded["directional_net_guard"]["dropped_place_orders"], 2)
+
+    def test_directional_net_guard_adds_near_touch_short_reduce_when_plan_has_none(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+
+        fallback = _ensure_best_quote_directional_net_guard_reduce_order(
+            plan,
+            direction="net_short",
+            bid_price=0.5485,
+            ask_price=0.5486,
+            current_long_qty=148.0,
+            current_short_qty=2385.0,
+            max_order_notional=50.0,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+        )
+
+        self.assertTrue(fallback["added"])
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_reduce_short")
+        self.assertEqual(plan["buy_orders"][0]["side"], "BUY")
+        self.assertEqual(plan["buy_orders"][0]["position_side"], "SHORT")
+        self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
+        self.assertEqual(plan["buy_orders"][0]["time_in_force"], "GTX")
 
     def test_hedge_best_quote_position_diff_treats_min_notional_residue_as_dust(self) -> None:
         self.assertTrue(
