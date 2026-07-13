@@ -2327,6 +2327,22 @@ def check_symbol(
         _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional")) * 0.5,
     )
     assessment["recovery_entry_reserve_notional"] = recovery_entry_reserve_notional
+    max_actual_net_notional = _safe_float(control.get("max_actual_net_notional"))
+    actual_long_for_net = assessment.get("actual_long_notional")
+    actual_short_for_net = assessment.get("actual_short_notional")
+    if actual_long_for_net is None or actual_short_for_net is None:
+        actual_long_for_net = assessment.get("current_long_notional")
+        actual_short_for_net = assessment.get("current_short_notional")
+    actual_net_for_entry = abs(
+        _safe_float(actual_long_for_net) - _safe_float(actual_short_for_net)
+    )
+    net_guard_entry_buffer_ok = (
+        max_actual_net_notional <= 0
+        or actual_net_for_entry + recovery_entry_reserve_notional
+        <= max_actual_net_notional * 0.95
+    )
+    assessment["actual_net_notional_for_entry"] = actual_net_for_entry
+    assessment["net_guard_entry_buffer_ok"] = net_guard_entry_buffer_ok
     ledger_drift_threshold = max(
         100.0,
         max(
@@ -2416,7 +2432,12 @@ def check_symbol(
         restore_baseline = (
             original_guard_limit if original_guard_limit > 0 else net_guard_baseline
         )
-        if actual_net is not None and actual_net <= restore_baseline * 0.95:
+        restore_threshold = max(
+            restore_baseline * 0.95 - recovery_entry_reserve_notional,
+            0.0,
+        )
+        assessment["net_guard_restore_threshold_notional"] = restore_threshold
+        if actual_net is not None and actual_net <= restore_threshold:
             updates = _restore_recovery_controls(
                 item,
                 control,
@@ -5938,6 +5959,7 @@ def check_symbol(
                 if (
                     current_gap >= configured_gap
                     and relief_gap > configured_gap
+                    and net_guard_entry_buffer_ok
                     and not recovery_reapply_debounced
                 ):
                     _remember_recovery_controls(

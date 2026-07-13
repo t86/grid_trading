@@ -1443,6 +1443,69 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
             self.assertEqual(control["max_actual_net_notional"], 1_350.0)
 
+    def test_net_guard_recovery_keeps_directional_guard_until_entry_reserve_fits(self) -> None:
+        now = datetime(2026, 7, 13, 1, 6, 30, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            recovery_controls = {
+                "max_actual_net_notional": 1_065.0,
+                "best_quote_maker_volume_directional_net_guard": "net_long",
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
+                "best_quote_maker_volume_cycle_budget_notional": 120.0,
+            }
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control=recovery_controls,
+                long_notional=1_016.0,
+                short_notional=71.0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["sell_orders"] = [{"role": "best_quote_reduce_long", "side": "SELL"}]
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 1_016.0,
+                    "actual_short_notional": 71.0,
+                }
+            }
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "net_guard_recovery_baseline_notional": 1_000.0,
+                        "net_guard_recovery_direction": "net_long",
+                        "guard_original_controls": {"max_actual_net_notional": 1_000.0},
+                        "guard_recovery_controls": recovery_controls,
+                    }
+                }
+            }
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                restart_runner=lambda _symbol: None,
+            )
+
+            self.assertEqual(result["action"], "hold_net_guard_rebalance")
+            self.assertEqual(
+                result["assessment"]["net_guard_restore_threshold_notional"],
+                890.0,
+            )
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(control["max_actual_net_notional"], 1_065.0)
+            self.assertEqual(
+                control["best_quote_maker_volume_directional_net_guard"],
+                "net_long",
+            )
+
     def test_active_net_guard_retries_after_a_newer_guard_stop_event(self) -> None:
         now = datetime(2026, 7, 13, 1, 7, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
@@ -3464,6 +3527,56 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_inventory_bias_min_notional_gap"], 164.0)
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["REUSDT"])
+
+    def test_does_not_relax_inventory_bias_without_net_guard_entry_buffer(self) -> None:
+        now = datetime(2026, 7, 13, 11, 23, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "max_actual_net_notional": 1_000.0,
+                    "per_order_notional": 50.0,
+                    "best_quote_maker_volume_cycle_budget_notional": 120.0,
+                    "best_quote_maker_volume_inventory_bias_min_notional_gap": 190.0,
+                },
+                long_notional=1_016.0,
+                short_notional=71.0,
+                open_order_count=3,
+                active_order_count=3,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                inventory_bias_relief_notional_margin=24,
+                restart_runner=lambda _symbol: None,
+            )
+
+            self.assertNotEqual(result["action"], "relax_inventory_bias_for_volume")
+            self.assertFalse(result["assessment"]["net_guard_entry_buffer_ok"])
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                control["best_quote_maker_volume_inventory_bias_min_notional_gap"],
+                190.0,
+            )
 
     def test_restores_inventory_bias_after_volume_recovers(self) -> None:
         now = datetime(2026, 6, 26, 8, 0, tzinfo=timezone.utc)
