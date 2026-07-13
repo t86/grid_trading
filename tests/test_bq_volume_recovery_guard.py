@@ -1386,6 +1386,63 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(control["best_quote_maker_volume_suppress_short_reduce_enabled"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_net_guard_recovery_keeps_original_limit_until_original_buffer_is_reached(self) -> None:
+        now = datetime(2026, 7, 13, 1, 6, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            recovery_controls = {
+                "max_actual_net_notional": 1_350.0,
+                "best_quote_maker_volume_suppress_short_reduce_enabled": False,
+                "best_quote_maker_volume_directional_net_guard": "net_short",
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
+            }
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control=recovery_controls,
+                long_notional=80.0,
+                short_notional=1_155.0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["buy_orders"] = [{"role": "best_quote_reduce_short", "side": "BUY"}]
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 80.0,
+                    "actual_short_notional": 1_155.0,
+                }
+            }
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "net_guard_recovery_baseline_notional": 1_148.0,
+                        "net_guard_recovery_direction": "net_short",
+                        "guard_original_controls": {"max_actual_net_notional": 1_000.0},
+                        "guard_recovery_controls": recovery_controls,
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(result["action"], "hold_net_guard_rebalance")
+            self.assertEqual(restarts, [])
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(control["max_actual_net_notional"], 1_350.0)
+
     def test_active_net_guard_retries_after_a_newer_guard_stop_event(self) -> None:
         now = datetime(2026, 7, 13, 1, 7, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

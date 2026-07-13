@@ -1998,6 +1998,9 @@ def recover_inactive_runner(
             )
             _remember_recovery_controls(item, control, tuple(net_guard_updates))
             _remember_recovery_updates(item, net_guard_updates)
+            original_max_actual_net_notional = _safe_float(
+                (item.get("guard_original_controls") or {}).get("max_actual_net_notional")
+            )
             if dry_run:
                 changed = [
                     key for key, value in net_guard_updates.items() if control.get(key) != value
@@ -2030,7 +2033,9 @@ def recover_inactive_runner(
             item.update(
                 {
                     "net_guard_recovery_baseline_notional": _safe_float(
-                        control.get("max_actual_net_notional")
+                        original_max_actual_net_notional
+                        if original_max_actual_net_notional > 0
+                        else control.get("max_actual_net_notional")
                     ),
                     "net_guard_recovery_direction": str(
                         net_guard_live_gate.get("direction") or "net"
@@ -2405,7 +2410,13 @@ def check_symbol(
             if isinstance(expected_controls, dict)
             else {}
         )
-        if actual_net is not None and actual_net <= net_guard_baseline * 0.95:
+        original_guard_limit = _safe_float(
+            (item.get("guard_original_controls") or {}).get("max_actual_net_notional")
+        )
+        restore_baseline = (
+            original_guard_limit if original_guard_limit > 0 else net_guard_baseline
+        )
+        if actual_net is not None and actual_net <= restore_baseline * 0.95:
             updates = _restore_recovery_controls(
                 item,
                 control,
@@ -2517,6 +2528,7 @@ def check_symbol(
             "volume_summary": volume_summary,
             "assessment": assessment,
             "net_guard_recovery_baseline_notional": net_guard_baseline,
+            "net_guard_restore_baseline_notional": restore_baseline,
             "net_guard_actual_notional": actual_net,
         }
         _append_jsonl(
