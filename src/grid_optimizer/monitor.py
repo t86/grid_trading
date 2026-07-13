@@ -686,40 +686,36 @@ def _load_or_fetch_trade_rows(
             trade_row_key(row),
         )
 
-    merged: list[dict[str, Any]] = []
-    seen: set[tuple[Any, ...]] = set()
     audit_keys: set[tuple[Any, ...]] = set()
-    duplicate_count = 0
     for row in audit_rows:
         key = _trade_merge_key(row)
         audit_keys.add(key)
-        if key in seen:
-            duplicate_count += 1
-            continue
-        seen.add(key)
-        merged.append(row)
+
+    rows: list[dict[str, Any]] = []
+    seen_api_keys: set[str] = set()
+    duplicate_count = 0
     missing_api_rows: list[dict[str, Any]] = []
     for row in api_rows:
-        key = _trade_merge_key(row)
-        if key in seen:
+        api_key = trade_row_key(row)
+        if api_key in seen_api_keys:
             duplicate_count += 1
             continue
-        if key not in audit_keys:
+        seen_api_keys.add(api_key)
+        if _trade_merge_key(row) not in audit_keys:
             missing_api_rows.append(row)
-        seen.add(key)
-        merged.append(row)
-    rows = sorted(merged, key=lambda item: (int(trade_row_time_ms(item) or 0), trade_row_key(item)))
+        rows.append(row)
+    rows.sort(key=lambda item: (int(trade_row_time_ms(item) or 0), trade_row_key(item)))
     for row in missing_api_rows:
         append_jsonl(audit_path, row)
-    source = "audit+api" if audit_rows and api_rows else ("audit" if audit_rows else "api")
     return rows, {
-        "source": source,
+        "source": "api",
         "path": str(audit_path) if audit_rows or missing_api_rows else None,
         "row_count": len(rows),
         "audit_row_count": len(audit_rows),
         "api_row_count": len(api_rows),
         "merged_row_count": len(rows),
         "deduped_row_count": duplicate_count,
+        "ignored_audit_only_row_count": len(audit_keys - {_trade_merge_key(row) for row in rows}),
         "missing_api_row_count": len(missing_api_rows),
         "start_time": effective_start.isoformat(),
     }

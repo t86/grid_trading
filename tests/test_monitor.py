@@ -169,7 +169,9 @@ class MonitorTests(unittest.TestCase):
         self.assertAlmostEqual(current, 1_250_000.0, places=8)
 
     @patch("grid_optimizer.monitor.fetch_time_paged")
-    def test_load_or_fetch_trade_rows_merges_audit_with_full_api_window(self, mock_fetch_time_paged) -> None:
+    def test_load_or_fetch_trade_rows_prefers_full_exchange_window_over_audit_only_rows(
+        self, mock_fetch_time_paged
+    ) -> None:
         start = datetime(2026, 5, 14, 10, 0, tzinfo=timezone.utc)
         old_api_trade = {
             "id": 1,
@@ -209,10 +211,11 @@ class MonitorTests(unittest.TestCase):
                 session_start=start,
             )
 
-        self.assertEqual([row["id"] for row in rows], [1, 2, 3])
-        self.assertEqual(meta["source"], "audit+api")
+        self.assertEqual([row["id"] for row in rows], [1, 2])
+        self.assertEqual(meta["source"], "api")
         self.assertEqual(meta["audit_row_count"], 2)
         self.assertEqual(meta["api_row_count"], 2)
+        self.assertEqual(meta["ignored_audit_only_row_count"], 1)
 
     def test_monitor_stats_anchor_persists_first_data_start(self) -> None:
         from grid_optimizer.monitor import _resolve_monitor_stats_anchor
@@ -339,7 +342,7 @@ class MonitorTests(unittest.TestCase):
         )
 
     @patch("grid_optimizer.monitor.fetch_time_paged")
-    def test_load_or_fetch_trade_rows_merges_audit_and_api_manual_trades(self, mock_fetch_time_paged) -> None:
+    def test_load_or_fetch_trade_rows_prefers_api_rows_over_audit_copy(self, mock_fetch_time_paged) -> None:
         session_start = datetime(2026, 3, 19, 8, 0, tzinfo=timezone.utc)
         audit_trade = {
             "id": 10,
@@ -375,12 +378,13 @@ class MonitorTests(unittest.TestCase):
             )
 
         self.assertEqual([item["id"] for item in rows], [10, 11])
-        self.assertEqual(meta["source"], "audit+api")
+        self.assertEqual(meta["source"], "api")
         self.assertEqual(meta["audit_row_count"], 1)
         self.assertEqual(meta["api_row_count"], 2)
         self.assertEqual(meta["merged_row_count"], 2)
-        self.assertEqual(meta["deduped_row_count"], 1)
-        self.assertAlmostEqual(summarize_user_trades(rows)["gross_notional"], 5.2, places=8)
+        self.assertEqual(meta["deduped_row_count"], 0)
+        self.assertEqual(meta["ignored_audit_only_row_count"], 0)
+        self.assertAlmostEqual(summarize_user_trades(rows)["gross_notional"], 2999.2, places=8)
 
     @patch("grid_optimizer.monitor.fetch_time_paged")
     def test_load_or_fetch_income_rows_merges_audit_and_api_funding(self, mock_fetch_time_paged) -> None:
@@ -424,7 +428,7 @@ class MonitorTests(unittest.TestCase):
         self.assertAlmostEqual(summarize_income(rows)["funding_fee"], 0.01, places=8)
 
     @patch("grid_optimizer.monitor.fetch_time_paged")
-    def test_load_or_fetch_trade_rows_dedupes_audit_composite_id_against_api_trade(self, mock_fetch_time_paged) -> None:
+    def test_load_or_fetch_trade_rows_prefers_api_id_over_audit_composite_id(self, mock_fetch_time_paged) -> None:
         session_start = datetime(2026, 5, 12, 10, 0, tzinfo=timezone.utc)
         trade_time_ms = int((session_start + timedelta(minutes=5)).timestamp() * 1000)
         audit_trade = {
@@ -479,13 +483,14 @@ class MonitorTests(unittest.TestCase):
             )
 
         self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["id"], audit_trade["id"])
+        self.assertEqual(rows[0]["id"], api_trade["id"])
         self.assertEqual(rows[1]["id"], later_api_trade["id"])
-        self.assertEqual(meta["source"], "audit+api")
+        self.assertEqual(meta["source"], "api")
         self.assertEqual(meta["audit_row_count"], 1)
         self.assertEqual(meta["api_row_count"], 2)
         self.assertEqual(meta["merged_row_count"], 2)
-        self.assertEqual(meta["deduped_row_count"], 1)
+        self.assertEqual(meta["deduped_row_count"], 0)
+        self.assertEqual(meta["ignored_audit_only_row_count"], 0)
         self.assertAlmostEqual(
             summarize_user_trades(rows)["gross_notional"],
             (0.03352 * 5369) + (0.03351 * 100),
