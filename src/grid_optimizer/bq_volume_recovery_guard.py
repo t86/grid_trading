@@ -78,6 +78,8 @@ _RECOVERY_CONTROL_KEYS = (
     "best_quote_maker_volume_cycle_budget_notional",
     "best_quote_maker_volume_quote_offset_ticks",
     "best_quote_maker_volume_same_side_entry_price_guard_min_notional",
+    "best_quote_maker_volume_suppress_short_reduce_enabled",
+    "max_actual_net_notional",
     "pause_buy_position_notional",
     "pause_short_position_notional",
     "sticky_entry_price_tolerance_steps",
@@ -508,6 +510,19 @@ def _parse_time(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _exchange_trade_fetch_cooldown_seconds(exc: Exception) -> float | None:
+    message = str(exc)
+    if "Binance API local cooldown active for futures" not in message:
+        return None
+    match = re.search(r"retry after\s+([0-9]+(?:\.[0-9]+)?)s", message)
+    if match is None:
+        return 60.0
+    try:
+        return max(float(match.group(1)), 0.0)
+    except ValueError:
+        return 60.0
 
 
 def _trade_time(row: dict[str, Any]) -> datetime | None:
@@ -1793,6 +1808,87 @@ def _inactive_restart_gate(
     }
 
 
+def _net_long_guard_stop_recovery(
+    *,
+    control: dict[str, Any],
+    plan: dict[str, Any],
+    exchange: dict[str, Any],
+    recovery_baseline_notional: float = 0.0,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Permit one bounded restart that can only reduce a verified net-long stop.
+
+    A max-net stop leaves the runner inactive and its last plan stale, so it
+    cannot pass the generic restart gate.  This exception is deliberately
+    narrow: exchange positions must match the stop snapshot, no strategy order
+    may remain, and the restart suppresses the BUY/SHORT reduce leg that would
+    otherwise increase a net-long imbalance.
+    """
+    best_quote = plan.get("best_quote_maker_volume")
+    reduce_freeze = (
+        best_quote.get("reduce_freeze") if isinstance(best_quote, dict) else {}
+    )
+    snapshot_long = _safe_float(reduce_freeze.get("actual_long_notional"))
+    snapshot_short = _safe_float(reduce_freeze.get("actual_short_notional"))
+    exchange_long = _safe_float(exchange.get("long_notional"))
+    exchange_short = _safe_float(exchange.get("short_notional"))
+    configured_max_net = _safe_float(control.get("max_actual_net_notional"))
+    max_net = _safe_float(recovery_baseline_notional) or configured_max_net
+    per_order = max(
+        _safe_float(control.get("per_order_notional")),
+        _safe_float(control.get("maker_order_notional")),
+        _safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")),
+        20.0,
+    )
+    position_drift = abs(exchange_long - snapshot_long) + abs(exchange_short - snapshot_short)
+    drift_threshold = max(
+        _safe_float(plan.get("hedge_bq_position_drift_tolerance_notional")),
+        per_order * 2.0,
+        100.0,
+    )
+    net_long = exchange_long - exchange_short
+    details = {
+        "ok": False,
+        "exchange_open_order_count": _safe_int(exchange.get("open_order_count"), -1),
+        "exchange_long_notional": exchange_long,
+        "exchange_short_notional": exchange_short,
+        "snapshot_long_notional": snapshot_long,
+        "snapshot_short_notional": snapshot_short,
+        "position_drift_notional": position_drift,
+        "position_drift_threshold_notional": drift_threshold,
+        "configured_max_actual_net_notional": configured_max_net,
+        "recovery_baseline_notional": _safe_float(recovery_baseline_notional),
+        "effective_guard_baseline_notional": max_net,
+        "net_long_notional": net_long,
+    }
+    if max_net <= 0:
+        details["reason"] = "max_actual_net_notional_not_configured"
+        return {}, details
+    if _safe_int(exchange.get("open_order_count"), -1) != 0:
+        details["reason"] = "exchange_open_orders_present"
+        return {}, details
+    if position_drift > drift_threshold:
+        details["reason"] = "exchange_position_drift_too_large"
+        return {}, details
+    if net_long < max_net:
+        details["reason"] = "exchange_not_net_long_at_guard"
+        return {}, details
+
+    temporary_limit = max(configured_max_net, net_long + per_order)
+    details.update(
+        {
+            "ok": True,
+            "temporary_max_actual_net_notional": temporary_limit,
+            "direction": "net_long",
+        }
+    )
+    return {
+        "max_actual_net_notional": temporary_limit,
+        "best_quote_maker_volume_suppress_short_reduce_enabled": True,
+        "best_quote_maker_volume_allow_loss_reduce_only": False,
+        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+    }, details
+
+
 def recover_inactive_runner(
     *,
     symbol: str,
@@ -1821,16 +1917,102 @@ def recover_inactive_runner(
     control_path = _control_path(output_dir, normalized_symbol)
     control = _read_json(control_path)
     plan = _read_json(_plan_path(output_dir, normalized_symbol))
+    submit = _read_json(_submit_path(output_dir, normalized_symbol))
     gate = _inactive_restart_gate(
         control=control,
         plan=plan,
-        submit=_read_json(_submit_path(output_dir, normalized_symbol)),
+        submit=submit,
         now=now,
         max_snapshot_age_seconds=max_snapshot_age_seconds,
     )
     item["inactive_gate_reasons"] = list(gate["reasons"])
     action = "wait_runner_inactive_confirmation"
     restart_failed: str | None = None
+
+    last_restart_at = _parse_time(item.get("last_inactive_restart_at"))
+    restart_cooldown_active = (
+        last_restart_at is not None
+        and (now - last_restart_at).total_seconds() < max(float(restart_cooldown_seconds), 0.0)
+    )
+    stop_reason = str(plan.get("stop_reason") or submit.get("stop_reason") or "").strip()
+    net_guard_live_gate: dict[str, Any] | None = None
+    if (
+        stop_reason == "max_actual_net_notional_hit"
+        and elapsed >= max(float(trigger_seconds), 0.0)
+        and not restart_cooldown_active
+    ):
+        try:
+            exchange = (exchange_snapshot_fetcher or _fetch_corrupt_state_exchange_snapshot)(
+                normalized_symbol
+            )
+            net_guard_updates, net_guard_live_gate = _net_long_guard_stop_recovery(
+                control=control,
+                plan=plan,
+                exchange=exchange,
+                recovery_baseline_notional=_safe_float(
+                    item.get("net_guard_recovery_baseline_notional")
+                ),
+            )
+        except Exception as exc:
+            net_guard_updates = {}
+            net_guard_live_gate = {"ok": False, "error": str(exc)[:240]}
+        if net_guard_updates:
+            restart = restart_runner or (
+                lambda item_symbol: _default_restart_runner(
+                    item_symbol, runner_wrapper=runner_wrapper
+                )
+            )
+            _remember_recovery_controls(item, control, tuple(net_guard_updates))
+            _remember_recovery_updates(item, net_guard_updates)
+            if dry_run:
+                changed = [
+                    key for key, value in net_guard_updates.items() if control.get(key) != value
+                ]
+                backup_path = None
+                action = "dry_run_recover_net_long_guard_stop"
+            else:
+                try:
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=net_guard_updates,
+                        now=now,
+                        dry_run=False,
+                        restart_runner=restart,
+                    )
+                    if not changed:
+                        restart(normalized_symbol)
+                    action = "recover_net_long_guard_stop"
+                    item["last_inactive_restart_at"] = now.isoformat()
+                    item["status"] = "net_guard_recovery_active"
+                except subprocess.CalledProcessError as exc:
+                    changed, backup_path = list(net_guard_updates), None
+                    action = "recover_net_long_guard_stop_restart_failed"
+                    restart_failed = str(exc)
+            item.update(
+                {
+                    "net_guard_recovery_baseline_notional": _safe_float(
+                        control.get("max_actual_net_notional")
+                    ),
+                    "net_guard_recovery_direction": "net_long",
+                    "recovery_started_at": now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            return {
+                "symbol": normalized_symbol,
+                "action": action,
+                "changed_keys": changed,
+                "backup_path": backup_path,
+                "dry_run": dry_run,
+                "restart_failed": restart_failed,
+                "inactive_seconds": elapsed,
+                "inactive_restart_gate": gate,
+                "net_guard_live_gate": net_guard_live_gate,
+            }
 
     original_controls = item.get("guard_original_controls")
     invalid_pause_updates: dict[str, Any] = {}
@@ -1916,11 +2098,6 @@ def recover_inactive_runner(
             "invalid_control_live_gate": invalid_control_live_gate,
         }
 
-    last_restart_at = _parse_time(item.get("last_inactive_restart_at"))
-    restart_cooldown_active = (
-        last_restart_at is not None
-        and (now - last_restart_at).total_seconds() < max(float(restart_cooldown_seconds), 0.0)
-    )
     if not gate["ok"]:
         action = "skip_runner_inactive_safety_gate"
     elif restart_cooldown_active:
@@ -2160,7 +2337,109 @@ def check_symbol(
             if baseline > 0 and _safe_float(original_controls.get(key)) < baseline:
                 original_controls[key] = baseline
         item["guard_original_controls"] = original_controls
+    action = "none"
+    backup_path: str | None = None
+    changed: list[str] = []
+    restart_failed: str | None = None
     restart = restart_runner or (lambda item_symbol: _default_restart_runner(item_symbol, runner_wrapper=runner_wrapper))
+    net_guard_baseline = _safe_float(item.get("net_guard_recovery_baseline_notional"))
+    if net_guard_baseline > 0:
+        actual_long = assessment.get("actual_long_notional")
+        actual_short = assessment.get("actual_short_notional")
+        actual_net = (
+            abs(_safe_float(actual_long) - _safe_float(actual_short))
+            if actual_long is not None and actual_short is not None
+            else None
+        )
+        expected_controls = item.get("guard_recovery_controls")
+        expected_controls = (
+            {
+                key: value
+                for key, value in expected_controls.items()
+                if key in _RECOVERY_CONTROL_KEYS
+            }
+            if isinstance(expected_controls, dict)
+            else {}
+        )
+        if actual_net is not None and actual_net <= net_guard_baseline * 0.95:
+            updates = _restore_recovery_controls(
+                item,
+                control,
+                cycle_budget_floor_notional,
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+            action = (
+                "dry_run_restore_net_guard_after_rebalance"
+                if dry_run
+                else "restore_net_guard_after_rebalance"
+            )
+            _set_post_restore_cooldown(
+                item,
+                now=now,
+                cooldown_seconds=post_restore_cooldown_seconds,
+            )
+            for key in (
+                "net_guard_recovery_baseline_notional",
+                "net_guard_recovery_direction",
+                "guard_original_controls",
+                "guard_recovery_controls",
+                "recovery_started_at",
+                "recovery_owned",
+            ):
+                item.pop(key, None)
+        else:
+            drifted_updates = {
+                key: value for key, value in expected_controls.items() if control.get(key) != value
+            }
+            if drifted_updates:
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=drifted_updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = (
+                    "dry_run_reapply_net_guard_recovery_controls"
+                    if dry_run
+                    else "reapply_net_guard_recovery_controls"
+                )
+            else:
+                action = "hold_net_guard_rebalance"
+            item.update(
+                {
+                    "status": "net_guard_recovery_active",
+                    "last_recovery_check_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+        result = {
+            "symbol": normalized_symbol,
+            "action": action,
+            "changed_keys": changed,
+            "backup_path": backup_path,
+            "dry_run": dry_run,
+            "restart_failed": restart_failed,
+            "volume_summary": volume_summary,
+            "assessment": assessment,
+            "net_guard_recovery_baseline_notional": net_guard_baseline,
+            "net_guard_actual_notional": actual_net,
+        }
+        _append_jsonl(
+            output_dir / "bq_volume_recovery_guard_events.jsonl",
+            {"ts": now.isoformat(), **result},
+        )
+        return result
     recover_floor = (
         float(recover_min_volume_notional)
         if recover_min_volume_notional is not None
@@ -2168,10 +2447,6 @@ def check_symbol(
     )
     recover_floor = max(recover_floor, _safe_float(volume_summary.get("target_pace_floor_notional")))
 
-    action = "none"
-    backup_path: str | None = None
-    changed: list[str] = []
-    restart_failed: str | None = None
     status_reasons = set(assessment.get("reasons") or [])
     stale_or_missing = bool({"missing_control", "latest_plan_stale", "latest_submit_stale"} & status_reasons)
     recovery_gate = _inactive_restart_gate(
@@ -5790,7 +6065,25 @@ def main(argv: list[str] | None = None) -> int:
             if result.get("restart_failed"):
                 exit_code = 1
             continue
-        _clear_inactive_observation(_symbol_state(state, symbol))
+        item = _symbol_state(state, symbol)
+        _clear_inactive_observation(item)
+        fetch_deferred_until = _parse_time(item.get("exchange_trade_fetch_deferred_until"))
+        if fetch_deferred_until is not None and now < fetch_deferred_until:
+            result = {
+                "symbol": symbol,
+                "action": "defer_exchange_trade_fetch_cooldown",
+                "changed_keys": [],
+                "backup_path": None,
+                "dry_run": args.dry_run,
+                "restart_failed": None,
+                "retry_after_seconds": round((fetch_deferred_until - now).total_seconds(), 3),
+            }
+            _append_jsonl(
+                output_dir / "bq_volume_recovery_guard_events.jsonl",
+                {"ts": now.isoformat(), **result},
+            )
+            results.append(result)
+            continue
         try:
             fetch_window_seconds = args.window_seconds
             if symbol in daily_targets:
@@ -5802,6 +6095,26 @@ def main(argv: list[str] | None = None) -> int:
                 window_seconds=fetch_window_seconds,
             )
         except (KeyError, OSError, RuntimeError, ValueError) as exc:
+            retry_after_seconds = _exchange_trade_fetch_cooldown_seconds(exc)
+            if retry_after_seconds is not None:
+                item["exchange_trade_fetch_deferred_until"] = (
+                    now + timedelta(seconds=retry_after_seconds)
+                ).isoformat()
+                result = {
+                    "symbol": symbol,
+                    "action": "defer_exchange_trade_fetch_cooldown",
+                    "changed_keys": [],
+                    "backup_path": None,
+                    "dry_run": args.dry_run,
+                    "restart_failed": None,
+                    "retry_after_seconds": retry_after_seconds,
+                }
+                _append_jsonl(
+                    output_dir / "bq_volume_recovery_guard_events.jsonl",
+                    {"ts": now.isoformat(), **result},
+                )
+                results.append(result)
+                continue
             result = {
                 "symbol": symbol,
                 "action": "skip_exchange_trade_fetch_failed",
@@ -5815,6 +6128,7 @@ def main(argv: list[str] | None = None) -> int:
             results.append(result)
             exit_code = 1
             continue
+        item.pop("exchange_trade_fetch_deferred_until", None)
         result = check_symbol(
             symbol=symbol,
             output_dir=output_dir,
