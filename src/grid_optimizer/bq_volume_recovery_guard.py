@@ -3962,6 +3962,13 @@ def check_symbol(
             and bool(assessment.get("budget_raise_inventory_buffer_blocked"))
             and not bool(assessment.get("balancing_budget_raise_safe"))
             and not arx_missing_entry_anti_chase_recovery_due
+            and not (
+                sla_recovery_due
+                and _safe_int(assessment.get("active_order_count")) > 0
+                and _safe_int(assessment.get("planned_entry_order_count")) > 0
+                and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) > 0
+                and net_guard_entry_buffer_ok
+            )
         ):
             action = "hold_budget_raise_for_inventory_imbalance"
         elif (
@@ -4263,7 +4270,13 @@ def check_symbol(
                 "best_quote_maker_volume_allow_loss_reduce_only": False,
                 "best_quote_maker_volume_net_loss_reduce_enabled": False,
             }
-            if target_budget > current_budget:
+            if (
+                target_budget > current_budget
+                and (
+                    not bool(assessment.get("budget_raise_inventory_buffer_blocked"))
+                    or bool(assessment.get("balancing_budget_raise_safe"))
+                )
+            ):
                 updates["best_quote_maker_volume_cycle_budget_notional"] = target_budget
             if current_offset > 0:
                 updates["best_quote_maker_volume_quote_offset_ticks"] = current_offset - 1

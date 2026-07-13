@@ -3982,6 +3982,70 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 96.0)
             self.assertEqual(restarts, [])
 
+    def test_inventory_buffer_hold_still_allows_one_tick_sla_tightening(self) -> None:
+        now = datetime(2026, 7, 13, 11, 51, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 300.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 2,
+                    "pause_buy_position_notional": 620.0,
+                    "pause_short_position_notional": 620.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.75,
+                    "sticky_entry_price_tolerance_steps": 1.0,
+                },
+                long_notional=468.0,
+                short_notional=592.0,
+                open_order_count=3,
+                active_order_count=3,
+                orders_near_market=False,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "first_low_volume_at": (now - timedelta(minutes=20)).isoformat(),
+                        "low_pace_since": (now - timedelta(minutes=20)).isoformat(),
+                        "no_fill_since": (now - timedelta(minutes=15)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100.0,
+                daily_target_notional=180_000.0,
+                trigger_seconds=120,
+                cycle_budget_floor_notional=312.0,
+                volume_recovery_cycle_budget_increment=12.0,
+                trade_rows=[
+                    {
+                        "time": int((now - timedelta(minutes=30)).timestamp() * 1000),
+                        "quoteQty": 1_000.0,
+                    }
+                ],
+                volume_source="exchange_user_trades",
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(result["assessment"]["budget_raise_inventory_buffer_blocked"])
+            self.assertTrue(result["assessment"]["sla_recovery_due"])
+            self.assertEqual(result["action"], "escalate_normal_entry_for_sla")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 300.0)
+            self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 1)
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_backs_off_cycle_budget_when_recent_realized_wear_is_high(self) -> None:
         now = datetime(2026, 7, 12, 2, 47, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
