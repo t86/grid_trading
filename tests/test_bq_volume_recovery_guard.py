@@ -947,6 +947,46 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
 
         self.assertEqual(updates["pause_short_position_notional"], 1.0)
 
+    def test_recovery_parameters_use_one_authoritative_floor_for_all_config_values(self) -> None:
+        for configured_min in (32.0, 72.0, 100.0, 120.0, 200.0):
+            with self.subTest(configured_min=configured_min):
+                control = {
+                    "best_quote_maker_volume_min_cycle_budget_notional": configured_min,
+                    "best_quote_maker_volume_cycle_budget_notional": 44.0,
+                    "per_order_notional": 8.0,
+                }
+                parameters = bq_volume_recovery_guard._resolve_recovery_parameters(
+                    control=control,
+                    static_cycle_budget_floor_notional=32.0,
+                    effective_cycle_budget_floor_notional=32.0,
+                    cycle_budget_increment_notional=12.0,
+                )
+                updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
+                    control=control,
+                    assessment={},
+                    parameters=parameters,
+                )
+
+                self.assertEqual(parameters.effective_cycle_budget_floor_notional, configured_min)
+                self.assertEqual(parameters.loss_reduce_cycle_budget_cap_notional, configured_min)
+                self.assertEqual(
+                    updates["best_quote_maker_volume_cycle_budget_notional"],
+                    configured_min,
+                )
+
+    def test_recovery_parameters_only_use_per_order_multiple_as_last_resort(self) -> None:
+        fallback = bq_volume_recovery_guard._resolve_recovery_parameters(
+            control={"per_order_notional": 8.0},
+            static_cycle_budget_floor_notional=0.0,
+        )
+        strategy_floor = bq_volume_recovery_guard._resolve_recovery_parameters(
+            control={"per_order_notional": 8.0},
+            static_cycle_budget_floor_notional=100.0,
+        )
+
+        self.assertEqual(fallback.effective_cycle_budget_floor_notional, 32.0)
+        self.assertEqual(strategy_floor.effective_cycle_budget_floor_notional, 100.0)
+
     def test_inactive_runner_repairs_recovery_owned_zero_pause_with_live_gate(self) -> None:
         now = datetime(2026, 7, 12, 18, 30, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
@@ -2467,7 +2507,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         )
         self.assertEqual(
             updates["best_quote_maker_volume_active_pair_reduce_max_notional_per_side"],
-            100.0,
+            60.0,
         )
         self.assertAlmostEqual(
             updates["best_quote_maker_volume_inventory_soft_ratio"],

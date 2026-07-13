@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import ceil
 from pathlib import Path
@@ -15,6 +16,52 @@ from typing import Any, Callable
 RestartRunner = Callable[[str], object]
 UserTradesPageFetcher = Callable[..., list[dict[str, Any]]]
 CorruptStateExchangeFetcher = Callable[[str], dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class RecoveryParameters:
+    """Resolved recovery parameters; action branches must not re-derive them."""
+
+    per_order_notional: float
+    configured_min_cycle_budget_notional: float
+    static_cycle_budget_floor_notional: float
+    effective_cycle_budget_floor_notional: float
+    loss_reduce_cycle_budget_cap_notional: float
+    cycle_budget_increment_notional: float
+
+
+def _resolve_recovery_parameters(
+    *,
+    control: dict[str, Any],
+    static_cycle_budget_floor_notional: float,
+    effective_cycle_budget_floor_notional: float | None = None,
+    cycle_budget_increment_notional: float = 0.0,
+) -> RecoveryParameters:
+    """Resolve runner control > guard configuration > derived fallback once."""
+    per_order = max(
+        _safe_float(control.get("per_order_notional")),
+        _safe_float(control.get("maker_order_notional")),
+    )
+    configured_min = max(
+        _safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")),
+        0.0,
+    )
+    static_floor = max(float(static_cycle_budget_floor_notional), 0.0)
+    # per_order*4 is only a legacy fallback when neither authoritative source
+    # provides a minimum. It must never compete with an explicit runner value.
+    authoritative_floor = configured_min or static_floor or per_order * 4.0
+    effective_floor = max(
+        authoritative_floor,
+        max(float(effective_cycle_budget_floor_notional or 0.0), 0.0),
+    )
+    return RecoveryParameters(
+        per_order_notional=per_order,
+        configured_min_cycle_budget_notional=configured_min,
+        static_cycle_budget_floor_notional=static_floor,
+        effective_cycle_budget_floor_notional=effective_floor,
+        loss_reduce_cycle_budget_cap_notional=authoritative_floor,
+        cycle_budget_increment_notional=max(float(cycle_budget_increment_notional), 0.0),
+    )
 
 
 _RECOVERY_CONTROL_KEYS = (
@@ -830,6 +877,7 @@ def _loss_reduce_recovery_updates(
     quote_offset_extra_ticks: int = 0,
     pause_baseline_long_notional: float = 0.0,
     pause_baseline_short_notional: float = 0.0,
+    parameters: RecoveryParameters | None = None,
 ) -> dict[str, Any]:
     updates: dict[str, Any] = {
         "best_quote_maker_volume_net_loss_reduce_enabled": False,
@@ -847,21 +895,16 @@ def _loss_reduce_recovery_updates(
             updates["best_quote_maker_volume_quote_offset_ticks"] = (
                 max(_safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")), 0) + extra_ticks
             )
-    per_order = max(
-        _safe_float(control.get("per_order_notional")),
-        _safe_float(control.get("maker_order_notional")),
+    resolved = parameters or _resolve_recovery_parameters(
+        control=control,
+        static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
     )
-    loss_reduce_budget_cap = max(
-        float(static_cycle_budget_floor_notional),
-        _safe_float(
-            control.get("best_quote_maker_volume_min_cycle_budget_notional")
-        ),
-        per_order * 4.0,
-    )
+    per_order = resolved.per_order_notional
+    loss_reduce_budget_cap = resolved.loss_reduce_cycle_budget_cap_notional
     loss_reduce_budget_floor = (
         min(
             max(
-                _safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")),
+                resolved.configured_min_cycle_budget_notional,
                 per_order,
             ),
             loss_reduce_budget_cap,
@@ -912,7 +955,7 @@ def _loss_reduce_recovery_updates(
         target_soft_ratio = min(soft_ratio_candidates)
         if current_soft_ratio <= 0 or target_soft_ratio < current_soft_ratio:
             updates["best_quote_maker_volume_inventory_soft_ratio"] = target_soft_ratio
-    buffer_notional = max(_safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")), 0.0)
+    buffer_notional = resolved.loss_reduce_cycle_budget_cap_notional
     if buffer_notional <= 0:
         return updates
     current_long = max(_safe_float(assessment.get("current_long_notional")), 0.0)
@@ -1975,6 +2018,15 @@ def check_symbol(
         target_pace_fraction=target_pace_fraction,
         cycle_budget_increment=volume_recovery_cycle_budget_increment,
     )
+    parameters = _resolve_recovery_parameters(
+        control=control,
+        static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+        effective_cycle_budget_floor_notional=cycle_budget_floor_notional,
+        cycle_budget_increment_notional=volume_recovery_cycle_budget_increment,
+    )
+    # All downstream actions consume the same resolved floor. In particular an
+    # explicit runner min-cycle value cannot be lowered by a guard CLI default.
+    cycle_budget_floor_notional = parameters.effective_cycle_budget_floor_notional
     item = _symbol_state(state, normalized_symbol)
     original_controls = item.get("guard_original_controls")
     if isinstance(original_controls, dict):
@@ -2087,17 +2139,7 @@ def check_symbol(
                 directional_loss_reduce_pause_updates["pause_buy_position_notional"] = (
                     pause_baseline_long_notional
                 )
-    loss_reduce_cycle_budget_cap = max(
-        static_cycle_budget_floor_notional,
-        _safe_float(
-            control.get("best_quote_maker_volume_min_cycle_budget_notional")
-        ),
-        max(
-            _safe_float(control.get("per_order_notional")),
-            _safe_float(control.get("maker_order_notional")),
-        )
-        * 4.0,
-    )
+    loss_reduce_cycle_budget_cap = parameters.loss_reduce_cycle_budget_cap_notional
     required_hourly_notional = max(_safe_float(volume_summary.get("required_hourly_notional")), 0.0)
     trailing_hourly_notional = max(_safe_float(volume_summary.get("trailing_60m_hourly_notional")), 0.0)
     trailing_15m_notional = max(
