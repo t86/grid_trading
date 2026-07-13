@@ -9594,6 +9594,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_max_scale",
         "adaptive_step_min_per_order_scale",
         "adaptive_step_min_position_limit_scale",
+        "adaptive_step_dynamic_base_min_scale",
+        "adaptive_step_dynamic_base_full_raw_scale",
         "adaptive_regime_router_min_dwell_seconds",
         "adaptive_regime_router_max_spread_bps",
         "adaptive_regime_router_min_depth_notional",
@@ -9997,6 +9999,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "market_bias_regime_switch_enabled",
         "take_profit_enabled",
         "adaptive_step_enabled",
+        "adaptive_step_dynamic_base_enabled",
         "adaptive_regime_router_enabled",
         "adaptive_regime_router_cancel_stale_entries_on_no_trade",
         "best_quote_maker_volume_enabled",
@@ -10103,6 +10106,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_max_scale",
         "adaptive_step_min_per_order_scale",
         "adaptive_step_min_position_limit_scale",
+        "adaptive_step_dynamic_base_min_scale",
+        "adaptive_step_dynamic_base_full_raw_scale",
         "elastic_loss_per_10k_sprint",
         "elastic_loss_per_10k_cruise",
         "elastic_loss_per_10k_defensive",
@@ -11592,6 +11597,15 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--adaptive-step-min-per-order-scale", str(config["adaptive_step_min_per_order_scale"])])
     if config.get("adaptive_step_min_position_limit_scale") is not None:
         command.extend(["--adaptive-step-min-position-limit-scale", str(config["adaptive_step_min_position_limit_scale"])])
+    command.append(
+        "--adaptive-step-dynamic-base-enabled"
+        if config.get("adaptive_step_dynamic_base_enabled", False)
+        else "--no-adaptive-step-dynamic-base-enabled"
+    )
+    if config.get("adaptive_step_dynamic_base_min_scale") is not None:
+        command.extend(["--adaptive-step-dynamic-base-min-scale", str(config["adaptive_step_dynamic_base_min_scale"])])
+    if config.get("adaptive_step_dynamic_base_full_raw_scale") is not None:
+        command.extend(["--adaptive-step-dynamic-base-full-raw-scale", str(config["adaptive_step_dynamic_base_full_raw_scale"])])
     command.append(
         "--adaptive-regime-router-enabled"
         if config.get("adaptive_regime_router_enabled", False)

@@ -551,6 +551,9 @@ def resolve_adaptive_step_price(
     base_max_total_notional: float | None = None,
     min_per_order_scale: float = 1.0,
     min_position_limit_scale: float = 1.0,
+    dynamic_base_enabled: bool = False,
+    dynamic_base_min_scale: float = 1.0,
+    dynamic_base_full_raw_scale: float = 1.0,
 ) -> dict[str, Any]:
     def _safe_min_scale(value: float | None) -> float:
         return min(max(_safe_float(value), 0.0), 1.0) or 0.0
@@ -573,11 +576,17 @@ def resolve_adaptive_step_price(
     safe_max_scale = max(float(max_scale), 1.0)
     safe_min_per_order_scale = _safe_min_scale(min_per_order_scale) or 1.0
     safe_min_position_limit_scale = _safe_min_scale(min_position_limit_scale) or 1.0
+    safe_dynamic_base_min_scale = _safe_min_scale(dynamic_base_min_scale) or 1.0
+    safe_dynamic_base_full_raw_scale = max(float(dynamic_base_full_raw_scale), 1.0)
     report = {
         "enabled": bool(enabled),
         "active": False,
         "controls_active": False,
+        "configured_base_step_price": safe_base_step,
         "base_step_price": safe_base_step,
+        "dynamic_base_enabled": bool(dynamic_base_enabled),
+        "dynamic_base_scale": 1.0,
+        "dynamic_base_full_raw_scale": safe_dynamic_base_full_raw_scale,
         "effective_step_price": safe_base_step,
         "scale": 1.0,
         "raw_scale": 1.0,
@@ -673,19 +682,50 @@ def resolve_adaptive_step_price(
             "dominant_threshold": dominant_threshold,
         }
     )
+    dynamic_base_scale = 1.0
+    if bool(dynamic_base_enabled):
+        if safe_dynamic_base_full_raw_scale <= 1.0:
+            dynamic_base_scale = 1.0
+        else:
+            progress = min(
+                max((raw_scale - 1.0) / (safe_dynamic_base_full_raw_scale - 1.0), 0.0),
+                1.0,
+            )
+            dynamic_base_scale = safe_dynamic_base_min_scale + (
+                (1.0 - safe_dynamic_base_min_scale) * progress
+            )
+    dynamic_base_step = safe_base_step * dynamic_base_scale
+    report.update(
+        {
+            "base_step_price": dynamic_base_step,
+            "dynamic_base_scale": dynamic_base_scale,
+        }
+    )
     if raw_scale <= 1.0:
+        effective_step_price = _round_up_to_step(
+            dynamic_base_step,
+            safe_tick if safe_tick > 0 else None,
+        )
+        controls_active = abs(effective_step_price - safe_base_step) > 1e-12
+        report.update(
+            {
+                "controls_active": controls_active,
+                "active": controls_active,
+                "effective_step_price": effective_step_price,
+            }
+        )
         return report
 
     effective_scale = min(raw_scale, safe_max_scale)
-    desired_step = safe_base_step * effective_scale
+    desired_step = dynamic_base_step * effective_scale
     effective_step_price = _round_up_to_step(desired_step, safe_tick if safe_tick > 0 else None)
-    scale = (effective_step_price / safe_base_step) if safe_base_step > 0 else 1.0
+    scale = (effective_step_price / dynamic_base_step) if dynamic_base_step > 0 else 1.0
     per_order_scale = max(1.0 / effective_scale, safe_min_per_order_scale)
     position_limit_scale = max(1.0 / effective_scale, safe_min_position_limit_scale)
     report.update(
         {
             "controls_active": True,
-            "active": effective_step_price > safe_base_step + 1e-12,
+            "active": abs(effective_step_price - safe_base_step) > 1e-12,
             "effective_step_price": effective_step_price,
             "scale": scale,
             "per_order_scale": per_order_scale,
@@ -17474,6 +17514,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         base_max_total_notional=getattr(effective_args, "max_total_notional", None),
         min_per_order_scale=float(getattr(effective_args, "adaptive_step_min_per_order_scale", 1.0)),
         min_position_limit_scale=float(getattr(effective_args, "adaptive_step_min_position_limit_scale", 1.0)),
+        dynamic_base_enabled=bool(getattr(effective_args, "adaptive_step_dynamic_base_enabled", False)),
+        dynamic_base_min_scale=float(getattr(effective_args, "adaptive_step_dynamic_base_min_scale", 1.0)),
+        dynamic_base_full_raw_scale=float(
+            getattr(effective_args, "adaptive_step_dynamic_base_full_raw_scale", 1.0)
+        ),
     )
     if adaptive_step["controls_active"]:
         effective_args = argparse.Namespace(**vars(effective_args))
@@ -24169,6 +24214,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adaptive-step-max-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-min-per-order-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-min-position-limit-scale", type=float, default=1.0)
+    parser.add_argument("--adaptive-step-dynamic-base-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--adaptive-step-dynamic-base-min-scale", type=float, default=1.0)
+    parser.add_argument("--adaptive-step-dynamic-base-full-raw-scale", type=float, default=1.0)
     parser.add_argument("--elastic-volume-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--elastic-volume-mode", type=str, default="competition_elastic_volume_v1")
     parser.add_argument("--elastic-loss-per-10k-sprint", type=float, default=0.3)
@@ -24952,6 +25000,10 @@ def main() -> None:
         raise SystemExit("--adaptive-step-min-per-order-scale must be within (0, 1]")
     if args.adaptive_step_min_position_limit_scale <= 0 or args.adaptive_step_min_position_limit_scale > 1.0:
         raise SystemExit("--adaptive-step-min-position-limit-scale must be within (0, 1]")
+    if args.adaptive_step_dynamic_base_min_scale <= 0 or args.adaptive_step_dynamic_base_min_scale > 1.0:
+        raise SystemExit("--adaptive-step-dynamic-base-min-scale must be within (0, 1]")
+    if args.adaptive_step_dynamic_base_enabled and args.adaptive_step_dynamic_base_full_raw_scale <= 1.0:
+        raise SystemExit("--adaptive-step-dynamic-base-full-raw-scale must be > 1 when dynamic base is enabled")
     if args.adaptive_step_enabled and not any(
         threshold > 0
         for threshold in (
