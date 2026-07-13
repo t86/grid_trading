@@ -1808,20 +1808,21 @@ def _inactive_restart_gate(
     }
 
 
-def _net_long_guard_stop_recovery(
+def _net_guard_stop_recovery(
     *,
     control: dict[str, Any],
     plan: dict[str, Any],
     exchange: dict[str, Any],
     recovery_baseline_notional: float = 0.0,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Permit one bounded restart that can only reduce a verified net-long stop.
+    """Permit one bounded restart from a verified directional max-net stop.
 
     A max-net stop leaves the runner inactive and its last plan stale, so it
-    cannot pass the generic restart gate.  This exception is deliberately
-    narrow: exchange positions must match the stop snapshot, no strategy order
-    may remain, and the restart suppresses the BUY/SHORT reduce leg that would
-    otherwise increase a net-long imbalance.
+    cannot pass the generic restart gate. This exception is deliberately
+    narrow: exchange positions must match the stop snapshot and no strategy
+    order may remain. A net-long restart suppresses the BUY/SHORT reduce leg;
+    a net-short restart must explicitly leave that leg enabled so it can reduce
+    the short imbalance.
     """
     best_quote = plan.get("best_quote_maker_volume")
     reduce_freeze = (
@@ -1845,7 +1846,8 @@ def _net_long_guard_stop_recovery(
         per_order * 2.0,
         100.0,
     )
-    net_long = exchange_long - exchange_short
+    net_notional = exchange_long - exchange_short
+    net_abs = abs(net_notional)
     details = {
         "ok": False,
         "exchange_open_order_count": _safe_int(exchange.get("open_order_count"), -1),
@@ -1858,7 +1860,8 @@ def _net_long_guard_stop_recovery(
         "configured_max_actual_net_notional": configured_max_net,
         "recovery_baseline_notional": _safe_float(recovery_baseline_notional),
         "effective_guard_baseline_notional": max_net,
-        "net_long_notional": net_long,
+        "net_notional": net_notional,
+        "net_notional_abs": net_abs,
     }
     if max_net <= 0:
         details["reason"] = "max_actual_net_notional_not_configured"
@@ -1869,21 +1872,22 @@ def _net_long_guard_stop_recovery(
     if position_drift > drift_threshold:
         details["reason"] = "exchange_position_drift_too_large"
         return {}, details
-    if net_long < max_net:
-        details["reason"] = "exchange_not_net_long_at_guard"
+    if net_abs < max_net:
+        details["reason"] = "exchange_inside_net_guard"
         return {}, details
 
-    temporary_limit = max(configured_max_net, net_long + per_order)
+    direction = "net_long" if net_notional >= 0 else "net_short"
+    temporary_limit = max(configured_max_net, net_abs + per_order)
     details.update(
         {
             "ok": True,
             "temporary_max_actual_net_notional": temporary_limit,
-            "direction": "net_long",
+            "direction": direction,
         }
     )
     return {
         "max_actual_net_notional": temporary_limit,
-        "best_quote_maker_volume_suppress_short_reduce_enabled": True,
+        "best_quote_maker_volume_suppress_short_reduce_enabled": direction == "net_long",
         "best_quote_maker_volume_allow_loss_reduce_only": False,
         "best_quote_maker_volume_net_loss_reduce_enabled": False,
     }, details
@@ -1934,18 +1938,19 @@ def recover_inactive_runner(
         last_restart_at is not None
         and (now - last_restart_at).total_seconds() < max(float(restart_cooldown_seconds), 0.0)
     )
+    net_guard_recovery_active = _safe_float(item.get("net_guard_recovery_baseline_notional")) > 0
     stop_reason = str(plan.get("stop_reason") or submit.get("stop_reason") or "").strip()
     net_guard_live_gate: dict[str, Any] | None = None
     if (
         stop_reason == "max_actual_net_notional_hit"
         and elapsed >= max(float(trigger_seconds), 0.0)
-        and not restart_cooldown_active
+        and (not restart_cooldown_active or not net_guard_recovery_active)
     ):
         try:
             exchange = (exchange_snapshot_fetcher or _fetch_corrupt_state_exchange_snapshot)(
                 normalized_symbol
             )
-            net_guard_updates, net_guard_live_gate = _net_long_guard_stop_recovery(
+            net_guard_updates, net_guard_live_gate = _net_guard_stop_recovery(
                 control=control,
                 plan=plan,
                 exchange=exchange,
@@ -1969,7 +1974,8 @@ def recover_inactive_runner(
                     key for key, value in net_guard_updates.items() if control.get(key) != value
                 ]
                 backup_path = None
-                action = "dry_run_recover_net_long_guard_stop"
+                direction = str(net_guard_live_gate.get("direction") or "net")
+                action = f"dry_run_recover_{direction}_guard_stop"
             else:
                 try:
                     changed, backup_path = _apply_control_update(
@@ -1983,19 +1989,23 @@ def recover_inactive_runner(
                     )
                     if not changed:
                         restart(normalized_symbol)
-                    action = "recover_net_long_guard_stop"
+                    direction = str(net_guard_live_gate.get("direction") or "net")
+                    action = f"recover_{direction}_guard_stop"
                     item["last_inactive_restart_at"] = now.isoformat()
                     item["status"] = "net_guard_recovery_active"
                 except subprocess.CalledProcessError as exc:
                     changed, backup_path = list(net_guard_updates), None
-                    action = "recover_net_long_guard_stop_restart_failed"
+                    direction = str(net_guard_live_gate.get("direction") or "net")
+                    action = f"recover_{direction}_guard_stop_restart_failed"
                     restart_failed = str(exc)
             item.update(
                 {
                     "net_guard_recovery_baseline_notional": _safe_float(
                         control.get("max_actual_net_notional")
                     ),
-                    "net_guard_recovery_direction": "net_long",
+                    "net_guard_recovery_direction": str(
+                        net_guard_live_gate.get("direction") or "net"
+                    ),
                     "recovery_started_at": now.isoformat(),
                     "recovery_owned": True,
                     "last_recovery_action_at": now.isoformat(),

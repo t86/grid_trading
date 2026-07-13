@@ -1249,6 +1249,70 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_inactive_runner_recovers_net_short_guard_stop_without_short_reduce_suppression(self) -> None:
+        now = datetime(2026, 7, 13, 1, 2, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now - timedelta(minutes=10),
+                control={
+                    "run_start_time": (now - timedelta(hours=1)).isoformat(),
+                    "run_end_time": (now + timedelta(hours=1)).isoformat(),
+                    "max_actual_net_notional": 800.0,
+                    "per_order_notional": 50.0,
+                    "best_quote_maker_volume_suppress_short_reduce_enabled": True,
+                },
+                open_order_count=0,
+                active_order_count=0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan.update({"stop_reason": "max_actual_net_notional_hit"})
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 300.0,
+                    "actual_short_notional": 1280.0,
+                }
+            }
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "first_inactive_at": (now - timedelta(minutes=5)).isoformat(),
+                        "last_inactive_restart_at": (now - timedelta(seconds=30)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = recover_inactive_runner(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                trigger_seconds=120,
+                restart_cooldown_seconds=600,
+                max_snapshot_age_seconds=300,
+                runner_wrapper="/usr/local/bin/grid-saved-runner",
+                dry_run=False,
+                restart_runner=restarts.append,
+                exchange_snapshot_fetcher=lambda _symbol: {
+                    "open_order_count": 0,
+                    "long_notional": 300.0,
+                    "short_notional": 1280.0,
+                },
+            )
+
+            self.assertEqual(result["action"], "recover_net_short_guard_stop")
+            self.assertEqual(result["net_guard_live_gate"]["direction"], "net_short")
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(control["max_actual_net_notional"], 1030.0)
+            self.assertFalse(control["best_quote_maker_volume_suppress_short_reduce_enabled"])
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_net_guard_recovery_restores_baseline_only_after_net_returns_inside_buffer(self) -> None:
         now = datetime(2026, 7, 13, 1, 5, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
