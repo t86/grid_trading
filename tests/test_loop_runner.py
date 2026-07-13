@@ -139,6 +139,8 @@ from grid_optimizer.loop_runner import (
     _hedge_best_quote_position_diff_effectively_dust,
     _apply_best_quote_entry_inventory_cap_guard,
     _apply_best_quote_entry_level_guard,
+    _apply_best_quote_directional_net_guard_to_actions,
+    _apply_best_quote_directional_net_guard,
 )
 from grid_optimizer.submit_plan import (
     apply_loss_inventory_no_cross_entry_guard_to_actions,
@@ -303,6 +305,43 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(guard["blocked_sell_order_details"][0]["block_reason"], "sell_levels_disabled")
         self.assertEqual([order["role"] for order in plan["buy_orders"]], ["best_quote_entry_long", "best_quote_reduce_short"])
         self.assertEqual([order["role"] for order in plan["sell_orders"]], ["best_quote_reduce_long"])
+
+    def test_best_quote_directional_net_guard_keeps_only_net_short_reduction(self) -> None:
+        plan = {
+            "buy_orders": [
+                {"role": "best_quote_entry_long", "side": "BUY", "qty": 10, "notional": 6.0},
+                {"role": "best_quote_reduce_short", "side": "BUY", "qty": 8, "notional": 5.0},
+            ],
+            "sell_orders": [
+                {"role": "best_quote_entry_short", "side": "SELL", "qty": 12, "notional": 7.0},
+                {"role": "best_quote_reduce_long", "side": "SELL", "qty": 9, "notional": 5.5},
+            ],
+        }
+
+        guard = _apply_best_quote_directional_net_guard(plan, direction="net_short")
+
+        self.assertTrue(guard["enabled"])
+        self.assertEqual(guard["allowed_role"], "best_quote_reduce_short")
+        self.assertEqual([order["role"] for order in plan["buy_orders"]], ["best_quote_reduce_short"])
+        self.assertEqual(plan["sell_orders"], [])
+
+    def test_best_quote_directional_net_guard_actions_drops_late_reverse_orders(self) -> None:
+        actions = {
+            "place_orders": [
+                {"role": "best_quote_reduce_short", "side": "BUY", "notional": 5.0},
+                {"role": "best_quote_reduce_long", "side": "SELL", "notional": 6.0},
+                {"role": "best_quote_entry_long", "side": "BUY", "notional": 7.0},
+            ],
+            "place_count": 3,
+            "place_notional": 18.0,
+        }
+
+        guarded = _apply_best_quote_directional_net_guard_to_actions(actions, direction="net_short")
+
+        self.assertEqual([order["role"] for order in guarded["place_orders"]], ["best_quote_reduce_short"])
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertEqual(guarded["place_notional"], 5.0)
+        self.assertEqual(guarded["directional_net_guard"]["dropped_place_orders"], 2)
 
     def test_hedge_best_quote_position_diff_treats_min_notional_residue_as_dust(self) -> None:
         self.assertTrue(

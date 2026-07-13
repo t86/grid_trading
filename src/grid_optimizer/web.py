@@ -10004,6 +10004,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_inventory_cost_gate_enabled",
         "best_quote_maker_volume_net_loss_reduce_enabled",
         "best_quote_maker_volume_suppress_short_reduce_enabled",
+        "best_quote_maker_volume_directional_net_guard",
         "best_quote_maker_volume_active_pair_reduce_enabled",
         "best_quote_maker_volume_reduce_freeze_enabled",
         "best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled",
@@ -10073,6 +10074,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "runtime_guard_stats_start_time",
         "volume_trigger_window",
         "volatility_trigger_window",
+        "best_quote_maker_volume_directional_net_guard",
     }
     json_fields = {
         "volatility_trigger_fast_windows",
@@ -11013,6 +11015,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         "--best-quote-maker-volume-suppress-short-reduce-enabled"
         if config.get("best_quote_maker_volume_suppress_short_reduce_enabled", False)
         else "--no-best-quote-maker-volume-suppress-short-reduce-enabled",
+        "--best-quote-maker-volume-directional-net-guard",
+        str(config.get("best_quote_maker_volume_directional_net_guard") or "off"),
         "--best-quote-maker-volume-active-pair-reduce-enabled"
         if config.get("best_quote_maker_volume_active_pair_reduce_enabled", False)
         else "--no-best-quote-maker-volume-active-pair-reduce-enabled",

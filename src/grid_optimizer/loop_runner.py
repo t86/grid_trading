@@ -2463,6 +2463,74 @@ def _apply_best_quote_entry_level_guard(
     return guard
 
 
+def _apply_best_quote_directional_net_guard(
+    plan: dict[str, Any],
+    *,
+    direction: str,
+) -> dict[str, Any]:
+    normalized_direction = str(direction or "off").lower().strip()
+    allowed_roles = {
+        "net_long": "best_quote_reduce_long",
+        "net_short": "best_quote_reduce_short",
+    }
+    allowed_role = allowed_roles.get(normalized_direction, "")
+    guard = {
+        "enabled": bool(allowed_role),
+        "direction": normalized_direction if allowed_role else "off",
+        "allowed_role": allowed_role or None,
+        "dropped_buy_orders": 0,
+        "dropped_sell_orders": 0,
+        "dropped_notional": 0.0,
+    }
+    if not allowed_role or not isinstance(plan, dict):
+        return guard
+    for key in ("buy_orders", "sell_orders"):
+        kept_orders: list[dict[str, Any]] = []
+        dropped_orders: list[dict[str, Any]] = []
+        for item in list(plan.get(key) or []):
+            if isinstance(item, dict) and _order_role(item) == allowed_role:
+                kept_orders.append(item)
+            elif isinstance(item, dict):
+                dropped_orders.append(item)
+        plan[key] = kept_orders
+        guard[f"dropped_{key[:-7]}_orders"] = len(dropped_orders)
+        guard["dropped_notional"] += sum(
+            _safe_float(item.get("notional")) for item in dropped_orders
+        )
+    return guard
+
+
+def _apply_best_quote_directional_net_guard_to_actions(
+    actions: dict[str, Any],
+    *,
+    direction: str,
+) -> dict[str, Any]:
+    """Keep only the recovery direction's BQ reduce-only placement actions."""
+    normalized_direction = str(direction or "off").lower().strip()
+    allowed_roles = {
+        "net_long": "best_quote_reduce_long",
+        "net_short": "best_quote_reduce_short",
+    }
+    allowed_role = allowed_roles.get(normalized_direction, "")
+    if not allowed_role:
+        return actions
+    result = dict(actions)
+    place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    kept_orders = [item for item in place_orders if _order_role(item) == allowed_role]
+    dropped_orders = [item for item in place_orders if _order_role(item) != allowed_role]
+    result["place_orders"] = kept_orders
+    result["place_count"] = len(kept_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_orders)
+    result["directional_net_guard"] = {
+        "enabled": True,
+        "direction": normalized_direction,
+        "allowed_role": allowed_role,
+        "dropped_place_orders": len(dropped_orders),
+        "dropped_notional": sum(_safe_float(item.get("notional")) for item in dropped_orders),
+    }
+    return result
+
+
 def _best_quote_trade_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> str:
     explicit_role = str((row or {}).get("role") or "").lower().strip()
     if explicit_role in {
@@ -21085,6 +21153,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 best_quote_short_reduce_suppression["dropped_notional"] = sum(
                     _safe_float(item.get("notional")) for item in dropped_buy_orders
                 )
+        best_quote_directional_net_guard = {
+            "enabled": False,
+            "direction": "off",
+            "allowed_role": None,
+            "dropped_buy_orders": 0,
+            "dropped_sell_orders": 0,
+            "dropped_notional": 0.0,
+        }
         best_quote_maker_volume = {
             "enabled": bool(plan.get("enabled")),
             "regime": str(plan.get("regime") or ""),
@@ -21101,6 +21177,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "frozen_pair_release": dict(best_quote_frozen_pair_release),
             "frozen_total_cap": dict(best_quote_frozen_total_cap),
             "short_reduce_suppression": dict(best_quote_short_reduce_suppression),
+            "directional_net_guard": dict(best_quote_directional_net_guard),
         }
         inventory_tier = {
             "enabled": False,
@@ -22255,6 +22332,20 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         desired_orders=desired_orders,
         state=state,
     )
+    if _is_best_quote_maker_volume_mode(strategy_mode):
+        _sync_plan_orders_from_desired_orders(plan, desired_orders)
+        best_quote_directional_net_guard = _apply_best_quote_directional_net_guard(
+            plan,
+            direction=str(
+                getattr(effective_args, "best_quote_maker_volume_directional_net_guard", "off")
+                or "off"
+            ),
+        )
+        best_quote_maker_volume["directional_net_guard"] = dict(best_quote_directional_net_guard)
+        desired_orders = [
+            *plan["buy_orders"],
+            *plan["sell_orders"],
+        ]
     diff = diff_open_orders(existing_orders=open_orders_for_diff, desired_orders=desired_orders)
 
     state_now = _isoformat(_utc_now())
@@ -23112,6 +23203,12 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         enabled=True,
         allow_loss_roles=_best_quote_submit_allow_loss_roles(args),
     )
+    validation["actions"] = _apply_best_quote_directional_net_guard_to_actions(
+        validation["actions"],
+        direction=str(
+            getattr(args, "best_quote_maker_volume_directional_net_guard", "off") or "off"
+        ),
+    )
     if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
         validation["errors"] = [
             item for item in validation["errors"] if "plan contains no actions to execute" not in item
@@ -23590,6 +23687,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--best-quote-maker-volume-allow-loss-reduce-only", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--best-quote-maker-volume-suppress-short-reduce-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--best-quote-maker-volume-directional-net-guard",
+        choices=("off", "net_long", "net_short"),
+        default="off",
+    )
     parser.add_argument(
         "--best-quote-maker-volume-active-pair-reduce-enabled",
         action=argparse.BooleanOptionalAction,
