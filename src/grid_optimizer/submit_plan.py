@@ -116,6 +116,19 @@ def _order_bucket_key(side: str, price: float, position_side: str | None = None)
     return f"{side.upper()}:{normalized_position_side}:{price:.10f}"
 
 
+def _order_reconcile_lane(order: dict[str, Any]) -> str:
+    client_order_id = str(order.get("clientOrderId", order.get("client_order_id", "")) or "").lower()
+    if bool(order.get("frozen_inventory_per_lot_release")) or "-frozenpl-" in client_order_id:
+        return "frozen_per_lot"
+    return "default"
+
+
+def _order_reconcile_bucket_key(order: dict[str, Any], *, price: float | None = None) -> str:
+    side = str(order.get("side", "")).upper().strip()
+    safe_price = _safe_float(order.get("price")) if price is None else _safe_float(price)
+    return f"{_order_reconcile_lane(order)}:{_order_bucket_key(side, safe_price, _order_position_side(order))}"
+
+
 
 def _resolve_reduce_only_flag(
     *,
@@ -227,7 +240,7 @@ def _merge_place_orders_by_submitted_bucket(
         if price <= 0 or qty <= Decimal("0"):
             merged.append(order)
             continue
-        bucket = _order_bucket_key(side, price, _order_position_side(order))
+        bucket = _order_reconcile_bucket_key(order, price=price)
         if bucket not in merged_index_by_bucket:
             template = dict(order)
             template["price"] = price
@@ -472,6 +485,8 @@ def _open_order_role(open_order: dict[str, Any]) -> str:
 def _is_urgent_reduce_only_order(order: dict[str, Any], *, strategy_mode: str) -> bool:
     if _reduce_only_cap_side(order=order, strategy_mode=strategy_mode) is None:
         return False
+    if bool(order.get("frozen_inventory_per_lot_release")):
+        return True
     role = str(order.get("role", "") or "").strip().lower()
     if role in URGENT_REDUCE_ONLY_ROLES:
         return True
@@ -1612,7 +1627,7 @@ def preserve_queue_priority_in_execution_actions(
         qty = _quantity_decimal(order.get("origQty", order.get("qty")))
         if side not in {"BUY", "SELL"} or price <= 0 or qty <= Decimal("0"):
             continue
-        key = _order_bucket_key(side, price, _order_position_side(order))
+        key = _order_reconcile_bucket_key(order, price=price)
         cancel_indices_by_bucket.setdefault(key, []).append(index)
         cancel_totals_by_bucket[key] = cancel_totals_by_bucket.get(key, Decimal("0")) + qty
 
@@ -1639,7 +1654,7 @@ def preserve_queue_priority_in_execution_actions(
         price = _safe_float(prepared_order.get("submitted_price"))
         if qty <= Decimal("0") or price <= 0:
             continue
-        key = _order_bucket_key(side, price, _order_position_side(order))
+        key = _order_reconcile_bucket_key(order, price=price)
         projected_place_totals[key] = projected_place_totals.get(key, Decimal("0")) + qty
         if key not in projected_place_templates:
             template = dict(order)
@@ -1708,10 +1723,9 @@ def preserve_queue_priority_in_execution_actions(
         if prepared_order is None:
             adjusted_place_orders.append(order)
             continue
-        projected_key = _order_bucket_key(
-            side,
-            _safe_float(prepared_order.get("submitted_price")),
-            _order_position_side(order),
+        projected_key = _order_reconcile_bucket_key(
+            order,
+            price=_safe_float(prepared_order.get("submitted_price")),
         )
         if projected_key not in reduced_place_totals:
             adjusted_place_orders.append(order)
@@ -1727,11 +1741,7 @@ def preserve_queue_priority_in_execution_actions(
         order for index, order in enumerate(cancel_orders) if index not in preserved_cancel_indices
     ]
     pending_cancel_buckets = {
-        _order_bucket_key(
-            str(order.get("side", "")).upper().strip(),
-            _safe_float(order.get("price")),
-            _order_position_side(order),
-        )
+        _order_reconcile_bucket_key(order)
         for order in adjusted_cancel_orders
         if str(order.get("side", "")).upper().strip() in {"BUY", "SELL"}
         and _safe_float(order.get("price")) > 0
@@ -1760,7 +1770,7 @@ def preserve_queue_priority_in_execution_actions(
                 if prepared_order is not None
                 else _safe_float(order.get("price"))
             )
-            bucket = _order_bucket_key(side, price, _order_position_side(order))
+            bucket = _order_reconcile_bucket_key(order, price=price)
             if bucket in pending_cancel_buckets:
                 deferred = dict(order)
                 deferred["defer_reason"] = "pending_same_bucket_cancel"
@@ -1825,7 +1835,7 @@ def suppress_place_orders_with_existing_submitted_buckets(
         price = _safe_float(order.get("price"))
         if side not in {"BUY", "SELL"} or price <= 0:
             continue
-        existing_buckets.add(_order_bucket_key(side, price, _order_position_side(order)))
+        existing_buckets.add(_order_reconcile_bucket_key(order, price=price))
 
     if not existing_buckets:
         return actions
@@ -1853,7 +1863,7 @@ def suppress_place_orders_with_existing_submitted_buckets(
             if prepared_order is not None
             else _safe_float(order.get("price"))
         )
-        bucket = _order_bucket_key(side, price, _order_position_side(order))
+        bucket = _order_reconcile_bucket_key(order, price=price)
         if bucket in existing_buckets:
             suppressed = dict(order)
             suppressed["defer_reason"] = "existing_same_submitted_bucket"

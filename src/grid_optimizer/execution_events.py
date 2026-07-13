@@ -63,6 +63,7 @@ class ExecutionEvent:
     side: str
     execution_type: str
     order_status: str
+    trade_id: int | None = None
     order_type: str = ""
     time_in_force: str = ""
     position_side: str = "BOTH"
@@ -84,6 +85,7 @@ class ExecutionEvent:
             self.client_order_id,
             self.execution_type,
             self.order_status,
+            self.trade_id,
             self.event_time,
             self.transaction_time,
             self.cumulative_filled_qty,
@@ -327,6 +329,7 @@ def normalize_order_trade_update(payload: dict[str, Any]) -> ExecutionEvent | No
         side=str(order.get("S") or "").upper().strip(),
         execution_type=execution_type,
         order_status=order_status,
+        trade_id=_safe_int(order.get("t")),
         order_type=str(order.get("o") or "").upper().strip(),
         time_in_force=str(order.get("f") or "").upper().strip(),
         position_side=str(order.get("ps") or "BOTH").upper().strip() or "BOTH",

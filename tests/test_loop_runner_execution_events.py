@@ -17,6 +17,7 @@ from grid_optimizer.loop_runner import (
     _summarize_runner_strategy_execution_events,
     _snapshot_runner_execution_events,
     _trade_event_to_audit_row,
+    sync_best_quote_frozen_manual_fills,
 )
 
 
@@ -196,6 +197,79 @@ class LoopRunnerExecutionEventHelpersTests(unittest.TestCase):
         self.assertEqual(row["qty"], 10.0)
         self.assertEqual(row["commission"], 0.001)
         self.assertEqual(row["realizedPnl"], 0.12)
+
+    def test_trade_event_rows_use_exchange_trade_ids_and_both_partial_fills_sync(self) -> None:
+        common = {
+            "kind": "ORDER_PARTIALLY_FILLED",
+            "symbol": "ARXUSDT",
+            "event_time": 1010,
+            "transaction_time": 1005,
+            "order_id": 123,
+            "client_order_id": "gx-arxu-frozenpl-1-12345678",
+            "side": "SELL",
+            "execution_type": "TRADE",
+            "order_status": "PARTIALLY_FILLED",
+            "position_side": "LONG",
+            "last_filled_qty": 5.0,
+            "cumulative_filled_qty": 5.0,
+            "last_filled_price": 1.003,
+            "commission": 0.0,
+            "commission_asset": "USDT",
+            "realized_pnl": 0.01,
+        }
+        rows = [
+            _trade_event_to_audit_row(SimpleNamespace(**common, trade_id=9001)),
+            _trade_event_to_audit_row(SimpleNamespace(**common, trade_id=9002)),
+        ]
+
+        self.assertEqual([row["id"] for row in rows], [9001, 9002])
+        self.assertTrue(all(isinstance(row["id"], int) for row in rows))
+
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [
+                    {
+                        "qty": 30.0,
+                        "entry_price": 1.0,
+                        "frozen_lot_id": "long-selected",
+                    }
+                ],
+            },
+            "best_quote_frozen_inventory_manual_reduce": {
+                "long": {
+                    "requested": False,
+                    "submitted": True,
+                    "requested_qty": 20.0,
+                    "source": "auto_single_leg_take_profit",
+                    "request_id": "auto-tp-trade-event",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                    "frozen_inventory_per_lot_release": True,
+                }
+            },
+            "best_quote_volume_order_refs": {
+                "123": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "frozen_inventory_request_id": "auto-tp-trade-event",
+                    "source": "auto_single_leg_take_profit",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                    "frozen_inventory_per_lot_release": True,
+                }
+            },
+        }
+
+        synced = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=rows,
+        )
+
+        self.assertEqual(synced["applied_fill_count"], 2)
+        self.assertEqual(synced["consumed_long_qty"], 10.0)
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_qty"], 20.0)
 
     def test_should_backfill_trade_rest_skips_recent_backfill_when_observed_trades_exist(self) -> None:
         decision = _should_backfill_trade_rest(

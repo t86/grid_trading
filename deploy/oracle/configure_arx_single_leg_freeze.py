@@ -14,7 +14,8 @@ UPDATES = {
     "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
     "best_quote_maker_volume_frozen_pair_release_enabled": False,
     "best_quote_maker_volume_frozen_single_leg_take_profit_enabled": True,
-    "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.01,
+    "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.002,
+    "best_quote_maker_volume_frozen_pair_release_max_notional": 20.0,
 }
 
 REQUIRED_SAFETY = {

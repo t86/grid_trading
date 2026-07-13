@@ -59,6 +59,42 @@ class ExecutionEventStoreTests(unittest.TestCase):
         self.assertEqual(event.cumulative_filled_qty, 10.0)
         self.assertEqual(event.last_filled_price, 0.0671)
         self.assertEqual(event.realized_pnl, 0.12)
+        self.assertIsNone(event.trade_id)
+
+    def test_trade_update_uses_exchange_trade_id_to_distinguish_identical_fills(self) -> None:
+        base_order = {
+            "s": "ARXUSDT",
+            "c": "gx-arxu-frozenpl-1-12345678",
+            "S": "SELL",
+            "o": "LIMIT",
+            "f": "GTX",
+            "q": "20",
+            "p": "1.003",
+            "x": "TRADE",
+            "X": "PARTIALLY_FILLED",
+            "i": 123,
+            "l": "5",
+            "z": "5",
+            "L": "1.003",
+            "ps": "LONG",
+        }
+
+        first = normalize_order_trade_update(
+            {"E": 1000, "T": 990, "o": {**base_order, "t": 9001}}
+        )
+        second = normalize_order_trade_update(
+            {"E": 1000, "T": 990, "o": {**base_order, "t": 9002}}
+        )
+
+        assert first is not None
+        assert second is not None
+        self.assertEqual(first.trade_id, 9001)
+        self.assertEqual(second.trade_id, 9002)
+        self.assertNotEqual(first.dedupe_key, second.dedupe_key)
+        store = ExecutionEventStore(max_events=10)
+        self.assertTrue(store.add(first))
+        self.assertTrue(store.add(second))
+        self.assertEqual(len(store.snapshot()), 2)
 
     def test_event_store_deduplicates_order_updates_by_stable_key(self) -> None:
         store = ExecutionEventStore(max_events=10)

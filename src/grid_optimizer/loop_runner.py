@@ -2496,14 +2496,15 @@ def _best_quote_trade_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> 
 def _best_quote_frozen_manual_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> str:
     client_order_id = str((row or {}).get("clientOrderId") or (row or {}).get("client_order_id") or "").strip()
     parts = client_order_id.lower().split("-")
-    if len(parts) < 3 or parts[0] != "gx" or parts[2].strip() != "frozenin":
+    if len(parts) < 3 or parts[0] != "gx" or parts[2].strip() not in {"frozenin", "frozenpl"}:
         return ""
+    per_lot_release = parts[2].strip() == "frozenpl"
     side = str((row or {}).get("side") or "").upper().strip()
     position_side = str((row or {}).get("positionSide") or (row or {}).get("position_side") or "").upper().strip()
     if side == "SELL" and position_side == "LONG":
-        return "frozen_inventory_manual_limit_long"
+        return "frozen_inventory_manual_reduce_long" if per_lot_release else "frozen_inventory_manual_limit_long"
     if side == "BUY" and position_side == "SHORT":
-        return "frozen_inventory_manual_limit_short"
+        return "frozen_inventory_manual_reduce_short" if per_lot_release else "frozen_inventory_manual_limit_short"
     return ""
 
 
@@ -2567,7 +2568,7 @@ def _best_quote_trade_book_from_order_ref(
     return role_book
 
 
-def _best_quote_trade_fill_key(row: Mapping[str, Any] | dict[str, Any]) -> str:
+def _legacy_best_quote_trade_fill_key(row: Mapping[str, Any] | dict[str, Any]) -> str:
     order_id = str((row or {}).get("orderId") or (row or {}).get("order_id") or "").strip()
     side = str((row or {}).get("side") or "").upper().strip()
     position_side = str((row or {}).get("positionSide") or (row or {}).get("position_side") or "").upper().strip()
@@ -2586,6 +2587,14 @@ def _best_quote_trade_fill_key(row: Mapping[str, Any] | dict[str, Any]) -> str:
             ]
         )
     return trade_row_key(dict(row or {}))
+
+
+def _best_quote_trade_fill_key(row: Mapping[str, Any] | dict[str, Any]) -> str:
+    order_id = str((row or {}).get("orderId") or (row or {}).get("order_id") or "").strip()
+    trade_id = str((row or {}).get("id") or (row or {}).get("tradeId") or "").strip()
+    if trade_id.isdigit():
+        return f"{order_id}:trade:{trade_id}" if order_id else f"trade:{trade_id}"
+    return _legacy_best_quote_trade_fill_key(row)
 
 
 def _normalize_best_quote_volume_lots(raw_lots: Any) -> list[dict[str, Any]]:
@@ -2892,6 +2901,7 @@ def reset_best_quote_hedge_ledgers_after_exchange_flat(
         for key in (
             "best_quote_frozen_inventory",
             "best_quote_frozen_inventory_manual_reduce",
+            "best_quote_frozen_per_lot_client_bindings",
             "best_quote_frozen_inventory_manual_limit",
             "best_quote_frozen_inventory_pair_release",
             "runtime_guard_manual_frozen_inventory_override",
@@ -2920,6 +2930,7 @@ def reset_best_quote_hedge_ledgers_after_exchange_flat(
     for key in (
         "best_quote_frozen_inventory",
         "best_quote_frozen_inventory_manual_reduce",
+        "best_quote_frozen_per_lot_client_bindings",
         "best_quote_frozen_inventory_manual_limit",
         "best_quote_frozen_inventory_pair_release",
         "runtime_guard_manual_frozen_inventory_override",
@@ -3276,6 +3287,9 @@ def sync_best_quote_volume_ledger(
         if str(item).strip()
     ]
     applied_fill_key_set = set(applied_fill_keys)
+    historical_fill_key_set = set(applied_fill_keys)
+    seen_legacy_fill_keys: set[str] = set()
+    seen_legacy_without_exchange_id: set[str] = set()
     applied = 0
     unmatched = 0
     skipped_frozen = 0
@@ -3285,7 +3299,14 @@ def sync_best_quote_volume_ledger(
     gross_delta = 0.0
     for row in fresh_rows:
         fill_key = _best_quote_trade_fill_key(row)
-        if fill_key and fill_key in applied_fill_key_set:
+        legacy_fill_key = _legacy_best_quote_trade_fill_key(row)
+        has_exchange_trade_id = fill_key != legacy_fill_key
+        if (
+            fill_key in applied_fill_key_set
+            or legacy_fill_key in historical_fill_key_set
+            or (has_exchange_trade_id and legacy_fill_key in seen_legacy_without_exchange_id)
+            or (not has_exchange_trade_id and legacy_fill_key in seen_legacy_fill_keys)
+        ):
             continue
         order_ref = _best_quote_order_ref_for_trade(row, state)
         if order_ref is not None:
@@ -3335,6 +3356,9 @@ def sync_best_quote_volume_ledger(
         if fill_key:
             applied_fill_keys.append(fill_key)
             applied_fill_key_set.add(fill_key)
+        seen_legacy_fill_keys.add(legacy_fill_key)
+        if not has_exchange_trade_id:
+            seen_legacy_without_exchange_id.add(legacy_fill_key)
 
     ledger["long_lots"] = long_lots
     ledger["short_lots"] = short_lots
@@ -3436,11 +3460,21 @@ def sync_best_quote_frozen_pair_release(
         if str(item).strip()
     ]
     applied_fill_key_set = set(applied_fill_keys)
+    historical_fill_key_set = set(applied_fill_keys)
+    seen_legacy_fill_keys: set[str] = set()
+    seen_legacy_without_exchange_id: set[str] = set()
     long_delta = 0.0
     short_delta = 0.0
     for row in [dict(item) for item in list(observed_trade_rows or []) if isinstance(item, dict)]:
         fill_key = _best_quote_trade_fill_key(row)
-        if fill_key and fill_key in applied_fill_key_set:
+        legacy_fill_key = _legacy_best_quote_trade_fill_key(row)
+        has_exchange_trade_id = fill_key != legacy_fill_key
+        if (
+            fill_key in applied_fill_key_set
+            or legacy_fill_key in historical_fill_key_set
+            or (has_exchange_trade_id and legacy_fill_key in seen_legacy_without_exchange_id)
+            or (not has_exchange_trade_id and legacy_fill_key in seen_legacy_fill_keys)
+        ):
             continue
         order_id = str(row.get("orderId") or row.get("order_id") or "").strip()
         ref = order_refs.get(order_id) if order_id else None
@@ -3472,6 +3506,9 @@ def sync_best_quote_frozen_pair_release(
         if fill_key:
             applied_fill_keys.append(fill_key)
             applied_fill_key_set.add(fill_key)
+        seen_legacy_fill_keys.add(legacy_fill_key)
+        if not has_exchange_trade_id:
+            seen_legacy_without_exchange_id.add(legacy_fill_key)
 
     filled_long_qty = report["filled_long_qty"] + long_delta
     filled_short_qty = report["filled_short_qty"] + short_delta
@@ -3561,6 +3598,7 @@ def sync_best_quote_frozen_manual_fills(
         "consumed_long_qty": 0.0,
         "consumed_short_qty": 0.0,
         "applied_fill_count": 0,
+        "unmatched_per_lot_fill_count": 0,
     }
     refs = state.get("best_quote_volume_order_refs")
     order_refs = refs if isinstance(refs, Mapping) else {}
@@ -3570,23 +3608,174 @@ def sync_best_quote_frozen_manual_fills(
         if str(item).strip()
     ]
     applied_fill_key_set = set(applied_fill_keys)
+    historical_fill_key_set = set(applied_fill_keys)
+    seen_legacy_fill_keys: set[str] = set()
+    seen_legacy_without_exchange_id: set[str] = set()
     frozen = dict(state.get("best_quote_frozen_inventory") or {})
     if not frozen:
         return report
+    per_lot_client_bindings = dict(state.get("best_quote_frozen_per_lot_client_bindings") or {})
+    manual_reduce_directive = dict(state.get("best_quote_frozen_inventory_manual_reduce") or {})
     manual_limit_directive = dict(state.get("best_quote_frozen_inventory_manual_limit") or {})
 
-    def _consume(side_key: str, qty: float, *, role: str) -> float:
-        nonlocal frozen, manual_limit_directive
+    def _consume_selected(
+        lots: list[dict[str, Any]],
+        allocations: list[dict[str, Any]],
+        qty: float,
+    ) -> tuple[list[dict[str, Any]], float, dict[str, float]]:
+        updated = [dict(item) for item in lots]
+        remaining = max(_safe_float(qty), 0.0)
+        consumed_by_id: dict[str, float] = {}
+        index_by_id = {
+            str(item.get("frozen_lot_id") or "").strip(): index
+            for index, item in enumerate(updated)
+            if str(item.get("frozen_lot_id") or "").strip()
+        }
+        for allocation in allocations:
+            lot_id = str(allocation.get("frozen_lot_id") or "").strip()
+            index = index_by_id.get(lot_id)
+            if index is None or remaining <= 1e-12:
+                continue
+            lot_qty = max(_safe_float(updated[index].get("qty")), 0.0)
+            allocation_qty = max(_safe_float(allocation.get("qty")), 0.0)
+            take_qty = min(lot_qty, allocation_qty, remaining)
+            if take_qty <= 1e-12:
+                continue
+            updated[index]["qty"] = max(lot_qty - take_qty, 0.0)
+            consumed_by_id[lot_id] = consumed_by_id.get(lot_id, 0.0) + take_qty
+            remaining = max(remaining - take_qty, 0.0)
+        updated = [item for item in updated if _safe_float(item.get("qty")) > 1e-12]
+        return updated, sum(consumed_by_id.values()), consumed_by_id
+
+    def _remaining_allocations(
+        allocations: list[dict[str, Any]],
+        consumed_by_id: Mapping[str, float],
+    ) -> list[dict[str, Any]]:
+        remaining_by_id = {str(key): max(_safe_float(value), 0.0) for key, value in consumed_by_id.items()}
+        remaining_allocations: list[dict[str, Any]] = []
+        for allocation in allocations:
+            lot_id = str(allocation.get("frozen_lot_id") or "").strip()
+            allocation_qty = max(_safe_float(allocation.get("qty")), 0.0)
+            consumed = min(allocation_qty, remaining_by_id.get(lot_id, 0.0))
+            if consumed > 0:
+                remaining_by_id[lot_id] = max(remaining_by_id.get(lot_id, 0.0) - consumed, 0.0)
+            remaining_qty = max(allocation_qty - consumed, 0.0)
+            if lot_id and remaining_qty > 1e-12:
+                remaining_allocations.append({"frozen_lot_id": lot_id, "qty": remaining_qty})
+        return remaining_allocations
+
+    def _consume(
+        side_key: str,
+        qty: float,
+        *,
+        role: str,
+        ref: Mapping[str, Any],
+        row: Mapping[str, Any],
+    ) -> float:
+        nonlocal frozen, per_lot_client_bindings, manual_reduce_directive, manual_limit_directive
         safe_qty = max(_safe_float(qty), 0.0)
         if safe_qty <= 1e-12:
             return 0.0
         lots_key = f"{side_key}_lots"
         lots = _normalize_best_quote_volume_lots(frozen.get(lots_key))
-        lots, consumed_lots, _ = _best_quote_volume_consume_fifo(lots, safe_qty)
-        consumed_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in consumed_lots)
+        client_order_id = str(row.get("clientOrderId") or row.get("client_order_id") or "").strip()
+        client_binding = dict(per_lot_client_bindings.get(client_order_id) or {})
+        selected_lot_allocations = [
+            dict(item)
+            for item in list(
+                ref.get("selected_lot_allocations")
+                or row.get("selected_lot_allocations")
+                or client_binding.get("selected_lot_allocations")
+                or []
+            )
+            if isinstance(item, dict)
+        ]
+        per_lot_client_tag = "-frozenpl-" in client_order_id.lower()
+        current_side_directive = dict(manual_reduce_directive.get(side_key) or {})
+        directive_client_order_id = str(
+            current_side_directive.get("submitted_client_order_id") or ""
+        ).lower()
+        if (
+            per_lot_client_tag
+            and not selected_lot_allocations
+            and directive_client_order_id
+            and client_order_id.lower() == directive_client_order_id
+        ):
+            selected_lot_allocations = [
+                dict(item)
+                for item in list(current_side_directive.get("selected_lot_allocations") or [])
+                if isinstance(item, dict)
+            ]
+        source = str(
+            ref.get("source")
+            or ref.get("frozen_inventory_source")
+            or row.get("source")
+            or client_binding.get("source")
+            or (current_side_directive.get("source") if per_lot_client_tag else "")
+            or ""
+        ).strip()
+        per_lot_release = bool(
+            ref.get("frozen_inventory_per_lot_release")
+            or row.get("frozen_inventory_per_lot_release")
+            or per_lot_client_tag
+            or (source == "auto_single_leg_take_profit" and selected_lot_allocations)
+        )
+        consumed_by_id: dict[str, float] = {}
+        if per_lot_release:
+            if not selected_lot_allocations:
+                return 0.0
+            lots, consumed_qty, consumed_by_id = _consume_selected(lots, selected_lot_allocations, safe_qty)
+        else:
+            lots, consumed_lots, _ = _best_quote_volume_consume_fifo(lots, safe_qty)
+            consumed_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in consumed_lots)
         if consumed_qty <= 1e-12:
             return 0.0
         frozen[lots_key] = lots
+        if per_lot_release and client_binding:
+            remaining_binding_allocations = _remaining_allocations(
+                [
+                    dict(item)
+                    for item in list(client_binding.get("selected_lot_allocations") or [])
+                    if isinstance(item, dict)
+                ],
+                consumed_by_id,
+            )
+            if remaining_binding_allocations:
+                client_binding["selected_lot_allocations"] = remaining_binding_allocations
+                per_lot_client_bindings[client_order_id] = client_binding
+            else:
+                per_lot_client_bindings.pop(client_order_id, None)
+        if per_lot_release and role.startswith("frozen_inventory_manual_reduce_"):
+            side_directive = dict(manual_reduce_directive.get(side_key) or {})
+            row_request_id = str(
+                row.get("frozen_inventory_request_id")
+                or ref.get("frozen_inventory_request_id")
+                or client_binding.get("request_id")
+                or ""
+            ).strip()
+            directive_request_id = str(side_directive.get("request_id") or "").strip()
+            if side_directive and (not row_request_id or row_request_id == directive_request_id):
+                directive_allocations = [
+                    dict(item)
+                    for item in list(side_directive.get("selected_lot_allocations") or [])
+                    if isinstance(item, dict)
+                ]
+                remaining_allocations = _remaining_allocations(directive_allocations, consumed_by_id)
+                remaining_request = sum(
+                    max(_safe_float(item.get("qty")), 0.0) for item in remaining_allocations
+                )
+                if remaining_request > 1e-12:
+                    side_directive.update(
+                        {
+                            "requested": True,
+                            "submitted": False,
+                            "requested_qty": remaining_request,
+                            "selected_lot_allocations": remaining_allocations,
+                        }
+                    )
+                    manual_reduce_directive[side_key] = side_directive
+                else:
+                    manual_reduce_directive.pop(side_key, None)
         if role.startswith("frozen_inventory_manual_limit_"):
             isolated_key = f"{side_key}_manual_limit_isolated_qty"
             frozen[isolated_key] = max(_safe_float(frozen.get(isolated_key)) - consumed_qty, 0.0)
@@ -3606,7 +3795,14 @@ def sync_best_quote_frozen_manual_fills(
 
     for row in [dict(item) for item in list(observed_trade_rows or []) if isinstance(item, dict)]:
         fill_key = _best_quote_trade_fill_key(row)
-        if fill_key and fill_key in applied_fill_key_set:
+        legacy_fill_key = _legacy_best_quote_trade_fill_key(row)
+        has_exchange_trade_id = fill_key != legacy_fill_key
+        if (
+            fill_key in applied_fill_key_set
+            or legacy_fill_key in historical_fill_key_set
+            or (has_exchange_trade_id and legacy_fill_key in seen_legacy_without_exchange_id)
+            or (not has_exchange_trade_id and legacy_fill_key in seen_legacy_fill_keys)
+        ):
             continue
         order_id = str(row.get("orderId") or row.get("order_id") or "").strip()
         ref = order_refs.get(order_id) if order_id else None
@@ -3627,12 +3823,23 @@ def sync_best_quote_frozen_manual_fills(
         qty = max(_safe_float(row.get("qty")), 0.0)
         if qty <= 1e-12:
             continue
+        per_lot_fill = bool(
+            ref.get("frozen_inventory_per_lot_release")
+            or "-frozenpl-"
+            in str(row.get("clientOrderId") or row.get("client_order_id") or "").lower()
+        )
         if role.endswith("_long"):
-            consumed = _consume("long", qty, role=role)
+            consumed = _consume("long", qty, role=role, ref=ref, row=row)
+            if per_lot_fill and consumed <= 1e-12:
+                report["unmatched_per_lot_fill_count"] += 1
+                continue
             report["new_long_fill_qty"] += qty
             report["consumed_long_qty"] += consumed
         elif role.endswith("_short"):
-            consumed = _consume("short", qty, role=role)
+            consumed = _consume("short", qty, role=role, ref=ref, row=row)
+            if per_lot_fill and consumed <= 1e-12:
+                report["unmatched_per_lot_fill_count"] += 1
+                continue
             report["new_short_fill_qty"] += qty
             report["consumed_short_qty"] += consumed
         else:
@@ -3641,9 +3848,20 @@ def sync_best_quote_frozen_manual_fills(
         if fill_key:
             applied_fill_keys.append(fill_key)
             applied_fill_key_set.add(fill_key)
+        seen_legacy_fill_keys.add(legacy_fill_key)
+        if not has_exchange_trade_id:
+            seen_legacy_without_exchange_id.add(legacy_fill_key)
 
     if report["applied_fill_count"] > 0:
         state["best_quote_frozen_inventory"] = _refresh_best_quote_frozen_inventory_quantities(frozen)
+        if manual_reduce_directive:
+            state["best_quote_frozen_inventory_manual_reduce"] = manual_reduce_directive
+        else:
+            state.pop("best_quote_frozen_inventory_manual_reduce", None)
+        if per_lot_client_bindings:
+            state["best_quote_frozen_per_lot_client_bindings"] = per_lot_client_bindings
+        else:
+            state.pop("best_quote_frozen_per_lot_client_bindings", None)
         if manual_limit_directive:
             state["best_quote_frozen_inventory_manual_limit"] = manual_limit_directive
         else:
@@ -4939,81 +5157,167 @@ def _frozen_inventory_releasable_qty_after_retain(
     return max(safe_qty - (safe_retain / safe_price), 0.0)
 
 
+def _ensure_best_quote_frozen_lot_ids(
+    lots: list[dict[str, Any]],
+    *,
+    side: str,
+    checked_at: datetime,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    checked_ms = int(checked_at.timestamp() * 1000)
+    for index, raw_lot in enumerate(_normalize_best_quote_volume_lots(lots)):
+        lot = dict(raw_lot)
+        if not str(lot.get("frozen_lot_id") or "").strip():
+            lot["frozen_lot_id"] = f"frozen-{side}-{checked_ms}-{index}"
+        normalized.append(lot)
+    return normalized
+
+
+def _trim_best_quote_frozen_lot_allocations(
+    allocations: list[dict[str, Any]],
+    qty: float,
+) -> list[dict[str, Any]]:
+    remaining = max(_safe_float(qty), 0.0)
+    trimmed: list[dict[str, Any]] = []
+    for raw_allocation in allocations:
+        lot_id = str(raw_allocation.get("frozen_lot_id") or "").strip()
+        allocation_qty = max(_safe_float(raw_allocation.get("qty")), 0.0)
+        take_qty = min(allocation_qty, remaining)
+        if lot_id and take_qty > 1e-12:
+            trimmed.append({"frozen_lot_id": lot_id, "qty": take_qty})
+            remaining = max(remaining - take_qty, 0.0)
+        if remaining <= 1e-12:
+            break
+    return trimmed
+
+
+def _select_best_quote_frozen_lot_allocations(
+    lots: list[dict[str, Any]],
+    *,
+    side: str,
+    eligibility_price: float,
+    batch_price: float,
+    min_profit_ratio: float,
+    max_notional: float,
+) -> list[dict[str, Any]]:
+    safe_eligibility_price = max(_safe_float(eligibility_price), 0.0)
+    safe_batch_price = max(_safe_float(batch_price), 0.0)
+    safe_ratio = max(_safe_float(min_profit_ratio), 0.0)
+    if safe_eligibility_price <= 0 or safe_batch_price <= 0 or safe_ratio <= 0:
+        return []
+    normalized_side = str(side or "").lower().strip()
+    normalized_lots = _normalize_best_quote_volume_lots(lots)
+    eligible_lots: list[dict[str, Any]] = []
+    for lot in normalized_lots:
+        entry_price = max(_safe_float(lot.get("entry_price", lot.get("price"))), 0.0)
+        eligible = (
+            safe_eligibility_price + 1e-12 >= entry_price * (1.0 + safe_ratio)
+            if normalized_side == "long"
+            else safe_eligibility_price <= entry_price * (1.0 - safe_ratio) + 1e-12
+        )
+        if entry_price > 0 and eligible:
+            eligible_lots.append(lot)
+    eligible_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in eligible_lots)
+    if eligible_qty <= 1e-12:
+        return []
+    target_qty = eligible_qty
+    safe_max_notional = max(_safe_float(max_notional), 0.0)
+    if safe_max_notional > 0:
+        target_qty = min(target_qty, safe_max_notional / safe_batch_price)
+    total_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in normalized_lots)
+    if eligible_qty + 1e-12 >= total_qty:
+        target_qty = min(
+            target_qty,
+            _frozen_inventory_releasable_qty_after_retain(total_qty, safe_eligibility_price),
+        )
+    raw_allocations = [
+        {
+            "frozen_lot_id": str(item.get("frozen_lot_id") or "").strip(),
+            "qty": max(_safe_float(item.get("qty")), 0.0),
+        }
+        for item in eligible_lots
+    ]
+    return _trim_best_quote_frozen_lot_allocations(raw_allocations, target_qty)
+
+
 def arm_best_quote_frozen_single_leg_take_profit(
     *,
     state: dict[str, Any],
     bid_price: float,
     ask_price: float,
     min_profit_ratio: float,
+    max_notional: float = 0.0,
     now: datetime | None = None,
 ) -> dict[str, float]:
-    """Auto-arm a manual_reduce directive to take profit on frozen inventory whose OWN
-    profit versus its frozen entry has reached ``min_profit_ratio`` -- WITHOUT needing an
-    opposite-side frozen lot to pair against (which is what frozen_pair_release requires).
-
-    A frozen SHORT can be closed for >= r profit when it can be bought back at ask <=
-    entry*(1-r); a frozen LONG when it can be sold at bid >= entry*(1+r). The directive is
-    handed to the existing, tested apply_best_quote_frozen_inventory_manual_reduce path, so
-    order placement, fill handling and ledger/budget restore all reuse vetted code. Returns
-    the per-side qty it armed (empty when nothing qualifies). A side that already has a
-    pending manual_reduce directive is left untouched.
-    """
+    """Arm one maker batch per side from individually profitable frozen lots."""
     r = max(_safe_float(min_profit_ratio), 0.0)
     if r <= 0.0:
         return {}
-    ledger = state.get("best_quote_frozen_inventory")
-    if not isinstance(ledger, Mapping):
+    raw_ledger = state.get("best_quote_frozen_inventory")
+    if not isinstance(raw_ledger, Mapping):
+        return {}
+    pair_release = state.get("best_quote_frozen_inventory_pair_release")
+    if isinstance(pair_release, Mapping) and pair_release:
         return {}
     existing = dict(state.get("best_quote_frozen_inventory_manual_reduce") or {})
+    manual_limit = dict(state.get("best_quote_frozen_inventory_manual_limit") or {})
     safe_bid = max(_safe_float(bid_price), 0.0)
     safe_ask = max(_safe_float(ask_price), 0.0)
+    if safe_bid <= 0 or safe_ask <= 0:
+        return {}
+    checked_at = (now or _utc_now()).astimezone(timezone.utc)
+    ledger = dict(raw_ledger)
+    ledger["long_lots"] = _ensure_best_quote_frozen_lot_ids(
+        list(ledger.get("long_lots") or []),
+        side="long",
+        checked_at=checked_at,
+    )
+    ledger["short_lots"] = _ensure_best_quote_frozen_lot_ids(
+        list(ledger.get("short_lots") or []),
+        side="short",
+        checked_at=checked_at,
+    )
+    state["best_quote_frozen_inventory"] = ledger
     armed: dict[str, float] = {}
 
-    short_qty = max(_safe_float(ledger.get("short_qty")), 0.0)
-    short_entry = _frozen_inventory_weighted_entry(ledger, "short")
-    short_worst_entry = _frozen_inventory_worst_entry(ledger, "short")
-    if (
-        short_qty > 1e-12
-        and short_entry > 0.0
-        and safe_ask > 0.0
-        and not bool((existing.get("short") or {}).get("requested"))
-        # whole frozen short book is at least r profitable on average ...
-        and (short_entry - safe_ask) / short_entry >= r
-        # ... and even the least-profitable lot is not underwater, so closing the FIFO
-        # aggregate never realizes a loss on any individual lot.
-        and short_worst_entry > safe_ask
+    selected_by_side: dict[str, list[dict[str, Any]]] = {}
+    for side_key, eligibility_price, batch_price in (
+        ("short", safe_ask, safe_bid),
+        ("long", safe_bid, safe_ask),
     ):
-        release_qty = _frozen_inventory_releasable_qty_after_retain(short_qty, safe_ask)
+        if (
+            isinstance(existing.get(side_key), Mapping)
+            or isinstance(manual_limit.get(side_key), Mapping)
+            or _safe_float(ledger.get(f"{side_key}_manual_limit_isolated_qty")) > 1e-12
+        ):
+            continue
+        selected = _select_best_quote_frozen_lot_allocations(
+            list(ledger.get(f"{side_key}_lots") or []),
+            side=side_key,
+            eligibility_price=eligibility_price,
+            batch_price=batch_price,
+            min_profit_ratio=r,
+            max_notional=max_notional,
+        )
+        release_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in selected)
         if release_qty > 1e-12:
-            armed["short"] = release_qty
-
-    long_qty = max(_safe_float(ledger.get("long_qty")), 0.0)
-    long_entry = _frozen_inventory_weighted_entry(ledger, "long")
-    long_worst_entry = _frozen_inventory_worst_entry(ledger, "long")
-    if (
-        long_qty > 1e-12
-        and long_entry > 0.0
-        and safe_bid > 0.0
-        and not bool((existing.get("long") or {}).get("requested"))
-        and (safe_bid - long_entry) / long_entry >= r
-        and 0.0 < long_worst_entry < safe_bid
-    ):
-        release_qty = _frozen_inventory_releasable_qty_after_retain(long_qty, safe_bid)
-        if release_qty > 1e-12:
-            armed["long"] = release_qty
+            selected_by_side[side_key] = selected
+            armed[side_key] = release_qty
 
     if not armed:
         return {}
-    checked_at = (now or _utc_now()).astimezone(timezone.utc)
     directive = dict(existing)
     for side_key, qty in armed.items():
         directive[side_key] = {
             "requested": True,
             "requested_qty": qty,
             "source": "auto_single_leg_take_profit",
+            "frozen_inventory_per_lot_release": True,
+            "min_profit_ratio": r,
+            "selected_lot_allocations": selected_by_side[side_key],
             "request_id": f"auto-tp-{side_key}-{int(checked_at.timestamp() * 1000)}",
             "requested_at": checked_at.isoformat(),
-            "expires_at": (checked_at + timedelta(minutes=10)).isoformat(),
+            "expires_at": (checked_at + timedelta(days=1)).isoformat(),
         }
     state["best_quote_frozen_inventory_manual_reduce"] = directive
     return armed
@@ -5067,15 +5371,65 @@ def apply_best_quote_frozen_inventory_manual_reduce(
             reduce_report["blocked_reasons"].append(f"{side_key}_frozen_qty_empty")
             return None
         side = "SELL" if is_long else "BUY"
+        selected_lot_allocations = [
+            dict(item)
+            for item in list(side_directive.get("selected_lot_allocations") or [])
+            if isinstance(item, dict)
+        ]
+        per_lot_release = bool(
+            side_directive.get("frozen_inventory_per_lot_release")
+            or (
+                str(side_directive.get("source") or "") == "auto_single_leg_take_profit"
+                and selected_lot_allocations
+            )
+        )
         safe_tick = max(_safe_float(tick_size), 0.0)
-        raw_price = bid_price if is_long else ask_price
-        if safe_tick > 0:
+        raw_price = (ask_price if is_long else bid_price) if per_lot_release else (bid_price if is_long else ask_price)
+        if safe_tick > 0 and not per_lot_release:
             raw_price = raw_price - safe_tick if is_long else raw_price + safe_tick
         price = _round_order_price(max(_safe_float(raw_price), 0.0), tick_size, side)
         if price <= 0:
             reduce_report["blocked_reasons"].append(f"{side_key}_missing_price")
             return None
-        if str(side_directive.get("source") or "") == "auto_single_leg_take_profit":
+        if per_lot_release:
+            lots_by_id = {
+                str(item.get("frozen_lot_id") or "").strip(): item
+                for item in _normalize_best_quote_volume_lots(ledger.get(f"{side_key}_lots"))
+                if str(item.get("frozen_lot_id") or "").strip()
+            }
+            min_profit_ratio = max(_safe_float(side_directive.get("min_profit_ratio")), 0.0)
+            eligible_allocations: list[dict[str, Any]] = []
+            for allocation in selected_lot_allocations:
+                lot_id = str(allocation.get("frozen_lot_id") or "").strip()
+                lot = lots_by_id.get(lot_id)
+                if not lot:
+                    continue
+                entry_price = max(_safe_float(lot.get("entry_price", lot.get("price"))), 0.0)
+                profitable = (
+                    price + 1e-12 >= entry_price * (1.0 + min_profit_ratio)
+                    if is_long
+                    else price <= entry_price * (1.0 - min_profit_ratio) + 1e-12
+                )
+                if entry_price > 0 and (min_profit_ratio <= 0 or profitable):
+                    remaining_lot_qty = max(_safe_float(lot.get("qty")), 0.0)
+                    allocation_qty = min(
+                        max(_safe_float(allocation.get("qty")), 0.0),
+                        remaining_lot_qty,
+                    )
+                    if allocation_qty > 1e-12:
+                        eligible_allocations.append(
+                            {"frozen_lot_id": lot_id, "qty": allocation_qty}
+                        )
+            if not eligible_allocations:
+                directive.pop(side_key, None)
+                reduce_report["blocked_reasons"].append(f"{side_key}_selected_lots_not_profitable")
+                return None
+            selected_lot_allocations = eligible_allocations
+            requested_qty = min(
+                requested_qty if requested_qty > 0 else frozen_qty,
+                sum(max(_safe_float(item.get("qty")), 0.0) for item in selected_lot_allocations),
+            )
+        elif str(side_directive.get("source") or "") == "auto_single_leg_take_profit":
             retained_qty = _frozen_inventory_releasable_qty_after_retain(frozen_qty, price)
             requested_qty = min(requested_qty if requested_qty > 0 else frozen_qty, retained_qty)
             if requested_qty <= 1e-12:
@@ -5084,13 +5438,28 @@ def apply_best_quote_frozen_inventory_manual_reduce(
                 return None
         qty = _round_order_qty(min(frozen_qty, requested_qty) if requested_qty > 0 else frozen_qty, step_size)
         if qty <= 0 or (min_qty is not None and qty < _safe_float(min_qty)):
+            if per_lot_release:
+                directive.pop(side_key, None)
             reduce_report["blocked_reasons"].append(f"{side_key}_below_min_qty")
             return None
         notional = qty * price
         if safe_min_notional > 0 and notional + 1e-12 < safe_min_notional:
+            if per_lot_release:
+                directive.pop(side_key, None)
             reduce_report["blocked_reasons"].append(f"{side_key}_below_min_notional")
             return None
-        return {
+        if per_lot_release:
+            selected_lot_allocations = _trim_best_quote_frozen_lot_allocations(selected_lot_allocations, qty)
+            side_directive.update(
+                {
+                    "requested": True,
+                    "requested_qty": qty,
+                    "selected_lot_allocations": selected_lot_allocations,
+                    "frozen_inventory_per_lot_release": True,
+                }
+            )
+            directive[side_key] = side_directive
+        order = {
             "side": side,
             "price": price,
             "qty": qty,
@@ -5098,24 +5467,37 @@ def apply_best_quote_frozen_inventory_manual_reduce(
             "role": f"frozen_inventory_manual_reduce_{side_key}",
             "position_side": ("LONG" if is_long else "SHORT") if hedge_mode else "BOTH",
             "force_reduce_only": True,
-            "execution_type": "aggressive",
-            "time_in_force": "IOC",
+            "execution_type": "maker" if per_lot_release else "aggressive",
+            "time_in_force": "GTX" if per_lot_release else "IOC",
+            "post_only": per_lot_release,
             "manual_frozen_inventory_reduce": True,
             "frozen_inventory_request_id": str(side_directive.get("request_id") or "").strip(),
         }
+        if per_lot_release:
+            order.update(
+                {
+                    "frozen_inventory_per_lot_release": True,
+                    "frozen_inventory_source": str(side_directive.get("source") or ""),
+                    "client_order_role": "frozenpl",
+                    "selected_lot_allocations": selected_lot_allocations,
+                }
+            )
+        return order
 
     long_order = _build_order(side_key="long")
     if long_order is not None:
         plan["sell_orders"] = [long_order, *list(plan.get("sell_orders") or [])]
         reduce_report["placed_long"] = True
         reduce_report["orders"].append(dict(long_order))
-        directive.pop("long", None)
+        if not bool(long_order.get("frozen_inventory_per_lot_release")):
+            directive.pop("long", None)
     short_order = _build_order(side_key="short")
     if short_order is not None:
         plan["buy_orders"] = [short_order, *list(plan.get("buy_orders") or [])]
         reduce_report["placed_short"] = True
         reduce_report["orders"].append(dict(short_order))
-        directive.pop("short", None)
+        if not bool(short_order.get("frozen_inventory_per_lot_release")):
+            directive.pop("short", None)
 
     if directive:
         state["best_quote_frozen_inventory_manual_reduce"] = directive
@@ -7926,6 +8308,9 @@ def update_best_quote_volume_order_refs(
     pair_release_submitted_orders: list[dict[str, Any]] = []
     pair_release_long_qty = 0.0
     pair_release_short_qty = 0.0
+    manual_reduce_directive = state.get("best_quote_frozen_inventory_manual_reduce")
+    manual_reduce_directive = dict(manual_reduce_directive) if isinstance(manual_reduce_directive, Mapping) else {}
+    manual_reduce_updated = False
     manual_limit_directive = state.get("best_quote_frozen_inventory_manual_limit")
     manual_limit_directive = dict(manual_limit_directive) if isinstance(manual_limit_directive, Mapping) else {}
     manual_limit_updated = False
@@ -7942,6 +8327,12 @@ def update_best_quote_volume_order_refs(
         role = str(request.get("role", "")).strip()
         role_lower = role.lower()
         frozen_request_id = str(request.get("frozen_inventory_request_id") or "").strip()
+        frozen_source = str(request.get("frozen_inventory_source") or request.get("source") or "").strip()
+        selected_lot_allocations = [
+            dict(allocation)
+            for allocation in list(request.get("selected_lot_allocations") or [])
+            if isinstance(allocation, dict)
+        ]
         if not frozen_request_id and role_lower.startswith("frozen_inventory_pair_release_"):
             frozen_request_id = pair_release_request_id
         if _is_frozen_inventory_pair_release_order(request):
@@ -7969,6 +8360,33 @@ def update_best_quote_volume_order_refs(
                 side_directive["submitted_at"] = now_iso
                 manual_limit_directive[side_key] = side_directive
                 manual_limit_updated = True
+        if role_lower in {"frozen_inventory_manual_reduce_long", "frozen_inventory_manual_reduce_short"}:
+            side_key = "long" if role_lower.endswith("_long") else "short"
+            side_directive = dict(manual_reduce_directive.get(side_key) or {})
+            directive_request_id = str(side_directive.get("request_id") or "").strip()
+            if (
+                bool(request.get("frozen_inventory_per_lot_release"))
+                and side_directive
+                and frozen_request_id
+                and frozen_request_id == directive_request_id
+            ):
+                side_directive["requested"] = True
+                side_directive["submitted"] = True
+                side_directive["submitted_order_id"] = str(order_id)
+                side_directive["submitted_client_order_id"] = str(response.get("clientOrderId", "")).strip()
+                side_directive["submitted_qty"] = max(_safe_float(request.get("qty")), 0.0)
+                side_directive["submitted_price"] = max(
+                    _safe_float(request.get("submitted_price", request.get("price"))),
+                    0.0,
+                )
+                side_directive["submitted_at"] = now_iso
+                if selected_lot_allocations:
+                    side_directive["selected_lot_allocations"] = selected_lot_allocations
+                    side_directive["requested_qty"] = sum(
+                        max(_safe_float(item.get("qty")), 0.0) for item in selected_lot_allocations
+                    )
+                manual_reduce_directive[side_key] = side_directive
+                manual_reduce_updated = True
         refs[str(order_id)] = {
             "book": _best_quote_order_book_from_role(request.get("role")),
             "role": role,
@@ -7979,6 +8397,9 @@ def update_best_quote_volume_order_refs(
             or "BOTH",
             "client_order_id": str(response.get("clientOrderId", "")).strip(),
             "frozen_inventory_request_id": frozen_request_id,
+            "source": frozen_source,
+            "frozen_inventory_per_lot_release": bool(request.get("frozen_inventory_per_lot_release")),
+            "selected_lot_allocations": selected_lot_allocations,
             "updated_at": _isoformat(_utc_now()),
         }
 
@@ -7986,6 +8407,8 @@ def update_best_quote_volume_order_refs(
         refs = dict(list(refs.items())[-10000:])
 
     state["best_quote_volume_order_refs"] = refs
+    if manual_reduce_updated:
+        state["best_quote_frozen_inventory_manual_reduce"] = manual_reduce_directive
     if manual_limit_updated:
         state["best_quote_frozen_inventory_manual_limit"] = manual_limit_directive
     if pair_release_submitted_orders:
@@ -9219,8 +9642,13 @@ def _trade_event_to_audit_row(event: Any) -> dict[str, Any]:
     last_filled_price = _safe_float(getattr(event, "last_filled_price", 0.0))
     order_id = getattr(event, "order_id", None)
     client_order_id = str(getattr(event, "client_order_id", "") or "")
+    trade_id = getattr(event, "trade_id", None)
     return {
-        "id": f"{order_id}:{client_order_id}:{transaction_time}:{last_filled_qty}:{last_filled_price}",
+        "id": (
+            int(trade_id)
+            if trade_id is not None
+            else f"{order_id}:{client_order_id}:{transaction_time}:{last_filled_qty}:{last_filled_price}"
+        ),
         "orderId": order_id,
         "clientOrderId": client_order_id,
         "symbol": str(getattr(event, "symbol", "") or "").upper().strip(),
@@ -10047,6 +10475,109 @@ def _is_frozen_inventory_manual_order(order: Mapping[str, Any] | dict[str, Any])
         or bool((order or {}).get("manual_frozen_inventory_limit"))
         or bool((order or {}).get("frozen_inventory_pair_release"))
     )
+
+
+def _is_frozen_inventory_per_lot_order(order: Mapping[str, Any] | dict[str, Any]) -> bool:
+    client_order_id = str(
+        (order or {}).get("clientOrderId") or (order or {}).get("client_order_id") or ""
+    ).lower()
+    return bool((order or {}).get("frozen_inventory_per_lot_release")) or "-frozenpl-" in client_order_id
+
+
+def _reserve_best_quote_frozen_per_lot_client_binding(
+    *,
+    state: dict[str, Any],
+    side: str,
+    request_id: str,
+    client_order_id: str,
+) -> dict[str, Any]:
+    side_key = str(side or "").lower().strip()
+    safe_request_id = str(request_id or "").strip()
+    safe_client_order_id = str(client_order_id or "").strip()
+    if side_key not in {"long", "short"}:
+        return {"reserved": False, "reason": "invalid_side"}
+    if not safe_request_id or not safe_client_order_id:
+        return {"reserved": False, "reason": "missing_identity"}
+    directive = dict(state.get("best_quote_frozen_inventory_manual_reduce") or {})
+    side_directive = dict(directive.get(side_key) or {})
+    if str(side_directive.get("request_id") or "").strip() != safe_request_id:
+        return {"reserved": False, "reason": "request_mismatch"}
+    selected_lot_allocations = [
+        dict(item)
+        for item in list(side_directive.get("selected_lot_allocations") or [])
+        if isinstance(item, dict)
+    ]
+    if not selected_lot_allocations:
+        return {"reserved": False, "reason": "missing_allocations"}
+    bindings = dict(state.get("best_quote_frozen_per_lot_client_bindings") or {})
+    bindings[safe_client_order_id] = {
+        "request_id": safe_request_id,
+        "side": side_key,
+        "source": str(side_directive.get("source") or "auto_single_leg_take_profit"),
+        "selected_lot_allocations": selected_lot_allocations,
+        "reserved_at": _utc_now().isoformat(),
+    }
+    if len(bindings) > 10000:
+        bindings = dict(list(bindings.items())[-10000:])
+    side_directive["submitted_client_order_id"] = safe_client_order_id
+    side_directive["client_binding_reserved_at"] = bindings[safe_client_order_id]["reserved_at"]
+    directive[side_key] = side_directive
+    state["best_quote_frozen_inventory_manual_reduce"] = directive
+    state["best_quote_frozen_per_lot_client_bindings"] = bindings
+    return {
+        "reserved": True,
+        "reason": "reserved",
+        "side": side_key,
+        "request_id": safe_request_id,
+        "client_order_id": safe_client_order_id,
+    }
+
+
+def _enforce_frozen_per_lot_single_active_lane(
+    *,
+    actions: dict[str, Any],
+    current_open_orders: Iterable[Any] | None,
+) -> dict[str, Any]:
+    place_orders = [dict(item) for item in list(actions.get("place_orders") or []) if isinstance(item, dict)]
+    cancel_orders = [dict(item) for item in list(actions.get("cancel_orders") or []) if isinstance(item, dict)]
+    active_lanes = {
+        (
+            str(item.get("side", "")).upper().strip(),
+            _order_position_side(item),
+        )
+        for item in list(current_open_orders or [])
+        if isinstance(item, dict) and _is_frozen_inventory_per_lot_order(item)
+    }
+    reserved_lanes = set(active_lanes)
+    kept: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    for order in place_orders:
+        if not _is_frozen_inventory_per_lot_order(order):
+            kept.append(order)
+            continue
+        lane = (
+            str(order.get("side", "")).upper().strip(),
+            _order_position_side(order),
+        )
+        if lane in reserved_lanes:
+            deferred.append(order)
+            continue
+        reserved_lanes.add(lane)
+        kept.append(order)
+    if not deferred:
+        return actions
+    result = dict(actions)
+    result["place_orders"] = kept
+    result["cancel_orders"] = cancel_orders
+    result["place_count"] = len(kept)
+    result["cancel_count"] = len(cancel_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept)
+    result["frozen_per_lot_lane_guard"] = {
+        "enabled": True,
+        "active_lanes": [f"{side}:{position_side}" for side, position_side in sorted(active_lanes)],
+        "deferred_place_orders": deferred,
+    }
+    return result
 
 
 def _is_authorized_frozen_inventory_order(order: Mapping[str, Any] | dict[str, Any]) -> bool:
@@ -19697,6 +20228,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 bid_price=bid_price,
                 ask_price=ask_price,
                 min_profit_ratio=best_quote_frozen_pair_release_min_profit_ratio,
+                max_notional=best_quote_frozen_pair_release_max_notional,
             )
         best_quote_frozen_manual_reduce = apply_best_quote_frozen_inventory_manual_reduce(
             plan=plan,
@@ -22194,6 +22726,10 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
     )
+    validation["actions"] = _enforce_frozen_per_lot_single_active_lane(
+        actions=validation["actions"],
+        current_open_orders=current_strategy_open_orders,
+    )
     validation["actions"] = sort_cancel_orders_farthest_from_market_first(
         actions=validation["actions"],
         live_bid_price=live_bid_price,
@@ -22439,17 +22975,29 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                 f"{_safe_float(prepared_order.get('submitted_price')):.10f}",
                 position_side,
             )
+            submitted_is_per_lot = _is_frozen_inventory_per_lot_order(order)
+            latest_strategy_orders = _filter_futures_strategy_orders(latest_open_orders, symbol)
+            existing_per_lot_side_orders = [
+                item
+                for item in latest_strategy_orders
+                if submitted_is_per_lot
+                and _is_frozen_inventory_per_lot_order(item)
+                and str(item.get("side", "")).upper().strip() == side
+                and _order_position_side(item) == position_side
+            ]
             existing_same_bucket_orders = [
                 item
-                for item in _filter_futures_strategy_orders(latest_open_orders, symbol)
+                for item in latest_strategy_orders
                 if (
                     str(item.get("side", "")).upper().strip(),
                     f"{_safe_float(item.get('price')):.10f}",
                     _order_position_side(item),
                 )
                 == submitted_bucket
+                and _is_frozen_inventory_per_lot_order(item) == submitted_is_per_lot
             ]
-            if existing_same_bucket_orders:
+            blocking_existing_orders = existing_per_lot_side_orders or existing_same_bucket_orders
+            if blocking_existing_orders:
                 report["skipped_orders"].append(
                     {
                         "request": {
@@ -22465,18 +23013,71 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                             "reduce_only": reduce_only,
                         },
                         "reason": {
-                            "reason": "existing_same_submitted_bucket",
+                            "reason": (
+                                "existing_frozen_per_lot_side_order"
+                                if existing_per_lot_side_orders
+                                else "existing_same_submitted_bucket"
+                            ),
                             "bucket": ":".join(submitted_bucket),
-                            "existing_order_count": len(existing_same_bucket_orders),
-                            "existing_order_ids": [item.get("orderId") for item in existing_same_bucket_orders],
+                            "existing_order_count": len(blocking_existing_orders),
+                            "existing_order_ids": [item.get("orderId") for item in blocking_existing_orders],
                             "existing_client_order_ids": [
-                                item.get("clientOrderId") for item in existing_same_bucket_orders
+                                item.get("clientOrderId") for item in blocking_existing_orders
                             ],
                         },
                     }
                 )
                 last_exc = None
                 break
+            client_order_id = _build_client_order_id(
+                symbol=symbol,
+                role=str(order.get("client_order_role") or role),
+                index=index,
+            )
+            if submitted_is_per_lot:
+                binding_state_path = Path(str(plan_report.get("state_path") or args.state_path))
+                binding_state = read_json(binding_state_path) if binding_state_path.exists() else None
+                if not isinstance(binding_state, dict):
+                    report["skipped_orders"].append(
+                        {
+                            "request": {
+                                "role": role,
+                                "side": side,
+                                "position_side": position_side,
+                                "qty": _safe_float(prepared_order.get("qty")),
+                                "desired_price": _safe_float(prepared_order.get("desired_price")),
+                            },
+                            "reason": {"reason": "frozen_per_lot_binding_state_unavailable"},
+                        }
+                    )
+                    last_exc = None
+                    break
+                binding_side = "long" if role.endswith("_long") else "short"
+                binding_report = _reserve_best_quote_frozen_per_lot_client_binding(
+                    state=binding_state,
+                    side=binding_side,
+                    request_id=str(order.get("frozen_inventory_request_id") or ""),
+                    client_order_id=client_order_id,
+                )
+                if not binding_report.get("reserved"):
+                    report["skipped_orders"].append(
+                        {
+                            "request": {
+                                "role": role,
+                                "side": side,
+                                "position_side": position_side,
+                                "qty": _safe_float(prepared_order.get("qty")),
+                                "desired_price": _safe_float(prepared_order.get("desired_price")),
+                            },
+                            "reason": {
+                                "reason": "frozen_per_lot_binding_reservation_failed",
+                                "binding_reason": binding_report.get("reason"),
+                            },
+                        }
+                    )
+                    last_exc = None
+                    break
+                _write_json(binding_state_path, binding_state)
             try:
                 place_response = post_futures_order(
                     symbol=symbol,
@@ -22487,7 +23088,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                     api_secret=api_secret,
                     recv_window=args.recv_window,
                     time_in_force=time_in_force,
-                    new_client_order_id=_build_client_order_id(symbol=symbol, role=role, index=index),
+                    new_client_order_id=client_order_id,
                     reduce_only=reduce_only,
                     position_side=None if position_side == "BOTH" else position_side,
                 )
@@ -22506,6 +23107,17 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                             "frozen_inventory_request_id": str(
                                 order.get("frozen_inventory_request_id") or ""
                             ).strip(),
+                            "frozen_inventory_source": str(
+                                order.get("frozen_inventory_source") or ""
+                            ).strip(),
+                            "frozen_inventory_per_lot_release": bool(
+                                order.get("frozen_inventory_per_lot_release")
+                            ),
+                            "selected_lot_allocations": [
+                                dict(item)
+                                for item in list(order.get("selected_lot_allocations") or [])
+                                if isinstance(item, dict)
+                            ],
                         },
                         "response": place_response,
                     }

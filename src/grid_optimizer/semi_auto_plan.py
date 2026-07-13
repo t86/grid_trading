@@ -1960,6 +1960,24 @@ def diff_open_orders(
     existing_orders: list[dict[str, Any]],
     desired_orders: list[dict[str, Any]],
 ) -> dict[str, list[dict[str, Any]]]:
+    def _reconcile_lane(order: dict[str, Any]) -> str:
+        client_order_id = str(order.get("clientOrderId", order.get("client_order_id", "")) or "").lower()
+        if bool(order.get("frozen_inventory_per_lot_release")) or "-frozenpl-" in client_order_id:
+            return "frozen_per_lot"
+        return "default"
+
+    def _bucket_key(order: dict[str, Any]) -> str:
+        return ":".join(
+            [
+                _reconcile_lane(order),
+                _order_bucket_key(
+                    str(order["side"]),
+                    float(order["price"]),
+                    str(order.get("position_side", order.get("positionSide", "BOTH"))),
+                ),
+            ]
+        )
+
     def _merged_desired_order(orders: list[dict[str, Any]]) -> dict[str, Any]:
         total_qty = sum(
             (_quantity_decimal(order.get("qty", order.get("quantity"))) for order in orders),
@@ -1973,11 +1991,7 @@ def diff_open_orders(
 
     desired_by_bucket: dict[str, list[dict[str, Any]]] = {}
     for order in desired_orders:
-        key = _order_bucket_key(
-            str(order["side"]),
-            float(order["price"]),
-            str(order.get("position_side", order.get("positionSide", "BOTH"))),
-        )
+        key = _bucket_key(order)
         desired_by_bucket.setdefault(key, []).append(order)
 
     existing_limit_by_bucket: dict[str, list[dict[str, Any]]] = {}
@@ -1994,7 +2008,7 @@ def diff_open_orders(
             continue
         if order_type and order_type not in {"LIMIT", "LIMIT_MAKER"}:
             continue
-        key = _order_bucket_key(side, price, str(order.get("positionSide", "BOTH")))
+        key = _bucket_key(order)
         existing_limit_by_bucket.setdefault(key, []).append(order)
 
     all_keys = set(existing_limit_by_bucket) | set(desired_by_bucket)

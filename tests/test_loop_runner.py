@@ -482,6 +482,64 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(ref["book"], "frozen_bq")
         self.assertEqual(ref["role"], "frozen_inventory_manual_reduce_long")
 
+    def test_update_best_quote_volume_order_refs_persists_per_lot_release_allocations(self) -> None:
+        allocations = [{"frozen_lot_id": "long-selected", "qty": 19.9}]
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "best_quote_frozen_inventory_manual_reduce": {
+                            "long": {
+                                "requested": True,
+                                "requested_qty": 19.9,
+                                "source": "auto_single_leg_take_profit",
+                                "request_id": "auto-tp-long",
+                                "selected_lot_allocations": allocations,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            update_best_quote_volume_order_refs(
+                state_path=state_path,
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                submit_report={
+                    "placed_orders": [
+                        {
+                            "request": {
+                                "role": "frozen_inventory_manual_reduce_long",
+                                "side": "SELL",
+                                "position_side": "LONG",
+                                "qty": 19.9,
+                                "submitted_price": 1.003,
+                                "frozen_inventory_request_id": "auto-tp-long",
+                                "frozen_inventory_source": "auto_single_leg_take_profit",
+                                "frozen_inventory_per_lot_release": True,
+                                "selected_lot_allocations": allocations,
+                            },
+                            "response": {
+                                "orderId": 41974649,
+                                "clientOrderId": "gx-arxu-frozenpl-1-87716363",
+                            },
+                        }
+                    ]
+                },
+            )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        ref = state["best_quote_volume_order_refs"]["41974649"]
+        self.assertEqual(ref["source"], "auto_single_leg_take_profit")
+        self.assertTrue(ref["frozen_inventory_per_lot_release"])
+        self.assertEqual(ref["selected_lot_allocations"], allocations)
+        directive = state["best_quote_frozen_inventory_manual_reduce"]["long"]
+        self.assertTrue(directive["submitted"])
+        self.assertEqual(directive["submitted_order_id"], "41974649")
+        self.assertEqual(directive["selected_lot_allocations"], allocations)
+
     def test_update_best_quote_volume_order_refs_preserves_pair_release_request_id(self) -> None:
         with TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "state.json"
@@ -1900,6 +1958,88 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(armed, {})
         self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
 
+    def test_arm_frozen_single_leg_long_uses_per_lot_point_two_percent_threshold(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 50.0,
+                "long_lots": [
+                    {
+                        "qty": 25.0,
+                        "entry_price": 1.01,
+                        "freeze_band_key": "long:high",
+                        "frozen_at": "2026-07-13T00:00:00+00:00",
+                        "source_order_id": "long-high",
+                    },
+                    {
+                        "qty": 25.0,
+                        "entry_price": 1.00,
+                        "freeze_band_key": "long:eligible",
+                        "frozen_at": "2026-07-13T00:01:00+00:00",
+                        "source_order_id": "long-eligible",
+                    },
+                ],
+            },
+        }
+
+        armed = arm_best_quote_frozen_single_leg_take_profit(
+            state=state,
+            bid_price=1.002,
+            ask_price=1.003,
+            min_profit_ratio=0.002,
+            max_notional=20.0,
+        )
+
+        self.assertIn("long", armed)
+        frozen = state["best_quote_frozen_inventory"]
+        eligible_lot = frozen["long_lots"][1]
+        self.assertTrue(eligible_lot.get("frozen_lot_id"))
+        directive = state["best_quote_frozen_inventory_manual_reduce"]["long"]
+        allocations = directive["selected_lot_allocations"]
+        self.assertEqual(len(allocations), 1)
+        self.assertEqual(allocations[0]["frozen_lot_id"], eligible_lot["frozen_lot_id"])
+        self.assertLessEqual(directive["requested_qty"] * 1.003, 20.0 + 1e-12)
+
+    def test_arm_frozen_single_leg_short_uses_per_lot_point_two_percent_threshold(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_qty": 50.0,
+                "short_lots": [
+                    {
+                        "qty": 25.0,
+                        "entry_price": 0.999,
+                        "freeze_band_key": "short:low",
+                        "frozen_at": "2026-07-13T00:00:00+00:00",
+                        "source_order_id": "short-low",
+                    },
+                    {
+                        "qty": 25.0,
+                        "entry_price": 1.00,
+                        "freeze_band_key": "short:eligible",
+                        "frozen_at": "2026-07-13T00:01:00+00:00",
+                        "source_order_id": "short-eligible",
+                    },
+                ],
+            },
+        }
+
+        armed = arm_best_quote_frozen_single_leg_take_profit(
+            state=state,
+            bid_price=0.997,
+            ask_price=0.998,
+            min_profit_ratio=0.002,
+            max_notional=20.0,
+        )
+
+        self.assertIn("short", armed)
+        frozen = state["best_quote_frozen_inventory"]
+        eligible_lot = frozen["short_lots"][1]
+        self.assertTrue(eligible_lot.get("frozen_lot_id"))
+        directive = state["best_quote_frozen_inventory_manual_reduce"]["short"]
+        allocations = directive["selected_lot_allocations"]
+        self.assertEqual(len(allocations), 1)
+        self.assertEqual(allocations[0]["frozen_lot_id"], eligible_lot["frozen_lot_id"])
+        self.assertLessEqual(directive["requested_qty"] * 0.997, 20.0 + 1e-12)
+
     def test_arm_frozen_single_leg_take_profit_skips_pending_side(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
@@ -1918,6 +2058,43 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(
             state["best_quote_frozen_inventory_manual_reduce"]["short"]["requested_qty"], 50.0
         )
+
+    def test_arm_frozen_single_leg_take_profit_skips_active_partial_pair_release(self) -> None:
+        pair_release = {
+            "requested": True,
+            "request_id": "pair-release-active",
+            "requested_qty": 20.0,
+            "filled_long_qty": 20.0,
+            "filled_short_qty": 5.0,
+            "paired_released_qty": 5.0,
+            "repair_side": "short",
+            "awaiting_fill_confirmation": True,
+        }
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 50.0,
+                "long_lots": [
+                    {
+                        "qty": 50.0,
+                        "entry_price": 1.0,
+                        "frozen_lot_id": "long-profitable",
+                    }
+                ],
+            },
+            "best_quote_frozen_inventory_pair_release": dict(pair_release),
+        }
+
+        armed = arm_best_quote_frozen_single_leg_take_profit(
+            state=state,
+            bid_price=1.003,
+            ask_price=1.004,
+            min_profit_ratio=0.002,
+            max_notional=20.0,
+        )
+
+        self.assertEqual(armed, {})
+        self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
+        self.assertEqual(state["best_quote_frozen_inventory_pair_release"], pair_release)
 
     def test_best_quote_frozen_pair_release_retains_one_usd_per_side(self) -> None:
         plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
@@ -1953,20 +2130,30 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(plan["sell_orders"][0]["qty"], 6.0, places=9)
         self.assertAlmostEqual(plan["buy_orders"][0]["qty"], 6.0, places=9)
 
-    def test_auto_single_leg_manual_reduce_directive_retains_one_usd(self) -> None:
+    def test_auto_single_leg_long_release_places_20u_maker_at_ask(self) -> None:
         plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
-                "long_qty": 10.0,
-                "long_lots": [{"qty": 10.0, "entry_price": 0.82, "freeze_band_key": "long:0"}],
+                "long_qty": 50.0,
+                "long_lots": [
+                    {
+                        "qty": 50.0,
+                        "entry_price": 1.0,
+                        "freeze_band_key": "long:0",
+                        "frozen_lot_id": "long-selected",
+                    }
+                ],
             },
             "best_quote_frozen_inventory_manual_reduce": {
                 "long": {
                     "requested": True,
-                    "requested_qty": 10.0,
+                    "requested_qty": 20.0 / 1.003,
                     "source": "auto_single_leg_take_profit",
                     "request_id": "auto-tp-long",
                     "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0 / 1.003}
+                    ],
                 }
             },
         }
@@ -1974,36 +2161,241 @@ class LoopRunnerTests(unittest.TestCase):
             plan=plan,
             state=state,
             report={},
-            bid_price=0.861,
-            ask_price=0.862,
-            tick_size=None,
-            step_size=None,
-            min_qty=None,
-            min_notional=None,
+            bid_price=1.002,
+            ask_price=1.003,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
             hedge_mode=True,
         )
-        expected_qty = 10.0 - (1.0 / 0.861)
-        self.assertTrue(report["active"])
-        self.assertAlmostEqual(plan["sell_orders"][0]["qty"], expected_qty, places=9)
 
-    def test_arm_frozen_single_leg_take_profit_blocks_underwater_lot(self) -> None:
-        # weighted entry 1.075 -> (1.075-0.98)/1.075 = 8.8% >= 5%, BUT the 0.95 lot is
-        # underwater at ask 0.98, so closing the FIFO book would realize a loss on it.
-        # The worst-entry guard must block the arm entirely.
+        self.assertTrue(report["active"])
+        order = plan["sell_orders"][0]
+        self.assertEqual(order["side"], "SELL")
+        self.assertEqual(order["position_side"], "LONG")
+        self.assertEqual(order["price"], 1.003)
+        self.assertEqual(order["execution_type"], "maker")
+        self.assertEqual(order["time_in_force"], "GTX")
+        self.assertTrue(order["force_reduce_only"])
+        self.assertTrue(order["frozen_inventory_per_lot_release"])
+        self.assertLessEqual(order["notional"], 20.0 + 1e-12)
+        self.assertLess(20.0 - order["notional"], 1.003 * 0.1 + 1e-12)
+
+    def test_auto_single_leg_short_release_places_20u_maker_at_bid(self) -> None:
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_qty": 50.0,
+                "short_lots": [
+                    {
+                        "qty": 50.0,
+                        "entry_price": 1.01,
+                        "freeze_band_key": "short:0",
+                        "frozen_lot_id": "short-selected",
+                    }
+                ],
+            },
+            "best_quote_frozen_inventory_manual_reduce": {
+                "short": {
+                    "requested": True,
+                    "requested_qty": 20.0 / 0.999,
+                    "source": "auto_single_leg_take_profit",
+                    "request_id": "auto-tp-short",
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "short-selected", "qty": 20.0 / 0.999}
+                    ],
+                }
+            },
+        }
+
+        report = apply_best_quote_frozen_inventory_manual_reduce(
+            plan=plan,
+            state=state,
+            report={},
+            bid_price=0.999,
+            ask_price=1.000,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+        )
+
+        self.assertTrue(report["active"])
+        order = plan["buy_orders"][0]
+        self.assertEqual(order["side"], "BUY")
+        self.assertEqual(order["position_side"], "SHORT")
+        self.assertEqual(order["price"], 0.999)
+        self.assertEqual(order["execution_type"], "maker")
+        self.assertEqual(order["time_in_force"], "GTX")
+        self.assertTrue(order["force_reduce_only"])
+        self.assertTrue(order["frozen_inventory_per_lot_release"])
+        self.assertLessEqual(order["notional"], 20.0 + 1e-12)
+        self.assertLess(20.0 - order["notional"], 0.999 * 0.1 + 1e-12)
+
+    def test_auto_single_leg_below_min_notional_clears_side_and_reselects_larger_batch(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 14.0,
+                "long_lots": [
+                    {
+                        "qty": 4.0,
+                        "entry_price": 1.00,
+                        "frozen_lot_id": "long-small-eligible",
+                    },
+                    {
+                        "qty": 10.0,
+                        "entry_price": 1.01,
+                        "frozen_lot_id": "long-later-eligible",
+                    },
+                ],
+            },
+        }
+
+        first_arm = arm_best_quote_frozen_single_leg_take_profit(
+            state=state,
+            bid_price=1.002,
+            ask_price=1.003,
+            min_profit_ratio=0.002,
+            max_notional=20.0,
+        )
+
+        self.assertEqual(first_arm, {"long": 4.0})
+        first_plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+        first_apply = apply_best_quote_frozen_inventory_manual_reduce(
+            plan=first_plan,
+            state=state,
+            report={},
+            bid_price=1.002,
+            ask_price=1.003,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+        )
+
+        self.assertFalse(first_apply["active"])
+        self.assertIn("long_below_min_notional", first_apply["blocked_reasons"])
+        self.assertEqual(first_plan["sell_orders"], [])
+        self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
+
+        second_arm = arm_best_quote_frozen_single_leg_take_profit(
+            state=state,
+            bid_price=1.013,
+            ask_price=1.014,
+            min_profit_ratio=0.002,
+            max_notional=20.0,
+        )
+        second_plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+        second_apply = apply_best_quote_frozen_inventory_manual_reduce(
+            plan=second_plan,
+            state=state,
+            report={},
+            bid_price=1.013,
+            ask_price=1.014,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+        )
+
+        self.assertIn("long", second_arm)
+        self.assertTrue(second_apply["active"])
+        order = second_plan["sell_orders"][0]
+        self.assertGreaterEqual(order["notional"], 5.0)
+        self.assertLessEqual(order["notional"], 20.0)
+
+    def test_auto_single_leg_below_min_qty_clears_side_directive(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 0.05,
+                "long_lots": [
+                    {
+                        "qty": 0.05,
+                        "entry_price": 1.00,
+                        "frozen_lot_id": "long-below-min-qty",
+                    }
+                ],
+            },
+            "best_quote_frozen_inventory_manual_reduce": {
+                "long": {
+                    "requested": True,
+                    "requested_qty": 0.05,
+                    "source": "auto_single_leg_take_profit",
+                    "request_id": "auto-tp-below-min-qty",
+                    "expires_at": "2099-01-01T00:00:00+00:00",
+                    "min_profit_ratio": 0.002,
+                    "frozen_inventory_per_lot_release": True,
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-below-min-qty", "qty": 0.05}
+                    ],
+                }
+            },
+        }
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        applied = apply_best_quote_frozen_inventory_manual_reduce(
+            plan=plan,
+            state=state,
+            report={},
+            bid_price=1.002,
+            ask_price=1.003,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=0.0,
+            hedge_mode=True,
+        )
+
+        self.assertFalse(applied["active"])
+        self.assertIn("long_below_min_qty", applied["blocked_reasons"])
+        self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
+
+    def test_arm_frozen_single_leg_take_profit_selects_profitable_lot_while_another_is_underwater(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
                 "short_qty": 100.0,
                 "short_lots": [
-                    {"qty": 50.0, "entry_price": 1.20, "freeze_band_key": "short:1"},
-                    {"qty": 50.0, "entry_price": 0.95, "freeze_band_key": "short:-1"},
+                    {
+                        "qty": 50.0,
+                        "entry_price": 1.20,
+                        "freeze_band_key": "short:1",
+                        "frozen_at": "2026-07-13T00:00:00+00:00",
+                        "source_order_id": "profitable",
+                    },
+                    {
+                        "qty": 50.0,
+                        "entry_price": 0.95,
+                        "freeze_band_key": "short:-1",
+                        "frozen_at": "2026-07-13T00:01:00+00:00",
+                        "source_order_id": "underwater",
+                    },
                 ],
             },
         }
         armed = arm_best_quote_frozen_single_leg_take_profit(
-            state=state, bid_price=0.979, ask_price=0.980, min_profit_ratio=0.05,
+            state=state,
+            bid_price=0.979,
+            ask_price=0.980,
+            min_profit_ratio=0.05,
+            max_notional=20.0,
         )
-        self.assertEqual(armed, {})
-        self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
+
+        self.assertIn("short", armed)
+        frozen = state["best_quote_frozen_inventory"]
+        profitable_lot = frozen["short_lots"][0]
+        underwater_lot = frozen["short_lots"][1]
+        directive = state["best_quote_frozen_inventory_manual_reduce"]["short"]
+        selected_ids = {
+            item["frozen_lot_id"] for item in directive["selected_lot_allocations"]
+        }
+        self.assertIn(profitable_lot["frozen_lot_id"], selected_ids)
+        self.assertNotIn(underwater_lot["frozen_lot_id"], selected_ids)
+        self.assertLessEqual(directive["requested_qty"] * 0.979, 20.0 + 1e-12)
 
     def test_best_quote_frozen_pair_release_releases_short_from_highest_band_first(self) -> None:
         state: dict[str, object] = {
@@ -3970,6 +4362,708 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(frozen["short_qty"], 0.0)
         self.assertNotIn("best_quote_frozen_inventory_pair_release", state)
 
+    def test_sync_auto_single_leg_partial_fill_consumes_selected_lot_not_fifo(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [
+                    {
+                        "qty": 10.0,
+                        "entry_price": 1.01,
+                        "freeze_band_key": "long:underwater",
+                        "frozen_lot_id": "long-underwater",
+                    },
+                    {
+                        "qty": 30.0,
+                        "entry_price": 1.00,
+                        "freeze_band_key": "long:selected",
+                        "frozen_lot_id": "long-selected",
+                    },
+                ],
+            },
+            "best_quote_frozen_inventory_manual_reduce": {
+                "long": {
+                    "requested": False,
+                    "submitted": True,
+                    "requested_qty": 20.0,
+                    "source": "auto_single_leg_take_profit",
+                    "request_id": "auto-tp-long",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                }
+            },
+            "best_quote_volume_order_refs": {
+                "123": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "frozen_inventory_request_id": "auto-tp-long",
+                    "source": "auto_single_leg_take_profit",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                }
+            },
+        }
+        trade = {
+            "orderId": "123",
+            "id": "fill-1",
+            "side": "SELL",
+            "positionSide": "LONG",
+            "qty": "7.5",
+            "price": "1.003",
+            "time": 123456,
+        }
+
+        synced = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=[trade],
+        )
+
+        self.assertEqual(synced["applied_fill_count"], 1)
+        self.assertEqual(synced["consumed_long_qty"], 7.5)
+        lots_by_id = {
+            item["frozen_lot_id"]: item
+            for item in state["best_quote_frozen_inventory"]["long_lots"]
+        }
+        self.assertEqual(lots_by_id["long-underwater"]["qty"], 10.0)
+        self.assertEqual(lots_by_id["long-selected"]["qty"], 22.5)
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_qty"], 32.5)
+        directive = state["best_quote_frozen_inventory_manual_reduce"]["long"]
+        self.assertEqual(directive["requested_qty"], 12.5)
+        self.assertEqual(directive["selected_lot_allocations"], [
+            {"frozen_lot_id": "long-selected", "qty": 12.5}
+        ])
+
+        replayed = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=[trade],
+        )
+
+        self.assertEqual(replayed["applied_fill_count"], 0)
+        replayed_lots = {
+            item["frozen_lot_id"]: item
+            for item in state["best_quote_frozen_inventory"]["long_lots"]
+        }
+        self.assertEqual(replayed_lots["long-underwater"]["qty"], 10.0)
+        self.assertEqual(replayed_lots["long-selected"]["qty"], 22.5)
+
+    def test_sync_distinct_binance_trade_ids_with_same_composite_fields_apply_twice(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [
+                    {
+                        "qty": 30.0,
+                        "entry_price": 1.00,
+                        "frozen_lot_id": "long-selected",
+                    }
+                ],
+            },
+            "best_quote_frozen_inventory_manual_reduce": {
+                "long": {
+                    "requested": False,
+                    "submitted": True,
+                    "requested_qty": 20.0,
+                    "source": "auto_single_leg_take_profit",
+                    "request_id": "auto-tp-trade-id",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                    "frozen_inventory_per_lot_release": True,
+                }
+            },
+            "best_quote_volume_order_refs": {
+                "123": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "frozen_inventory_request_id": "auto-tp-trade-id",
+                    "source": "auto_single_leg_take_profit",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                    "frozen_inventory_per_lot_release": True,
+                }
+            },
+        }
+        common = {
+            "orderId": "123",
+            "side": "SELL",
+            "positionSide": "LONG",
+            "qty": "5",
+            "price": "1.003",
+            "time": 123456,
+        }
+
+        synced = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=[
+                {**common, "id": 9001},
+                {**common, "id": 9002},
+            ],
+        )
+
+        self.assertEqual(synced["applied_fill_count"], 2)
+        self.assertEqual(synced["consumed_long_qty"], 10.0)
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_qty"], 20.0)
+        directive = state["best_quote_frozen_inventory_manual_reduce"]["long"]
+        self.assertEqual(directive["requested_qty"], 10.0)
+        self.assertEqual(directive["selected_lot_allocations"], [
+            {"frozen_lot_id": "long-selected", "qty": 10.0}
+        ])
+
+    def test_sync_skips_row_when_legacy_composite_fill_key_was_already_applied(self) -> None:
+        legacy_key = "123:SELL:LONG:123456:5:1.003"
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [
+                    {
+                        "qty": 30.0,
+                        "entry_price": 1.00,
+                        "frozen_lot_id": "long-selected",
+                    }
+                ],
+            },
+            "best_quote_frozen_inventory_manual_reduce": {
+                "long": {
+                    "requested": False,
+                    "submitted": True,
+                    "requested_qty": 20.0,
+                    "source": "auto_single_leg_take_profit",
+                    "request_id": "auto-tp-legacy-key",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                    "frozen_inventory_per_lot_release": True,
+                }
+            },
+            "best_quote_volume_order_refs": {
+                "123": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "frozen_inventory_request_id": "auto-tp-legacy-key",
+                    "source": "auto_single_leg_take_profit",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                    "frozen_inventory_per_lot_release": True,
+                }
+            },
+            "best_quote_frozen_manual_applied_fill_keys": [legacy_key],
+        }
+
+        synced = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=[
+                {
+                    "id": 9003,
+                    "orderId": "123",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "5",
+                    "price": "1.003",
+                    "time": 123456,
+                }
+            ],
+        )
+
+        self.assertEqual(synced["applied_fill_count"], 0)
+        self.assertEqual(synced["consumed_long_qty"], 0.0)
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_lots"][0]["qty"], 30.0)
+        self.assertEqual(state["best_quote_frozen_manual_applied_fill_keys"], [legacy_key])
+
+    def test_reserve_frozen_per_lot_client_binding_requires_current_request(self) -> None:
+        reserve = getattr(
+            loop_runner_module,
+            "_reserve_best_quote_frozen_per_lot_client_binding",
+        )
+        directive = {
+            "requested": True,
+            "requested_qty": 20.0,
+            "source": "auto_single_leg_take_profit",
+            "request_id": "auto-tp-current",
+            "selected_lot_allocations": [
+                {"frozen_lot_id": "long-selected", "qty": 20.0}
+            ],
+            "frozen_inventory_per_lot_release": True,
+        }
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory_manual_reduce": {"long": dict(directive)}
+        }
+
+        reserved = reserve(
+            state=state,
+            side="long",
+            request_id="auto-tp-current",
+            client_order_id="gx-arxu-frozenpl-1-current01",
+        )
+
+        self.assertTrue(reserved["reserved"])
+        binding = state["best_quote_frozen_per_lot_client_bindings"][
+            "gx-arxu-frozenpl-1-current01"
+        ]
+        self.assertEqual(binding["request_id"], "auto-tp-current")
+        self.assertEqual(binding["side"], "long")
+        self.assertEqual(binding["selected_lot_allocations"], [
+            {"frozen_lot_id": "long-selected", "qty": 20.0}
+        ])
+        self.assertEqual(
+            state["best_quote_frozen_inventory_manual_reduce"]["long"]["submitted_client_order_id"],
+            "gx-arxu-frozenpl-1-current01",
+        )
+
+        mismatch_state: dict[str, object] = {
+            "best_quote_frozen_inventory_manual_reduce": {"long": dict(directive)}
+        }
+        rejected = reserve(
+            state=mismatch_state,
+            side="long",
+            request_id="auto-tp-stale",
+            client_order_id="gx-arxu-frozenpl-1-stale001",
+        )
+
+        self.assertFalse(rejected["reserved"])
+        self.assertEqual(rejected["reason"], "request_mismatch")
+        self.assertNotIn("best_quote_frozen_per_lot_client_bindings", mismatch_state)
+        self.assertNotIn(
+            "submitted_client_order_id",
+            mismatch_state["best_quote_frozen_inventory_manual_reduce"]["long"],
+        )
+
+    def test_sync_frozenpl_without_order_ref_recovers_allocations_from_directive(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [
+                    {
+                        "qty": 10.0,
+                        "entry_price": 1.01,
+                        "frozen_lot_id": "long-underwater",
+                    },
+                    {
+                        "qty": 30.0,
+                        "entry_price": 1.00,
+                        "frozen_lot_id": "long-selected",
+                    },
+                ],
+            },
+            "best_quote_frozen_inventory_manual_reduce": {
+                "long": {
+                    "requested": False,
+                    "submitted": True,
+                    "requested_qty": 20.0,
+                    "source": "auto_single_leg_take_profit",
+                    "request_id": "auto-tp-long",
+                    "submitted_client_order_id": "gx-arxu-frozenpl-1-12345678",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                }
+            },
+        }
+
+        synced = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=[
+                {
+                    "clientOrderId": "gx-arxu-frozenpl-1-12345678",
+                    "orderId": "456",
+                    "id": "fill-frozenpl",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "5",
+                    "price": "1.003",
+                    "time": 123457,
+                }
+            ],
+        )
+
+        self.assertEqual(synced["applied_fill_count"], 1)
+        lots_by_id = {
+            item["frozen_lot_id"]: item
+            for item in state["best_quote_frozen_inventory"]["long_lots"]
+        }
+        self.assertEqual(lots_by_id["long-underwater"]["qty"], 10.0)
+        self.assertEqual(lots_by_id["long-selected"]["qty"], 25.0)
+        directive = state["best_quote_frozen_inventory_manual_reduce"]["long"]
+        self.assertEqual(directive["requested_qty"], 15.0)
+        self.assertEqual(directive["selected_lot_allocations"], [
+            {"frozen_lot_id": "long-selected", "qty": 15.0}
+        ])
+
+    def test_sync_stale_frozenpl_without_ref_does_not_consume_current_directive(self) -> None:
+        current_directive = {
+            "requested": False,
+            "submitted": True,
+            "requested_qty": 20.0,
+            "source": "auto_single_leg_take_profit",
+            "request_id": "auto-tp-current",
+            "submitted_client_order_id": "gx-arxu-frozenpl-1-current01",
+            "selected_lot_allocations": [
+                {"frozen_lot_id": "long-current", "qty": 20.0}
+            ],
+        }
+        original_lots = [
+            {
+                "qty": 10.0,
+                "entry_price": 1.01,
+                "frozen_lot_id": "long-underwater",
+            },
+            {
+                "qty": 30.0,
+                "entry_price": 1.00,
+                "frozen_lot_id": "long-current",
+            },
+        ]
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {"long_lots": [dict(item) for item in original_lots]},
+            "best_quote_frozen_inventory_manual_reduce": {
+                "long": dict(current_directive),
+            },
+        }
+
+        synced = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=[
+                {
+                    "clientOrderId": "gx-arxu-frozenpl-1-stale001",
+                    "orderId": "old-order-without-ref",
+                    "id": "stale-fill",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "5",
+                    "price": "1.003",
+                    "time": 123458,
+                }
+            ],
+        )
+
+        self.assertEqual(synced["applied_fill_count"], 0)
+        self.assertEqual(synced["consumed_long_qty"], 0.0)
+        self.assertEqual(synced["unmatched_per_lot_fill_count"], 1)
+        self.assertEqual(
+            state["best_quote_frozen_inventory"]["long_lots"],
+            original_lots,
+        )
+        self.assertEqual(
+            state["best_quote_frozen_inventory_manual_reduce"]["long"],
+            current_directive,
+        )
+
+    def test_sync_frozenpl_without_ref_or_directive_uses_reserved_binding(self) -> None:
+        client_order_id = "gx-arxu-frozenpl-1-crashgap"
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [
+                    {
+                        "qty": 10.0,
+                        "entry_price": 1.01,
+                        "frozen_lot_id": "long-underwater",
+                    },
+                    {
+                        "qty": 30.0,
+                        "entry_price": 1.00,
+                        "frozen_lot_id": "long-selected",
+                    },
+                ],
+            },
+            "best_quote_frozen_per_lot_client_bindings": {
+                client_order_id: {
+                    "request_id": "auto-tp-crash-gap",
+                    "side": "long",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                }
+            },
+        }
+
+        synced = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=[
+                {
+                    "clientOrderId": client_order_id,
+                    "orderId": "missing-ref-order",
+                    "id": "crash-gap-partial",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "5",
+                    "price": "1.003",
+                    "time": 123460,
+                }
+            ],
+        )
+
+        self.assertEqual(synced["applied_fill_count"], 1)
+        self.assertEqual(synced["consumed_long_qty"], 5.0)
+        lots_by_id = {
+            item["frozen_lot_id"]: item
+            for item in state["best_quote_frozen_inventory"]["long_lots"]
+        }
+        self.assertEqual(lots_by_id["long-underwater"]["qty"], 10.0)
+        self.assertEqual(lots_by_id["long-selected"]["qty"], 25.0)
+        binding = state["best_quote_frozen_per_lot_client_bindings"][client_order_id]
+        self.assertEqual(binding["selected_lot_allocations"], [
+            {"frozen_lot_id": "long-selected", "qty": 15.0}
+        ])
+        self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
+
+    def test_sync_frozenpl_reserved_binding_clears_after_full_fill_and_cannot_replay(self) -> None:
+        client_order_id = "gx-arxu-frozenpl-1-fullfill"
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [
+                    {
+                        "qty": 20.0,
+                        "entry_price": 1.00,
+                        "frozen_lot_id": "long-selected",
+                    }
+                ],
+            },
+            "best_quote_frozen_per_lot_client_bindings": {
+                client_order_id: {
+                    "request_id": "auto-tp-full-fill",
+                    "side": "long",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 10.0}
+                    ],
+                }
+            },
+        }
+
+        filled = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=[
+                {
+                    "clientOrderId": client_order_id,
+                    "orderId": "missing-ref-order",
+                    "id": "binding-full-fill",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "10",
+                    "price": "1.003",
+                    "time": 123461,
+                }
+            ],
+        )
+
+        self.assertEqual(filled["applied_fill_count"], 1)
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_qty"], 10.0)
+        self.assertNotIn(
+            client_order_id,
+            state.get("best_quote_frozen_per_lot_client_bindings", {}),
+        )
+
+        replayed = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=[
+                {
+                    "clientOrderId": client_order_id,
+                    "orderId": "missing-ref-order",
+                    "id": "late-extra-fill",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "5",
+                    "price": "1.003",
+                    "time": 123462,
+                }
+            ],
+        )
+
+        self.assertEqual(replayed["applied_fill_count"], 0)
+        self.assertEqual(replayed["consumed_long_qty"], 0.0)
+        self.assertEqual(replayed["unmatched_per_lot_fill_count"], 1)
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_qty"], 10.0)
+
+    def test_auto_single_leg_partial_remainder_below_min_notional_clears_and_reselects(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 16.0,
+                "long_lots": [
+                    {
+                        "qty": 6.0,
+                        "entry_price": 1.00,
+                        "frozen_lot_id": "long-first-batch",
+                    },
+                    {
+                        "qty": 10.0,
+                        "entry_price": 1.01,
+                        "frozen_lot_id": "long-later-eligible",
+                    },
+                ],
+            },
+            "best_quote_frozen_inventory_manual_reduce": {
+                "long": {
+                    "requested": False,
+                    "submitted": True,
+                    "requested_qty": 6.0,
+                    "source": "auto_single_leg_take_profit",
+                    "request_id": "auto-tp-partial",
+                    "expires_at": "2099-01-01T00:00:00+00:00",
+                    "min_profit_ratio": 0.002,
+                    "submitted_client_order_id": "gx-arxu-frozenpl-1-partial1",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-first-batch", "qty": 6.0}
+                    ],
+                    "frozen_inventory_per_lot_release": True,
+                }
+            },
+            "best_quote_volume_order_refs": {
+                "123": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "frozen_inventory_request_id": "auto-tp-partial",
+                    "source": "auto_single_leg_take_profit",
+                    "frozen_inventory_per_lot_release": True,
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-first-batch", "qty": 6.0}
+                    ],
+                }
+            },
+        }
+
+        synced = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=[
+                {
+                    "orderId": "123",
+                    "clientOrderId": "gx-arxu-frozenpl-1-partial1",
+                    "id": "partial-fill",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "2",
+                    "price": "1.003",
+                    "time": 123459,
+                }
+            ],
+        )
+
+        self.assertEqual(synced["consumed_long_qty"], 2.0)
+        remaining = state["best_quote_frozen_inventory_manual_reduce"]["long"]
+        self.assertEqual(remaining["requested_qty"], 4.0)
+        self.assertEqual(remaining["selected_lot_allocations"], [
+            {"frozen_lot_id": "long-first-batch", "qty": 4.0}
+        ])
+
+        blocked_plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+        blocked = apply_best_quote_frozen_inventory_manual_reduce(
+            plan=blocked_plan,
+            state=state,
+            report={},
+            bid_price=1.002,
+            ask_price=1.003,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+        )
+
+        self.assertFalse(blocked["active"])
+        self.assertIn("long_below_min_notional", blocked["blocked_reasons"])
+        self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
+
+        rearmed = arm_best_quote_frozen_single_leg_take_profit(
+            state=state,
+            bid_price=1.013,
+            ask_price=1.014,
+            min_profit_ratio=0.002,
+            max_notional=20.0,
+        )
+        next_plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+        next_apply = apply_best_quote_frozen_inventory_manual_reduce(
+            plan=next_plan,
+            state=state,
+            report={},
+            bid_price=1.013,
+            ask_price=1.014,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+        )
+
+        self.assertIn("long", rearmed)
+        self.assertTrue(next_apply["active"])
+        order = next_plan["sell_orders"][0]
+        self.assertGreaterEqual(order["notional"], 5.0)
+        self.assertLessEqual(order["notional"], 20.0)
+
+    def test_auto_single_leg_release_arms_next_batch_after_confirmed_fill(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [
+                    {
+                        "qty": 20.0,
+                        "entry_price": 1.00,
+                        "freeze_band_key": "long:first",
+                        "frozen_lot_id": "long-first",
+                    },
+                    {
+                        "qty": 30.0,
+                        "entry_price": 1.00,
+                        "freeze_band_key": "long:next",
+                        "frozen_lot_id": "long-next",
+                    },
+                ],
+            },
+            "best_quote_frozen_inventory_manual_reduce": {
+                "long": {
+                    "requested": False,
+                    "submitted": True,
+                    "requested_qty": 20.0,
+                    "source": "auto_single_leg_take_profit",
+                    "request_id": "auto-tp-long-first",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-first", "qty": 20.0}
+                    ],
+                }
+            },
+            "best_quote_volume_order_refs": {
+                "123": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "frozen_inventory_request_id": "auto-tp-long-first",
+                    "source": "auto_single_leg_take_profit",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-first", "qty": 20.0}
+                    ],
+                }
+            },
+        }
+
+        synced = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=[
+                {
+                    "orderId": "123",
+                    "id": "fill-first",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "20",
+                    "price": "1.003",
+                    "time": 123456,
+                }
+            ],
+        )
+
+        self.assertEqual(synced["consumed_long_qty"], 20.0)
+        self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
+
+        armed = arm_best_quote_frozen_single_leg_take_profit(
+            state=state,
+            bid_price=1.002,
+            ask_price=1.003,
+            min_profit_ratio=0.002,
+            max_notional=20.0,
+        )
+
+        self.assertIn("long", armed)
+        directive = state["best_quote_frozen_inventory_manual_reduce"]["long"]
+        self.assertEqual(
+            {item["frozen_lot_id"] for item in directive["selected_lot_allocations"]},
+            {"long-next"},
+        )
+        self.assertLessEqual(directive["requested_qty"] * 1.003, 20.0 + 1e-12)
+
     def test_sync_best_quote_frozen_manual_limit_deducts_frozen_lots_and_isolation(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
@@ -5727,6 +6821,170 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(result["action"], "position_realign_recovery_failed")
         self.assertEqual(result["recovery_error"], "RuntimeError: exchange unavailable")
+
+    def test_diff_open_orders_does_not_merge_frozen_per_lot_with_normal_reduce_at_same_price(self) -> None:
+        normal_reduce = {
+            "side": "SELL",
+            "price": 1.003,
+            "qty": 10.0,
+            "notional": 10.03,
+            "role": "best_quote_reduce_long",
+            "position_side": "LONG",
+        }
+        frozen_per_lot = {
+            "side": "SELL",
+            "price": 1.003,
+            "qty": 20.0,
+            "notional": 20.06,
+            "role": "frozen_inventory_manual_reduce_long",
+            "position_side": "LONG",
+            "frozen_inventory_per_lot_release": True,
+            "frozen_inventory_request_id": "auto-tp-long",
+        }
+
+        diff = loop_runner_module.diff_open_orders(
+            existing_orders=[],
+            desired_orders=[normal_reduce, frozen_per_lot],
+        )
+
+        self.assertEqual(len(diff["missing_orders"]), 2)
+        self.assertEqual(
+            {item["role"] for item in diff["missing_orders"]},
+            {"best_quote_reduce_long", "frozen_inventory_manual_reduce_long"},
+        )
+        self.assertEqual(sorted(item["qty"] for item in diff["missing_orders"]), [10.0, 20.0])
+
+    def test_diff_open_orders_does_not_keep_normal_reduce_for_frozen_per_lot_lane(self) -> None:
+        existing_normal = {
+            "orderId": 123,
+            "clientOrderId": "gx-arxu-bestquot-1-12345678",
+            "side": "SELL",
+            "positionSide": "LONG",
+            "type": "LIMIT",
+            "price": "1.003",
+            "origQty": "20",
+        }
+        desired_frozen = {
+            "side": "SELL",
+            "price": 1.003,
+            "qty": 20.0,
+            "notional": 20.06,
+            "role": "frozen_inventory_manual_reduce_long",
+            "position_side": "LONG",
+            "frozen_inventory_per_lot_release": True,
+            "frozen_inventory_request_id": "auto-tp-long",
+        }
+
+        diff = loop_runner_module.diff_open_orders(
+            existing_orders=[existing_normal],
+            desired_orders=[desired_frozen],
+        )
+
+        self.assertEqual(diff["kept_orders"], [])
+        self.assertEqual(diff["stale_orders"], [existing_normal])
+        self.assertEqual(len(diff["missing_orders"]), 1)
+        missing = diff["missing_orders"][0]
+        self.assertEqual(missing["role"], "frozen_inventory_manual_reduce_long")
+        self.assertEqual(missing["frozen_inventory_request_id"], "auto-tp-long")
+        self.assertEqual(missing["qty"], 20.0)
+
+    def test_same_side_spacing_guard_does_not_suppress_frozen_per_lot_near_normal_reduce(self) -> None:
+        frozen_per_lot = {
+            "side": "SELL",
+            "price": 1.003,
+            "qty": 19.9,
+            "notional": 19.9597,
+            "role": "frozen_inventory_manual_reduce_long",
+            "position_side": "LONG",
+            "force_reduce_only": True,
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "frozen_inventory_per_lot_release": True,
+            "frozen_inventory_request_id": "auto-tp-long",
+        }
+        actions = {
+            "place_orders": [frozen_per_lot],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+            "place_notional": frozen_per_lot["notional"],
+        }
+        normal_open_order = {
+            "orderId": 123,
+            "clientOrderId": "gx-arxu-bestquot-1-12345678",
+            "side": "SELL",
+            "positionSide": "LONG",
+            "type": "LIMIT",
+            "price": "1.002",
+            "origQty": "10",
+        }
+
+        guarded = loop_runner_module.suppress_same_side_nearby_place_orders(
+            actions=actions,
+            current_open_orders=[normal_open_order],
+            min_price_spacing=0.01,
+            live_bid_price=1.002,
+            live_ask_price=1.003,
+            tick_size=0.001,
+            min_qty=0.1,
+            min_notional=5.0,
+            step_size=0.1,
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertEqual(guarded["place_orders"], [frozen_per_lot])
+
+    def test_frozen_per_lot_lane_waits_for_old_order_to_disappear_before_replacing(self) -> None:
+        old_order = {
+            "orderId": 123,
+            "clientOrderId": "gx-arxu-frozenpl-1-11111111",
+            "side": "SELL",
+            "positionSide": "LONG",
+            "type": "LIMIT",
+            "price": "1.002",
+            "origQty": "19.9",
+        }
+        new_order = {
+            "side": "SELL",
+            "price": 1.003,
+            "qty": 19.9,
+            "notional": 19.9597,
+            "role": "frozen_inventory_manual_reduce_long",
+            "position_side": "LONG",
+            "frozen_inventory_per_lot_release": True,
+            "frozen_inventory_request_id": "auto-tp-long",
+        }
+        actions = {
+            "place_orders": [new_order],
+            "cancel_orders": [old_order],
+            "place_count": 1,
+            "cancel_count": 1,
+            "place_notional": new_order["notional"],
+        }
+        guard = getattr(
+            loop_runner_module,
+            "_enforce_frozen_per_lot_single_active_lane",
+        )
+
+        while_old_is_open = guard(
+            actions=actions,
+            current_open_orders=[old_order],
+        )
+
+        self.assertEqual(while_old_is_open["place_count"], 0)
+        self.assertEqual(while_old_is_open["cancel_count"], 1)
+        self.assertEqual(
+            while_old_is_open["frozen_per_lot_lane_guard"]["deferred_place_orders"],
+            [new_order],
+        )
+
+        after_old_disappears = guard(
+            actions={**actions, "cancel_orders": [], "cancel_count": 0},
+            current_open_orders=[],
+        )
+
+        self.assertEqual(after_old_disappears["place_count"], 1)
+        self.assertEqual(after_old_disappears["place_orders"], [new_order])
 
     def test_preserve_frozen_inventory_manual_limit_open_orders_keeps_existing_order(self) -> None:
         open_orders = [
