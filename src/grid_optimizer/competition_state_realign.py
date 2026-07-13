@@ -36,10 +36,12 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from .audit import fetch_time_paged, trade_row_key, trade_row_time_ms
 from .data import (
     delete_futures_order,
     fetch_futures_open_orders,
     fetch_futures_position_risk_v3,
+    fetch_futures_user_trades,
 )
 
 
@@ -93,7 +95,95 @@ def compute_drift(state: dict[str, Any], long_qty: float, short_qty: float) -> t
     return ldrift, sdrift
 
 
-def realign_ledger(state: dict[str, Any], lq: float, lavg: float, sq: float, savg: float) -> dict[str, Any]:
+def _best_quote_trade_fill_key(row: dict[str, Any]) -> str:
+    order_id = str(row.get("orderId") or row.get("order_id") or "").strip()
+    trade_id = str(row.get("id") or row.get("tradeId") or "").strip()
+    if not trade_id.isdigit():
+        return ""
+    return f"{order_id}:trade:{trade_id}" if order_id else f"trade:{trade_id}"
+
+
+def _seal_reflected_trade_rows(ledger: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    reflected = [dict(row) for row in rows if isinstance(row, dict) and trade_row_time_ms(row) > 0]
+    if not reflected:
+        return
+    previous_time_ms = int(ledger.get("last_trade_time_ms") or 0)
+    reflected_time_ms = max(trade_row_time_ms(row) for row in reflected)
+    sealed_time_ms = max(previous_time_ms, reflected_time_ms)
+    sealed_keys = {
+        trade_row_key(row)
+        for row in reflected
+        if trade_row_time_ms(row) == sealed_time_ms
+    }
+    if sealed_time_ms == previous_time_ms:
+        sealed_keys.update(str(item) for item in list(ledger.get("last_trade_keys_at_time") or []))
+    applied_fill_keys = [
+        str(item).strip()
+        for item in list(ledger.get("applied_trade_fill_keys") or [])
+        if str(item).strip()
+    ]
+    applied_fill_key_set = set(applied_fill_keys)
+    for row in reflected:
+        fill_key = _best_quote_trade_fill_key(row)
+        if fill_key and fill_key not in applied_fill_key_set:
+            applied_fill_keys.append(fill_key)
+            applied_fill_key_set.add(fill_key)
+    ledger["last_trade_time_ms"] = sealed_time_ms
+    ledger["last_trade_keys_at_time"] = sorted(sealed_keys)
+    ledger["applied_trade_fill_keys"] = applied_fill_keys[-10000:]
+    ledger["realign_trade_cursor_sealed_at"] = _now_iso()
+    ledger["realign_reflected_trade_count"] = len(reflected)
+
+
+def fetch_settled_realign_snapshot(
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    *,
+    start_time_ms: int,
+    attempts: int = 5,
+    settle_seconds: float = 0.25,
+) -> tuple[float, float, float, float, list[dict[str, Any]]]:
+    previous_marker: tuple[Any, ...] | None = None
+    for _ in range(max(int(attempts), 2)):
+        end_time_ms = int(time.time() * 1000)
+        rows = fetch_time_paged(
+            fetch_page=lambda **params: fetch_futures_user_trades(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                **params,
+            ),
+            start_time_ms=max(int(start_time_ms), 0),
+            end_time_ms=end_time_ms,
+            limit=1000,
+            row_time_ms=trade_row_time_ms,
+            row_key=trade_row_key,
+        )
+        lq, lavg, sq, savg = fetch_exchange_sides(symbol, api_key, api_secret)
+        marker = (
+            round(lq, 12),
+            round(lavg, 12),
+            round(sq, 12),
+            round(savg, 12),
+            tuple(sorted(trade_row_key(row) for row in rows)),
+        )
+        if marker == previous_marker:
+            return lq, lavg, sq, savg, rows
+        previous_marker = marker
+        time.sleep(max(float(settle_seconds), 0.0))
+    raise RuntimeError("exchange position/trade snapshot did not settle after managed-order cancel")
+
+
+def realign_ledger(
+    state: dict[str, Any],
+    lq: float,
+    lavg: float,
+    sq: float,
+    savg: float,
+    *,
+    reflected_trade_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Rewrite BQ ledger lots to exchange truth, preserving frozen inventory."""
     led = state.get("best_quote_volume_ledger") or {}
     fro = state.get("best_quote_frozen_inventory") or {}
@@ -107,6 +197,7 @@ def realign_ledger(state: dict[str, Any], lq: float, lavg: float, sq: float, sav
     led["short_lots"] = (
         [{"qty": act_s, "price": savg, "source": "auto_realign", "side": "SHORT"}] if act_s > 0 else []
     )
+    _seal_reflected_trade_rows(led, list(reflected_trade_rows or []))
     state["best_quote_volume_ledger"] = led
     return {"new_long": act_l, "new_short": act_s}
 
@@ -199,9 +290,22 @@ def main() -> None:
     status["canceled_managed_orders"] = canceled
     status["kept_unmanaged_orders"] = skipped_protected
 
-    lq, lavg, sq, savg = fetch_exchange_sides(sym, k, s)  # refresh after cancels
     state = json.load(open(state_path))
-    new_lots = realign_ledger(state, lq, lavg, sq, savg)
+    ledger = state.get("best_quote_volume_ledger") or {}
+    lq, lavg, sq, savg, reflected_trade_rows = fetch_settled_realign_snapshot(
+        sym,
+        k,
+        s,
+        start_time_ms=int(ledger.get("last_trade_time_ms") or 0),
+    )
+    new_lots = realign_ledger(
+        state,
+        lq,
+        lavg,
+        sq,
+        savg,
+        reflected_trade_rows=reflected_trade_rows,
+    )
     state["updated_at"] = _now_iso()
     state["updated_by"] = "competition_state_realign"
     state["last_realign"] = {"at": _now_iso(), "backup": bak, **new_lots}
@@ -209,7 +313,7 @@ def main() -> None:
     json.dump(state, open(tmp, "w"))
     os.replace(tmp, state_path)
 
-    status.update({"backup": bak, **new_lots})
+    status.update({"backup": bak, "reflected_trade_count": len(reflected_trade_rows), **new_lots})
     if should_start_after_realign(was_active, a.allow_start_when_stopped):
         archived = archive_stale_plan(a.workdir, slug)
         if archived:

@@ -338,6 +338,73 @@ def test_realign_ledger_preserves_frozen_and_writes_active_remainder() -> None:
     assert led["short_lots"] == []
 
 
+def test_realign_ledger_seals_reflected_trade_cursor_against_restart_replay(monkeypatch) -> None:
+    import grid_optimizer.loop_runner as lr
+
+    trade = {
+        "id": 15800462,
+        "orderId": 81319375,
+        "clientOrderId": "gx-arxu-bestquot-2-14962130",
+        "symbol": "ARXUSDT",
+        "side": "BUY",
+        "positionSide": "SHORT",
+        "time": 2_000,
+        "price": "0.1755",
+        "qty": "967",
+        "quoteQty": "169.7085",
+    }
+    state = {
+        "best_quote_volume_order_refs": {
+            "81319375": {
+                "book": "normal_bq",
+                "role": "best_quote_active_pair_reduce_short",
+                "side": "BUY",
+                "position_side": "SHORT",
+            }
+        },
+        "best_quote_volume_ledger": {
+            "initialized": True,
+            "sync_ok": True,
+            "long_lots": [],
+            "short_lots": [{"qty": 3_763.6339548294677, "price": 0.1762}],
+            "last_trade_time_ms": 1_000,
+            "last_trade_keys_at_time": [],
+            "applied_trade_fill_keys": [],
+        },
+        "best_quote_frozen_inventory": {
+            "long_lots": [],
+            "short_lots": [{"qty": 1_747.3660451705323, "price": 0.1762}],
+        },
+    }
+
+    ra.realign_ledger(
+        state,
+        lq=0.0,
+        lavg=0.0,
+        sq=4_544.0,
+        savg=0.1762,
+        reflected_trade_rows=[trade],
+    )
+    monkeypatch.setattr(lr, "_fetch_trade_rows_since", lambda **_kwargs: [trade])
+    snapshot = lr.sync_best_quote_volume_ledger(
+        state=state,
+        symbol="ARXUSDT",
+        api_key="k",
+        api_secret="s",
+        recv_window=5_000,
+        current_long_qty=0.0,
+        current_short_qty=4_544.0,
+        current_long_avg_price=0.0,
+        current_short_avg_price=0.1762,
+        mid_price=0.1755,
+        observed_trade_rows=[],
+    )
+
+    assert snapshot["short_qty"] == 2_796.6339548294677
+    assert state["best_quote_volume_ledger"]["last_applied_trade_count"] == 0
+    assert "81319375:trade:15800462" in state["best_quote_volume_ledger"]["applied_trade_fill_keys"]
+
+
 def test_archive_stale_plan_moves_file_and_tolerates_missing(tmp_path) -> None:
     (tmp_path / "output").mkdir(parents=True)
     plan = tmp_path / "output" / "arxusdt_loop_latest_plan.json"
@@ -545,6 +612,11 @@ def test_realign_main_cancels_managed_only_and_archives_plan(tmp_path: Path, mon
     monkeypatch.setattr("sys.argv", ["realign", "--symbol", "ARXUSDT", "--service", "svc",
                                      "--workdir", str(tmp_path), "--enforce"])
     monkeypatch.setattr(ra, "fetch_exchange_sides", lambda *a, **k: (1400.0, 0.2175, 1400.0, 0.2142))
+    monkeypatch.setattr(
+        ra,
+        "fetch_settled_realign_snapshot",
+        lambda *a, **k: (1400.0, 0.2175, 1400.0, 0.2142, []),
+    )
     monkeypatch.setattr(ra, "is_active", lambda service: True)
     sysctl: list = []
     monkeypatch.setattr(ra.subprocess, "run",
