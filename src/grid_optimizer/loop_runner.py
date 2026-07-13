@@ -11850,7 +11850,22 @@ def _maybe_handle_runtime_guard(
         if flatten_is_best_quote
         else None
     )
-    if end_window_stop:
+    auto_flatten_on_runtime_stop = bool(
+        getattr(args, "runtime_guard_stop_auto_flatten_enabled", True)
+    )
+    if not auto_flatten_on_runtime_stop:
+        flatten_snapshot = {
+            "orders": [],
+            "warnings": [
+                f"{args.symbol.upper().strip()} runtime guard stop only cancels strategy orders; auto flatten is disabled"
+            ],
+            "allow_loss": False,
+            "max_loss_ratio": None,
+            "preserve_long_qty": frozen_long_qty,
+            "preserve_short_qty": frozen_short_qty,
+            "skip_reason": "runtime_guard_auto_flatten_disabled",
+        }
+    elif end_window_stop:
         flatten_snapshot = {
             "orders": [],
             "warnings": [f"{args.symbol.upper().strip()} after_end_window 停机只撤单，不启动自动平仓"],
@@ -24535,6 +24550,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-guard-loss-recovery-cooldown-seconds", type=float, default=180.0)
     parser.add_argument("--runtime-guard-loss-recovery-max-1m-amplitude-ratio", type=float, default=0.012)
     parser.add_argument("--runtime-guard-loss-recovery-max-3m-amplitude-ratio", type=float, default=0.025)
+    parser.add_argument("--runtime-guard-stop-auto-flatten-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-cumulative-notional", type=float, default=None)
     parser.add_argument("--max-actual-net-notional", type=float, default=None)
     parser.add_argument("--max-synthetic-drift-notional", type=float, default=None)

@@ -10000,6 +10000,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "take_profit_enabled",
         "adaptive_step_enabled",
         "adaptive_step_dynamic_base_enabled",
+        "runtime_guard_stop_auto_flatten_enabled",
         "adaptive_regime_router_enabled",
         "adaptive_regime_router_cancel_stale_entries_on_no_trade",
         "best_quote_maker_volume_enabled",
@@ -12101,6 +12102,11 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--run-end-time", str(config["run_end_time"])])
     if config.get("runtime_guard_stats_start_time") is not None:
         command.extend(["--runtime-guard-stats-start-time", str(config["runtime_guard_stats_start_time"])])
+    command.append(
+        "--runtime-guard-stop-auto-flatten-enabled"
+        if config.get("runtime_guard_stop_auto_flatten_enabled", True)
+        else "--no-runtime-guard-stop-auto-flatten-enabled"
+    )
     if config.get("rolling_hourly_loss_limit") is not None:
         command.extend(["--rolling-hourly-loss-limit", str(config["rolling_hourly_loss_limit"])])
     if config.get("rolling_hourly_loss_per_10k_limit") is not None:
