@@ -3667,6 +3667,7 @@ def _transfer_best_quote_volume_to_frozen(
     band_budget_emergency_extra_ratio: float = 0.0,
     band_budget_recover_ratio: float = 0.0,
     band_budget_emergency_active: bool = False,
+    frozen_total_cap_notional: float = 0.0,
     transfer_lots: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     normalized_side = str(side or "").lower().strip()
@@ -3676,11 +3677,34 @@ def _transfer_best_quote_volume_to_frozen(
     source_lots = _normalize_best_quote_volume_lots(ledger.get(source_key))
     requested_qty = max(_safe_float(qty), 0.0)
     allowed_qty = requested_qty
+    safe_mid = max(_safe_float(mid_price), 0.0)
+
+    def _migrate_legacy_frozen_side(side_name: str) -> None:
+        lots_key = f"{side_name}_lots"
+        normalized_lots = _normalize_best_quote_volume_lots(frozen.get(lots_key))
+        lots_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in normalized_lots)
+        aggregate_qty = max(_safe_float(frozen.get(f"{side_name}_qty")), 0.0)
+        missing_qty = max(aggregate_qty - lots_qty, 0.0)
+        legacy_entry_price = max(_safe_float(frozen.get(f"{side_name}_entry_price")), 0.0) or safe_mid
+        if missing_qty > 1e-12 and legacy_entry_price > 0:
+            normalized_lots.insert(
+                0,
+                {
+                    "qty": missing_qty,
+                    "price": legacy_entry_price,
+                    "entry_price": legacy_entry_price,
+                    "frozen_at": str(frozen.get(f"{side_name}_frozen_at") or ""),
+                    "source": "legacy_aggregate",
+                },
+            )
+        frozen[lots_key] = normalized_lots
+
+    _migrate_legacy_frozen_side("long")
+    _migrate_legacy_frozen_side("short")
     budget_report: dict[str, Any] = {"enabled": bool(band_budget_enabled)}
     band_record: dict[str, Any] | None = None
     band_key = ""
     if bool(band_budget_enabled):
-        safe_mid = max(_safe_float(mid_price), 0.0)
         safe_min_price = max(_safe_float(band_budget_min_price), 0.0)
         band_info = _best_quote_freeze_band_info(
             side=normalized_side,
@@ -3737,6 +3761,33 @@ def _transfer_best_quote_volume_to_frozen(
                     "blocked_reason": "band_budget_exhausted" if allowed_qty <= 1e-12 else None,
                 }
             )
+    safe_total_cap_notional = max(_safe_float(frozen_total_cap_notional), 0.0)
+
+    def _frozen_side_qty(side_name: str) -> float:
+        side_lots = _normalize_best_quote_volume_lots(frozen.get(f"{side_name}_lots"))
+        if side_lots:
+            return sum(max(_safe_float(item.get("qty")), 0.0) for item in side_lots)
+        return max(_safe_float(frozen.get(f"{side_name}_qty")), 0.0)
+
+    frozen_total_notional_before = (_frozen_side_qty("long") + _frozen_side_qty("short")) * safe_mid
+    total_cap_remaining_notional = max(safe_total_cap_notional - frozen_total_notional_before, 0.0)
+    total_cap_report = {
+        "enabled": safe_total_cap_notional > 0,
+        "cap_notional": safe_total_cap_notional,
+        "frozen_total_notional_before": frozen_total_notional_before,
+        "remaining_notional_before": total_cap_remaining_notional,
+        "allowed_qty": allowed_qty,
+        "blocked_reason": None,
+    }
+    if safe_total_cap_notional > 0:
+        if safe_mid <= 0:
+            allowed_qty = 0.0
+            total_cap_report["blocked_reason"] = "invalid_mid_price"
+        else:
+            allowed_qty = min(allowed_qty, total_cap_remaining_notional / safe_mid)
+            if total_cap_remaining_notional <= 1e-12 and requested_qty > 1e-12:
+                total_cap_report["blocked_reason"] = "frozen_total_cap_exhausted"
+        total_cap_report["allowed_qty"] = allowed_qty
     transfer_source_lots = (
         _normalize_best_quote_volume_lots(transfer_lots)
         if isinstance(transfer_lots, list)
@@ -3812,7 +3863,14 @@ def _transfer_best_quote_volume_to_frozen(
     frozen[source_key] = frozen_lots
     frozen["updated_at"] = now_iso
     state["best_quote_volume_ledger"] = ledger
-    state["best_quote_frozen_inventory"] = _refresh_best_quote_freeze_band_budgets(frozen)
+    state["best_quote_frozen_inventory"] = _refresh_best_quote_frozen_inventory_quantities(frozen)
+    frozen_total_notional_after = frozen_total_notional_before + transfer_qty * safe_mid
+    total_cap_report.update(
+        {
+            "frozen_total_notional": frozen_total_notional_after,
+            "remaining_notional": max(safe_total_cap_notional - frozen_total_notional_after, 0.0),
+        }
+    )
     return {
         "side": normalized_side.upper(),
         "requested_qty": requested_qty,
@@ -3821,6 +3879,7 @@ def _transfer_best_quote_volume_to_frozen(
         "shortfall_qty": max(requested_qty - transfer_qty, 0.0),
         "lot_count": len(consumed_lots),
         "band_budget": budget_report,
+        "total_cap": total_cap_report,
     }
 
 
@@ -4103,6 +4162,47 @@ def _apply_best_quote_reduce_freeze(
             }
         )
     report["frozen_total_cap"] = frozen_total_cap_report
+
+    def _refresh_frozen_total_cap_report() -> None:
+        frozen_state = dict(state.get("best_quote_frozen_inventory") or {})
+
+        def _side_notional(side_name: str) -> float:
+            side_lots = _normalize_best_quote_volume_lots(frozen_state.get(f"{side_name}_lots"))
+            if side_lots:
+                qty_value = sum(max(_safe_float(item.get("qty")), 0.0) for item in side_lots)
+            else:
+                qty_value = max(_safe_float(frozen_state.get(f"{side_name}_qty")), 0.0)
+            return qty_value * max(_safe_float(mid_price), 0.0)
+
+        long_notional_value = _side_notional("long")
+        short_notional_value = _side_notional("short")
+        total_notional_value = long_notional_value + short_notional_value
+        remaining_notional_value = (
+            max(safe_frozen_total_cap_notional - total_notional_value, 0.0)
+            if safe_frozen_total_cap_notional > 0
+            else 0.0
+        )
+        cap_active = (
+            safe_frozen_total_cap_notional > 0
+            and total_notional_value >= safe_frozen_total_cap_notional - 1e-12
+        )
+        frozen_total_cap_report.update(
+            {
+                "active": cap_active,
+                "blocks_new_freeze": cap_active,
+                "frozen_long_notional": long_notional_value,
+                "frozen_short_notional": short_notional_value,
+                "frozen_total_notional": total_notional_value,
+                "remaining_notional": remaining_notional_value,
+                "reason": (
+                    f"frozen_total_notional={_float(total_notional_value)} "
+                    f">= cap_notional={_float(safe_frozen_total_cap_notional)}"
+                    if cap_active
+                    else None
+                ),
+            }
+        )
+        report["frozen_total_cap"] = frozen_total_cap_report
     safe_frozen_long_cap_notional = max(_safe_float(frozen_long_cap_notional), 0.0)
     safe_frozen_short_cap_notional = max(_safe_float(frozen_short_cap_notional), 0.0)
     frozen_side_cap_report = {
@@ -4635,8 +4735,10 @@ def _apply_best_quote_reduce_freeze(
             band_budget_emergency_extra_ratio=band_budget_emergency_extra_ratio,
             band_budget_recover_ratio=band_budget_recover_ratio,
             band_budget_emergency_active=_band_budget_emergency_active(long_confirm_loss_ratio, long_confirm_notional),
+            frozen_total_cap_notional=safe_frozen_total_cap_notional,
             transfer_lots=long_candidate_lots if use_lot_candidates else None,
         )
+        _refresh_frozen_total_cap_report()
         band_budget_report["long"] = dict(transfer.get("band_budget") or {})
         if _safe_float(transfer.get("transferred_qty")) > 1e-12 or not bool(band_budget_enabled):
             events.append(
@@ -4672,8 +4774,10 @@ def _apply_best_quote_reduce_freeze(
             band_budget_emergency_extra_ratio=band_budget_emergency_extra_ratio,
             band_budget_recover_ratio=band_budget_recover_ratio,
             band_budget_emergency_active=_band_budget_emergency_active(short_confirm_loss_ratio, short_confirm_notional),
+            frozen_total_cap_notional=safe_frozen_total_cap_notional,
             transfer_lots=short_candidate_lots if use_lot_candidates else None,
         )
+        _refresh_frozen_total_cap_report()
         band_budget_report["short"] = dict(transfer.get("band_budget") or {})
         if _safe_float(transfer.get("transferred_qty")) > 1e-12 or not bool(band_budget_enabled):
             events.append(

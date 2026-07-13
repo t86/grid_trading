@@ -25,7 +25,7 @@ REQUIRED_SAFETY = {
 
 EXPECTED_LIMITS = {
     "best_quote_maker_volume_reduce_freeze_band_budget_base_notional": 100.0,
-    "best_quote_maker_volume_frozen_total_cap_notional": 400.0,
+    "best_quote_maker_volume_frozen_total_cap_notional": 800.0,
 }
 
 
