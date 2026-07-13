@@ -115,6 +115,69 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
         )
         mock_start_flatten.assert_not_called()
 
+    @patch("grid_optimizer.loop_runner._load_futures_runtime_guard_inputs")
+    def test_runtime_guard_tradable_after_cooldown_clears_submit_block(self, mock_inputs) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = datetime(2026, 7, 13, 10, 30, tzinfo=timezone.utc)
+            stopped_at = now - timedelta(minutes=20)
+            state_path = Path(tmpdir) / "state.json"
+            plan_path = Path(tmpdir) / "plan.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "runtime_guard_loss_recovery": {
+                            "stopped_at": stopped_at.isoformat(),
+                            "last_reason": "rolling_hourly_loss_limit_hit",
+                            "last_rolling_hourly_loss": 20.8,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": now.isoformat(),
+                        "mid_price": 1.0,
+                        "actual_net_notional": 0.0,
+                        "unrealized_pnl": 0.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                symbol="ARXUSDT",
+                strategy_profile="test",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                runtime_guard_stats_start_time=None,
+                run_start_time=None,
+                run_end_time=None,
+                rolling_hourly_loss_limit=20.0,
+                rolling_hourly_loss_per_10k_limit=None,
+                runtime_guard_loss_recovery_enabled=True,
+                runtime_guard_loss_recovery_cooldown_seconds=180.0,
+                max_cumulative_notional=None,
+                max_actual_net_notional=None,
+                max_synthetic_drift_notional=None,
+                max_unrealized_loss=None,
+                state_path=str(state_path),
+                plan_json=str(plan_path),
+            )
+            mock_inputs.return_value = (1000.0, [], None)
+
+            summary = _maybe_handle_runtime_guard(
+                args=args,
+                cycle=1,
+                cycle_started_at=now,
+                summary_path=Path(tmpdir) / "events.jsonl",
+            )
+
+            self.assertIsNone(summary)
+            recovery = json.loads(state_path.read_text(encoding="utf-8"))["runtime_guard_loss_recovery"]
+            self.assertEqual(recovery["recovered_at"], now.isoformat())
+            self.assertEqual(recovery["last_reason"], "runtime_guard_tradable_after_loss_cooldown")
+            self.assertEqual(recovery["cooldown_elapsed_seconds"], 1200.0)
+
     @patch("grid_optimizer.loop_runner._start_futures_flatten_process")
     @patch("grid_optimizer.loop_runner.load_live_flatten_snapshot")
     @patch("grid_optimizer.loop_runner._cancel_futures_strategy_orders")

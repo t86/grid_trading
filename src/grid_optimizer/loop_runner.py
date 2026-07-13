@@ -11618,7 +11618,40 @@ def _maybe_handle_runtime_guard(
     )
     if runtime_guard_result.tradable:
         recovery["loss_scope"] = runtime_guard_loss_scope
+        recovery_changed = False
+        stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
+        recovered_at = _parse_state_datetime(recovery.get("recovered_at"))
+        if stopped_at is not None and (recovered_at is None or recovered_at < stopped_at):
+            cooldown_seconds = max(
+                _safe_float(getattr(args, "runtime_guard_loss_recovery_cooldown_seconds", 180.0)),
+                0.0,
+            )
+            elapsed = max(
+                (
+                    cycle_started_at.astimezone(timezone.utc)
+                    - stopped_at.astimezone(timezone.utc)
+                ).total_seconds(),
+                0.0,
+            )
+            recovery.update(
+                {
+                    "last_checked_at": cycle_started_at.astimezone(timezone.utc).isoformat(),
+                    "cooldown_elapsed_seconds": elapsed,
+                    "cooldown_seconds": cooldown_seconds,
+                }
+            )
+            recovery_changed = True
+            if elapsed >= cooldown_seconds:
+                recovery.update(
+                    {
+                        "recovered_at": cycle_started_at.astimezone(timezone.utc).isoformat(),
+                        "last_reason": "runtime_guard_tradable_after_loss_cooldown",
+                        "last_rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
+                    }
+                )
         if _clear_runtime_guard_manual_frozen_inventory_override(state):
+            recovery_changed = True
+        if recovery_changed:
             _write_json(state_path, state)
         return None
     loss_only_stop = runtime_guard_result.matched_reasons in (
