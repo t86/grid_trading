@@ -7400,6 +7400,89 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_low_pace_reduce_only_flow_tightens_sticky_exit_to_top_of_book(self) -> None:
+        now = datetime(2026, 7, 13, 5, 12, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 1,
+                    "sticky_exit_price_tolerance_steps": 8.0,
+                },
+                long_notional=650.0,
+                short_notional=620.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+                recent_trade_notional=10.0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["buy_orders"] = [
+                {
+                    "side": "BUY",
+                    "price": 0.5958,
+                    "qty": 16.0,
+                    "role": "best_quote_reduce_short",
+                    "force_reduce_only": True,
+                }
+            ]
+            plan["sell_orders"] = []
+            _write_json(plan_path, plan)
+            for suffix in ("runner_control.json", "latest_plan.json", "latest_submit.json"):
+                source = output_dir / f"reusdt_loop_{suffix}"
+                target = output_dir / f"ousdt_loop_{suffix}"
+                target.write_text(
+                    source.read_text(encoding="utf-8").replace("REUSDT", "OUSDT"),
+                    encoding="utf-8",
+                )
+            state: dict[str, object] = {
+                "symbols": {
+                    "OUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                        "low_pace_since": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="OUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                daily_target_notional=120_000.0,
+                trade_rows=[
+                    {
+                        "id": 1,
+                        "time": int((now - timedelta(seconds=20)).timestamp() * 1000),
+                        "quoteQty": "10",
+                        "realizedPnl": "0",
+                    }
+                ],
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "ousdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(result["assessment"]["near_market_order_count"], 0)
+            self.assertAlmostEqual(
+                result["assessment"]["nearest_reduce_only_distance_ticks"], 10.0
+            )
+            self.assertEqual(result["action"], "tighten_sticky_exit_for_low_pace_reduce_only_flow")
+            self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 0)
+            self.assertEqual(control["sticky_exit_price_tolerance_steps"], 1.0)
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, ["OUSDT"])
+
     def test_stalled_reduce_only_flow_enables_bounded_active_loss_recovery(self) -> None:
         now = datetime(2026, 7, 12, 11, 56, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

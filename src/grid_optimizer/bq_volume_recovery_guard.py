@@ -79,6 +79,7 @@ _RECOVERY_CONTROL_KEYS = (
     "pause_buy_position_notional",
     "pause_short_position_notional",
     "sticky_entry_price_tolerance_steps",
+    "sticky_exit_price_tolerance_steps",
 )
 
 
@@ -1139,6 +1140,20 @@ def _order_is_near_market(order: dict[str, Any], *, bid: float, ask: float, tick
     return False
 
 
+def _order_market_distance_ticks(
+    order: dict[str, Any], *, bid: float, ask: float, tick_size: float
+) -> float | None:
+    side = str(order.get("side") or "").upper().strip()
+    price = _safe_float(order.get("price"))
+    if price <= 0 or tick_size <= 0:
+        return None
+    if side == "BUY":
+        return max((bid - price) / tick_size, 0.0)
+    if side == "SELL":
+        return max((price - ask) / tick_size, 0.0)
+    return None
+
+
 def _order_is_reduce_only(order: dict[str, Any]) -> bool:
     if bool(order.get("reduce_only") or order.get("reduceOnly") or order.get("force_reduce_only")):
         return True
@@ -1277,6 +1292,12 @@ def assess_symbol(
         item
         for item in reduce_only_orders
         if _order_is_near_market(item, bid=bid, ask=ask, tick_size=tick, far_ticks=far_ticks)
+    ]
+    reduce_only_distance_ticks = [
+        distance
+        for item in reduce_only_orders
+        if (distance := _order_market_distance_ticks(item, bid=bid, ask=ask, tick_size=tick))
+        is not None
     ]
     active_count = _active_order_count(plan, submit)
     low_volume = gross < max(float(min_volume_notional), 0.0) or active_count <= 0
@@ -1440,6 +1461,9 @@ def assess_symbol(
         "near_market_order_count": len(near_orders),
         "near_market_entry_order_count": len(near_entry_orders),
         "near_market_reduce_only_order_count": len(near_reduce_only_orders),
+        "nearest_reduce_only_distance_ticks": (
+            min(reduce_only_distance_ticks) if reduce_only_distance_ticks else None
+        ),
         "all_entry_orders_far": bool(entry_orders) and not near_entry_orders,
         "dynamic_quote_offset_applied": bool(dynamic_offsets.get("dynamic_quote_offset_applied")),
         "dynamic_quote_offset_ticks": _safe_int(dynamic_offsets.get("quote_offset_ticks")),
@@ -4846,6 +4870,58 @@ def check_symbol(
             else:
                 action = "hold_recovery_until_volume_or_orders"
                 item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+        elif (
+            normalized_symbol == "OUSDT"
+            and target_pace_behind
+            and pace_ratio < 0.75
+            and low_pace_seconds >= max(float(trigger_seconds), 120.0)
+            and bool(assessment.get("low_volume"))
+            and bool(assessment.get("planned_reduce_only_only"))
+            and _safe_int(assessment.get("planned_reduce_only_order_count")) > 0
+            and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) <= 1
+            and _safe_float(control.get("sticky_exit_price_tolerance_steps")) > 1.0
+            and _safe_float(assessment.get("nearest_reduce_only_distance_ticks")) > 1.0
+            and _safe_float(volume_summary.get("gross_notional"))
+            <= _safe_float(volume_summary.get("effective_min_volume_notional")) * 0.25
+        ):
+            updates = {
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "best_quote_maker_volume_quote_offset_ticks": 0,
+                "sticky_exit_price_tolerance_steps": 1.0,
+            }
+            _remember_recovery_controls(
+                item,
+                control,
+                (
+                    "best_quote_maker_volume_quote_offset_ticks",
+                    "sticky_exit_price_tolerance_steps",
+                ),
+            )
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_tighten_sticky_exit_for_low_pace_reduce_only_flow"
+                if dry_run
+                else "tighten_sticky_exit_for_low_pace_reduce_only_flow"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
         elif (
             target_pace_behind
             and pace_ratio < 0.75
