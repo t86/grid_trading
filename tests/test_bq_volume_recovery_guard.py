@@ -1456,6 +1456,48 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(result["net_guard_live_gate"]["temporary_max_actual_net_notional"], 1_276.0)
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_active_net_guard_restarts_when_fresh_plan_has_no_directional_reduction(self) -> None:
+        now = datetime(2026, 7, 13, 1, 8, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            recovery_controls = {
+                "max_actual_net_notional": 1_350.0,
+                "best_quote_maker_volume_suppress_short_reduce_enabled": False,
+                "best_quote_maker_volume_directional_net_guard": "net_short",
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
+            }
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control=recovery_controls,
+                long_notional=80.0,
+                short_notional=1_300.0,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "net_guard_recovery_baseline_notional": 1_000.0,
+                        "net_guard_recovery_direction": "net_short",
+                        "guard_recovery_controls": recovery_controls,
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(result["action"], "restart_net_guard_missing_directional_reduce")
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_inactive_net_guard_recovery_restarts_when_temporary_control_already_exists(self) -> None:
         now = datetime(2026, 7, 13, 1, 10, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

@@ -2460,6 +2460,46 @@ def check_symbol(
                 )
             else:
                 action = "hold_net_guard_rebalance"
+                direction = str(item.get("net_guard_recovery_direction") or "").strip().lower()
+                expected_role = {
+                    "net_long": "best_quote_reduce_long",
+                    "net_short": "best_quote_reduce_short",
+                }.get(direction, "")
+                planned_roles = {
+                    str(order.get("role") or "").strip().lower()
+                    for key in ("buy_orders", "sell_orders")
+                    for order in list(plan.get(key) or [])
+                    if isinstance(order, dict)
+                }
+                plan_generated_at = _parse_time(plan.get("generated_at"))
+                plan_is_fresh = (
+                    plan_generated_at is not None
+                    and (now - plan_generated_at).total_seconds() <= max(float(plan_stale_seconds), 0.0)
+                )
+                last_directional_restart_at = _parse_time(
+                    item.get("last_directional_net_guard_restart_at")
+                )
+                directional_restart_due = (
+                    bool(expected_role)
+                    and expected_role not in planned_roles
+                    and plan_is_fresh
+                    and (
+                        last_directional_restart_at is None
+                        or (now - last_directional_restart_at).total_seconds()
+                        >= max(float(recovery_reapply_min_seconds), 60.0)
+                    )
+                )
+                if directional_restart_due:
+                    item["last_directional_net_guard_restart_at"] = now.isoformat()
+                    if dry_run:
+                        action = "dry_run_restart_net_guard_missing_directional_reduce"
+                    else:
+                        try:
+                            restart(normalized_symbol)
+                            action = "restart_net_guard_missing_directional_reduce"
+                        except Exception as exc:  # pragma: no cover - exercised by host wrapper failures
+                            restart_failed = str(exc)
+                            action = "restart_net_guard_missing_directional_reduce_failed"
             item.update(
                 {
                     "status": "net_guard_recovery_active",
