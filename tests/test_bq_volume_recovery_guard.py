@@ -1404,7 +1404,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 control["best_quote_maker_volume_allow_loss_reduce_only"], result
             )
 
-    def test_keeps_allow_loss_enabled_until_inventory_has_recovered_buffer(self) -> None:
+    def test_effective_flow_disables_allow_loss_before_inventory_buffer(self) -> None:
         now = datetime(2026, 6, 26, 7, 10, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -1437,9 +1437,9 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
 
             control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
 
-            self.assertEqual(result["action"], "hold_recovery_until_cap_buffer")
-            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
-            self.assertEqual(restarts, [])
+            self.assertEqual(result["action"], "disable_allow_loss_after_recovery")
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, ["REUSDT"])
 
     def test_cap_pressure_reduce_only_flow_gets_one_bounded_budget_step(self) -> None:
         now = datetime(2026, 7, 12, 12, 45, tzinfo=timezone.utc)
@@ -6289,7 +6289,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
             self.assertEqual(restarts, ["REUSDT"])
 
-    def test_recovered_volume_does_not_close_loss_reduce_above_soft_limit(self) -> None:
+    def test_recovered_volume_closes_loss_reduce_above_soft_limit(self) -> None:
         now = datetime(2026, 6, 26, 9, 50, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -6336,9 +6336,9 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
 
             control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
-            self.assertEqual(result["action"], "hold_recovery_until_cap_buffer")
-            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
-            self.assertEqual(restarts, [])
+            self.assertEqual(result["action"], "restore_recovery_controls")
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, ["REUSDT"])
 
     def test_soft_inventory_recovery_gets_one_bounded_extension(self) -> None:
         now = datetime(2026, 6, 26, 10, 0, tzinfo=timezone.utc)

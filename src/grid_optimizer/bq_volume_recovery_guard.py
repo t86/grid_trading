@@ -4723,12 +4723,7 @@ def check_symbol(
                 }
                 _append_jsonl(output_dir / "bq_volume_recovery_guard_events.jsonl", {"ts": now.isoformat(), **return_result})
                 return return_result
-            restore_ready = (
-                _safe_float(volume_summary.get("gross_notional")) >= recover_floor
-                and _safe_int(assessment.get("active_order_count")) > 0
-                and _safe_int(assessment.get("near_market_order_count")) > 0
-                and cap_buffer_ok
-            )
+            restore_ready = effective_near_market_flow
             if restore_ready and not recovery_hold_satisfied:
                 action = "hold_recovery_min_duration"
                 item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
