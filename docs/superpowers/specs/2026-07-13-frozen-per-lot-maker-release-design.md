@@ -27,11 +27,12 @@ Release profitable frozen inventory continuously without allowing an expensive l
 - Partial fills consume only the selected allocations and only up to the filled quantity.
 - Unselected lots, including higher-cost lots, must not be consumed by FIFO fallback.
 - Restart/reconciliation must retain enough order metadata to apply late fills to the selected allocations.
+- An unconsumed client binding blocks the next batch on that side until REST order state and `userTrades` confirm the terminal outcome. Filled quantity is backfilled before the binding clears; zero-fill cancellation and never-created POST reservations clear without consuming a lot.
 
 ## Safety and compatibility
 
-- Pair release behavior is unchanged.
-- The configured minimum profit ratio remains the existing `0.002` for ARX.
+- Pair release stays disabled for ARX. If it is enabled later, it will share the same configured 1% profit threshold.
+- The configured minimum profit ratio is `0.01` for ARX.
 - The configured per-release notional remains the existing 20 USDT.
 - If no eligible lot exists, no single-leg release order is armed.
 - Existing frozen total caps and managed-position soft/hard thresholds are unchanged.
@@ -43,4 +44,5 @@ Release profitable frozen inventory continuously without allowing an expensive l
 3. Generated release orders are best-quote GTX maker orders and never IOC.
 4. Partial fills reduce only the selected lot allocations.
 5. A completed batch immediately permits the next eligible batch to be armed.
-6. Existing pair-release and non-frozen runner tests remain green.
+6. A submitted but not-yet-consumed batch cannot arm the same lot again.
+7. Existing pair-release and non-frozen runner tests remain green.

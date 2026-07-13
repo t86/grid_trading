@@ -54,6 +54,7 @@ from .data import (
     fetch_futures_income_history,
     fetch_futures_klines,
     fetch_futures_open_orders,
+    fetch_futures_order,
     fetch_futures_position_mode,
     fetch_futures_position_risk_v3,
     fetch_futures_premium_index,
@@ -5279,14 +5280,26 @@ def arm_best_quote_frozen_single_leg_take_profit(
     )
     state["best_quote_frozen_inventory"] = ledger
     armed: dict[str, float] = {}
+    per_lot_bindings = dict(state.get("best_quote_frozen_per_lot_client_bindings") or {})
 
     selected_by_side: dict[str, list[dict[str, Any]]] = {}
     for side_key, eligibility_price, batch_price in (
         ("short", safe_ask, safe_bid),
         ("long", safe_bid, safe_ask),
     ):
+        pending_binding = any(
+            str((binding or {}).get("side") or "").lower().strip() == side_key
+            and any(
+                max(_safe_float(allocation.get("qty")), 0.0) > 1e-12
+                for allocation in list((binding or {}).get("selected_lot_allocations") or [])
+                if isinstance(allocation, Mapping)
+            )
+            for binding in per_lot_bindings.values()
+            if isinstance(binding, Mapping)
+        )
         if (
-            isinstance(existing.get(side_key), Mapping)
+            pending_binding
+            or isinstance(existing.get(side_key), Mapping)
             or isinstance(manual_limit.get(side_key), Mapping)
             or _safe_float(ledger.get(f"{side_key}_manual_limit_isolated_qty")) > 1e-12
         ):
@@ -10531,6 +10544,282 @@ def _reserve_best_quote_frozen_per_lot_client_binding(
         "request_id": safe_request_id,
         "client_order_id": safe_client_order_id,
     }
+
+
+def _clear_best_quote_frozen_per_lot_client_binding(
+    *, state: dict[str, Any], client_order_id: str
+) -> dict[str, Any]:
+    safe_client_order_id = str(client_order_id or "").strip()
+    bindings = dict(state.get("best_quote_frozen_per_lot_client_bindings") or {})
+    binding = dict(bindings.get(safe_client_order_id) or {})
+    if not binding:
+        return {"cleared": False, "reason": "binding_missing"}
+    bindings.pop(safe_client_order_id, None)
+    if bindings:
+        state["best_quote_frozen_per_lot_client_bindings"] = bindings
+    else:
+        state.pop("best_quote_frozen_per_lot_client_bindings", None)
+
+    side_key = str(binding.get("side") or "").lower().strip()
+    directive = dict(state.get("best_quote_frozen_inventory_manual_reduce") or {})
+    side_directive = dict(directive.get(side_key) or {})
+    if str(side_directive.get("submitted_client_order_id") or "").strip() == safe_client_order_id:
+        for key in (
+            "submitted",
+            "submitted_order_id",
+            "submitted_client_order_id",
+            "submitted_qty",
+            "submitted_price",
+            "submitted_at",
+            "client_binding_reserved_at",
+        ):
+            side_directive.pop(key, None)
+        frozen = dict(state.get("best_quote_frozen_inventory") or {})
+        lots_by_id = {
+            str(item.get("frozen_lot_id") or "").strip(): max(
+                _safe_float(item.get("qty")), 0.0
+            )
+            for item in _normalize_best_quote_volume_lots(frozen.get(f"{side_key}_lots"))
+            if str(item.get("frozen_lot_id") or "").strip()
+        }
+        remaining_allocations = [
+            {
+                "frozen_lot_id": str(item.get("frozen_lot_id") or "").strip(),
+                "qty": min(
+                    max(_safe_float(item.get("qty")), 0.0),
+                    lots_by_id.get(str(item.get("frozen_lot_id") or "").strip(), 0.0),
+                ),
+            }
+            for item in list(side_directive.get("selected_lot_allocations") or [])
+            if isinstance(item, Mapping)
+        ]
+        remaining_allocations = [
+            item for item in remaining_allocations if item["frozen_lot_id"] and item["qty"] > 1e-12
+        ]
+        if remaining_allocations:
+            side_directive["requested"] = True
+            side_directive["selected_lot_allocations"] = remaining_allocations
+            side_directive["requested_qty"] = sum(item["qty"] for item in remaining_allocations)
+            directive[side_key] = side_directive
+        else:
+            directive.pop(side_key, None)
+        if directive:
+            state["best_quote_frozen_inventory_manual_reduce"] = directive
+        else:
+            state.pop("best_quote_frozen_inventory_manual_reduce", None)
+    return {
+        "cleared": True,
+        "reason": "terminal_order_reconciled",
+        "client_order_id": safe_client_order_id,
+        "side": side_key,
+    }
+
+
+def reconcile_best_quote_frozen_per_lot_bindings(
+    *,
+    state: dict[str, Any],
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    current_open_orders: Iterable[Any] | None,
+    recv_window: int,
+    now: datetime | None = None,
+    missing_order_grace_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Resolve terminal per-lot orders from REST before another batch can arm."""
+    report: dict[str, Any] = {
+        "enabled": True,
+        "binding_count": 0,
+        "active_count": 0,
+        "resolved_filled_count": 0,
+        "resolved_partial_cancel_count": 0,
+        "resolved_not_found_with_trade_count": 0,
+        "released_zero_fill_count": 0,
+        "released_not_found_count": 0,
+        "unresolved_count": 0,
+        "errors": [],
+    }
+    bindings = dict(state.get("best_quote_frozen_per_lot_client_bindings") or {})
+    report["binding_count"] = len(bindings)
+    if not bindings:
+        return report
+
+    checked_at = (now or _utc_now()).astimezone(timezone.utc)
+    active_client_order_ids = {
+        str((item or {}).get("clientOrderId") or (item or {}).get("client_order_id") or "").strip()
+        for item in list(current_open_orders or [])
+        if isinstance(item, Mapping)
+    }
+    refs_by_client_order_id: dict[str, tuple[str, dict[str, Any]]] = {}
+    for raw_order_id, raw_ref in dict(state.get("best_quote_volume_order_refs") or {}).items():
+        if not isinstance(raw_ref, Mapping):
+            continue
+        ref = dict(raw_ref)
+        client_order_id = str(
+            ref.get("client_order_id") or ref.get("clientOrderId") or ""
+        ).strip()
+        if client_order_id:
+            refs_by_client_order_id[client_order_id] = (str(raw_order_id), ref)
+
+    def _binding_age_seconds(binding: Mapping[str, Any]) -> float:
+        raw = str(binding.get("reserved_at") or "").strip()
+        if not raw:
+            return float("inf")
+        try:
+            reserved_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return float("inf")
+        if reserved_at.tzinfo is None:
+            reserved_at = reserved_at.replace(tzinfo=timezone.utc)
+        return max((checked_at - reserved_at.astimezone(timezone.utc)).total_seconds(), 0.0)
+
+    def _fetch_matching_trades(
+        *, binding: Mapping[str, Any], client_order_id: str, order_id: str
+    ) -> list[dict[str, Any]]:
+        start_time_ms = max(int((checked_at - timedelta(minutes=5)).timestamp() * 1000), 0)
+        reserved_at_raw = str(binding.get("reserved_at") or "").strip()
+        if reserved_at_raw:
+            try:
+                reserved_at = datetime.fromisoformat(reserved_at_raw.replace("Z", "+00:00"))
+                if reserved_at.tzinfo is None:
+                    reserved_at = reserved_at.replace(tzinfo=timezone.utc)
+                start_time_ms = max(int(reserved_at.timestamp() * 1000) - 5000, 0)
+            except ValueError:
+                pass
+        fetched_trades = fetch_futures_user_trades(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            start_time_ms=start_time_ms,
+            end_time_ms=int(checked_at.timestamp() * 1000),
+            limit=1000,
+            recv_window=recv_window,
+        )
+        matching: list[dict[str, Any]] = []
+        for raw_trade in fetched_trades:
+            if str((raw_trade or {}).get("orderId") or "").strip() != order_id:
+                continue
+            trade = dict(raw_trade)
+            trade["clientOrderId"] = client_order_id
+            trade["role"] = (
+                "frozen_inventory_manual_reduce_"
+                f"{str(binding.get('side') or '').lower().strip()}"
+            )
+            trade["frozen_inventory_request_id"] = str(binding.get("request_id") or "")
+            trade["frozen_inventory_per_lot_release"] = True
+            matching.append(trade)
+        return matching
+
+    terminal_statuses = {"CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "FILLED", "REJECTED"}
+    for client_order_id, raw_binding in list(bindings.items()):
+        if client_order_id in active_client_order_ids:
+            report["active_count"] += 1
+            continue
+        binding = dict(raw_binding) if isinstance(raw_binding, Mapping) else {}
+        ref_entry = refs_by_client_order_id.get(client_order_id)
+        raw_order_id = str(binding.get("order_id") or (ref_entry or ("", {}))[0] or "").strip()
+        order_id = int(raw_order_id) if raw_order_id.isdigit() else None
+        if (
+            ref_entry is None
+            and order_id is None
+            and _binding_age_seconds(binding) < max(missing_order_grace_seconds, 0.0)
+        ):
+            report["unresolved_count"] += 1
+            continue
+        try:
+            order = fetch_futures_order(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_id=order_id,
+                orig_client_order_id=None if order_id is not None else client_order_id,
+                recv_window=recv_window,
+            )
+        except RuntimeError as exc:
+            if (
+                "-2013" in str(exc)
+                and _binding_age_seconds(binding) >= max(missing_order_grace_seconds, 0.0)
+            ):
+                matching_trades: list[dict[str, Any]] = []
+                if order_id is not None:
+                    try:
+                        matching_trades = _fetch_matching_trades(
+                            binding=binding,
+                            client_order_id=client_order_id,
+                            order_id=str(order_id),
+                        )
+                    except RuntimeError as trade_exc:
+                        report["unresolved_count"] += 1
+                        report["errors"].append(f"{client_order_id}: {trade_exc}")
+                        continue
+                if matching_trades:
+                    fill_sync = sync_best_quote_frozen_manual_fills(
+                        state=state,
+                        observed_trade_rows=matching_trades,
+                    )
+                    report.setdefault("fill_sync_reports", []).append(fill_sync)
+                    report["resolved_not_found_with_trade_count"] += 1
+                cleared = _clear_best_quote_frozen_per_lot_client_binding(
+                    state=state,
+                    client_order_id=client_order_id,
+                )
+                if cleared.get("cleared") and not matching_trades:
+                    report["released_not_found_count"] += 1
+                continue
+            report["unresolved_count"] += 1
+            report["errors"].append(f"{client_order_id}: {exc}")
+            continue
+
+        status = str(order.get("status") or "").upper().strip()
+        if status not in terminal_statuses:
+            report["unresolved_count"] += 1
+            continue
+        executed_qty = max(_safe_float(order.get("executedQty")), 0.0)
+        if executed_qty <= 1e-12:
+            cleared = _clear_best_quote_frozen_per_lot_client_binding(
+                state=state,
+                client_order_id=client_order_id,
+            )
+            if cleared.get("cleared"):
+                report["released_zero_fill_count"] += 1
+            continue
+
+        resolved_order_id = str(order.get("orderId") or raw_order_id or "").strip()
+        if not resolved_order_id.isdigit():
+            report["unresolved_count"] += 1
+            report["errors"].append(f"{client_order_id}: terminal order missing orderId")
+            continue
+        try:
+            matching_trades = _fetch_matching_trades(
+                binding=binding,
+                client_order_id=client_order_id,
+                order_id=resolved_order_id,
+            )
+        except RuntimeError as exc:
+            report["unresolved_count"] += 1
+            report["errors"].append(f"{client_order_id}: {exc}")
+            continue
+        covered_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in matching_trades)
+        if covered_qty + 1e-12 < executed_qty:
+            report["unresolved_count"] += 1
+            report["errors"].append(
+                f"{client_order_id}: trade coverage {covered_qty} < executed {executed_qty}"
+            )
+            continue
+        fill_sync = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=matching_trades,
+        )
+        report.setdefault("fill_sync_reports", []).append(fill_sync)
+        _clear_best_quote_frozen_per_lot_client_binding(
+            state=state,
+            client_order_id=client_order_id,
+        )
+        if status == "FILLED":
+            report["resolved_filled_count"] += 1
+        else:
+            report["resolved_partial_cancel_count"] += 1
+    return report
 
 
 def _enforce_frozen_per_lot_single_active_lane(
@@ -17468,12 +17757,49 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             state=state,
             observed_trade_rows=observed_trade_rows,
         )
+        best_quote_frozen_binding_reconcile = reconcile_best_quote_frozen_per_lot_bindings(
+            state=state,
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            current_open_orders=open_orders,
+            recv_window=args.recv_window,
+        )
+        if any(
+            int(best_quote_frozen_binding_reconcile.get(key) or 0) > 0
+            for key in (
+                "resolved_filled_count",
+                "resolved_partial_cancel_count",
+                "resolved_not_found_with_trade_count",
+                "released_zero_fill_count",
+                "released_not_found_count",
+            )
+        ):
+            best_quote_volume_ledger = reconcile_best_quote_volume_ledger_surplus(
+                state=state,
+                current_long_qty=current_long_qty,
+                current_short_qty=current_short_qty,
+                current_long_avg_price=current_long_avg_price,
+                current_short_avg_price=current_short_avg_price,
+                current_long_entry_price=exchange_long_entry_price,
+                current_short_entry_price=exchange_short_entry_price,
+                mid_price=mid_price,
+                normal_open_order_count=sum(
+                    1
+                    for order in _filter_futures_strategy_orders(open_orders, symbol)
+                    if "bestquot" in str(order.get("clientOrderId") or "").lower()
+                ),
+                position_reconcile_confirm_cycles=1,
+            )
         best_quote_frozen_pair_release_sync = sync_best_quote_frozen_pair_release(
             state=state,
             observed_trade_rows=observed_trade_rows,
         )
         best_quote_maker_volume["volume_ledger"] = dict(best_quote_volume_ledger)
         best_quote_maker_volume["frozen_manual_sync"] = dict(best_quote_frozen_manual_sync)
+        best_quote_maker_volume["frozen_per_lot_binding_reconcile"] = dict(
+            best_quote_frozen_binding_reconcile
+        )
         best_quote_maker_volume["frozen_pair_release_sync"] = dict(best_quote_frozen_pair_release_sync)
 
     elastic_volume_config = _elastic_volume_config(effective_args)

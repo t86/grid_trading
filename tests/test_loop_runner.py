@@ -2059,6 +2059,40 @@ class LoopRunnerTests(unittest.TestCase):
             state["best_quote_frozen_inventory_manual_reduce"]["short"]["requested_qty"], 50.0
         )
 
+    def test_arm_frozen_single_leg_take_profit_waits_for_reserved_fill_consumption(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_qty": 100.0,
+                "short_lots": [
+                    {
+                        "qty": 100.0,
+                        "entry_price": 1.02,
+                        "frozen_lot_id": "short-profitable",
+                    }
+                ],
+            },
+            "best_quote_frozen_per_lot_client_bindings": {
+                "gx-arxu-frozenpl-1-filled01": {
+                    "request_id": "auto-tp-short-previous",
+                    "side": "short",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "short-profitable", "qty": 20.0}
+                    ],
+                }
+            },
+        }
+
+        armed = arm_best_quote_frozen_single_leg_take_profit(
+            state=state,
+            bid_price=0.99,
+            ask_price=0.991,
+            min_profit_ratio=0.01,
+            max_notional=20.0,
+        )
+
+        self.assertEqual(armed, {})
+        self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
+
     def test_arm_frozen_single_leg_take_profit_skips_active_partial_pair_release(self) -> None:
         pair_release = {
             "requested": True,
@@ -4627,6 +4661,288 @@ class LoopRunnerTests(unittest.TestCase):
             "submitted_client_order_id",
             mismatch_state["best_quote_frozen_inventory_manual_reduce"]["long"],
         )
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_user_trades")
+    @patch("grid_optimizer.loop_runner.fetch_futures_order")
+    def test_reconcile_frozen_per_lot_binding_backfills_missing_filled_trade(
+        self,
+        mock_fetch_order,
+        mock_fetch_trades,
+    ) -> None:
+        reconcile = getattr(
+            loop_runner_module,
+            "reconcile_best_quote_frozen_per_lot_bindings",
+        )
+        client_order_id = "gx-arxu-frozenpl-1-filled01"
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [
+                    {"frozen_lot_id": "long-selected", "qty": 5.0, "entry_price": 1.0}
+                ],
+            },
+            "best_quote_frozen_inventory_manual_reduce": {
+                "long": {
+                    "requested": True,
+                    "requested_qty": 20.0,
+                    "request_id": "auto-tp-long-current",
+                    "source": "auto_single_leg_take_profit",
+                    "frozen_inventory_per_lot_release": True,
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                    "submitted_client_order_id": client_order_id,
+                }
+            },
+            "best_quote_frozen_per_lot_client_bindings": {
+                client_order_id: {
+                    "request_id": "auto-tp-long-current",
+                    "side": "long",
+                    "source": "auto_single_leg_take_profit",
+                    "reserved_at": "2026-07-13T00:00:00+00:00",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                }
+            },
+            "best_quote_volume_order_refs": {
+                "123": {
+                    "book": "frozen",
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "client_order_id": client_order_id,
+                    "source": "auto_single_leg_take_profit",
+                    "frozen_inventory_per_lot_release": True,
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                }
+            },
+        }
+        mock_fetch_order.return_value = {
+            "orderId": 123,
+            "clientOrderId": client_order_id,
+            "status": "FILLED",
+            "executedQty": "20",
+        }
+        mock_fetch_trades.return_value = [
+            {
+                "id": 9001,
+                "orderId": 123,
+                "side": "SELL",
+                "positionSide": "LONG",
+                "qty": "20",
+                "price": "1.02",
+                "time": 1783900805000,
+            }
+        ]
+
+        report = reconcile(
+            state=state,
+            symbol="ARXUSDT",
+            api_key="key",
+            api_secret="secret",
+            current_open_orders=[],
+            recv_window=5000,
+            now=datetime(2026, 7, 13, 0, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(report["resolved_filled_count"], 1)
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_lots"], [])
+        self.assertNotIn("best_quote_frozen_per_lot_client_bindings", state)
+        self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_user_trades")
+    @patch("grid_optimizer.loop_runner.fetch_futures_order")
+    def test_reconcile_frozen_per_lot_partial_cancel_consumes_fill_and_releases_remainder(
+        self,
+        mock_fetch_order,
+        mock_fetch_trades,
+    ) -> None:
+        reconcile = getattr(
+            loop_runner_module,
+            "reconcile_best_quote_frozen_per_lot_bindings",
+        )
+        client_order_id = "gx-arxu-frozenpl-1-partial01"
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [
+                    {"frozen_lot_id": "long-selected", "qty": 30.0, "entry_price": 1.0}
+                ],
+            },
+            "best_quote_frozen_inventory_manual_reduce": {
+                "long": {
+                    "requested": True,
+                    "requested_qty": 20.0,
+                    "request_id": "auto-tp-long-current",
+                    "source": "auto_single_leg_take_profit",
+                    "frozen_inventory_per_lot_release": True,
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                    "submitted_client_order_id": client_order_id,
+                }
+            },
+            "best_quote_frozen_per_lot_client_bindings": {
+                client_order_id: {
+                    "request_id": "auto-tp-long-current",
+                    "side": "long",
+                    "source": "auto_single_leg_take_profit",
+                    "reserved_at": "2026-07-13T00:00:00+00:00",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                }
+            },
+            "best_quote_volume_order_refs": {
+                "123": {
+                    "book": "frozen",
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "client_order_id": client_order_id,
+                    "source": "auto_single_leg_take_profit",
+                    "frozen_inventory_per_lot_release": True,
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                }
+            },
+        }
+        mock_fetch_order.return_value = {
+            "orderId": 123,
+            "clientOrderId": client_order_id,
+            "status": "CANCELED",
+            "executedQty": "5",
+        }
+        mock_fetch_trades.return_value = [
+            {
+                "id": 9002,
+                "orderId": 123,
+                "side": "SELL",
+                "positionSide": "LONG",
+                "qty": "5",
+                "price": "1.02",
+                "time": 1783900805000,
+            }
+        ]
+
+        report = reconcile(
+            state=state,
+            symbol="ARXUSDT",
+            api_key="key",
+            api_secret="secret",
+            current_open_orders=[],
+            recv_window=5000,
+            now=datetime(2026, 7, 13, 0, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(report["resolved_partial_cancel_count"], 1)
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_lots"][0]["qty"], 25.0)
+        self.assertNotIn("best_quote_frozen_per_lot_client_bindings", state)
+        directive = state["best_quote_frozen_inventory_manual_reduce"]["long"]
+        self.assertEqual(directive["requested_qty"], 15.0)
+        self.assertNotIn("submitted_client_order_id", directive)
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_order")
+    def test_reconcile_frozen_per_lot_not_found_reservation_clears_after_grace(
+        self,
+        mock_fetch_order,
+    ) -> None:
+        reconcile = getattr(
+            loop_runner_module,
+            "reconcile_best_quote_frozen_per_lot_bindings",
+        )
+        client_order_id = "gx-arxu-frozenpl-1-neverpost"
+        state: dict[str, object] = {
+            "best_quote_frozen_per_lot_client_bindings": {
+                client_order_id: {
+                    "request_id": "auto-tp-long-current",
+                    "side": "long",
+                    "reserved_at": "2026-07-13T00:00:00+00:00",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 20.0}
+                    ],
+                }
+            }
+        }
+        mock_fetch_order.side_effect = RuntimeError("Binance API error -2013: Order does not exist")
+
+        report = reconcile(
+            state=state,
+            symbol="ARXUSDT",
+            api_key="key",
+            api_secret="secret",
+            current_open_orders=[],
+            recv_window=5000,
+            now=datetime(2026, 7, 13, 0, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(report["released_not_found_count"], 1)
+        self.assertNotIn("best_quote_frozen_per_lot_client_bindings", state)
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_user_trades")
+    @patch("grid_optimizer.loop_runner.fetch_futures_order")
+    def test_reconcile_frozen_per_lot_not_found_order_backfills_trade_by_ref(
+        self,
+        mock_fetch_order,
+        mock_fetch_trades,
+    ) -> None:
+        reconcile = getattr(
+            loop_runner_module,
+            "reconcile_best_quote_frozen_per_lot_bindings",
+        )
+        client_order_id = "gx-arxu-frozenpl-1-oldfilled"
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [
+                    {"frozen_lot_id": "long-selected", "qty": 5.0, "entry_price": 1.0}
+                ]
+            },
+            "best_quote_frozen_per_lot_client_bindings": {
+                client_order_id: {
+                    "request_id": "auto-tp-long-old",
+                    "side": "long",
+                    "reserved_at": "2026-07-13T00:00:00+00:00",
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 5.0}
+                    ],
+                }
+            },
+            "best_quote_volume_order_refs": {
+                "123": {
+                    "book": "frozen",
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "client_order_id": client_order_id,
+                    "frozen_inventory_per_lot_release": True,
+                    "selected_lot_allocations": [
+                        {"frozen_lot_id": "long-selected", "qty": 5.0}
+                    ],
+                }
+            },
+        }
+        mock_fetch_order.side_effect = RuntimeError("Binance API error -2013: Order does not exist")
+        mock_fetch_trades.return_value = [
+            {
+                "id": 9003,
+                "orderId": 123,
+                "side": "SELL",
+                "positionSide": "LONG",
+                "qty": "5",
+                "price": "1.02",
+                "time": 1783900805000,
+            }
+        ]
+
+        report = reconcile(
+            state=state,
+            symbol="ARXUSDT",
+            api_key="key",
+            api_secret="secret",
+            current_open_orders=[],
+            recv_window=5000,
+            now=datetime(2026, 7, 13, 0, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(report["resolved_not_found_with_trade_count"], 1)
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_lots"], [])
+        self.assertNotIn("best_quote_frozen_per_lot_client_bindings", state)
 
     def test_sync_frozenpl_without_order_ref_recovers_allocations_from_directive(self) -> None:
         state: dict[str, object] = {

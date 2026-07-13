@@ -8,7 +8,7 @@ Change automatic frozen single-leg profit release from whole-side IOC liquidatio
 
 1. Add failing tests in `tests/test_loop_runner.py`.
    - Select a profitable lot while another lot on the same side is underwater.
-   - Cover exact 0.2% long and short thresholds.
+   - Cover configurable long and short thresholds, deployed at 1% for ARX.
    - Cap each automatic batch to 20 USDT.
    - Assert long SELL at ask and short BUY at bid with maker/GTX.
    - Assert partial fills consume only selected lots and a completed batch allows the next batch.
@@ -27,12 +27,13 @@ Change automatic frozen single-leg profit release from whole-side IOC liquidatio
    - Copy request ID, source, and selected allocations into submit reports and order refs.
    - Consume selected lot IDs for partial fills; never fall back to FIFO for marked per-lot releases.
    - Reduce or clear the persistent directive after confirmed fills.
+   - Block a new side batch while any submitted allocation remains unconsumed; reconcile terminal orders from REST order state plus `userTrades`, including full fill, partial-fill cancellation, zero-fill cancellation, and a never-created POST reservation.
 
 5. Wire the existing frozen release max-notional into automatic arming and persist ARX runtime defaults.
    - Pass the existing pair-release max notional (20 USDT) to the single-leg arm call.
-   - Ensure both tracked ARX host configs retain enabled=true, min profit 0.002, max batch 20, and pair release disabled.
+   - Ensure both tracked ARX host configs retain enabled=true, min profit 0.01, max batch 20, and pair release disabled.
 
 6. Verify and deploy.
    - Run focused tests first, then the full `tests/test_loop_runner.py` suite with the repository's isolated pytest command.
    - Review the diff for unrelated changes.
-   - Commit and push `main`, deploy by each host's tracked update wrapper, restart ARX only, and verify commit, runner health, order type, selected allocation state, and frozen totals.
+   - Commit and push `main`, deploy by each host's tracked update wrapper, run `configure_arx_single_leg_freeze.py` against each live output control file, restart ARX only, and verify commit, live min profit `0.01`, runner health, order type, selected allocation state, and frozen totals.

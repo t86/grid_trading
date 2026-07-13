@@ -25,5 +25,5 @@ def test_configure_accepts_arx_total_frozen_cap_800(tmp_path) -> None:
     assert updated["best_quote_maker_volume_frozen_total_cap_notional"] == 800.0
     assert updated["best_quote_maker_volume_frozen_pair_release_enabled"] is False
     assert updated["best_quote_maker_volume_frozen_single_leg_take_profit_enabled"] is True
-    assert updated["best_quote_maker_volume_frozen_pair_release_min_profit_ratio"] == 0.002
+    assert updated["best_quote_maker_volume_frozen_pair_release_min_profit_ratio"] == 0.01
     assert updated["best_quote_maker_volume_frozen_pair_release_max_notional"] == 20.0
