@@ -188,6 +188,34 @@ class FuturesSignedResponseCacheTests(unittest.TestCase):
         self.assertEqual(mock_http.call_count, 2)
 
     @patch("grid_optimizer.data._http_signed_request_json")
+    def test_fetch_futures_user_trades_can_bypass_signed_cache(self, mock_http) -> None:
+        mock_http.side_effect = [
+            [{"id": 1, "time": 1000}],
+            [{"id": 2, "time": 1001}],
+        ]
+
+        first = fetch_futures_user_trades(
+            symbol="BTCUSDT",
+            api_key="key",
+            api_secret="secret",
+            start_time_ms=100,
+            end_time_ms=200,
+            use_cache=False,
+        )
+        second = fetch_futures_user_trades(
+            symbol="BTCUSDT",
+            api_key="key",
+            api_secret="secret",
+            start_time_ms=100,
+            end_time_ms=200,
+            use_cache=False,
+        )
+
+        self.assertEqual(first, [{"id": 1, "time": 1000}])
+        self.assertEqual(second, [{"id": 2, "time": 1001}])
+        self.assertEqual(mock_http.call_count, 2)
+
+    @patch("grid_optimizer.data._http_signed_request_json")
     @patch("grid_optimizer.data.time.time")
     def test_open_orders_cache_survives_memory_cache_clear_via_file_cache(self, mock_time, mock_http) -> None:
         mock_http.return_value = [{"orderId": 99}]

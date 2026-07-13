@@ -79,6 +79,51 @@ class WebSecurityTests(unittest.TestCase):
     def _mock_book(self) -> list[dict[str, str]]:
         return [{"bid_price": "1.2345", "ask_price": "1.2347"}]
 
+    def test_loop_monitor_capacity_rejects_excess_request(self) -> None:
+        request_slots = Mock()
+        request_slots.acquire.return_value = False
+
+        with patch.object(web_module, "_LOOP_MONITOR_REQUEST_SLOTS", request_slots, create=True), patch.object(
+            web_module, "build_monitor_snapshot"
+        ) as mock_snapshot:
+            with self.assertRaises(web_module._LoopMonitorBusyError):
+                _run_loop_monitor_query({"symbol": ["OUSDT"]})
+
+        request_slots.acquire.assert_called_once_with(blocking=False)
+        request_slots.release.assert_not_called()
+        mock_snapshot.assert_not_called()
+
+    def test_loop_monitor_capacity_releases_slot_after_error(self) -> None:
+        request_slots = Mock()
+        request_slots.acquire.return_value = True
+
+        with patch.object(web_module, "_LOOP_MONITOR_REQUEST_SLOTS", request_slots, create=True), patch.object(
+            web_module, "read_symbol_runner_process", return_value={}
+        ), patch.object(web_module, "build_monitor_snapshot", side_effect=RuntimeError("snapshot failed")):
+            with self.assertRaisesRegex(RuntimeError, "snapshot failed"):
+                _run_loop_monitor_query({"symbol": ["OUSDT"]})
+
+        request_slots.acquire.assert_called_once_with(blocking=False)
+        request_slots.release.assert_called_once_with()
+
+    def test_loop_monitor_busy_route_returns_503(self) -> None:
+        handler = object.__new__(web_module._Handler)
+        handler.path = "/api/loop_monitor?symbol=OUSDT"
+        handler._authorize_request = Mock(return_value=True)
+        handler._send_json = Mock()
+
+        with patch.object(
+            web_module,
+            "_run_loop_monitor_query",
+            side_effect=web_module._LoopMonitorBusyError("monitor capacity is full"),
+        ):
+            handler.do_GET()
+
+        handler._send_json.assert_called_once_with(
+            {"ok": False, "error": "monitor capacity is full"},
+            status=web_module.HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
     def test_running_status_api_body_builds_payload_outside_cache_lock(self) -> None:
         web_module.RUNNING_STATUS_API_RESPONSE_CACHE.clear()
 

@@ -142,6 +142,15 @@ class _InflightMonitorSnapshot:
         self.error: Exception | None = None
 
 
+def _monitor_inflight_wait_timeout_seconds() -> float:
+    raw = str(os.environ.get("GRID_MONITOR_INFLIGHT_WAIT_TIMEOUT_SECONDS") or "30.0").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 30.0
+    return max(value, 0.01)
+
+
 def _read_json_dict(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -642,6 +651,7 @@ def _load_or_fetch_trade_rows(
                 symbol=symbol,
                 api_key=api_key,
                 api_secret=api_secret,
+                use_cache=False,
                 **params,
             ),
             start_time_ms=start_time_ms,
@@ -2598,7 +2608,11 @@ def build_monitor_snapshot(
             owner = False
 
     if not owner:
-        inflight.event.wait()
+        wait_timeout = _monitor_inflight_wait_timeout_seconds()
+        if not inflight.event.wait(timeout=wait_timeout):
+            raise RuntimeError(
+                f"timed out waiting for monitor snapshot after {wait_timeout:g} seconds"
+            )
         if inflight.snapshot is not None:
             return inflight.snapshot
         if inflight.error is not None:

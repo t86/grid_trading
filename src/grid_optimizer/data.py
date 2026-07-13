@@ -1810,6 +1810,7 @@ def fetch_futures_user_trades(
     end_time_ms: int | None = None,
     limit: int = 1000,
     recv_window: int = 5000,
+    use_cache: bool = True,
 ) -> list[dict[str, Any]]:
     normalized_contract_type = normalize_contract_type(contract_type)
     normalized_symbol = symbol.upper().strip()
@@ -1840,6 +1841,9 @@ def fetch_futures_user_trades(
             method="GET",
         )
         return _as_list_payload(data, "futures userTrades")
+
+    if not use_cache:
+        return _fetch()
 
     return _get_or_fetch_cached_signed_response(
         namespace="futures_user_trades",

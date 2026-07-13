@@ -492,6 +492,26 @@ class MonitorTests(unittest.TestCase):
             places=8,
         )
 
+    @mock.patch("grid_optimizer.monitor.fetch_futures_user_trades", return_value=[])
+    def test_load_or_fetch_trade_rows_bypasses_signed_cache(self, mock_fetch_user_trades) -> None:
+        def fake_fetch_time_paged(**kwargs: object) -> list[dict[str, object]]:
+            fetch_page = kwargs["fetch_page"]
+            return fetch_page(start_time_ms=1, end_time_ms=2, limit=1000)
+
+        with TemporaryDirectory() as tmpdir, mock.patch(
+            "grid_optimizer.monitor.fetch_time_paged",
+            side_effect=fake_fetch_time_paged,
+        ):
+            _load_or_fetch_trade_rows(
+                audit_path=Path(tmpdir) / "trades.jsonl",
+                symbol="CACHEUSDT",
+                api_key="key",
+                api_secret="secret",
+                session_start=datetime.now(timezone.utc),
+            )
+
+        self.assertFalse(mock_fetch_user_trades.call_args.kwargs["use_cache"])
+
     def test_summarize_hourly_metrics_combines_trades_income_and_candles(self) -> None:
         hour0 = datetime(2026, 3, 19, 8, 0, tzinfo=timezone.utc)
         hour1 = datetime(2026, 3, 19, 9, 0, tzinfo=timezone.utc)
@@ -1318,6 +1338,31 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(call_count, 1)
         self.assertEqual(result1, result2)
+
+    def test_build_monitor_snapshot_times_out_waiting_for_stuck_inflight(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_build(**kwargs: object) -> dict[str, object]:
+            started.set()
+            release.wait(timeout=2)
+            return {"ok": True, "symbol": kwargs["symbol"]}
+
+        with mock.patch("grid_optimizer.monitor._build_monitor_snapshot_uncached", side_effect=fake_build):
+            with mock.patch.dict(
+                "os.environ",
+                {"GRID_MONITOR_INFLIGHT_WAIT_TIMEOUT_SECONDS": "0.05"},
+            ):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    owner = pool.submit(build_monitor_snapshot, symbol="WAITUSDT")
+                    self.assertTrue(started.wait(timeout=1))
+                    waiter = pool.submit(build_monitor_snapshot, symbol="WAITUSDT")
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, "timed out waiting for monitor snapshot"):
+                            waiter.result(timeout=1)
+                    finally:
+                        release.set()
+                    self.assertTrue(owner.result(timeout=1)["ok"])
 
     def test_count_monitor_audit_lines_skips_uncached_large_file(self) -> None:
         with TemporaryDirectory() as tmpdir:

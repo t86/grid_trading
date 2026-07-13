@@ -173,7 +173,15 @@ from .symbol_lists import (
 )
 from .types import Candle
 
+
 FUTURES_USDM_FALLBACK_SYMBOLS = ["PHAROSUSDT", "BTCUSDT", "ETHUSDT"]
+
+
+class _LoopMonitorBusyError(RuntimeError):
+    pass
+
+
+_LOOP_MONITOR_REQUEST_SLOTS = threading.BoundedSemaphore(4)
 
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
@@ -36816,6 +36824,15 @@ def _safe_positive_int_query(value: Any, default: int) -> int:
 
 
 def _run_loop_monitor_query(query: dict[str, list[str]]) -> dict[str, Any]:
+    if not _LOOP_MONITOR_REQUEST_SLOTS.acquire(blocking=False):
+        raise _LoopMonitorBusyError("monitor request capacity is full; retry shortly")
+    try:
+        return _run_loop_monitor_query_unbounded(query)
+    finally:
+        _LOOP_MONITOR_REQUEST_SLOTS.release()
+
+
+def _run_loop_monitor_query_unbounded(query: dict[str, list[str]]) -> dict[str, Any]:
     symbol = str(query.get("symbol", ["NIGHTUSDT"])[0]).upper().strip() or "NIGHTUSDT"
     summary_limit = min(_safe_positive_int_query(query.get("summary_limit", ["500"])[0], 500), 2000)
     runner = read_symbol_runner_process(symbol)
@@ -38283,6 +38300,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/loop_monitor"):
             try:
                 payload = _run_loop_monitor_query(query)
+            except _LoopMonitorBusyError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+                return
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
                 return
