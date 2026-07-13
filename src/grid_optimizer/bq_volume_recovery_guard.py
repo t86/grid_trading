@@ -835,6 +835,18 @@ def _trade_path(output_dir: Path, symbol: str) -> Path:
     return output_dir / f"{symbol.lower()}_loop_trade_audit.jsonl"
 
 
+def _events_path(output_dir: Path, symbol: str) -> Path:
+    return output_dir / f"{symbol.lower()}_loop_events.jsonl"
+
+
+def _latest_runtime_stop_reason(output_dir: Path, symbol: str) -> str:
+    for event in reversed(_iter_jsonl(_events_path(output_dir, symbol))):
+        reason = str(event.get("stop_reason") or "").strip()
+        if reason and str(event.get("runtime_status") or "").strip().lower() == "stopped":
+            return reason
+    return ""
+
+
 def _symbol_state(state: dict[str, Any], symbol: str) -> dict[str, Any]:
     symbols = state.setdefault("symbols", {})
     if not isinstance(symbols, dict):
@@ -1940,6 +1952,10 @@ def recover_inactive_runner(
     )
     net_guard_recovery_active = _safe_float(item.get("net_guard_recovery_baseline_notional")) > 0
     stop_reason = str(plan.get("stop_reason") or submit.get("stop_reason") or "").strip()
+    stop_reason_source = "plan_or_submit" if stop_reason else ""
+    if not stop_reason:
+        stop_reason = _latest_runtime_stop_reason(output_dir, normalized_symbol)
+        stop_reason_source = "runner_event" if stop_reason else ""
     net_guard_live_gate: dict[str, Any] | None = None
     if (
         stop_reason == "max_actual_net_notional_hit"
@@ -2022,6 +2038,7 @@ def recover_inactive_runner(
                 "inactive_seconds": elapsed,
                 "inactive_restart_gate": gate,
                 "net_guard_live_gate": net_guard_live_gate,
+                "net_guard_stop_reason_source": stop_reason_source,
             }
 
     original_controls = item.get("guard_original_controls")
@@ -2137,6 +2154,8 @@ def recover_inactive_runner(
         "restart_failed": restart_failed,
         "inactive_seconds": elapsed,
         "inactive_restart_gate": gate,
+        "net_guard_live_gate": net_guard_live_gate,
+        "net_guard_stop_reason_source": stop_reason_source,
     }
 
 

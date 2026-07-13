@@ -1268,7 +1268,6 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
             plan_path = output_dir / "reusdt_loop_latest_plan.json"
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
-            plan.update({"stop_reason": "max_actual_net_notional_hit"})
             plan["best_quote_maker_volume"] = {
                 "reduce_freeze": {
                     "actual_long_notional": 300.0,
@@ -1276,6 +1275,16 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 }
             }
             _write_json(plan_path, plan)
+            _append_jsonl(
+                output_dir / "reusdt_loop_events.jsonl",
+                [
+                    {
+                        "ts": now.isoformat(),
+                        "runtime_status": "stopped",
+                        "stop_reason": "max_actual_net_notional_hit",
+                    }
+                ],
+            )
             state: dict[str, object] = {
                 "symbols": {
                     "REUSDT": {
@@ -1306,6 +1315,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
 
             self.assertEqual(result["action"], "recover_net_short_guard_stop")
             self.assertEqual(result["net_guard_live_gate"]["direction"], "net_short")
+            self.assertEqual(result["net_guard_stop_reason_source"], "runner_event")
             control = json.loads(
                 (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
             )
