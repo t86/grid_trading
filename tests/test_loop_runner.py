@@ -3402,6 +3402,69 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(ledger["last_unknown_trade_count"], 0)
         self.assertAlmostEqual(ledger["realized_pnl"], -0.0126, places=6)
 
+    def test_best_quote_volume_ledger_counts_inventory_unlock_order_ref_as_managed_reduce(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_volume_order_refs": {
+                "81263060": {
+                    "book": "unknown",
+                    "role": "inventory_unlock_reduce_short",
+                    "side": "BUY",
+                    "position_side": "SHORT",
+                    "client_order_id": "gx-arxu-inventor-1-13387165",
+                }
+            },
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [],
+                "short_lots": [{"qty": 100.0, "price": 0.1760, "source": "trade_fill"}],
+                "last_trade_time_ms": 1000,
+                "last_trade_keys_at_time": [],
+            },
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[]):
+            snapshot = sync_best_quote_volume_ledger(
+                state=state,
+                symbol="ARXUSDT",
+                api_key="",
+                api_secret="",
+                recv_window=5000,
+                current_long_qty=0.0,
+                current_short_qty=90.0,
+                current_long_avg_price=0.0,
+                current_short_avg_price=0.1760,
+                mid_price=0.1756,
+                observed_trade_rows=[
+                    {
+                        "id": 15784035,
+                        "time": 2000,
+                        "orderId": 81263060,
+                        "side": "BUY",
+                        "positionSide": "SHORT",
+                        "qty": "10",
+                        "price": "0.1756",
+                        "quoteQty": "1.756",
+                    }
+                ],
+            )
+
+        self.assertEqual(snapshot["short_qty"], 90.0)
+        ledger = state["best_quote_volume_ledger"]
+        self.assertEqual(ledger["last_applied_trade_count"], 1)
+        self.assertEqual(ledger["last_unknown_trade_count"], 0)
+
+    def test_best_quote_volume_ledger_classifies_recovery_reduce_roles_as_normal(self) -> None:
+        classify = getattr(loop_runner_module, "_best_quote_order_book_from_role")
+        for role in (
+            "inventory_unlock_reduce_long",
+            "inventory_unlock_reduce_short",
+            "best_quote_active_pair_reduce_long",
+            "best_quote_active_pair_reduce_short",
+        ):
+            with self.subTest(role=role):
+                self.assertEqual(classify(role), "normal_bq")
+
     def test_best_quote_volume_ledger_uses_order_ref_when_trade_row_lacks_client_id(self) -> None:
         state: dict[str, object] = {
             "best_quote_volume_order_refs": {

@@ -2344,6 +2344,10 @@ def _best_quote_order_book_from_role(role: Any) -> str:
         "best_quote_reduce_short",
         "hard_loss_forced_reduce_long",
         "hard_loss_forced_reduce_short",
+        "inventory_unlock_reduce_long",
+        "inventory_unlock_reduce_short",
+        "best_quote_active_pair_reduce_long",
+        "best_quote_active_pair_reduce_short",
     }:
         return BQ_BOOK_NORMAL
     if (
