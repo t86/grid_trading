@@ -2181,6 +2181,9 @@ def check_symbol(
             and trailing_5m_realized_wear_per_10k > 3.0
         )
     )
+    active_pair_reduce_deadlock = bool(
+        assessment.get("active_pair_reduce_suppression_deadlock")
+    ) or bool(assessment.get("active_pair_reduce_below_soft_deadlock"))
     assessment["high_recovery_wear"] = high_recovery_wear
     assessment["confirmed_loss_reduce_wear"] = confirmed_loss_reduce_wear
     two_sided_stale_no_fill = (
@@ -2495,6 +2498,7 @@ def check_symbol(
             (high_recovery_wear or confirmed_loss_reduce_wear)
             and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and not recovery_hold_satisfied
+            and not active_pair_reduce_deadlock
         ):
             action = "hold_loss_reduce_min_duration_before_wear_judgement"
             item.update(
@@ -2507,6 +2511,7 @@ def check_symbol(
             high_recovery_wear
             and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and not confirmed_loss_reduce_wear
+            and not active_pair_reduce_deadlock
         ):
             action = "hold_loss_reduce_until_fresh_wear_confirmation"
             item.update(
@@ -2692,9 +2697,7 @@ def check_symbol(
             and _safe_int(assessment.get("active_order_count")) > 0
         ):
             action = "hold_ledger_position_drift_safety_gate"
-        elif bool(assessment.get("active_pair_reduce_suppression_deadlock")) or bool(
-            assessment.get("active_pair_reduce_below_soft_deadlock")
-        ):
+        elif active_pair_reduce_deadlock:
             updates = {
                 "best_quote_maker_volume_active_pair_reduce_enabled": False,
                 "best_quote_maker_volume_net_loss_reduce_enabled": False,

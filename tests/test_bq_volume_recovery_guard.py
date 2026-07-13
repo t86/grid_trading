@@ -5612,6 +5612,89 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, [])
 
+    def test_zero_order_pair_suppression_deadlock_preempts_stale_wear_hold(self) -> None:
+        now = datetime(2026, 7, 12, 12, 43, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_active_pair_reduce_enabled": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 32.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 1,
+                    "per_order_notional": 8.0,
+                    "pause_buy_position_notional": 361.0,
+                    "pause_short_position_notional": 361.0,
+                },
+                long_notional=358.0,
+                short_notional=327.0,
+                open_order_count=0,
+                active_order_count=0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_active_pair_reduce"] = {
+                "enabled": True,
+                "active": True,
+                "reason": "no_valid_reduce_order",
+                "order_count": 0,
+                "suppressed_entry_order_count": 1,
+            }
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_owned": True,
+                        "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_allow_loss_reduce_only": False,
+                            "best_quote_maker_volume_active_pair_reduce_enabled": False,
+                            "best_quote_maker_volume_cycle_budget_notional": 32.0,
+                        },
+                    }
+                }
+            }
+            trade_rows = [
+                {
+                    "id": 1,
+                    "time": int((now - timedelta(minutes=10)).timestamp() * 1000),
+                    "quoteQty": "120",
+                    "realizedPnl": "-0.3",
+                },
+                {
+                    "id": 2,
+                    "time": int((now - timedelta(minutes=2)).timestamp() * 1000),
+                    "quoteQty": "120",
+                    "realizedPnl": "0",
+                },
+            ]
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=400,
+                trigger_seconds=120,
+                trade_rows=trade_rows,
+                restart_runner=restarts.append,
+                recovery_min_hold_seconds=120.0,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                result["action"], "disable_stalled_active_pair_reduce_suppression"
+            )
+            self.assertFalse(control["best_quote_maker_volume_active_pair_reduce_enabled"])
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_high_wear_backoff_keeps_cycle_budget_runnable(self) -> None:
         now = datetime(2026, 7, 12, 10, 30, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
