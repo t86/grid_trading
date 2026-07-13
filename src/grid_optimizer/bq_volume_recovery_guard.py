@@ -2064,6 +2064,21 @@ def recover_inactive_runner(
                 "net_guard_stop_reason_source": stop_reason_source,
                 "net_guard_stop_event_at": runtime_stop_at.isoformat() if runtime_stop_at else None,
             }
+        if net_guard_live_gate is not None and not bool(net_guard_live_gate.get("ok")):
+            item["status"] = "net_guard_live_safety_hold"
+            return {
+                "symbol": normalized_symbol,
+                "action": "skip_net_guard_live_safety_gate",
+                "changed_keys": [],
+                "backup_path": None,
+                "dry_run": dry_run,
+                "restart_failed": None,
+                "inactive_seconds": elapsed,
+                "inactive_restart_gate": gate,
+                "net_guard_live_gate": net_guard_live_gate,
+                "net_guard_stop_reason_source": stop_reason_source,
+                "net_guard_stop_event_at": runtime_stop_at.isoformat() if runtime_stop_at else None,
+            }
 
     original_controls = item.get("guard_original_controls")
     invalid_pause_updates: dict[str, Any] = {}
