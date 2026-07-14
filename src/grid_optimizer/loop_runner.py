@@ -22693,6 +22693,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "effective_loss_reentry_cooldown_seconds": getattr(effective_args, "loss_reentry_cooldown_seconds", None),
         "effective_loss_reentry_cost_buffer_steps": getattr(effective_args, "loss_reentry_cost_buffer_steps", None),
         "effective_short_threshold_timeout_seconds": getattr(effective_args, "short_threshold_timeout_seconds", None),
+        "effective_sticky_entry_preserve_less_aggressive": bool(
+            getattr(effective_args, "sticky_entry_preserve_less_aggressive", True)
+        ),
         "effective_synthetic_residual_long_flat_notional": getattr(
             effective_args,
             "synthetic_residual_long_flat_notional",
@@ -23365,7 +23368,10 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
             step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
             protect_cancelled_existing=bool(
-                getattr(args, "sticky_entry_preserve_less_aggressive", True)
+                plan_report.get(
+                    "effective_sticky_entry_preserve_less_aggressive",
+                    getattr(args, "sticky_entry_preserve_less_aggressive", True),
+                )
             ),
         )
     validation["actions"] = _suppress_place_orders_during_runtime_guard_loss_cooldown(
