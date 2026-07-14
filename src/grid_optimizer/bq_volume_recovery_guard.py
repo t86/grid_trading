@@ -1733,6 +1733,7 @@ def recover_arx_exchange_order_drift(
     *,
     symbol: str,
     local_active_order_count: int,
+    submit: dict[str, Any] | None = None,
     state: dict[str, Any],
     now: datetime,
     cooldown_seconds: float,
@@ -1772,6 +1773,20 @@ def recover_arx_exchange_order_drift(
         exchange_open_order_count=exchange_open_order_count,
     ):
         return None
+    if has_recent_arx_submit_fill(
+        submit=submit or {}, now=now, max_age_seconds=cooldown_seconds
+    ):
+        return {
+            "symbol": normalized_symbol,
+            "action": "hold_arx_exchange_order_drift_after_recent_fill",
+            "changed_keys": [],
+            "backup_path": None,
+            "dry_run": dry_run,
+            "restart_failed": None,
+            "local_active_order_count": int(local_active_order_count),
+            "exchange_open_order_count": exchange_open_order_count,
+            "exchange_strategy_order_ids": exchange.get("strategy_order_ids") or [],
+        }
     item = _symbol_state(state, normalized_symbol)
     last_restart_at = _parse_time(item.get("last_exchange_order_drift_restart_at"))
     cooldown_active = (
@@ -2113,6 +2128,21 @@ def should_restart_arx_for_exchange_order_drift(
         symbol.upper().strip() == "ARXUSDT"
         and int(local_active_order_count) > 0
         and int(exchange_open_order_count) == 0
+    )
+
+
+def has_recent_arx_submit_fill(
+    *, submit: dict[str, Any], now: datetime, max_age_seconds: float
+) -> bool:
+    """A fresh maker fill is not an empty-book runner failure."""
+    events = submit.get("observed_execution_events") or []
+    cutoff_ms = (now - timedelta(seconds=max(float(max_age_seconds), 0.0))).timestamp() * 1000
+    return any(
+        isinstance(event, dict)
+        and str(event.get("kind") or "").upper()
+        in {"ORDER_FILLED", "ORDER_PARTIALLY_FILLED"}
+        and _safe_float(event.get("event_time")) >= cutoff_ms
+        for event in events
     )
 
 
@@ -7454,6 +7484,7 @@ def main(argv: list[str] | None = None) -> int:
         exchange_order_drift_result = recover_arx_exchange_order_drift(
             symbol=symbol,
             local_active_order_count=local_active_order_count,
+            submit=submit,
             state=state,
             now=now,
             # A runner needs one complete fresh cycle after restart, but an
