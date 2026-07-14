@@ -1277,6 +1277,11 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             _arx_independent_freeze_policy_updates(symbol="OUSDT", control=control),
             {},
         )
+        control["best_quote_maker_volume_directional_net_guard"] = "net_long"
+        self.assertEqual(
+            _arx_independent_freeze_policy_updates(symbol="ARXUSDT", control=control),
+            {},
+        )
 
     def test_arx_independent_freeze_policy_is_stable_at_expected_values(self) -> None:
         control = {

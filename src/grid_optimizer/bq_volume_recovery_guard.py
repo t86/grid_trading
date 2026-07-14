@@ -1657,6 +1657,14 @@ def _arx_independent_freeze_policy_updates(
 ) -> dict[str, Any]:
     if symbol.upper().strip() != "ARXUSDT":
         return {}
+    # A directional net unwind owns the runner until the exchange-side
+    # imbalance is settled.  Rewriting ordinary freeze/entry policy here can
+    # restart the runner into a large normal entry before that unwind finishes.
+    if str(control.get("best_quote_maker_volume_directional_net_guard") or "off").lower() in {
+        "net_long",
+        "net_short",
+    }:
+        return {}
     freeze_was_enabled = bool(
         control.get("best_quote_maker_volume_reduce_freeze_enabled")
     )
