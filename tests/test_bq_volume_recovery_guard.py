@@ -4814,7 +4814,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             cycle_budget_increment=12.0,
         )
 
-        self.assertEqual(floor, 192.0)
+        self.assertEqual(floor, 140.0)
         self.assertEqual(volume_summary["trailing_60m_gross_notional"], 4000.0)
         self.assertEqual(volume_summary["target_cycle_budget_ladder_capacity"], 256.0)
 

@@ -786,7 +786,10 @@ def apply_target_pace_cycle_budget_floor(
     raw_target = static_floor * max(pace_ratio, 1.0)
     rounded_target = ceil(raw_target / increment) * increment
     ladder_capacity = per_order * ladder_levels * 2.0
-    one_step_capacity = current_budget + max(increment, current_budget * 0.5)
+    # Target pacing is allowed to advance only by the configured recovery
+    # increment.  A percentage-based jump can turn a low-volume recovery into
+    # an abrupt exposure and wear increase after a restart.
+    one_step_capacity = current_budget + increment
 
     frozen_total = max(_safe_float(assessment.get("frozen_total_notional")), 0.0)
     use_actual = (
