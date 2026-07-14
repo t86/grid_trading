@@ -321,6 +321,21 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(1.0, updates["best_quote_maker_volume_inventory_soft_ratio"])
         self.assertEqual(8000.0, updates["max_total_notional"])
 
+    def test_arx_severe_pace_capacity_keeps_one_batch_above_4000_side(self) -> None:
+        updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
+            control={"max_position_notional": 4000.0, "max_short_position_notional": 4000.0},
+            target_pace_behind=True,
+            pace_ratio=0.2,
+            near_cap=True,
+            volatility_entry_pause_active=False,
+            frozen_total_notional=400.0,
+            actual_long_notional=2818.0,
+            actual_short_notional=4133.0,
+        )
+        self.assertEqual(4800.0, updates["max_position_notional"])
+        self.assertEqual(4800.0, updates["max_short_position_notional"])
+        self.assertEqual(9600.0, updates["max_total_notional"])
+
     def test_arx_fast_sla_bypasses_only_capacity_reapply_debounce(self) -> None:
         decide = bq_volume_recovery_guard.should_bypass_arx_recovery_drift_debounce
         self.assertTrue(

@@ -2352,7 +2352,7 @@ def arx_severe_pace_capacity_updates(
         _safe_float(actual_long_notional), _safe_float(actual_short_notional), 0.0
     )
     target_max_notional = (
-        min(4000.0, max(3200.0, ceil((actual_side_max + 600.0) / 200.0) * 200.0))
+        min(5000.0, max(3200.0, ceil((actual_side_max + 600.0) / 200.0) * 200.0))
         if actual_side_max > 3200.0
         else 2600.0
     )
@@ -2395,7 +2395,7 @@ def arx_severe_pace_capacity_updates(
         "best_quote_maker_volume_cycle_budget_notional": 1600.0,
         "best_quote_maker_volume_active_pair_reduce_order_notional": 480.0,
         "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 480.0,
-        "max_total_notional": 8000.0 if extended_for_actual_inventory else 4000.0,
+        "max_total_notional": target_max_notional * 2.0 if extended_for_actual_inventory else 4000.0,
     }
     updates = {
         key: value
@@ -2435,9 +2435,9 @@ def arx_balanced_fast_sla_capacity_updates(
     # Frozen inventory can make the exchange side larger than the runner's
     # ledger side.  A fixed 3,200 cap then turns a balanced recovery into a
     # one-sided reduce-only book.  Give exactly one 600U maker batch of room,
-    # bounded at 4,000U, so the recovery guard can restore two-sided flow.
+    # bounded at 5,000U, so the recovery guard can restore two-sided flow.
     actual_side_max = max(actual_long, actual_short)
-    target_max = min(4000.0, max(3200.0, ceil((actual_side_max + 600.0) / 200.0) * 200.0))
+    target_max = min(5000.0, max(3200.0, ceil((actual_side_max + 600.0) / 200.0) * 200.0))
     extended_for_actual_inventory = target_max > 3200.0
     if (
         not bool(target_pace_behind)
@@ -2464,7 +2464,7 @@ def arx_balanced_fast_sla_capacity_updates(
         "best_quote_maker_volume_cycle_budget_notional": 2000.0,
         "best_quote_maker_volume_active_pair_reduce_order_notional": 600.0,
         "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 600.0,
-        "max_total_notional": 8000.0 if extended_for_actual_inventory else 6000.0,
+        "max_total_notional": target_max * 2.0 if extended_for_actual_inventory else 6000.0,
         "best_quote_maker_volume_allow_loss_reduce_only": False,
         "best_quote_maker_volume_net_loss_reduce_enabled": False,
         "best_quote_maker_volume_quote_offset_ticks": 0,
