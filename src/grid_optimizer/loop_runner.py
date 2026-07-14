@@ -23365,7 +23365,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
             step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
             protect_cancelled_existing=bool(
-                getattr(effective_args, "sticky_entry_preserve_less_aggressive", True)
+                getattr(args, "sticky_entry_preserve_less_aggressive", True)
             ),
         )
     validation["actions"] = _suppress_place_orders_during_runtime_guard_loss_cooldown(
