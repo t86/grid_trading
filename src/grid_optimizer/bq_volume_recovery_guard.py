@@ -1868,6 +1868,80 @@ def recover_arx_runner_error_loop(
     return result
 
 
+def recover_arx_effective_control_drift(
+    *,
+    output_dir: Path,
+    symbol: str,
+    state: dict[str, Any],
+    now: datetime,
+    cooldown_seconds: float,
+    dry_run: bool,
+    runner_wrapper: str,
+    restart_runner: RestartRunner | None = None,
+) -> dict[str, Any] | None:
+    """Restart when a recovery control was not consumed by the live runner."""
+    normalized_symbol = symbol.upper().strip()
+    if normalized_symbol != "ARXUSDT":
+        return None
+    control = _read_json(_control_path(Path(output_dir), normalized_symbol))
+    plan = _read_json(_plan_path(Path(output_dir), normalized_symbol))
+    if control.get("sticky_entry_preserve_less_aggressive") is not False:
+        return None
+    if plan.get("effective_sticky_entry_preserve_less_aggressive") is False:
+        return None
+    item = _symbol_state(state, normalized_symbol)
+    last_restart_at = _parse_time(item.get("last_effective_control_drift_restart_at"))
+    if (
+        last_restart_at is not None
+        and (now - last_restart_at).total_seconds() < max(float(cooldown_seconds), 0.0)
+    ):
+        return {
+            "symbol": normalized_symbol,
+            "action": "hold_arx_effective_control_drift_restart_cooldown",
+            "changed_keys": [],
+            "backup_path": None,
+            "dry_run": dry_run,
+            "restart_failed": None,
+            "control_sticky_entry_preserve_less_aggressive": False,
+            "plan_effective_sticky_entry_preserve_less_aggressive": plan.get(
+                "effective_sticky_entry_preserve_less_aggressive"
+            ),
+        }
+    result = {
+        "symbol": normalized_symbol,
+        "changed_keys": [],
+        "backup_path": None,
+        "dry_run": dry_run,
+        "restart_failed": None,
+        "control_sticky_entry_preserve_less_aggressive": False,
+        "plan_effective_sticky_entry_preserve_less_aggressive": plan.get(
+            "effective_sticky_entry_preserve_less_aggressive"
+        ),
+    }
+    if dry_run:
+        result["action"] = "dry_run_restart_arx_effective_control_drift"
+        return result
+    restart = restart_runner or (
+        lambda item_symbol: _default_restart_runner(item_symbol, runner_wrapper=runner_wrapper)
+    )
+    try:
+        restart(normalized_symbol)
+    except subprocess.CalledProcessError as exc:
+        result["action"] = "restart_arx_effective_control_drift_failed"
+        result["restart_failed"] = str(exc)
+        return result
+    item.update(
+        {
+            "last_effective_control_drift_restart_at": now.isoformat(),
+            "last_recovery_action_at": now.isoformat(),
+            "last_recovery_action": "restart_arx_effective_control_drift",
+            "status": "effective_control_drift_recovery_active",
+        }
+    )
+    result["action"] = "restart_arx_effective_control_drift"
+    return result
+
+
 def should_enter_loss_reduce(
     *,
     low_volume: bool,
@@ -6979,6 +7053,24 @@ def main(argv: list[str] | None = None) -> int:
             )
             results.append(result)
             if result.get("restart_failed"):
+                exit_code = 1
+            continue
+        effective_control_drift_result = recover_arx_effective_control_drift(
+            output_dir=output_dir,
+            symbol=symbol,
+            state=state,
+            now=now,
+            cooldown_seconds=max(min(float(args.trigger_seconds), 90.0), 60.0),
+            dry_run=args.dry_run,
+            runner_wrapper=args.runner_wrapper,
+        )
+        if effective_control_drift_result is not None:
+            _append_jsonl(
+                output_dir / "bq_volume_recovery_guard_events.jsonl",
+                {"ts": now.isoformat(), **effective_control_drift_result},
+            )
+            results.append(effective_control_drift_result)
+            if effective_control_drift_result.get("restart_failed"):
                 exit_code = 1
             continue
         runner_error_result = recover_arx_runner_error_loop(

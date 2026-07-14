@@ -210,6 +210,28 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 restart_runner=lambda _symbol: self.fail("must not restart"),
             )
         self.assertIsNone(result)
+
+    def test_arx_effective_control_drift_restarts_runner(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            _write_json(
+                output_dir / "arxusdt_loop_runner_control.json",
+                {"sticky_entry_preserve_less_aggressive": False},
+            )
+            _write_json(output_dir / "arxusdt_loop_latest_plan.json", {})
+            restarted: list[str] = []
+            result = bq_volume_recovery_guard.recover_arx_effective_control_drift(
+                output_dir=output_dir,
+                symbol="ARXUSDT",
+                state={},
+                now=datetime(2026, 7, 14, tzinfo=timezone.utc),
+                cooldown_seconds=60.0,
+                dry_run=False,
+                runner_wrapper="unused",
+                restart_runner=lambda symbol: restarted.append(symbol),
+            )
+        self.assertEqual("restart_arx_effective_control_drift", result["action"])
+        self.assertEqual(["ARXUSDT"], restarted)
         self.assertFalse(
             bq_volume_recovery_guard.should_relax_arx_zero_order_volume_blockers(
                 symbol="ARXUSDT",
