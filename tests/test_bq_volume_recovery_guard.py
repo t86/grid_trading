@@ -354,6 +354,15 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 planned_reduce_only_order_count=3,
             )
         )
+        self.assertTrue(
+            bq_volume_recovery_guard.should_hold_arx_volume_priority_release(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.24,
+                allow_loss_reduce_only=False,
+                planned_reduce_only_order_count=3,
+            )
+        )
         self.assertFalse(
             bq_volume_recovery_guard.should_hold_arx_volume_priority_release(
                 symbol="ARXUSDT",

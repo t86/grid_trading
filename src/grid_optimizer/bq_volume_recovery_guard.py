@@ -2103,14 +2103,15 @@ def should_hold_arx_volume_priority_release(
     allow_loss_reduce_only: bool,
     planned_reduce_only_order_count: int,
 ) -> bool:
-    return (
-        is_arx_severe_volume_priority_recovery(
-            symbol=symbol,
-            target_pace_behind=target_pace_behind,
-            pace_ratio=pace_ratio,
-            planned_reduce_only_order_count=planned_reduce_only_order_count,
-        )
-        and bool(allow_loss_reduce_only)
+    # A recovery timeout is not evidence that pace recovered.  While ARX is
+    # still below 30% of its required pace and has an executable reduce leg,
+    # retain the recovery profile even when that profile has already disabled
+    # its temporary loss-reduce switch.
+    return is_arx_severe_volume_priority_recovery(
+        symbol=symbol,
+        target_pace_behind=target_pace_behind,
+        pace_ratio=pace_ratio,
+        planned_reduce_only_order_count=planned_reduce_only_order_count,
     )
 
 
