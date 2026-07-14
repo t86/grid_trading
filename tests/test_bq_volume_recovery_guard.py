@@ -506,25 +506,26 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertFalse(reset["best_quote_maker_volume_net_loss_reduce_enabled"])
         self.assertFalse(reset["best_quote_maker_volume_active_pair_reduce_enabled"])
 
-    def test_arx_side_cap_unwind_yields_to_high_wear_backoff(self) -> None:
-        self.assertEqual(
-            bq_volume_recovery_guard.arx_side_cap_unwind_updates(
-                control={
-                    "max_actual_net_notional": 1000.0,
-                    "max_position_notional": 800.0,
-                    "max_short_position_notional": 800.0,
-                    "pause_buy_position_notional": 440.0,
-                    "pause_short_position_notional": 440.0,
-                },
-                actual_long_notional=900.0,
-                actual_short_notional=200.0,
-                high_recovery_wear=True,
-            ),
-            {},
-        )
-
-        stale_direction = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+    def test_arx_side_cap_unwind_keeps_bounded_cap_relief_during_high_wear(self) -> None:
+        cap_relief = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
             control={
+                "max_actual_net_notional": 1000.0,
+                "max_position_notional": 800.0,
+                "max_short_position_notional": 800.0,
+                "pause_buy_position_notional": 440.0,
+                "pause_short_position_notional": 440.0,
+            },
+            actual_long_notional=900.0,
+            actual_short_notional=200.0,
+            high_recovery_wear=True,
+        )
+        self.assertEqual("net_long", cap_relief["best_quote_maker_volume_directional_net_guard"])
+        self.assertTrue(cap_relief["best_quote_maker_volume_allow_loss_reduce_only"])
+        self.assertFalse(cap_relief["best_quote_maker_volume_net_loss_reduce_enabled"])
+
+        continued_relief = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+            control={
+                "max_actual_net_notional": 1000.0,
                 "max_position_notional": 1000.0,
                 "max_short_position_notional": 1000.0,
                 "pause_buy_position_notional": 900.0,
@@ -537,13 +538,17 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             high_recovery_wear=True,
         )
         self.assertEqual(
-            "off",
-            stale_direction["best_quote_maker_volume_directional_net_guard"],
+            "net_short",
+            continued_relief["best_quote_maker_volume_directional_net_guard"],
         )
-        self.assertFalse(stale_direction["best_quote_maker_volume_allow_loss_reduce_only"])
+        self.assertNotEqual(
+            False,
+            continued_relief.get("best_quote_maker_volume_allow_loss_reduce_only", True),
+        )
 
         stale_allow_loss = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
             control={
+                "max_actual_net_notional": 1000.0,
                 "max_position_notional": 1000.0,
                 "max_short_position_notional": 1000.0,
                 "pause_buy_position_notional": 900.0,
@@ -552,7 +557,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 "best_quote_maker_volume_allow_loss_reduce_only": True,
             },
             actual_long_notional=400.0,
-            actual_short_notional=999.0,
+            actual_short_notional=800.0,
             high_recovery_wear=True,
         )
         self.assertFalse(

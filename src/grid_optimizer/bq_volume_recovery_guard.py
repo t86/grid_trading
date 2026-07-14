@@ -2494,32 +2494,24 @@ def arx_side_cap_unwind_updates(
             direction = "net_long" if long_relief >= short_relief else "net_short"
     else:
         direction = None
-    # Wear backoff prevents a new or continued loss unwind, but it must not
-    # retain a stale one once both sides are back inside their soft limits.
-    # Leaving that latch set suppresses ordinary two-sided quoting indefinitely.
-    if high_recovery_wear and (
-        direction is not None
-        or current_direction in {"net_long", "net_short"}
+    # High wear must clear a stale reduction latch, but it must not leave an
+    # active side at its cap with an empty book. In that case the bounded,
+    # maker-only release below remains the least risky way to recover room for
+    # ordinary two-sided flow. The normal target path also keeps the release
+    # close to the book and disables all prohibited loss/pair mechanisms.
+    if high_recovery_wear and direction is None and (
+        current_direction in {"net_long", "net_short"}
         or bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
     ):
-        # A high-wear tick must not leave the prior directional latch in
-        # place. The runner would otherwise keep reducing the old side after
-        # inventory has crossed over, exactly when the guard is meant to back
-        # away from loss-only flow.
-        if (
-            current_direction in {"net_long", "net_short"}
-            or bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
-        ):
-            targets = {
-                "best_quote_maker_volume_directional_net_guard": "off",
-                "best_quote_maker_volume_allow_loss_reduce_only": False,
-                "best_quote_maker_volume_net_loss_reduce_enabled": False,
-                "best_quote_maker_volume_active_pair_reduce_enabled": False,
-            }
-            return {
-                key: value for key, value in targets.items() if control.get(key) != value
-            }
-        return {}
+        targets = {
+            "best_quote_maker_volume_directional_net_guard": "off",
+            "best_quote_maker_volume_allow_loss_reduce_only": False,
+            "best_quote_maker_volume_net_loss_reduce_enabled": False,
+            "best_quote_maker_volume_active_pair_reduce_enabled": False,
+        }
+        return {
+            key: value for key, value in targets.items() if control.get(key) != value
+        }
     if direction is None:
         if (
             current_direction == "off"
@@ -4116,8 +4108,6 @@ def check_symbol(
                     bool(assessment.get("long_near_cap"))
                     or bool(assessment.get("short_near_cap"))
                 )
-                and not high_recovery_wear
-                and not confirmed_loss_reduce_wear
             ),
         ),
     } if normalized_symbol == "ARXUSDT" else {}
