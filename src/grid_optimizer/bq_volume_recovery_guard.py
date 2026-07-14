@@ -6712,10 +6712,45 @@ def check_symbol(
                         restart_runner=restart,
                     )
                 else:
-                    action = "hold_recovery_until_cap_buffer"
-                    item.update(
-                        {"status": "recovery_active", "last_recovery_check_at": now.isoformat()}
+                    arx_extension_updates = arx_soft_recovery_extension_updates(
+                        control=control,
+                        assessment=assessment,
+                        volume_summary=volume_summary,
                     )
+                    if arx_extension_updates:
+                        _remember_recovery_controls(
+                            item,
+                            control,
+                            tuple(arx_extension_updates),
+                        )
+                        _remember_recovery_updates(item, arx_extension_updates)
+                        action = (
+                            "dry_run_raise_arx_cap_pressure_maker_flow"
+                            if dry_run
+                            else "raise_arx_cap_pressure_maker_flow"
+                        )
+                        item.update(
+                            {
+                                "status": "recovery_active",
+                                "last_recovery_check_at": now.isoformat(),
+                                "last_recovery_action_at": now.isoformat(),
+                                "last_recovery_action": action,
+                            }
+                        )
+                        changed, backup_path = _apply_control_update(
+                            symbol=normalized_symbol,
+                            control_path=control_path,
+                            control=control,
+                            updates=arx_extension_updates,
+                            now=now,
+                            dry_run=dry_run,
+                            restart_runner=restart,
+                        )
+                    else:
+                        action = "hold_recovery_until_cap_buffer"
+                        item.update(
+                            {"status": "recovery_active", "last_recovery_check_at": now.isoformat()}
+                        )
             else:
                 action = "hold_recovery_until_volume_or_orders"
                 item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
