@@ -5972,7 +5972,10 @@ def check_symbol(
                     and no_fill_seconds >= max(float(trigger_seconds), 0.0)
                     and bool(assessment.get("inventory_soft_pressure"))
                     and not confirmed_loss_reduce_wear
-                    and not post_restore_budget_cooldown_active
+                    and (
+                        not post_restore_budget_cooldown_active
+                        or arx_severe_volume_priority_recovery
+                    )
                     and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
                 ):
                     updates = {

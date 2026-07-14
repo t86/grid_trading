@@ -55,7 +55,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
         )
 
-    def test_arx_severe_target_gap_releases_during_existing_inventory_recovery(self) -> None:
+    def test_arx_severe_target_gap_releases_during_post_restore_cooldown(self) -> None:
         now = datetime(2026, 7, 12, 11, 56, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -95,17 +95,11 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             state: dict[str, object] = {
                 "symbols": {
                     "ARXUSDT": {
-                        "status": "recovery_active",
+                        "status": "cooldown",
                         "first_low_volume_at": (now - timedelta(minutes=30)).isoformat(),
                         "no_fill_since": (now - timedelta(minutes=30)).isoformat(),
-                        "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
-                        "last_recovery_action_at": (now - timedelta(seconds=60)).isoformat(),
-                        "guard_original_controls": {
-                            "best_quote_maker_volume_cycle_budget_notional": 108.0,
-                        },
-                        "guard_recovery_controls": {
-                            "best_quote_maker_volume_cycle_budget_notional": 162.0,
-                        },
+                        "cooldown_until": (now + timedelta(minutes=5)).isoformat(),
+                        "post_restore_budget_cooldown_until": (now + timedelta(minutes=5)).isoformat(),
                     }
                 }
             }
@@ -131,7 +125,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             control = json.loads(
                 (output_dir / "arxusdt_loop_runner_control.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(result["action"], "enable_arx_severe_inventory_loss_recovery", result)
+            self.assertEqual(result["action"], "enable_stalled_reduce_only_loss_recovery", result)
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["ARXUSDT"])
 
