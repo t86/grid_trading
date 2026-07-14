@@ -2497,12 +2497,19 @@ def arx_side_cap_unwind_updates(
     # Wear backoff prevents a new or continued loss unwind, but it must not
     # retain a stale one once both sides are back inside their soft limits.
     # Leaving that latch set suppresses ordinary two-sided quoting indefinitely.
-    if high_recovery_wear and direction is not None:
+    if high_recovery_wear and (
+        direction is not None
+        or current_direction in {"net_long", "net_short"}
+        or bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+    ):
         # A high-wear tick must not leave the prior directional latch in
         # place. The runner would otherwise keep reducing the old side after
         # inventory has crossed over, exactly when the guard is meant to back
         # away from loss-only flow.
-        if current_direction in {"net_long", "net_short"}:
+        if (
+            current_direction in {"net_long", "net_short"}
+            or bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+        ):
             targets = {
                 "best_quote_maker_volume_directional_net_guard": "off",
                 "best_quote_maker_volume_allow_loss_reduce_only": False,
