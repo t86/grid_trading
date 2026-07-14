@@ -80,6 +80,7 @@ _RECOVERY_CONTROL_KEYS = (
     "best_quote_maker_volume_inventory_bias_reduce_share",
     "best_quote_maker_volume_inventory_soft_ratio",
     "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled",
+    "best_quote_maker_volume_dynamic_control_trend_inventory_guard_enabled",
     "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_enabled",
     "best_quote_maker_volume_inventory_bias_enabled",
     "best_quote_maker_volume_same_side_entry_price_guard_report_only",
@@ -2248,6 +2249,37 @@ def should_repair_arx_loss_reduce_flow(
     )
 
 
+def arx_lopsided_entry_recovery_updates(
+    *, control: dict[str, Any], assessment: dict[str, Any]
+) -> dict[str, Any]:
+    """Restore the empty opposite maker leg when ARX is trapped on one side."""
+    current_long = max(_safe_float(assessment.get("current_long_notional")), 0.0)
+    current_short = max(_safe_float(assessment.get("current_short_notional")), 0.0)
+    max_long = max(_safe_float(assessment.get("max_long_notional")), 0.0)
+    max_short = max(_safe_float(assessment.get("max_short_notional")), 0.0)
+    if (
+        str(assessment.get("symbol") or "").upper() != "ARXUSDT"
+        or not bool(assessment.get("target_pace_behind"))
+        or not bool(assessment.get("low_volume"))
+        or bool(assessment.get("volatility_entry_pause_active"))
+        or _safe_int(assessment.get("planned_entry_order_count")) > 0
+        or max_long <= 0
+        or max_short <= 0
+        or current_long < max_long * 0.9
+        or current_short > max_short * 0.5
+    ):
+        return {}
+    return {
+        key: False
+        for key in (
+            "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled",
+            "best_quote_maker_volume_dynamic_control_trend_inventory_guard_enabled",
+            "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_enabled",
+        )
+        if bool(control.get(key))
+    }
+
+
 def should_bypass_arx_recovery_drift_debounce(
     *,
     symbol: str,
@@ -3669,6 +3701,10 @@ def check_symbol(
             arx_zero_order_volume_updates[
                 "best_quote_maker_volume_same_side_entry_price_guard_report_only"
             ] = True
+    arx_lopsided_entry_updates = arx_lopsided_entry_recovery_updates(
+        control=control,
+        assessment=assessment,
+    )
     arx_sticky_requote_updates: dict[str, Any] = {}
     arx_severe_pace_capacity = arx_severe_pace_capacity_updates(
         control=control,
@@ -3926,6 +3962,37 @@ def check_symbol(
                 control_path=control_path,
                 control=control,
                 updates=arx_zero_order_volume_updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif arx_lopsided_entry_updates:
+            _remember_recovery_controls(
+                item,
+                control,
+                tuple(arx_lopsided_entry_updates),
+            )
+            _remember_recovery_updates(item, arx_lopsided_entry_updates)
+            action = (
+                "dry_run_relax_arx_lopsided_entry_blockers_for_pace"
+                if dry_run
+                else "relax_arx_lopsided_entry_blockers_for_pace"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                    "last_sla_action_at": now.isoformat(),
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=arx_lopsided_entry_updates,
                 now=now,
                 dry_run=dry_run,
                 restart_runner=restart,

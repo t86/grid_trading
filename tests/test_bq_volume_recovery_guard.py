@@ -93,6 +93,53 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
         )
 
+    def test_arx_lopsided_entry_recovery_relaxes_only_calm_opposite_leg_blockers(self) -> None:
+        updates = bq_volume_recovery_guard.arx_lopsided_entry_recovery_updates(
+            control={
+                "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled": True,
+                "best_quote_maker_volume_dynamic_control_trend_inventory_guard_enabled": True,
+                "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_enabled": True,
+            },
+            assessment={
+                "symbol": "ARXUSDT",
+                "target_pace_behind": True,
+                "low_volume": True,
+                "volatility_entry_pause_active": False,
+                "planned_entry_order_count": 0,
+                "current_long_notional": 2500.0,
+                "current_short_notional": 800.0,
+                "max_long_notional": 2600.0,
+                "max_short_notional": 2600.0,
+            },
+        )
+        self.assertEqual(
+            {
+                "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled": False,
+                "best_quote_maker_volume_dynamic_control_trend_inventory_guard_enabled": False,
+                "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_enabled": False,
+            },
+            updates,
+        )
+        self.assertEqual(
+            {},
+            bq_volume_recovery_guard.arx_lopsided_entry_recovery_updates(
+                control={
+                    "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled": True,
+                },
+                assessment={
+                    "symbol": "ARXUSDT",
+                    "target_pace_behind": True,
+                    "low_volume": True,
+                    "volatility_entry_pause_active": True,
+                    "planned_entry_order_count": 0,
+                    "current_long_notional": 2500.0,
+                    "current_short_notional": 800.0,
+                    "max_long_notional": 2600.0,
+                    "max_short_notional": 2600.0,
+                },
+            ),
+        )
+
     def test_arx_only_bypasses_submit_failure_gate_when_no_strategy_order_survives(self) -> None:
         decide = bq_volume_recovery_guard.should_bypass_arx_submit_failure_recovery_gate
 
