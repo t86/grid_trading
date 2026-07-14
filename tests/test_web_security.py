@@ -3906,6 +3906,21 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--sticky-entry-preserve-less-aggressive", command)
         self.assertIn("--synthetic-residual-short-flat-notional", command)
 
+    def test_build_runner_command_disables_less_aggressive_sticky_entry(self) -> None:
+        config = dict(web_module.RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "ARXUSDT",
+                "strategy_profile": "arxusdt_best_quote_maker_volume_114_v2",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "sticky_entry_preserve_less_aggressive": False,
+            }
+        )
+        command = _build_runner_command(config)
+
+        self.assertIn("--no-sticky-entry-preserve-less-aggressive", command)
+        self.assertNotIn("--sticky-entry-preserve-less-aggressive", command)
+
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     def test_default_runner_command_includes_sticky_entry_churn_controls(

@@ -11367,8 +11367,11 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
                 str(config["sticky_exit_price_tolerance_steps"]),
             ]
         )
-    if bool(config.get("sticky_entry_preserve_less_aggressive", False)):
-        command.append("--sticky-entry-preserve-less-aggressive")
+    command.append(
+        "--sticky-entry-preserve-less-aggressive"
+        if bool(config.get("sticky_entry_preserve_less_aggressive", False))
+        else "--no-sticky-entry-preserve-less-aggressive"
+    )
     if config.get("synthetic_residual_long_flat_notional") is not None:
         command.extend(
             [
