@@ -348,6 +348,34 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(3200.0, updates["max_position_notional"])
         self.assertEqual(2000.0, updates["best_quote_maker_volume_cycle_budget_notional"])
         self.assertFalse(updates["best_quote_maker_volume_allow_loss_reduce_only"])
+
+    def test_arx_balanced_fast_sla_capacity_covers_actual_frozen_side(self) -> None:
+        updates = bq_volume_recovery_guard.arx_balanced_fast_sla_capacity_updates(
+            control={
+                "max_position_notional": 3200.0,
+                "max_short_position_notional": 3200.0,
+                "pause_buy_position_notional": 2880.0,
+                "pause_short_position_notional": 2880.0,
+                "best_quote_maker_volume_inventory_soft_ratio": 0.9,
+            },
+            assessment={
+                "current_long_notional": 2580.0,
+                "current_short_notional": 3203.0,
+                "actual_long_notional": 2827.0,
+                "actual_short_notional": 3359.0,
+                "volatility_entry_pause_active": False,
+            },
+            target_pace_behind=True,
+            no_fill_seconds=120.0,
+            fast_sla_seconds=120.0,
+            high_recovery_wear=False,
+        )
+        self.assertEqual(4000.0, updates["max_position_notional"])
+        self.assertEqual(4000.0, updates["max_short_position_notional"])
+        self.assertEqual(4000.0, updates["pause_buy_position_notional"])
+        self.assertEqual(4000.0, updates["pause_short_position_notional"])
+        self.assertEqual(1.0, updates["best_quote_maker_volume_inventory_soft_ratio"])
+        self.assertEqual(8000.0, updates["max_total_notional"])
         self.assertEqual(
             {},
             bq_volume_recovery_guard.arx_balanced_fast_sla_capacity_updates(
