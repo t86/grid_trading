@@ -370,6 +370,42 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
         self.assertEqual(plan["buy_orders"][0]["time_in_force"], "GTX")
 
+    def test_directional_net_guard_reprices_existing_short_reduce_to_best_bid(self) -> None:
+        plan = {
+            "buy_orders": [
+                {
+                    "role": "best_quote_reduce_short",
+                    "side": "BUY",
+                    "position_side": "SHORT",
+                    "price": 0.1706,
+                    "qty": 2558.0,
+                    "notional": 436.3948,
+                }
+            ],
+            "sell_orders": [],
+        }
+
+        result = _ensure_best_quote_directional_net_guard_reduce_order(
+            plan,
+            direction="net_short",
+            bid_price=0.1710,
+            ask_price=0.1711,
+            current_long_qty=0.0,
+            current_short_qty=2558.0,
+            max_order_notional=32.0,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+        )
+
+        self.assertTrue(result["repriced"])
+        self.assertEqual(result["reason"], "repriced_directional_reduce")
+        self.assertEqual(plan["buy_orders"][0]["price"], 0.1710)
+        self.assertEqual(plan["buy_orders"][0]["notional"], 437.418)
+        self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
+        self.assertEqual(plan["buy_orders"][0]["time_in_force"], "GTX")
+
     def test_hedge_best_quote_position_diff_treats_min_notional_residue_as_dust(self) -> None:
         self.assertTrue(
             _hedge_best_quote_position_diff_effectively_dust(

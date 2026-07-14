@@ -2599,13 +2599,36 @@ def _ensure_best_quote_directional_net_guard_reduce_order(
         "enabled": bool(spec),
         "direction": normalized_direction if spec else "off",
         "added": False,
+        "repriced": False,
         "reason": "off" if not spec else "already_present",
         "order": None,
     }
     if not spec:
         return result
     order_key, side, position_side, role, position_qty, anchor_price = spec
-    if any(_order_role(item) == role for item in list(plan.get(order_key) or []) if isinstance(item, dict)):
+    existing_orders = [
+        dict(item)
+        for item in list(plan.get(order_key) or [])
+        if isinstance(item, dict) and _order_role(item) == role
+    ]
+    if existing_orders:
+        price = _round_order_price(max(_safe_float(anchor_price), 0.0), tick_size, side)
+        if price <= 0:
+            result["reason"] = "missing_anchor_price"
+            return result
+        for order in existing_orders:
+            order["price"] = price
+            order["notional"] = _safe_float(order.get("qty")) * price
+            order["time_in_force"] = "GTX"
+            order["force_reduce_only"] = True
+        plan[order_key] = existing_orders
+        result.update(
+            {
+                "repriced": True,
+                "reason": "repriced_directional_reduce",
+                "order": dict(existing_orders[0]),
+            }
+        )
         return result
     price = _round_order_price(max(_safe_float(anchor_price), 0.0), tick_size, side)
     safe_notional = min(max(_safe_float(position_qty), 0.0) * price, max(_safe_float(max_order_notional), 0.0))
