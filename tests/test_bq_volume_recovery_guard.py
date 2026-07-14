@@ -315,6 +315,26 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             ),
         )
 
+    def test_arx_single_side_cap_lowers_existing_recovery_override(self) -> None:
+        updates = bq_volume_recovery_guard.arx_single_side_cap_updates(
+            {
+                "pause_buy_position_notional": 5000.0,
+                "pause_short_position_notional": 2600.0,
+                "max_position_notional": 5000.0,
+                "max_short_position_notional": 2600.0,
+                "maker_max_long_notional": 5000.0,
+                "maker_max_short_notional": 2600.0,
+                "best_quote_maker_volume_max_long_notional": 5000.0,
+                "best_quote_maker_volume_max_short_notional": 2600.0,
+            }
+        )
+        self.assertEqual(1800.0, updates["pause_buy_position_notional"])
+        self.assertEqual(1800.0, updates["pause_short_position_notional"])
+        self.assertEqual(2000.0, updates["max_position_notional"])
+        self.assertEqual(2000.0, updates["max_short_position_notional"])
+        self.assertEqual(2000.0, updates["maker_max_long_notional"])
+        self.assertEqual(2000.0, updates["maker_max_short_notional"])
+
     def test_arx_severe_pace_capacity_never_exceeds_single_side_hard_cap(self) -> None:
         updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
             control={

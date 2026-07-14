@@ -2363,6 +2363,23 @@ def should_bypass_arx_recovery_drift_debounce(
     )
 
 
+def arx_single_side_cap_updates(control: dict[str, Any]) -> dict[str, Any]:
+    """Keep all ARX entry paths within the operational single-side hard cap."""
+    targets = {
+        "pause_buy_position_notional": 1800.0,
+        "pause_short_position_notional": 1800.0,
+        "max_position_notional": 2000.0,
+        "max_short_position_notional": 2000.0,
+        "maker_max_long_notional": 2000.0,
+        "maker_max_short_notional": 2000.0,
+        "best_quote_maker_volume_max_long_notional": 2000.0,
+        "best_quote_maker_volume_max_short_notional": 2000.0,
+    }
+    return {
+        key: value for key, value in targets.items() if _safe_float(control.get(key)) != value
+    }
+
+
 def arx_severe_pace_capacity_updates(
     *,
     control: dict[str, Any],
@@ -2377,23 +2394,8 @@ def arx_severe_pace_capacity_updates(
     """Temporarily recover ARX flow without exceeding the per-side hard cap."""
     del actual_long_notional, actual_short_notional
     target_max_notional = 2000.0
-    target_pause_notional = 1800.0
-    side_cap_keys = (
-        "pause_buy_position_notional",
-        "pause_short_position_notional",
-        "max_position_notional",
-        "max_short_position_notional",
-        "maker_max_long_notional",
-        "maker_max_short_notional",
-        "best_quote_maker_volume_max_long_notional",
-        "best_quote_maker_volume_max_short_notional",
-    )
-    capacity_already_raised = all(
-        _safe_float(control.get(key)) == (
-            target_pause_notional if key.startswith("pause_") else target_max_notional
-        )
-        for key in side_cap_keys
-    ) and all(
+    side_cap_updates = arx_single_side_cap_updates(control)
+    capacity_already_raised = not side_cap_updates and all(
         _safe_float(control.get(key)) >= 480.0
         for key in (
             "best_quote_maker_volume_active_pair_reduce_order_notional",
@@ -2408,14 +2410,6 @@ def arx_severe_pace_capacity_updates(
     ):
         return {}
     targets = {
-        "pause_buy_position_notional": target_pause_notional,
-        "pause_short_position_notional": target_pause_notional,
-        "max_position_notional": target_max_notional,
-        "max_short_position_notional": target_max_notional,
-        "maker_max_long_notional": target_max_notional,
-        "maker_max_short_notional": target_max_notional,
-        "best_quote_maker_volume_max_long_notional": target_max_notional,
-        "best_quote_maker_volume_max_short_notional": target_max_notional,
         "best_quote_maker_volume_inventory_soft_ratio": 0.9,
         "best_quote_maker_volume_min_cycle_budget_notional": 960.0,
         "best_quote_maker_volume_cycle_budget_notional": 1600.0,
@@ -2423,15 +2417,12 @@ def arx_severe_pace_capacity_updates(
         "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 480.0,
         "max_total_notional": target_max_notional * 2.0,
     }
-    updates = {
+    updates = dict(side_cap_updates)
+    updates.update({
         key: value
         for key, value in targets.items()
-        if (
-            _safe_float(control.get(key)) != value
-            if key in side_cap_keys
-            else _safe_float(control.get(key)) < value
-        )
-    }
+        if _safe_float(control.get(key)) < value
+    })
     if bool(control.get("best_quote_maker_volume_inventory_bias_enabled")):
         updates["best_quote_maker_volume_inventory_bias_enabled"] = False
     if (
@@ -7901,6 +7892,10 @@ def main(argv: list[str] | None = None) -> int:
                 "active_order_count"
             )
         )
+        arx_single_side_cap_pending = (
+            symbol.upper() == "ARXUSDT"
+            and bool(arx_single_side_cap_updates(_read_json(_control_path(output_dir, symbol))))
+        )
         exchange_order_drift_result = recover_arx_exchange_order_drift(
             symbol=symbol,
             local_active_order_count=local_active_order_count,
@@ -7915,14 +7910,19 @@ def main(argv: list[str] | None = None) -> int:
             runner_wrapper=args.runner_wrapper,
         )
         if exchange_order_drift_result is not None:
-            _append_jsonl(
-                output_dir / "bq_volume_recovery_guard_events.jsonl",
-                {"ts": now.isoformat(), **exchange_order_drift_result},
+            hold_for_recent_activity = (
+                exchange_order_drift_result.get("action")
+                == "hold_arx_exchange_order_drift_after_recent_activity"
             )
-            results.append(exchange_order_drift_result)
-            if exchange_order_drift_result.get("restart_failed"):
-                exit_code = 1
-            continue
+            if not (arx_single_side_cap_pending and hold_for_recent_activity):
+                _append_jsonl(
+                    output_dir / "bq_volume_recovery_guard_events.jsonl",
+                    {"ts": now.isoformat(), **exchange_order_drift_result},
+                )
+                results.append(exchange_order_drift_result)
+                if exchange_order_drift_result.get("restart_failed"):
+                    exit_code = 1
+                continue
         result = check_symbol(
             symbol=symbol,
             output_dir=output_dir,
