@@ -3992,13 +3992,36 @@ def check_symbol(
         frozen_long_notional=_safe_float(assessment.get("frozen_long_notional")),
         frozen_short_notional=_safe_float(assessment.get("frozen_short_notional")),
     ) if normalized_symbol == "ARXUSDT" else {}
+    frozen_inventory_present = (
+        _safe_float(assessment.get("frozen_long_notional")) > 0.0
+        or _safe_float(assessment.get("frozen_short_notional")) > 0.0
+    )
+    directional_long_notional = _safe_float(
+        assessment.get(
+            "current_long_notional"
+            if frozen_inventory_present
+            else "actual_long_notional"
+        )
+    )
+    directional_short_notional = _safe_float(
+        assessment.get(
+            "current_short_notional"
+            if frozen_inventory_present
+            else "actual_short_notional"
+        )
+    )
     arx_side_cap_unwind = {
         **arx_frozen_inventory_headroom,
         **arx_side_cap_unwind_updates(
-        control=control,
-        actual_long_notional=_safe_float(assessment.get("actual_long_notional")),
-        actual_short_notional=_safe_float(assessment.get("actual_short_notional")),
-        high_recovery_wear=high_recovery_wear or confirmed_loss_reduce_wear,
+            control=control,
+            # Frozen inventory has its own cap and release policy. Directional
+            # recovery must only react to runner-managed active inventory; a
+            # frozen lot above the active soft band must not latch net-long or
+            # net-short and suppress both normal entry legs. With no frozen
+            # inventory, retain the existing exchange-actual behavior.
+            actual_long_notional=directional_long_notional,
+            actual_short_notional=directional_short_notional,
+            high_recovery_wear=high_recovery_wear or confirmed_loss_reduce_wear,
         ),
     } if normalized_symbol == "ARXUSDT" else {}
     arx_fast_sla_capacity_reapply = should_bypass_arx_recovery_drift_debounce(
