@@ -104,6 +104,14 @@ _RECOVERY_CONTROL_KEYS = (
     "sticky_exit_price_tolerance_steps",
 )
 
+# Keep generic loss-reduction protection separate from the bounded ARX
+# catch-up mode. A few dollars per 10k of maker turnover is expected while a
+# lagging ARX runner rebuilds two-sided capacity, but that must not weaken the
+# normal protection used by every other strategy.
+LOSS_REDUCE_WEAR_PER_10K = 3.0
+ARX_TARGET_PACE_WEAR_PER_10K = 8.0
+EMERGENCY_WEAR_PER_10K = 80.0
+
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
@@ -529,7 +537,10 @@ def _is_high_recovery_wear(volume_summary: dict[str, Any]) -> bool:
     )
     return (
         _safe_float(volume_summary.get("trailing_15m_gross_notional")) >= 100.0
-        and (trailing_15m_wear > 3.0 or trailing_5m_wear > 80.0)
+        and (
+            trailing_15m_wear > LOSS_REDUCE_WEAR_PER_10K
+            or trailing_5m_wear > EMERGENCY_WEAR_PER_10K
+        )
     )
 
 
@@ -1101,13 +1112,13 @@ def _normal_entry_wear_backoff_confirmed(
     wear_15m = _safe_float(volume_summary.get("trailing_15m_realized_wear_per_10k"))
     volume_5m = _safe_float(volume_summary.get("trailing_5m_gross_notional"))
     volume_15m = _safe_float(volume_summary.get("trailing_15m_gross_notional"))
-    if volume_15m < 100.0 or max(wear_5m, wear_15m) <= 3.0:
+    if volume_15m < 100.0 or max(wear_5m, wear_15m) <= LOSS_REDUCE_WEAR_PER_10K:
         return False
     if not target_pace_behind:
         return True
     # While badly behind target, stale loss-reduce wear in the 15m window must
     # not immediately throttle newly restored normal entry flow.
-    return volume_5m >= 100.0 and wear_5m > 3.0
+    return volume_5m >= 100.0 and wear_5m > LOSS_REDUCE_WEAR_PER_10K
 
 
 def _recovery_inventory_buffer_ok(
@@ -2648,7 +2659,7 @@ def arx_soft_recovery_extension_updates(
         or not bool(assessment.get("effective_inventory_soft_pressure"))
         or bool(assessment.get("volatility_entry_pause_active"))
         or _safe_float(volume_summary.get("trailing_15m_gross_notional")) < 100.0
-        or max(wear_5m, wear_15m) > 3.0
+        or max(wear_5m, wear_15m) > LOSS_REDUCE_WEAR_PER_10K
     ):
         return {}
     targets = {
@@ -3807,11 +3818,16 @@ def check_symbol(
     trailing_5m_gross_notional = _safe_float(
         volume_summary.get("trailing_5m_gross_notional")
     )
+    loss_reduce_wear_threshold = (
+        ARX_TARGET_PACE_WEAR_PER_10K
+        if normalized_symbol == "ARXUSDT" and target_pace_behind
+        else LOSS_REDUCE_WEAR_PER_10K
+    )
     confirmed_loss_reduce_wear = (
-        trailing_5m_realized_wear_per_10k > 80.0
+        trailing_5m_realized_wear_per_10k > EMERGENCY_WEAR_PER_10K
         or (
             trailing_5m_gross_notional >= 100.0
-            and trailing_5m_realized_wear_per_10k > 3.0
+            and trailing_5m_realized_wear_per_10k > loss_reduce_wear_threshold
         )
     )
     active_pair_reduce_deadlock = bool(
@@ -5233,8 +5249,8 @@ def check_symbol(
             and bool(assessment.get("all_entry_orders_far"))
             and _safe_int(assessment.get("near_market_reduce_only_order_count")) > 0
             and _safe_float(volume_summary.get("trailing_15m_gross_notional")) >= 100.0
-            and trailing_5m_realized_wear_per_10k <= 3.0
-            and trailing_15m_realized_wear_per_10k <= 3.0
+            and trailing_5m_realized_wear_per_10k <= LOSS_REDUCE_WEAR_PER_10K
+            and trailing_15m_realized_wear_per_10k <= LOSS_REDUCE_WEAR_PER_10K
             and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) > 1
         ):
             updates = {
@@ -5290,8 +5306,8 @@ def check_symbol(
             and (
                 bool(assessment.get("balancing_entry_requote_safe"))
                 or (
-                    trailing_5m_realized_wear_per_10k <= 3.0
-                    and trailing_15m_realized_wear_per_10k <= 3.0
+                    trailing_5m_realized_wear_per_10k <= LOSS_REDUCE_WEAR_PER_10K
+                    and trailing_15m_realized_wear_per_10k <= LOSS_REDUCE_WEAR_PER_10K
                 )
             )
             and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) > 0
@@ -5459,8 +5475,8 @@ def check_symbol(
             and _safe_int(assessment.get("planned_entry_order_count")) > 0
             and _safe_int(assessment.get("planned_reduce_only_order_count")) > 0
             and _safe_float(volume_summary.get("trailing_15m_gross_notional")) >= 100.0
-            and trailing_5m_realized_wear_per_10k <= 3.0
-            and trailing_15m_realized_wear_per_10k <= 3.0
+            and trailing_5m_realized_wear_per_10k <= LOSS_REDUCE_WEAR_PER_10K
+            and trailing_15m_realized_wear_per_10k <= LOSS_REDUCE_WEAR_PER_10K
             and static_cycle_budget_floor_notional > 0
             and _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
             < static_cycle_budget_floor_notional
