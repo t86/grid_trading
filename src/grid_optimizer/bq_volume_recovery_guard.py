@@ -2185,7 +2185,7 @@ def arx_severe_pace_capacity_updates(
     frozen_total_notional: float,
 ) -> dict[str, Any]:
     """Temporarily widen ARX capacity only for a severe, calm pace miss."""
-    target_max_notional = 2000.0
+    target_max_notional = 2600.0
     capacity_already_raised = all(
         _safe_float(control.get(key)) >= target_max_notional
         for key in (
@@ -2204,8 +2204,8 @@ def arx_severe_pace_capacity_updates(
     ):
         return {}
     targets = {
-        "pause_buy_position_notional": 1800.0,
-        "pause_short_position_notional": 1800.0,
+        "pause_buy_position_notional": 2340.0,
+        "pause_short_position_notional": 2340.0,
         "max_position_notional": target_max_notional,
         "max_short_position_notional": target_max_notional,
         "maker_max_long_notional": target_max_notional,
@@ -2213,8 +2213,8 @@ def arx_severe_pace_capacity_updates(
         "best_quote_maker_volume_max_long_notional": target_max_notional,
         "best_quote_maker_volume_max_short_notional": target_max_notional,
         "best_quote_maker_volume_inventory_soft_ratio": 0.9,
-        "best_quote_maker_volume_min_cycle_budget_notional": 720.0,
-        "best_quote_maker_volume_cycle_budget_notional": 1200.0,
+        "best_quote_maker_volume_min_cycle_budget_notional": 960.0,
+        "best_quote_maker_volume_cycle_budget_notional": 1600.0,
     }
     updates = {
         key: value

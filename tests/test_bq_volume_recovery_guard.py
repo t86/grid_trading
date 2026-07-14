@@ -151,11 +151,11 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             volatility_entry_pause_active=False,
             frozen_total_notional=400.0,
         )
-        self.assertEqual(1800.0, updates["pause_buy_position_notional"])
-        self.assertEqual(2000.0, updates["max_position_notional"])
+        self.assertEqual(2340.0, updates["pause_buy_position_notional"])
+        self.assertEqual(2600.0, updates["max_position_notional"])
         self.assertEqual(0.9, updates["best_quote_maker_volume_inventory_soft_ratio"])
-        self.assertEqual(1200.0, updates["best_quote_maker_volume_cycle_budget_notional"])
-        self.assertEqual(720.0, updates["best_quote_maker_volume_min_cycle_budget_notional"])
+        self.assertEqual(1600.0, updates["best_quote_maker_volume_cycle_budget_notional"])
+        self.assertEqual(960.0, updates["best_quote_maker_volume_min_cycle_budget_notional"])
         self.assertFalse(updates["best_quote_maker_volume_inventory_bias_enabled"])
         self.assertTrue(
             updates["best_quote_maker_volume_same_side_entry_price_guard_report_only"]
@@ -189,22 +189,22 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             frozen_total_notional=400.0,
         )
 
-        self.assertEqual(2000.0, updates["max_position_notional"])
+        self.assertEqual(2600.0, updates["max_position_notional"])
         self.assertEqual(0.9, updates["best_quote_maker_volume_inventory_soft_ratio"])
 
         self.assertEqual(
             {},
             bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
                 control={
-                    "pause_buy_position_notional": 1800.0,
-                    "pause_short_position_notional": 1800.0,
-                    "max_position_notional": 2000.0,
-                    "max_short_position_notional": 2000.0,
-                    "best_quote_maker_volume_max_long_notional": 2000.0,
-                    "best_quote_maker_volume_max_short_notional": 2000.0,
+                    "pause_buy_position_notional": 2340.0,
+                    "pause_short_position_notional": 2340.0,
+                    "max_position_notional": 2600.0,
+                    "max_short_position_notional": 2600.0,
+                    "best_quote_maker_volume_max_long_notional": 2600.0,
+                    "best_quote_maker_volume_max_short_notional": 2600.0,
                     "best_quote_maker_volume_inventory_soft_ratio": 0.9,
-                    "best_quote_maker_volume_min_cycle_budget_notional": 720.0,
-                    "best_quote_maker_volume_cycle_budget_notional": 1200.0,
+                    "best_quote_maker_volume_min_cycle_budget_notional": 960.0,
+                    "best_quote_maker_volume_cycle_budget_notional": 1600.0,
                 },
                 target_pace_behind=True,
                 pace_ratio=0.40,
