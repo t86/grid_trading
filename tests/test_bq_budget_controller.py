@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+import grid_optimizer.bq_budget_controller as budget_controller
 from grid_optimizer.bq_budget_controller import (
     Budgets,
     FlowSplit,
@@ -12,6 +17,23 @@ from grid_optimizer.bq_budget_controller import (
 
 
 class BqBudgetControllerTests(unittest.TestCase):
+    def test_control_writer_uses_a_unique_atomic_temp_path_per_write(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "arxusdt_loop_runner_control.json"
+            original_replace = budget_controller.os.replace
+            replaced_sources: list[str] = []
+
+            def capture_replace(source: str | Path, destination: str | Path) -> None:
+                replaced_sources.append(Path(source).name)
+                return original_replace(source, destination)
+
+            with patch.object(budget_controller.os, "replace", new=capture_replace):
+                budget_controller._write_control_json(str(path), {"cycle": 1})
+                budget_controller._write_control_json(str(path), {"cycle": 2})
+
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"cycle": 2})
+            self.assertEqual(len(set(replaced_sources)), 2)
+
     def test_defaults_all_tiers_to_current_runner_cycle(self) -> None:
         budgets, source = resolve_budget_tiers(
             {"best_quote_maker_volume_cycle_budget_notional": 120.0}

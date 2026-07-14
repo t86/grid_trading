@@ -4421,7 +4421,12 @@ def _read_json_dict(path: Path) -> dict[str, Any] | None:
 
 def _write_json_dict(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def _email_float(value: Any, default: float = 0.0) -> float:
@@ -5289,8 +5294,7 @@ def _read_flatten_process_for_symbol(symbol: str) -> dict[str, Any]:
 def _save_flatten_control_config(config: dict[str, Any], *, symbol: str | None = None) -> None:
     normalized_symbol = str(symbol or config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
     control_path = _flatten_control_path(normalized_symbol)
-    control_path.parent.mkdir(parents=True, exist_ok=True)
-    control_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json_dict(control_path, config)
 
 
 def _save_runner_control_config(config: dict[str, Any], *, symbol: str | None = None) -> None:
@@ -8617,7 +8621,7 @@ def _save_spot_runner_control_config(config: dict[str, Any], *, symbol: str | No
         for key, value in existing.items():
             if key.startswith("spot_app_loss_prestart_gate_") and key not in config:
                 config[key] = value
-    control_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json_dict(control_path, config)
 
 
 def _tail_jsonl_dicts(path: Path, limit: int = 20) -> list[dict[str, Any]]:

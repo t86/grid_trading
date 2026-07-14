@@ -43,7 +43,9 @@ import subprocess
 import sys
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterable, Sequence
+from uuid import uuid4
 
 FLOW_PNL_CUT_DEFAULT = 0.3
 PLAN_MAX_AGE_SECONDS_DEFAULT = 300.0
@@ -60,6 +62,18 @@ TIER_DONE = "done"
 _CYCLE_BUDGET_KEY = "best_quote_maker_volume_cycle_budget_notional"
 _MIN_CYCLE_BUDGET_KEY = "best_quote_maker_volume_min_cycle_budget_notional"
 _TIER_BUDGETS_KEY = "budget_controller_tier_budgets"
+
+
+def _write_control_json(path: str, control: dict[str, Any]) -> None:
+    control_path = Path(path)
+    temporary_path = control_path.with_name(f".{control_path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary_path.open("w", encoding="utf-8") as handle:
+            json.dump(control, handle, indent=1)
+            handle.write("\n")
+        os.replace(temporary_path, control_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -475,11 +489,7 @@ def main(argv: list[str] | None = None) -> int:
         control["best_quote_maker_volume_min_cycle_budget_notional"] = min_cycle
         control["budget_controller_tier"] = tier
         control["budget_controller_updated_at"] = status["ts"]
-        temporary_path = f"{control_path}.tmp"
-        with open(temporary_path, "w", encoding="utf-8") as f:
-            json.dump(control, f, indent=1)
-            f.write("\n")
-        os.replace(temporary_path, control_path)
+        _write_control_json(control_path, control)
         completed = subprocess.run(
             [a.runner_wrapper, "restart", a.symbol],
             capture_output=True,
