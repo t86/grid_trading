@@ -44,6 +44,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 "pause_short_position_notional": 620.0,
                 "max_position_notional": 800.0,
                 "max_short_position_notional": 800.0,
+                "best_quote_maker_volume_inventory_soft_ratio": 0.55,
                 "best_quote_maker_volume_cycle_budget_notional": 240.0,
                 "best_quote_maker_volume_min_cycle_budget_notional": 128.0,
                 "best_quote_maker_volume_inventory_bias_enabled": True,
@@ -57,9 +58,11 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             volatility_entry_pause_active=False,
             frozen_total_notional=400.0,
         )
-        self.assertEqual(900.0, updates["pause_buy_position_notional"])
-        self.assertEqual(1100.0, updates["max_position_notional"])
-        self.assertEqual(480.0, updates["best_quote_maker_volume_cycle_budget_notional"])
+        self.assertEqual(1200.0, updates["pause_buy_position_notional"])
+        self.assertEqual(1400.0, updates["max_position_notional"])
+        self.assertEqual(0.8, updates["best_quote_maker_volume_inventory_soft_ratio"])
+        self.assertEqual(800.0, updates["best_quote_maker_volume_cycle_budget_notional"])
+        self.assertEqual(480.0, updates["best_quote_maker_volume_min_cycle_budget_notional"])
         self.assertFalse(updates["best_quote_maker_volume_inventory_bias_enabled"])
         self.assertTrue(
             updates["best_quote_maker_volume_same_side_entry_price_guard_report_only"]
