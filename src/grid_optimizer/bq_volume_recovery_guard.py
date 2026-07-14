@@ -2969,6 +2969,7 @@ def check_symbol(
     )
     assessment["arx_severe_near_maker_entry"] = arx_severe_near_maker_entry
     wear_backoff_floor = max(
+        parameters.effective_cycle_budget_floor_notional,
         static_cycle_budget_floor_notional,
         max(
             _safe_float(control.get("per_order_notional")),

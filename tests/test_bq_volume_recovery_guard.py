@@ -7030,6 +7030,56 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertNotIn("guard_recovery_controls", state["symbols"]["REUSDT"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_budget_pause_never_restores_below_explicit_runner_minimum(self) -> None:
+        now = datetime(2026, 7, 14, 4, 10, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_cycle_budget_notional": 28.0,
+                    "best_quote_maker_volume_min_cycle_budget_notional": 40.0,
+                    "per_order_notional": 8.0,
+                },
+                long_notional=340.0,
+                short_notional=345.0,
+                open_order_count=0,
+                active_order_count=0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["pause_reasons"] = ["budget_below_minimum"]
+            _write_json(plan_path, plan)
+
+            restarts: list[str] = []
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state={},
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                daily_target_notional=100_000.0,
+                trade_rows=[
+                    {
+                        "id": 1,
+                        "time": int((now - timedelta(minutes=10)).timestamp() * 1000),
+                        "quoteQty": "100",
+                    }
+                ],
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(result["action"], "restore_runnable_budget_after_wear_backoff")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 40.0)
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_high_wear_cooldown_restores_safe_normal_entry_pace(self) -> None:
         now = datetime(2026, 7, 12, 6, 16, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
