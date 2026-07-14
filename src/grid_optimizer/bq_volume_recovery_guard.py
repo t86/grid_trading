@@ -1415,9 +1415,10 @@ def assess_symbol(
         if "actual_short_notional" in reduce_freeze
         else None
     )
+    frozen_long = max(_safe_float(reduce_freeze.get("frozen_long_notional")), 0.0)
+    frozen_short = max(_safe_float(reduce_freeze.get("frozen_short_notional")), 0.0)
     frozen_total = max(
-        _safe_float(reduce_freeze.get("frozen_long_notional"))
-        + _safe_float(reduce_freeze.get("frozen_short_notional")),
+        frozen_long + frozen_short,
         _safe_float(frozen_v2.get("frozen_total_notional")),
         0.0,
     )
@@ -1577,6 +1578,8 @@ def assess_symbol(
         "current_short_notional": current_short,
         "actual_long_notional": actual_long,
         "actual_short_notional": actual_short,
+        "frozen_long_notional": frozen_long,
+        "frozen_short_notional": frozen_short,
         "frozen_total_notional": frozen_total,
         "max_long_notional": long_cap,
         "max_short_notional": short_cap,
@@ -2381,6 +2384,36 @@ def arx_single_side_cap_updates(control: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def arx_frozen_inventory_headroom_updates(
+    *,
+    control: dict[str, Any],
+    frozen_long_notional: float,
+    frozen_short_notional: float,
+) -> dict[str, Any]:
+    """Reserve frozen ARX inventory inside the real exchange-side limits."""
+    frozen_long = max(_safe_float(frozen_long_notional), 0.0)
+    frozen_short = max(_safe_float(frozen_short_notional), 0.0)
+    if frozen_long <= 0.0 and frozen_short <= 0.0:
+        return {}
+    long_soft = max(1800.0 - frozen_long, 1.0)
+    short_soft = max(1800.0 - frozen_short, 1.0)
+    long_hard = max(2000.0 - frozen_long, 1.0)
+    short_hard = max(2000.0 - frozen_short, 1.0)
+    targets = {
+        "pause_buy_position_notional": long_soft,
+        "pause_short_position_notional": short_soft,
+        "max_position_notional": long_hard,
+        "max_short_position_notional": short_hard,
+        "maker_max_long_notional": long_hard,
+        "maker_max_short_notional": short_hard,
+        "best_quote_maker_volume_max_long_notional": long_hard,
+        "best_quote_maker_volume_max_short_notional": short_hard,
+    }
+    return {
+        key: value for key, value in targets.items() if _safe_float(control.get(key)) != value
+    }
+
+
 def arx_directional_unwind_quote_updates(control: dict[str, Any]) -> dict[str, Any]:
     """Keep an active ARX directional unwind at the best maker quote."""
     if str(control.get("best_quote_maker_volume_directional_net_guard") or "off").lower() not in {
@@ -2460,13 +2493,22 @@ def arx_severe_pace_capacity_updates(
     near_cap: bool,
     volatility_entry_pause_active: bool,
     frozen_total_notional: float,
+    frozen_long_notional: float = 0.0,
+    frozen_short_notional: float = 0.0,
     actual_long_notional: float = 0.0,
     actual_short_notional: float = 0.0,
 ) -> dict[str, Any]:
     """Temporarily recover ARX flow without exceeding the per-side hard cap."""
     del actual_long_notional, actual_short_notional
     target_max_notional = 2000.0
-    side_cap_updates = arx_single_side_cap_updates(control)
+    side_cap_updates = (
+        arx_frozen_inventory_headroom_updates(
+            control=control,
+            frozen_long_notional=frozen_long_notional,
+            frozen_short_notional=frozen_short_notional,
+        )
+        or arx_single_side_cap_updates(control)
+    )
     capacity_already_raised = not side_cap_updates and all(
         _safe_float(control.get(key)) >= 480.0
         for key in (
@@ -3940,14 +3982,24 @@ def check_symbol(
         near_cap=bool(assessment.get("near_cap")),
         volatility_entry_pause_active=bool(assessment.get("volatility_entry_pause_active")),
         frozen_total_notional=_safe_float(assessment.get("frozen_total_notional")),
+        frozen_long_notional=_safe_float(assessment.get("frozen_long_notional")),
+        frozen_short_notional=_safe_float(assessment.get("frozen_short_notional")),
         actual_long_notional=_safe_float(assessment.get("actual_long_notional")),
         actual_short_notional=_safe_float(assessment.get("actual_short_notional")),
     ) if normalized_symbol == "ARXUSDT" else {}
-    arx_side_cap_unwind = arx_side_cap_unwind_updates(
+    arx_frozen_inventory_headroom = arx_frozen_inventory_headroom_updates(
+        control=control,
+        frozen_long_notional=_safe_float(assessment.get("frozen_long_notional")),
+        frozen_short_notional=_safe_float(assessment.get("frozen_short_notional")),
+    ) if normalized_symbol == "ARXUSDT" else {}
+    arx_side_cap_unwind = {
+        **arx_frozen_inventory_headroom,
+        **arx_side_cap_unwind_updates(
         control=control,
         actual_long_notional=_safe_float(assessment.get("actual_long_notional")),
         actual_short_notional=_safe_float(assessment.get("actual_short_notional")),
-    ) if normalized_symbol == "ARXUSDT" else {}
+        ),
+    } if normalized_symbol == "ARXUSDT" else {}
     arx_fast_sla_capacity_reapply = should_bypass_arx_recovery_drift_debounce(
         symbol=normalized_symbol,
         target_pace_behind=target_pace_behind,
@@ -5152,6 +5204,18 @@ def check_symbol(
             max_short_notional=_safe_float(assessment.get("max_short_notional")),
         ):
             updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
+            if normalized_symbol == "ARXUSDT":
+                updates.update(
+                    arx_frozen_inventory_headroom_updates(
+                        control=control,
+                        frozen_long_notional=_safe_float(
+                            assessment.get("frozen_long_notional")
+                        ),
+                        frozen_short_notional=_safe_float(
+                            assessment.get("frozen_short_notional")
+                        ),
+                    )
+                )
             changed, backup_path = _apply_control_update(
                 symbol=normalized_symbol,
                 control_path=control_path,

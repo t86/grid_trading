@@ -406,6 +406,36 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertFalse(reset["best_quote_maker_volume_net_loss_reduce_enabled"])
         self.assertFalse(reset["best_quote_maker_volume_active_pair_reduce_enabled"])
 
+    def test_arx_frozen_inventory_headroom_reserves_real_side_cap(self) -> None:
+        updates = bq_volume_recovery_guard.arx_frozen_inventory_headroom_updates(
+            control={
+                "pause_buy_position_notional": 1800.0,
+                "pause_short_position_notional": 1800.0,
+                "max_position_notional": 2000.0,
+                "max_short_position_notional": 2000.0,
+                "maker_max_long_notional": 2000.0,
+                "maker_max_short_notional": 2000.0,
+                "best_quote_maker_volume_max_long_notional": 2000.0,
+                "best_quote_maker_volume_max_short_notional": 2000.0,
+            },
+            frozen_long_notional=200.0,
+            frozen_short_notional=210.0,
+        )
+        self.assertEqual(1600.0, updates["pause_buy_position_notional"])
+        self.assertEqual(1590.0, updates["pause_short_position_notional"])
+        self.assertEqual(1800.0, updates["max_position_notional"])
+        self.assertEqual(1790.0, updates["max_short_position_notional"])
+        self.assertEqual(1800.0, updates["maker_max_long_notional"])
+        self.assertEqual(1790.0, updates["maker_max_short_notional"])
+        self.assertEqual(
+            1800.0,
+            updates["best_quote_maker_volume_max_long_notional"],
+        )
+        self.assertEqual(
+            1790.0,
+            updates["best_quote_maker_volume_max_short_notional"],
+        )
+
     def test_arx_directional_unwind_quote_updates_only_when_active(self) -> None:
         updates = bq_volume_recovery_guard.arx_directional_unwind_quote_updates(
             {
