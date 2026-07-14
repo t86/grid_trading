@@ -5640,7 +5640,27 @@ def check_symbol(
                 > _safe_float(recovery_original_controls.get(key))
             )
             if recovery_gate_already_raised:
-                target_gate = float(ceil(max(heavier_inventory - 1.0, current_gate)))
+                if frozen_inventory_present:
+                    # A freeze-isolated runner may rebalance active inventory
+                    # below its soft bands while an earlier anti-chase relief
+                    # is still exactly at the heavier active leg. Permit one
+                    # additional ordinary maker order, but never above the
+                    # active soft band. This is a bounded, reversible gate
+                    # relaxation rather than a change to frozen exposure.
+                    active_soft_limit = max(
+                        _safe_float(assessment.get("long_soft_limit_notional")),
+                        _safe_float(assessment.get("short_soft_limit_notional")),
+                    )
+                    target_gate = float(
+                        ceil(
+                            min(
+                                heavier_inventory + order_notional,
+                                max(active_soft_limit - 1.0, current_gate),
+                            )
+                        )
+                    )
+                else:
+                    target_gate = float(ceil(max(heavier_inventory - 1.0, current_gate)))
             elif no_fill_seconds >= 300.0 and pace_ratio < 0.1:
                 max_inventory = max(
                     _safe_float(assessment.get("max_long_notional")),
