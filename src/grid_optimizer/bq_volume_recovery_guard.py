@@ -2344,9 +2344,19 @@ def arx_severe_pace_capacity_updates(
     near_cap: bool,
     volatility_entry_pause_active: bool,
     frozen_total_notional: float,
+    actual_long_notional: float = 0.0,
+    actual_short_notional: float = 0.0,
 ) -> dict[str, Any]:
     """Temporarily widen ARX capacity when its live target window is behind."""
-    target_max_notional = 2600.0
+    actual_side_max = max(
+        _safe_float(actual_long_notional), _safe_float(actual_short_notional), 0.0
+    )
+    target_max_notional = (
+        min(4000.0, max(3200.0, ceil((actual_side_max + 600.0) / 200.0) * 200.0))
+        if actual_side_max > 3200.0
+        else 2600.0
+    )
+    extended_for_actual_inventory = target_max_notional > 2600.0
     capacity_already_raised = all(
         _safe_float(control.get(key)) >= target_max_notional
         for key in (
@@ -2371,8 +2381,8 @@ def arx_severe_pace_capacity_updates(
     ):
         return {}
     targets = {
-        "pause_buy_position_notional": 2340.0,
-        "pause_short_position_notional": 2340.0,
+        "pause_buy_position_notional": target_max_notional if extended_for_actual_inventory else 2340.0,
+        "pause_short_position_notional": target_max_notional if extended_for_actual_inventory else 2340.0,
         "max_position_notional": target_max_notional,
         "max_short_position_notional": target_max_notional,
         "max_actual_net_notional": target_max_notional,
@@ -2380,12 +2390,12 @@ def arx_severe_pace_capacity_updates(
         "maker_max_short_notional": target_max_notional,
         "best_quote_maker_volume_max_long_notional": target_max_notional,
         "best_quote_maker_volume_max_short_notional": target_max_notional,
-        "best_quote_maker_volume_inventory_soft_ratio": 0.9,
+        "best_quote_maker_volume_inventory_soft_ratio": 1.0 if extended_for_actual_inventory else 0.9,
         "best_quote_maker_volume_min_cycle_budget_notional": 960.0,
         "best_quote_maker_volume_cycle_budget_notional": 1600.0,
         "best_quote_maker_volume_active_pair_reduce_order_notional": 480.0,
         "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 480.0,
-        "max_total_notional": 4000.0,
+        "max_total_notional": 8000.0 if extended_for_actual_inventory else 4000.0,
     }
     updates = {
         key: value
@@ -3771,6 +3781,8 @@ def check_symbol(
         near_cap=bool(assessment.get("near_cap")),
         volatility_entry_pause_active=bool(assessment.get("volatility_entry_pause_active")),
         frozen_total_notional=_safe_float(assessment.get("frozen_total_notional")),
+        actual_long_notional=_safe_float(assessment.get("actual_long_notional")),
+        actual_short_notional=_safe_float(assessment.get("actual_short_notional")),
     ) if normalized_symbol == "ARXUSDT" else {}
     arx_fast_sla_capacity_reapply = should_bypass_arx_recovery_drift_debounce(
         symbol=normalized_symbol,
