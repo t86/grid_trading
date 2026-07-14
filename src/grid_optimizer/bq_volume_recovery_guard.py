@@ -2443,11 +2443,11 @@ def arx_side_cap_unwind_updates(
     long_soft_excess = max(_safe_float(actual_long_notional) - 1800.0, 0.0)
     short_soft_excess = max(_safe_float(actual_short_notional) - 1800.0, 0.0)
     # Pace recovery can temporarily raise max_actual_net_notional.  That is a
-    # capacity ceiling, not permission to leave ARX permanently one-sided.
-    # Keep the directional recovery target at the normal 1,000U net bound.
+    # capacity ceiling, not permission to leave ARX one-sided.  Restore to a
+    # 600U net balance band before returning to ordinary two-sided quoting.
     net_limit = min(
-        max(_safe_float(control.get("max_actual_net_notional")), 0.0) or 1000.0,
-        1000.0,
+        max(_safe_float(control.get("max_actual_net_notional")), 0.0) or 600.0,
+        600.0,
     )
     net_notional = _safe_float(actual_long_notional) - _safe_float(actual_short_notional)
     current_direction = str(

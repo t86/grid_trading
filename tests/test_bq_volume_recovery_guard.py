@@ -391,6 +391,24 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             raised_capacity_still_unwinds_net["best_quote_maker_volume_directional_net_guard"],
         )
 
+        normal_net_ceiling_still_recovers_to_balance = (
+            bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+                control={
+                    "max_actual_net_notional": 1000.0,
+                    "best_quote_maker_volume_directional_net_guard": "off",
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                },
+                actual_long_notional=1103.0,
+                actual_short_notional=129.0,
+            )
+        )
+        self.assertEqual(
+            "net_long",
+            normal_net_ceiling_still_recovers_to_balance[
+                "best_quote_maker_volume_directional_net_guard"
+            ],
+        )
+
         updates = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
             control={
                 "best_quote_maker_volume_directional_net_guard": "off",
