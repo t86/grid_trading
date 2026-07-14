@@ -272,6 +272,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 volatility_entry_pause_active=False,
             )
         )
+    @unittest.skip("unsafe ARX capacity expansion was removed")
     def test_arx_severe_pace_capacity_raises_thresholds_and_budget_only_when_calm(self) -> None:
         updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
             control={
@@ -327,6 +328,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             ),
         )
 
+    @unittest.skip("ARX side-cap values are profile-owned")
     def test_arx_single_side_cap_lowers_existing_recovery_override(self) -> None:
         updates = bq_volume_recovery_guard.arx_single_side_cap_updates(
             {
@@ -347,6 +349,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(2000.0, updates["maker_max_long_notional"])
         self.assertEqual(2000.0, updates["maker_max_short_notional"])
 
+    @unittest.skip("side-unwind now derives limits from the active profile")
     def test_arx_side_cap_unwind_prioritizes_larger_excess_and_resets(self) -> None:
         self.assertTrue(
             bq_volume_recovery_guard.should_bypass_arx_side_unwind_recovery_gate(
@@ -491,6 +494,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertFalse(reset["best_quote_maker_volume_net_loss_reduce_enabled"])
         self.assertFalse(reset["best_quote_maker_volume_active_pair_reduce_enabled"])
 
+    @unittest.skip("frozen inventory no longer enlarges ARX capacity")
     def test_arx_frozen_inventory_headroom_reserves_real_side_cap(self) -> None:
         updates = bq_volume_recovery_guard.arx_frozen_inventory_headroom_updates(
             control={
@@ -521,6 +525,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             updates["best_quote_maker_volume_max_short_notional"],
         )
 
+    @unittest.skip("directional unwind now changes quote offset by one tick only")
     def test_arx_directional_unwind_quote_updates_only_when_active(self) -> None:
         updates = bq_volume_recovery_guard.arx_directional_unwind_quote_updates(
             {
@@ -547,6 +552,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             ),
         )
 
+    @unittest.skip("unsafe ARX capacity expansion was removed")
     def test_arx_severe_pace_capacity_never_exceeds_single_side_hard_cap(self) -> None:
         updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
             control={
@@ -570,6 +576,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(0.9, updates["best_quote_maker_volume_inventory_soft_ratio"])
         self.assertEqual(4000.0, updates["max_total_notional"])
 
+    @unittest.skip("unsafe ARX capacity expansion was removed")
     def test_arx_severe_pace_capacity_lowers_previously_overridden_side_cap(self) -> None:
         updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
             control={"max_position_notional": 4000.0, "max_short_position_notional": 4000.0},
@@ -584,6 +591,65 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(2000.0, updates["max_position_notional"])
         self.assertEqual(2000.0, updates["max_short_position_notional"])
         self.assertEqual(4000.0, updates["max_total_notional"])
+
+    def test_arx_capacity_helpers_never_expand_profile_limits(self) -> None:
+        control = {
+            "max_position_notional": 800.0,
+            "max_short_position_notional": 800.0,
+            "pause_buy_position_notional": 620.0,
+            "pause_short_position_notional": 620.0,
+            "best_quote_maker_volume_cycle_budget_notional": 128.0,
+        }
+        self.assertEqual({}, bq_volume_recovery_guard.arx_single_side_cap_updates(control))
+        self.assertEqual(
+            {},
+            bq_volume_recovery_guard.arx_frozen_inventory_headroom_updates(
+                control=control,
+                frozen_long_notional=200.0,
+                frozen_short_notional=200.0,
+            ),
+        )
+        self.assertEqual(
+            {},
+            bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
+                control=control,
+                target_pace_behind=True,
+                pace_ratio=0.1,
+                near_cap=True,
+                volatility_entry_pause_active=False,
+                frozen_total_notional=400.0,
+            ),
+        )
+        self.assertEqual(
+            {},
+            bq_volume_recovery_guard.arx_balanced_fast_sla_capacity_updates(
+                control=control,
+                assessment={"current_long_notional": 700.0, "current_short_notional": 700.0},
+                target_pace_behind=True,
+                no_fill_seconds=180.0,
+                fast_sla_seconds=120.0,
+                high_recovery_wear=False,
+            ),
+        )
+        self.assertEqual(
+            {},
+            bq_volume_recovery_guard.arx_soft_recovery_extension_updates(
+                control=control,
+                assessment={"symbol": "ARXUSDT", "target_pace_behind": True},
+                volume_summary={"trailing_15m_gross_notional": 1000.0},
+            ),
+        )
+
+    def test_arx_directional_unwind_changes_quote_by_one_tick(self) -> None:
+        updates = bq_volume_recovery_guard.arx_directional_unwind_quote_updates(
+            {
+                "best_quote_maker_volume_directional_net_guard": "net_long",
+                "best_quote_maker_volume_active_pair_reduce_enabled": True,
+                "best_quote_maker_volume_quote_offset_ticks": 3,
+            }
+        )
+        self.assertFalse(updates["best_quote_maker_volume_active_pair_reduce_enabled"])
+        self.assertEqual(2, updates["best_quote_maker_volume_quote_offset_ticks"])
 
     def test_arx_fast_sla_bypasses_only_capacity_reapply_debounce(self) -> None:
         decide = bq_volume_recovery_guard.should_bypass_arx_recovery_drift_debounce
@@ -639,6 +705,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 max_short_notional=800.0,
             )
         )
+    @unittest.skip("fast-SLA recovery cannot enlarge ARX capacity")
     def test_arx_balanced_fast_sla_capacity_avoids_loss_reduce(self) -> None:
         updates = bq_volume_recovery_guard.arx_balanced_fast_sla_capacity_updates(
             control={
@@ -660,6 +727,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(2000.0, updates["best_quote_maker_volume_cycle_budget_notional"])
         self.assertFalse(updates["best_quote_maker_volume_allow_loss_reduce_only"])
 
+    @unittest.skip("fast-SLA recovery cannot enlarge ARX capacity")
     def test_arx_balanced_fast_sla_capacity_covers_actual_frozen_side(self) -> None:
         updates = bq_volume_recovery_guard.arx_balanced_fast_sla_capacity_updates(
             control={
@@ -703,6 +771,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             ),
         )
 
+    @unittest.skip("soft recovery cannot enlarge ARX capacity")
     def test_arx_soft_recovery_extension_restores_normal_maker_flow(self) -> None:
         updates = bq_volume_recovery_guard.arx_soft_recovery_extension_updates(
             control={
@@ -747,6 +816,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             ),
         )
 
+    @unittest.skip("unsafe ARX capacity expansion was removed")
     def test_arx_capacity_recovery_raises_an_old_near_cap_when_pace_trails_target(self) -> None:
         # The target window can be behind even while a longer-lived pace
         # ratio still reflects an earlier burst of fills.

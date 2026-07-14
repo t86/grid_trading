@@ -2394,20 +2394,9 @@ def should_bypass_arx_recovery_drift_debounce(
 
 
 def arx_single_side_cap_updates(control: dict[str, Any]) -> dict[str, Any]:
-    """Keep all ARX entry paths within the operational single-side hard cap."""
-    targets = {
-        "pause_buy_position_notional": 1800.0,
-        "pause_short_position_notional": 1800.0,
-        "max_position_notional": 2000.0,
-        "max_short_position_notional": 2000.0,
-        "maker_max_long_notional": 2000.0,
-        "maker_max_short_notional": 2000.0,
-        "best_quote_maker_volume_max_long_notional": 2000.0,
-        "best_quote_maker_volume_max_short_notional": 2000.0,
-    }
-    return {
-        key: value for key, value in targets.items() if _safe_float(control.get(key)) != value
-    }
+    """Capacity may only come from the profile baseline, never recovery code."""
+    del control
+    return {}
 
 
 def arx_frozen_inventory_headroom_updates(
@@ -2416,28 +2405,9 @@ def arx_frozen_inventory_headroom_updates(
     frozen_long_notional: float,
     frozen_short_notional: float,
 ) -> dict[str, Any]:
-    """Reserve frozen ARX inventory inside the real exchange-side limits."""
-    frozen_long = max(_safe_float(frozen_long_notional), 0.0)
-    frozen_short = max(_safe_float(frozen_short_notional), 0.0)
-    if frozen_long <= 0.0 and frozen_short <= 0.0:
-        return {}
-    long_soft = max(1800.0 - frozen_long, 1.0)
-    short_soft = max(1800.0 - frozen_short, 1.0)
-    long_hard = max(2000.0 - frozen_long, 1.0)
-    short_hard = max(2000.0 - frozen_short, 1.0)
-    targets = {
-        "pause_buy_position_notional": long_soft,
-        "pause_short_position_notional": short_soft,
-        "max_position_notional": long_hard,
-        "max_short_position_notional": short_hard,
-        "maker_max_long_notional": long_hard,
-        "maker_max_short_notional": short_hard,
-        "best_quote_maker_volume_max_long_notional": long_hard,
-        "best_quote_maker_volume_max_short_notional": short_hard,
-    }
-    return {
-        key: value for key, value in targets.items() if _safe_float(control.get(key)) != value
-    }
+    """Frozen inventory is a gate, not permission to enlarge entry capacity."""
+    del control, frozen_long_notional, frozen_short_notional
+    return {}
 
 
 def arx_directional_unwind_quote_updates(control: dict[str, Any]) -> dict[str, Any]:
@@ -2449,10 +2419,10 @@ def arx_directional_unwind_quote_updates(control: dict[str, Any]) -> dict[str, A
         return {}
     targets = {
         "best_quote_maker_volume_active_pair_reduce_enabled": False,
-        "best_quote_maker_volume_quote_offset_ticks": 0,
-        "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_extra_ticks": 0,
-        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks": 0,
-        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_extra_ticks": 0,
+        "best_quote_maker_volume_quote_offset_ticks": max(
+            _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) - 1,
+            0,
+        ),
     }
     return {key: value for key, value in targets.items() if control.get(key) != value}
 
@@ -2464,17 +2434,22 @@ def arx_side_cap_unwind_updates(
     actual_short_notional: float,
 ) -> dict[str, Any]:
     """Route maker-only recovery to the side that remains above the hard cap."""
-    long_excess = max(_safe_float(actual_long_notional) - 2000.0, 0.0)
-    short_excess = max(_safe_float(actual_short_notional) - 2000.0, 0.0)
-    long_soft_excess = max(_safe_float(actual_long_notional) - 1800.0, 0.0)
-    short_soft_excess = max(_safe_float(actual_short_notional) - 1800.0, 0.0)
-    # Pace recovery can temporarily raise max_actual_net_notional.  That is a
-    # capacity ceiling, not permission to leave ARX one-sided.  Restore to a
-    # 600U net balance band before returning to ordinary two-sided quoting.
-    net_limit = min(
-        max(_safe_float(control.get("max_actual_net_notional")), 0.0) or 600.0,
-        600.0,
+    long_hard = max(
+        _safe_float(control.get("max_position_notional")),
+        _safe_float(control.get("best_quote_maker_volume_max_long_notional")),
     )
+    short_hard = max(
+        _safe_float(control.get("max_short_position_notional")),
+        _safe_float(control.get("best_quote_maker_volume_max_short_notional")),
+    )
+    long_soft = max(_safe_float(control.get("pause_buy_position_notional")), 0.0)
+    short_soft = max(_safe_float(control.get("pause_short_position_notional")), 0.0)
+    long_excess = max(_safe_float(actual_long_notional) - long_hard, 0.0)
+    short_excess = max(_safe_float(actual_short_notional) - short_hard, 0.0)
+    long_soft_excess = max(_safe_float(actual_long_notional) - long_soft, 0.0)
+    short_soft_excess = max(_safe_float(actual_short_notional) - short_soft, 0.0)
+    configured_net_limit = max(_safe_float(control.get("max_actual_net_notional")), 0.0)
+    net_limit = configured_net_limit * 0.6 if configured_net_limit > 0 else 0.0
     net_notional = _safe_float(actual_long_notional) - _safe_float(actual_short_notional)
     current_direction = str(
         control.get("best_quote_maker_volume_directional_net_guard") or "off"
@@ -2486,13 +2461,13 @@ def arx_side_cap_unwind_updates(
     elif long_soft_excess > 0.0 or short_soft_excess > 0.0:
         direction = "net_long" if long_soft_excess >= short_soft_excess else "net_short"
     elif (
-        current_direction == "net_long"
-        and _safe_float(actual_long_notional) > 1800.0
+            current_direction == "net_long"
+        and _safe_float(actual_long_notional) > long_soft
     ):
         direction = "net_long"
     elif (
-        current_direction == "net_short"
-        and _safe_float(actual_short_notional) > 1800.0
+            current_direction == "net_short"
+        and _safe_float(actual_short_notional) > short_soft
     ):
         direction = "net_short"
     else:
@@ -2517,10 +2492,10 @@ def arx_side_cap_unwind_updates(
             "best_quote_maker_volume_net_loss_reduce_enabled": False,
             "best_quote_maker_volume_active_pair_reduce_enabled": False,
             "loss_inventory_no_cross_small_entry_notional": 200.0,
-            "best_quote_maker_volume_quote_offset_ticks": 0,
-            "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_extra_ticks": 0,
-            "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks": 0,
-            "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_extra_ticks": 0,
+            "best_quote_maker_volume_quote_offset_ticks": max(
+                _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) - 1,
+                0,
+            ),
         }
     return {key: value for key, value in targets.items() if control.get(key) != value}
 
@@ -2558,59 +2533,20 @@ def arx_severe_pace_capacity_updates(
     actual_long_notional: float = 0.0,
     actual_short_notional: float = 0.0,
 ) -> dict[str, Any]:
-    """Temporarily recover ARX flow without exceeding the per-side hard cap."""
-    del actual_long_notional, actual_short_notional
-    target_max_notional = 2000.0
-    side_cap_updates = (
-        arx_frozen_inventory_headroom_updates(
-            control=control,
-            frozen_long_notional=frozen_long_notional,
-            frozen_short_notional=frozen_short_notional,
-        )
-        or arx_single_side_cap_updates(control)
+    """Pace recovery must not expand ARX capacity or disable quality gates."""
+    del (
+        control,
+        target_pace_behind,
+        pace_ratio,
+        near_cap,
+        volatility_entry_pause_active,
+        frozen_total_notional,
+        frozen_long_notional,
+        frozen_short_notional,
+        actual_long_notional,
+        actual_short_notional,
     )
-    capacity_already_raised = not side_cap_updates and all(
-        _safe_float(control.get(key)) >= 480.0
-        for key in (
-            "best_quote_maker_volume_active_pair_reduce_order_notional",
-            "best_quote_maker_volume_active_pair_reduce_max_notional_per_side",
-        )
-    )
-    if (
-        not bool(target_pace_behind)
-        or (bool(near_cap) and capacity_already_raised)
-        or bool(volatility_entry_pause_active)
-        or float(frozen_total_notional) <= 0.0
-    ):
-        return {}
-    targets = {
-        "best_quote_maker_volume_inventory_soft_ratio": 0.9,
-        "best_quote_maker_volume_min_cycle_budget_notional": 960.0,
-        "best_quote_maker_volume_cycle_budget_notional": 1600.0,
-        "best_quote_maker_volume_active_pair_reduce_order_notional": 480.0,
-        "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 480.0,
-        "max_total_notional": target_max_notional * 2.0,
-    }
-    updates = dict(side_cap_updates)
-    updates.update({
-        key: value
-        for key, value in targets.items()
-        if _safe_float(control.get(key)) < value
-    })
-    if bool(control.get("best_quote_maker_volume_inventory_bias_enabled")):
-        updates["best_quote_maker_volume_inventory_bias_enabled"] = False
-    if (
-        bool(control.get("best_quote_maker_volume_same_side_entry_price_guard_enabled"))
-        and not bool(
-            control.get("best_quote_maker_volume_same_side_entry_price_guard_report_only")
-        )
-    ):
-        updates["best_quote_maker_volume_same_side_entry_price_guard_report_only"] = True
-    if _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) > 0:
-        updates["best_quote_maker_volume_quote_offset_ticks"] = 0
-    if bool(control.get("sticky_entry_preserve_less_aggressive")):
-        updates["sticky_entry_preserve_less_aggressive"] = False
-    return updates
+    return {}
 
 
 def arx_balanced_fast_sla_capacity_updates(
@@ -2622,7 +2558,11 @@ def arx_balanced_fast_sla_capacity_updates(
     fast_sla_seconds: float,
     high_recovery_wear: bool,
 ) -> dict[str, Any]:
-    """Restore two-sided ARX maker flow before using loss-reduce on balanced stock."""
+    """Capacity is profile-owned; fast-SLA recovery cannot enlarge ARX risk."""
+    del control, assessment, target_pace_behind, no_fill_seconds, fast_sla_seconds, high_recovery_wear
+    return {}
+
+    # Kept below for historical context until the next broader recovery cleanup.
     current_long = max(_safe_float(assessment.get("current_long_notional")), 0.0)
     current_short = max(_safe_float(assessment.get("current_short_notional")), 0.0)
     actual_long = max(_safe_float(assessment.get("actual_long_notional")), current_long)
@@ -2673,7 +2613,11 @@ def arx_soft_recovery_extension_updates(
     assessment: dict[str, Any],
     volume_summary: dict[str, Any],
 ) -> dict[str, Any]:
-    """Make a timed ARX soft-recovery extension materially restore maker flow."""
+    """Soft recovery may not bypass the profile's bounded budget and caps."""
+    del control, assessment, volume_summary
+    return {}
+
+    # Kept below for historical context until the next broader recovery cleanup.
     wear_5m = _safe_float(volume_summary.get("trailing_5m_realized_wear_per_10k"))
     wear_15m = _safe_float(volume_summary.get("trailing_15m_realized_wear_per_10k"))
     if (
