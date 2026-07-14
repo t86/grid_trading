@@ -387,6 +387,32 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertFalse(reset["best_quote_maker_volume_net_loss_reduce_enabled"])
         self.assertFalse(reset["best_quote_maker_volume_active_pair_reduce_enabled"])
 
+    def test_arx_directional_unwind_quote_updates_only_when_active(self) -> None:
+        updates = bq_volume_recovery_guard.arx_directional_unwind_quote_updates(
+            {
+                "best_quote_maker_volume_directional_net_guard": "net_short",
+                "best_quote_maker_volume_active_pair_reduce_enabled": True,
+                "best_quote_maker_volume_quote_offset_ticks": 4,
+                "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_extra_ticks": 4,
+                "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks": 6,
+                "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_extra_ticks": 10,
+            }
+        )
+        self.assertFalse(updates["best_quote_maker_volume_active_pair_reduce_enabled"])
+        self.assertEqual(0, updates["best_quote_maker_volume_quote_offset_ticks"])
+        self.assertEqual(
+            0,
+            updates[
+                "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_extra_ticks"
+            ],
+        )
+        self.assertEqual(
+            {},
+            bq_volume_recovery_guard.arx_directional_unwind_quote_updates(
+                {"best_quote_maker_volume_directional_net_guard": "off"}
+            ),
+        )
+
     def test_arx_severe_pace_capacity_never_exceeds_single_side_hard_cap(self) -> None:
         updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
             control={

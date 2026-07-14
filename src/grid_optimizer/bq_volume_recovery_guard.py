@@ -2380,6 +2380,23 @@ def arx_single_side_cap_updates(control: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def arx_directional_unwind_quote_updates(control: dict[str, Any]) -> dict[str, Any]:
+    """Keep an active ARX directional unwind at the best maker quote."""
+    if str(control.get("best_quote_maker_volume_directional_net_guard") or "off").lower() not in {
+        "net_long",
+        "net_short",
+    }:
+        return {}
+    targets = {
+        "best_quote_maker_volume_active_pair_reduce_enabled": False,
+        "best_quote_maker_volume_quote_offset_ticks": 0,
+        "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_extra_ticks": 0,
+        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks": 0,
+        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_extra_ticks": 0,
+    }
+    return {key: value for key, value in targets.items() if control.get(key) != value}
+
+
 def arx_side_cap_unwind_updates(
     *,
     control: dict[str, Any],
@@ -7970,9 +7987,10 @@ def main(argv: list[str] | None = None) -> int:
                 "active_order_count"
             )
         )
-        arx_single_side_cap_pending = (
-            symbol.upper() == "ARXUSDT"
-            and bool(arx_single_side_cap_updates(_read_json(_control_path(output_dir, symbol))))
+        control_for_drift_recovery = _read_json(_control_path(output_dir, symbol))
+        arx_single_side_cap_pending = symbol.upper() == "ARXUSDT" and bool(
+            arx_single_side_cap_updates(control_for_drift_recovery)
+            or arx_directional_unwind_quote_updates(control_for_drift_recovery)
         )
         exchange_order_drift_result = recover_arx_exchange_order_drift(
             symbol=symbol,
