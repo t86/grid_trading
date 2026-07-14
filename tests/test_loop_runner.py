@@ -5841,6 +5841,32 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(filtered["dropped_place_count_by_runtime_guard_loss_cooldown"], 1)
         self.assertEqual(filtered["allowed_place_count_by_runtime_guard_loss_cooldown"], 1)
 
+    @patch("grid_optimizer.loop_runner._runtime_guard_loss_recovery_blocks_submit")
+    def test_runtime_guard_loss_cooldown_allows_maker_directional_net_reduce_only(self, mock_cooldown) -> None:
+        mock_cooldown.return_value = {"blocked": True, "reason": "runtime_guard_loss_cooling_down"}
+        filtered = _suppress_place_orders_during_runtime_guard_loss_cooldown(
+            actions={
+                "place_count": 2,
+                "place_orders": [
+                    {
+                        "role": "best_quote_reduce_short",
+                        "side": "BUY",
+                        "force_reduce_only": True,
+                        "execution_type": "maker",
+                        "time_in_force": "GTX",
+                        "post_only": True,
+                        "directional_net_guard_fallback": True,
+                    },
+                    {"role": "best_quote_entry_long", "side": "BUY"},
+                ],
+            },
+            args=Namespace(),
+        )
+
+        self.assertEqual(filtered["place_count"], 1)
+        self.assertEqual(filtered["place_orders"][0]["role"], "best_quote_reduce_short")
+        self.assertEqual(filtered["dropped_place_count_by_runtime_guard_loss_cooldown"], 1)
+
     def test_best_quote_reduce_freeze_drops_normal_reduce_long_when_no_managed_long_remains(self) -> None:
         plan: dict[str, object] = {
             "buy_orders": [],

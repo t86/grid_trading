@@ -11150,6 +11150,19 @@ def _runtime_guard_has_allowed_frozen_inventory_places(actions: Mapping[str, Any
     return bool(place_orders) and all(_is_frozen_inventory_manual_order(item) for item in place_orders)
 
 
+def _is_directional_net_guard_reduce_only_order(order: Mapping[str, Any] | dict[str, Any]) -> bool:
+    """Permit only the maker reduce order synthesized by the ARX net guard."""
+    return (
+        bool((order or {}).get("directional_net_guard_fallback"))
+        and str((order or {}).get("role") or "")
+        in {"best_quote_reduce_long", "best_quote_reduce_short"}
+        and bool((order or {}).get("force_reduce_only"))
+        and str((order or {}).get("execution_type") or "").lower() == "maker"
+        and str((order or {}).get("time_in_force") or "").upper() == "GTX"
+        and bool((order or {}).get("post_only"))
+    )
+
+
 def _has_pending_frozen_inventory_manual_directive(state: Mapping[str, Any] | dict[str, Any]) -> bool:
     manual_reduce = state.get("best_quote_frozen_inventory_manual_reduce") if isinstance(state, Mapping) else None
     manual_limit = state.get("best_quote_frozen_inventory_manual_limit") if isinstance(state, Mapping) else None
@@ -11244,8 +11257,16 @@ def _suppress_place_orders_during_runtime_guard_loss_cooldown(
     block_key = "runtime_guard_loss_cooldown" if cooldown.get("blocked") else "runtime_guard_manual_frozen_inventory_override"
     updated = dict(actions)
     place_orders = [dict(item) for item in list(updated.get("place_orders") or []) if isinstance(item, dict)]
-    allowed = [dict(item) for item in place_orders if _is_frozen_inventory_manual_order(item)]
-    dropped = [dict(item) for item in place_orders if not _is_frozen_inventory_manual_order(item)]
+    allowed: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+    for item in place_orders:
+        if (
+            _is_frozen_inventory_manual_order(item)
+            or _is_directional_net_guard_reduce_only_order(item)
+        ):
+            allowed.append(dict(item))
+        else:
+            dropped.append(dict(item))
     updated["place_orders"] = allowed
     updated["place_count"] = len(allowed)
     updated[block_key] = block
