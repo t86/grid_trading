@@ -11116,9 +11116,23 @@ def _has_pending_frozen_inventory_manual_directive(state: Mapping[str, Any] | di
     def _has_requested(raw: Any) -> bool:
         if not isinstance(raw, dict):
             return False
-        if bool(raw.get("requested")):
+        if (
+            bool(raw.get("requested"))
+            and not (
+                raw.get("source") == "auto_single_leg_take_profit"
+                and bool(raw.get("frozen_inventory_per_lot_release"))
+            )
+        ):
             return True
-        return any(isinstance(item, dict) and bool(item.get("requested")) for item in raw.values())
+        return any(
+            isinstance(item, dict)
+            and bool(item.get("requested"))
+            and not (
+                item.get("source") == "auto_single_leg_take_profit"
+                and bool(item.get("frozen_inventory_per_lot_release"))
+            )
+            for item in raw.values()
+        )
 
     return _has_requested(manual_reduce) or _has_requested(manual_limit) or _has_requested(pair_release)
 

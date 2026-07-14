@@ -336,6 +336,16 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(2000.0, updates["maker_max_short_notional"])
 
     def test_arx_side_cap_unwind_prioritizes_larger_excess_and_resets(self) -> None:
+        soft_limit_start = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+            control={
+                "best_quote_maker_volume_directional_net_guard": "off",
+                "best_quote_maker_volume_allow_loss_reduce_only": False,
+            },
+            actual_long_notional=1988.0,
+            actual_short_notional=129.0,
+        )
+        self.assertEqual("net_long", soft_limit_start["best_quote_maker_volume_directional_net_guard"])
+
         updates = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
             control={
                 "best_quote_maker_volume_directional_net_guard": "off",

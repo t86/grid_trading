@@ -694,6 +694,48 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
             self.assertEqual(override["reason"], "runtime_guard_manual_frozen_inventory_override")
             self.assertEqual(actions["dropped_place_count_by_runtime_guard_manual_frozen_inventory_override"], 1)
 
+    def test_auto_per_lot_release_does_not_hold_manual_frozen_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "runtime_guard_manual_frozen_inventory_override": {
+                            "active": True,
+                            "stop_reasons": ["max_actual_net_notional_hit"],
+                        },
+                        "best_quote_frozen_inventory_manual_reduce": {
+                            "short": {
+                                "requested": True,
+                                "source": "auto_single_leg_take_profit",
+                                "frozen_inventory_per_lot_release": True,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                state_path=str(state_path),
+                runtime_guard_loss_recovery_enabled=True,
+                runtime_guard_loss_recovery_cooldown_seconds=180.0,
+            )
+
+            actions = _suppress_place_orders_during_runtime_guard_loss_cooldown(
+                actions={
+                    "place_count": 1,
+                    "cancel_count": 0,
+                    "place_orders": [{"role": "entry_short", "side": "SELL"}],
+                    "cancel_orders": [],
+                },
+                args=args,
+            )
+
+            self.assertEqual(1, actions["place_count"])
+            self.assertNotIn("runtime_guard_manual_frozen_inventory_override", actions)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("runtime_guard_manual_frozen_inventory_override", state)
+
     @patch("grid_optimizer.loop_runner._start_futures_flatten_process")
     @patch("grid_optimizer.loop_runner.load_live_flatten_snapshot")
     @patch("grid_optimizer.loop_runner._cancel_futures_strategy_orders")

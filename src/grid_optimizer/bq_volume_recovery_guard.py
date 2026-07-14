@@ -2440,11 +2440,15 @@ def arx_side_cap_unwind_updates(
     """Route maker-only recovery to the side that remains above the hard cap."""
     long_excess = max(_safe_float(actual_long_notional) - 2000.0, 0.0)
     short_excess = max(_safe_float(actual_short_notional) - 2000.0, 0.0)
+    long_soft_excess = max(_safe_float(actual_long_notional) - 1800.0, 0.0)
+    short_soft_excess = max(_safe_float(actual_short_notional) - 1800.0, 0.0)
     current_direction = str(
         control.get("best_quote_maker_volume_directional_net_guard") or "off"
     ).lower()
     if long_excess > 0.0 or short_excess > 0.0:
         direction: str | None = "net_long" if long_excess >= short_excess else "net_short"
+    elif long_soft_excess > 0.0 or short_soft_excess > 0.0:
+        direction = "net_long" if long_soft_excess >= short_soft_excess else "net_short"
     elif (
         current_direction == "net_long"
         and _safe_float(actual_long_notional) > 1800.0
