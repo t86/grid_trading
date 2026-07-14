@@ -3077,6 +3077,19 @@ def check_symbol(
             arx_zero_order_volume_updates[
                 "best_quote_maker_volume_same_side_entry_price_guard_report_only"
             ] = True
+    arx_sticky_requote_updates: dict[str, Any] = {}
+    if (
+        normalized_symbol == "ARXUSDT"
+        and target_pace_behind
+        and pace_ratio < 0.30
+        and not bool(assessment.get("near_cap"))
+        and not bool(assessment.get("volatility_entry_pause_active"))
+        and bool(control.get("sticky_entry_preserve_less_aggressive"))
+    ):
+        # A stale, less-aggressive entry must not survive a severe pace
+        # recovery merely for queue priority: it blocks the replacement maker
+        # quote that the recovery guard is trying to restore.
+        arx_sticky_requote_updates["sticky_entry_preserve_less_aggressive"] = False
     wear_backoff_floor = max(
         parameters.effective_cycle_budget_floor_notional,
         static_cycle_budget_floor_notional,
@@ -3202,6 +3215,30 @@ def check_symbol(
         elif action_verification == "failed":
             action = "recovery_action_verification_failed_hold"
             item["status"] = "recovery_verification_failed"
+        elif arx_sticky_requote_updates:
+            _remember_recovery_controls(
+                item, control, tuple(arx_sticky_requote_updates)
+            )
+            _remember_recovery_updates(item, arx_sticky_requote_updates)
+            action = "dry_run_enable_arx_sticky_requote" if dry_run else "enable_arx_sticky_requote"
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=arx_sticky_requote_updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
         elif arx_zero_order_volume_updates:
             _remember_recovery_controls(
                 item,
