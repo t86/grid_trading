@@ -2133,6 +2133,24 @@ def should_restore_near_market_recovery(
     )
 
 
+def should_enable_arx_sticky_requote(
+    *,
+    symbol: str,
+    target_pace_behind: bool,
+    pace_ratio: float,
+    near_cap: bool,
+    volatility_entry_pause_active: bool,
+) -> bool:
+    """Permit a best-quote replacement while ARX still materially trails pace."""
+    return (
+        symbol.upper().strip() == "ARXUSDT"
+        and bool(target_pace_behind)
+        and float(pace_ratio) < 0.75
+        and not bool(near_cap)
+        and not bool(volatility_entry_pause_active)
+    )
+
+
 def arx_severe_pace_capacity_updates(
     *,
     control: dict[str, Any],
@@ -3440,11 +3458,13 @@ def check_symbol(
         frozen_total_notional=_safe_float(assessment.get("frozen_total_notional")),
     ) if normalized_symbol == "ARXUSDT" else {}
     if (
-        normalized_symbol == "ARXUSDT"
-        and target_pace_behind
-        and pace_ratio < 0.30
-        and not bool(assessment.get("near_cap"))
-        and not bool(assessment.get("volatility_entry_pause_active"))
+        should_enable_arx_sticky_requote(
+            symbol=normalized_symbol,
+            target_pace_behind=target_pace_behind,
+            pace_ratio=pace_ratio,
+            near_cap=bool(assessment.get("near_cap")),
+            volatility_entry_pause_active=bool(assessment.get("volatility_entry_pause_active")),
+        )
         and bool(control.get("sticky_entry_preserve_less_aggressive"))
     ):
         # A stale, less-aggressive entry must not survive a severe pace
