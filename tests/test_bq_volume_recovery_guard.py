@@ -550,6 +550,19 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(900.0, start["pause_buy_position_notional"])
         self.assertEqual(900.0, start["pause_short_position_notional"])
 
+        one_sided_cap = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+            control=control,
+            actual_long_notional=910.0,
+            actual_short_notional=998.0,
+            recover_cap_ratio=0.90,
+            near_cap_ratio=0.95,
+            force_active_relief=True,
+        )
+        self.assertEqual(
+            "net_short",
+            one_sided_cap["best_quote_maker_volume_directional_net_guard"],
+        )
+
         second_leg = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
             control={**control, **start},
             actual_long_notional=899.0,

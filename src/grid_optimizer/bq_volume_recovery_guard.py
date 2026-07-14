@@ -2477,22 +2477,21 @@ def arx_side_cap_unwind_updates(
         and _safe_float(actual_short_notional) > short_soft
     ):
         direction = "net_short"
-    elif (
-        force_active_relief
-        and long_hard > 0
-        and short_hard > 0
-        and _safe_float(actual_long_notional) >= long_hard * near_ratio
-        and _safe_float(actual_short_notional) >= short_hard * near_ratio
-        and (
-            _safe_float(actual_long_notional) > long_recovery_target
-            or _safe_float(actual_short_notional) > short_recovery_target
+    elif force_active_relief and long_hard > 0 and short_hard > 0:
+        long_relief = (
+            _safe_float(actual_long_notional) - long_recovery_target
+            if _safe_float(actual_long_notional) >= long_hard * near_ratio
+            else float("-inf")
         )
-    ):
-        direction = (
-            "net_long"
-            if _safe_float(actual_long_notional) >= _safe_float(actual_short_notional)
-            else "net_short"
+        short_relief = (
+            _safe_float(actual_short_notional) - short_recovery_target
+            if _safe_float(actual_short_notional) >= short_hard * near_ratio
+            else float("-inf")
         )
+        if max(long_relief, short_relief) <= 0.0:
+            direction = None
+        else:
+            direction = "net_long" if long_relief >= short_relief else "net_short"
     else:
         direction = None
     # Wear backoff prevents a new or continued loss unwind, but it must not
@@ -4082,15 +4081,20 @@ def check_symbol(
             high_recovery_wear=high_recovery_wear or confirmed_loss_reduce_wear,
             recover_cap_ratio=recover_cap_ratio,
             near_cap_ratio=near_cap_ratio,
-            # A normal directional guard only reacts after a one-sided soft
-            # breach.  When both active legs are nearly full, keep a separate
-            # bounded release state so the next ordinary entry cannot refill
-            # the first leg before the opposite leg has room too.
+            # A normal directional guard only reacts after a soft breach.
+            # When a lagging run loses either entry leg to an active cap, keep
+            # a bounded release state so ordinary entry cannot refill that
+            # side before both legs have room again.
             force_active_relief=(
                 target_pace_behind
-                and bool(assessment.get("low_volume"))
-                and bool(assessment.get("long_near_cap"))
-                and bool(assessment.get("short_near_cap"))
+                and (
+                    bool(assessment.get("low_volume"))
+                    or bool(assessment.get("planned_entry_one_sided"))
+                )
+                and (
+                    bool(assessment.get("long_near_cap"))
+                    or bool(assessment.get("short_near_cap"))
+                )
                 and not high_recovery_wear
                 and not confirmed_loss_reduce_wear
             ),
