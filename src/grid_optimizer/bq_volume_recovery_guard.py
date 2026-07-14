@@ -2380,6 +2380,43 @@ def arx_single_side_cap_updates(control: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def arx_side_cap_unwind_updates(
+    *,
+    control: dict[str, Any],
+    actual_long_notional: float,
+    actual_short_notional: float,
+) -> dict[str, Any]:
+    """Route maker-only recovery to the side that remains above the hard cap."""
+    long_excess = max(_safe_float(actual_long_notional) - 2000.0, 0.0)
+    short_excess = max(_safe_float(actual_short_notional) - 2000.0, 0.0)
+    if long_excess <= 0.0 and short_excess <= 0.0:
+        current_direction = str(
+            control.get("best_quote_maker_volume_directional_net_guard") or "off"
+        ).lower()
+        if (
+            current_direction == "off"
+            and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and not bool(control.get("best_quote_maker_volume_net_loss_reduce_enabled"))
+        ):
+            return {}
+        targets = {
+            "best_quote_maker_volume_directional_net_guard": "off",
+            "best_quote_maker_volume_allow_loss_reduce_only": False,
+            "best_quote_maker_volume_net_loss_reduce_enabled": False,
+            "best_quote_maker_volume_active_pair_reduce_enabled": False,
+        }
+    else:
+        direction = "net_long" if long_excess >= short_excess else "net_short"
+        targets = {
+            "best_quote_maker_volume_directional_net_guard": direction,
+            "best_quote_maker_volume_allow_loss_reduce_only": True,
+            "best_quote_maker_volume_net_loss_reduce_enabled": False,
+            "best_quote_maker_volume_active_pair_reduce_enabled": False,
+            "loss_inventory_no_cross_small_entry_notional": 200.0,
+        }
+    return {key: value for key, value in targets.items() if control.get(key) != value}
+
+
 def arx_severe_pace_capacity_updates(
     *,
     control: dict[str, Any],
@@ -3817,6 +3854,11 @@ def check_symbol(
         actual_long_notional=_safe_float(assessment.get("actual_long_notional")),
         actual_short_notional=_safe_float(assessment.get("actual_short_notional")),
     ) if normalized_symbol == "ARXUSDT" else {}
+    arx_side_cap_unwind = arx_side_cap_unwind_updates(
+        control=control,
+        actual_long_notional=_safe_float(assessment.get("actual_long_notional")),
+        actual_short_notional=_safe_float(assessment.get("actual_short_notional")),
+    ) if normalized_symbol == "ARXUSDT" else {}
     arx_fast_sla_capacity_reapply = should_bypass_arx_recovery_drift_debounce(
         symbol=normalized_symbol,
         target_pace_behind=target_pace_behind,
@@ -3985,6 +4027,32 @@ def check_symbol(
         elif action_verification == "failed":
             action = "recovery_action_verification_failed_hold"
             item["status"] = "recovery_verification_failed"
+        elif arx_side_cap_unwind:
+            _remember_recovery_controls(item, control, tuple(arx_side_cap_unwind))
+            _remember_recovery_updates(item, arx_side_cap_unwind)
+            action = (
+                "dry_run_enforce_arx_single_side_cap_unwind"
+                if dry_run
+                else "enforce_arx_single_side_cap_unwind"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=arx_side_cap_unwind,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
         elif arx_severe_pace_capacity:
             _remember_recovery_controls(
                 item, control, tuple(arx_severe_pace_capacity)

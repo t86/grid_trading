@@ -335,6 +335,39 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(2000.0, updates["maker_max_long_notional"])
         self.assertEqual(2000.0, updates["maker_max_short_notional"])
 
+    def test_arx_side_cap_unwind_prioritizes_larger_excess_and_resets(self) -> None:
+        updates = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+            control={
+                "best_quote_maker_volume_directional_net_guard": "off",
+                "best_quote_maker_volume_allow_loss_reduce_only": False,
+                "best_quote_maker_volume_net_loss_reduce_enabled": True,
+                "best_quote_maker_volume_active_pair_reduce_enabled": True,
+                "loss_inventory_no_cross_small_entry_notional": 22.0,
+            },
+            actual_long_notional=2250.0,
+            actual_short_notional=5135.0,
+        )
+        self.assertEqual("net_short", updates["best_quote_maker_volume_directional_net_guard"])
+        self.assertTrue(updates["best_quote_maker_volume_allow_loss_reduce_only"])
+        self.assertFalse(updates["best_quote_maker_volume_net_loss_reduce_enabled"])
+        self.assertFalse(updates["best_quote_maker_volume_active_pair_reduce_enabled"])
+        self.assertEqual(200.0, updates["loss_inventory_no_cross_small_entry_notional"])
+
+        reset = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+            control={
+                "best_quote_maker_volume_directional_net_guard": "net_short",
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
+                "best_quote_maker_volume_net_loss_reduce_enabled": True,
+                "best_quote_maker_volume_active_pair_reduce_enabled": True,
+            },
+            actual_long_notional=1999.0,
+            actual_short_notional=2000.0,
+        )
+        self.assertEqual("off", reset["best_quote_maker_volume_directional_net_guard"])
+        self.assertFalse(reset["best_quote_maker_volume_allow_loss_reduce_only"])
+        self.assertFalse(reset["best_quote_maker_volume_net_loss_reduce_enabled"])
+        self.assertFalse(reset["best_quote_maker_volume_active_pair_reduce_enabled"])
+
     def test_arx_severe_pace_capacity_never_exceeds_single_side_hard_cap(self) -> None:
         updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
             control={
