@@ -1745,6 +1745,21 @@ def evaluate_action_verification(
     return "pending", failures
 
 
+def is_arx_severe_volume_priority_recovery(
+    *,
+    symbol: str,
+    target_pace_behind: bool,
+    pace_ratio: float,
+    planned_reduce_only_order_count: int,
+) -> bool:
+    return (
+        symbol.upper().strip() == "ARXUSDT"
+        and bool(target_pace_behind)
+        and float(pace_ratio) < 0.30
+        and int(planned_reduce_only_order_count) > 0
+    )
+
+
 def should_hold_arx_volume_priority_release(
     *,
     symbol: str,
@@ -1754,11 +1769,13 @@ def should_hold_arx_volume_priority_release(
     planned_reduce_only_order_count: int,
 ) -> bool:
     return (
-        symbol.upper().strip() == "ARXUSDT"
-        and bool(target_pace_behind)
-        and float(pace_ratio) < 0.30
+        is_arx_severe_volume_priority_recovery(
+            symbol=symbol,
+            target_pace_behind=target_pace_behind,
+            pace_ratio=pace_ratio,
+            planned_reduce_only_order_count=planned_reduce_only_order_count,
+        )
         and bool(allow_loss_reduce_only)
-        and int(planned_reduce_only_order_count) > 0
     )
 
 
@@ -2856,6 +2873,14 @@ def check_symbol(
         if required_hourly_notional > 0
         else 1.0
     )
+    arx_severe_volume_priority_recovery = is_arx_severe_volume_priority_recovery(
+        symbol=normalized_symbol,
+        target_pace_behind=target_pace_behind,
+        pace_ratio=pace_ratio,
+        planned_reduce_only_order_count=_safe_int(
+            assessment.get("planned_reduce_only_order_count")
+        ),
+    )
     critical_arx_inventory_pace_override = (
         normalized_symbol == "ARXUSDT"
         and bool(volume_summary.get("completion_buffer_expired"))
@@ -2906,6 +2931,7 @@ def check_symbol(
             "one_sided_entry_seconds": one_sided_entry_seconds,
             "fast_sla_seconds": fast_sla_seconds,
             "pace_ratio": pace_ratio,
+            "arx_severe_volume_priority_recovery": arx_severe_volume_priority_recovery,
             "low_pace_seconds": low_pace_seconds,
             "sla_recovery_due": sla_recovery_due,
             "sla_action_debounced": sla_action_debounced,
@@ -4361,6 +4387,7 @@ def check_symbol(
         elif (
             cooldown_until is not None
             and now < cooldown_until
+            and not arx_severe_volume_priority_recovery
             and not severe_one_sided_stall
             and not (recovery_low_volume and effective_inventory_soft_pressure)
             and not (
@@ -4667,7 +4694,12 @@ def check_symbol(
                 item.pop("guard_recovery_controls", None)
                 item.pop("recovery_started_at", None)
                 item.pop("recovery_owned", None)
-            elif drifted_updates and not restore_ready and recovery_reapply_debounced:
+            elif (
+                drifted_updates
+                and not restore_ready
+                and recovery_reapply_debounced
+                and not arx_severe_volume_priority_recovery
+            ):
                 action = "hold_recovery_control_drift_debounce"
                 item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
             elif drifted_updates and not restore_ready:
@@ -5692,7 +5724,11 @@ def check_symbol(
             )
             if elapsed < max(float(trigger_seconds), 0.0):
                 action = "wait_low_volume_confirmation"
-            elif recovery_reapply_debounced and not effective_inventory_soft_pressure:
+            elif (
+                recovery_reapply_debounced
+                and not effective_inventory_soft_pressure
+                and not arx_severe_volume_priority_recovery
+            ):
                 action = "hold_non_safety_recovery_debounce"
             elif (
                 severe_one_sided_stall

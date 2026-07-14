@@ -37,6 +37,97 @@ def _append_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class BqVolumeRecoveryGuardTests(unittest.TestCase):
+    def test_arx_severe_target_gap_bypasses_recovery_debounce_for_maker_release(self) -> None:
+        self.assertTrue(
+            bq_volume_recovery_guard.is_arx_severe_volume_priority_recovery(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.24,
+                planned_reduce_only_order_count=3,
+            )
+        )
+        self.assertFalse(
+            bq_volume_recovery_guard.is_arx_severe_volume_priority_recovery(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.31,
+                planned_reduce_only_order_count=3,
+            )
+        )
+
+    def test_arx_severe_target_gap_releases_during_recovery_debounce(self) -> None:
+        now = datetime(2026, 7, 12, 11, 56, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 24.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 3,
+                    "pause_buy_position_notional": 380.0,
+                    "pause_short_position_notional": 380.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.95,
+                },
+                long_notional=385.0,
+                short_notional=354.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            for suffix in ("runner_control", "latest_plan", "latest_submit"):
+                source = output_dir / f"reusdt_loop_{suffix}.json"
+                target = output_dir / f"arxusdt_loop_{suffix}.json"
+                target.write_text(
+                    source.read_text(encoding="utf-8").replace("REUSDT", "ARXUSDT"),
+                    encoding="utf-8",
+                )
+            plan_path = output_dir / "arxusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["buy_orders"] = [
+                {"side": "BUY", "price": 0.5968, "qty": 16.0, "force_reduce_only": True}
+            ]
+            plan["sell_orders"] = [
+                {"side": "SELL", "price": 0.5972, "qty": 16.0, "force_reduce_only": True}
+            ]
+            plan["pause_reasons"] = ["inventory_soft"]
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "ARXUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=30)).isoformat(),
+                        "no_fill_since": (now - timedelta(minutes=30)).isoformat(),
+                        "last_recovery_action_at": (now - timedelta(seconds=60)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            with patch.object(
+                bq_volume_recovery_guard,
+                "_arx_independent_freeze_policy_updates",
+                return_value={},
+            ):
+                result = check_symbol(
+                    symbol="ARXUSDT",
+                    output_dir=output_dir,
+                    state=state,
+                    now=now,
+                    window_seconds=180,
+                    min_volume_notional=100,
+                    trigger_seconds=120,
+                    daily_target_notional=100_000.0,
+                    restart_runner=restarts.append,
+                )
+
+            control = json.loads(
+                (output_dir / "arxusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(result["action"], "enable_stalled_reduce_only_loss_recovery", result)
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, ["ARXUSDT"])
+
     def test_arx_severe_target_gap_keeps_maker_release_past_recovery_timeout(self) -> None:
         self.assertTrue(
             bq_volume_recovery_guard.should_hold_arx_volume_priority_release(
