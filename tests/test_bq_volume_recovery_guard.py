@@ -258,11 +258,19 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 planned_reduce_only_order_count=3,
             )
         )
+        self.assertTrue(
+            bq_volume_recovery_guard.is_arx_severe_volume_priority_recovery(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.84,
+                planned_reduce_only_order_count=3,
+            )
+        )
         self.assertFalse(
             bq_volume_recovery_guard.is_arx_severe_volume_priority_recovery(
                 symbol="ARXUSDT",
                 target_pace_behind=True,
-                pace_ratio=0.76,
+                pace_ratio=1.01,
                 planned_reduce_only_order_count=3,
             )
         )
@@ -553,11 +561,20 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 planned_reduce_only_order_count=3,
             )
         )
+        self.assertTrue(
+            bq_volume_recovery_guard.should_hold_arx_volume_priority_release(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.84,
+                allow_loss_reduce_only=True,
+                planned_reduce_only_order_count=3,
+            )
+        )
         self.assertFalse(
             bq_volume_recovery_guard.should_hold_arx_volume_priority_release(
                 symbol="ARXUSDT",
                 target_pace_behind=True,
-                pace_ratio=0.76,
+                pace_ratio=1.01,
                 allow_loss_reduce_only=True,
                 planned_reduce_only_order_count=3,
             )
