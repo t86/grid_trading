@@ -105,6 +105,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 volatility_entry_pause_active=False,
                 ledger_position_drift_blocked=False,
                 recovery_gate_reasons=("latest_submit_error", "latest_validation_failed"),
+                validation_errors=("plan places total notional 1505.0, above max_total_notional=1200.0",),
             )
         )
         self.assertFalse(
@@ -116,6 +117,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 volatility_entry_pause_active=False,
                 ledger_position_drift_blocked=False,
                 recovery_gate_reasons=("latest_submit_error", "latest_validation_failed"),
+                validation_errors=("plan places total notional 1505.0, above max_total_notional=1200.0",),
             )
         )
         self.assertFalse(
@@ -123,10 +125,11 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 symbol="ARXUSDT",
                 target_pace_behind=True,
                 low_volume=True,
-                active_order_count=1,
+                active_order_count=2,
                 volatility_entry_pause_active=False,
                 ledger_position_drift_blocked=False,
                 recovery_gate_reasons=("latest_submit_error", "latest_validation_failed"),
+                validation_errors=("plan places total notional 1505.0, above max_total_notional=1200.0",),
             )
         )
     def test_arx_severe_pace_capacity_raises_thresholds_and_budget_only_when_calm(self) -> None:
@@ -156,6 +159,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(0.9, updates["best_quote_maker_volume_inventory_soft_ratio"])
         self.assertEqual(1600.0, updates["best_quote_maker_volume_cycle_budget_notional"])
         self.assertEqual(960.0, updates["best_quote_maker_volume_min_cycle_budget_notional"])
+        self.assertEqual(2000.0, updates["max_total_notional"])
         self.assertFalse(updates["best_quote_maker_volume_inventory_bias_enabled"])
         self.assertTrue(
             updates["best_quote_maker_volume_same_side_entry_price_guard_report_only"]
@@ -205,6 +209,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "best_quote_maker_volume_inventory_soft_ratio": 0.9,
                     "best_quote_maker_volume_min_cycle_budget_notional": 960.0,
                     "best_quote_maker_volume_cycle_budget_notional": 1600.0,
+                    "max_total_notional": 2000.0,
                 },
                 target_pace_behind=True,
                 pace_ratio=0.40,

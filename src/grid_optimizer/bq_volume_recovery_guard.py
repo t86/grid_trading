@@ -2160,18 +2160,22 @@ def should_bypass_arx_submit_failure_recovery_gate(
     volatility_entry_pause_active: bool,
     ledger_position_drift_blocked: bool,
     recovery_gate_reasons: Iterable[str],
+    validation_errors: Iterable[str],
 ) -> bool:
-    """Let ARX repair its own failed submit only when no strategy order remains."""
+    """Let ARX raise a stale submit cap without opening other validation bypasses."""
     reasons = {str(item).strip() for item in recovery_gate_reasons if str(item).strip()}
+    errors = [str(item).strip() for item in validation_errors if str(item).strip()]
     return (
         symbol.upper().strip() == "ARXUSDT"
         and bool(target_pace_behind)
         and bool(low_volume)
-        and int(active_order_count) <= 0
+        and int(active_order_count) <= 1
         and not bool(volatility_entry_pause_active)
         and not bool(ledger_position_drift_blocked)
         and reasons
         and reasons <= {"latest_submit_error", "latest_validation_failed"}
+        and bool(errors)
+        and all("above max_total_notional=" in item for item in errors)
     )
 
 
@@ -2215,6 +2219,7 @@ def arx_severe_pace_capacity_updates(
         "best_quote_maker_volume_inventory_soft_ratio": 0.9,
         "best_quote_maker_volume_min_cycle_budget_notional": 960.0,
         "best_quote_maker_volume_cycle_budget_notional": 1600.0,
+        "max_total_notional": 2000.0,
     }
     updates = {
         key: value
@@ -3262,6 +3267,11 @@ def check_symbol(
         volatility_entry_pause_active=bool(assessment.get("volatility_entry_pause_active")),
         ledger_position_drift_blocked=bool(assessment.get("ledger_position_drift_blocked")),
         recovery_gate_reasons=tuple(recovery_gate.get("reasons") or ()),
+        validation_errors=tuple(
+            (submit.get("validation") or {}).get("errors") or ()
+            if isinstance(submit.get("validation"), dict)
+            else ()
+        ),
     )
     recovery_low_volume = bool(assessment.get("low_volume")) or target_pace_behind
     assessment["target_pace_behind"] = target_pace_behind
