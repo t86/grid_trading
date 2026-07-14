@@ -4551,6 +4551,9 @@ def check_symbol(
             and not sla_action_debounced
             and loss_reduce_quote_offset_extra_ticks > 0
             and not bool(assessment.get("dynamic_quote_offset_applied"))
+            and not (
+                normalized_symbol == "ARXUSDT" and target_pace_behind
+            )
             and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks"))
             < int(loss_reduce_quote_offset_extra_ticks)
         ):
