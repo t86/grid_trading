@@ -301,6 +301,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             assessment={
                 "symbol": "ARXUSDT",
                 "target_pace_behind": True,
+                "effective_inventory_soft_pressure": True,
                 "volatility_entry_pause_active": False,
             },
             volume_summary={
@@ -320,6 +321,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 assessment={
                     "symbol": "ARXUSDT",
                     "target_pace_behind": True,
+                    "effective_inventory_soft_pressure": True,
                     "volatility_entry_pause_active": True,
                 },
                 volume_summary={

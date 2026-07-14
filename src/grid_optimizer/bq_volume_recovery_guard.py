@@ -2393,6 +2393,7 @@ def arx_soft_recovery_extension_updates(
     if (
         str(assessment.get("symbol") or "").upper() != "ARXUSDT"
         or not bool(assessment.get("target_pace_behind"))
+        or not bool(assessment.get("effective_inventory_soft_pressure"))
         or bool(assessment.get("volatility_entry_pause_active"))
         or _safe_float(volume_summary.get("trailing_15m_gross_notional")) < 100.0
         or max(wear_5m, wear_15m) > 3.0
@@ -5060,11 +5061,47 @@ def check_symbol(
                 dry_run=dry_run,
                 restart_runner=restart,
             )
+        elif arx_soft_recovery_extension_updates(
+            control=control,
+            assessment=assessment,
+            volume_summary=volume_summary,
+        ):
+            updates = arx_soft_recovery_extension_updates(
+                control=control,
+                assessment=assessment,
+                volume_summary=volume_summary,
+            )
+            _remember_recovery_controls(item, control, tuple(updates))
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_raise_arx_recovery_maker_flow"
+                if dry_run
+                else "raise_arx_recovery_maker_flow"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
         elif (
             bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and loss_reduce_cycle_budget_cap > 0
             and _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
             > loss_reduce_cycle_budget_cap
+            and not (normalized_symbol == "ARXUSDT" and target_pace_behind)
             and not (
                 recovery_has_original_controls
                 and recovery_hold_satisfied
