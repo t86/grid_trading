@@ -4639,7 +4639,69 @@ def check_symbol(
                 else:
                     action = "hold_inventory_relief_without_budget"
                     item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
-            elif recovery_timed_out:
+            elif (
+                arx_severe_volume_priority_recovery
+                and bool(assessment.get("inventory_soft_pressure"))
+                and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+                and not confirmed_loss_reduce_wear
+            ):
+                updates = _loss_reduce_recovery_updates(
+                    control=control,
+                    assessment=assessment,
+                    static_cycle_budget_floor_notional=max(
+                        cycle_budget_floor_notional,
+                        _safe_float(
+                            control.get("best_quote_maker_volume_cycle_budget_notional")
+                        ),
+                    ),
+                    quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
+                    pause_baseline_long_notional=pause_baseline_long_notional,
+                    pause_baseline_short_notional=pause_baseline_short_notional,
+                )
+                _remember_recovery_controls(
+                    item,
+                    control,
+                    tuple(
+                        key
+                        for key in updates
+                        if key != "best_quote_maker_volume_net_loss_reduce_enabled"
+                    ),
+                )
+                _remember_recovery_updates(item, updates)
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = (
+                    "dry_run_enable_arx_severe_inventory_loss_recovery"
+                    if dry_run
+                    else "enable_arx_severe_inventory_loss_recovery"
+                )
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                        "recovery_owned": True,
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+            elif recovery_timed_out and not should_hold_arx_volume_priority_release(
+                symbol=normalized_symbol,
+                target_pace_behind=target_pace_behind,
+                pace_ratio=pace_ratio,
+                allow_loss_reduce_only=bool(
+                    control.get("best_quote_maker_volume_allow_loss_reduce_only")
+                ),
+                planned_reduce_only_order_count=_safe_int(
+                    assessment.get("planned_reduce_only_order_count")
+                ),
+            ):
                 updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
