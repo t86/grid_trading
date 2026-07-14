@@ -1,116 +1,126 @@
-# Futures Recovery Single-Action Coordinator Design
+# 合约恢复单动作协调器设计
 
-Status: design approved in conversation; pending written-spec review.
+状态：会话中的设计已获确认；待审阅书面规范。
 
-## Goal
+## 术语约定
 
-Replace the current collection of futures recovery branches and direct writers with one general recovery module that, for each symbol and reconciliation round:
+- `symbol`：正文通常称“交易对”；代码、字段、枚举和需要指明原始字段的语境中保留 `symbol`。
+- `generation`：正文通常称“代际”；字段名、代码和需要指明原始字段的语境中保留 `generation`。
+- `document_revision`：正文称“文档修订号”。
+- `baseline`：正文称“规范基线”；`desired_profile` 称“目标配置”；`desired_runner_state` 称“运行器目标状态”。“目标状态”表示目标配置与运行器目标状态的组合。
+- `effect_stage`：正文称“执行阶段”；`effect_epoch` 称“执行纪元”；effect fence 称“执行栅栏”。
+- `decision_id`：正文称“决策 ID”；`round_id`：正文称“轮次 ID”。
+- runner：正文通常称“运行器”；类名、函数名、字段名和需要指明原始组件的语境中保留 runner。
 
-- evaluates one immutable snapshot;
-- selects at most one action;
-- materializes one complete managed desired state;
-- performs at most one control commit and advances at most one persisted effect stage;
-- waits for generation-matched evidence before allowing another ordinary action.
+## 目标
 
-ARX is the incident that exposed the problem, but the module is not ARX-specific. It applies to explicitly registered, recovery-managed futures symbols. Spot runners, manual operations, and the AI scheduler are outside this design.
+用一个通用恢复模块替换当前分散的合约恢复分支和直接写入方。对于每个交易对（`symbol`）的每个协调轮次，该模块：
 
-## Problem statement
+- 评估一个不可变快照；
+- 最多选择一个动作；
+- 物化一份完整的受管目标状态；
+- 最多执行一次控制提交，并最多推进一个持久化执行阶段（`effect_stage`）；
+- 在允许下一个普通动作前，等待与当前代际（`generation`）匹配的证据。
 
-The existing recovery flow has several independent action paths:
+ARX 事件暴露了这个问题，但该模块并非 ARX 专用。它适用于显式注册并由恢复模块管理的合约交易对。现货运行器、人工操作和 AI 调度器不属于本设计范围。
 
-- `bq_volume_recovery_guard.check_symbol()` selects and executes control changes inside a large branch chain;
-- inactive-runner, runner-error, effective-control-drift, and exchange-order-drift paths can restart before normal action verification;
-- budget, liveness, and health processes contain their own actuation logic, although some currently become observe-only for recovery-managed symbols;
-- Web volume and volatility trigger threads can start, stop, reduce, or flatten independently;
-- target-gate, state-realignment, and runner-local runtime-guard paths have their own multi-step side effects;
-- daily roll rewrites control and clears guard state separately;
-- Web saves can write the same control document through a shared file lock but without a recovery generation or baseline protocol.
+## 问题陈述
 
-One branch is chosen within a single function invocation, but there is no durable, cross-round single-action state machine. A control write may be followed by a restart probe consuming an old plan, then an exchange-drift probe consuming a transient empty book, then another branch writing an opposing control value. The current ownership marker serializes only writers that honor it; it does not define a lease, generation, complete baseline, complete desired state, or activation acknowledgement.
+现有恢复流程包含多条相互独立的动作路径：
 
-The result is a recurring class of failures:
+- `bq_volume_recovery_guard.check_symbol()` 在一条大型分支链中选择并执行控制变更；
+- 运行器不活跃、运行器错误、有效控制漂移和交易所订单漂移路径，可能在普通动作完成验证前触发重启；
+- 预算、存活性和健康检查进程包含各自的执行逻辑，尽管其中一部分目前对恢复托管的交易对已改为仅观察；
+- Web 成交量和波动率触发线程可以独立启动、停止、减仓或清仓；
+- 目标闸门、状态重对齐和运行器本地运行时守卫路径各自包含多阶段外部操作；
+- 每日滚动分别重写控制文件并清除守卫状态；
+- Web 保存通过共享文件锁写入同一份控制文档，但没有恢复代际或基线协议。
 
-- the same field is set to `true` by one branch and reset by another branch in a later round;
-- a pre-update plan or submit report confirms or rejects a post-update action;
-- separate restart reasons consume the same stale event and create restart cascades;
-- an exchange-empty gap during GTX cancel/replace or a fast fill is treated as drift;
-- a temporary control value is captured as the restore baseline;
-- control, guard state, daily roll, and restart do not share one generation boundary;
-- restart failure is reported without retaining the original committed decision.
+一次函数调用内只会选择一个分支，但系统没有可持久化、跨轮次的单动作状态机。一次控制写入后，重启探针可能读取旧的 `plan`，随后交易所漂移探针又读取 GTX 撤换单期间的瞬时空单簿，之后另一条分支再写入相反的控制值。现有所有权标记只能串行化遵守它的写入方；它没有定义租约、代际、完整基线、完整目标状态或激活确认。
 
-The root cause is not one bad `if` statement. It is split ownership: several components independently perform detection, choose restore values, mutate partial control, and actuate the same symbol without one durable decision/generation boundary.
+因此会反复出现同一类故障：
+
+- 某分支将同一字段设为 `true`，后续轮次的另一分支又将其复原；
+- 更新前的 `plan` 或 `submit` 报告被用来确认或否定更新后的动作；
+- 不同重启原因消费同一个陈旧事件，形成重启级联；
+- GTX 撤换单或快速成交期间的交易所空单间隙被误判为漂移；
+- 临时控制值被采集为还原基线；
+- 控制配置、守卫状态、每日滚动和重启不共享同一个代际边界；
+- 重启失败被上报时，原先已经提交的决策却没有被保留。
+
+根因不是某一个错误的 `if` 语句，而是所有权被拆散：多个组件在没有统一、持久的决策/代际边界时，各自完成检测、选择恢复值、修改局部控制配置并驱动同一个交易对。
 
 ```mermaid
 flowchart LR
-    G["Volume recovery guard"] --> C["Shared control JSON"]
-    B["Budget / liveness / health"] --> C
-    B --> R["Runner lifecycle"]
-    W["Web save + volume/volatility triggers"] --> C
+    G["成交量恢复守卫"] --> C["共享控制 JSON"]
+    B["预算 / 存活性 / 健康检查"] --> C
+    B --> R["运行器生命周期"]
+    W["Web 保存 + 成交量/波动率触发器"] --> C
     W --> R
-    D["Daily roll"] --> C
-    T["Target gate / state realign"] --> R
-    T --> E["Exchange orders / position"]
-    L["Runner-local runtime guard"] --> E
-    C --> P["Plan / submit / receipt"]
+    D["每日滚动"] --> C
+    T["目标闸门 / 状态重对齐"] --> R
+    T --> E["交易所订单 / 仓位"]
+    L["运行器本地运行时守卫"] --> E
+    C --> P["计划 / 提交 / 回执"]
     R --> P
     E --> P
-    P -. "stale or transient evidence" .-> G
-    P -. "independent recovery reason" .-> B
-    G -. "partial restore" .-> C
-    W -. "later overwrite" .-> C
+    P -. "陈旧或瞬时证据" .-> G
+    P -. "独立恢复原因" .-> B
+    G -. "局部恢复" .-> C
+    W -. "后续覆盖" .-> C
 ```
 
-The coordinator removes the competing arrows: each component becomes a pure observation or intent adapter; one per-symbol decision owns baseline, complete desired state, effect stages, and acknowledgement.
+协调器移除这些相互竞争的箭头：每个组件都退化为纯观察或意图适配器；每个交易对由唯一决策持有规范基线、完整目标状态、执行阶段和确认状态。
 
-## Scope
+## 范围
 
-### In scope
+### 范围内
 
-- Futures volume and inventory recovery currently hosted in `bq_volume_recovery_guard`.
-- Inactive runner, error-loop, effective-control-drift, and exchange/local-order-drift recovery.
-- Budget and wear/liveness decisions for recovery-managed futures symbols.
-- Web volume-trigger and volatility-trigger background loops for recovery-managed futures symbols.
-- Competition target-gate and competition state-realignment automatic paths for recovery-managed futures symbols.
-- Runner-local runtime-guard safety interrupts and their handoff to the coordinator.
-- Daily competition-window/profile rebase.
-- Web writes to recovery-managed futures control documents.
-- Runner generation propagation and post-action acknowledgement.
-- Control ownership, baseline/desired-state persistence, temporary grants, and restart/stop idempotency.
+- 当前由 `bq_volume_recovery_guard` 承载的合约成交量和库存恢复。
+- 运行器不活跃、错误循环、有效控制漂移，以及交易所/本地订单漂移恢复。
+- 面向恢复托管合约交易对的预算、磨损与存活性决策。
+- 面向恢复托管合约交易对的 Web 成交量触发与波动率触发后台循环。
+- 面向恢复托管合约交易对的竞赛目标闸门与状态重对齐自动路径。
+- 运行器本地运行时守卫的安全中断，以及其向协调器的交接。
+- 每日竞赛窗口/配置基线重建。
+- Web 对恢复托管合约控制文档的写入。
+- 运行器代际传播和动作后确认。
+- 控制所有权、基线/目标状态持久化、临时授权，以及重启/停止幂等性。
 
-### Out of scope
+### 范围外
 
-- Spot strategy runners and spot competition control.
-- Manual trading and manual server operations.
-- AI scheduler actions.
-- Distributed consensus or cross-host leader election.
-- Rewriting unrelated runner planning or order execution logic.
-- Manual liquidation or discretionary position-closing workflows. Automatic recovery and terminal stop remain maker-only and never use MARKET/IOC/taker flattening.
-- Automatically managing every symbol. A symbol must be explicitly registered with a valid policy and complete managed-field schema.
+- 现货策略运行器和现货竞赛控制。
+- 人工交易和人工服务器操作。
+- AI 调度器动作。
+- 分布式共识或跨主机主节点选举。
+- 重写无关的运行器规划或订单执行逻辑。
+- 人工强平或主观平仓流程。自动恢复和 `TERMINAL_STOP` 仍然严格使用 GTX 仅挂单（maker-only），不得使用 MARKET、IOC 或吃单方（taker）清仓。
+- 自动托管所有交易对。交易对必须显式注册，并具备有效策略和完整的受管字段模式。
 
-## Core decisions
+## 核心决策
 
-1. The coordination unit is one symbol, not the whole guard process. Different symbols may each perform one action in the same timer invocation.
-2. Detection is pure. Action definitions cannot write files, call Binance, or restart/stop a runner.
-3. Each action owns its full lifecycle: enter, hold, advance, exit, TTL, cooldown, and complete managed desired profile.
-4. Detectors and action definitions cannot return raw control patches, shell commands, or caller-chosen priorities.
-5. One deterministic arbiter owns a unique total action order.
-6. The coordinator executor is the only control, process, and exchange mutating seam. A runner-local emergency interrupt may only enter a durable fail-closed pause and write a receipt; it cannot touch control, process lifecycle, orders, or positions. The coordinator adopts that receipt as the current safety decision.
-7. Correctness-critical recovery metadata lives in the same control document as the materialized flat runner config and is committed atomically.
-8. Ordinary action transitions must return through baseline restoration and cooldown. Safety actions may preempt any ordinary phase. `TERMINAL_STOP` is monotonic once latched: nonterminal safety may only strengthen its safe stopped profile. A trusted daily roll may replace an acknowledged, control-only temporary overlay, but it cannot preempt frozen-ledger repair or an in-flight lifecycle effect; ordinary Web changes never preempt.
-9. A generation that has not been acknowledged suppresses all new ordinary actions and independent restarts.
-10. Recovery execution remains GTX maker-only, volatility entry pause remains enabled, and temporary `allow_loss` is a finite lease rather than a baseline setting.
-11. Lifecycle effects are fenced by the committed generation and decision. A delayed restart from an older decision cannot run after a newer safety or stop decision.
-12. A multi-stage recovery remains one action and one decision across rounds. Each symbol round may advance at most one persisted effect stage.
-13. Recovery-managed runner units use `Restart=no`. Process crashes become `RUNNER_RECOVER` observations; systemd cannot bypass coordinator ownership with an unfenced auto-restart.
+1. 协调单元是单个交易对，而不是整个守卫进程。同一次定时器调用中，不同交易对可以各自执行一个动作。
+2. 检测必须是纯函数。动作定义不得写文件、调用 Binance，或重启/停止运行器。
+3. 每个动作拥有其完整生命周期：进入、保持、推进、退出、存活时间（TTL）、冷却，以及完整的受管目标配置。
+4. 检测器和动作定义不得返回原始控制补丁、Shell 命令或由调用方指定的优先级。
+5. 唯一的确定性仲裁器持有唯一的动作全序。
+6. 协调器执行器是唯一有权修改控制配置、进程状态和交易所状态的边界。运行器本地紧急中断只能使运行器进入持久化的故障关闭式暂停状态并写入回执；它不得接触控制配置、进程生命周期、订单或仓位。协调器将该回执接管为当前安全决策。
+7. 对正确性关键的恢复元数据与物化后的扁平运行器配置存放在同一份控制文档中，并原子提交。
+8. 普通动作的转换必须经过基线还原和冷却。安全动作可以抢占任何普通阶段。`TERMINAL_STOP` 一旦锁定即为单调状态：非终止安全动作只能进一步收紧其安全停止配置。受信任的每日滚动可以替换一个已确认、仅修改控制配置的临时覆盖，但不能抢占冻结账本修复或正在执行的生命周期操作；普通 Web 变更永不抢占。
+9. 尚未得到确认的代际会抑制所有新普通动作和独立重启。
+10. 恢复执行继续严格使用 GTX 仅挂单（maker-only），波动率入场暂停继续保持启用，临时 `allow_loss` 是有限租约，而不是基线配置。
+11. 生命周期操作受已提交代际和决策的栅栏约束。旧决策延迟到达的重启，不得在更新的安全或停止决策之后执行。
+12. 多阶段恢复跨轮次仍然属于同一个动作和同一个决策。每个交易对每轮最多推进一个持久化执行阶段。
+13. 恢复托管的运行器单元使用 `Restart=no`。进程崩溃只生成供 `RUNNER_RECOVER` 使用的观测；systemd 不得通过无栅栏的自动重启绕过协调器所有权。
 
-## External interface
+## 外部接口
 
-The deep module exposes three entry points:
+该协调器模块对外提供三个入口：
 
 ```python
 class FuturesRecoveryCoordinator:
     def inspect(self, symbol: str) -> SymbolView:
-        """Return revision, generation, phase, baseline, desired state, and activation."""
+        """返回 `revision`、`generation`、`phase`、`baseline`、目标状态和激活状态。"""
 
     def reconcile_symbol(
         self,
@@ -119,7 +129,7 @@ class FuturesRecoveryCoordinator:
         now: datetime,
         round_id: str,
     ) -> RoundOutcome:
-        """Evaluate and, at most once, actuate one symbol for one round."""
+        """评估单个 `symbol` 的一轮协调，并且最多执行一次动作。"""
 
     def change_baseline(
         self,
@@ -127,16 +137,16 @@ class FuturesRecoveryCoordinator:
         *,
         now: datetime,
     ) -> RoundOutcome:
-        """CAS-update a complete managed baseline through the same executor."""
+        """通过同一个执行器，以 CAS 更新完整的受管基线。"""
 ```
 
-`bq_volume_recovery_guard.main()` becomes a timer adapter that calls `reconcile_symbol()` once for each configured symbol. Web reads through `inspect()` and submits a full managed baseline with `change_baseline()`. Daily roll submits a trusted profile rebase through `change_baseline()` rather than writing control and state independently.
+`bq_volume_recovery_guard.main()` 变为定时器适配器，对每个已注册的受管交易对调用一次 `reconcile_symbol()`。Web 通过 `inspect()` 读取，并使用 `change_baseline()` 提交完整的受管基线。每日滚动通过 `change_baseline()` 提交受信任的配置基线重建，而不是分别写入控制配置和状态。
 
-Callers do not load plan/submit files, choose a recovery priority, calculate restore values, or call the runner wrapper.
+调用方不再加载 `plan`/`submit` 文件、不选择恢复优先级、不计算恢复值，也不调用运行器包装器。
 
-`change_baseline()` is not a privileged direct-write path. It captures the same immutable snapshot, turns the request into a `BASELINE_REBASE` candidate, and runs the same safety-first arbitration and executor. `BaselineChange.operation_id` remains stable for the business change, while each fresh-view retry has a unique `attempt_id`; `attempt_id` becomes `RoundOutcome.round_id`. A safety candidate therefore still outranks a simultaneous Web or daily-roll request. `RoundOutcome.status` describes the selected symbol action; `request_status` separately tells the baseline caller whether its request was accepted, deferred, or rejected.
+`change_baseline()` 不是特权直写路径。它采集同样的不可变快照，将请求转换为 `BASELINE_REBASE` 候选，并经过同一套安全优先仲裁和执行器。`BaselineChange.operation_id` 在一次业务变更期间保持稳定；每次基于新视图的重试都有唯一的 `attempt_id`，且 `attempt_id` 会成为 `RoundOutcome.round_id`。因此，安全候选仍然优先于同时到来的 Web 或每日滚动请求。`RoundOutcome.status` 描述选中的交易对动作；`request_status` 另行告知基线变更调用方其请求状态是 `accepted`、`deferred` 还是 `rejected`。
 
-## Core types
+## 核心类型
 
 ```python
 @dataclass(frozen=True)
@@ -216,17 +226,17 @@ class MaterializedDecision:
     lease: HardLease | None
 ```
 
-All types passed between detection, arbitration, and materialization are immutable values. `ManagedValue` preserves the difference between a missing field and a JSON `null`. Profile digests use one documented canonical JSON encoding: sorted UTF-8 keys, normalized JSON scalar encoding, and the explicit `present` bit.
+在检测、仲裁和物化之间传递的所有类型都是不可变值。`ManagedValue` 保留字段缺失与 JSON `null` 之间的差异。配置摘要使用文档中明确规定的规范化 JSON 编码：按 UTF-8 键排序、规范化 JSON 标量编码，并显式包含 `present` 位。
 
-`document_revision` increments on every atomic metadata or control-document mutation. `generation` increments only when the complete desired managed profile or desired runner state changes. Internal compare-and-swap checks both; this avoids turning a phase-only acknowledgement into a new runner generation. Web and daily-roll requests submit both values returned by `inspect()`.
+每次元数据或控制文档发生原子变更时，`document_revision` 都递增。只有完整的受管目标配置或目标运行器状态发生变化时，`generation` 才递增。内部比较并交换（CAS）同时检查两者，避免仅更新确认状态的操作被误算为新的运行器代际。Web 和每日滚动请求提交 `inspect()` 返回的这两个值。
 
-`unmanaged_updates` is allowed only on keys outside the managed registry and `_futures_recovery`. The executor stages them, applies them to the document re-read under lock only when that `BASELINE_REBASE` request wins arbitration, and otherwise discards them; it never rebuilds unmanaged fields from the older snapshot.
+`unmanaged_updates` 只能包含受管字段注册表和 `_futures_recovery` 之外的键。执行器先暂存这些更新；只有当 `BASELINE_REBASE` 请求赢得仲裁时，才将其应用到持锁后重新读取的文档，否则将其丢弃。执行器绝不能基于较旧的快照重建非受管字段。
 
-`EffectStageKind` is a closed set: `none`, `runner_stop`, `runner_start`, `runner_restart`, `managed_gtx_cancel`, and `local_state_repair`. A stage is a step of the selected action, not a second action. No recovery effect may place MARKET, IOC, or taker orders. Terminal stop uses `runner_stop` only; it never implies cancel, close, flatten, or protective-order placement.
+`EffectStageKind` 是闭合集合：`none`、`runner_stop`、`runner_start`、`runner_restart`、`managed_gtx_cancel` 和 `local_state_repair`。执行阶段是选中动作的一个步骤，不是第二个动作。任何恢复操作都不得提交 MARKET、IOC 或吃单方（taker）订单。`TERMINAL_STOP` 只使用 `runner_stop`；它从不隐含撤单、平仓、清仓或保护单下单。
 
-## Action definitions
+## 动作定义
 
-An action definition is an internal seam. Its implementation contains the entire lifecycle for one semantic action:
+动作定义是一个内部边界。其实现包含一个语义动作的完整生命周期：
 
 ```python
 class ActionDefinition(Protocol):
@@ -241,162 +251,169 @@ class ActionDefinition(Protocol):
         snapshot: SymbolSnapshot,
         active: ActiveAction | None,
     ) -> ActionIntent | None:
-        """Return ENTER, HOLD, ADVANCE, or EXIT intent without side effects."""
+        """无副作用地返回进入（ENTER）、保持（HOLD）、推进（ADVANCE）或退出（EXIT）意图。"""
 
     def materialize(
         self,
         intent: ActionIntent,
         baseline: ManagedProfile,
     ) -> MaterializedDecision:
-        """Return baseline, desired state, lease, effect, and activation contract."""
+        """返回规范基线、目标状态、租约、执行阶段和激活契约。"""
 ```
 
-Every implementation must define in one place:
+每个实现都必须在同一个位置定义：
 
-- entry conditions;
-- hold and same-action advancement conditions;
-- completion, timeout, and exit conditions;
-- minimum hold and cooldown;
-- complete managed desired values;
-- whether the canonical baseline stays unchanged or is durably replaced;
-- permitted effect stages;
-- action-specific activation evidence;
-- structured reason and evidence fields.
+- 进入条件；
+- 保持条件和同动作推进条件；
+- 完成、超时和退出条件；
+- 最短保持时间和冷却期；
+- 完整的受管目标值；
+- 规范基线保持不变还是被持久替换；
+- 允许的执行阶段；
+- 动作特定的激活证据；
+- 结构化原因和证据字段。
 
-The registry validates that action IDs and ranks are unique. Rank `1` is the highest priority. An action cannot choose its own dynamic priority. Every registered symbol policy must also supply and validate finite values for observation max age, drift evidence max gap, activation timeout, cooldown, hard lease maximum, retry backoff, maximum effect attempts, request-retry horizon, and idempotency retention/capacity. The coordinator refuses to start for a symbol with an incomplete or invalid policy.
+注册表验证 `action_id` 和 `rank` 唯一。`rank=1` 为最高优先级。动作不能自行选择动态优先级。每个已注册交易对的策略还必须提供下列有界参数并通过校验：观察数据最长有效期、漂移证据最大间隔、激活超时、冷却期、硬租约上限、重试退避、最大执行尝试次数、请求重试时限，以及幂等记录的保留期限和容量。若某交易对的策略不完整或无效，协调器拒绝为其启动。
 
-`trusted_rebase_preemptible` is explicit per action and defaults to `false`. It can be `true` only for an acknowledged temporary control overlay whose definition has no ledger/state-repair stage and no in-flight effect. `FROZEN_LEDGER_REPAIR`, `RUNNER_RECOVER` state realignment, restore, and stop phases are never rebase-preemptible.
+`trusted_rebase_preemptible` 在每个动作中显式定义，默认值为 `false`。只有同时满足以下条件的临时控制覆盖才能设为 `true`：已获确认；定义中不包含账本或状态修复阶段；没有正在执行的阶段。`FROZEN_LEDGER_REPAIR`、`RUNNER_RECOVER` 的状态重对齐、恢复阶段和停止阶段永远不可被基线重建抢占。
 
-### Canonical actions and total priority
+### 标准动作及其全序优先级
 
-The new model deliberately collapses many legacy branch names into a small semantic action set:
+新模型有意将许多旧分支名称收敛为一小组语义动作：
 
-1. `TERMINAL_STOP`
-   - Target completed, unrecoverable corrupt state, or safety cannot be established.
-   - Effect is stop-only. It does not automatically cancel orders, close positions, flatten, or place a protective order. The managed-symbol target gate submits this intent and cannot run its legacy market-flatten path.
-2. `SAFETY_CONVERGE`
-   - Volatility trigger/pause, high wear, expired temporary grants, runner-local safety receipt, or a protected invariant violation.
-   - Clears temporary risk fields and materializes a complete safe profile.
-3. `FROZEN_LEDGER_REPAIR`
-   - Allowed only with an identified frozen-ledger entry and a validated expected hedge delta.
-   - Ordinary inventory or bottom-position recovery cannot use contract exposure for balancing.
-4. `BASELINE_REBASE`
-   - Daily runtime-profile rebase or a Web managed-profile change while stable.
-   - A trusted daily roll may revoke an acknowledged control-only temporary overlay. It returns `deferred` while frozen-ledger repair, restoration, stop confirmation, or a lifecycle effect is in flight, and the caller retries with a fresh revision. An ordinary Web edit receives `RecoveryBusy` in every non-`Stable` phase.
-5. `RUNNER_RECOVER`
-   - Inactive runner, confirmed error loop, effective-control drift, or confirmed exchange/local order drift.
-   - Multiple restart reasons collapse into one action with multiple reason codes.
-   - State realignment is one persisted multi-stage decision: stop request, stop confirmation, optional managed-GTX cancellation, local-state repair, start request, and generation-matched activation. Only one stage advances per symbol round.
-6. `INVENTORY_RECOVER`
-   - Maker-only inventory or net-notional recovery without enabling temporary loss relief.
-7. `TEMPORARY_LOSS_RELIEF`
-   - Used only after a confirmed safe inventory-recovery attempt is ineffective.
-   - Requires a finite TTL and keeps net-loss/hard-loss forced reducers disabled.
-8. `MAKER_FLOW_RECOVER`
-   - Volume pace, Web volume-trigger intent, quote distance, capacity, or maker-flow recovery.
-9. `BASELINE_TUNE`
-   - Low-priority durable budget-tier or wear-governor adjustment.
-   - Replaces the canonical baseline through `next_baseline`; it is not a temporary desired-state overlay that later restores to the old baseline.
-10. `NOOP`
-   - No actuation. The outcome may still report holds and suppressed candidates.
+1. `TERMINAL_STOP`（终止停机）
+   - 竞赛目标已完成、状态不可恢复地损坏，或无法建立安全状态。
+   - 唯一外部操作是停止。它不会自动撤单、平仓、清仓或挂保护单。受管交易对的目标闸门提交该意图，不得运行旧的市价清仓路径。
+2. `SAFETY_CONVERGE`（安全收敛）
+   - 波动率触发/暂停、高磨损、临时授权到期、运行器本地安全回执，或违反受保护不变量。
+   - 清除临时风险字段，并物化完整的安全配置。
+3. `FROZEN_LEDGER_REPAIR`（冻结账本修复）
+   - 只有存在已识别的冻结账本条目，并验证了预期对冲差量时才允许执行。
+   - 普通库存或底仓恢复不得使用合约敞口做平衡。
+4. `BASELINE_REBASE`（基线重建）
+   - 每日运行时配置基线重建，或稳定状态下的 Web 受管配置变更。
+   - 受信任的每日滚动可以撤销已获确认、仅修改控制配置的临时覆盖。当冻结账本修复、基线还原、停止确认或生命周期操作正在进行时，返回 `deferred`，调用方基于新的修订号重试。普通 Web 编辑在任何非 `Stable` 阶段都会收到 `RecoveryBusy`。
+5. `RUNNER_RECOVER`（运行器恢复）
+   - 运行器不活跃、已确认的错误循环、有效控制漂移，或已确认的交易所/本地订单漂移。
+   - 多个重启原因合并为一个动作，并带多个原因码。
+   - 状态重对齐是一个持久化的多阶段决策：停止请求、停止确认、可选的受管 GTX 撤单、本地状态修复、启动请求，以及与代际匹配的激活。每个交易对每轮只推进一个阶段。
+6. `INVENTORY_RECOVER`（库存恢复）
+   - 只使用挂单方订单恢复库存或净名义敞口，不启用临时亏损放宽。
+7. `TEMPORARY_LOSS_RELIEF`（临时亏损放宽）
+   - 仅在已确认安全的库存恢复尝试无效后使用。
+   - 必须设置有限存活时间（TTL），并保持净亏损/硬亏损强制减仓器禁用。
+8. `MAKER_FLOW_RECOVER`（挂单方流量恢复）
+   - 成交量进度、Web 成交量触发意图、报价距离、容量或挂单方流量恢复。
+9. `BASELINE_TUNE`（基线调优）
+   - 低优先级、持久化的预算层级或磨损调节器调整。
+   - 通过 `next_baseline` 替换规范基线；它不是之后会恢复旧基线的临时目标状态覆盖。
+10. `NOOP`（不执行动作）
+   - 不执行动作。结果仍可报告保持状态和被抑制的候选。
 
-Within each canonical action, symbol-specific thresholds and allowed profile parameters come from a registered symbol policy. Symbol policy cannot change the global action order or the protected invariants.
+每个标准动作中的交易对特定阈值和允许的配置参数都来自已注册交易对策略。交易对策略不得改变全局动作顺序或受保护不变量。
 
-## State machine
+## 状态机
 
 ```mermaid
 stateDiagram-v2
+    state "稳定" as Stable
+    state "确认中" as Settling
+    state "已生效" as Active
+    state "基线还原中" as Restoring
+    state "冷却中" as Cooldown
+    state "停止确认中" as StopPending
+    state "已停止" as Stopped
     [*] --> Stable
-    Stable --> Settling: select action and commit generation N+1
-    Settling --> Active: temporary action activation contract satisfied
-    Settling --> Stable: durable action activation contract satisfied
-    Settling --> Settling: stale evidence or fenced retry of same decision
-    Settling --> Settling: nonterminal safety replaces pending ordinary decision
-    Active --> Settling: same action advances without extending hard expiry
-    Active --> Restoring: commit baseline when action completes or expires
-    Restoring --> Cooldown: restored generation is acknowledged
-    Cooldown --> Stable: cooldown expires
-    Stable --> StopPending: commit terminal stop
-    Settling --> StopPending: terminal safety preempts
-    Active --> StopPending: terminal safety preempts
-    Restoring --> StopPending: terminal safety preempts
-    Cooldown --> StopPending: terminal safety preempts
-    StopPending --> Stopped: process-stopped contract satisfied
-    Stopped --> Settling: allowed new-window or profile transition
-    Active --> Settling: safety or allowed trusted rebase preempts
-    Restoring --> Settling: nonterminal safety preempts
-    Cooldown --> Settling: nonterminal safety preempts
+    Stable --> Settling: 选择动作并提交代际 N+1
+    Settling --> Active: 临时动作激活契约已满足
+    Settling --> Stable: 持久动作激活契约已满足
+    Settling --> Settling: 陈旧证据或同一决策受栅栏约束的重试
+    Settling --> Settling: 非终止安全动作替换待确认普通决策
+    Active --> Settling: 推进同一动作且不延长硬截止时间
+    Active --> Restoring: 动作完成或到期时提交规范基线
+    Restoring --> Cooldown: 还原后的代际已获确认
+    Cooldown --> Stable: 冷却期到期
+    Stable --> StopPending: 提交终止停机动作
+    Settling --> StopPending: 终止型安全动作抢占
+    Active --> StopPending: 终止型安全动作抢占
+    Restoring --> StopPending: 终止型安全动作抢占
+    Cooldown --> StopPending: 终止型安全动作抢占
+    StopPending --> Stopped: 进程停止契约已满足
+    Stopped --> Settling: 允许的新窗口或配置转换
+    Active --> Settling: 安全动作或获准的受信任基线重建抢占
+    Restoring --> Settling: 非终止安全动作抢占
+    Cooldown --> Settling: 非终止安全动作抢占
 ```
 
-### Transition rules
+### 转换规则
 
-- `Stable` means no temporary overlay is active and the materialized managed fields match the canonical baseline.
-- `Settling` means a generation is committed but its action-specific activation contract is not yet satisfied. No ordinary action or independent restart may be selected.
-- `Active` is used only for a confirmed temporary action. A durable baseline transition returns to `Stable` after acknowledgement.
-- `Restoring` writes the complete baseline as a new generation. It does not clear ownership metadata before acknowledgement.
-- `Cooldown` blocks immediate re-entry but performs no control mutation.
-- `StopPending` already sets desired runner state to stopped and suppresses liveness restart, but does not claim success before the process-stopped activation contract is satisfied.
-- `Stopped` suppresses liveness restart. Only an allowed new-window/profile transition or explicit lifecycle request can make the desired runner state running again.
-- An ordinary action cannot directly replace a different ordinary action. It must exit through `Restoring` and `Cooldown`.
-- A safety action can preempt any ordinary phase. It replaces the full desired profile as one new action; it does not layer a patch on the active profile.
-- `StopPending` and `Stopped` latch `TERMINAL_STOP`. A nonterminal safety condition may rematerialize a stricter complete safe profile under the same terminal action and stopped desired state, but it cannot change the action or resume the runner.
-- A trusted daily roll is the only nonsafety exception. It may replace an acknowledged control-only temporary overlay, after safety arbitration and only when no lifecycle effect is claimed. It cannot interrupt `FROZEN_LEDGER_REPAIR`; that request is deferred. Web baseline changes require `Stable`.
-- Action execution failure never causes the arbiter to try the second-ranked candidate in the same round.
+- `Stable` 表示当前没有活动的临时覆盖层，且物化后的受管字段与规范基线一致。
+- `Settling` 表示代际已提交，但该动作的激活契约尚未满足。此时不得选择普通动作或独立重启。
+- `Active` 仅用于已确认的临时动作。持久基线转换获得确认后返回 `Stable`。
+- `Restoring` 将完整规范基线写入新代际。在获得确认前，不得清除所有权元数据。
+- `Cooldown` 阻止立即重新进入，但不修改控制文档。
+- `StopPending` 已将运行器目标状态设为 `stopped`，并抑制存活性重启；但在进程已停止的激活契约满足前，不得宣告成功。
+- `Stopped` 抑制存活性重启。只有获准的新窗口或配置转换，或显式生命周期请求，才能将运行器目标状态重新设为 `running`。
+- 普通动作不能直接替换另一个普通动作，必须经过 `Restoring` 和 `Cooldown` 退出。
+- 安全动作可以抢占任何普通阶段。它会用一个新动作替换完整目标配置，而不是在活动配置上叠加补丁。
+- `StopPending` 和 `Stopped` 会锁定 `TERMINAL_STOP`。非终止安全条件可以在同一个终止动作和已停止目标状态下，重新物化更严格的完整安全配置，但不能更换动作或恢复运行器。
+- 受信任的每日滚动是唯一的非安全例外。它可以在完成安全仲裁后，且没有生命周期执行阶段被认领时，替换一个已获确认、仅修改控制文档的临时覆盖层。它不能中断 `FROZEN_LEDGER_REPAIR`；该请求会标记为 `deferred`。Web 基线变更要求系统处于 `Stable`。
+- 动作执行失败不会让仲裁器在同一轮尝试第二优先级候选。
 
-`pending_restart`, `failed_settling`, retry counts, and activation errors are persisted effect/activation substates, not additional recovery phases. Phase changes that do not alter desired control increment only `document_revision`.
+`pending_restart`、`failed_settling`、重试次数和激活错误是持久化的执行/激活子状态，不是额外的恢复阶段。不改变目标控制配置的阶段变更只递增 `document_revision`。
 
-## Effect stages and activation contracts
+## 执行阶段与激活契约
 
-An action may be single-stage or multi-stage, but its `action_id` and `decision_id` do not change while it advances. The action definition owns the ordered stage transition table, timeout, retry policy, and terminal outcome. A stage cannot enqueue the next stage in the same symbol round.
+一个动作可以是单阶段或多阶段，但在推进过程中，其 `action_id` 和 `decision_id` 不变。动作定义持有有序的阶段转换表、超时、重试策略和终止结果。同一交易对的同一轮次内，不得从一个阶段继续推进到下一个阶段。
 
-Each stage declares the evidence that proves completion:
+每个阶段都必须声明完成该阶段所需的证据：
 
-- control-only profile application requires a current-generation plan with the expected profile digest;
-- restart requires a fenced actuator receipt, a new process identity/start epoch, and a current-generation plan;
-- order-changing recovery requires the current-generation plan plus a complete post-action receipt and submit evidence;
-- stop requires observed process absence for the intended runner identity;
-- managed-GTX cancellation requires a complete exchange response and receipt listing the exact managed order IDs;
-- local-state repair requires an atomic repair receipt with before/after state digests.
+- 仅应用控制配置时，需要当前代际的计划，并且计划带有预期配置摘要；
+- 重启需要受栅栏约束的执行器回执、新的进程标识/启动纪元，以及当前代际的计划；
+- 涉及订单变更的恢复阶段，需要当前代际的计划、完整的动作后回执和提交证据；
+- 停止需要观察到目标运行器标识对应的进程不存在；
+- 取消受管 GTX 订单需要完整的交易所响应，以及列出精确受管订单 ID 的回执；
+- 本地状态修复需要带有修复前后状态摘要的原子修复回执。
 
-All required evidence must match symbol, generation, decision, stage, digest where applicable, and a timestamp at or after stage issuance. Evidence requirements are conjunctive; a plan *or* submit report alone never acknowledges a lifecycle or order-changing stage.
+所有必要证据都必须同时满足：匹配交易对、代际、决策和阶段，在适用时还要匹配摘要；其时间戳不得早于阶段发出时间。仅凭计划或提交报告，永远不能确认生命周期阶段或会改变订单的阶段。
 
-The runner lifecycle section persists desired state, current stage, effect generation, decision ID, claim owner/expiry, attempt count, next retry time, last error, and activation deadline. Normal effect exhaustion transitions on a later round to a complete safe baseline plus terminal stop; a safety-effect failure also remains stop-biased. Neither path tries a lower-priority ordinary action.
+运行器生命周期区段持久化目标状态、当前阶段、`effect_generation`、决策 ID、认领方及其到期时间、尝试次数、下次重试时间、最近错误和激活截止时间。普通执行阶段用尽重试次数后，在后续轮次转换为完整安全基线并执行终止停机；安全阶段失败后仍保持停止优先，不恢复交易。两条路径都不会尝试优先级更低的普通动作。
 
-## Complete desired-state model
+## 完整目标状态模型
 
-Managed fields are declared in a versioned registry. A valid baseline and desired profile contains every registered field, including presence information when omission differs from JSON `null`.
+受管字段在带版本的注册表中声明。有效的基线和目标配置必须包含每个已注册字段；当字段省略与 JSON `null` 含义不同时，还必须包含字段是否存在的信息。
 
-The effective control is always:
+有效控制配置始终为：
 
 ```text
-latest unowned fields
-+ canonical managed baseline
-+ exactly one active complete managed profile, if any
-+ protected invariants
+最新的非受管字段
++ 规范受管基线
++ 恰好一个活动的完整受管配置（如有）
++ 受保护不变量
 ```
 
-It is never the accumulation of prior sparse patches.
+它绝不是此前稀疏补丁的累积结果。
 
-Switching or restoring a profile rematerializes every managed field. A prior action's `true`, budget, cap, offset, or sticky value therefore cannot leak into the next action.
+切换或恢复配置时会重新物化每一个受管字段。因此，前一个动作留下的 `true`、预算、上限、偏移量或粘滞值不会泄漏到下一个动作。
 
-### Protected invariants
+### 受保护不变量
 
-For recovery-managed futures symbols:
+对于恢复托管的合约交易对：
 
-- `volatility_entry_pause_enabled` is materialized as `true` when absent and automatic actions cannot set it to `false`.
-- The policy's required volatility pause thresholds must be present and positive.
-- `best_quote_maker_volume_net_loss_reduce_enabled` remains `false`.
-- `hard_loss_forced_reduce_enabled` remains `false`.
-- Recovery execution policy is `gtx_maker_only`.
-- Normal recovery cannot request aggressive, IOC, market, or taker execution.
-- `best_quote_maker_volume_allow_loss_reduce_only=true` is not a legal baseline value.
-- In this document, `allow_loss` is shorthand for `best_quote_maker_volume_allow_loss_reduce_only`.
-- `allow_loss=true` is legal only for `TEMPORARY_LOSS_RELIEF` with a valid, absolute hard expiry no later than the registered policy maximum.
-- Ordinary recovery cannot use contract exposure to repair inventory. Contract changes require `FROZEN_LEDGER_REPAIR` and frozen-ledger evidence.
+- `volatility_entry_pause_enabled` 缺失时物化为 `true`，任何自动动作都不能将其设为 `false`。
+- 策略要求的波动率暂停阈值必须存在且为正数。
+- `best_quote_maker_volume_net_loss_reduce_enabled` 保持为 `false`。
+- `hard_loss_forced_reduce_enabled` 保持为 `false`。
+- 恢复执行策略为 `gtx_maker_only`。
+- 普通恢复不得请求 `aggressive`、`IOC`、`market` 或吃单方（`taker`）执行。
+- `best_quote_maker_volume_allow_loss_reduce_only=true` 不是合法规范基线值。
+- 本文中的 `allow_loss` 是 `best_quote_maker_volume_allow_loss_reduce_only` 的简称。
+- 只有带有有效绝对硬截止时间，且该时间不晚于注册策略最大值的 `TEMPORARY_LOSS_RELIEF`，才允许 `allow_loss=true`。
+- 普通恢复不得使用合约敞口修复库存。合约变更必须属于 `FROZEN_LEDGER_REPAIR`，并具备冻结账本证据。
 
-## Persistence and ownership
+## 持久化与所有权
 
-The flat top-level control remains compatible with `run_saved_runner`. Correctness-critical metadata is embedded in the same document:
+扁平的顶层控制配置继续与 `run_saved_runner` 兼容。对正确性关键的元数据嵌入同一文档：
 
 ```json
 {
@@ -414,10 +431,10 @@ The flat top-level control remains compatible with `run_saved_runner`. Correctne
     "action_id": "maker_flow_recover",
     "decision_id": "uuid",
     "baseline": {
-      "...every managed field...": {"present": true, "value": false}
+      "...全部受管字段...": {"present": true, "value": false}
     },
     "desired": {
-      "...every managed field...": {"present": true, "value": true}
+      "...全部受管字段...": {"present": true, "value": true}
     },
     "issued_at": "2026-07-14T05:00:00Z",
     "expires_at": null,
@@ -461,423 +478,423 @@ The flat top-level control remains compatible with `run_saved_runner`. Correctne
 }
 ```
 
-The control document is the sole truth for document revision, generation, baseline, desired state, active action, phase, hard lease, lifecycle effect, activation contract, and recent idempotency keys. Auxiliary guard state may store drift counters and diagnostic evidence, but losing it may only delay an action; it cannot change the restore target or reactivate a temporary grant.
+控制文档是文档修订号、代际、规范基线、目标状态、活动动作、阶段、硬租约、生命周期操作、激活契约和近期幂等键的唯一事实来源。辅助防护状态可以存储漂移计数器和诊断证据，但丢失这些信息最多只能延迟动作；不得改变恢复目标或重新激活临时授权。
 
-The existing ownership helper becomes part of the coordinator store/executor. All in-scope writers use the same per-symbol lock and revision/generation compare-and-swap. The metadata stores a bounded policy-sized set of recent scheduler rounds and baseline request attempts together with operation ID, attempt ID, outcome summary, and whether the operation is final. Retention must exceed the registered maximum request-retry horizon plus maximum action lifetime. A duplicate attempt returns its recorded outcome; a completed operation cannot create another generation.
+现有所有权辅助组件纳入协调器的存储与执行边界。所有范围内写入方使用同一个按交易对划分的锁，以及基于 `revision`/`generation` 的比较并交换。元数据保存一组容量受策略限制的近期调度轮次和基线请求尝试，同时保存操作 ID、尝试 ID、结果摘要，以及操作是否已结束。保留时长必须超过已注册的最大请求重试时限与最大动作生命周期之和。重复尝试返回已记录结果；已完成的操作不得产生新的代际。
 
-A retryable baseline `request_status=deferred` finalizes only its `attempt_id`, not its `operation_id`, even when another safety action commits in the same call. Daily roll re-reads `inspect()`, keeps the same operation ID, and submits a new attempt ID. An accepted rebase, rejected-invalid request, or explicitly canceled operation is final. Scheduler rounds use their `round_id` as both operation and attempt ID and have `request_status=None`.
+可重试基线请求的 `request_status=deferred` 只结束其 `attempt_id`，不结束其 `operation_id`，即使同一次调用中另一个安全动作已经提交。每日滚动重新读取 `inspect()`，保留同一个操作 ID，并提交新的尝试 ID。只有基线重建被接受或请求因无效被拒绝时，操作才结束。调度轮次使用其 `round_id` 同时作为操作 ID 和尝试 ID，且 `request_status=None`。
 
-Ownership is protocol ownership, not a permanent daemon lease: only the coordinator executor may mutate a managed document, while any local adapter may submit a request to it. A lifecycle attempt has a short persisted claim containing owner ID, attempt ID, and claim expiry. An expired claimant may be replaced through CAS; a live claimant cannot be duplicated. Each claimed attempt increments the monotonic `effect_epoch`, even when it retries the same generation and stage. The production actuator must be idempotent by `(symbol, effect_generation, effect_decision_id, effect_epoch)`.
+这里的所有权是协议所有权，不是永久守护进程租约：只有协调器执行器可以修改受管文档，但任何本地适配器都可以向其提交请求。一次生命周期尝试具有一项短期持久化认领，其中包含所有者 ID、尝试 ID 和认领到期时间。过期认领方可通过 CAS 替换；未过期的认领不得被替换或重复创建。每次认领尝试都会单调递增执行纪元（`effect_epoch`），即使它重试的是同一个代际和阶段。生产执行器必须以 `(symbol, effect_generation, effect_decision_id, effect_epoch)` 为幂等键。
 
-Lifecycle submission is generation-fenced, not merely idempotent. Every generation-changing commit acquires the per-symbol effect fence first and the control-document lock second; revision-only metadata commits use only the control lock. The executor may launch the wrapper without holding either lock. The wrapper itself then acquires the same per-symbol effect fence, re-reads the document under the control lock, verifies desired runner state, effect generation, decision ID, stage, live claim, and monotonic effect epoch, and releases only the control lock. While still holding the effect fence, it performs the synchronous process mutation and records the effect receipt; it releases the effect fence only after the process command returns. Activation observation happens later without locks. A lower or superseded epoch is rejected before mutation. If an old wrapper already owns the fence, a newer stop commit waits, then commits and applies after the old mutation. Therefore an old restart cannot apply after a newer terminal-stop commit.
+生命周期提交受代际栅栏约束，而不只是具备幂等性。每次改变代际的提交，先获取按交易对划分的执行栅栏，再获取控制文档锁；仅修改 `revision` 元数据的提交只使用控制锁。执行器可以在不持有任何一个锁的情况下启动包装器。包装器随后自行获取同一个执行栅栏，在控制锁下重新读取文档，验证运行器目标状态、`effect_generation`、决策 ID、阶段、有效认领和单调执行纪元（`effect_epoch`），然后仅释放控制锁。在仍持有执行栅栏时，包装器同步变更进程并记录执行回执；只有进程命令返回后才释放执行栅栏。稍后在无锁情况下执行激活观测。低于当前值或已被取代的执行纪元会在修改前被拒绝。若旧包装器已持有栅栏，较新的停止提交会等待，随后提交并在旧修改完成后执行。因此，旧重启不可能在更新的终止停机提交之后生效。
 
-This locking design assumes one host or a filesystem whose advisory locks and atomic replace semantics are shared by every writer. Cross-host coordination requires a different store and is outside this design.
+该锁设计假设所有写入方位于同一主机，或使用所有写入方共享、具备建议锁与原子替换语义的文件系统。跨主机协调需要使用不同的存储实现，不属于本设计范围。
 
-## Immutable snapshot and freshness
+## 不可变快照与时效性
 
-The snapshot factory reads each source once per symbol round. Action definitions cannot perform their own reads.
+快照工厂在每个交易对的每个轮次中对每个来源只读取一次。动作定义不得自行读取。
 
-Every observation includes:
+每项观测包含：
 
-- `captured_at`;
-- source request or cycle ID;
-- symbol;
-- control generation where applicable;
-- profile digest where applicable.
+- `captured_at`；
+- 来源请求 ID 或循环 ID；
+- 交易对；
+- 适用时的控制代际；
+- 适用时的配置摘要。
 
-Each action declares its required observations. The coordinator rejects or holds that action on stale or missing required evidence; an unrelated missing source does not block control-document invariants, absolute lease expiry, or terminal stop. It does not convert a failed Binance request into an empty book or zero position.
+每个动作声明其所需观测。所需证据陈旧或缺失时，协调器会拒绝该动作或将其置于等待；不相关来源缺失，不会阻止控制文档不变量、绝对租约到期或终止停机。协调器不会把失败的 Binance 请求解释为空订单簿或零仓位。
 
-The runner propagates the applied recovery generation and profile digest into:
+运行器将已应用的恢复代际和配置摘要传播到：
 
-- latest plan;
-- latest submit;
-- runner error events;
-- a post-action receipt written after cancel/place processing, not before it.
+- 最新计划；
+- 最新提交结果；
+- 运行器错误事件；
+- 仅在撤单或下单处理完成后写入的动作后回执。
 
-An observation can acknowledge a decision only when its generation matches the current required generation and its timestamp is at or after the decision's `issued_at`.
+只有当观测的代际与当前所需代际一致，且时间戳不早于决策的 `issued_at` 时，它才能确认该决策。
 
-### Runner-local emergency safety lane
+### 运行器本地紧急安全通道
 
-The runner may immediately interrupt its own normal planning only for a registered emergency safety condition. It may atomically enter a durable local pause and stop generating or submitting new work. It cannot cancel orders, submit risk reduction, change contract exposure, enable `allow_loss`, relax volatility pause, restart itself, mutate process state, or mutate the canonical control/baseline.
+只有已注册的紧急安全条件，才允许运行器立即中断自身普通规划。运行器可以原子地进入持久本地暂停状态，并停止生成或提交新的计划与订单。它不得撤单、提交风险降低订单、改变合约敞口、启用 `allow_loss`、放宽波动率暂停条件、自行重启、修改进程状态，或修改规范控制配置/基线。
 
-Before entering the pause, the runner atomically records a safety receipt containing symbol, current generation/profile digest, safety action ID, safety decision ID, stage, and timestamps; startup reads the receipt before normal planning. While the receipt is nonterminal, the runner remains nontradable. On the next coordinator round, that receipt is adopted as the current `SAFETY_CONVERGE` or `TERMINAL_STOP` decision; any required managed-GTX cancellation or frozen-ledger repair then runs through the fenced coordinator executor. No ordinary action, restart, or rebase may run. A malformed, missing, or generation-mismatched receipt fails closed to pause rather than triggering recovery.
+进入暂停前，运行器原子写入安全回执，内容包括交易对、当前代际/配置摘要、安全动作 ID、安全决策 ID、阶段和时间戳；启动时先于普通规划读取该回执。只要回执处于非终止状态，运行器就保持不可交易。下一个协调器轮次将该回执接管为当前 `SAFETY_CONVERGE` 或 `TERMINAL_STOP` 决策；后续所需的受管 GTX 撤单或冻结账本修复，均通过受栅栏约束的协调器执行器完成。此时不得运行普通动作、重启或基线重建。回执格式错误、缺失或与代际不匹配时，系统以故障关闭方式进入暂停，而不是触发恢复。
 
-This exception preserves semantic single ownership: the emergency interrupt becomes the one current safety action for the symbol; the coordinator continues the same decision instead of creating a competing action.
+该例外仍保持语义上的单一所有权：紧急中断成为该交易对当前唯一的安全动作；协调器继续执行同一个决策，而不是创建竞争动作。
 
-### Exchange/local order drift
+### 交易所/本地订单漂移
 
-Order drift is not inferred from one local active count and one exchange-empty response. A `RUNNER_RECOVER` drift intent requires:
+不能仅根据一次本地活动订单计数和一次交易所空单响应推断订单漂移。`RUNNER_RECOVER` 漂移意图需要：
 
-- two successful observations with strictly increasing runner cycle sequence numbers;
-- two successful exchange requests with distinct request IDs and increasing capture timestamps;
-- current-generation post-action receipts;
-- observations newer than the current decision;
-- both observations within the registered freshness limit and evidence max-gap;
-- the same expected-order set derived from the latest complete current-generation receipt;
-- no fresh managed GTX placement, partial fill, or fill;
-- symbol- and managed-client-ID filtering;
-- exact managed LIMIT/GTX order classification where exchange data provides it.
+- 两次成功观测，且运行器循环序列号严格递增；
+- 两次成功的交易所请求，请求 ID 不同，采集时间戳递增；
+- 当前代际的动作后回执；
+- 观测时间晚于当前决策；
+- 两次观测都处于已注册的时效限制和证据最大间隔内；
+- 根据最新且完整的当前代际回执推导出的预期订单集合一致；
+- 没有新的受管 GTX 下单、部分成交或完全成交；
+- 按交易对和受管客户端 ID 过滤；
+- 当交易所数据提供相关信息时，精确识别受管 LIMIT/GTX 订单。
 
-A fast GTX fill followed by an empty open-order book is execution progress, not drift. Unrelated symbol or manual-account events neither confirm nor suppress the managed symbol's recovery.
+GTX 订单快速成交后，未结订单簿为空属于执行进展，而不是漂移。无关交易对或人工账户事件既不能确认，也不能抑制受管交易对的恢复。
 
-### Order identity contract
+### 订单身份契约
 
-New managed futures orders use a versioned client-order-ID renderer that includes a compact base-36 recovery generation and decision token while retaining symbol/role identity. The renderer validates Binance's 36-character limit before submission. The runner also atomically writes a checksummed post-action manifest containing generation, decision ID, cycle sequence, request ID, placed IDs, canceled IDs, filled IDs, and `completed_at`.
+新的受管合约订单使用带版本的客户端订单 ID 生成器，其中包含紧凑的三十六进制恢复代际和决策令牌，同时保留交易对/角色标识。生成器会在提交前验证 Binance 的 36 字符限制。运行器还会原子写入带校验和的动作后清单，内容包含代际、决策 ID、循环序列号、请求 ID、已下单 ID、已撤单 ID、已成交 ID 和 `completed_at`。
 
-Exchange classification joins the parsed client-order-ID token with the complete manifest. A missing, truncated, checksum-invalid, or generation-mismatched manifest yields `hold`, never an empty managed order set. IDs from the legacy format are `legacy_unattributed`; they cannot confirm current-generation health or drift. Before a future symbol cutover, the runner must be quiesced and every legacy managed order must either finish or be explicitly canceled as a recorded maker-order cleanup stage. No position is market-flattened during this migration.
+交易所订单分类会将解析出的客户端订单 ID 令牌与完整清单关联。清单缺失、截断、校验和无效或与代际不匹配时，结果为 `hold`，绝不能解释为空的受管订单集合。旧格式 ID 标记为 `legacy_unattributed`；它们不能确认当前代际的健康状态或漂移。未来切换交易对前，必须先将运行器置于静止状态；所有旧格式受管订单必须执行完毕，或通过有记录的挂单方订单清理阶段显式撤销。迁移过程中不允许以市价方式清空任何仓位。
 
-## Per-symbol round algorithm
+## 每个交易对的轮次算法
 
 ```text
-capture one immutable snapshot without holding an actuator lock
-acquire the per-symbol effect fence when a generation may change
-acquire the per-symbol control lock
-re-read document revision and generation
-if either differs from the snapshot: return deferred
-if attempt ID was already processed: return its recorded outcome
-if operation ID is already final: return its final outcome
-stage any requested unmanaged updates; do not apply them before arbitration
-validate the managed document, registered policy, and protected invariants
-evaluate terminal and safety intents first
-if phase is StopPending or Stopped:
-    keep TERMINAL_STOP latched
-    if a terminal or nonterminal safety observation requires a stricter profile:
-        continue the terminal decision and only strengthen its stopped safe profile
-    elif phase is Stopped and request is a trusted daily new-window/profile rebase
-         and registered policy permits resume:
-        select BASELINE_REBASE with desired runner state running
-    elif a baseline request exists:
-        select no action and set result to request-level DEFERRED;
-            Web adapter maps it to RecoveryBusy
-    else:
-        verify stop or set result to HOLD under the terminal decision
-elif terminal or safety preempts:
-    select only that highest-ranked intent
-elif request is a trusted daily rebase and phase is Active and
-     active definition is trusted-rebase-preemptible and no effect is claimed:
-    select BASELINE_REBASE
-elif a baseline request exists and phase is not Stable:
-    select no action and set result to request-level DEFERRED;
-        Web adapter maps it to RecoveryBusy
-        do not advance the existing action in this request
-elif an effect or activation is pending:
-    verify, back off, or claim one retry stage of the existing decision
-elif phase is Active:
-    evaluate only the active definition's HOLD, ADVANCE, or EXIT
-    record every other ordinary candidate as suppressed
-elif phase is Restoring:
-    verify only the restore activation contract
-elif phase is Cooldown:
-    expire cooldown or set result to HOLD; select no ordinary candidate
-else Stable:
-    evaluate applicable pure definitions and an optional baseline request
-    select the single highest-ranked intent
-if a baseline request exists:
-    set request_status=accepted only when BASELINE_REBASE was selected
-    otherwise set request_status=deferred unless validation rejected it
-    set operation_final=true only for accepted, rejected, or canceled requests
-if result is NOOP, HOLD, or request-level DEFERRED:
-    atomically record the attempt ID and outcome as a revision-only commit;
-        retryable DEFERRED leaves operation final=false
-    release locks, append audit outcome, and return
-else:
-    materialize complete next baseline, desired profile, and one effect stage
-    apply staged unmanaged updates only if BASELINE_REBASE was selected;
-        otherwise preserve the lock-time unmanaged document unchanged
-    atomically commit document revision N+1, generation when required,
-        the operation/attempt idempotency record, pending activation,
-        and effect fence token
-release the control lock and effect fence
-if one effect stage was claimed: invoke it through fenced, idempotent executor
-append the audit outcome
-verify stage activation in a later symbol round
+在不持有控制锁或执行栅栏时采集一个不可变快照
+当代际可能变化时，获取按交易对划分的执行栅栏
+获取按交易对划分的控制锁
+重新读取文档修订号和代际
+如果任一值与快照不同：返回 deferred
+如果尝试 ID 已处理：返回已记录结果
+如果操作 ID 已结束：返回其最终结果
+暂存请求中的非受管更新；仲裁前不得应用
+验证受管文档、已注册策略和受保护不变量
+先评估终止意图和安全意图
+如果 phase 是 StopPending 或 Stopped：
+    保持 TERMINAL_STOP 锁定
+    如果终止型或非终止型安全观测要求更严格的配置：
+        继续终止决策，只收紧其已停止安全配置
+    否则，如果 phase 是 Stopped，且请求为受信任的每日新窗口/配置基线重建，
+         并且已注册策略允许恢复运行：
+        选择 BASELINE_REBASE，并将运行器目标状态设为 running
+    否则，如果存在基线请求：
+        不选择动作，将结果设为请求级 deferred；
+            Web 适配器将其映射为 RecoveryBusy
+    否则：
+        验证停止，或在终止决策下将结果设为 hold
+否则，如果终止动作或安全动作抢占：
+    只选择其中优先级最高的意图
+否则，如果请求是受信任的每日基线重建，phase 是 Active，
+     活动动作定义的 trusted_rebase_preemptible 为 true，且没有执行阶段被认领：
+    选择 BASELINE_REBASE
+否则，如果存在基线请求，且 phase 不是 Stable：
+    不选择动作，将结果设为请求级 deferred；
+        Web 适配器将其映射为 RecoveryBusy
+        本次请求中不推进现有动作
+否则，如果有待处理的执行阶段或激活：
+    验证、退避，或认领现有决策的一个重试阶段
+否则，如果 phase 是 Active：
+    只评估活动动作定义的 HOLD、ADVANCE 或 EXIT
+    将所有其他普通候选记录为已抑制
+否则，如果 phase 是 Restoring：
+    只验证恢复激活契约
+否则，如果 phase 是 Cooldown：
+    如果冷却期已到则结束 Cooldown，否则将结果设为 hold；不选择普通候选
+否则，phase 为 Stable：
+    评估适用的纯函数式动作定义和可选基线请求
+    选择唯一的最高优先级意图
+如果存在基线请求：
+    仅当选中 BASELINE_REBASE 时，设置 request_status=accepted
+    否则，除非校验已拒绝请求，设置 request_status=deferred
+    仅对 accepted 或 rejected 请求设置 operation_final=true
+如果结果是 noop、hold 或请求级 deferred：
+    通过仅修改修订号的提交，原子记录尝试 ID 和结果；
+        可重试 deferred 保持 operation_final=false
+    释放锁，追加审计结果并返回
+否则：
+    物化完整的下一规范基线、目标配置和一个执行阶段
+    仅当选中 BASELINE_REBASE 时应用暂存的非受管更新；
+        否则保持持锁时读取的非受管文档不变
+    原子提交文档修订号 N+1、需要时提交代际、
+        操作/尝试幂等记录、待处理激活
+        和执行栅栏令牌
+释放控制锁和执行栅栏
+如果一个执行阶段已被认领：通过受栅栏约束的幂等执行器调用它
+追加审计结果
+在后续交易对轮次验证阶段激活
 ```
 
-The coordinator never evaluates a second ordinary definition while another ordinary action is active. `EXIT` commits only the complete restore profile; it cannot select the next ordinary action in the same round. A phase-only acknowledgement or first-time `noop`/`hold` outcome increments `document_revision` but not `generation`. Repeating the same attempt ID returns the recorded outcome without another commit; retrying a nonfinal baseline operation requires a new attempt ID and fresh expected revision/generation.
+当另一个普通动作处于活动状态时，协调器绝不评估第二个普通动作定义。`EXIT` 只提交完整恢复配置；它不能在同一轮选择下一个普通动作。仅确认阶段或首次产生 `noop`/`hold` 结果时，只递增 `document_revision`，不递增 `generation`。重复相同尝试 ID 时，直接返回已记录结果，不产生另一次提交；重试尚未结束的基线操作时，需要新的尝试 ID，以及新的预期 `revision`/`generation`。
 
-Network requests and activation/health waits do not occur while locks are held. The wrapper holds only the effect fence, not the control lock, across the bounded synchronous process mutation required to close the fencing race; plan, submit, and health completion are observed in later rounds.
+持锁期间不执行网络请求，也不等待激活或健康状态。为了消除栅栏竞争，包装器在有界的同步进程修改期间只持有执行栅栏，不持有控制锁；计划、提交结果和健康状态完成证据在后续轮次观测。
 
-## Failure semantics
+## 故障语义
 
-### Missing or stale observations
+### 观察数据缺失或陈旧
 
-Return `hold` for the action that requires the missing evidence; write only the revision/idempotency outcome, without changing generation, profile, or effect state, and do not restart. Exchange request failure is not evidence of an empty exchange state. Protected-invariant repair, hard lease expiry, runner-local safety adoption, and terminal stop depend only on the trusted control document, local clock, and their own required evidence, so unrelated exchange failure cannot block them.
+对需要该缺失证据的动作返回 `hold`；只写入修订号/幂等结果，不改变代际、配置或执行状态，也不重启。交易所请求失败不是交易所状态为空的证据。受保护不变量修复、硬租约到期、运行器本地安全接管和终止停机，只依赖受信任的控制文档、本地时钟及各自必需的证据，因此不相关的交易所故障不能阻止它们。
 
-### Duplicate timer or generation conflict
+### 重复定时器或代际冲突
 
-Return `deferred`. The caller retries in a later round with a new snapshot. A stale Web request returns an HTTP conflict through the Web adapter.
+返回 `deferred`。调用方在后续轮次使用新快照重试。陈旧的 Web 请求通过 Web 适配器返回 HTTP 冲突。
 
-### Control commit failure
+### 控制提交失败
 
-No new generation exists and no runner effect is attempted.
+不存在新的代际，也不尝试运行器生命周期操作。
 
-### Runner effect failure after commit
+### 控制提交后的运行器生命周期操作失败
 
-Keep the same decision and effect stage pending. Persist `attempt_count`, `next_retry_at`, and `last_error`; retry only after the registered backoff and only while below the registered attempt limit. The next round may idempotently retry that stage or allow a higher-priority safety action. It cannot select a different ordinary candidate. Attempt exhaustion schedules a complete safe profile plus terminal stop on a later round.
+保持同一个决策及其执行阶段处于待处理状态。持久化 `attempt_count`、`next_retry_at` 和 `last_error`；只有经过已注册的退避时间，且未超过已注册的尝试次数上限时才重试。下一轮可以幂等重试该阶段，或允许更高优先级的安全动作；不能选择其他普通候选。尝试次数用尽后，在后续轮次安排完整安全配置并执行终止停机。
 
-### Activation timeout
+### 激活超时
 
-Keep the committed desired generation in the activation substate `failed_settling`. Do not roll back to the previous generation and do not execute a fallback action. Retry within the registered limit or allow safety convergence; exhaustion schedules terminal stop rather than another ordinary action.
+将已提交的目标代际保持在激活子状态 `failed_settling`。不回滚到前一个代际，也不执行后备动作。在已注册限制内重试，或允许安全收敛；用尽重试后安排终止停机，而不是另一个普通动作。
 
-### Corrupt managed document
+### 受管文档损坏
 
-If a complete baseline can be reconstructed from the registered runtime profile, commit a safe baseline generation. Otherwise use terminal stop-only. Never infer a canonical baseline from a live control that may contain an overlay.
+如果能从已注册的运行时配置重建完整基线，则提交安全基线并创建新代际；否则只执行终止停机。绝不能从可能包含覆盖层的实时控制配置推断规范基线。
 
-### Audit failure
+### 审计失败
 
-Report degraded audit state but do not roll back a successfully committed generation. The next round can reconstruct correctness from the control document.
+报告审计降级状态，但不回滚已成功提交的代际。下一轮可以从控制文档重建正确状态。
 
-### Web managed-profile conflict
+### Web 受管配置冲突
 
-Web must provide `expected_revision` and `expected_generation`. The Web adapter maps baseline `request_status`, not the unrelated selected action status: a normal Web edit in any non-`Stable` phase returns `RecoveryBusy`; it does not silently alter an action's restore target. Daily roll is a trusted rebase request and may revoke only an acknowledged control-only overlay as one `BASELINE_REBASE` action; otherwise it receives retryable `request_status=deferred`, keeps its operation ID, and retries from a fresh view with a new attempt ID.
+Web 必须提供 `expected_revision` 和 `expected_generation`。Web 适配器映射基线的 `request_status`，而不是无关的选中动作状态：普通 Web 编辑在任何非 `Stable` 阶段返回 `RecoveryBusy`；它不会静默改变动作的恢复目标。每日滚动是受信任的基线重建请求，只能通过一个 `BASELINE_REBASE` 动作撤销已获确认、仅修改控制配置的覆盖层；否则它会收到可重试的 `request_status=deferred`，保留操作 ID，并基于新视图使用新的尝试 ID 重试。
 
-## Temporary `allow_loss` reclaim
+## 临时 `allow_loss` 回收
 
-`TEMPORARY_LOSS_RELIEF` stores `lease_started_at` and an absolute `hard_expires_at` in the managed document. Same-action `ADVANCE` cannot move `hard_expires_at`; a new lease is possible only after restore and cooldown. The coordinator restores a complete non-loss baseline when any of these occur:
+`TEMPORARY_LOSS_RELIEF` 在受管文档中保存 `lease_started_at` 和绝对 `hard_expires_at`。同一动作的 `ADVANCE` 不能移动 `hard_expires_at`；只有经过恢复和冷却后才能创建新租约。发生以下任一情况时，协调器恢复完整的非亏损基线：
 
-- TTL expires;
-- inventory recovery succeeds;
-- volatility pause becomes active;
-- wear reaches the safety threshold;
-- the action fails its effectiveness verification;
-- a trusted baseline rebase revokes the overlay.
+- TTL 到期；
+- 库存恢复成功；
+- 波动率暂停变为活动状态；
+- 磨损达到安全阈值；
+- 动作未通过有效性验证；
+- 受信任的基线重建撤销覆盖层。
 
-Lease expiry uses the trusted control document and local UTC clock; it is not blocked by missing exchange, plan, or submit observations. The runner treats `allow_loss=false` at startup, on every plan cycle, and immediately before generating or submitting each order when the action ID, start time, or hard expiry is absent, malformed, mismatched, or expired. This prevents an indefinitely enabled temporary grant if the coordinator is down. Coordinator recovery later persists the complete safe profile.
+租约到期判断使用受信任的控制文档和本地 UTC 时钟；不会被缺失的交易所观测、计划观测或提交观测阻塞。当动作 ID、开始时间或硬截止时间缺失、格式错误、不匹配或已过期时，运行器在启动时、每个计划循环中，以及紧接在每次生成或提交订单之前，都按 `allow_loss=false` 处理。这样即使协调器宕机，也不会无限期启用临时授权。协调器恢复后再持久化完整安全配置。
 
-## Dependencies and adapters
+## 依赖与适配器
 
-### In-process
+### 进程内组件
 
-- action definitions;
-- arbiter;
-- profile materializer and validator;
-- generation verifier;
-- snapshot normalization.
+- 动作定义；
+- 仲裁器；
+- 配置物化器与校验器；
+- `generation` 校验器；
+- 快照规范化器。
 
-These are pure implementations and do not need public ports.
+这些都是纯内部实现，无需作为外部接口暴露。
 
-### Local-substitutable
+### 可在本地替换的组件
 
-- `ManagedControlStoreAdapter`: production uses the per-symbol effect/control locks, temp file, file fsync, `os.replace`, and directory fsync; tests use memory or a temporary directory.
-- `RunnerObservationAdapter`: production reads process, plan, submit, event, and receipt data; tests use immutable fixtures.
-- `EffectExecutorAdapter`: production dispatches the closed effect-stage set to the generation-fenced saved-runner wrapper/systemd, exact managed-GTX cancellation, or atomic local-state repair; tests use a recording fake with monotonic fence epochs and idempotent decision IDs.
-- `RuntimeProfileRepositoryAdapter`: production reads registered runtime profiles; tests use an in-memory registry.
-- `AuditJournalAdapter`: production appends JSONL; tests use memory.
+- `ManagedControlStoreAdapter`：生产环境使用按交易对划分的执行栅栏和控制锁、临时文件、文件级 `fsync`、`os.replace` 和目录级 `fsync`；测试使用内存实现或临时目录。
+- `RunnerObservationAdapter`：生产环境读取 `process`、`plan`、`submit`、`event` 和 `receipt` 数据；测试使用不可变测试夹具。
+- `EffectExecutorAdapter`：生产环境将封闭的执行阶段集合分派到受代际栅栏保护的 saved-runner 包装器/systemd、精确的受管 GTX 撤单或原子化本地状态修复；测试使用可记录调用的测试替身，并具备单调递增的执行纪元（`effect_epoch`）和幂等决策 ID（`decision_id`）。
+- `RuntimeProfileRepositoryAdapter`：生产环境读取已注册的运行时配置；测试使用内存注册表。
+- `AuditJournalAdapter`：生产环境追加 JSONL；测试使用内存。
 
-### True external
+### 真实外部依赖
 
-- `ExchangeObservationPort`: production uses read-only Binance futures positions, open orders, and user trades; tests use deterministic fake responses. Exact managed-GTX cancellation is exposed only through `EffectExecutorAdapter`.
+- `ExchangeObservationPort`：生产环境以只读方式获取 Binance 合约仓位、挂单和用户成交；测试使用返回确定性结果的测试替身。精确的受管 GTX 撤单只能通过 `EffectExecutorAdapter` 对外暴露。
 
-## Integration of existing writers
+## 现有写入方的集成
 
 ### `bq_volume_recovery_guard`
 
-- Retain reusable pure assessment calculations.
-- Replace branch-local writes, original-control snapshots, restore patches, and direct restarts with action definitions and `reconcile_symbol()`.
-- The main loop becomes a thin timer adapter.
+- 保留可复用的纯评估计算。
+- 用动作定义和 `reconcile_symbol()` 取代分支内写入、原始 `control` 快照、恢复补丁和直接重启。
+- 主循环缩减为轻量的定时适配器。
 
-### Inactive, error, effective-control, and order-drift recovery
+### 非活跃、错误、有效控制与订单漂移恢复
 
-- Convert each to pure evidence collection or intent logic under `RUNNER_RECOVER`.
-- Remove their independent cooldown and restart side effects.
-- Install managed per-symbol systemd units with `Restart=no`; inactive or crashed processes are recovered only through the fenced action.
+- 全部转换为 `RUNNER_RECOVER` 下的纯证据收集或意图判断逻辑。
+- 移除各自独立的冷却逻辑和重启操作。
+- 为每个受管 symbol 安装 systemd 单元，并设置 `Restart=no`；非活跃或已崩溃的进程只能通过受栅栏保护的动作恢复。
 
-### Budget controller
+### 预算控制器
 
-- Reuse pure budget-tier calculation as `BASELINE_TUNE` input.
-- For managed symbols it no longer writes control or restarts independently.
+- 复用纯预算分层计算作为 `BASELINE_TUNE` 的输入。
+- 对受管 symbol，不再独立写入 `control` 或执行重启。
 
-### Liveness and health monitors
+### 存活性与健康监控器
 
-- Provide observations and pure intents.
-- Direct restart, offset mutation, or deadlock trading is not allowed for managed symbols.
-- Any contract-side repair must be re-expressed as `FROZEN_LEDGER_REPAIR` with ledger proof; otherwise it remains observe-only.
+- 提供观测与纯意图。
+- 对受管 symbol，不允许直接重启、修改偏移量或直接提交任何用于自愈的交易订单。
+- 任何合约侧修复都必须在有账本证据时重新表达为 `FROZEN_LEDGER_REPAIR`；否则只做观察。
 
-### Web volume and volatility triggers
+### Web 成交量与波动率触发器
 
-- For managed symbols, `_run_volume_trigger_loop()` and `_run_volatility_trigger_loop()` become observation/intent adapters.
-- They cannot call runner start/stop, reduce-to-notional, full-flatten, cancel, or control-write helpers directly.
-- Volume trigger intents map to `MAKER_FLOW_RECOVER` or `TERMINAL_STOP`; volatility trigger intents map to `SAFETY_CONVERGE` or `TERMINAL_STOP` under the global priority table.
-- Their candidates share the same symbol snapshot and can never create a second action beside the guard candidate in one round.
+- 对受管 symbol，`_run_volume_trigger_loop()` 和 `_run_volatility_trigger_loop()` 变为观测/意图适配器。
+- 它们不能直接调用 runner 启停、名义金额压缩、全量平仓、撤单或 `control` 写入辅助函数。
+- 成交量触发意图映射到 `MAKER_FLOW_RECOVER` 或 `TERMINAL_STOP`；波动率触发意图按全局优先级表映射到 `SAFETY_CONVERGE` 或 `TERMINAL_STOP`。
+- 它们的候选动作共享同一个 symbol 快照，在一个轮次中绝不能与守卫候选动作并行形成第二个动作。
 
-### Target gate and state realignment
+### 目标闸门与状态重对齐
 
-- The managed-symbol competition target gate submits `TERMINAL_STOP`. Its legacy cancel, MARKET flatten, and protective-order side effects are disabled; stop confirmation is its activation contract.
-- Competition state realignment becomes the staged `RUNNER_RECOVER` decision described above. Its stop, exact managed-order cleanup, state rewrite/archive, start, and acknowledgement occur across separate rounds under one decision and fence epoch sequence.
-- Neither module retains an independent runner or exchange mutator for managed symbols.
+- 竞赛目标闸门为受管 symbol 提交 `TERMINAL_STOP`。禁用其旧的撤单、MARKET 平仓和保护单操作；停止确认是该动作的激活契约。
+- 竞赛状态重对齐改为上文所述的分阶段 `RUNNER_RECOVER` 决策。停止、精确清理受管订单、重写/归档状态、启动和确认分别在不同轮次执行，并共用同一个决策 ID（`decision_id`）和执行纪元（`effect_epoch`）序列。
+- 两个模块都不再为受管 symbol 保留独立 runner 或交易所变更执行器。
 
-### Runner-local runtime guard
+### 运行器本地运行时保护机制
 
-- `_maybe_handle_runtime_guard()` is reduced to the documented emergency safety lane for managed symbols.
-- It writes a current-generation safety receipt and blocks normal planning; it cannot cancel or submit orders, change exposure, independently transition from stop to cooldown/running, start a flatten workflow, or resume trading.
-- The coordinator adopts and completes that same safety decision. Any legacy MARKET/IOC loss-recovery branch is disabled for managed symbols.
+- 对受管 symbol，`_maybe_handle_runtime_guard()` 收窄为文档所述的紧急安全通道。
+- 它写入当前代际的安全回执并阻止正常规划；不得撤单或提交订单、改变风险敞口、自行解除停止或冷却状态并恢复运行，也不得启动平仓流程。
+- 协调器接管并完成同一个安全决策。对受管 symbol 禁用任何旧的 MARKET/IOC 亏损恢复分支。
 
-### Daily roll
+### 每日滚动
 
-- Submit a complete registered runtime profile through `BASELINE_REBASE`.
-- Update baseline, clear the overlay, reclaim temporary grants, increment generation, and materialize flat control in one atomic commit.
-- Do not separately clear correctness-critical guard state.
+- 通过 `BASELINE_REBASE` 提交完整的已注册运行时配置。
+- 在一次原子提交中更新规范基线、清除覆盖层、回收临时授权、递增代际并物化扁平化 `control`。
+- 不再单独清除会影响正确性的保护状态。
 
-### Web
+### Web 集成
 
-- Read current document revision and generation through `inspect()`.
-- Submit the complete managed profile with expected revision and generation.
-- Route the entire control save through the coordinator for managed symbols so management metadata cannot be erased.
-- Continue existing behavior for unmanaged symbols.
+- 通过 `inspect()` 读取当前文档修订号和 `generation`。
+- 提交带有预期修订号与 `generation` 的完整受管配置。
+- 对受管 symbol，将整个 `control` 保存流程路由到协调器，避免管理元数据被擦除。
+- 对未受管 symbol 继续现有行为。
 
-### External operational actuators
+### 外部运维执行器
 
-- Before any future cutover, inventory cron jobs, systemd units, and scripts inside and outside the repository that can write the symbol control, invoke runner lifecycle commands, cancel orders, or submit trades.
-- Known deployment-managed examples include `output/ops/*_ledger_drift_monitor.py`, daily-window rollover, target gates, and recovery installer wiring.
-- A managed symbol cannot be enabled until this inventory has an explicit disposition for every actuator: coordinator adapter, runner-local safety lane, observe-only, disabled, or out of scope with proof that it cannot touch the symbol.
+- 未来任何所有权切换前，都要盘点仓库内外所有可能写 symbol `control`、调用运行器生命周期命令、撤单或提交交易的 cron 任务、systemd unit 和脚本。
+- 已知由部署系统管理的示例包括 `output/ops/*_ledger_drift_monitor.py`、每日窗口滚动、目标闸门和恢复安装器配置链路。
+- 在清单中的每个执行器都被明确归类前，不得启用受管 symbol。允许的归类值为：`coordinator adapter`（协调器适配器）、`runner-local safety lane`（运行器本地安全通道）、`observe-only`（仅观察）、`disabled`（禁用），或有证据证明不会接触该 symbol 的 `out of scope`（范围外）。
 
-## Testing strategy
+## 测试策略
 
-Implementation follows test-first development. Tests primarily exercise the coordinator interface with in-memory adapters.
+实现遵循测试优先开发。测试主要使用内存适配器验证协调器接口。
 
-### Action contract tests
+### 动作契约测试
 
-- Action IDs and ranks are unique.
-- Every action materializes all managed fields.
-- No automatic action disables volatility pause.
-- No action enables net-loss or hard-loss forced reduction.
-- Only `TEMPORARY_LOSS_RELIEF` may request `allow_loss=true`, and it must supply an absolute expiry within the registered hard maximum.
-- Same-action advancement cannot extend the absolute `allow_loss` hard expiry.
-- Ordinary actions cannot request contract exposure changes.
-- Frozen-ledger repair requires a ledger entry, expected hedge delta, and tolerance proof.
+- 动作 ID 和优先级序号唯一。
+- 每个动作都物化全部受管字段。
+- 任何自动动作都不能禁用波动率暂停。
+- 任何动作都不能启用净亏损或硬亏损强制减仓。
+- 只有 `TEMPORARY_LOSS_RELIEF` 可以请求 `allow_loss=true`，且必须提供不超过已注册硬上限的绝对到期时间。
+- 同一动作的阶段推进不得延长 `allow_loss` 的绝对硬到期时间。
+- 普通动作不得请求改变合约敞口。
+- 冻结账本修复必须具备账本条目、预期对冲变化量和容差证据。
 
-### Arbitration and state-machine tests
+### 仲裁与状态机测试
 
-- Many simultaneous candidates produce one selected action and one ordered suppressed list.
-- Different symbols can each perform one action in the same scheduler invocation.
-- Pending generation suppresses every ordinary candidate and independent restart.
-- Safety action may preempt pending or active state but still performs only one commit and one effect stage.
-- `TERMINAL_STOP` remains latched in `StopPending`/`Stopped`; nonterminal safety can only strengthen the stopped profile.
-- Only an authorized trusted daily new-window/profile transition can move `Stopped` toward running; Web cannot.
-- An ordinary action exits through restore and cooldown before another ordinary action enters.
-- The same action alone controls its enter, hold, advance, and exit behavior.
-- Switching actions rematerializes from baseline and leaves no prior profile values behind.
+- 同时出现多个候选动作时，只生成一个已选动作和一份有序的被抑制动作列表。
+- 同一次调度器调用中，不同 symbol 可以各自执行一个动作。
+- 待确认的 `generation` 抑制所有普通候选动作和独立重启。
+- 安全动作可以抢占待处理或活动状态，但仍然只提交一次，并推进一个执行阶段。
+- `TERMINAL_STOP` 在 `StopPending`/`Stopped` 中保持锁定；非终止安全动作只能进一步收紧已停止配置。
+- 只有获授权、受信任的每日新窗口/配置转换才能使 `Stopped` 向 `running` 转换；Web 不可以。
+- 普通动作进入下一个普通动作前，必须先经过恢复和冷却阶段退出。
+- 同一个动作独立控制自身的进入、保持、推进和退出行为。
+- 切换动作时从基线重新物化，不保留上一个配置中的任何值。
 
-### Generation and restart tests
+### 代际与重启测试
 
-- Stale plan, submit, error, and exchange snapshots cannot acknowledge or re-trigger an action.
-- Two restart reasons in one round produce one `RUNNER_RECOVER` decision and one restart.
-- Restart failure retains the original action and committed-control fact.
-- A duplicate coordinator invocation cannot commit a second generation for the same round.
-- First-time `noop` and `hold` persist one revision-only idempotency outcome; a duplicate returns it without another commit or later action.
-- Retryable daily-roll `deferred` finalizes the attempt but not the operation; a fresh attempt can later commit exactly once.
-- When safety wins a baseline call, action status records the safety commit while request status remains retryable `deferred` under the same operation.
-- A crash before commit, after commit, after restart, or before acknowledgement resumes idempotently.
-- A phase-only acknowledgement increments document revision without creating a new runner generation.
-- An old delayed restart is rejected after a newer terminal-stop generation commits.
-- The wrapper holds the shared effect fence across token validation and synchronous process mutation, closing the validate/start TOCTOU race.
-- Effect retries obey persisted backoff and attempt limits and never fall through to another ordinary action.
+- 陈旧的 `plan`、`submit`、`error` 和交易所快照不能确认或重新触发动作。
+- 一轮中出现两个重启原因时，只产生一个 `RUNNER_RECOVER` 决策和一次重启。
+- 重启失败时，保留原动作以及 `control` 已提交这一事实。
+- 同一轮的重复协调器调用不能提交第二个 `generation`。
+- 首次出现 `noop` 或 `hold` 时，持久化一条仅修订号变化的幂等结果；重复调用返回该结果，不再提交或执行后续动作。
+- 可重试的每日滚动 `deferred` 会结束本次尝试，但不结束整个操作；后续的新尝试最多成功提交一次。
+- 安全动作在基线变更调用中获胜时，动作状态记录安全提交，而同一操作下的请求状态保持为可重试的 `deferred`。
+- 进程在提交前、提交后、重启后或确认前崩溃，都能幂等恢复。
+- 仅阶段确认只递增文档修订号，不创建新的 runner `generation`。
+- 较新的 `TERMINAL_STOP` `generation` 提交后，旧的延迟重启会被拒绝。
+- 包装器在令牌校验与同步进程变更期间持有共享执行栅栏，以消除检查与使用时差（TOCTOU）竞态。
+- 执行重试遵守已持久化的退避规则和尝试次数上限，且永远不会转而尝试另一个普通动作。
 
-### Order-drift tests
+### 订单漂移测试
 
-- A fresh executed GTX placement or fill followed by an empty exchange book is not drift.
-- One exchange-empty observation is insufficient.
-- Re-reading the same exchange request or runner cycle is insufficient.
-- Unrelated symbol or manual account activity is ignored.
-- Only current-generation managed LIMIT/GTX orders count as managed open orders.
-- Cross-generation residual orders cannot satisfy current-generation health.
-- Missing, truncated, or checksum-invalid manifests produce `hold`.
-- The generated client order ID carries the generation token and never exceeds 36 characters.
+- 当前代际已经产生新的 GTX 挂单或成交记录时，即使交易所订单簿为空，也不视为漂移。
+- 单次交易所空订单观测不足以确认漂移。
+- 重复读取同一个交易所请求或 runner 循环不足以确认漂移。
+- 忽略无关 symbol 或人工账户活动。
+- 只有当前 `generation` 的受管 LIMIT/GTX 订单才计入受管未成交订单。
+- 跨 `generation` 的残留订单不能满足当前 `generation` 的健康条件。
+- 动作后清单缺失、被截断或校验和无效时产生 `hold`。
+- 生成的客户端订单 ID 携带代际令牌，且长度永不超过 36 个字符。
 
-### Safety integration tests
+### 安全集成测试
 
-- Recovery plans and final requests remain LIMIT, GTX, and post-only.
-- Missing volatility pause config materializes `true`.
-- Temporary `allow_loss` expires in the runner even when the coordinator is unavailable.
-- Missing or failed exchange observations cannot block hard-expiry reclaim.
-- Missing or malformed lease metadata makes runner-effective `allow_loss=false` at startup, planning, and pre-submit.
-- Coordinator reconciliation then persists `allow_loss=false` and `net_loss_reduce=false`.
-- Daily roll and Web stale generations cannot overwrite a newer recovery generation.
-- An eligible trusted daily roll can preempt only an acknowledged action marked rebase-preemptible; frozen repair and in-flight effects defer it.
-- Unselected Web unmanaged updates cannot leak into a simultaneous safety commit.
-- Ordinary inventory recovery cannot change contract exposure.
-- Runner-local safety is adopted as the one current action and suppresses restart/rebase.
-- Runner-local safety can only persist pause/receipt state; it cannot cancel, submit, or change contract exposure.
-- Managed terminal stop never cancels, closes, flattens, or places a protective order.
-- State realignment advances stop, repair, and start across separate rounds under one decision.
-- A simultaneous Web trigger and guard candidate still produce exactly one symbol action.
+- 恢复计划和最终请求始终保持 LIMIT、GTX 和仅挂单（post-only）。
+- 波动率暂停配置缺失时物化为 `true`。
+- 即使协调器不可用，临时 `allow_loss` 也会在 runner 内到期失效。
+- 交易所观测缺失或失败不能阻止硬到期回收。
+- 租约元数据缺失或格式错误时，runner 在启动、规划和提交前阶段的有效值均为 `allow_loss=false`。
+- 随后的协调器对账会持久化 `allow_loss=false` 和 `net_loss_reduce=false`。
+- 每日滚动与 Web 的陈旧 `generation` 不能覆盖较新的恢复 `generation`。
+- 符合条件的受信任每日滚动只能抢占已确认且标记为 `rebase-preemptible` 的动作；冻结修复或正在执行的阶段会使其进入 `deferred`。
+- 未选中的 Web 非受管更新不能泄漏到同时发生的安全提交中。
+- 普通库存恢复不能改变合约敞口。
+- 运行器本地安全动作被接管为唯一当前动作，并抑制重启和基线重建。
+- runner 本地安全动作只能持久化暂停/回执状态；不能撤单、提交订单或改变合约敞口。
+- 受管终止动作永远不撤单、平仓、全量平仓或下保护单。
+- 状态重对齐在同一个决策 ID（`decision_id`）下，跨不同轮次推进停止、修复和启动。
+- Web 触发器与守卫候选动作同时出现时，仍然只产生一个 symbol 动作。
 
-### Architecture tests
+### 架构测试
 
-- Only the coordinator executor may write a recovery-managed control document or call automatic runner restart/stop.
-- Action modules cannot import filesystem, subprocess, or Binance adapters.
-- In-scope legacy modules cannot retain direct managed-field mutation paths.
-- Managed Web saves must delegate to the coordinator.
-- Managed Web volume/volatility trigger loops, target gate, state realignment, budget, liveness, and health modules cannot retain direct lifecycle or trading paths.
-- The narrowly allowlisted runner-local safety lane can only pause local planning and emit the required receipt; it cannot mutate control, process, exchange orders, or positions, and no executor exception is permitted.
-- A pre-cutover actuator-inventory check scans repository scripts plus declared cron/systemd/`output/ops` sources and fails on an unclassified writer or actuator.
-- The same check fails if a recovery-managed runner unit has any systemd automatic restart policy other than `Restart=no`.
+- 只有协调器执行器可以写入恢复模块托管的控制文档，或调用 runner 的自动重启/停止。
+- 动作模块不得导入文件系统、子进程或 Binance 适配器。
+- 范围内的旧模块不得保留直接修改受管字段的路径。
+- 受管 Web 保存操作必须委托给协调器。
+- 受管 Web 成交量/波动率触发循环、目标闸门、状态重对齐、预算、存活性和健康模块不得保留直接的生命周期或交易路径。
+- 严格白名单限制的 runner 本地安全通道只能暂停本地规划并发出必需回执；它不能修改 `control`、进程、交易所订单或仓位，且不允许任何执行器例外。
+- 所有权切换前的执行器清单检查会扫描仓库脚本，以及已声明的 cron/systemd/`output/ops` 来源；遇到未分类的写入方或执行器时检查失败。
+- 如果恢复受管 runner unit 的 systemd 自动重启策略不是 `Restart=no`，同一项检查也会失败。
 
-Obsolete tests that only exercise removed shallow direct-writer paths are replaced by interface-level behavior tests. Reusable assessment and detector tests remain.
+只覆盖已移除浅层直接写入路径的旧测试，将由接口级行为测试替换。可复用的评估和检测器测试继续保留。
 
-## Migration plan
+## 迁移计划
 
-The implementation is developed and committed only on the isolated branch. It is not deployed by this task.
+实现只在隔离分支上开发和提交，本任务不执行部署。
 
-1. Rebase the isolated branch onto the latest `origin/main` before implementation.
-2. Add coordinator types, in-memory adapters, managed schema, profile validator, and state-machine tests.
-3. Add document revision, generation/profile-digest propagation, fenced wrapper epochs, versioned client-order IDs, and atomic post-action/safety receipts.
-4. Implement coordinator persistence and executor with no production caller enabled.
-5. Port legacy behavior into canonical action definitions, including staged state realignment, starting with safety and restore, then restart, inventory, temporary loss relief, maker flow, and baseline tuning.
-6. Add a shadow adapter that reports the new canonical decision without executing it. Compare it with legacy outcomes and targeted historical fixtures.
-7. Route guard, inactive/restart, budget, liveness/health, Web volume/volatility triggers, target gate, state realignment, daily roll, and managed Web writes through the coordinator; narrow runtime guard to the safety lane.
-8. Inventory repository and operational cron/systemd/`output/ops` actuators, install `Restart=no` for managed runner units, then remove, disable, adapt, or make observe-only every in-scope direct writer and enable architecture checks.
-9. Run focused, module, runner, Web, roll, deployment-inventory, and full regression suites.
-10. Commit the implementation branch without push or deployment.
+1. 实现前将隔离分支 `rebase` 到最新 `origin/main`。
+2. 添加协调器类型、内存适配器、受管字段 schema、配置校验器和状态机测试。
+3. 添加文档修订号、`generation`/配置摘要传播、受栅栏保护的执行纪元、带版本的客户端订单 ID，以及原子化的动作后/安全回执。
+4. 实现协调器持久化和执行器，但不启用任何生产调用方。
+5. 将旧行为迁移到标准动作定义中，包括分阶段状态重对齐；顺序为安全和基线还原，然后是重启、库存、临时亏损放宽、挂单方流量恢复和基线调优。
+6. 添加影子适配器，只报告新的规范决策，不实际执行。将其与旧结果和定向历史测试夹具比较。
+7. 将守卫、非活跃/重启、预算、存活性/健康、Web 成交量/波动率触发器、目标闸门、状态重对齐、每日滚动和受管 Web 写入全部路由到协调器；将运行时保护机制收窄为安全通道。
+8. 盘点仓库与运维 cron/systemd/`output/ops` 执行器，为受管 runner unit 设置 `Restart=no`，然后移除、禁用或适配所有范围内的直接写入方，或将其改为仅观察，并启用架构检查。
+9. 运行专项测试、模块测试、运行器测试、Web 测试、滚动测试、部署清单测试和完整回归测试集。
+10. 提交实现分支，不执行 `push` 或部署。
 
-A future production rollout must switch ownership atomically per symbol. It cannot run the legacy executor and new coordinator concurrently. ARX may be used as the first canary because it exposed the conflict, but the implementation and tests are general and the cutover requires an explicitly registered symbol policy.
+未来的生产发布必须按 symbol 原子化切换所有权。不得同时运行旧执行器和新协调器。ARX 可作为首个灰度 symbol，因为它暴露了冲突；但实现和测试都是通用的，所有权切换需要显式注册的 symbol 策略。
 
-## Baseline migration
+## 基线迁移
 
-The initial canonical baseline comes from the registered runtime profile, not from a live control that may contain temporary recovery values.
+初始规范基线来自已注册的运行时配置，而不是可能含有临时恢复值的实时 `control`。
 
-- Every required managed field must be present or have a protected policy default.
-- `allow_loss`, net-loss reduction, and hard-loss forced reduction are forced false.
-- volatility pause is forced true.
-- If a required field cannot be resolved, migration fails closed and does not enable the coordinator for that symbol.
-- Unmanaged fields are preserved from the latest control under the per-symbol lock.
-- Legacy managed order IDs must be drained or canceled through a recorded GTX-cleanup stage before current-generation drift enforcement is enabled.
+- 每个必需受管字段都必须存在，或具有受保护的策略默认值。
+- `allow_loss`、净亏损减仓和硬亏损强制减仓均强制为 `false`。
+- 波动率暂停强制为 `true`。
+- 如果无法解析必需字段，迁移将失败并按安全关闭原则处理，不为该 symbol 启用协调器。
+- 在按 symbol 划分的锁下，从最新 `control` 中保留非受管字段。
+- 启用当前代际的漂移约束前，旧的受管订单必须自然成交或结束，或通过有记录的 GTX 清理阶段撤销。
 
-## Rollback
+## 回滚
 
-Source rollback is a branch revert because this task does not deploy.
+由于本任务不部署，源码层面通过回退本分支的提交进行回滚。
 
-For a later production rollback:
+对于未来的生产回滚：
 
-1. Stop new scheduler intake for the symbol while keeping the coordinator's rollback executor and ownership active.
-2. Read the canonical baseline from `_futures_recovery`.
-3. While retaining coordinator ownership, fencing metadata, and a new rollback generation, materialize a flat control with `allow_loss=false`, net-loss reduction false, hard-loss forced reduction false, and volatility pause true.
-4. Apply the fenced runner effect and verify its action-specific contract: current rollback generation/digest, intended process state, and fresh plan/submit or stopped-process evidence.
-5. Atomically transfer ownership and remove temporary/pending metadata only after that verification succeeds.
-6. Only then re-enable exactly one classified legacy writer, if rollback requires it; all other automatic writers remain disabled or observe-only.
+1. 停止向该交易对提交新的调度请求，同时保持协调器回滚执行器与所有权处于活动状态。
+2. 从 `_futures_recovery` 读取规范基线。
+3. 在保留协调器所有权、栅栏元数据并创建新回滚代际的同时，物化扁平化 `control`，其中 `allow_loss=false`、净亏损减仓为 `false`、硬亏损强制减仓为 `false`，波动率暂停为 `true`。
+4. 执行受栅栏保护的运行器生命周期操作，并验证其动作专属契约：当前回滚代际/摘要、预期进程状态，以及新的 `plan`/`submit` 或已停止进程证据。
+5. 只有验证成功后，才原子化转移所有权并移除临时/待处理元数据。
+6. 仅当回滚确有需要时，才重新启用一个已归类的旧写入方；其他自动写入方继续保持 `disabled` 或 `observe-only`。
 
-An arbitrary backup is not a valid rollback source because it may contain an active overlay.
+任意备份都不是有效的回滚源，因为其中可能包含活动覆盖层。
 
-## Acceptance criteria
+## 验收标准
 
-1. A symbol reconciliation round performs at most one non-noop action, one control commit, and one persisted effect stage.
-2. Multiple reasons for the same semantic action collapse into one action with multiple evidence codes.
-3. All actions use the same immutable symbol snapshot.
-4. No ordinary action can execute while another generation is unacknowledged.
-5. No legacy in-scope module directly writes recovery-managed fields or automatically restarts/stops a managed runner.
-6. Each action's entry, hold, advance, exit, TTL, cooldown, and desired values reside in one action definition.
-7. Every desired profile is complete over the managed-field registry and is rematerialized from the canonical baseline.
-8. Stale or repeated plan, submit, error, and exchange observations cannot cause restart loops; lifecycle effects are fenced against newer generations.
-9. Recovery order execution remains LIMIT/GTX/post-only.
-10. Volatility entry pause remains enabled.
-11. Temporary `allow_loss` is bounded, runner-enforced at expiry, and persistently reclaimed.
-12. Ordinary inventory recovery never uses contract exposure; frozen-ledger repair remains explicitly ledger-bound.
-13. Daily roll, managed Web writes, Web trigger loops, target gate, state realignment, budget, liveness, and health paths participate in the same generation/ownership protocol.
-14. The runner-local emergency lane only enters a durable pause and writes a receipt; all control, process, order, position, and repair mutations remain coordinator-owned.
-15. Current-generation order identity is verifiable from bounded client IDs and complete atomic manifests; legacy or corrupt identity evidence cannot confirm drift.
-16. Document revision, runner generation, round/request idempotency, and effect retry state survive process crashes without creating a second action.
-17. A future symbol cutover is blocked by any unclassified repository or operational automatic actuator.
-18. Managed runner units cannot auto-restart outside the coordinator; their systemd policy is `Restart=no`.
-19. Terminal stop remains latched until an authorized trusted new-window/profile operation resumes it; nonterminal safety never restarts it.
-20. Retryable baseline attempts can use a stable operation ID without either duplicate execution or permanent `deferred` poisoning.
-21. Focused and full regression suites pass before the branch is handed off.
+1. 每个交易对每轮最多执行一个非 `noop` 动作、提交一次控制文档并推进一个持久化执行阶段。
+2. 同一语义动作的多个原因合并为一个动作，并携带多个原因码。
+3. 所有动作使用同一个不可变 symbol 快照。
+4. 另一个 `generation` 未获确认时，普通动作不得执行。
+5. 范围内的旧模块不得直接写入恢复受管字段，也不得自动重启/停止受管 runner。
+6. 每个动作的进入、保持、推进、退出、TTL、冷却时间和目标值都位于同一个动作定义中。
+7. 每个目标配置都覆盖受管字段注册表中的全部字段，并从规范基线重新物化。
+8. 陈旧或重复的 `plan`、`submit`、`error` 和交易所观测不能引发重启循环；生命周期操作受栅栏保护，不会在更新的代际提交后继续生效。
+9. 恢复订单执行继续保持 LIMIT/GTX/仅挂单（post-only）。
+10. 波动率入场暂停保持启用。
+11. 临时 `allow_loss` 有明确边界，到期时由 runner 强制使其失效，并持久化回收。
+12. 普通库存恢复永远不使用合约敞口；冻结账本修复明确受账本约束。
+13. 每日滚动、受管 Web 写入、Web 触发循环、目标闸门、状态重对齐、预算、存活性和健康路径全部遵循同一套 `generation`/所有权协议。
+14. runner 本地紧急通道只能进入持久暂停并写入回执；所有 `control`、进程、订单、仓位和修复变更继续由协调器持有。
+15. 当前代际的订单身份可通过受长度限制的客户端订单 ID 和完整的原子清单验证；旧的或损坏的订单标识证据不能确认漂移。
+16. 文档修订号、运行器代际、轮次/请求幂等性和执行重试状态在进程崩溃后仍会保留，且不会产生第二个动作。
+17. 任何未分类的仓库或运维自动执行器都会阻止未来的 symbol 所有权切换。
+18. 受管 runner unit 不能绕过协调器自动重启；其 systemd 策略为 `Restart=no`。
+19. 终止动作保持锁定，直到获授权、受信任的新窗口/配置操作恢复它；非终止安全动作永远不会重启它。
+20. 可重试的基线尝试可以使用稳定的操作 ID，既不会重复执行，也不会因曾返回 `deferred` 而永久无法完成。
+21. 分支交付前，专项测试和完整回归测试集均必须通过。
