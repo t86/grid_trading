@@ -9349,6 +9349,47 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["buy_orders"][0]["time_in_force"], "GTX")
         self.assertTrue(state["best_quote_active_pair_reduce"]["active"])
 
+    def test_best_quote_active_pair_reduce_clears_subminimum_residual(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+        state: dict[str, object] = {
+            "best_quote_active_pair_reduce": {
+                "active": True,
+                "long_target_notional": 100.0,
+                "short_target_notional": 100.0,
+                "long_start_notional": 580.0,
+                "short_start_notional": 580.0,
+            }
+        }
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state=state,
+            enabled=True,
+            current_long_qty=590.0,
+            current_short_qty=584.0,
+            current_long_notional=101.0,
+            current_short_notional=100.0,
+            max_long_notional=600.0,
+            max_short_notional=600.0,
+            soft_ratio=0.70,
+            min_side_notional=50.0,
+            per_order_notional=480.0,
+            max_reduce_notional_per_side=480.0,
+            offset_ticks=1,
+            step_price=0.0005,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.1717,
+            ask_price=0.1718,
+            volatility_entry_pause={"active": False},
+        )
+
+        self.assertTrue(report["completed"])
+        self.assertEqual(report["reason"], "target_reached_small_residual")
+        self.assertNotIn("best_quote_active_pair_reduce", state)
+
     def test_best_quote_active_pair_reduce_suppresses_normal_entries(self) -> None:
         plan = {
             "buy_orders": [
