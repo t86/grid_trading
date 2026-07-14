@@ -2170,13 +2170,12 @@ def should_bypass_arx_submit_failure_recovery_gate(
     recovery_gate_reasons: Iterable[str],
     validation_errors: Iterable[str],
 ) -> bool:
-    """Let ARX raise a stale submit cap without opening other validation bypasses."""
+    """Let ARX repair a stale submit cap without opening other validation bypasses."""
     reasons = {str(item).strip() for item in recovery_gate_reasons if str(item).strip()}
     errors = [str(item).strip() for item in validation_errors if str(item).strip()]
     return (
         symbol.upper().strip() == "ARXUSDT"
         and bool(target_pace_behind)
-        and bool(low_volume)
         and int(active_order_count) <= 1
         and not bool(volatility_entry_pause_active)
         and not bool(ledger_position_drift_blocked)
