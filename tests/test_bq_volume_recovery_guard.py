@@ -102,6 +102,19 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 pause_reasons=["trend_entry_guard"],
             )
         )
+        self.assertTrue(
+            bq_volume_recovery_guard.should_relax_arx_zero_order_volume_blockers(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.08,
+                active_order_count=0,
+                planned_order_count=1,
+                near_cap=False,
+                volatility_entry_pause_active=False,
+                pause_reasons=[],
+                same_side_entry_blocked=True,
+            )
+        )
         self.assertFalse(
             bq_volume_recovery_guard.should_relax_arx_zero_order_volume_blockers(
                 symbol="ARXUSDT",

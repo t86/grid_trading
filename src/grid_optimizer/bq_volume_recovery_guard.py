@@ -82,6 +82,7 @@ _RECOVERY_CONTROL_KEYS = (
     "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled",
     "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_enabled",
     "best_quote_maker_volume_inventory_bias_enabled",
+    "best_quote_maker_volume_same_side_entry_price_guard_report_only",
     "best_quote_maker_volume_cycle_budget_notional",
     "best_quote_maker_volume_quote_offset_ticks",
     "best_quote_maker_volume_same_side_entry_price_guard_min_notional",
@@ -1793,6 +1794,7 @@ def should_relax_arx_zero_order_volume_blockers(
     near_cap: bool,
     volatility_entry_pause_active: bool,
     pause_reasons: list[str] | set[str] | tuple[str, ...],
+    same_side_entry_blocked: bool = False,
 ) -> bool:
     """Permit a bounded ARX escape when soft guards leave the book empty.
 
@@ -1806,10 +1808,15 @@ def should_relax_arx_zero_order_volume_blockers(
         and bool(target_pace_behind)
         and float(pace_ratio) < 0.30
         and int(active_order_count) <= 0
-        and int(planned_order_count) <= 0
+        # One unplaced plan leg is operationally equivalent to an empty book:
+        # it cannot restore two-sided maker flow by itself.
+        and int(planned_order_count) <= 1
         and not bool(near_cap)
         and not bool(volatility_entry_pause_active)
-        and bool(soft_blockers.intersection(str(reason) for reason in pause_reasons))
+        and (
+            bool(soft_blockers.intersection(str(reason) for reason in pause_reasons))
+            or bool(same_side_entry_blocked)
+        )
     )
 
 
@@ -3016,6 +3023,17 @@ def check_symbol(
         ),
     )
     assessment["arx_severe_near_maker_entry"] = arx_severe_near_maker_entry
+    preflight_best_quote = plan.get("best_quote_maker_volume")
+    preflight_metrics = (
+        preflight_best_quote.get("metrics")
+        if isinstance(preflight_best_quote, dict)
+        else {}
+    )
+    preflight_same_side_guard = (
+        preflight_metrics.get("same_side_entry_price_guard")
+        if isinstance(preflight_metrics, dict)
+        else {}
+    )
     arx_zero_order_volume_updates: dict[str, Any] = {}
     if should_relax_arx_zero_order_volume_blockers(
         symbol=normalized_symbol,
@@ -3026,6 +3044,12 @@ def check_symbol(
         near_cap=bool(assessment.get("near_cap")),
         volatility_entry_pause_active=bool(assessment.get("volatility_entry_pause_active")),
         pause_reasons=tuple(assessment.get("pause_reasons") or ()),
+        same_side_entry_blocked=bool(
+            preflight_same_side_guard.get("blocked_long_entry")
+            or preflight_same_side_guard.get("blocked_short_entry")
+        )
+        if isinstance(preflight_same_side_guard, dict)
+        else False,
     ):
         for key in (
             "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled",
@@ -3038,6 +3062,20 @@ def check_symbol(
             arx_zero_order_volume_updates["best_quote_maker_volume_quote_offset_ticks"] = 0
         if _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0:
             arx_zero_order_volume_updates["sticky_entry_price_tolerance_steps"] = 1.0
+        if (
+            bool(control.get("best_quote_maker_volume_same_side_entry_price_guard_enabled"))
+            and not bool(
+                control.get("best_quote_maker_volume_same_side_entry_price_guard_report_only")
+            )
+            and isinstance(preflight_same_side_guard, dict)
+            and (
+                bool(preflight_same_side_guard.get("blocked_long_entry"))
+                or bool(preflight_same_side_guard.get("blocked_short_entry"))
+            )
+        ):
+            arx_zero_order_volume_updates[
+                "best_quote_maker_volume_same_side_entry_price_guard_report_only"
+            ] = True
     wear_backoff_floor = max(
         parameters.effective_cycle_budget_floor_notional,
         static_cycle_budget_floor_notional,
