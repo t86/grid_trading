@@ -3080,6 +3080,7 @@ class WebSecurityTests(unittest.TestCase):
                 "strategy_mode": "best_quote_maker_volume_v1",
                 "symbol": "BTCUSDC",
                 "best_quote_maker_volume_enabled": True,
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
                 "best_quote_maker_volume_cycle_budget_notional": "400",
                 "best_quote_maker_volume_quote_offset_ticks": "0",
                 "best_quote_maker_volume_defensive_offset_ticks": "3",
@@ -3096,6 +3097,7 @@ class WebSecurityTests(unittest.TestCase):
         )
 
         self.assertTrue(payload["best_quote_maker_volume_enabled"])
+        self.assertTrue(payload["best_quote_maker_volume_allow_loss_reduce_only"])
         self.assertEqual(payload["best_quote_maker_volume_cycle_budget_notional"], 400.0)
         self.assertEqual(payload["best_quote_maker_volume_quote_offset_ticks"], 0)
         self.assertEqual(payload["best_quote_maker_volume_defensive_offset_ticks"], 3)

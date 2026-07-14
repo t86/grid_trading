@@ -10012,6 +10012,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_take_profit_guard_enabled",
         "best_quote_maker_volume_inventory_cost_gate_enabled",
         "best_quote_maker_volume_net_loss_reduce_enabled",
+        "best_quote_maker_volume_allow_loss_reduce_only",
         "best_quote_maker_volume_suppress_short_reduce_enabled",
         "best_quote_maker_volume_directional_net_guard",
         "best_quote_maker_volume_active_pair_reduce_enabled",
