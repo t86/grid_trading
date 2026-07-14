@@ -58,9 +58,9 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             volatility_entry_pause_active=False,
             frozen_total_notional=400.0,
         )
-        self.assertEqual(1200.0, updates["pause_buy_position_notional"])
+        self.assertEqual(1300.0, updates["pause_buy_position_notional"])
         self.assertEqual(1400.0, updates["max_position_notional"])
-        self.assertEqual(0.8, updates["best_quote_maker_volume_inventory_soft_ratio"])
+        self.assertEqual(0.9, updates["best_quote_maker_volume_inventory_soft_ratio"])
         self.assertEqual(800.0, updates["best_quote_maker_volume_cycle_budget_notional"])
         self.assertEqual(480.0, updates["best_quote_maker_volume_min_cycle_budget_notional"])
         self.assertFalse(updates["best_quote_maker_volume_inventory_bias_enabled"])

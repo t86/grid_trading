@@ -2141,15 +2141,15 @@ def arx_severe_pace_capacity_updates(
     ):
         return {}
     targets = {
-        "pause_buy_position_notional": 1200.0,
-        "pause_short_position_notional": 1200.0,
+        "pause_buy_position_notional": 1300.0,
+        "pause_short_position_notional": 1300.0,
         "max_position_notional": 1400.0,
         "max_short_position_notional": 1400.0,
         "maker_max_long_notional": 1400.0,
         "maker_max_short_notional": 1400.0,
         "best_quote_maker_volume_max_long_notional": 1400.0,
         "best_quote_maker_volume_max_short_notional": 1400.0,
-        "best_quote_maker_volume_inventory_soft_ratio": 0.8,
+        "best_quote_maker_volume_inventory_soft_ratio": 0.9,
         "best_quote_maker_volume_min_cycle_budget_notional": 480.0,
         "best_quote_maker_volume_cycle_budget_notional": 800.0,
     }
