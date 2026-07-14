@@ -159,6 +159,14 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(0.9, updates["best_quote_maker_volume_inventory_soft_ratio"])
         self.assertEqual(1600.0, updates["best_quote_maker_volume_cycle_budget_notional"])
         self.assertEqual(960.0, updates["best_quote_maker_volume_min_cycle_budget_notional"])
+        self.assertEqual(
+            480.0,
+            updates["best_quote_maker_volume_active_pair_reduce_order_notional"],
+        )
+        self.assertEqual(
+            480.0,
+            updates["best_quote_maker_volume_active_pair_reduce_max_notional_per_side"],
+        )
         self.assertEqual(2000.0, updates["max_total_notional"])
         self.assertFalse(updates["best_quote_maker_volume_inventory_bias_enabled"])
         self.assertTrue(
@@ -178,7 +186,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             ),
         )
 
-    def test_arx_capacity_recovery_raises_an_old_near_cap_when_pace_is_below_half(self) -> None:
+    def test_arx_capacity_recovery_raises_an_old_near_cap_when_pace_trails_target(self) -> None:
         updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
             control={
                 "max_position_notional": 800.0,
@@ -187,7 +195,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 "best_quote_maker_volume_max_short_notional": 800.0,
             },
             target_pace_behind=True,
-            pace_ratio=0.40,
+            pace_ratio=0.84,
             near_cap=True,
             volatility_entry_pause_active=False,
             frozen_total_notional=400.0,
@@ -209,6 +217,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "best_quote_maker_volume_inventory_soft_ratio": 0.9,
                     "best_quote_maker_volume_min_cycle_budget_notional": 960.0,
                     "best_quote_maker_volume_cycle_budget_notional": 1600.0,
+                    "best_quote_maker_volume_active_pair_reduce_order_notional": 480.0,
+                    "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 480.0,
                     "max_total_notional": 2000.0,
                 },
                 target_pace_behind=True,
