@@ -5443,6 +5443,43 @@ def _select_best_quote_frozen_lot_allocations(
     return _trim_best_quote_frozen_lot_allocations(raw_allocations, target_qty)
 
 
+def _auto_single_leg_release_within_net_limit(
+    *,
+    state: Mapping[str, Any],
+    side: str,
+    release_qty: float,
+    mid_price: float,
+) -> bool:
+    """Do not let a profitable frozen release widen a large BQ net exposure."""
+    safe_mid = max(_safe_float(mid_price), 0.0)
+    if safe_mid <= 0.0:
+        return False
+    managed = _best_quote_volume_ledger_snapshot(
+        dict(state.get("best_quote_volume_ledger") or {}),
+        mid_price=safe_mid,
+    )
+    frozen = dict(state.get("best_quote_frozen_inventory") or {})
+    frozen_long_qty = sum(
+        max(_safe_float(item.get("qty")), 0.0)
+        for item in _normalize_best_quote_volume_lots(frozen.get("long_lots"))
+    )
+    frozen_short_qty = sum(
+        max(_safe_float(item.get("qty")), 0.0)
+        for item in _normalize_best_quote_volume_lots(frozen.get("short_lots"))
+    )
+    if frozen_long_qty <= 0.0:
+        frozen_long_qty = max(_safe_float(frozen.get("long_qty")), 0.0)
+    if frozen_short_qty <= 0.0:
+        frozen_short_qty = max(_safe_float(frozen.get("short_qty")), 0.0)
+    net_before = (
+        (_safe_float(managed.get("long_qty")) + frozen_long_qty)
+        - (_safe_float(managed.get("short_qty")) + frozen_short_qty)
+    ) * safe_mid
+    release_notional = max(_safe_float(release_qty), 0.0) * safe_mid
+    net_after = net_before - release_notional if side == "long" else net_before + release_notional
+    return abs(net_after) <= max(600.0, abs(net_before)) + 1e-9
+
+
 def arm_best_quote_frozen_single_leg_take_profit(
     *,
     state: dict[str, Any],
@@ -5515,7 +5552,12 @@ def arm_best_quote_frozen_single_leg_take_profit(
             max_notional=max_notional,
         )
         release_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in selected)
-        if release_qty > 1e-12:
+        if release_qty > 1e-12 and _auto_single_leg_release_within_net_limit(
+            state=state,
+            side=side_key,
+            release_qty=release_qty,
+            mid_price=(safe_ask if side_key == "long" else safe_bid),
+        ):
             selected_by_side[side_key] = selected
             armed[side_key] = release_qty
 

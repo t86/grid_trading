@@ -2018,6 +2018,28 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(directive.get("request_id"))
         self.assertTrue(directive.get("expires_at"))
 
+    def test_auto_single_leg_release_does_not_widen_large_net_exposure(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "long_lots": [{"qty": 2000.0, "entry_price": 1.0}],
+            },
+            "best_quote_frozen_inventory": {
+                "short_qty": 100.0,
+                "short_lots": [{"qty": 100.0, "entry_price": 1.04}],
+            },
+        }
+
+        armed = arm_best_quote_frozen_single_leg_take_profit(
+            state=state,
+            bid_price=0.98,
+            ask_price=0.981,
+            min_profit_ratio=0.05,
+        )
+
+        self.assertEqual({}, armed)
+        self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
+
     def test_arm_frozen_single_leg_take_profit_long_retains_one_usd(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
