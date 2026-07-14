@@ -92,6 +92,7 @@ _RECOVERY_CONTROL_KEYS = (
     "pause_buy_position_notional",
     "pause_short_position_notional",
     "sticky_entry_price_tolerance_steps",
+    "sticky_entry_preserve_less_aggressive",
     "sticky_exit_price_tolerance_steps",
 )
 
@@ -3360,6 +3361,7 @@ def check_symbol(
                 pause_baseline_short_notional=pause_baseline_short_notional,
             )
             updates["best_quote_maker_volume_active_pair_reduce_enabled"] = False
+            updates["sticky_entry_preserve_less_aggressive"] = False
             _remember_recovery_controls(
                 item,
                 control,

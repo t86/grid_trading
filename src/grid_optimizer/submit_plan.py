@@ -1445,6 +1445,7 @@ def suppress_same_side_nearby_place_orders(
     min_qty: float | None,
     min_notional: float | None,
     step_size: float | None = None,
+    protect_cancelled_existing: bool = True,
 ) -> dict[str, Any]:
     """Keep only one non-urgent maker order per side inside the configured spacing."""
     place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
@@ -1462,6 +1463,10 @@ def suppress_same_side_nearby_place_orders(
         side = str(open_order.get("side", "")).upper().strip()
         price = _safe_float(open_order.get("price"))
         if side not in {"BUY", "SELL"} or price <= 0:
+            continue
+        if not protect_cancelled_existing and any(
+            _order_matches_cancel(open_order, cancel_order) for cancel_order in cancel_orders
+        ):
             continue
         existing_orders.append((dict(open_order), side, _order_position_side(open_order), price))
 
