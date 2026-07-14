@@ -172,7 +172,10 @@ def main() -> None:
             raise SystemExit(gate_code)
         command_builder = _build_spot_runner_command
     else:
-        config = _load_runner_control_config(symbol)
+        # A restart must honor the persisted control, not the arguments from
+        # the process being replaced.  Otherwise a stale one-way command can
+        # overwrite a corrected hedge-mode control during bootstrap.
+        config = _load_runner_control_config(symbol, include_running_process=False)
         command_builder = _build_runner_command
     command = command_builder(config)
     command = _anchor_relative_runtime_paths(command, runner_work_dir)

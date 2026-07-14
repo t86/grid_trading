@@ -5223,15 +5223,20 @@ def _read_runner_process_for_symbol(symbol: str) -> dict[str, Any]:
     return read_symbol_runner_process(normalized_symbol)
 
 
-def _load_runner_control_config(symbol: str | None = None) -> dict[str, Any]:
+def _load_runner_control_config(
+    symbol: str | None = None,
+    *,
+    include_running_process: bool = True,
+) -> dict[str, Any]:
     config = dict(RUNNER_DEFAULT_CONFIG)
     normalized_symbol = str(symbol or config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
     stored = _read_json_dict(_runner_control_path(normalized_symbol))
     if stored:
         config.update(stored)
-    runner = _read_runner_process_for_symbol(normalized_symbol)
-    if runner.get("config"):
-        config.update(runner["config"])
+    if include_running_process:
+        runner = _read_runner_process_for_symbol(normalized_symbol)
+        if runner.get("config"):
+            config.update(runner["config"])
     config = _normalize_runner_runtime_paths(config, normalized_symbol)
     return _normalize_runner_volatility_trigger_config(_normalize_runner_volume_trigger_config(config))
 

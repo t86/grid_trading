@@ -36,7 +36,7 @@ class RunSavedRunnerTests(unittest.TestCase):
         mock_write_pid.assert_called_once()
         mock_atexit_register.assert_called_once()
         mock_chdir.assert_not_called()
-        mock_load_runner_control_config.assert_called_once_with("SOONUSDT")
+        mock_load_runner_control_config.assert_called_once_with("SOONUSDT", include_running_process=False)
         mock_build_runner_command.assert_called_once_with({"symbol": "SOONUSDT"})
         mock_execvpe.assert_called_once()
         _, _, exec_env = mock_execvpe.call_args.args
@@ -71,7 +71,7 @@ class RunSavedRunnerTests(unittest.TestCase):
         self.assertEqual(len(mock_chdir.call_args_list), 2)
         self.assertEqual(mock_chdir.call_args_list[0].args, ("/tmp/runtime",))
         self.assertEqual(mock_chdir.call_args_list[1].args, ("/repo",))
-        mock_load_runner_control_config.assert_called_once_with("SOONUSDT")
+        mock_load_runner_control_config.assert_called_once_with("SOONUSDT", include_running_process=False)
         mock_execvpe.assert_called_once()
 
     @patch("grid_optimizer.run_saved_runner.os.chdir")
