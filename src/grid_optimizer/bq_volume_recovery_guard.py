@@ -2519,7 +2519,10 @@ def arx_soft_recovery_extension_updates(
         return {}
     targets = {
         "best_quote_maker_volume_cycle_budget_notional": 1600.0,
-        "best_quote_maker_volume_active_pair_reduce_enabled": True,
+        # Active-pair reduction deliberately suppresses ordinary entries.  It
+        # is therefore the wrong recovery path when ARX needs sustained maker
+        # flow rather than a one-sided inventory exit.
+        "best_quote_maker_volume_active_pair_reduce_enabled": False,
         "best_quote_maker_volume_active_pair_reduce_order_notional": 600.0,
         "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 600.0,
         "best_quote_maker_volume_quote_offset_ticks": 0,
@@ -2527,7 +2530,11 @@ def arx_soft_recovery_extension_updates(
     return {
         key: value
         for key, value in targets.items()
-        if _safe_float(control.get(key)) < value
+        if (
+            key == "best_quote_maker_volume_active_pair_reduce_enabled"
+            and bool(control.get(key)) != bool(value)
+        )
+        or _safe_float(control.get(key)) < value
         or (
             key == "best_quote_maker_volume_quote_offset_ticks"
             and _safe_int(control.get(key)) > 0

@@ -471,11 +471,11 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             ),
         )
 
-    def test_arx_soft_recovery_extension_requotes_and_enlarges_maker_flow(self) -> None:
+    def test_arx_soft_recovery_extension_restores_normal_maker_flow(self) -> None:
         updates = bq_volume_recovery_guard.arx_soft_recovery_extension_updates(
             control={
                 "best_quote_maker_volume_cycle_budget_notional": 960.0,
-                "best_quote_maker_volume_active_pair_reduce_enabled": False,
+                "best_quote_maker_volume_active_pair_reduce_enabled": True,
                 "best_quote_maker_volume_active_pair_reduce_order_notional": 480.0,
                 "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 480.0,
                 "best_quote_maker_volume_quote_offset_ticks": 1,
@@ -493,7 +493,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             },
         )
         self.assertEqual(1600.0, updates["best_quote_maker_volume_cycle_budget_notional"])
-        self.assertTrue(updates["best_quote_maker_volume_active_pair_reduce_enabled"])
+        self.assertFalse(updates["best_quote_maker_volume_active_pair_reduce_enabled"])
         self.assertEqual(600.0, updates["best_quote_maker_volume_active_pair_reduce_order_notional"])
         self.assertEqual(600.0, updates["best_quote_maker_volume_active_pair_reduce_max_notional_per_side"])
         self.assertEqual(0, updates["best_quote_maker_volume_quote_offset_ticks"])
