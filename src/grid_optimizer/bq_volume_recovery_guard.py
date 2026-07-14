@@ -4168,7 +4168,12 @@ def check_symbol(
                 dry_run=dry_run,
                 restart_runner=restart,
             )
-        elif should_repair_arx_loss_reduce_flow(
+        elif (
+            str(control.get("best_quote_maker_volume_directional_net_guard") or "off")
+            .lower()
+            .strip()
+            == "off"
+            and should_repair_arx_loss_reduce_flow(
             symbol=normalized_symbol,
             target_pace_behind=target_pace_behind,
             allow_loss_reduce_only=bool(
@@ -4180,6 +4185,7 @@ def check_symbol(
             volatility_entry_pause_active=bool(
                 assessment.get("volatility_entry_pause_active")
             ),
+            )
         ):
             _remember_recovery_controls(
                 item,
