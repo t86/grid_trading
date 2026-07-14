@@ -99,6 +99,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled": True,
                 "best_quote_maker_volume_dynamic_control_trend_inventory_guard_enabled": True,
                 "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_enabled": True,
+                "best_quote_maker_volume_inventory_soft_ratio": 0.9,
             },
             assessment={
                 "symbol": "ARXUSDT",
@@ -117,6 +118,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled": False,
                 "best_quote_maker_volume_dynamic_control_trend_inventory_guard_enabled": False,
                 "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_enabled": False,
+                "best_quote_maker_volume_inventory_soft_ratio": 1.2,
             },
             updates,
         )

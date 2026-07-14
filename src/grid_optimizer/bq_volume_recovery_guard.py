@@ -2284,7 +2284,7 @@ def arx_lopsided_entry_recovery_updates(
         or current_short > max_short * 0.5
     ):
         return {}
-    return {
+    updates = {
         key: False
         for key in (
             "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled",
@@ -2293,6 +2293,9 @@ def arx_lopsided_entry_recovery_updates(
         )
         if bool(control.get(key))
     }
+    if _safe_float(control.get("best_quote_maker_volume_inventory_soft_ratio")) < 1.2:
+        updates["best_quote_maker_volume_inventory_soft_ratio"] = 1.2
+    return updates
 
 
 def should_bypass_arx_recovery_drift_debounce(
