@@ -82,6 +82,11 @@ REQUIRED_CONTROL_KEYS = (
     "max_actual_net_notional",
 )
 
+TARGET_NOTIONAL_KEYS = (
+    "best_quote_maker_volume_target_remaining_notional",
+    "max_cumulative_notional",
+)
+
 
 def current_trade_window(now: datetime, reset_hour: int) -> tuple[datetime, datetime]:
     local_now = now.astimezone(BEIJING)
@@ -146,6 +151,21 @@ def clear_recovery_overlay(state: dict[str, object], *, symbol: str) -> bool:
     return changed
 
 
+def apply_target_notional(control: dict[str, object], *, target_notional: float | None) -> bool:
+    """Keep the runner's pace target and hard daily ceiling in one update."""
+    if target_notional is None:
+        return False
+    target = float(target_notional)
+    if target <= 0:
+        raise ValueError("target_notional must be positive")
+    changed = False
+    for key in TARGET_NOTIONAL_KEYS:
+        if control.get(key) != target:
+            control[key] = target
+            changed = True
+    return changed
+
+
 def load_usable_control(control_path: Path) -> tuple[dict[str, object], str | None]:
     """Use the newest complete backup when a concurrent writer damaged control."""
     candidates = [control_path] + sorted(
@@ -182,10 +202,13 @@ def main() -> None:
     parser.add_argument("--guard-state-path", type=Path)
     parser.add_argument("--symbol", default="ARXUSDT")
     parser.add_argument("--force-profile-rebase", action="store_true")
+    parser.add_argument("--target-notional", type=float)
     parser.add_argument("--reset-hour", type=int, default=8)
     args = parser.parse_args()
     if not 0 <= args.reset_hour <= 23:
         raise SystemExit("--reset-hour must be between 0 and 23")
+    if args.target_notional is not None and args.target_notional <= 0:
+        raise SystemExit("--target-notional must be positive")
 
     control_path = args.control_path
     control, recovered_from = load_usable_control(control_path)
@@ -202,7 +225,8 @@ def main() -> None:
         runtime_profile=runtime_profile,
         force_profile_rebase=args.force_profile_rebase,
     )
-    changed = updated != control or recovered_from is not None
+    target_changed = apply_target_notional(updated, target_notional=args.target_notional)
+    changed = updated != control or recovered_from is not None or target_changed
     if changed:
         write_json_atomically(control_path, updated)
     state_changed = False
@@ -221,6 +245,8 @@ def main() -> None:
                 "runtime_guard_stats_start_time": updated.get("runtime_guard_stats_start_time"),
                 "profile_rebased": bool(runtime_profile) and changed,
                 "recovery_overlay_cleared": state_changed,
+                "target_notional": args.target_notional,
+                "target_changed": target_changed,
                 "control_recovered_from": recovered_from,
             },
             ensure_ascii=False,

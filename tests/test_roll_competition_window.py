@@ -2,6 +2,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from deploy.oracle.roll_competition_window import (
+    apply_target_notional,
     clear_recovery_overlay,
     load_usable_control,
     roll_control_window,
@@ -88,6 +89,18 @@ def test_clears_only_temporary_recovery_overlay() -> None:
     assert clear_recovery_overlay(state, symbol="ARXUSDT") is True
     item = state["symbols"]["ARXUSDT"]  # type: ignore[index]
     assert item == {"last_volume_summary": {"gross_quote_qty": 123.0}}
+
+
+def test_apply_target_notional_updates_both_runner_target_fields() -> None:
+    control: dict[str, object] = {
+        "best_quote_maker_volume_target_remaining_notional": 100_000.0,
+        "max_cumulative_notional": 180_000.0,
+    }
+
+    assert apply_target_notional(control, target_notional=200_000.0) is True
+    assert control["best_quote_maker_volume_target_remaining_notional"] == 200_000.0
+    assert control["max_cumulative_notional"] == 200_000.0
+    assert apply_target_notional(control, target_notional=200_000.0) is False
 
 
 def test_recovers_incomplete_control_from_latest_complete_backup() -> None:
