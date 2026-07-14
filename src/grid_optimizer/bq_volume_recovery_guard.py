@@ -2172,6 +2172,21 @@ def should_hold_arx_volume_priority_release(
     )
 
 
+def should_hold_arx_recovery_capacity_for_net_limit(
+    *,
+    symbol: str,
+    actual_net_notional: float,
+    original_max_actual_net_notional: float,
+) -> bool:
+    """Do not restore ARX's baseline net cap while it would stop the runner."""
+    return (
+        symbol.upper().strip() == "ARXUSDT"
+        and _safe_float(original_max_actual_net_notional) > 0
+        and abs(_safe_float(actual_net_notional))
+        > _safe_float(original_max_actual_net_notional)
+    )
+
+
 def should_restore_near_market_recovery(
     *,
     symbol: str,
@@ -3403,6 +3418,15 @@ def check_symbol(
     )
     recovery_timeout_required = recovery_timed_out and (
         recovery_has_original_controls or bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+    )
+    arx_recovery_baseline_net_limit_blocked = should_hold_arx_recovery_capacity_for_net_limit(
+        symbol=normalized_symbol,
+        actual_net_notional=_safe_float(assessment.get("actual_net_notional_for_entry")),
+        original_max_actual_net_notional=_safe_float(
+            recovery_original_controls.get("max_actual_net_notional")
+            if isinstance(recovery_original_controls, dict)
+            else 0.0
+        ),
     )
     recovery_hold_satisfied = (
         recovery_started_at is None
@@ -5798,16 +5822,20 @@ def check_symbol(
                         "last_recovery_action": action,
                     }
                 )
-            elif recovery_timed_out and not should_hold_arx_volume_priority_release(
-                symbol=normalized_symbol,
-                target_pace_behind=target_pace_behind,
-                pace_ratio=pace_ratio,
-                allow_loss_reduce_only=bool(
-                    control.get("best_quote_maker_volume_allow_loss_reduce_only")
-                ),
-                planned_reduce_only_order_count=_safe_int(
-                    assessment.get("planned_reduce_only_order_count")
-                ),
+            elif (
+                recovery_timed_out
+                and not arx_recovery_baseline_net_limit_blocked
+                and not should_hold_arx_volume_priority_release(
+                    symbol=normalized_symbol,
+                    target_pace_behind=target_pace_behind,
+                    pace_ratio=pace_ratio,
+                    allow_loss_reduce_only=bool(
+                        control.get("best_quote_maker_volume_allow_loss_reduce_only")
+                    ),
+                    planned_reduce_only_order_count=_safe_int(
+                        assessment.get("planned_reduce_only_order_count")
+                    ),
+                )
             ):
                 updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
                 changed, backup_path = _apply_control_update(
@@ -6655,16 +6683,20 @@ def check_symbol(
                     {"ts": now.isoformat(), **return_result},
                 )
                 return return_result
-            if recovery_stage_timed_out and not should_hold_arx_volume_priority_release(
-                symbol=normalized_symbol,
-                target_pace_behind=target_pace_behind,
-                pace_ratio=pace_ratio,
-                allow_loss_reduce_only=bool(
-                    control.get("best_quote_maker_volume_allow_loss_reduce_only")
-                ),
-                planned_reduce_only_order_count=_safe_int(
-                    assessment.get("planned_reduce_only_order_count")
-                ),
+            if (
+                recovery_stage_timed_out
+                and not arx_recovery_baseline_net_limit_blocked
+                and not should_hold_arx_volume_priority_release(
+                    symbol=normalized_symbol,
+                    target_pace_behind=target_pace_behind,
+                    pace_ratio=pace_ratio,
+                    allow_loss_reduce_only=bool(
+                        control.get("best_quote_maker_volume_allow_loss_reduce_only")
+                    ),
+                    planned_reduce_only_order_count=_safe_int(
+                        assessment.get("planned_reduce_only_order_count")
+                    ),
+                )
             ):
                 updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
                 changed, backup_path = _apply_control_update(

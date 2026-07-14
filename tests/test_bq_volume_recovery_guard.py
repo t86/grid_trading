@@ -813,6 +813,31 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
         )
 
+    def test_arx_timeout_keeps_capacity_until_original_net_limit_clears(self) -> None:
+        decide = bq_volume_recovery_guard.should_hold_arx_recovery_capacity_for_net_limit
+
+        self.assertTrue(
+            decide(
+                symbol="ARXUSDT",
+                actual_net_notional=1724.22,
+                original_max_actual_net_notional=1000.0,
+            )
+        )
+        self.assertFalse(
+            decide(
+                symbol="ARXUSDT",
+                actual_net_notional=999.99,
+                original_max_actual_net_notional=1000.0,
+            )
+        )
+        self.assertFalse(
+            decide(
+                symbol="REUSDT",
+                actual_net_notional=1724.22,
+                original_max_actual_net_notional=1000.0,
+            )
+        )
+
     def test_high_recovery_wear_requires_15m_confirmation_or_extreme_5m(self) -> None:
         self.assertFalse(
             bq_volume_recovery_guard._is_high_recovery_wear(
