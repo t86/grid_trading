@@ -2409,10 +2409,6 @@ def arx_side_cap_unwind_updates(
     high_recovery_wear: bool = False,
 ) -> dict[str, Any]:
     """Route maker-only recovery to the side that remains above the hard cap."""
-    # The wear backoff owns the next bounded adjustment.  Do not let a
-    # directional unwind immediately undo its one-tick wider quote.
-    if high_recovery_wear:
-        return {}
     long_hard = max(
         _safe_float(control.get("max_position_notional")),
         _safe_float(control.get("best_quote_maker_volume_max_long_notional")),
@@ -2451,6 +2447,11 @@ def arx_side_cap_unwind_updates(
         direction = "net_short"
     else:
         direction = None
+    # Wear backoff prevents a new or continued loss unwind, but it must not
+    # retain a stale one once both sides are back inside their soft limits.
+    # Leaving that latch set suppresses ordinary two-sided quoting indefinitely.
+    if high_recovery_wear and direction is not None:
+        return {}
     if direction is None:
         if (
             current_direction == "off"

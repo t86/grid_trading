@@ -1404,6 +1404,34 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             {},
         )
 
+    def test_arx_high_wear_clears_stale_directional_unwind_below_soft_limit(self) -> None:
+        control = {
+            "best_quote_maker_volume_directional_net_guard": "net_long",
+            "best_quote_maker_volume_allow_loss_reduce_only": True,
+            "best_quote_maker_volume_net_loss_reduce_enabled": False,
+            "best_quote_maker_volume_active_pair_reduce_enabled": False,
+            "best_quote_maker_volume_max_long_notional": 800.0,
+            "best_quote_maker_volume_max_short_notional": 800.0,
+            "max_position_notional": 800.0,
+            "max_short_position_notional": 800.0,
+            "pause_buy_position_notional": 620.0,
+            "pause_short_position_notional": 620.0,
+            "max_actual_net_notional": 1000.0,
+        }
+
+        self.assertEqual(
+            bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+                control=control,
+                actual_long_notional=598.0,
+                actual_short_notional=402.0,
+                high_recovery_wear=True,
+            ),
+            {
+                "best_quote_maker_volume_directional_net_guard": "off",
+                "best_quote_maker_volume_allow_loss_reduce_only": False,
+            },
+        )
+
     def test_main_never_restarts_symbol_after_target_gate_done(self) -> None:
         now = datetime.now(timezone.utc)
         with TemporaryDirectory() as tmpdir:
