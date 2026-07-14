@@ -1773,12 +1773,12 @@ def recover_arx_exchange_order_drift(
         exchange_open_order_count=exchange_open_order_count,
     ):
         return None
-    if has_recent_arx_submit_fill(
+    if has_recent_arx_submit_activity(
         submit=submit or {}, now=now, max_age_seconds=cooldown_seconds
     ):
         return {
             "symbol": normalized_symbol,
-            "action": "hold_arx_exchange_order_drift_after_recent_fill",
+            "action": "hold_arx_exchange_order_drift_after_recent_activity",
             "changed_keys": [],
             "backup_path": None,
             "dry_run": dry_run,
@@ -2131,16 +2131,21 @@ def should_restart_arx_for_exchange_order_drift(
     )
 
 
-def has_recent_arx_submit_fill(
+def has_recent_arx_submit_activity(
     *, submit: dict[str, Any], now: datetime, max_age_seconds: float
 ) -> bool:
-    """A fresh maker fill is not an empty-book runner failure."""
+    """A fresh maker event is not an empty-book runner failure.
+
+    REST can briefly observe no order between a maker cancellation and the
+    replacement.  A new or filled strategy order in that interval proves the
+    runner is alive and re-quoting; only a quiet stream may justify restart.
+    """
     events = submit.get("observed_execution_events") or []
     cutoff_ms = (now - timedelta(seconds=max(float(max_age_seconds), 0.0))).timestamp() * 1000
     return any(
         isinstance(event, dict)
         and str(event.get("kind") or "").upper()
-        in {"ORDER_FILLED", "ORDER_PARTIALLY_FILLED"}
+        in {"ORDER_NEW", "ORDER_FILLED", "ORDER_PARTIALLY_FILLED"}
         and _safe_float(event.get("event_time")) >= cutoff_ms
         for event in events
     )
