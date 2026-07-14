@@ -225,6 +225,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         )
 
     def test_arx_capacity_recovery_raises_an_old_near_cap_when_pace_trails_target(self) -> None:
+        # The target window can be behind even while a longer-lived pace
+        # ratio still reflects an earlier burst of fills.
         updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
             control={
                 "max_position_notional": 800.0,
@@ -233,7 +235,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 "best_quote_maker_volume_max_short_notional": 800.0,
             },
             target_pace_behind=True,
-            pace_ratio=0.84,
+            pace_ratio=1.20,
             near_cap=True,
             volatility_entry_pause_active=False,
             frozen_total_notional=400.0,

@@ -2222,7 +2222,7 @@ def arx_severe_pace_capacity_updates(
     volatility_entry_pause_active: bool,
     frozen_total_notional: float,
 ) -> dict[str, Any]:
-    """Temporarily widen ARX capacity only for a severe, calm pace miss."""
+    """Temporarily widen ARX capacity when its live target window is behind."""
     target_max_notional = 2600.0
     capacity_already_raised = all(
         _safe_float(control.get(key)) >= target_max_notional
@@ -2241,7 +2241,6 @@ def arx_severe_pace_capacity_updates(
     )
     if (
         not bool(target_pace_behind)
-        or float(pace_ratio) >= 1.0
         or (bool(near_cap) and capacity_already_raised)
         or bool(volatility_entry_pause_active)
         or float(frozen_total_notional) <= 0.0
