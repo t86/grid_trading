@@ -2436,6 +2436,31 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
 
         self.assertEqual(updates["pause_short_position_notional"], 1.0)
 
+    def test_arx_frozen_loss_reduce_keeps_active_pause_baseline(self) -> None:
+        updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
+            control={
+                "best_quote_maker_volume_allow_loss_reduce_only": False,
+                "best_quote_maker_volume_cycle_budget_notional": 128.0,
+                "per_order_notional": 32.0,
+                "pause_buy_position_notional": 320.0,
+                "pause_short_position_notional": 240.0,
+            },
+            assessment={
+                "symbol": "ARXUSDT",
+                "current_long_notional": 520.0,
+                "current_short_notional": 280.0,
+                "max_long_notional": 800.0,
+                "max_short_notional": 800.0,
+                "frozen_long_notional": 400.0,
+                "frozen_short_notional": 0.0,
+            },
+            pause_baseline_long_notional=620.0,
+            pause_baseline_short_notional=620.0,
+        )
+
+        self.assertEqual(updates["pause_buy_position_notional"], 620.0)
+        self.assertEqual(updates["pause_short_position_notional"], 620.0)
+
     def test_recovery_parameters_use_one_authoritative_floor_for_all_config_values(self) -> None:
         for configured_min in (32.0, 72.0, 100.0, 120.0, 200.0):
             with self.subTest(configured_min=configured_min):

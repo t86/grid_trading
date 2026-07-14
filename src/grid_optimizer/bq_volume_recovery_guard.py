@@ -1057,6 +1057,20 @@ def _loss_reduce_recovery_updates(
     ):
         if pause_key not in control:
             continue
+        if (
+            str(assessment.get("symbol") or "").upper() == "ARXUSDT"
+            and (
+                _safe_float(assessment.get("frozen_long_notional")) > 0.0
+                or _safe_float(assessment.get("frozen_short_notional")) > 0.0
+            )
+        ):
+            # Frozen ARX inventory has a separate cap/release policy.  A
+            # temporary active-only loss reducer may quote its reduce order,
+            # but must not ratchet the ordinary entry pauses down to the
+            # active balance and strand the two-sided volume loop.
+            if baseline > 0 and _safe_float(control.get(pause_key)) < baseline:
+                updates[pause_key] = baseline
+            continue
         if side not in reducible_sides:
             if baseline > 0 and _safe_float(control.get(pause_key)) < baseline:
                 updates[pause_key] = baseline
