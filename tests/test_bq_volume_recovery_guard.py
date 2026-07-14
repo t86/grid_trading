@@ -159,6 +159,57 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 },
             )
         )
+
+    def test_arx_runner_error_loop_restarts_after_three_errors(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            _append_jsonl(
+                output_dir / "arxusdt_loop_events.jsonl",
+                [
+                    {
+                        "ts": "2026-07-14T00:00:00+00:00",
+                        "cycle": 3,
+                        "error_type": "NameError",
+                        "error_message": "broken",
+                        "consecutive_errors": 3,
+                    }
+                ],
+            )
+            restarted: list[str] = []
+            result = bq_volume_recovery_guard.recover_arx_runner_error_loop(
+                output_dir=output_dir,
+                symbol="ARXUSDT",
+                state={},
+                now=datetime(2026, 7, 14, tzinfo=timezone.utc),
+                cooldown_seconds=60.0,
+                dry_run=False,
+                runner_wrapper="unused",
+                restart_runner=lambda symbol: restarted.append(symbol),
+            )
+        self.assertEqual("restart_arx_runner_error_loop", result["action"])
+        self.assertEqual(["ARXUSDT"], restarted)
+
+    def test_arx_runner_error_loop_ignores_old_error_after_success(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            _append_jsonl(
+                output_dir / "arxusdt_loop_events.jsonl",
+                [
+                    {"cycle": 3, "error_type": "NameError", "consecutive_errors": 3},
+                    {"cycle": 4, "error_message": None},
+                ],
+            )
+            result = bq_volume_recovery_guard.recover_arx_runner_error_loop(
+                output_dir=output_dir,
+                symbol="ARXUSDT",
+                state={},
+                now=datetime(2026, 7, 14, tzinfo=timezone.utc),
+                cooldown_seconds=60.0,
+                dry_run=False,
+                runner_wrapper="unused",
+                restart_runner=lambda _symbol: self.fail("must not restart"),
+            )
+        self.assertIsNone(result)
         self.assertFalse(
             bq_volume_recovery_guard.should_relax_arx_zero_order_volume_blockers(
                 symbol="ARXUSDT",

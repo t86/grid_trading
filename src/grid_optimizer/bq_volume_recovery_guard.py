@@ -875,6 +875,17 @@ def _latest_runtime_stop_event(output_dir: Path, symbol: str) -> dict[str, Any]:
     return {}
 
 
+def _latest_runner_error_event(output_dir: Path, symbol: str) -> dict[str, Any]:
+    for event in reversed(_iter_jsonl(_events_path(output_dir, symbol))):
+        if str(event.get("error_type") or "").strip():
+            return event
+        # A successful cycle after an error proves the runner has recovered;
+        # do not restart it just because an older error remains in the log.
+        if "cycle" in event and not str(event.get("error_message") or "").strip():
+            return {}
+    return {}
+
+
 def _symbol_state(state: dict[str, Any], symbol: str) -> dict[str, Any]:
     symbols = state.setdefault("symbols", {})
     if not isinstance(symbols, dict):
@@ -1786,6 +1797,74 @@ def recover_arx_exchange_order_drift(
         }
     )
     result["action"] = "restart_arx_exchange_order_drift"
+    return result
+
+
+def recover_arx_runner_error_loop(
+    *,
+    output_dir: Path,
+    symbol: str,
+    state: dict[str, Any],
+    now: datetime,
+    cooldown_seconds: float,
+    dry_run: bool,
+    runner_wrapper: str,
+    restart_runner: RestartRunner | None = None,
+) -> dict[str, Any] | None:
+    """Break a live ARX runner error loop before it exhausts its retries."""
+    normalized_symbol = symbol.upper().strip()
+    if normalized_symbol != "ARXUSDT":
+        return None
+    event = _latest_runner_error_event(Path(output_dir), normalized_symbol)
+    consecutive_errors = _safe_int(event.get("consecutive_errors"))
+    if consecutive_errors < 3:
+        return None
+    item = _symbol_state(state, normalized_symbol)
+    last_restart_at = _parse_time(item.get("last_runner_error_restart_at"))
+    if (
+        last_restart_at is not None
+        and (now - last_restart_at).total_seconds() < max(float(cooldown_seconds), 0.0)
+    ):
+        return {
+            "symbol": normalized_symbol,
+            "action": "hold_arx_runner_error_restart_cooldown",
+            "changed_keys": [],
+            "backup_path": None,
+            "dry_run": dry_run,
+            "restart_failed": None,
+            "runner_error_type": event.get("error_type"),
+            "runner_consecutive_errors": consecutive_errors,
+        }
+    result = {
+        "symbol": normalized_symbol,
+        "changed_keys": [],
+        "backup_path": None,
+        "dry_run": dry_run,
+        "restart_failed": None,
+        "runner_error_type": event.get("error_type"),
+        "runner_consecutive_errors": consecutive_errors,
+    }
+    if dry_run:
+        result["action"] = "dry_run_restart_arx_runner_error_loop"
+        return result
+    restart = restart_runner or (
+        lambda item_symbol: _default_restart_runner(item_symbol, runner_wrapper=runner_wrapper)
+    )
+    try:
+        restart(normalized_symbol)
+    except subprocess.CalledProcessError as exc:
+        result["action"] = "restart_arx_runner_error_loop_failed"
+        result["restart_failed"] = str(exc)
+        return result
+    item.update(
+        {
+            "last_runner_error_restart_at": now.isoformat(),
+            "last_recovery_action_at": now.isoformat(),
+            "last_recovery_action": "restart_arx_runner_error_loop",
+            "status": "runner_error_recovery_active",
+        }
+    )
+    result["action"] = "restart_arx_runner_error_loop"
     return result
 
 
@@ -6900,6 +6979,24 @@ def main(argv: list[str] | None = None) -> int:
             )
             results.append(result)
             if result.get("restart_failed"):
+                exit_code = 1
+            continue
+        runner_error_result = recover_arx_runner_error_loop(
+            output_dir=output_dir,
+            symbol=symbol,
+            state=state,
+            now=now,
+            cooldown_seconds=max(min(float(args.trigger_seconds), 90.0), 60.0),
+            dry_run=args.dry_run,
+            runner_wrapper=args.runner_wrapper,
+        )
+        if runner_error_result is not None:
+            _append_jsonl(
+                output_dir / "bq_volume_recovery_guard_events.jsonl",
+                {"ts": now.isoformat(), **runner_error_result},
+            )
+            results.append(runner_error_result)
+            if runner_error_result.get("restart_failed"):
                 exit_code = 1
             continue
         item = _symbol_state(state, symbol)
