@@ -2186,6 +2186,27 @@ def should_bypass_arx_submit_failure_recovery_gate(
     )
 
 
+def should_repair_arx_loss_reduce_flow(
+    *,
+    symbol: str,
+    target_pace_behind: bool,
+    allow_loss_reduce_only: bool,
+    has_flow_updates: bool,
+    high_recovery_wear: bool,
+    confirmed_loss_reduce_wear: bool,
+    volatility_entry_pause_active: bool,
+) -> bool:
+    return (
+        symbol.upper().strip() == "ARXUSDT"
+        and bool(target_pace_behind)
+        and bool(allow_loss_reduce_only)
+        and bool(has_flow_updates)
+        and not bool(high_recovery_wear)
+        and not bool(confirmed_loss_reduce_wear)
+        and not bool(volatility_entry_pause_active)
+    )
+
+
 def arx_severe_pace_capacity_updates(
     *,
     control: dict[str, Any],
@@ -3740,6 +3761,48 @@ def check_symbol(
                 control_path=control_path,
                 control=control,
                 updates=arx_zero_order_volume_updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif should_repair_arx_loss_reduce_flow(
+            symbol=normalized_symbol,
+            target_pace_behind=target_pace_behind,
+            allow_loss_reduce_only=bool(
+                control.get("best_quote_maker_volume_allow_loss_reduce_only")
+            ),
+            has_flow_updates=bool(loss_reduce_flow_updates),
+            high_recovery_wear=high_recovery_wear,
+            confirmed_loss_reduce_wear=confirmed_loss_reduce_wear,
+            volatility_entry_pause_active=bool(
+                assessment.get("volatility_entry_pause_active")
+            ),
+        ):
+            _remember_recovery_controls(
+                item,
+                control,
+                tuple(loss_reduce_flow_updates),
+            )
+            _remember_recovery_updates(item, loss_reduce_flow_updates)
+            action = (
+                "dry_run_repair_arx_loss_reduce_flow"
+                if dry_run
+                else "repair_arx_loss_reduce_flow"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=loss_reduce_flow_updates,
                 now=now,
                 dry_run=dry_run,
                 restart_runner=restart,

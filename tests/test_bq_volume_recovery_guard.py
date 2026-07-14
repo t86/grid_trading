@@ -144,6 +144,32 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 validation_errors=("plan places total notional 1505.0, above max_total_notional=1200.0",),
             )
         )
+
+    def test_arx_repairs_loss_reduce_flow_before_freeze_policy(self) -> None:
+        decide = bq_volume_recovery_guard.should_repair_arx_loss_reduce_flow
+
+        self.assertTrue(
+            decide(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                allow_loss_reduce_only=True,
+                has_flow_updates=True,
+                high_recovery_wear=False,
+                confirmed_loss_reduce_wear=False,
+                volatility_entry_pause_active=False,
+            )
+        )
+        self.assertFalse(
+            decide(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                allow_loss_reduce_only=True,
+                has_flow_updates=True,
+                high_recovery_wear=True,
+                confirmed_loss_reduce_wear=False,
+                volatility_entry_pause_active=False,
+            )
+        )
     def test_arx_severe_pace_capacity_raises_thresholds_and_budget_only_when_calm(self) -> None:
         updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
             control={
