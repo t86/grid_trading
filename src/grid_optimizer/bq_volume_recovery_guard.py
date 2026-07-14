@@ -1694,6 +1694,7 @@ def _arx_independent_freeze_policy_updates(
         anti_chase_min_key: configured_anti_chase_min,
         anti_chase_gap_key: configured_anti_chase_gap,
         "best_quote_maker_volume_net_loss_reduce_enabled": False,
+        "adverse_reduce_enabled": False,
         "hard_loss_forced_reduce_enabled": False,
     }
     if temporary_anti_chase_relief:

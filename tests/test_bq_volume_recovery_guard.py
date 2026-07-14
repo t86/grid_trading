@@ -1136,6 +1136,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 "best_quote_maker_volume_same_side_entry_price_guard_report_only": False,
                 "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 200.0,
                 "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 1,
+                "adverse_reduce_enabled": False,
             },
         )
         self.assertEqual(
@@ -1171,6 +1172,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 200.0,
             "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 1,
             "best_quote_maker_volume_net_loss_reduce_enabled": False,
+            "adverse_reduce_enabled": False,
             "hard_loss_forced_reduce_enabled": False,
         }
 
