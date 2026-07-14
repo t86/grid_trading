@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import ceil
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .recovery_control_ownership import (
     exclusive_control_lock,
@@ -2151,6 +2151,30 @@ def should_enable_arx_sticky_requote(
     )
 
 
+def should_bypass_arx_submit_failure_recovery_gate(
+    *,
+    symbol: str,
+    target_pace_behind: bool,
+    low_volume: bool,
+    active_order_count: int,
+    volatility_entry_pause_active: bool,
+    ledger_position_drift_blocked: bool,
+    recovery_gate_reasons: Iterable[str],
+) -> bool:
+    """Let ARX repair its own failed submit only when no strategy order remains."""
+    reasons = {str(item).strip() for item in recovery_gate_reasons if str(item).strip()}
+    return (
+        symbol.upper().strip() == "ARXUSDT"
+        and bool(target_pace_behind)
+        and bool(low_volume)
+        and int(active_order_count) <= 0
+        and not bool(volatility_entry_pause_active)
+        and not bool(ledger_position_drift_blocked)
+        and reasons
+        and reasons <= {"latest_submit_error", "latest_validation_failed"}
+    )
+
+
 def arx_severe_pace_capacity_updates(
     *,
     control: dict[str, Any],
@@ -3230,6 +3254,15 @@ def check_symbol(
         required_hourly_notional > 0
         and not target_pace_ahead
     )
+    arx_submit_failure_recovery_bypass = should_bypass_arx_submit_failure_recovery_gate(
+        symbol=normalized_symbol,
+        target_pace_behind=target_pace_behind,
+        low_volume=bool(assessment.get("low_volume")),
+        active_order_count=_safe_int(assessment.get("active_order_count")),
+        volatility_entry_pause_active=bool(assessment.get("volatility_entry_pause_active")),
+        ledger_position_drift_blocked=bool(assessment.get("ledger_position_drift_blocked")),
+        recovery_gate_reasons=tuple(recovery_gate.get("reasons") or ()),
+    )
     recovery_low_volume = bool(assessment.get("low_volume")) or target_pace_behind
     assessment["target_pace_behind"] = target_pace_behind
     trailing_realized_wear_per_10k = _safe_float(
@@ -3591,7 +3624,11 @@ def check_symbol(
     try:
         if stale_or_missing and not recovery_timeout_required:
             action = "skip_stale_or_missing_inputs"
-        elif not bool(recovery_gate.get("ok")) and not recovery_timeout_required:
+        elif (
+            not bool(recovery_gate.get("ok"))
+            and not arx_submit_failure_recovery_bypass
+            and not recovery_timeout_required
+        ):
             action = "skip_recovery_safety_gate"
         elif action_verification == "pending":
             action = "hold_recovery_action_verification_pending"

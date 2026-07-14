@@ -93,6 +93,42 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
         )
 
+    def test_arx_only_bypasses_submit_failure_gate_when_no_strategy_order_survives(self) -> None:
+        decide = bq_volume_recovery_guard.should_bypass_arx_submit_failure_recovery_gate
+
+        self.assertTrue(
+            decide(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                low_volume=True,
+                active_order_count=0,
+                volatility_entry_pause_active=False,
+                ledger_position_drift_blocked=False,
+                recovery_gate_reasons=("latest_submit_error", "latest_validation_failed"),
+            )
+        )
+        self.assertFalse(
+            decide(
+                symbol="REUSDT",
+                target_pace_behind=True,
+                low_volume=True,
+                active_order_count=0,
+                volatility_entry_pause_active=False,
+                ledger_position_drift_blocked=False,
+                recovery_gate_reasons=("latest_submit_error", "latest_validation_failed"),
+            )
+        )
+        self.assertFalse(
+            decide(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                low_volume=True,
+                active_order_count=1,
+                volatility_entry_pause_active=False,
+                ledger_position_drift_blocked=False,
+                recovery_gate_reasons=("latest_submit_error", "latest_validation_failed"),
+            )
+        )
     def test_arx_severe_pace_capacity_raises_thresholds_and_budget_only_when_calm(self) -> None:
         updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
             control={
