@@ -1745,6 +1745,23 @@ def evaluate_action_verification(
     return "pending", failures
 
 
+def should_hold_arx_volume_priority_release(
+    *,
+    symbol: str,
+    target_pace_behind: bool,
+    pace_ratio: float,
+    allow_loss_reduce_only: bool,
+    planned_reduce_only_order_count: int,
+) -> bool:
+    return (
+        symbol.upper().strip() == "ARXUSDT"
+        and bool(target_pace_behind)
+        and float(pace_ratio) < 0.30
+        and bool(allow_loss_reduce_only)
+        and int(planned_reduce_only_order_count) > 0
+    )
+
+
 def _runner_is_active(symbol: str) -> bool:
     service = f"grid-loop@{symbol}.service"
     return (
@@ -5372,7 +5389,17 @@ def check_symbol(
                     {"ts": now.isoformat(), **return_result},
                 )
                 return return_result
-            if recovery_stage_timed_out:
+            if recovery_stage_timed_out and not should_hold_arx_volume_priority_release(
+                symbol=normalized_symbol,
+                target_pace_behind=target_pace_behind,
+                pace_ratio=pace_ratio,
+                allow_loss_reduce_only=bool(
+                    control.get("best_quote_maker_volume_allow_loss_reduce_only")
+                ),
+                planned_reduce_only_order_count=_safe_int(
+                    assessment.get("planned_reduce_only_order_count")
+                ),
+            ):
                 updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,

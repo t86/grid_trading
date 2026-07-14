@@ -37,6 +37,26 @@ def _append_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class BqVolumeRecoveryGuardTests(unittest.TestCase):
+    def test_arx_severe_target_gap_keeps_maker_release_past_recovery_timeout(self) -> None:
+        self.assertTrue(
+            bq_volume_recovery_guard.should_hold_arx_volume_priority_release(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.24,
+                allow_loss_reduce_only=True,
+                planned_reduce_only_order_count=3,
+            )
+        )
+        self.assertFalse(
+            bq_volume_recovery_guard.should_hold_arx_volume_priority_release(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.76,
+                allow_loss_reduce_only=True,
+                planned_reduce_only_order_count=3,
+            )
+        )
+
     def test_high_recovery_wear_requires_15m_confirmation_or_extreme_5m(self) -> None:
         self.assertFalse(
             bq_volume_recovery_guard._is_high_recovery_wear(
