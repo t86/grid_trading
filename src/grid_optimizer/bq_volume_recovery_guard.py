@@ -2335,6 +2335,52 @@ def arx_severe_pace_capacity_updates(
     return updates
 
 
+def arx_balanced_fast_sla_capacity_updates(
+    *,
+    control: dict[str, Any],
+    assessment: dict[str, Any],
+    target_pace_behind: bool,
+    no_fill_seconds: float,
+    fast_sla_seconds: float,
+    high_recovery_wear: bool,
+) -> dict[str, Any]:
+    """Restore two-sided ARX maker flow before using loss-reduce on balanced stock."""
+    current_long = max(_safe_float(assessment.get("current_long_notional")), 0.0)
+    current_short = max(_safe_float(assessment.get("current_short_notional")), 0.0)
+    target_max = 3200.0
+    if (
+        not bool(target_pace_behind)
+        or float(no_fill_seconds) < max(float(fast_sla_seconds), 0.0)
+        or bool(high_recovery_wear)
+        or bool(assessment.get("volatility_entry_pause_active"))
+        or min(current_long, current_short) < 1300.0
+        or abs(current_long - current_short) > 650.0
+        or _safe_float(control.get("max_position_notional")) >= target_max
+        or _safe_float(control.get("max_short_position_notional")) >= target_max
+    ):
+        return {}
+    targets = {
+        "pause_buy_position_notional": 2880.0,
+        "pause_short_position_notional": 2880.0,
+        "max_position_notional": target_max,
+        "max_short_position_notional": target_max,
+        "maker_max_long_notional": target_max,
+        "maker_max_short_notional": target_max,
+        "best_quote_maker_volume_max_long_notional": target_max,
+        "best_quote_maker_volume_max_short_notional": target_max,
+        "best_quote_maker_volume_inventory_soft_ratio": 0.9,
+        "best_quote_maker_volume_min_cycle_budget_notional": 1200.0,
+        "best_quote_maker_volume_cycle_budget_notional": 2000.0,
+        "best_quote_maker_volume_active_pair_reduce_order_notional": 600.0,
+        "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 600.0,
+        "max_total_notional": 6000.0,
+        "best_quote_maker_volume_allow_loss_reduce_only": False,
+        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+        "best_quote_maker_volume_quote_offset_ticks": 0,
+    }
+    return {key: value for key, value in targets.items() if control.get(key) != value}
+
+
 def _runner_is_active(symbol: str) -> bool:
     service = f"grid-loop@{symbol}.service"
     return (
@@ -5299,7 +5345,43 @@ def check_symbol(
                 for key, value in recovery_expected_controls.items()
                 if control.get(key) != value
             }
-            if should_enter_loss_reduce(
+            arx_balanced_capacity_updates = arx_balanced_fast_sla_capacity_updates(
+                control=control,
+                assessment=assessment,
+                target_pace_behind=target_pace_behind,
+                no_fill_seconds=no_fill_seconds,
+                fast_sla_seconds=fast_sla_seconds,
+                high_recovery_wear=high_recovery_wear,
+            ) if normalized_symbol == "ARXUSDT" else {}
+            if arx_balanced_capacity_updates:
+                _remember_recovery_controls(
+                    item, control, tuple(arx_balanced_capacity_updates)
+                )
+                _remember_recovery_updates(item, arx_balanced_capacity_updates)
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=arx_balanced_capacity_updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = (
+                    "dry_run_raise_arx_balanced_fast_sla_capacity"
+                    if dry_run
+                    else "raise_arx_balanced_fast_sla_capacity"
+                )
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "recovery_started_at": now.isoformat(),
+                        "recovery_owned": True,
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+            elif should_enter_loss_reduce(
                 low_volume=bool(assessment.get("low_volume")),
                 effective_inventory_soft_pressure=effective_inventory_soft_pressure,
                 sla_recovery_due=sla_recovery_due,

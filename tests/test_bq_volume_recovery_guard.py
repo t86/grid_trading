@@ -254,6 +254,42 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
         )
 
+    def test_arx_balanced_fast_sla_capacity_avoids_loss_reduce(self) -> None:
+        updates = bq_volume_recovery_guard.arx_balanced_fast_sla_capacity_updates(
+            control={
+                "max_position_notional": 2600.0,
+                "max_short_position_notional": 2600.0,
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
+            },
+            assessment={
+                "current_long_notional": 2512.0,
+                "current_short_notional": 2271.0,
+                "volatility_entry_pause_active": False,
+            },
+            target_pace_behind=True,
+            no_fill_seconds=120.0,
+            fast_sla_seconds=120.0,
+            high_recovery_wear=False,
+        )
+        self.assertEqual(3200.0, updates["max_position_notional"])
+        self.assertEqual(2000.0, updates["best_quote_maker_volume_cycle_budget_notional"])
+        self.assertFalse(updates["best_quote_maker_volume_allow_loss_reduce_only"])
+        self.assertEqual(
+            {},
+            bq_volume_recovery_guard.arx_balanced_fast_sla_capacity_updates(
+                control={"max_position_notional": 2600.0, "max_short_position_notional": 2600.0},
+                assessment={
+                    "current_long_notional": 10.0,
+                    "current_short_notional": 2500.0,
+                    "volatility_entry_pause_active": False,
+                },
+                target_pace_behind=True,
+                no_fill_seconds=120.0,
+                fast_sla_seconds=120.0,
+                high_recovery_wear=False,
+            ),
+        )
+
     def test_arx_capacity_recovery_raises_an_old_near_cap_when_pace_trails_target(self) -> None:
         # The target window can be behind even while a longer-lived pace
         # ratio still reflects an earlier burst of fills.
