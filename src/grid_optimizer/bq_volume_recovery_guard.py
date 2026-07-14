@@ -2374,25 +2374,25 @@ def arx_severe_pace_capacity_updates(
     actual_long_notional: float = 0.0,
     actual_short_notional: float = 0.0,
 ) -> dict[str, Any]:
-    """Temporarily widen ARX capacity when its live target window is behind."""
-    actual_side_max = max(
-        _safe_float(actual_long_notional), _safe_float(actual_short_notional), 0.0
+    """Temporarily recover ARX flow without exceeding the per-side hard cap."""
+    del actual_long_notional, actual_short_notional
+    target_max_notional = 2000.0
+    target_pause_notional = 1800.0
+    side_cap_keys = (
+        "pause_buy_position_notional",
+        "pause_short_position_notional",
+        "max_position_notional",
+        "max_short_position_notional",
+        "maker_max_long_notional",
+        "maker_max_short_notional",
+        "best_quote_maker_volume_max_long_notional",
+        "best_quote_maker_volume_max_short_notional",
     )
-    target_max_notional = (
-        min(5000.0, max(3200.0, ceil((actual_side_max + 600.0) / 200.0) * 200.0))
-        if actual_side_max > 3200.0
-        else 2600.0
-    )
-    extended_for_actual_inventory = target_max_notional > 2600.0
     capacity_already_raised = all(
-        _safe_float(control.get(key)) >= target_max_notional
-        for key in (
-            "max_position_notional",
-            "max_short_position_notional",
-            "best_quote_maker_volume_max_long_notional",
-            "best_quote_maker_volume_max_short_notional",
-            "max_actual_net_notional",
+        _safe_float(control.get(key)) == (
+            target_pause_notional if key.startswith("pause_") else target_max_notional
         )
+        for key in side_cap_keys
     ) and all(
         _safe_float(control.get(key)) >= 480.0
         for key in (
@@ -2408,26 +2408,29 @@ def arx_severe_pace_capacity_updates(
     ):
         return {}
     targets = {
-        "pause_buy_position_notional": target_max_notional if extended_for_actual_inventory else 2340.0,
-        "pause_short_position_notional": target_max_notional if extended_for_actual_inventory else 2340.0,
+        "pause_buy_position_notional": target_pause_notional,
+        "pause_short_position_notional": target_pause_notional,
         "max_position_notional": target_max_notional,
         "max_short_position_notional": target_max_notional,
-        "max_actual_net_notional": target_max_notional,
         "maker_max_long_notional": target_max_notional,
         "maker_max_short_notional": target_max_notional,
         "best_quote_maker_volume_max_long_notional": target_max_notional,
         "best_quote_maker_volume_max_short_notional": target_max_notional,
-        "best_quote_maker_volume_inventory_soft_ratio": 1.0 if extended_for_actual_inventory else 0.9,
+        "best_quote_maker_volume_inventory_soft_ratio": 0.9,
         "best_quote_maker_volume_min_cycle_budget_notional": 960.0,
         "best_quote_maker_volume_cycle_budget_notional": 1600.0,
         "best_quote_maker_volume_active_pair_reduce_order_notional": 480.0,
         "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 480.0,
-        "max_total_notional": target_max_notional * 2.0 if extended_for_actual_inventory else 4000.0,
+        "max_total_notional": target_max_notional * 2.0,
     }
     updates = {
         key: value
         for key, value in targets.items()
-        if _safe_float(control.get(key)) < value
+        if (
+            _safe_float(control.get(key)) != value
+            if key in side_cap_keys
+            else _safe_float(control.get(key)) < value
+        )
     }
     if bool(control.get("best_quote_maker_volume_inventory_bias_enabled")):
         updates["best_quote_maker_volume_inventory_bias_enabled"] = False
@@ -4395,7 +4398,6 @@ def check_symbol(
             item.pop("recovery_owned", None)
         elif (
             high_recovery_wear
-            and target_pace_behind
             and confirmed_loss_reduce_wear
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and bool(control.get("best_quote_maker_volume_active_pair_reduce_enabled"))

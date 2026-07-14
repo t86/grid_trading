@@ -282,9 +282,9 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             volatility_entry_pause_active=False,
             frozen_total_notional=400.0,
         )
-        self.assertEqual(2340.0, updates["pause_buy_position_notional"])
-        self.assertEqual(2600.0, updates["max_position_notional"])
-        self.assertEqual(2600.0, updates["max_actual_net_notional"])
+        self.assertEqual(1800.0, updates["pause_buy_position_notional"])
+        self.assertEqual(2000.0, updates["max_position_notional"])
+        self.assertNotIn("max_actual_net_notional", updates)
         self.assertEqual(0.9, updates["best_quote_maker_volume_inventory_soft_ratio"])
         self.assertEqual(1600.0, updates["best_quote_maker_volume_cycle_budget_notional"])
         self.assertEqual(960.0, updates["best_quote_maker_volume_min_cycle_budget_notional"])
@@ -315,7 +315,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             ),
         )
 
-    def test_arx_severe_pace_capacity_covers_actual_frozen_side(self) -> None:
+    def test_arx_severe_pace_capacity_never_exceeds_single_side_hard_cap(self) -> None:
         updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
             control={
                 "max_position_notional": 800.0,
@@ -331,14 +331,14 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             actual_long_notional=2823.0,
             actual_short_notional=3310.0,
         )
-        self.assertEqual(4000.0, updates["max_position_notional"])
-        self.assertEqual(4000.0, updates["max_short_position_notional"])
-        self.assertEqual(4000.0, updates["pause_buy_position_notional"])
-        self.assertEqual(4000.0, updates["pause_short_position_notional"])
-        self.assertEqual(1.0, updates["best_quote_maker_volume_inventory_soft_ratio"])
-        self.assertEqual(8000.0, updates["max_total_notional"])
+        self.assertEqual(2000.0, updates["max_position_notional"])
+        self.assertEqual(2000.0, updates["max_short_position_notional"])
+        self.assertEqual(1800.0, updates["pause_buy_position_notional"])
+        self.assertEqual(1800.0, updates["pause_short_position_notional"])
+        self.assertEqual(0.9, updates["best_quote_maker_volume_inventory_soft_ratio"])
+        self.assertEqual(4000.0, updates["max_total_notional"])
 
-    def test_arx_severe_pace_capacity_keeps_one_batch_above_4000_side(self) -> None:
+    def test_arx_severe_pace_capacity_lowers_previously_overridden_side_cap(self) -> None:
         updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
             control={"max_position_notional": 4000.0, "max_short_position_notional": 4000.0},
             target_pace_behind=True,
@@ -349,9 +349,9 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             actual_long_notional=2818.0,
             actual_short_notional=4133.0,
         )
-        self.assertEqual(4800.0, updates["max_position_notional"])
-        self.assertEqual(4800.0, updates["max_short_position_notional"])
-        self.assertEqual(9600.0, updates["max_total_notional"])
+        self.assertEqual(2000.0, updates["max_position_notional"])
+        self.assertEqual(2000.0, updates["max_short_position_notional"])
+        self.assertEqual(4000.0, updates["max_total_notional"])
 
     def test_arx_fast_sla_bypasses_only_capacity_reapply_debounce(self) -> None:
         decide = bq_volume_recovery_guard.should_bypass_arx_recovery_drift_debounce
@@ -532,22 +532,22 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             frozen_total_notional=400.0,
         )
 
-        self.assertEqual(2600.0, updates["max_position_notional"])
+        self.assertEqual(2000.0, updates["max_position_notional"])
         self.assertEqual(0.9, updates["best_quote_maker_volume_inventory_soft_ratio"])
 
         self.assertEqual(
             {},
             bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
                 control={
-                    "pause_buy_position_notional": 2340.0,
-                    "pause_short_position_notional": 2340.0,
-                    "max_position_notional": 2600.0,
-                    "max_short_position_notional": 2600.0,
-                    "max_actual_net_notional": 2600.0,
-                    "maker_max_long_notional": 2600.0,
-                    "maker_max_short_notional": 2600.0,
-                    "best_quote_maker_volume_max_long_notional": 2600.0,
-                    "best_quote_maker_volume_max_short_notional": 2600.0,
+                    "pause_buy_position_notional": 1800.0,
+                    "pause_short_position_notional": 1800.0,
+                    "max_position_notional": 2000.0,
+                    "max_short_position_notional": 2000.0,
+                    "max_actual_net_notional": 5000.0,
+                    "maker_max_long_notional": 2000.0,
+                    "maker_max_short_notional": 2000.0,
+                    "best_quote_maker_volume_max_long_notional": 2000.0,
+                    "best_quote_maker_volume_max_short_notional": 2000.0,
                     "best_quote_maker_volume_inventory_soft_ratio": 0.9,
                     "best_quote_maker_volume_min_cycle_budget_notional": 960.0,
                     "best_quote_maker_volume_cycle_budget_notional": 1600.0,
@@ -7526,7 +7526,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 min_volume_notional=400,
                 trigger_seconds=120,
                 cycle_budget_floor_notional=72.0,
-                daily_target_notional=120_000.0,
+                daily_target_notional=600.0,
                 target_completion_buffer_seconds=10_800.0,
                 trade_rows=[
                     {
@@ -7543,7 +7543,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
             )
             self.assertEqual(result["action"], "suppress_active_pair_reduce_for_high_wear")
-            self.assertTrue(result["assessment"]["target_pace_behind"])
+            self.assertFalse(result["assessment"]["target_pace_behind"])
             self.assertTrue(result["assessment"]["confirmed_loss_reduce_wear"])
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
