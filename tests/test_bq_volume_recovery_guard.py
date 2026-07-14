@@ -224,6 +224,36 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             ),
         )
 
+    def test_arx_fast_sla_bypasses_only_capacity_reapply_debounce(self) -> None:
+        decide = bq_volume_recovery_guard.should_bypass_arx_recovery_drift_debounce
+        self.assertTrue(
+            decide(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                no_fill_seconds=120.0,
+                fast_sla_seconds=120.0,
+                volatility_entry_pause_active=False,
+            )
+        )
+        self.assertFalse(
+            decide(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                no_fill_seconds=119.0,
+                fast_sla_seconds=120.0,
+                volatility_entry_pause_active=False,
+            )
+        )
+        self.assertFalse(
+            decide(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                no_fill_seconds=240.0,
+                fast_sla_seconds=120.0,
+                volatility_entry_pause_active=True,
+            )
+        )
+
     def test_arx_capacity_recovery_raises_an_old_near_cap_when_pace_trails_target(self) -> None:
         # The target window can be behind even while a longer-lived pace
         # ratio still reflects an earlier burst of fills.

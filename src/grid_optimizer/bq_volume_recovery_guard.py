@@ -2248,6 +2248,23 @@ def should_repair_arx_loss_reduce_flow(
     )
 
 
+def should_bypass_arx_recovery_drift_debounce(
+    *,
+    symbol: str,
+    target_pace_behind: bool,
+    no_fill_seconds: float,
+    fast_sla_seconds: float,
+    volatility_entry_pause_active: bool,
+) -> bool:
+    """Reapply a lost ARX capacity recovery when the fast SLA is already missed."""
+    return (
+        symbol.upper().strip() == "ARXUSDT"
+        and bool(target_pace_behind)
+        and float(no_fill_seconds) >= max(float(fast_sla_seconds), 0.0)
+        and not bool(volatility_entry_pause_active)
+    )
+
+
 def arx_severe_pace_capacity_updates(
     *,
     control: dict[str, Any],
@@ -3578,6 +3595,13 @@ def check_symbol(
         volatility_entry_pause_active=bool(assessment.get("volatility_entry_pause_active")),
         frozen_total_notional=_safe_float(assessment.get("frozen_total_notional")),
     ) if normalized_symbol == "ARXUSDT" else {}
+    arx_fast_sla_capacity_reapply = should_bypass_arx_recovery_drift_debounce(
+        symbol=normalized_symbol,
+        target_pace_behind=target_pace_behind,
+        no_fill_seconds=no_fill_seconds,
+        fast_sla_seconds=fast_sla_seconds,
+        volatility_entry_pause_active=bool(assessment.get("volatility_entry_pause_active")),
+    )
     if (
         should_enable_arx_sticky_requote(
             symbol=normalized_symbol,
@@ -5619,6 +5643,7 @@ def check_symbol(
                 and not restore_ready
                 and recovery_reapply_debounced
                 and not arx_severe_volume_priority_recovery
+                and not arx_fast_sla_capacity_reapply
             ):
                 action = "hold_recovery_control_drift_debounce"
                 item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
