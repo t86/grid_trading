@@ -2235,7 +2235,7 @@ def arx_severe_pace_capacity_updates(
         "best_quote_maker_volume_cycle_budget_notional": 1600.0,
         "best_quote_maker_volume_active_pair_reduce_order_notional": 480.0,
         "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 480.0,
-        "max_total_notional": 2000.0,
+        "max_total_notional": 4000.0,
     }
     updates = {
         key: value

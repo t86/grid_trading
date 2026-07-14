@@ -167,7 +167,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             480.0,
             updates["best_quote_maker_volume_active_pair_reduce_max_notional_per_side"],
         )
-        self.assertEqual(2000.0, updates["max_total_notional"])
+        self.assertEqual(4000.0, updates["max_total_notional"])
         self.assertFalse(updates["best_quote_maker_volume_inventory_bias_enabled"])
         self.assertTrue(
             updates["best_quote_maker_volume_same_side_entry_price_guard_report_only"]
@@ -219,7 +219,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "best_quote_maker_volume_cycle_budget_notional": 1600.0,
                     "best_quote_maker_volume_active_pair_reduce_order_notional": 480.0,
                     "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 480.0,
-                    "max_total_notional": 2000.0,
+                    "max_total_notional": 4000.0,
                 },
                 target_pace_behind=True,
                 pace_ratio=0.40,
