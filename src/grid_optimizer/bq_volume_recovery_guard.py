@@ -2028,7 +2028,7 @@ def is_arx_severe_volume_priority_recovery(
     return (
         symbol.upper().strip() == "ARXUSDT"
         and bool(target_pace_behind)
-        and float(pace_ratio) < 0.30
+        and float(pace_ratio) < 0.75
         and int(planned_reduce_only_order_count) > 0
     )
 

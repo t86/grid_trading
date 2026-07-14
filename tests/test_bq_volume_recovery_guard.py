@@ -250,11 +250,19 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 planned_reduce_only_order_count=3,
             )
         )
+        self.assertTrue(
+            bq_volume_recovery_guard.is_arx_severe_volume_priority_recovery(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.45,
+                planned_reduce_only_order_count=3,
+            )
+        )
         self.assertFalse(
             bq_volume_recovery_guard.is_arx_severe_volume_priority_recovery(
                 symbol="ARXUSDT",
                 target_pace_behind=True,
-                pace_ratio=0.31,
+                pace_ratio=0.76,
                 planned_reduce_only_order_count=3,
             )
         )
