@@ -2503,12 +2503,19 @@ def should_bypass_arx_side_unwind_recovery_gate(
     *,
     symbol: str,
     updates: Mapping[str, Any],
+    control: Mapping[str, Any] | None = None,
 ) -> bool:
-    """A live ARX direction flip must not wait behind a stale submit report."""
-    return (
-        symbol.upper().strip() == "ARXUSDT"
-        and str(updates.get("best_quote_maker_volume_directional_net_guard") or "").lower()
-        in {"net_long", "net_short"}
+    """Never let a stale submit keep or arm a harmful ARX directional unwind."""
+    if symbol.upper().strip() != "ARXUSDT":
+        return False
+    requested_direction = str(
+        updates.get("best_quote_maker_volume_directional_net_guard") or ""
+    ).lower()
+    active_direction = str(
+        (control or {}).get("best_quote_maker_volume_directional_net_guard") or "off"
+    ).lower()
+    return requested_direction in {"net_long", "net_short"} or (
+        requested_direction == "off" and active_direction in {"net_long", "net_short"}
     )
 
 
@@ -4190,6 +4197,7 @@ def check_symbol(
             and not should_bypass_arx_side_unwind_recovery_gate(
                 symbol=normalized_symbol,
                 updates=arx_side_cap_unwind,
+                control=control,
             )
             and not recovery_timeout_required
         ):
