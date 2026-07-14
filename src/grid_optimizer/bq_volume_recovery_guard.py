@@ -2432,8 +2432,13 @@ def arx_side_cap_unwind_updates(
     control: dict[str, Any],
     actual_long_notional: float,
     actual_short_notional: float,
+    high_recovery_wear: bool = False,
 ) -> dict[str, Any]:
     """Route maker-only recovery to the side that remains above the hard cap."""
+    # The wear backoff owns the next bounded adjustment.  Do not let a
+    # directional unwind immediately undo its one-tick wider quote.
+    if high_recovery_wear:
+        return {}
     long_hard = max(
         _safe_float(control.get("max_position_notional")),
         _safe_float(control.get("best_quote_maker_volume_max_long_notional")),
@@ -4002,6 +4007,7 @@ def check_symbol(
         control=control,
         actual_long_notional=_safe_float(assessment.get("actual_long_notional")),
         actual_short_notional=_safe_float(assessment.get("actual_short_notional")),
+        high_recovery_wear=high_recovery_wear or confirmed_loss_reduce_wear,
         ),
     } if normalized_symbol == "ARXUSDT" else {}
     arx_fast_sla_capacity_reapply = should_bypass_arx_recovery_drift_debounce(

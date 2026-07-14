@@ -357,6 +357,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 updates={"best_quote_maker_volume_directional_net_guard": "net_short"},
             )
         )
+
         self.assertFalse(
             bq_volume_recovery_guard.should_bypass_arx_side_unwind_recovery_gate(
                 symbol="ARXUSDT",
@@ -493,6 +494,23 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertFalse(reset["best_quote_maker_volume_allow_loss_reduce_only"])
         self.assertFalse(reset["best_quote_maker_volume_net_loss_reduce_enabled"])
         self.assertFalse(reset["best_quote_maker_volume_active_pair_reduce_enabled"])
+
+    def test_arx_side_cap_unwind_yields_to_high_wear_backoff(self) -> None:
+        self.assertEqual(
+            bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+                control={
+                    "max_actual_net_notional": 1000.0,
+                    "max_position_notional": 800.0,
+                    "max_short_position_notional": 800.0,
+                    "pause_buy_position_notional": 440.0,
+                    "pause_short_position_notional": 440.0,
+                },
+                actual_long_notional=900.0,
+                actual_short_notional=200.0,
+                high_recovery_wear=True,
+            ),
+            {},
+        )
 
     @unittest.skip("frozen inventory no longer enlarges ARX capacity")
     def test_arx_frozen_inventory_headroom_reserves_real_side_cap(self) -> None:
