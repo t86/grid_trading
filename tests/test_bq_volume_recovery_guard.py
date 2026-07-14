@@ -352,6 +352,25 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertFalse(updates["best_quote_maker_volume_net_loss_reduce_enabled"])
         self.assertFalse(updates["best_quote_maker_volume_active_pair_reduce_enabled"])
         self.assertEqual(200.0, updates["loss_inventory_no_cross_small_entry_notional"])
+        self.assertEqual(0, updates["best_quote_maker_volume_quote_offset_ticks"])
+        self.assertEqual(
+            0,
+            updates[
+                "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_extra_ticks"
+            ],
+        )
+        self.assertEqual(
+            0,
+            updates[
+                "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks"
+            ],
+        )
+        self.assertEqual(
+            0,
+            updates[
+                "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_extra_ticks"
+            ],
+        )
 
         reset = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
             control={

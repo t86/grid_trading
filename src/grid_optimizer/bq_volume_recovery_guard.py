@@ -2413,6 +2413,10 @@ def arx_side_cap_unwind_updates(
             "best_quote_maker_volume_net_loss_reduce_enabled": False,
             "best_quote_maker_volume_active_pair_reduce_enabled": False,
             "loss_inventory_no_cross_small_entry_notional": 200.0,
+            "best_quote_maker_volume_quote_offset_ticks": 0,
+            "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_extra_ticks": 0,
+            "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks": 0,
+            "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_extra_ticks": 0,
         }
     return {key: value for key, value in targets.items() if control.get(key) != value}
 
