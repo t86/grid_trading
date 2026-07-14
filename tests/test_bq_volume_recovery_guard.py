@@ -46,6 +46,10 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 "max_short_position_notional": 800.0,
                 "best_quote_maker_volume_cycle_budget_notional": 240.0,
                 "best_quote_maker_volume_min_cycle_budget_notional": 128.0,
+                "best_quote_maker_volume_inventory_bias_enabled": True,
+                "best_quote_maker_volume_same_side_entry_price_guard_enabled": True,
+                "best_quote_maker_volume_same_side_entry_price_guard_report_only": False,
+                "best_quote_maker_volume_quote_offset_ticks": 1,
             },
             target_pace_behind=True,
             pace_ratio=0.12,
@@ -56,6 +60,11 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(900.0, updates["pause_buy_position_notional"])
         self.assertEqual(1100.0, updates["max_position_notional"])
         self.assertEqual(480.0, updates["best_quote_maker_volume_cycle_budget_notional"])
+        self.assertFalse(updates["best_quote_maker_volume_inventory_bias_enabled"])
+        self.assertTrue(
+            updates["best_quote_maker_volume_same_side_entry_price_guard_report_only"]
+        )
+        self.assertEqual(0, updates["best_quote_maker_volume_quote_offset_ticks"])
         self.assertEqual(
             {},
             bq_volume_recovery_guard.arx_severe_pace_capacity_updates(

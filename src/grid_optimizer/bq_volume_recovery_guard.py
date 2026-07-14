@@ -2152,11 +2152,23 @@ def arx_severe_pace_capacity_updates(
         "best_quote_maker_volume_min_cycle_budget_notional": 320.0,
         "best_quote_maker_volume_cycle_budget_notional": 480.0,
     }
-    return {
+    updates = {
         key: value
         for key, value in targets.items()
         if _safe_float(control.get(key)) < value
     }
+    if bool(control.get("best_quote_maker_volume_inventory_bias_enabled")):
+        updates["best_quote_maker_volume_inventory_bias_enabled"] = False
+    if (
+        bool(control.get("best_quote_maker_volume_same_side_entry_price_guard_enabled"))
+        and not bool(
+            control.get("best_quote_maker_volume_same_side_entry_price_guard_report_only")
+        )
+    ):
+        updates["best_quote_maker_volume_same_side_entry_price_guard_report_only"] = True
+    if _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) > 0:
+        updates["best_quote_maker_volume_quote_offset_ticks"] = 0
+    return updates
 
 
 def _runner_is_active(symbol: str) -> bool:
