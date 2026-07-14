@@ -366,6 +366,30 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
         )
 
+    def test_arx_closes_temporary_loss_reduce_after_pace_recovers_above_cap(self) -> None:
+        decide = bq_volume_recovery_guard.should_close_loss_reduce_when_target_pace_ahead
+        self.assertTrue(
+            decide(
+                symbol="ARXUSDT",
+                target_pace_ahead=True,
+                allow_loss_reduce_only=True,
+                current_long_notional=3000.0,
+                current_short_notional=3400.0,
+                max_long_notional=800.0,
+                max_short_notional=800.0,
+            )
+        )
+        self.assertFalse(
+            decide(
+                symbol="REUSDT",
+                target_pace_ahead=True,
+                allow_loss_reduce_only=True,
+                current_long_notional=3000.0,
+                current_short_notional=3400.0,
+                max_long_notional=800.0,
+                max_short_notional=800.0,
+            )
+        )
     def test_arx_balanced_fast_sla_capacity_avoids_loss_reduce(self) -> None:
         updates = bq_volume_recovery_guard.arx_balanced_fast_sla_capacity_updates(
             control={

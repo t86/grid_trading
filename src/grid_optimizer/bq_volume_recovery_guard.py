@@ -2084,6 +2084,27 @@ def is_target_pace_ahead(
     )
 
 
+def should_close_loss_reduce_when_target_pace_ahead(
+    *,
+    symbol: str,
+    target_pace_ahead: bool,
+    allow_loss_reduce_only: bool,
+    current_long_notional: float,
+    current_short_notional: float,
+    max_long_notional: float,
+    max_short_notional: float,
+) -> bool:
+    """Close temporary ARX loss-reduce as soon as maker pace recovers."""
+    if not bool(target_pace_ahead) or not bool(allow_loss_reduce_only):
+        return False
+    if symbol.upper().strip() == "ARXUSDT":
+        return True
+    return (
+        _safe_float(current_long_notional) < _safe_float(max_long_notional)
+        and _safe_float(current_short_notional) < _safe_float(max_short_notional)
+    )
+
+
 def should_force_arx_severe_near_maker_entry(
     *,
     symbol: str,
@@ -4945,13 +4966,16 @@ def check_symbol(
                 dry_run=dry_run,
                 restart_runner=restart,
             )
-        elif (
-            target_pace_ahead
-            and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
-            and _safe_float(assessment.get("current_long_notional"))
-            < _safe_float(assessment.get("max_long_notional"))
-            and _safe_float(assessment.get("current_short_notional"))
-            < _safe_float(assessment.get("max_short_notional"))
+        elif should_close_loss_reduce_when_target_pace_ahead(
+            symbol=normalized_symbol,
+            target_pace_ahead=target_pace_ahead,
+            allow_loss_reduce_only=bool(
+                control.get("best_quote_maker_volume_allow_loss_reduce_only")
+            ),
+            current_long_notional=_safe_float(assessment.get("current_long_notional")),
+            current_short_notional=_safe_float(assessment.get("current_short_notional")),
+            max_long_notional=_safe_float(assessment.get("max_long_notional")),
+            max_short_notional=_safe_float(assessment.get("max_short_notional")),
         ):
             updates = _restore_recovery_controls(item, control, cycle_budget_floor_notional)
             changed, backup_path = _apply_control_update(
