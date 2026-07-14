@@ -1,7 +1,14 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from deploy.oracle.roll_competition_window import clear_recovery_overlay, roll_control_window
+from deploy.oracle.roll_competition_window import (
+    clear_recovery_overlay,
+    load_usable_control,
+    roll_control_window,
+)
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import json
 
 
 BEIJING = ZoneInfo("Asia/Shanghai")
@@ -81,3 +88,26 @@ def test_clears_only_temporary_recovery_overlay() -> None:
     assert clear_recovery_overlay(state, symbol="ARXUSDT") is True
     item = state["symbols"]["ARXUSDT"]  # type: ignore[index]
     assert item == {"last_volume_summary": {"gross_quote_qty": 123.0}}
+
+
+def test_recovers_incomplete_control_from_latest_complete_backup() -> None:
+    with TemporaryDirectory() as tmpdir:
+        control_path = Path(tmpdir) / "arxusdt_loop_runner_control.json"
+        control_path.write_text('{"hard_loss_forced_reduce_enabled": false}', encoding="utf-8")
+        backup = control_path.with_name(control_path.name + ".bak_bq_volume_recovery_20260714T030000Z")
+        backup.write_text(
+            json.dumps(
+                {
+                    "symbol": "ARXUSDT",
+                    "strategy_profile": "arxusdt_best_quote_maker_volume_114_v2",
+                    "step_price": 0.0005,
+                    "max_actual_net_notional": 1000.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        control, recovered_from = load_usable_control(control_path)
+
+    assert control["max_actual_net_notional"] == 1000.0
+    assert recovered_from == str(backup)

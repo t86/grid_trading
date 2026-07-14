@@ -157,6 +157,7 @@ from .running_status import (
     _read_jsonl_tail as _read_running_status_jsonl_tail,
     normalize_running_status_server_payload,
 )
+from .recovery_control_ownership import exclusive_control_lock, write_control_json_atomically
 from .short_volume_candidates import build_short_volume_candidate_report
 from .spot_competition_tuner import (
     build_spot_competition_backtest,
@@ -5295,8 +5296,8 @@ def _save_flatten_control_config(config: dict[str, Any], *, symbol: str | None =
 def _save_runner_control_config(config: dict[str, Any], *, symbol: str | None = None) -> None:
     normalized_symbol = str(symbol or config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
     control_path = _runner_control_path(normalized_symbol)
-    control_path.parent.mkdir(parents=True, exist_ok=True)
-    control_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    with exclusive_control_lock(control_path):
+        write_control_json_atomically(control_path, config)
 
 
 def _is_spot_runner_control_path(path: Path) -> bool:

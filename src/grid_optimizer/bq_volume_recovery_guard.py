@@ -12,7 +12,11 @@ from math import ceil
 from pathlib import Path
 from typing import Any, Callable
 
-from .recovery_control_ownership import exclusive_control_lock, mark_recovery_owned
+from .recovery_control_ownership import (
+    exclusive_control_lock,
+    mark_recovery_owned,
+    write_control_json_atomically,
+)
 
 
 RestartRunner = Callable[[str], object]
@@ -97,13 +101,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    tmp_path.replace(path)
+    write_control_json_atomically(path, payload)
 
 
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:

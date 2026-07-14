@@ -75,6 +75,13 @@ RECOVERY_OVERLAY_STATE_KEYS = (
     "post_restore_cooldown_until",
 )
 
+REQUIRED_CONTROL_KEYS = (
+    "symbol",
+    "strategy_profile",
+    "step_price",
+    "max_actual_net_notional",
+)
+
 
 def current_trade_window(now: datetime, reset_hour: int) -> tuple[datetime, datetime]:
     local_now = now.astimezone(BEIJING)
@@ -139,6 +146,27 @@ def clear_recovery_overlay(state: dict[str, object], *, symbol: str) -> bool:
     return changed
 
 
+def load_usable_control(control_path: Path) -> tuple[dict[str, object], str | None]:
+    """Use the newest complete backup when a concurrent writer damaged control."""
+    candidates = [control_path] + sorted(
+        control_path.parent.glob(f"{control_path.name}.bak_*"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if any(key not in payload for key in REQUIRED_CONTROL_KEYS):
+            continue
+        recovered_from = None if candidate == control_path else str(candidate)
+        return payload, recovered_from
+    raise SystemExit("no complete runner control or valid control backup was found")
+
+
 def write_json_atomically(path: Path, payload: dict[str, object]) -> None:
     with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
@@ -160,9 +188,7 @@ def main() -> None:
         raise SystemExit("--reset-hour must be between 0 and 23")
 
     control_path = args.control_path
-    control = json.loads(control_path.read_text(encoding="utf-8"))
-    if not isinstance(control, dict):
-        raise SystemExit("runner control must be a JSON object")
+    control, recovered_from = load_usable_control(control_path)
     runtime_profile: dict[str, object] | None = None
     if args.runtime_profile is not None:
         runtime_profile = json.loads(args.runtime_profile.read_text(encoding="utf-8"))
@@ -176,7 +202,7 @@ def main() -> None:
         runtime_profile=runtime_profile,
         force_profile_rebase=args.force_profile_rebase,
     )
-    changed = updated != control
+    changed = updated != control or recovered_from is not None
     if changed:
         write_json_atomically(control_path, updated)
     state_changed = False
@@ -195,6 +221,7 @@ def main() -> None:
                 "runtime_guard_stats_start_time": updated.get("runtime_guard_stats_start_time"),
                 "profile_rebased": bool(runtime_profile) and changed,
                 "recovery_overlay_cleared": state_changed,
+                "control_recovered_from": recovered_from,
             },
             ensure_ascii=False,
         )

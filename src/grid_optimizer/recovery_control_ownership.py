@@ -9,9 +9,12 @@ the default rollout set.
 from __future__ import annotations
 
 import fcntl
+import json
+import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, Iterator
 
 
@@ -28,6 +31,23 @@ def is_recovery_managed(symbol: str, control: dict[str, Any] | None = None) -> b
 
 def mark_recovery_owned(control: dict[str, Any]) -> None:
     control["recovery_control_owner"] = RECOVERY_CONTROL_OWNER
+
+
+def write_control_json_atomically(control_path: Path, payload: dict[str, Any]) -> None:
+    """Replace a control document without exposing a partial shared ``.tmp``."""
+    control_path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=control_path.parent,
+        prefix=f".{control_path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        temporary_path = Path(handle.name)
+    os.replace(temporary_path, control_path)
 
 
 @contextmanager
