@@ -2421,8 +2421,11 @@ def arx_side_cap_unwind_updates(
     actual_long_notional: float,
     actual_short_notional: float,
     high_recovery_wear: bool = False,
+    recover_cap_ratio: float = 0.96,
+    force_active_relief: bool = False,
+    near_cap_ratio: float = 0.95,
 ) -> dict[str, Any]:
-    """Route maker-only recovery to the side that remains above the hard cap."""
+    """Route bounded maker-only relief before resuming two-sided ARX entry."""
     long_hard = max(
         _safe_float(control.get("max_position_notional")),
         _safe_float(control.get("best_quote_maker_volume_max_long_notional")),
@@ -2433,6 +2436,10 @@ def arx_side_cap_unwind_updates(
     )
     long_soft = max(_safe_float(control.get("pause_buy_position_notional")), 0.0)
     short_soft = max(_safe_float(control.get("pause_short_position_notional")), 0.0)
+    recovery_ratio = min(max(float(recover_cap_ratio), 0.0), 1.0)
+    near_ratio = min(max(float(near_cap_ratio), 0.0), 1.0)
+    long_recovery_target = long_hard * recovery_ratio
+    short_recovery_target = short_hard * recovery_ratio
     long_excess = max(_safe_float(actual_long_notional) - long_hard, 0.0)
     short_excess = max(_safe_float(actual_short_notional) - short_hard, 0.0)
     long_soft_excess = max(_safe_float(actual_long_notional) - long_soft, 0.0)
@@ -2459,6 +2466,22 @@ def arx_side_cap_unwind_updates(
         and _safe_float(actual_short_notional) > short_soft
     ):
         direction = "net_short"
+    elif (
+        force_active_relief
+        and long_hard > 0
+        and short_hard > 0
+        and _safe_float(actual_long_notional) >= long_hard * near_ratio
+        and _safe_float(actual_short_notional) >= short_hard * near_ratio
+        and (
+            _safe_float(actual_long_notional) > long_recovery_target
+            or _safe_float(actual_short_notional) > short_recovery_target
+        )
+    ):
+        direction = (
+            "net_long"
+            if _safe_float(actual_long_notional) >= _safe_float(actual_short_notional)
+            else "net_short"
+        )
     else:
         direction = None
     # Wear backoff prevents a new or continued loss unwind, but it must not
@@ -2485,6 +2508,11 @@ def arx_side_cap_unwind_updates(
             "best_quote_maker_volume_allow_loss_reduce_only": True,
             "best_quote_maker_volume_net_loss_reduce_enabled": False,
             "best_quote_maker_volume_active_pair_reduce_enabled": False,
+            # Persist the release target in runner controls. Without this, a
+            # timer tick can clear the direction at the hard cap and let an
+            # ordinary entry refill the just-released side.
+            "pause_buy_position_notional": long_recovery_target,
+            "pause_short_position_notional": short_recovery_target,
             "loss_inventory_no_cross_small_entry_notional": 200.0,
             "best_quote_maker_volume_quote_offset_ticks": max(
                 _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) - 1,
@@ -4036,6 +4064,20 @@ def check_symbol(
             actual_long_notional=directional_long_notional,
             actual_short_notional=directional_short_notional,
             high_recovery_wear=high_recovery_wear or confirmed_loss_reduce_wear,
+            recover_cap_ratio=recover_cap_ratio,
+            near_cap_ratio=near_cap_ratio,
+            # A normal directional guard only reacts after a one-sided soft
+            # breach.  When both active legs are nearly full, keep a separate
+            # bounded release state so the next ordinary entry cannot refill
+            # the first leg before the opposite leg has room too.
+            force_active_relief=(
+                target_pace_behind
+                and bool(assessment.get("low_volume"))
+                and bool(assessment.get("long_near_cap"))
+                and bool(assessment.get("short_near_cap"))
+                and not high_recovery_wear
+                and not confirmed_loss_reduce_wear
+            ),
         ),
     } if normalized_symbol == "ARXUSDT" else {}
     arx_fast_sla_capacity_reapply = should_bypass_arx_recovery_drift_debounce(
@@ -4212,31 +4254,86 @@ def check_symbol(
             action = "recovery_action_verification_failed_hold"
             item["status"] = "recovery_verification_failed"
         elif arx_side_cap_unwind:
-            _remember_recovery_controls(item, control, tuple(arx_side_cap_unwind))
-            _remember_recovery_updates(item, arx_side_cap_unwind)
-            action = (
-                "dry_run_enforce_arx_single_side_cap_unwind"
-                if dry_run
-                else "enforce_arx_single_side_cap_unwind"
+            active_direction = str(
+                control.get("best_quote_maker_volume_directional_net_guard") or "off"
+            ).lower()
+            requested_direction = str(
+                arx_side_cap_unwind.get(
+                    "best_quote_maker_volume_directional_net_guard"
+                )
+                or ""
+            ).lower()
+            unwind_complete = (
+                active_direction in {"net_long", "net_short"}
+                and requested_direction == "off"
             )
-            item.update(
-                {
-                    "status": "recovery_active",
-                    "recovery_started_at": now.isoformat(),
-                    "recovery_owned": True,
-                    "last_recovery_action_at": now.isoformat(),
-                    "last_recovery_action": action,
-                }
-            )
-            changed, backup_path = _apply_control_update(
-                symbol=normalized_symbol,
-                control_path=control_path,
-                control=control,
-                updates=arx_side_cap_unwind,
-                now=now,
-                dry_run=dry_run,
-                restart_runner=restart,
-            )
+            if unwind_complete:
+                # Restore the saved normal pause limits atomically with
+                # disabling maker-only reduction.  A partial restore leaves
+                # one side eligible to refill before the two-sided loop is
+                # genuinely ready.
+                updates = _restore_recovery_controls(
+                    item,
+                    control,
+                    cycle_budget_floor_notional,
+                )
+                updates.update(arx_side_cap_unwind)
+                updates["best_quote_maker_volume_net_loss_reduce_enabled"] = False
+                action = (
+                    "dry_run_restore_arx_two_sided_after_cap_relief"
+                    if dry_run
+                    else "restore_arx_two_sided_after_cap_relief"
+                )
+                item.update(
+                    {
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+                _set_post_restore_cooldown(
+                    item,
+                    now=now,
+                    cooldown_seconds=post_restore_cooldown_seconds,
+                )
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                item.pop("guard_original_controls", None)
+                item.pop("guard_recovery_controls", None)
+                item.pop("recovery_started_at", None)
+                item.pop("recovery_owned", None)
+            else:
+                _remember_recovery_controls(item, control, tuple(arx_side_cap_unwind))
+                _remember_recovery_updates(item, arx_side_cap_unwind)
+                action = (
+                    "dry_run_enforce_arx_single_side_cap_unwind"
+                    if dry_run
+                    else "enforce_arx_single_side_cap_unwind"
+                )
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "recovery_started_at": now.isoformat(),
+                        "recovery_owned": True,
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=arx_side_cap_unwind,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
         elif arx_severe_pace_capacity:
             _remember_recovery_controls(
                 item, control, tuple(arx_severe_pace_capacity)

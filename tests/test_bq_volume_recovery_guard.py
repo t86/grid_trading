@@ -523,6 +523,60 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             {},
         )
 
+    def test_arx_two_sided_near_cap_relief_keeps_a_shared_buffer(self) -> None:
+        control = {
+            "max_position_notional": 1000.0,
+            "max_short_position_notional": 1000.0,
+            "pause_buy_position_notional": 1000.0,
+            "pause_short_position_notional": 1000.0,
+            "best_quote_maker_volume_directional_net_guard": "off",
+            "best_quote_maker_volume_allow_loss_reduce_only": False,
+            "best_quote_maker_volume_quote_offset_ticks": 1,
+        }
+
+        start = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+            control=control,
+            actual_long_notional=998.0,
+            actual_short_notional=996.0,
+            recover_cap_ratio=0.90,
+            near_cap_ratio=0.95,
+            force_active_relief=True,
+        )
+        self.assertEqual(
+            "net_long",
+            start["best_quote_maker_volume_directional_net_guard"],
+        )
+        self.assertTrue(start["best_quote_maker_volume_allow_loss_reduce_only"])
+        self.assertEqual(900.0, start["pause_buy_position_notional"])
+        self.assertEqual(900.0, start["pause_short_position_notional"])
+
+        second_leg = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+            control={**control, **start},
+            actual_long_notional=899.0,
+            actual_short_notional=972.0,
+            recover_cap_ratio=0.90,
+            near_cap_ratio=0.95,
+            force_active_relief=True,
+        )
+        self.assertEqual(
+            "net_short",
+            second_leg["best_quote_maker_volume_directional_net_guard"],
+        )
+
+        complete = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+            control={**control, **start, **second_leg},
+            actual_long_notional=899.0,
+            actual_short_notional=899.0,
+            recover_cap_ratio=0.90,
+            near_cap_ratio=0.95,
+            force_active_relief=True,
+        )
+        self.assertEqual(
+            "off",
+            complete["best_quote_maker_volume_directional_net_guard"],
+        )
+        self.assertFalse(complete["best_quote_maker_volume_allow_loss_reduce_only"])
+
     @unittest.skip("frozen inventory no longer enlarges ARX capacity")
     def test_arx_frozen_inventory_headroom_reserves_real_side_cap(self) -> None:
         updates = bq_volume_recovery_guard.arx_frozen_inventory_headroom_updates(
