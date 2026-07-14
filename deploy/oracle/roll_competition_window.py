@@ -166,6 +166,22 @@ def apply_target_notional(control: dict[str, object], *, target_notional: float 
     return changed
 
 
+def reset_runtime_guard_baseline(
+    control: dict[str, object],
+    state: dict[str, object] | None,
+    *,
+    now: datetime,
+) -> tuple[bool, bool]:
+    """Start a fresh guard accounting interval without touching audit or inventory."""
+    control_changed = control.get("runtime_guard_stats_start_time") != now.isoformat()
+    control["runtime_guard_stats_start_time"] = now.isoformat()
+    state_changed = False
+    if isinstance(state, dict) and "runtime_guard_loss_recovery" in state:
+        state.pop("runtime_guard_loss_recovery", None)
+        state_changed = True
+    return control_changed, state_changed
+
+
 def load_usable_control(control_path: Path) -> tuple[dict[str, object], str | None]:
     """Use the newest complete backup when a concurrent writer damaged control."""
     candidates = [control_path] + sorted(
@@ -203,6 +219,8 @@ def main() -> None:
     parser.add_argument("--symbol", default="ARXUSDT")
     parser.add_argument("--force-profile-rebase", action="store_true")
     parser.add_argument("--target-notional", type=float)
+    parser.add_argument("--loop-state-path", type=Path)
+    parser.add_argument("--reset-runtime-guard-baseline", action="store_true")
     parser.add_argument("--reset-hour", type=int, default=8)
     args = parser.parse_args()
     if not 0 <= args.reset_hour <= 23:
@@ -226,9 +244,29 @@ def main() -> None:
         force_profile_rebase=args.force_profile_rebase,
     )
     target_changed = apply_target_notional(updated, target_notional=args.target_notional)
-    changed = updated != control or recovered_from is not None or target_changed
+    loop_state: dict[str, object] | None = None
+    if args.loop_state_path is not None and args.loop_state_path.exists():
+        raw_state = json.loads(args.loop_state_path.read_text(encoding="utf-8"))
+        if isinstance(raw_state, dict):
+            loop_state = raw_state
+    guard_baseline_changed = False
+    loss_recovery_cleared = False
+    if args.reset_runtime_guard_baseline:
+        guard_baseline_changed, loss_recovery_cleared = reset_runtime_guard_baseline(
+            updated,
+            loop_state,
+            now=now,
+        )
+    changed = (
+        updated != control
+        or recovered_from is not None
+        or target_changed
+        or guard_baseline_changed
+    )
     if changed:
         write_json_atomically(control_path, updated)
+    if loss_recovery_cleared and args.loop_state_path is not None and loop_state is not None:
+        write_json_atomically(args.loop_state_path, loop_state)
     state_changed = False
     if changed and args.guard_state_path is not None and args.guard_state_path.exists():
         state = json.loads(args.guard_state_path.read_text(encoding="utf-8"))
@@ -247,6 +285,8 @@ def main() -> None:
                 "recovery_overlay_cleared": state_changed,
                 "target_notional": args.target_notional,
                 "target_changed": target_changed,
+                "runtime_guard_baseline_reset": guard_baseline_changed,
+                "runtime_guard_loss_recovery_cleared": loss_recovery_cleared,
                 "control_recovered_from": recovered_from,
             },
             ensure_ascii=False,

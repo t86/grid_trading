@@ -5,6 +5,7 @@ from deploy.oracle.roll_competition_window import (
     apply_target_notional,
     clear_recovery_overlay,
     load_usable_control,
+    reset_runtime_guard_baseline,
     roll_control_window,
 )
 from pathlib import Path
@@ -101,6 +102,25 @@ def test_apply_target_notional_updates_both_runner_target_fields() -> None:
     assert control["best_quote_maker_volume_target_remaining_notional"] == 200_000.0
     assert control["max_cumulative_notional"] == 200_000.0
     assert apply_target_notional(control, target_notional=200_000.0) is False
+
+
+def test_reset_runtime_guard_baseline_preserves_inventory_and_audit_state() -> None:
+    now = datetime(2026, 7, 14, 18, 20, tzinfo=BEIJING)
+    control: dict[str, object] = {"runtime_guard_stats_start_time": "2026-07-14T08:00:00+08:00"}
+    state: dict[str, object] = {
+        "runtime_guard_loss_recovery": {"stopped_at": "2026-07-14T18:10:00+08:00"},
+        "best_quote_frozen_inventory": {"long_qty": 100.0},
+        "best_quote_volume_ledger": {"realized_pnl": -12.0},
+    }
+
+    control_changed, recovery_cleared = reset_runtime_guard_baseline(control, state, now=now)
+
+    assert control_changed is True
+    assert recovery_cleared is True
+    assert control["runtime_guard_stats_start_time"] == now.isoformat()
+    assert "runtime_guard_loss_recovery" not in state
+    assert state["best_quote_frozen_inventory"] == {"long_qty": 100.0}
+    assert state["best_quote_volume_ledger"] == {"realized_pnl": -12.0}
 
 
 def test_recovers_incomplete_control_from_latest_complete_backup() -> None:
