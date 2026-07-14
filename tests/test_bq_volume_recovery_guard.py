@@ -90,6 +90,75 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 pause_reasons=["trend_entry_guard", "inventory_bias"],
             )
         )
+
+    def test_arx_exchange_order_drift_requires_actual_empty_book(self) -> None:
+        self.assertTrue(
+            bq_volume_recovery_guard.should_restart_arx_for_exchange_order_drift(
+                symbol="ARXUSDT", local_active_order_count=1, exchange_open_order_count=0
+            )
+        )
+        self.assertFalse(
+            bq_volume_recovery_guard.should_restart_arx_for_exchange_order_drift(
+                symbol="ARXUSDT", local_active_order_count=1, exchange_open_order_count=1
+            )
+        )
+
+    def test_arx_exchange_order_drift_restarts_only_when_exchange_is_empty(self) -> None:
+        restarted: list[str] = []
+        state: dict[str, object] = {}
+        now = datetime(2026, 7, 14, tzinfo=timezone.utc)
+        result = bq_volume_recovery_guard.recover_arx_exchange_order_drift(
+            symbol="ARXUSDT",
+            local_active_order_count=2,
+            state=state,
+            now=now,
+            cooldown_seconds=60.0,
+            dry_run=False,
+            runner_wrapper="unused",
+            restart_runner=lambda symbol: restarted.append(symbol),
+            exchange_snapshot_fetcher=lambda _symbol: {
+                "strategy_open_order_count": 0,
+                "strategy_order_ids": [],
+            },
+        )
+        self.assertEqual("restart_arx_exchange_order_drift", result["action"])
+        self.assertEqual(["ARXUSDT"], restarted)
+        self.assertEqual(
+            now.isoformat(),
+            state["symbols"]["ARXUSDT"]["last_exchange_order_drift_restart_at"],
+        )
+        held = bq_volume_recovery_guard.recover_arx_exchange_order_drift(
+            symbol="ARXUSDT",
+            local_active_order_count=2,
+            state=state,
+            now=now + timedelta(seconds=10),
+            cooldown_seconds=60.0,
+            dry_run=False,
+            runner_wrapper="unused",
+            restart_runner=lambda symbol: restarted.append(symbol),
+            exchange_snapshot_fetcher=lambda _symbol: {
+                "strategy_open_order_count": 0,
+                "strategy_order_ids": [],
+            },
+        )
+        self.assertEqual("hold_arx_exchange_order_drift_restart_cooldown", held["action"])
+        self.assertEqual(["ARXUSDT"], restarted)
+        self.assertIsNone(
+            bq_volume_recovery_guard.recover_arx_exchange_order_drift(
+                symbol="ARXUSDT",
+                local_active_order_count=2,
+                state=state,
+                now=now + timedelta(seconds=61),
+                cooldown_seconds=60.0,
+                dry_run=False,
+                runner_wrapper="unused",
+                restart_runner=lambda symbol: restarted.append(symbol),
+                exchange_snapshot_fetcher=lambda _symbol: {
+                    "strategy_open_order_count": 1,
+                    "strategy_order_ids": ["123"],
+                },
+            )
+        )
         self.assertFalse(
             bq_volume_recovery_guard.should_relax_arx_zero_order_volume_blockers(
                 symbol="ARXUSDT",

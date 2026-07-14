@@ -142,6 +142,27 @@ def _fetch_corrupt_state_exchange_snapshot(symbol: str) -> dict[str, Any]:
     }
 
 
+def _fetch_arx_strategy_order_snapshot(symbol: str) -> dict[str, Any]:
+    """Return the exchange truth for ARX runner-owned orders only."""
+    from .data import fetch_futures_open_orders
+
+    api_key = os.environ["BINANCE_API_KEY"]
+    api_secret = os.environ["BINANCE_API_SECRET"]
+    prefix = "gx-arxu"
+    orders = fetch_futures_open_orders(
+        symbol, api_key, api_secret, use_cache=False
+    )
+    strategy_orders = [
+        order
+        for order in orders
+        if str(order.get("clientOrderId") or "").lower().startswith(prefix)
+    ]
+    return {
+        "strategy_open_order_count": len(strategy_orders),
+        "strategy_order_ids": [str(order.get("orderId") or "") for order in strategy_orders],
+    }
+
+
 def _salvage_truncated_order_refs_state(
     *,
     state_path: Path,
@@ -1682,6 +1703,92 @@ def _default_stop_runner(symbol: str, *, runner_wrapper: str) -> object:
     return subprocess.run([runner_wrapper, "stop", symbol], check=True)
 
 
+def recover_arx_exchange_order_drift(
+    *,
+    symbol: str,
+    local_active_order_count: int,
+    state: dict[str, Any],
+    now: datetime,
+    cooldown_seconds: float,
+    dry_run: bool,
+    runner_wrapper: str,
+    restart_runner: RestartRunner | None = None,
+    exchange_snapshot_fetcher: CorruptStateExchangeFetcher | None = None,
+) -> dict[str, Any] | None:
+    """Restart ARX only when Binance confirms the runner book is empty.
+
+    The runner's websocket/cache view can preserve a filled or cancelled order
+    briefly.  That must not suppress recovery while the exchange has no
+    runner-owned maker order at all.
+    """
+    normalized_symbol = symbol.upper().strip()
+    if normalized_symbol != "ARXUSDT" or int(local_active_order_count) <= 0:
+        return None
+    try:
+        exchange = (exchange_snapshot_fetcher or _fetch_arx_strategy_order_snapshot)(
+            normalized_symbol
+        )
+    except Exception as exc:
+        return {
+            "symbol": normalized_symbol,
+            "action": "skip_arx_exchange_order_drift_snapshot_failed",
+            "changed_keys": [],
+            "backup_path": None,
+            "dry_run": dry_run,
+            "restart_failed": None,
+            "local_active_order_count": int(local_active_order_count),
+            "exchange_order_snapshot_error": str(exc)[:240],
+        }
+    exchange_open_order_count = _safe_int(exchange.get("strategy_open_order_count"), -1)
+    if not should_restart_arx_for_exchange_order_drift(
+        symbol=normalized_symbol,
+        local_active_order_count=local_active_order_count,
+        exchange_open_order_count=exchange_open_order_count,
+    ):
+        return None
+    item = _symbol_state(state, normalized_symbol)
+    last_restart_at = _parse_time(item.get("last_exchange_order_drift_restart_at"))
+    cooldown_active = (
+        last_restart_at is not None
+        and (now - last_restart_at).total_seconds() < max(float(cooldown_seconds), 0.0)
+    )
+    result = {
+        "symbol": normalized_symbol,
+        "changed_keys": [],
+        "backup_path": None,
+        "dry_run": dry_run,
+        "restart_failed": None,
+        "local_active_order_count": int(local_active_order_count),
+        "exchange_open_order_count": exchange_open_order_count,
+        "exchange_strategy_order_ids": exchange.get("strategy_order_ids") or [],
+    }
+    if cooldown_active:
+        result["action"] = "hold_arx_exchange_order_drift_restart_cooldown"
+        return result
+    if dry_run:
+        result["action"] = "dry_run_restart_arx_exchange_order_drift"
+        return result
+    restart = restart_runner or (
+        lambda item_symbol: _default_restart_runner(item_symbol, runner_wrapper=runner_wrapper)
+    )
+    try:
+        restart(normalized_symbol)
+    except subprocess.CalledProcessError as exc:
+        result["action"] = "restart_arx_exchange_order_drift_failed"
+        result["restart_failed"] = str(exc)
+        return result
+    item.update(
+        {
+            "last_exchange_order_drift_restart_at": now.isoformat(),
+            "last_recovery_action_at": now.isoformat(),
+            "last_recovery_action": "restart_arx_exchange_order_drift",
+            "status": "exchange_order_drift_recovery_active",
+        }
+    )
+    result["action"] = "restart_arx_exchange_order_drift"
+    return result
+
+
 def should_enter_loss_reduce(
     *,
     low_volume: bool,
@@ -1818,6 +1925,20 @@ def should_relax_arx_zero_order_volume_blockers(
             bool(soft_blockers.intersection(str(reason) for reason in pause_reasons))
             or bool(same_side_entry_blocked)
         )
+    )
+
+
+def should_restart_arx_for_exchange_order_drift(
+    *,
+    symbol: str,
+    local_active_order_count: int,
+    exchange_open_order_count: int,
+) -> bool:
+    """A stream-only order count must not suppress ARX recovery."""
+    return (
+        symbol.upper().strip() == "ARXUSDT"
+        and int(local_active_order_count) > 0
+        and int(exchange_open_order_count) == 0
     )
 
 
@@ -6845,6 +6966,33 @@ def main(argv: list[str] | None = None) -> int:
             exit_code = 1
             continue
         item.pop("exchange_trade_fetch_deferred_until", None)
+        submit = _read_json(_submit_path(output_dir, symbol))
+        local_active_order_count = _safe_int(
+            (submit.get("observed_strategy_open_order_state") or {}).get(
+                "active_order_count"
+            )
+        )
+        exchange_order_drift_result = recover_arx_exchange_order_drift(
+            symbol=symbol,
+            local_active_order_count=local_active_order_count,
+            state=state,
+            now=now,
+            # A runner needs one complete fresh cycle after restart, but an
+            # exchange-empty ARX book must not remain stuck for the normal
+            # multi-minute recovery cooldown.
+            cooldown_seconds=max(min(float(args.trigger_seconds), 90.0), 60.0),
+            dry_run=args.dry_run,
+            runner_wrapper=args.runner_wrapper,
+        )
+        if exchange_order_drift_result is not None:
+            _append_jsonl(
+                output_dir / "bq_volume_recovery_guard_events.jsonl",
+                {"ts": now.isoformat(), **exchange_order_drift_result},
+            )
+            results.append(exchange_order_drift_result)
+            if exchange_order_drift_result.get("restart_failed"):
+                exit_code = 1
+            continue
         result = check_symbol(
             symbol=symbol,
             output_dir=output_dir,
