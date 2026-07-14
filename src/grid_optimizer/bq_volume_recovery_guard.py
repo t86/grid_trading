@@ -2063,6 +2063,27 @@ def is_arx_severe_volume_priority_recovery(
     )
 
 
+def is_target_pace_ahead(
+    *,
+    symbol: str,
+    required_hourly_notional: float,
+    trailing_60m_notional: float,
+    trailing_15m_notional: float,
+    trailing_5m_notional: float,
+    target_pace_fraction: float,
+) -> bool:
+    required_hourly = max(float(required_hourly_notional), 0.0)
+    fraction = max(float(target_pace_fraction), 0.0)
+    if required_hourly <= 0:
+        return False
+    five_minute_scale = 1.0 if symbol.upper().strip() == "ARXUSDT" else 0.5
+    return (
+        float(trailing_60m_notional) >= required_hourly * fraction
+        and float(trailing_15m_notional) >= required_hourly * 0.25 * fraction
+        and float(trailing_5m_notional) >= required_hourly / 12.0 * fraction * five_minute_scale
+    )
+
+
 def should_force_arx_severe_near_maker_entry(
     *,
     symbol: str,
@@ -3484,11 +3505,13 @@ def check_symbol(
         _safe_float(volume_summary.get("trailing_5m_gross_notional")), 0.0
     )
     pace_fraction = max(float(target_pace_fraction), 0.0)
-    target_pace_ahead = (
-        required_hourly_notional > 0
-        and trailing_hourly_notional >= required_hourly_notional * pace_fraction
-        and trailing_15m_notional >= required_hourly_notional * 0.25 * pace_fraction
-        and trailing_5m_notional >= required_hourly_notional / 12.0 * pace_fraction * 0.5
+    target_pace_ahead = is_target_pace_ahead(
+        symbol=normalized_symbol,
+        required_hourly_notional=required_hourly_notional,
+        trailing_60m_notional=trailing_hourly_notional,
+        trailing_15m_notional=trailing_15m_notional,
+        trailing_5m_notional=trailing_5m_notional,
+        target_pace_fraction=pace_fraction,
     )
     target_pace_behind = (
         required_hourly_notional > 0

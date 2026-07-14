@@ -62,6 +62,30 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
         )
 
+    def test_arx_target_pace_requires_full_five_minute_rate(self) -> None:
+        decide = bq_volume_recovery_guard.is_target_pace_ahead
+
+        self.assertFalse(
+            decide(
+                symbol="ARXUSDT",
+                required_hourly_notional=9843.0,
+                trailing_60m_notional=15233.0,
+                trailing_15m_notional=2608.0,
+                trailing_5m_notional=519.0,
+                target_pace_fraction=1.05,
+            )
+        )
+        self.assertTrue(
+            decide(
+                symbol="REUSDT",
+                required_hourly_notional=9843.0,
+                trailing_60m_notional=15233.0,
+                trailing_15m_notional=2608.0,
+                trailing_5m_notional=519.0,
+                target_pace_fraction=1.05,
+            )
+        )
+
     def test_arx_target_pace_miss_allows_stale_entry_requote_until_three_quarters_pace(self) -> None:
         decide = bq_volume_recovery_guard.should_enable_arx_sticky_requote
 
