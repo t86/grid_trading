@@ -336,6 +336,19 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(2000.0, updates["maker_max_short_notional"])
 
     def test_arx_side_cap_unwind_prioritizes_larger_excess_and_resets(self) -> None:
+        self.assertTrue(
+            bq_volume_recovery_guard.should_bypass_arx_side_unwind_recovery_gate(
+                symbol="ARXUSDT",
+                updates={"best_quote_maker_volume_directional_net_guard": "net_short"},
+            )
+        )
+        self.assertFalse(
+            bq_volume_recovery_guard.should_bypass_arx_side_unwind_recovery_gate(
+                symbol="ARXUSDT",
+                updates={"pause_buy_position_notional": 1600.0},
+            )
+        )
+
         soft_limit_start = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
             control={
                 "best_quote_maker_volume_directional_net_guard": "off",

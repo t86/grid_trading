@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import ceil
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from .recovery_control_ownership import (
     exclusive_control_lock,
@@ -2493,6 +2493,19 @@ def arx_side_cap_unwind_updates(
     return {key: value for key, value in targets.items() if control.get(key) != value}
 
 
+def should_bypass_arx_side_unwind_recovery_gate(
+    *,
+    symbol: str,
+    updates: Mapping[str, Any],
+) -> bool:
+    """A live ARX direction flip must not wait behind a stale submit report."""
+    return (
+        symbol.upper().strip() == "ARXUSDT"
+        and str(updates.get("best_quote_maker_volume_directional_net_guard") or "").lower()
+        in {"net_long", "net_short"}
+    )
+
+
 def arx_severe_pace_capacity_updates(
     *,
     control: dict[str, Any],
@@ -4168,6 +4181,10 @@ def check_symbol(
         elif (
             not bool(recovery_gate.get("ok"))
             and not arx_submit_failure_recovery_bypass
+            and not should_bypass_arx_side_unwind_recovery_gate(
+                symbol=normalized_symbol,
+                updates=arx_side_cap_unwind,
+            )
             and not recovery_timeout_required
         ):
             action = "skip_recovery_safety_gate"
