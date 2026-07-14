@@ -37,6 +37,37 @@ def _append_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class BqVolumeRecoveryGuardTests(unittest.TestCase):
+    def test_arx_severe_pace_capacity_raises_thresholds_and_budget_only_when_calm(self) -> None:
+        updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
+            control={
+                "pause_buy_position_notional": 620.0,
+                "pause_short_position_notional": 620.0,
+                "max_position_notional": 800.0,
+                "max_short_position_notional": 800.0,
+                "best_quote_maker_volume_cycle_budget_notional": 240.0,
+                "best_quote_maker_volume_min_cycle_budget_notional": 128.0,
+            },
+            target_pace_behind=True,
+            pace_ratio=0.12,
+            near_cap=False,
+            volatility_entry_pause_active=False,
+            frozen_total_notional=400.0,
+        )
+        self.assertEqual(900.0, updates["pause_buy_position_notional"])
+        self.assertEqual(1100.0, updates["max_position_notional"])
+        self.assertEqual(480.0, updates["best_quote_maker_volume_cycle_budget_notional"])
+        self.assertEqual(
+            {},
+            bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
+                control={},
+                target_pace_behind=True,
+                pace_ratio=0.12,
+                near_cap=False,
+                volatility_entry_pause_active=True,
+                frozen_total_notional=400.0,
+            ),
+        )
+
     def test_arx_severe_target_gap_forces_near_maker_entry_out_of_inventory_wait(self) -> None:
         self.assertTrue(
             bq_volume_recovery_guard.should_force_arx_severe_near_maker_entry(

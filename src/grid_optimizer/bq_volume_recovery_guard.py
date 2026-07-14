@@ -89,6 +89,13 @@ _RECOVERY_CONTROL_KEYS = (
     "best_quote_maker_volume_suppress_short_reduce_enabled",
     "best_quote_maker_volume_directional_net_guard",
     "max_actual_net_notional",
+    "max_position_notional",
+    "max_short_position_notional",
+    "maker_max_long_notional",
+    "maker_max_short_notional",
+    "best_quote_maker_volume_max_long_notional",
+    "best_quote_maker_volume_max_short_notional",
+    "best_quote_maker_volume_min_cycle_budget_notional",
     "pause_buy_position_notional",
     "pause_short_position_notional",
     "sticky_entry_price_tolerance_steps",
@@ -2115,6 +2122,43 @@ def should_hold_arx_volume_priority_release(
     )
 
 
+def arx_severe_pace_capacity_updates(
+    *,
+    control: dict[str, Any],
+    target_pace_behind: bool,
+    pace_ratio: float,
+    near_cap: bool,
+    volatility_entry_pause_active: bool,
+    frozen_total_notional: float,
+) -> dict[str, Any]:
+    """Temporarily widen ARX capacity only for a severe, calm pace miss."""
+    if (
+        not bool(target_pace_behind)
+        or float(pace_ratio) >= 0.30
+        or bool(near_cap)
+        or bool(volatility_entry_pause_active)
+        or float(frozen_total_notional) <= 0.0
+    ):
+        return {}
+    targets = {
+        "pause_buy_position_notional": 900.0,
+        "pause_short_position_notional": 900.0,
+        "max_position_notional": 1100.0,
+        "max_short_position_notional": 1100.0,
+        "maker_max_long_notional": 1100.0,
+        "maker_max_short_notional": 1100.0,
+        "best_quote_maker_volume_max_long_notional": 1100.0,
+        "best_quote_maker_volume_max_short_notional": 1100.0,
+        "best_quote_maker_volume_min_cycle_budget_notional": 320.0,
+        "best_quote_maker_volume_cycle_budget_notional": 480.0,
+    }
+    return {
+        key: value
+        for key, value in targets.items()
+        if _safe_float(control.get(key)) < value
+    }
+
+
 def _runner_is_active(symbol: str) -> bool:
     service = f"grid-loop@{symbol}.service"
     return (
@@ -3353,6 +3397,14 @@ def check_symbol(
                 "best_quote_maker_volume_same_side_entry_price_guard_report_only"
             ] = True
     arx_sticky_requote_updates: dict[str, Any] = {}
+    arx_severe_pace_capacity = arx_severe_pace_capacity_updates(
+        control=control,
+        target_pace_behind=target_pace_behind,
+        pace_ratio=pace_ratio,
+        near_cap=bool(assessment.get("near_cap")),
+        volatility_entry_pause_active=bool(assessment.get("volatility_entry_pause_active")),
+        frozen_total_notional=_safe_float(assessment.get("frozen_total_notional")),
+    ) if normalized_symbol == "ARXUSDT" else {}
     if (
         normalized_symbol == "ARXUSDT"
         and target_pace_behind
@@ -3490,6 +3542,35 @@ def check_symbol(
         elif action_verification == "failed":
             action = "recovery_action_verification_failed_hold"
             item["status"] = "recovery_verification_failed"
+        elif arx_severe_pace_capacity:
+            _remember_recovery_controls(
+                item, control, tuple(arx_severe_pace_capacity)
+            )
+            _remember_recovery_updates(item, arx_severe_pace_capacity)
+            action = (
+                "dry_run_raise_arx_severe_pace_capacity"
+                if dry_run
+                else "raise_arx_severe_pace_capacity"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                    "last_sla_action_at": now.isoformat(),
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=arx_severe_pace_capacity,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
         elif arx_sticky_requote_updates:
             _remember_recovery_controls(
                 item, control, tuple(arx_sticky_requote_updates)
