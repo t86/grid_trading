@@ -2070,17 +2070,23 @@ def is_target_pace_ahead(
     trailing_60m_notional: float,
     trailing_15m_notional: float,
     trailing_5m_notional: float,
+    trailing_3m_notional: float,
     target_pace_fraction: float,
 ) -> bool:
     required_hourly = max(float(required_hourly_notional), 0.0)
     fraction = max(float(target_pace_fraction), 0.0)
     if required_hourly <= 0:
         return False
-    five_minute_scale = 1.0 if symbol.upper().strip() == "ARXUSDT" else 0.5
+    is_arx = symbol.upper().strip() == "ARXUSDT"
+    five_minute_scale = 1.0 if is_arx else 0.5
     return (
         float(trailing_60m_notional) >= required_hourly * fraction
         and float(trailing_15m_notional) >= required_hourly * 0.25 * fraction
         and float(trailing_5m_notional) >= required_hourly / 12.0 * fraction * five_minute_scale
+        and (
+            not is_arx
+            or float(trailing_3m_notional) >= required_hourly / 20.0 * fraction
+        )
     )
 
 
@@ -3544,6 +3550,9 @@ def check_symbol(
     trailing_5m_notional = max(
         _safe_float(volume_summary.get("trailing_5m_gross_notional")), 0.0
     )
+    trailing_3m_notional = max(
+        _safe_float(volume_summary.get("gross_notional")), 0.0
+    )
     pace_fraction = max(float(target_pace_fraction), 0.0)
     target_pace_ahead = is_target_pace_ahead(
         symbol=normalized_symbol,
@@ -3551,6 +3560,7 @@ def check_symbol(
         trailing_60m_notional=trailing_hourly_notional,
         trailing_15m_notional=trailing_15m_notional,
         trailing_5m_notional=trailing_5m_notional,
+        trailing_3m_notional=trailing_3m_notional,
         target_pace_fraction=pace_fraction,
     )
     target_pace_behind = (

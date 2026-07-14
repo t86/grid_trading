@@ -72,6 +72,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 trailing_60m_notional=15233.0,
                 trailing_15m_notional=2608.0,
                 trailing_5m_notional=519.0,
+                trailing_3m_notional=600.0,
                 target_pace_fraction=1.05,
             )
         )
@@ -82,7 +83,23 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 trailing_60m_notional=15233.0,
                 trailing_15m_notional=2608.0,
                 trailing_5m_notional=519.0,
+                trailing_3m_notional=600.0,
                 target_pace_fraction=1.05,
+            )
+        )
+
+    def test_arx_target_pace_rejects_a_three_minute_fill_gap(self) -> None:
+        decide = bq_volume_recovery_guard.is_target_pace_ahead
+
+        self.assertFalse(
+            decide(
+                symbol="ARXUSDT",
+                required_hourly_notional=9600.0,
+                trailing_60m_notional=16000.0,
+                trailing_15m_notional=5000.0,
+                trailing_5m_notional=1000.0,
+                trailing_3m_notional=0.0,
+                target_pace_fraction=1.0,
             )
         )
 
