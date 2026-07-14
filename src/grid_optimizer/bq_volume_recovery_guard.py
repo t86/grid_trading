@@ -2283,6 +2283,7 @@ def arx_severe_pace_capacity_updates(
             "max_short_position_notional",
             "best_quote_maker_volume_max_long_notional",
             "best_quote_maker_volume_max_short_notional",
+            "max_actual_net_notional",
         )
     ) and all(
         _safe_float(control.get(key)) >= 480.0
@@ -2303,6 +2304,7 @@ def arx_severe_pace_capacity_updates(
         "pause_short_position_notional": 2340.0,
         "max_position_notional": target_max_notional,
         "max_short_position_notional": target_max_notional,
+        "max_actual_net_notional": target_max_notional,
         "maker_max_long_notional": target_max_notional,
         "maker_max_short_notional": target_max_notional,
         "best_quote_maker_volume_max_long_notional": target_max_notional,

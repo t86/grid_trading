@@ -194,6 +194,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         )
         self.assertEqual(2340.0, updates["pause_buy_position_notional"])
         self.assertEqual(2600.0, updates["max_position_notional"])
+        self.assertEqual(2600.0, updates["max_actual_net_notional"])
         self.assertEqual(0.9, updates["best_quote_maker_volume_inventory_soft_ratio"])
         self.assertEqual(1600.0, updates["best_quote_maker_volume_cycle_budget_notional"])
         self.assertEqual(960.0, updates["best_quote_maker_volume_min_cycle_budget_notional"])
@@ -360,6 +361,9 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "pause_short_position_notional": 2340.0,
                     "max_position_notional": 2600.0,
                     "max_short_position_notional": 2600.0,
+                    "max_actual_net_notional": 2600.0,
+                    "maker_max_long_notional": 2600.0,
+                    "maker_max_short_notional": 2600.0,
                     "best_quote_maker_volume_max_long_notional": 2600.0,
                     "best_quote_maker_volume_max_short_notional": 2600.0,
                     "best_quote_maker_volume_inventory_soft_ratio": 0.9,
