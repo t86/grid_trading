@@ -37,6 +37,17 @@ def _append_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class BqVolumeRecoveryGuardTests(unittest.TestCase):
+    def test_control_target_overrides_legacy_guard_target(self) -> None:
+        self.assertEqual(
+            bq_volume_recovery_guard._configured_daily_target_notional(
+                {
+                    "best_quote_maker_volume_target_remaining_notional": 200000.0,
+                    "max_cumulative_notional": 180000.0,
+                }
+            ),
+            200000.0,
+        )
+
     def test_arx_target_pace_miss_blocks_near_market_recovery_restore(self) -> None:
         decide = bq_volume_recovery_guard.should_restore_near_market_recovery
 

@@ -3215,6 +3215,16 @@ def _parse_symbol_pause_baselines(items: list[str]) -> dict[str, tuple[float, fl
     return values
 
 
+def _configured_daily_target_notional(control: Mapping[str, Any]) -> float:
+    """Use the saved runner target as the single pace authority when present."""
+    target = _safe_float(
+        control.get("best_quote_maker_volume_target_remaining_notional")
+    )
+    if target > 0:
+        return target
+    return max(_safe_float(control.get("max_cumulative_notional")), 0.0)
+
+
 def check_symbol(
     *,
     symbol: str,
@@ -3266,13 +3276,19 @@ def check_symbol(
         window_seconds=window_seconds,
     )
     volume_summary["source"] = volume_source
+    configured_daily_target = _configured_daily_target_notional(control)
+    effective_daily_target = (
+        configured_daily_target
+        if configured_daily_target > 0
+        else daily_target_notional
+    )
     effective_min_volume_notional = apply_daily_target_pace_floor(
         volume_summary=volume_summary,
         rows=rows,
         now=now,
         window_seconds=window_seconds,
         min_volume_notional=min_volume_notional,
-        daily_target_notional=daily_target_notional,
+        daily_target_notional=effective_daily_target,
         target_pace_fraction=target_pace_fraction,
         target_pace_max_multiplier=target_pace_max_multiplier,
         target_completion_buffer_seconds=target_completion_buffer_seconds,
@@ -8060,7 +8076,8 @@ def main(argv: list[str] | None = None) -> int:
             continue
         try:
             fetch_window_seconds = args.window_seconds
-            if symbol in daily_targets:
+            control_for_target = _read_json(_control_path(output_dir, symbol))
+            if symbol in daily_targets or _configured_daily_target_notional(control_for_target) > 0:
                 day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
                 fetch_window_seconds = max(fetch_window_seconds, (now - day_start).total_seconds())
             trade_rows = _fetch_exchange_user_trades(

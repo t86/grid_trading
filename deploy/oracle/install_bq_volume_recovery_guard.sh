@@ -16,7 +16,7 @@ WINDOW_SECONDS="${WINDOW_SECONDS:-180}"
 MIN_VOLUME_NOTIONAL="${MIN_VOLUME_NOTIONAL:-125}"
 TRIGGER_SECONDS="${TRIGGER_SECONDS:-120}"
 RECOVER_MIN_VOLUME_NOTIONAL="${RECOVER_MIN_VOLUME_NOTIONAL:-${MIN_VOLUME_NOTIONAL}}"
-DAILY_TARGETS="${DAILY_TARGETS:-ARXUSDT=180000,OUSDT=100000}"
+DAILY_TARGETS="${DAILY_TARGETS:-}"
 TARGET_PACE_FRACTION="${TARGET_PACE_FRACTION:-1.05}"
 TARGET_PACE_MAX_MULTIPLIER="${TARGET_PACE_MAX_MULTIPLIER:-5.0}"
 TARGET_COMPLETION_BUFFER_SECONDS="${TARGET_COMPLETION_BUFFER_SECONDS:-10800}"
@@ -89,7 +89,7 @@ WorkingDirectory=${APP_DIR}
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=${PYTHONPATH_VALUE}
 EnvironmentFile=${ENV_FILE}
-ExecStart=${PYTHON_BIN} -m grid_optimizer.bq_volume_recovery_guard --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --state-path ${STATE_PATH} --runner-wrapper ${RUNNER_WRAPPER} --window-seconds ${WINDOW_SECONDS} --min-volume-notional ${MIN_VOLUME_NOTIONAL} --trigger-seconds ${TRIGGER_SECONDS} --recover-min-volume-notional ${RECOVER_MIN_VOLUME_NOTIONAL} --daily-targets ${DAILY_TARGETS} --target-pace-fraction ${TARGET_PACE_FRACTION} --target-pace-max-multiplier ${TARGET_PACE_MAX_MULTIPLIER} --target-completion-buffer-seconds ${TARGET_COMPLETION_BUFFER_SECONDS} --near-cap-ratio ${NEAR_CAP_RATIO} --recover-cap-ratio ${RECOVER_CAP_RATIO} --far-ticks ${FAR_TICKS} --plan-stale-seconds ${PLAN_STALE_SECONDS} --max-recovery-seconds ${MAX_RECOVERY_SECONDS} --cooldown-seconds ${COOLDOWN_SECONDS} --inventory-bias-relief-notional-margin ${INVENTORY_BIAS_RELIEF_NOTIONAL_MARGIN} --volume-recovery-cycle-budget-increment ${VOLUME_RECOVERY_CYCLE_BUDGET_INCREMENT} --cycle-budget-floors ${CYCLE_BUDGET_FLOORS} --loss-reduce-quote-offset-extra-ticks ${LOSS_REDUCE_QUOTE_OFFSET_EXTRA_TICKS} --require-soft-pressure-for-allow-loss-symbols ${REQUIRE_SOFT_PRESSURE_FOR_ALLOW_LOSS_SYMBOLS} ${PAUSE_BASELINES_FLAG} ${COST_GATE_FLAG}
+ExecStart=${PYTHON_BIN} -m grid_optimizer.bq_volume_recovery_guard --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --state-path ${STATE_PATH} --runner-wrapper ${RUNNER_WRAPPER} --window-seconds ${WINDOW_SECONDS} --min-volume-notional ${MIN_VOLUME_NOTIONAL} --trigger-seconds ${TRIGGER_SECONDS} --recover-min-volume-notional ${RECOVER_MIN_VOLUME_NOTIONAL} ${DAILY_TARGETS:+--daily-targets ${DAILY_TARGETS}} --target-pace-fraction ${TARGET_PACE_FRACTION} --target-pace-max-multiplier ${TARGET_PACE_MAX_MULTIPLIER} --target-completion-buffer-seconds ${TARGET_COMPLETION_BUFFER_SECONDS} --near-cap-ratio ${NEAR_CAP_RATIO} --recover-cap-ratio ${RECOVER_CAP_RATIO} --far-ticks ${FAR_TICKS} --plan-stale-seconds ${PLAN_STALE_SECONDS} --max-recovery-seconds ${MAX_RECOVERY_SECONDS} --cooldown-seconds ${COOLDOWN_SECONDS} --inventory-bias-relief-notional-margin ${INVENTORY_BIAS_RELIEF_NOTIONAL_MARGIN} --volume-recovery-cycle-budget-increment ${VOLUME_RECOVERY_CYCLE_BUDGET_INCREMENT} --cycle-budget-floors ${CYCLE_BUDGET_FLOORS} --loss-reduce-quote-offset-extra-ticks ${LOSS_REDUCE_QUOTE_OFFSET_EXTRA_TICKS} --require-soft-pressure-for-allow-loss-symbols ${REQUIRE_SOFT_PRESSURE_FOR_ALLOW_LOSS_SYMBOLS} ${PAUSE_BASELINES_FLAG} ${COST_GATE_FLAG}
 EOF
 
 sudo tee "$TIMER_FILE" >/dev/null <<EOF
