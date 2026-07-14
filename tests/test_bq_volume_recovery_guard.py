@@ -125,7 +125,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             control = json.loads(
                 (output_dir / "arxusdt_loop_runner_control.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(result["action"], "enable_stalled_reduce_only_loss_recovery", result)
+            self.assertEqual(result["action"], "enable_arx_volume_priority_maker_release", result)
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["ARXUSDT"])
 
