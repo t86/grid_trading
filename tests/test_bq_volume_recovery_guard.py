@@ -210,6 +210,18 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 validation_errors=("plan places total notional 2100.0, above max_total_notional=2000.0",),
             )
         )
+        self.assertTrue(
+            decide(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                low_volume=True,
+                active_order_count=0,
+                volatility_entry_pause_active=False,
+                ledger_position_drift_blocked=False,
+                recovery_gate_reasons=("latest_validation_failed",),
+                validation_errors=(),
+            )
+        )
         self.assertFalse(
             decide(
                 symbol="REUSDT",
@@ -849,7 +861,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 planned_order_count=0,
                 near_cap=False,
                 volatility_entry_pause_active=False,
-                pause_reasons=["trend_entry_guard", "inventory_bias"],
+                pause_reasons=["low_volatility_expand", "inventory_bias"],
             )
         )
 

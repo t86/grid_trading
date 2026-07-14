@@ -2152,7 +2152,12 @@ def should_relax_arx_zero_order_volume_blockers(
     This only gives the recovery guard a reversible way to restore maker
     participation after trend/bias protections have jointly produced no orders.
     """
-    soft_blockers = {"trend_entry_guard", "trend_loss_reduce_guard", "inventory_bias"}
+    soft_blockers = {
+        "trend_entry_guard",
+        "trend_loss_reduce_guard",
+        "inventory_bias",
+        "low_volatility_expand",
+    }
     return (
         symbol.upper().strip() == "ARXUSDT"
         and bool(target_pace_behind)
@@ -2290,8 +2295,21 @@ def should_bypass_arx_submit_failure_recovery_gate(
         and not bool(ledger_position_drift_blocked)
         and reasons
         and reasons <= {"latest_submit_error", "latest_validation_failed"}
-        and bool(errors)
-        and all("above max_total_notional=" in item for item in errors)
+        and (
+            (
+                bool(errors)
+                and all("above max_total_notional=" in item for item in errors)
+            )
+            # A no-action report is labelled validation_failed by the recovery
+            # gate even when its validation itself is clean.  ARX may only
+            # clear soft zero-order blockers in this fully verified state.
+            or (
+                not errors
+                and bool(low_volume)
+                and int(active_order_count) == 0
+                and reasons == {"latest_validation_failed"}
+            )
+        )
     )
 
 
