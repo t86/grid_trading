@@ -1935,9 +1935,15 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             event = json.loads(
                 (output_dir / "bq_volume_recovery_guard_events.jsonl").read_text(encoding="utf-8")
             )
-            self.assertEqual(payload["results"][0]["action"], "skip_runner_inactive_safety_gate")
-            self.assertEqual(event["action"], "skip_runner_inactive_safety_gate")
-            self.assertIn("missing_control", event["inactive_restart_gate"]["reasons"])
+            self.assertEqual(
+                payload["results"][0]["action"],
+                "dry_run_enforce_arx_maker_only_policy_before_inactive_restart",
+            )
+            self.assertEqual(
+                event["action"],
+                "dry_run_enforce_arx_maker_only_policy_before_inactive_restart",
+            )
+            self.assertIn("adverse_reduce_enabled", event["changed_keys"])
 
     def test_recent_volume_deduplicates_exchange_trade_ids(self) -> None:
         now = datetime(2026, 6, 26, 7, 0, tzinfo=timezone.utc)

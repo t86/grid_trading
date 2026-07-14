@@ -2789,6 +2789,60 @@ def recover_inactive_runner(
     )
     control_path = _control_path(output_dir, normalized_symbol)
     control = _read_json(control_path)
+    arx_policy_updates = _arx_independent_freeze_policy_updates(
+        symbol=normalized_symbol,
+        control=control,
+    )
+    if arx_policy_updates:
+        restart = restart_runner or (
+            lambda item_symbol: _default_restart_runner(
+                item_symbol, runner_wrapper=runner_wrapper
+            )
+        )
+        if dry_run:
+            changed = list(arx_policy_updates)
+            backup_path = None
+            action = "dry_run_enforce_arx_maker_only_policy_before_inactive_restart"
+        else:
+            try:
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=arx_policy_updates,
+                    now=now,
+                    dry_run=False,
+                    restart_runner=restart,
+                )
+                action = "enforce_arx_maker_only_policy_before_inactive_restart"
+            except subprocess.CalledProcessError as exc:
+                changed, backup_path = list(arx_policy_updates), None
+                action = "enforce_arx_maker_only_policy_before_inactive_restart_failed"
+                return {
+                    "symbol": normalized_symbol,
+                    "action": action,
+                    "changed_keys": changed,
+                    "backup_path": backup_path,
+                    "dry_run": dry_run,
+                    "restart_failed": str(exc),
+                    "inactive_seconds": elapsed,
+                }
+        item.update(
+            {
+                "status": "runner_restart_requested",
+                "last_recovery_action_at": now.isoformat(),
+                "last_recovery_action": action,
+            }
+        )
+        return {
+            "symbol": normalized_symbol,
+            "action": action,
+            "changed_keys": changed,
+            "backup_path": backup_path,
+            "dry_run": dry_run,
+            "restart_failed": None,
+            "inactive_seconds": elapsed,
+        }
     plan = _read_json(_plan_path(output_dir, normalized_symbol))
     submit = _read_json(_submit_path(output_dir, normalized_symbol))
     gate = _inactive_restart_gate(
