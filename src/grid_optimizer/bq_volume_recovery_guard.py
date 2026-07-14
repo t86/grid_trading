@@ -2016,9 +2016,15 @@ def evaluate_action_verification(
     plan_is_fresh: bool,
     open_order_drift: int,
     prior_failures: int,
+    execution_progress: bool = False,
 ) -> tuple[str, int]:
     """Classify one post-actuation feedback cycle without side effects."""
-    if plan_is_fresh and abs(int(open_order_drift)) == 0:
+    # A fast GTX maker can be filled before the next stream snapshot.  In
+    # that case its absence from open orders is execution progress, not a
+    # failed recovery action.
+    if plan_is_fresh and (
+        abs(int(open_order_drift)) == 0 or bool(execution_progress)
+    ):
         return "confirmed", 0
     failures = max(int(prior_failures), 0) + 1
     if failures >= 2 or action_age_seconds >= 120.0:
@@ -3656,11 +3662,29 @@ def check_symbol(
         and control_updated_at <= now
         and item.get("last_verified_control_update_at") != control_updated_at.isoformat()
     ):
+        submit_generated_at = _parse_time(
+            submit.get("submit_generated_at") or submit.get("generated_at")
+        )
+        execution_progress = bool(
+            submit.get("executed")
+            and submit_generated_at is not None
+            and submit_generated_at >= control_updated_at
+            and (
+                submit.get("placed_orders")
+                or any(
+                    str(event.get("kind") or "").upper()
+                    in {"ORDER_FILLED", "ORDER_PARTIALLY_FILLED"}
+                    for event in (submit.get("observed_execution_events") or [])
+                    if isinstance(event, dict)
+                )
+            )
+        )
         action_verification, failures = evaluate_action_verification(
             action_age_seconds=max((now - control_updated_at).total_seconds(), 0.0),
             plan_is_fresh=_plan_time_is_fresh(plan, now=now, max_age_seconds=120.0),
             open_order_drift=_safe_int(recovery_gate.get("open_order_drift")),
             prior_failures=_safe_int(item.get("action_verification_failures")),
+            execution_progress=execution_progress,
         )
         item["action_verification_failures"] = failures
         item["last_action_verification"] = action_verification

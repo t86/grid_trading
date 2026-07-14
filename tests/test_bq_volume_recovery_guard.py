@@ -1140,6 +1140,16 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             ),
             ("confirmed", 0),
         )
+        self.assertEqual(
+            verify(
+                action_age_seconds=60.0,
+                plan_is_fresh=True,
+                open_order_drift=1,
+                prior_failures=1,
+                execution_progress=True,
+            ),
+            ("confirmed", 0),
+        )
 
     def test_restores_corrupt_state_from_recovery_restart_snapshot(self) -> None:
         now = datetime(2026, 7, 12, 16, 31, tzinfo=timezone.utc)
