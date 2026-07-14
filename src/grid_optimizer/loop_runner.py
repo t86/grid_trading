@@ -17307,6 +17307,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     plan_now = _utc_now()
     requested_strategy_mode = str(getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
     strategy_mode = requested_strategy_mode
+    hedge_best_quote = False
     summary_path = Path(args.summary_jsonl)
     if requested_strategy_mode not in {
         "one_way_long",
@@ -17451,6 +17452,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "metrics": {},
     }
     best_quote_volume_ledger: dict[str, Any] = {}
+    best_quote_reduce_freeze: dict[str, Any] = {}
     effective_args = args
     effective_strategy_profile = requested_strategy_profile
     if is_xaut_adaptive_profile(requested_strategy_profile):
