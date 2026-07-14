@@ -15238,7 +15238,14 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "run_end_time": runtime_guard_config["run_end_time"],
             "runtime_guard_stats_start_time": runtime_guard_config["runtime_guard_stats_start_time"],
             "rolling_hourly_loss_limit": runtime_guard_config["rolling_hourly_loss_limit"],
+            "rolling_hourly_loss_per_10k_limit": runtime_guard_config["rolling_hourly_loss_per_10k_limit"],
+            "rolling_hourly_loss_per_10k_min_notional": runtime_guard_config[
+                "rolling_hourly_loss_per_10k_min_notional"
+            ],
             "max_cumulative_notional": runtime_guard_config["max_cumulative_notional"],
+            "max_actual_net_notional": runtime_guard_config["max_actual_net_notional"],
+            "max_synthetic_drift_notional": runtime_guard_config["max_synthetic_drift_notional"],
+            "max_unrealized_loss": runtime_guard_config["max_unrealized_loss"],
         }
     )
     config.update(_default_spot_runtime_paths_for_symbol(symbol))

@@ -293,6 +293,28 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("--apply", command)
         self.assertIn("--cancel-stale", command)
 
+    @patch("grid_optimizer.web._validate_market_symbol")
+    def test_normalize_spot_runner_payload_preserves_runtime_guards(self, _mock_validate_symbol) -> None:
+        payload = _normalize_spot_runner_payload(
+            {
+                "symbol": "TOWNSUSDT",
+                "total_quote_budget": 120.0,
+                "rolling_hourly_loss_per_10k_limit": 3.0,
+                "rolling_hourly_loss_per_10k_min_notional": 500.0,
+                "max_cumulative_notional": 40000.0,
+                "max_actual_net_notional": 90.0,
+                "max_synthetic_drift_notional": 90.0,
+                "max_unrealized_loss": 10.0,
+            }
+        )
+
+        self.assertEqual(payload["rolling_hourly_loss_per_10k_limit"], 3.0)
+        self.assertEqual(payload["rolling_hourly_loss_per_10k_min_notional"], 500.0)
+        self.assertEqual(payload["max_cumulative_notional"], 40000.0)
+        self.assertEqual(payload["max_actual_net_notional"], 90.0)
+        self.assertEqual(payload["max_synthetic_drift_notional"], 90.0)
+        self.assertEqual(payload["max_unrealized_loss"], 10.0)
+
     def test_build_spot_runner_command_includes_runtime_guard_arguments(self) -> None:
         config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
         config.update(

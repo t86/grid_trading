@@ -68,7 +68,9 @@ _CONTRACT_TYPE_ALIASES = {
     "delivery": "coinm",
 }
 DEFAULT_TIMEOUT_SECONDS = 30
-MAX_HTTP_RESPONSE_BYTES = 8 * 1024 * 1024
+# Binance spot exchangeInfo currently exceeds 8 MiB. Keep a bounded response
+# limit, but leave enough headroom for the full actively traded symbol list.
+MAX_HTTP_RESPONSE_BYTES = 32 * 1024 * 1024
 HTTP_READ_CHUNK_BYTES = 64 * 1024
 SYMBOL_CACHE_TTL_SECONDS = 6 * 3600
 BINANCE_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("GRID_BINANCE_RATE_LIMIT_COOLDOWN_SECONDS", "45.0"))

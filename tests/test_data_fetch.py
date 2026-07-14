@@ -45,6 +45,9 @@ class DataFetchTests(unittest.TestCase):
             self._offset += len(chunk)
             return chunk
 
+    def test_default_http_response_limit_accepts_current_exchange_info_size(self) -> None:
+        self.assertGreaterEqual(data_module.MAX_HTTP_RESPONSE_BYTES, 20 * 1024 * 1024)
+
     def test_prefer_ipv4_nested_context_is_reentrant_and_restores_socket(self) -> None:
         original = socket.getaddrinfo
 
