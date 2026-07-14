@@ -37929,6 +37929,14 @@ def _build_running_status(scope: str = "cross") -> dict[str, Any]:
     return payload
 
 
+def _schedule_web_recovery(server: ThreadingHTTPServer) -> None:
+    def shutdown_server() -> None:
+        time.sleep(0.1)
+        server.shutdown()
+
+    threading.Thread(target=shutdown_server, daemon=True, name="web-recovery").start()
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "grid-web/0.1"
 
@@ -38686,6 +38694,29 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if not self._authorize_request():
+            return
+        if path == "/api/maintenance/recover_web":
+            try:
+                content_len = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._send_json({"ok": False, "error": "Invalid Content-Length"}, status=400)
+                return
+            if content_len <= 0 or content_len > 1024:
+                self._send_json({"ok": False, "error": "Invalid payload size"}, status=400)
+                return
+            try:
+                payload = json.loads(self.rfile.read(content_len).decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"ok": False, "error": "Invalid JSON"}, status=400)
+                return
+            if not isinstance(payload, dict) or payload.get("confirm") != "restart-web":
+                self._send_json({"ok": False, "error": "confirm must be restart-web"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._send_json(
+                {"ok": True, "action": "restart_web", "message": "web recovery scheduled"},
+                status=HTTPStatus.ACCEPTED,
+            )
+            _schedule_web_recovery(self.server)
             return
         if path in {
             "/api/manual_trade/maker",

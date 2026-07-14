@@ -4,8 +4,10 @@ import base64
 import io
 import json
 import os
+import threading
 import unittest
 from datetime import datetime, timezone
+from http import HTTPStatus
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
@@ -927,6 +929,54 @@ class WebSecurityTests(unittest.TestCase):
         mock_start_last.assert_called_once_with("SOONUSDT")
         handler._send_json.assert_called_once()
         self.assertTrue(handler._send_json.call_args.args[0]["ok"])
+
+    @patch("grid_optimizer.web._schedule_web_recovery")
+    def test_handler_routes_web_recovery_post(self, mock_schedule_recovery) -> None:
+        payload = b'{"confirm":"restart-web"}'
+        handler = object.__new__(_Handler)
+        handler.path = "/api/maintenance/recover_web"
+        handler.headers = {"Content-Length": str(len(payload))}
+        handler.rfile = io.BytesIO(payload)
+        handler.server = Mock()
+        handler._authorize_request = lambda: True
+        handler._send_json = Mock()
+
+        _Handler.do_POST(handler)
+
+        mock_schedule_recovery.assert_called_once_with(handler.server)
+        handler._send_json.assert_called_once_with(
+            {"ok": True, "action": "restart_web", "message": "web recovery scheduled"},
+            status=HTTPStatus.ACCEPTED,
+        )
+
+    @patch("grid_optimizer.web._schedule_web_recovery")
+    def test_handler_rejects_web_recovery_without_confirmation(self, mock_schedule_recovery) -> None:
+        payload = b'{"confirm":"wrong"}'
+        handler = object.__new__(_Handler)
+        handler.path = "/api/maintenance/recover_web"
+        handler.headers = {"Content-Length": str(len(payload))}
+        handler.rfile = io.BytesIO(payload)
+        handler.server = Mock()
+        handler._authorize_request = lambda: True
+        handler._send_json = Mock()
+
+        _Handler.do_POST(handler)
+
+        mock_schedule_recovery.assert_not_called()
+        handler._send_json.assert_called_once_with(
+            {"ok": False, "error": "confirm must be restart-web"},
+            status=HTTPStatus.BAD_REQUEST,
+        )
+
+    def test_schedule_web_recovery_shuts_down_server(self) -> None:
+        server = Mock()
+        shutdown_called = threading.Event()
+        server.shutdown.side_effect = shutdown_called.set
+
+        web_module._schedule_web_recovery(server)
+
+        self.assertTrue(shutdown_called.wait(1.0))
+        server.shutdown.assert_called_once_with()
 
     def test_monitor_page_keeps_newline_escape_in_editor_locator(self) -> None:
         self.assertIn('split("\\n").length - 1', MONITOR_PAGE)
