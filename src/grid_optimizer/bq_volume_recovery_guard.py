@@ -2381,6 +2381,40 @@ def arx_balanced_fast_sla_capacity_updates(
     return {key: value for key, value in targets.items() if control.get(key) != value}
 
 
+def arx_soft_recovery_extension_updates(
+    *,
+    control: dict[str, Any],
+    assessment: dict[str, Any],
+    volume_summary: dict[str, Any],
+) -> dict[str, Any]:
+    """Make a timed ARX soft-recovery extension materially restore maker flow."""
+    wear_5m = _safe_float(volume_summary.get("trailing_5m_realized_wear_per_10k"))
+    wear_15m = _safe_float(volume_summary.get("trailing_15m_realized_wear_per_10k"))
+    if (
+        str(assessment.get("symbol") or "").upper() != "ARXUSDT"
+        or not bool(assessment.get("target_pace_behind"))
+        or bool(assessment.get("volatility_entry_pause_active"))
+        or _safe_float(volume_summary.get("trailing_15m_gross_notional")) < 100.0
+        or max(wear_5m, wear_15m) > 3.0
+    ):
+        return {}
+    targets = {
+        "best_quote_maker_volume_cycle_budget_notional": 1600.0,
+        "best_quote_maker_volume_active_pair_reduce_order_notional": 600.0,
+        "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 600.0,
+        "best_quote_maker_volume_quote_offset_ticks": 0,
+    }
+    return {
+        key: value
+        for key, value in targets.items()
+        if _safe_float(control.get(key)) < value
+        or (
+            key == "best_quote_maker_volume_quote_offset_ticks"
+            and _safe_int(control.get(key)) > 0
+        )
+    }
+
+
 def _runner_is_active(symbol: str) -> bool:
     service = f"grid-loop@{symbol}.service"
     return (
@@ -6185,18 +6219,26 @@ def check_symbol(
             )
             if can_extend_soft_recovery:
                 action = "extend_soft_inventory_loss_recovery"
-                if loss_reduce_flow_updates:
+                extension_updates = dict(loss_reduce_flow_updates)
+                extension_updates.update(
+                    arx_soft_recovery_extension_updates(
+                        control=control,
+                        assessment=assessment,
+                        volume_summary=volume_summary,
+                    )
+                )
+                if extension_updates:
                     _remember_recovery_controls(
                         item,
                         control,
-                        tuple(loss_reduce_flow_updates),
+                        tuple(extension_updates),
                     )
-                    _remember_recovery_updates(item, loss_reduce_flow_updates)
+                    _remember_recovery_updates(item, extension_updates)
                     changed, backup_path = _apply_control_update(
                         symbol=normalized_symbol,
                         control_path=control_path,
                         control=control,
-                        updates=loss_reduce_flow_updates,
+                        updates=extension_updates,
                         now=now,
                         dry_run=dry_run,
                         restart_runner=restart,

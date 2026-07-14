@@ -290,6 +290,46 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             ),
         )
 
+    def test_arx_soft_recovery_extension_requotes_and_enlarges_maker_flow(self) -> None:
+        updates = bq_volume_recovery_guard.arx_soft_recovery_extension_updates(
+            control={
+                "best_quote_maker_volume_cycle_budget_notional": 960.0,
+                "best_quote_maker_volume_active_pair_reduce_order_notional": 480.0,
+                "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 480.0,
+                "best_quote_maker_volume_quote_offset_ticks": 1,
+            },
+            assessment={
+                "symbol": "ARXUSDT",
+                "target_pace_behind": True,
+                "volatility_entry_pause_active": False,
+            },
+            volume_summary={
+                "trailing_15m_gross_notional": 1200.0,
+                "trailing_5m_realized_wear_per_10k": 1.5,
+                "trailing_15m_realized_wear_per_10k": 2.0,
+            },
+        )
+        self.assertEqual(1600.0, updates["best_quote_maker_volume_cycle_budget_notional"])
+        self.assertEqual(600.0, updates["best_quote_maker_volume_active_pair_reduce_order_notional"])
+        self.assertEqual(600.0, updates["best_quote_maker_volume_active_pair_reduce_max_notional_per_side"])
+        self.assertEqual(0, updates["best_quote_maker_volume_quote_offset_ticks"])
+        self.assertEqual(
+            {},
+            bq_volume_recovery_guard.arx_soft_recovery_extension_updates(
+                control={},
+                assessment={
+                    "symbol": "ARXUSDT",
+                    "target_pace_behind": True,
+                    "volatility_entry_pause_active": True,
+                },
+                volume_summary={
+                    "trailing_15m_gross_notional": 1200.0,
+                    "trailing_5m_realized_wear_per_10k": 1.0,
+                    "trailing_15m_realized_wear_per_10k": 1.0,
+                },
+            ),
+        )
+
     def test_arx_capacity_recovery_raises_an_old_near_cap_when_pace_trails_target(self) -> None:
         # The target window can be behind even while a longer-lived pace
         # ratio still reflects an earlier burst of fills.
