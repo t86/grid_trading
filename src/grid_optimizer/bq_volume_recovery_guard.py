@@ -79,6 +79,9 @@ _RECOVERY_CONTROL_KEYS = (
     "best_quote_maker_volume_inventory_bias_min_notional_gap",
     "best_quote_maker_volume_inventory_bias_reduce_share",
     "best_quote_maker_volume_inventory_soft_ratio",
+    "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled",
+    "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_enabled",
+    "best_quote_maker_volume_inventory_bias_enabled",
     "best_quote_maker_volume_cycle_budget_notional",
     "best_quote_maker_volume_quote_offset_ticks",
     "best_quote_maker_volume_same_side_entry_price_guard_min_notional",
@@ -1780,6 +1783,36 @@ def should_force_arx_severe_near_maker_entry(
     )
 
 
+def should_relax_arx_zero_order_volume_blockers(
+    *,
+    symbol: str,
+    target_pace_behind: bool,
+    pace_ratio: float,
+    active_order_count: int,
+    planned_order_count: int,
+    near_cap: bool,
+    volatility_entry_pause_active: bool,
+    pause_reasons: list[str] | set[str] | tuple[str, ...],
+) -> bool:
+    """Permit a bounded ARX escape when soft guards leave the book empty.
+
+    The runner's hard position caps and volatility pause remain authoritative.
+    This only gives the recovery guard a reversible way to restore maker
+    participation after trend/bias protections have jointly produced no orders.
+    """
+    soft_blockers = {"trend_entry_guard", "trend_loss_reduce_guard", "inventory_bias"}
+    return (
+        symbol.upper().strip() == "ARXUSDT"
+        and bool(target_pace_behind)
+        and float(pace_ratio) < 0.30
+        and int(active_order_count) <= 0
+        and int(planned_order_count) <= 0
+        and not bool(near_cap)
+        and not bool(volatility_entry_pause_active)
+        and bool(soft_blockers.intersection(str(reason) for reason in pause_reasons))
+    )
+
+
 def should_hold_arx_volume_priority_release(
     *,
     symbol: str,
@@ -2968,6 +3001,28 @@ def check_symbol(
         ),
     )
     assessment["arx_severe_near_maker_entry"] = arx_severe_near_maker_entry
+    arx_zero_order_volume_updates: dict[str, Any] = {}
+    if should_relax_arx_zero_order_volume_blockers(
+        symbol=normalized_symbol,
+        target_pace_behind=target_pace_behind,
+        pace_ratio=pace_ratio,
+        active_order_count=_safe_int(assessment.get("active_order_count")),
+        planned_order_count=_safe_int(assessment.get("planned_order_count")),
+        near_cap=bool(assessment.get("near_cap")),
+        volatility_entry_pause_active=bool(assessment.get("volatility_entry_pause_active")),
+        pause_reasons=tuple(assessment.get("pause_reasons") or ()),
+    ):
+        for key in (
+            "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled",
+            "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_enabled",
+            "best_quote_maker_volume_inventory_bias_enabled",
+        ):
+            if bool(control.get(key)):
+                arx_zero_order_volume_updates[key] = False
+        if _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) > 0:
+            arx_zero_order_volume_updates["best_quote_maker_volume_quote_offset_ticks"] = 0
+        if _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0:
+            arx_zero_order_volume_updates["sticky_entry_price_tolerance_steps"] = 1.0
     wear_backoff_floor = max(
         parameters.effective_cycle_budget_floor_notional,
         static_cycle_budget_floor_notional,
@@ -3093,6 +3148,37 @@ def check_symbol(
         elif action_verification == "failed":
             action = "recovery_action_verification_failed_hold"
             item["status"] = "recovery_verification_failed"
+        elif arx_zero_order_volume_updates:
+            _remember_recovery_controls(
+                item,
+                control,
+                tuple(arx_zero_order_volume_updates),
+            )
+            _remember_recovery_updates(item, arx_zero_order_volume_updates)
+            action = (
+                "dry_run_relax_arx_zero_order_soft_blockers"
+                if dry_run
+                else "relax_arx_zero_order_soft_blockers"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                    "last_sla_action_at": now.isoformat(),
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=arx_zero_order_volume_updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
         elif arx_freeze_policy_updates:
             action = (
                 "dry_run_enable_arx_independent_freeze_first"

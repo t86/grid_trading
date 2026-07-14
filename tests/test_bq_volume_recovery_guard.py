@@ -77,6 +77,44 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
         )
 
+    def test_arx_zero_order_pace_recovery_relaxes_only_soft_blockers(self) -> None:
+        self.assertTrue(
+            bq_volume_recovery_guard.should_relax_arx_zero_order_volume_blockers(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.08,
+                active_order_count=0,
+                planned_order_count=0,
+                near_cap=False,
+                volatility_entry_pause_active=False,
+                pause_reasons=["trend_entry_guard", "inventory_bias"],
+            )
+        )
+        self.assertFalse(
+            bq_volume_recovery_guard.should_relax_arx_zero_order_volume_blockers(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.08,
+                active_order_count=0,
+                planned_order_count=0,
+                near_cap=True,
+                volatility_entry_pause_active=False,
+                pause_reasons=["trend_entry_guard"],
+            )
+        )
+        self.assertFalse(
+            bq_volume_recovery_guard.should_relax_arx_zero_order_volume_blockers(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.08,
+                active_order_count=0,
+                planned_order_count=0,
+                near_cap=False,
+                volatility_entry_pause_active=True,
+                pause_reasons=["trend_entry_guard"],
+            )
+        )
+
     def test_arx_severe_target_gap_releases_during_post_restore_cooldown(self) -> None:
         now = datetime(2026, 7, 12, 11, 56, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
