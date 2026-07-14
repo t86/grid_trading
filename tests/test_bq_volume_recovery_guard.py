@@ -372,6 +372,25 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             ],
         )
 
+        hold_until_soft_limit = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+            control={
+                "best_quote_maker_volume_directional_net_guard": "net_short",
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "best_quote_maker_volume_active_pair_reduce_enabled": False,
+            },
+            actual_long_notional=1498.0,
+            actual_short_notional=1973.0,
+        )
+        self.assertNotIn(
+            "best_quote_maker_volume_directional_net_guard",
+            hold_until_soft_limit,
+        )
+        self.assertNotIn(
+            "best_quote_maker_volume_allow_loss_reduce_only",
+            hold_until_soft_limit,
+        )
+
         reset = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
             control={
                 "best_quote_maker_volume_directional_net_guard": "net_short",
@@ -379,8 +398,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 "best_quote_maker_volume_net_loss_reduce_enabled": True,
                 "best_quote_maker_volume_active_pair_reduce_enabled": True,
             },
-            actual_long_notional=1999.0,
-            actual_short_notional=2000.0,
+            actual_long_notional=1799.0,
+            actual_short_notional=1800.0,
         )
         self.assertEqual("off", reset["best_quote_maker_volume_directional_net_guard"])
         self.assertFalse(reset["best_quote_maker_volume_allow_loss_reduce_only"])

@@ -2407,10 +2407,24 @@ def arx_side_cap_unwind_updates(
     """Route maker-only recovery to the side that remains above the hard cap."""
     long_excess = max(_safe_float(actual_long_notional) - 2000.0, 0.0)
     short_excess = max(_safe_float(actual_short_notional) - 2000.0, 0.0)
-    if long_excess <= 0.0 and short_excess <= 0.0:
-        current_direction = str(
-            control.get("best_quote_maker_volume_directional_net_guard") or "off"
-        ).lower()
+    current_direction = str(
+        control.get("best_quote_maker_volume_directional_net_guard") or "off"
+    ).lower()
+    if long_excess > 0.0 or short_excess > 0.0:
+        direction: str | None = "net_long" if long_excess >= short_excess else "net_short"
+    elif (
+        current_direction == "net_long"
+        and _safe_float(actual_long_notional) > 1800.0
+    ):
+        direction = "net_long"
+    elif (
+        current_direction == "net_short"
+        and _safe_float(actual_short_notional) > 1800.0
+    ):
+        direction = "net_short"
+    else:
+        direction = None
+    if direction is None:
         if (
             current_direction == "off"
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
@@ -2424,7 +2438,6 @@ def arx_side_cap_unwind_updates(
             "best_quote_maker_volume_active_pair_reduce_enabled": False,
         }
     else:
-        direction = "net_long" if long_excess >= short_excess else "net_short"
         targets = {
             "best_quote_maker_volume_directional_net_guard": direction,
             "best_quote_maker_volume_allow_loss_reduce_only": True,
