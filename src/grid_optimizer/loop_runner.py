@@ -553,6 +553,7 @@ def resolve_adaptive_step_price(
     min_position_limit_scale: float = 1.0,
     dynamic_base_enabled: bool = False,
     dynamic_base_min_scale: float = 1.0,
+    dynamic_base_max_scale: float = 1.0,
     dynamic_base_full_raw_scale: float = 1.0,
 ) -> dict[str, Any]:
     def _safe_min_scale(value: float | None) -> float:
@@ -577,6 +578,7 @@ def resolve_adaptive_step_price(
     safe_min_per_order_scale = _safe_min_scale(min_per_order_scale) or 1.0
     safe_min_position_limit_scale = _safe_min_scale(min_position_limit_scale) or 1.0
     safe_dynamic_base_min_scale = _safe_min_scale(dynamic_base_min_scale) or 1.0
+    safe_dynamic_base_max_scale = max(float(dynamic_base_max_scale), safe_dynamic_base_min_scale)
     safe_dynamic_base_full_raw_scale = max(float(dynamic_base_full_raw_scale), 1.0)
     report = {
         "enabled": bool(enabled),
@@ -586,6 +588,7 @@ def resolve_adaptive_step_price(
         "base_step_price": safe_base_step,
         "dynamic_base_enabled": bool(dynamic_base_enabled),
         "dynamic_base_scale": 1.0,
+        "dynamic_base_max_scale": safe_dynamic_base_max_scale,
         "dynamic_base_full_raw_scale": safe_dynamic_base_full_raw_scale,
         "effective_step_price": safe_base_step,
         "scale": 1.0,
@@ -692,7 +695,7 @@ def resolve_adaptive_step_price(
                 1.0,
             )
             dynamic_base_scale = safe_dynamic_base_min_scale + (
-                (1.0 - safe_dynamic_base_min_scale) * progress
+                (safe_dynamic_base_max_scale - safe_dynamic_base_min_scale) * progress
             )
     dynamic_base_step = safe_base_step * dynamic_base_scale
     report.update(
@@ -17531,6 +17534,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         min_position_limit_scale=float(getattr(effective_args, "adaptive_step_min_position_limit_scale", 1.0)),
         dynamic_base_enabled=bool(getattr(effective_args, "adaptive_step_dynamic_base_enabled", False)),
         dynamic_base_min_scale=float(getattr(effective_args, "adaptive_step_dynamic_base_min_scale", 1.0)),
+        dynamic_base_max_scale=float(getattr(effective_args, "adaptive_step_dynamic_base_max_scale", 1.0)),
         dynamic_base_full_raw_scale=float(
             getattr(effective_args, "adaptive_step_dynamic_base_full_raw_scale", 1.0)
         ),
@@ -24231,7 +24235,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adaptive-step-min-position-limit-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-dynamic-base-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--adaptive-step-dynamic-base-min-scale", type=float, default=1.0)
-    parser.add_argument("--adaptive-step-dynamic-base-full-raw-scale", type=float, default=1.0)
+    parser.add_argument("--adaptive-step-dynamic-base-max-scale", type=float, default=2.0)
+    parser.add_argument("--adaptive-step-dynamic-base-full-raw-scale", type=float, default=5.0)
     parser.add_argument("--elastic-volume-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--elastic-volume-mode", type=str, default="competition_elastic_volume_v1")
     parser.add_argument("--elastic-loss-per-10k-sprint", type=float, default=0.3)
@@ -25018,6 +25023,8 @@ def main() -> None:
         raise SystemExit("--adaptive-step-min-position-limit-scale must be within (0, 1]")
     if args.adaptive_step_dynamic_base_min_scale <= 0 or args.adaptive_step_dynamic_base_min_scale > 1.0:
         raise SystemExit("--adaptive-step-dynamic-base-min-scale must be within (0, 1]")
+    if args.adaptive_step_dynamic_base_max_scale < args.adaptive_step_dynamic_base_min_scale:
+        raise SystemExit("--adaptive-step-dynamic-base-max-scale must be >= min scale")
     if args.adaptive_step_dynamic_base_enabled and args.adaptive_step_dynamic_base_full_raw_scale <= 1.0:
         raise SystemExit("--adaptive-step-dynamic-base-full-raw-scale must be > 1 when dynamic base is enabled")
     if args.adaptive_step_enabled and not any(

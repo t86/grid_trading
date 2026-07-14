@@ -3599,6 +3599,10 @@ class WebSecurityTests(unittest.TestCase):
                 "adaptive_step_max_scale": 3.0,
                 "adaptive_step_min_per_order_scale": 0.35,
                 "adaptive_step_min_position_limit_scale": 0.45,
+                "adaptive_step_dynamic_base_enabled": True,
+                "adaptive_step_dynamic_base_min_scale": 1.0,
+                "adaptive_step_dynamic_base_max_scale": 2.0,
+                "adaptive_step_dynamic_base_full_raw_scale": 3.0,
                 "margin_type": "KEEP",
                 "leverage": 2,
                 "max_plan_age_seconds": 30,
@@ -3629,6 +3633,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--adaptive-step-max-scale", command)
         self.assertIn("--adaptive-step-min-per-order-scale", command)
         self.assertIn("--adaptive-step-min-position-limit-scale", command)
+        self.assertIn("--adaptive-step-dynamic-base-enabled", command)
+        self.assertIn("--adaptive-step-dynamic-base-max-scale", command)
 
     def test_build_runner_command_includes_multi_timeframe_bias_arguments(self) -> None:
         command = _build_runner_command(
@@ -4325,6 +4331,13 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertEqual(payload["exposure_escalation_hard_unrealized_loss_limit"], 10.0)
         self.assertEqual(payload["hard_loss_forced_reduce_unrealized_loss_limit"], 10.0)
+
+    def test_runner_defaults_enable_volatility_entry_pause_with_triggers(self) -> None:
+        payload = _normalize_runner_control_payload({})
+
+        self.assertTrue(payload["volatility_entry_pause_enabled"])
+        self.assertGreater(payload["volatility_entry_pause_10s_abs_return_ratio"], 0.0)
+        self.assertGreater(payload["volatility_entry_pause_1m_amplitude_ratio"], 0.0)
 
     @patch("grid_optimizer.web._stop_flatten_process")
     def test_start_runner_process_validates_risk_guards_before_stopping_flatten(self, mock_stop_flatten) -> None:

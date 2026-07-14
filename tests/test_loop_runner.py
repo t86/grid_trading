@@ -18452,6 +18452,42 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(result["effective_step_price"], 0.0002, places=8)
         self.assertAlmostEqual(result["dynamic_base_scale"], 0.2, places=8)
 
+    def test_resolve_adaptive_step_price_widens_dynamic_base_during_shock(self) -> None:
+        state = {
+            "adaptive_step_history": [
+                {"ts": "2026-04-05T16:20:00+00:00", "mid_price": 0.1000},
+                {"ts": "2026-04-05T16:20:15+00:00", "mid_price": 0.1000},
+                {"ts": "2026-04-05T16:20:30+00:00", "mid_price": 0.1000},
+                {"ts": "2026-04-05T16:20:45+00:00", "mid_price": 0.1000},
+            ]
+        }
+
+        result = resolve_adaptive_step_price(
+            state=state,
+            now=datetime(2026, 4, 5, 16, 20, 55, tzinfo=timezone.utc),
+            mid_price=0.1020,
+            base_step_price=0.001,
+            tick_size=0.00001,
+            enabled=True,
+            window_30s_abs_return_ratio=0.01,
+            window_30s_amplitude_ratio=0.0,
+            window_1m_abs_return_ratio=0.0,
+            window_1m_amplitude_ratio=0.0,
+            window_3m_abs_return_ratio=0.0,
+            window_5m_abs_return_ratio=0.0,
+            max_scale=3.0,
+            dynamic_base_enabled=True,
+            dynamic_base_min_scale=1.0,
+            dynamic_base_max_scale=2.0,
+            dynamic_base_full_raw_scale=3.0,
+        )
+
+        self.assertTrue(result["active"])
+        self.assertAlmostEqual(result["raw_scale"], 2.0, places=8)
+        self.assertAlmostEqual(result["dynamic_base_scale"], 1.5, places=8)
+        self.assertAlmostEqual(result["base_step_price"], 0.0015, places=8)
+        self.assertAlmostEqual(result["effective_step_price"], 0.003, places=8)
+
     def test_elastic_volume_config_reads_four_state_fields(self) -> None:
         args = Namespace(
             elastic_volume_enabled=True,
