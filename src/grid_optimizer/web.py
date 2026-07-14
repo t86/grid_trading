@@ -11007,7 +11007,7 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         "--best-quote-maker-volume-max-short-notional",
         str(config.get("best_quote_maker_volume_max_short_notional", 1_500.0)),
         "--best-quote-maker-volume-inventory-soft-ratio",
-        str(config.get("best_quote_maker_volume_inventory_soft_ratio", 0.60)),
+        str(config.get("best_quote_maker_volume_inventory_soft_ratio") or 0.60),
         "--best-quote-maker-volume-loss-per-10k-15m",
         str(config.get("best_quote_maker_volume_loss_per_10k_15m", 0.0)),
         "--best-quote-maker-volume-loss-per-10k-soft",

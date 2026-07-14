@@ -3358,6 +3358,25 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--elastic-early-wide-inventory-ratio", command)
         self.assertIn("--elastic-early-wide-loss-per-10k-5m", command)
 
+    def test_build_runner_command_replaces_null_best_quote_soft_ratio_with_default(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "ARXUSDT",
+                "strategy_profile": "arxusdt_best_quote_maker_volume_114_v2",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "step_price": 0.0005,
+                "buy_levels": 3,
+                "sell_levels": 3,
+                "per_order_notional": 8.0,
+                "base_position_notional": 0.0,
+                "best_quote_maker_volume_enabled": True,
+                "best_quote_maker_volume_inventory_soft_ratio": None,
+            }
+        )
+
+        ratio_index = command.index("--best-quote-maker-volume-inventory-soft-ratio")
+        self.assertEqual(command[ratio_index + 1], "0.6")
+
     def test_runner_preset_payload_for_maker_volatility_inventory_v1(self) -> None:
         payload = _runner_preset_payload("maker_volatility_inventory_v1", {"symbol": "BARDUSDT"})
 
