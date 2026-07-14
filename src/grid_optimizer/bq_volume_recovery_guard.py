@@ -1007,6 +1007,14 @@ def _loss_reduce_recovery_updates(
             control.get("best_quote_maker_volume_active_pair_reduce_max_notional_per_side")
         ),
     )
+    if (
+        str(assessment.get("symbol") or "").upper() == "ARXUSDT"
+        and bool(assessment.get("target_pace_behind"))
+    ):
+        # While ARX trails its daily target, a 20–32U near-market pair reducer
+        # cannot drain a 2.6k soft-cap inventory quickly enough to reopen flow.
+        # Use the already bounded recovery-side cap as the single maker order.
+        pair_order_notional = pair_max_notional
     if pair_order_notional > 0:
         updates.update(
             {

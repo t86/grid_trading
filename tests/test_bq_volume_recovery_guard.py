@@ -3986,6 +3986,36 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             1000.0 / 1350.0,
         )
 
+    def test_arx_target_pace_loss_reduce_uses_recovery_pair_capacity(self) -> None:
+        updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
+            control={
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
+                "best_quote_maker_volume_cycle_budget_notional": 1600.0,
+                "best_quote_maker_volume_min_cycle_budget_notional": 960.0,
+                "best_quote_maker_volume_active_pair_reduce_order_notional": 32.0,
+                "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 480.0,
+                "per_order_notional": 8.0,
+                "maker_order_notional": 32.0,
+            },
+            assessment={
+                "symbol": "ARXUSDT",
+                "target_pace_behind": True,
+                "current_long_notional": 2570.0,
+                "current_short_notional": 2590.0,
+                "max_long_notional": 2600.0,
+                "max_short_notional": 2600.0,
+            },
+        )
+
+        self.assertEqual(
+            updates["best_quote_maker_volume_active_pair_reduce_order_notional"],
+            480.0,
+        )
+        self.assertEqual(
+            updates["best_quote_maker_volume_active_pair_reduce_max_notional_per_side"],
+            480.0,
+        )
+
     def test_active_loss_reduce_converges_only_flow_controls(self) -> None:
         desired = {
             "best_quote_maker_volume_allow_loss_reduce_only": True,
