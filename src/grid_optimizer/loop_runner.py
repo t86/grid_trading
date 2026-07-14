@@ -13115,7 +13115,7 @@ def _build_adverse_reduce_order(
     normalized_side = str(side or "").upper().strip()
     position_side = (
         ("LONG" if normalized_side == "SELL" else "SHORT")
-        if str(strategy_mode or "").strip() == "hedge_neutral"
+        if _uses_exchange_hedge_position_sides(strategy_mode)
         else "BOTH"
     )
     rounded_price = _round_order_price(max(_safe_float(price), 0.0), tick_size, normalized_side)

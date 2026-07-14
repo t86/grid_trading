@@ -8925,7 +8925,7 @@ class LoopRunnerTests(unittest.TestCase):
             min_qty=1.0,
             min_notional=5.0,
             maker_timeout_seconds=30.0,
-            strategy_mode="hedge_neutral",
+            strategy_mode="hedge_best_quote_maker_volume_v1",
         )
 
         self.assertEqual(updated["placed_reduce_orders"], 1)
