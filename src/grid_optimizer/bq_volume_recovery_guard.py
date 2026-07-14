@@ -2513,6 +2513,7 @@ def arx_soft_recovery_extension_updates(
         return {}
     targets = {
         "best_quote_maker_volume_cycle_budget_notional": 1600.0,
+        "best_quote_maker_volume_active_pair_reduce_enabled": True,
         "best_quote_maker_volume_active_pair_reduce_order_notional": 600.0,
         "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 600.0,
         "best_quote_maker_volume_quote_offset_ticks": 0,
