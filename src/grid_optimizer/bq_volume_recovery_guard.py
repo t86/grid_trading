@@ -2959,6 +2959,17 @@ def check_symbol(
             "sla_action_debounced": sla_action_debounced,
         }
     )
+    arx_severe_near_maker_entry = should_force_arx_severe_near_maker_entry(
+        symbol=normalized_symbol,
+        target_pace_behind=target_pace_behind,
+        pace_ratio=pace_ratio,
+        planned_entry_order_count=_safe_int(assessment.get("planned_entry_order_count")),
+        effective_inventory_soft_pressure=effective_inventory_soft_pressure,
+        allow_loss_reduce_only=bool(
+            control.get("best_quote_maker_volume_allow_loss_reduce_only")
+        ),
+    )
+    assessment["arx_severe_near_maker_entry"] = arx_severe_near_maker_entry
     wear_backoff_floor = max(
         static_cycle_budget_floor_notional,
         max(
@@ -4371,7 +4382,7 @@ def check_symbol(
         elif (
             sla_recovery_due
             and target_pace_behind
-            and not high_recovery_wear
+            and (not high_recovery_wear or arx_severe_near_maker_entry)
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and not bool(assessment.get("inventory_soft_pressure"))
             and not bool(assessment.get("near_cap"))
@@ -4415,7 +4426,9 @@ def check_symbol(
             ):
                 updates["best_quote_maker_volume_cycle_budget_notional"] = target_budget
             if current_offset > 0:
-                updates["best_quote_maker_volume_quote_offset_ticks"] = current_offset - 1
+                updates["best_quote_maker_volume_quote_offset_ticks"] = (
+                    0 if arx_severe_near_maker_entry else current_offset - 1
+                )
             if len(updates) == 2 and _safe_float(
                 control.get("sticky_entry_price_tolerance_steps")
             ) > 1.0:
