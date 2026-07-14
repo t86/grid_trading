@@ -37,6 +37,31 @@ def _append_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 class BqVolumeRecoveryGuardTests(unittest.TestCase):
+    def test_arx_target_pace_miss_blocks_near_market_recovery_restore(self) -> None:
+        decide = bq_volume_recovery_guard.should_restore_near_market_recovery
+
+        self.assertFalse(
+            decide(
+                symbol="ARXUSDT",
+                effective_near_market_flow=True,
+                target_pace_behind=True,
+            )
+        )
+        self.assertTrue(
+            decide(
+                symbol="ARXUSDT",
+                effective_near_market_flow=True,
+                target_pace_behind=False,
+            )
+        )
+        self.assertTrue(
+            decide(
+                symbol="REUSDT",
+                effective_near_market_flow=True,
+                target_pace_behind=True,
+            )
+        )
+
     def test_arx_severe_pace_capacity_raises_thresholds_and_budget_only_when_calm(self) -> None:
         updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
             control={

@@ -2122,6 +2122,17 @@ def should_hold_arx_volume_priority_release(
     )
 
 
+def should_restore_near_market_recovery(
+    *,
+    symbol: str,
+    effective_near_market_flow: bool,
+    target_pace_behind: bool,
+) -> bool:
+    return bool(effective_near_market_flow) and not (
+        symbol.upper().strip() == "ARXUSDT" and bool(target_pace_behind)
+    )
+
+
 def arx_severe_pace_capacity_updates(
     *,
     control: dict[str, Any],
@@ -6217,7 +6228,11 @@ def check_symbol(
                 }
                 _append_jsonl(output_dir / "bq_volume_recovery_guard_events.jsonl", {"ts": now.isoformat(), **return_result})
                 return return_result
-            restore_ready = effective_near_market_flow
+            restore_ready = should_restore_near_market_recovery(
+                symbol=normalized_symbol,
+                effective_near_market_flow=effective_near_market_flow,
+                target_pace_behind=target_pace_behind,
+            )
             if restore_ready and not recovery_hold_satisfied:
                 action = "hold_recovery_min_duration"
                 item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
