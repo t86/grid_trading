@@ -1763,6 +1763,25 @@ def is_arx_severe_volume_priority_recovery(
     )
 
 
+def should_force_arx_severe_near_maker_entry(
+    *,
+    symbol: str,
+    target_pace_behind: bool,
+    pace_ratio: float,
+    planned_entry_order_count: int,
+    effective_inventory_soft_pressure: bool,
+    allow_loss_reduce_only: bool,
+) -> bool:
+    return (
+        symbol.upper().strip() == "ARXUSDT"
+        and bool(target_pace_behind)
+        and float(pace_ratio) < 0.30
+        and int(planned_entry_order_count) > 0
+        and not bool(effective_inventory_soft_pressure)
+        and not bool(allow_loss_reduce_only)
+    )
+
+
 def should_hold_arx_volume_priority_release(
     *,
     symbol: str,
@@ -4866,8 +4885,64 @@ def check_symbol(
                 item.pop("recovery_started_at", None)
                 item.pop("recovery_owned", None)
             else:
-                action = "hold_inventory_bias_relief"
-                item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+                if should_force_arx_severe_near_maker_entry(
+                    symbol=normalized_symbol,
+                    target_pace_behind=target_pace_behind,
+                    pace_ratio=pace_ratio,
+                    planned_entry_order_count=_safe_int(
+                        assessment.get("planned_entry_order_count")
+                    ),
+                    effective_inventory_soft_pressure=effective_inventory_soft_pressure,
+                    allow_loss_reduce_only=bool(
+                        control.get("best_quote_maker_volume_allow_loss_reduce_only")
+                    ),
+                ):
+                    updates: dict[str, Any] = {
+                        "best_quote_maker_volume_allow_loss_reduce_only": False,
+                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                        "best_quote_maker_volume_quote_offset_ticks": 0,
+                    }
+                    if _safe_float(control.get("sticky_entry_price_tolerance_steps")) > 1.0:
+                        updates["sticky_entry_price_tolerance_steps"] = 1.0
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        tuple(
+                            key
+                            for key in updates
+                            if key
+                            not in {
+                                "best_quote_maker_volume_allow_loss_reduce_only",
+                                "best_quote_maker_volume_net_loss_reduce_enabled",
+                            }
+                        ),
+                    )
+                    _remember_recovery_updates(item, updates)
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
+                    action = (
+                        "dry_run_force_arx_near_maker_entry_after_inventory_wait"
+                        if dry_run
+                        else "force_arx_near_maker_entry_after_inventory_wait"
+                    )
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "recovery_owned": True,
+                            "last_recovery_action_at": now.isoformat(),
+                            "last_recovery_action": action,
+                        }
+                    )
+                else:
+                    action = "hold_inventory_bias_relief"
+                    item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
         elif bool(control.get("best_quote_maker_volume_allow_loss_reduce_only")):
             if (
                 bool(control.get("best_quote_maker_volume_suppress_short_reduce_enabled"))
