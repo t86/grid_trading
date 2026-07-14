@@ -1229,6 +1229,63 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertTrue(result["inactive_restart_gate"]["ok"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_inactive_runner_restarts_after_stale_max_net_stop_is_back_inside_limit(self) -> None:
+        now = datetime(2026, 7, 14, 4, 25, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now - timedelta(minutes=10),
+                control={
+                    "run_start_time": (now - timedelta(hours=1)).isoformat(),
+                    "run_end_time": (now + timedelta(hours=1)).isoformat(),
+                    "max_actual_net_notional": 100.0,
+                },
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 200.0,
+                    "actual_short_notional": 100.0,
+                }
+            }
+            _write_json(plan_path, plan)
+            _append_jsonl(
+                output_dir / "reusdt_loop_events.jsonl",
+                [{"ts": (now - timedelta(minutes=10)).isoformat(), "runtime_status": "stopped", "stop_reason": "max_actual_net_notional_hit"}],
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "first_inactive_at": (now - timedelta(seconds=130)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = recover_inactive_runner(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                trigger_seconds=120,
+                restart_cooldown_seconds=600,
+                max_snapshot_age_seconds=300,
+                runner_wrapper="/usr/local/bin/grid-saved-runner",
+                dry_run=False,
+                restart_runner=restarts.append,
+                exchange_snapshot_fetcher=lambda _symbol: {
+                    "open_order_count": 0,
+                    "long_notional": 150.0,
+                    "short_notional": 100.0,
+                },
+            )
+
+            self.assertEqual(result["action"], "restart_runner_inactive")
+            self.assertTrue(result["inactive_restart_gate"]["ok"])
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_loss_reduce_pause_threshold_never_becomes_zero(self) -> None:
         updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
             control={
