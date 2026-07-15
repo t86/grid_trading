@@ -10193,14 +10193,15 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
     min_qty: float | None = None,
     min_notional: float | None = None,
 ) -> dict[str, Any]:
-    """Replace a blocked opposite BQ entry with a normal-inventory maker reduce.
+    """Add a normal-inventory maker reduce for a blocked BQ entry.
 
     A same-side entry price guard can legitimately block BUY/LONG while a
-    net-long account still has a planned SELL/SHORT.  Leaving that order as an
-    entry increases gross exposure and keeps the runner one-sided.  In that
-    exact state, reuse one candidate as SELL/LONG (or the mirror BUY/SHORT),
-    capped to exchange inventory minus frozen inventory.  Frozen directives
-    are deliberately neither candidates nor capacity for this path.
+    planned SELL/SHORT remains safe.  Reuse one opposite candidate as a
+    SELL/LONG (or mirror BUY/SHORT) reduce, but keep any other permitted
+    opposite-side entries.  Dropping the whole opposite ladder leaves a
+    reduce-only book and prevents the recovery guard from restoring volume.
+    Frozen directives are deliberately neither candidates nor capacity for
+    this path.
     """
     guard = dict(same_side_entry_guard or {})
     result = dict(actions)
@@ -10212,6 +10213,7 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
         "blocked_long_entry": bool(guard.get("blocked_long_entry")),
         "blocked_short_entry": bool(guard.get("blocked_short_entry")),
         "dropped_entry_orders": 0,
+        "preserved_opposite_entry_orders": 0,
         "order": None,
     }
     safe_step = max(_safe_float(step_price), _safe_float(tick_size), 0.0)
@@ -10314,12 +10316,29 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
             "actual_side_reduce": True,
         }
     )
+    blocked_roles = {
+        role
+        for role, blocked in (
+            ("best_quote_entry_long", bool(guard.get("blocked_long_entry"))),
+            ("best_quote_entry_short", bool(guard.get("blocked_short_entry"))),
+        )
+        if blocked
+    }
     kept_orders: list[dict[str, Any]] = []
     dropped_entry_orders = 0
+    preserved_opposite_entry_orders = 0
+    reused_candidate = False
     for item in place_orders:
-        if _order_role(item) in {"best_quote_entry_long", "best_quote_entry_short"}:
+        role = _order_role(item)
+        if role in blocked_roles:
             dropped_entry_orders += 1
             continue
+        if role == source_role:
+            if not reused_candidate and item == candidate:
+                reused_candidate = True
+                dropped_entry_orders += 1
+                continue
+            preserved_opposite_entry_orders += 1
         kept_orders.append(item)
     result["place_orders"] = [reduce_order, *kept_orders]
     result["place_count"] = len(result["place_orders"])
@@ -10329,6 +10348,7 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
             "applied": True,
             "reason": "blocked_entry_replaced_with_actual_side_reduce",
             "dropped_entry_orders": dropped_entry_orders,
+            "preserved_opposite_entry_orders": preserved_opposite_entry_orders,
             "normal_long_qty": normal_long_qty,
             "normal_short_qty": normal_short_qty,
             "order": dict(reduce_order),

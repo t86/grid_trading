@@ -8115,6 +8115,33 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(converted["best_quote_actual_side_reduce"]["reason"], "no_blocked_ordinary_side")
         self.assertEqual(converted["place_orders"][0]["role"], "best_quote_entry_short")
 
+    def test_blocked_best_quote_long_entry_preserves_other_safe_short_entry(self) -> None:
+        actions = {
+            "place_orders": [
+                {"role": "best_quote_entry_long", "side": "BUY", "position_side": "LONG", "qty": 100.0, "price": 0.99, "notional": 99.0},
+                {"role": "best_quote_entry_short", "side": "SELL", "position_side": "SHORT", "qty": 100.0, "price": 1.01, "notional": 101.0},
+                {"role": "best_quote_entry_short", "side": "SELL", "position_side": "SHORT", "qty": 100.0, "price": 1.02, "notional": 102.0},
+            ],
+            "cancel_orders": [],
+        }
+
+        converted = convert_blocked_best_quote_entry_to_actual_side_reduce(
+            actions=actions,
+            same_side_entry_guard={"blocked_long_entry": True, "report_only": False},
+            current_long_qty=250.0,
+            current_short_qty=20.0,
+            current_long_avg_price=1.0,
+            step_price=0.005,
+            tick_size=0.001,
+            min_profit_ratio=0.002,
+        )
+
+        roles = [item["role"] for item in converted["place_orders"]]
+        self.assertEqual(roles, ["best_quote_reduce_long", "best_quote_entry_short"])
+        report = converted["best_quote_actual_side_reduce"]
+        self.assertEqual(report["dropped_entry_orders"], 2)
+        self.assertEqual(report["preserved_opposite_entry_orders"], 1)
+
     def test_blocked_best_quote_plan_replaces_desired_short_entry_before_reconcile(self) -> None:
         plan = {
             "metrics": {"same_side_entry_price_guard": {"blocked_long_entry": True, "report_only": False}},
