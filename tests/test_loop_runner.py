@@ -8062,6 +8062,41 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"][0]["position_side"], "LONG")
         self.assertTrue(plan["sell_orders"][0]["force_reduce_only"])
 
+    def test_blocked_best_quote_plan_builds_long_reduce_when_both_entries_are_blocked(self) -> None:
+        plan = {
+            "metrics": {
+                "same_side_entry_price_guard": {
+                    "blocked_long_entry": True,
+                    "blocked_short_entry": True,
+                    "report_only": False,
+                }
+            },
+            "buy_orders": [],
+            "sell_orders": [],
+        }
+
+        report = convert_blocked_best_quote_plan_entry_to_actual_side_reduce(
+            plan=plan,
+            current_long_qty=120.0,
+            current_short_qty=20.0,
+            current_long_avg_price=1.0,
+            step_price=0.005,
+            tick_size=0.001,
+            min_profit_ratio=0.002,
+            bid_price=1.009,
+            ask_price=1.010,
+            fallback_order_notional=60.0,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+        )
+
+        self.assertTrue(report["applied"])
+        self.assertTrue(plan["sell_orders"][0]["actual_side_reduce"])
+        self.assertTrue(plan["sell_orders"][0]["actual_side_reduce_fallback"])
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_reduce_long")
+        self.assertEqual(plan["sell_orders"][0]["position_side"], "LONG")
+
     def test_soonusdt_volume_profiles_use_entry_price_cost_basis(self) -> None:
         self.assertTrue(_uses_entry_price_cost_basis("chip_low_wear_guarded_v1"))
         self.assertTrue(_uses_entry_price_cost_basis("chipusdt_competition_neutral_ping_pong_v1"))

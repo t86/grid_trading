@@ -10075,6 +10075,11 @@ def prioritize_inventory_reducing_place_orders(
     step_price: float = 0.0,
     tick_size: float | None = None,
     min_profit_ratio: float | None = None,
+    fallback_price: float = 0.0,
+    fallback_notional: float = 0.0,
+    step_size: float | None = None,
+    min_qty: float | None = None,
+    min_notional: float | None = None,
 ) -> dict[str, Any]:
     place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
     if not place_orders or abs(_safe_float(current_actual_net_qty)) <= 1e-12:
@@ -10181,6 +10186,11 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
     step_price: float = 0.0,
     tick_size: float | None = None,
     min_profit_ratio: float | None = None,
+    fallback_price: float = 0.0,
+    fallback_notional: float = 0.0,
+    step_size: float | None = None,
+    min_qty: float | None = None,
+    min_notional: float | None = None,
 ) -> dict[str, Any]:
     """Replace a blocked opposite BQ entry with a normal-inventory maker reduce.
 
@@ -10203,11 +10213,6 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
         "dropped_entry_orders": 0,
         "order": None,
     }
-    if not place_orders:
-        report["reason"] = "no_place_orders"
-        result["best_quote_actual_side_reduce"] = report
-        return result
-
     safe_step = max(_safe_float(step_price), _safe_float(tick_size), 0.0)
     safe_profit_ratio = max(_safe_float(min_profit_ratio), 0.0)
     normal_long_qty = max(_safe_float(current_long_qty) - max(_safe_float(frozen_long_qty), 0.0), 0.0)
@@ -10241,9 +10246,31 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
     source_role, side, position_side, reduce_role, available_qty, profit_bound = spec
     candidate = next((item for item in place_orders if _order_role(item) == source_role), None)
     if candidate is None:
-        report["reason"] = "missing_opposite_entry_candidate"
-        result["best_quote_actual_side_reduce"] = report
-        return result
+        raw_price = max(_safe_float(fallback_price), 0.0)
+        raw_notional = max(_safe_float(fallback_notional), 0.0)
+        if raw_price <= 0 or raw_notional <= 0:
+            report["reason"] = "missing_opposite_entry_candidate"
+            result["best_quote_actual_side_reduce"] = report
+            return result
+        fallback_qty = _round_order_qty(min(available_qty, raw_notional / raw_price), step_size)
+        fallback_order_notional = fallback_qty * raw_price
+        if (
+            fallback_qty <= 1e-12
+            or (min_qty is not None and fallback_qty + 1e-12 < _safe_float(min_qty))
+            or (min_notional is not None and fallback_order_notional + 1e-12 < _safe_float(min_notional))
+        ):
+            report["reason"] = "fallback_reduce_below_exchange_minimum"
+            result["best_quote_actual_side_reduce"] = report
+            return result
+        candidate = {
+            "role": source_role,
+            "side": side,
+            "position_side": position_side,
+            "qty": fallback_qty,
+            "notional": fallback_order_notional,
+            "price": raw_price,
+            "actual_side_reduce_fallback": True,
+        }
     qty = min(max(_safe_float(candidate.get("qty", candidate.get("quantity"))), 0.0), available_qty)
     price = _safe_float(candidate.get("price"))
     if side == "SELL" and profit_bound > 0:
@@ -10307,6 +10334,12 @@ def convert_blocked_best_quote_plan_entry_to_actual_side_reduce(
     step_price: float = 0.0,
     tick_size: float | None = None,
     min_profit_ratio: float | None = None,
+    bid_price: float = 0.0,
+    ask_price: float = 0.0,
+    fallback_order_notional: float = 0.0,
+    step_size: float | None = None,
+    min_qty: float | None = None,
+    min_notional: float | None = None,
 ) -> dict[str, Any]:
     """Apply actual-side BQ reduction while the desired order set is built.
 
@@ -10336,6 +10369,11 @@ def convert_blocked_best_quote_plan_entry_to_actual_side_reduce(
         step_price=step_price,
         tick_size=tick_size,
         min_profit_ratio=min_profit_ratio,
+        fallback_price=ask_price if bool((same_side_entry_guard or {}).get("blocked_long_entry")) else bid_price,
+        fallback_notional=fallback_order_notional,
+        step_size=step_size,
+        min_qty=min_qty,
+        min_notional=min_notional,
     )
     plan["buy_orders"] = [
         item for item in converted.get("place_orders", []) if str(item.get("side", "")).upper().strip() == "BUY"
@@ -21621,6 +21659,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             step_price=effective_args.step_price,
             tick_size=symbol_info.get("tick_size"),
             min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+            bid_price=bid_price,
+            ask_price=ask_price,
+            fallback_order_notional=cycle_budget / 2.0,
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
         )
         best_quote_directional_net_guard = {
             "enabled": False,
