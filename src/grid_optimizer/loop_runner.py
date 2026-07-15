@@ -10168,6 +10168,135 @@ def prioritize_inventory_reducing_place_orders(
     return result
 
 
+def convert_blocked_best_quote_entry_to_actual_side_reduce(
+    *,
+    actions: dict[str, Any],
+    same_side_entry_guard: Mapping[str, Any] | None,
+    current_long_qty: float,
+    current_short_qty: float,
+    frozen_long_qty: float = 0.0,
+    frozen_short_qty: float = 0.0,
+    current_long_avg_price: float = 0.0,
+    current_short_avg_price: float = 0.0,
+    step_price: float = 0.0,
+    tick_size: float | None = None,
+    min_profit_ratio: float | None = None,
+) -> dict[str, Any]:
+    """Replace a blocked opposite BQ entry with a normal-inventory maker reduce.
+
+    A same-side entry price guard can legitimately block BUY/LONG while a
+    net-long account still has a planned SELL/SHORT.  Leaving that order as an
+    entry increases gross exposure and keeps the runner one-sided.  In that
+    exact state, reuse one candidate as SELL/LONG (or the mirror BUY/SHORT),
+    capped to exchange inventory minus frozen inventory.  Frozen directives
+    are deliberately neither candidates nor capacity for this path.
+    """
+    guard = dict(same_side_entry_guard or {})
+    result = dict(actions)
+    place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    report: dict[str, Any] = {
+        "enabled": True,
+        "applied": False,
+        "reason": None,
+        "blocked_long_entry": bool(guard.get("blocked_long_entry")),
+        "blocked_short_entry": bool(guard.get("blocked_short_entry")),
+        "dropped_entry_orders": 0,
+        "order": None,
+    }
+    if not place_orders:
+        report["reason"] = "no_place_orders"
+        result["best_quote_actual_side_reduce"] = report
+        return result
+
+    safe_step = max(_safe_float(step_price), _safe_float(tick_size), 0.0)
+    safe_profit_ratio = max(_safe_float(min_profit_ratio), 0.0)
+    normal_long_qty = max(_safe_float(current_long_qty) - max(_safe_float(frozen_long_qty), 0.0), 0.0)
+    normal_short_qty = max(_safe_float(current_short_qty) - max(_safe_float(frozen_short_qty), 0.0), 0.0)
+    long_cost = max(_safe_float(current_long_avg_price), 0.0)
+    short_cost = max(_safe_float(current_short_avg_price), 0.0)
+    long_floor = max(
+        long_cost + safe_step if safe_step > 0 else 0.0,
+        long_cost * (1.0 + safe_profit_ratio) if safe_profit_ratio > 0 else 0.0,
+    )
+    short_ceiling_candidates = [
+        value
+        for value in (
+            short_cost - safe_step if safe_step > 0 else None,
+            short_cost * (1.0 - safe_profit_ratio) if safe_profit_ratio > 0 else None,
+        )
+        if value is not None and value > 0
+    ]
+    short_ceiling = min(short_ceiling_candidates) if short_ceiling_candidates else 0.0
+
+    spec: tuple[str, str, str, str, float, float] | None = None
+    if bool(guard.get("blocked_long_entry")) and normal_long_qty > 1e-12:
+        spec = ("best_quote_entry_short", "SELL", "LONG", "best_quote_reduce_long", normal_long_qty, long_floor)
+    elif bool(guard.get("blocked_short_entry")) and normal_short_qty > 1e-12:
+        spec = ("best_quote_entry_long", "BUY", "SHORT", "best_quote_reduce_short", normal_short_qty, short_ceiling)
+    if spec is None:
+        report["reason"] = "no_blocked_ordinary_side"
+        result["best_quote_actual_side_reduce"] = report
+        return result
+
+    source_role, side, position_side, reduce_role, available_qty, profit_bound = spec
+    candidate = next((item for item in place_orders if _order_role(item) == source_role), None)
+    if candidate is None:
+        report["reason"] = "missing_opposite_entry_candidate"
+        result["best_quote_actual_side_reduce"] = report
+        return result
+    qty = min(max(_safe_float(candidate.get("qty", candidate.get("quantity"))), 0.0), available_qty)
+    price = _safe_float(candidate.get("price"))
+    if side == "SELL" and profit_bound > 0:
+        price = max(price, profit_bound)
+    elif side == "BUY" and profit_bound > 0:
+        price = min(price, profit_bound) if price > 0 else profit_bound
+    price = _round_order_price(price, tick_size, side)
+    if qty <= 1e-12 or price <= 0:
+        report["reason"] = "invalid_reduce_candidate"
+        result["best_quote_actual_side_reduce"] = report
+        return result
+
+    reduce_order = dict(candidate)
+    reduce_order.update(
+        {
+            "side": side,
+            "position_side": position_side,
+            "role": reduce_role,
+            "client_order_role": reduce_role,
+            "qty": qty,
+            "notional": qty * price,
+            "price": price,
+            "force_reduce_only": True,
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "post_only": True,
+            "actual_side_reduce": True,
+        }
+    )
+    kept_orders: list[dict[str, Any]] = []
+    dropped_entry_orders = 0
+    for item in place_orders:
+        if _order_role(item) in {"best_quote_entry_long", "best_quote_entry_short"}:
+            dropped_entry_orders += 1
+            continue
+        kept_orders.append(item)
+    result["place_orders"] = [reduce_order, *kept_orders]
+    result["place_count"] = len(result["place_orders"])
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in result["place_orders"])
+    report.update(
+        {
+            "applied": True,
+            "reason": "blocked_entry_replaced_with_actual_side_reduce",
+            "dropped_entry_orders": dropped_entry_orders,
+            "normal_long_qty": normal_long_qty,
+            "normal_short_qty": normal_short_qty,
+            "order": dict(reduce_order),
+        }
+    )
+    result["best_quote_actual_side_reduce"] = report
+    return result
+
+
 def _maybe_sleep_between_execution_requests(args: argparse.Namespace) -> None:
     interval = _safe_float(getattr(args, "execution_request_min_interval_seconds", 0.0))
     if interval > 0:
@@ -23470,6 +23599,37 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         tick_size=(plan_report.get("symbol_info") or {}).get("tick_size"),
         min_profit_ratio=(plan_report.get("take_profit_guard") or {}).get("effective_min_profit_ratio"),
     )
+    if _is_hedge_best_quote_maker_volume_mode(strategy_mode):
+        best_quote_metrics = plan_report.get("best_quote_maker_volume")
+        reduce_freeze = best_quote_metrics.get("reduce_freeze") if isinstance(best_quote_metrics, dict) else None
+        same_side_entry_guard = (
+            best_quote_metrics.get("same_side_entry_price_guard") if isinstance(best_quote_metrics, dict) else None
+        )
+        validation["actions"] = convert_blocked_best_quote_entry_to_actual_side_reduce(
+            actions=validation["actions"],
+            same_side_entry_guard=same_side_entry_guard if isinstance(same_side_entry_guard, Mapping) else None,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            frozen_long_qty=(
+                _safe_float(reduce_freeze.get("frozen_long_qty")) if isinstance(reduce_freeze, Mapping) else 0.0
+            ),
+            frozen_short_qty=(
+                _safe_float(reduce_freeze.get("frozen_short_qty")) if isinstance(reduce_freeze, Mapping) else 0.0
+            ),
+            current_long_avg_price=_safe_float(plan_report.get("current_long_avg_price")),
+            current_short_avg_price=_safe_float(plan_report.get("current_short_avg_price")),
+            step_price=_safe_float((plan_report.get("adaptive_step") or {}).get("effective_step_price"))
+            or _safe_float(plan_report.get("effective_step_price"))
+            or _safe_float(getattr(args, "step_price", 0.0)),
+            tick_size=(plan_report.get("symbol_info") or {}).get("tick_size"),
+            min_profit_ratio=(plan_report.get("take_profit_guard") or {}).get("effective_min_profit_ratio"),
+        )
+        validation["actions"] = cap_reduce_only_place_orders_to_position(
+            actions=validation["actions"],
+            strategy_mode=strategy_mode,
+            current_actual_net_qty=current_actual_net_qty,
+            current_open_orders=current_strategy_open_orders,
+        )
     if _is_best_quote_maker_volume_mode(strategy_mode):
         validation["actions"] = suppress_same_side_nearby_place_orders(
             actions=validation["actions"],

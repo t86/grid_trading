@@ -71,6 +71,7 @@ from grid_optimizer.loop_runner import (
     _cap_best_quote_profitable_inventory_exit_offset,
     _separate_paired_best_quote_reduce_orders,
     prioritize_inventory_reducing_place_orders,
+    convert_blocked_best_quote_entry_to_actual_side_reduce,
     apply_execution_request_budget_to_actions,
     StartupProtectionError,
     _update_inventory_grid_order_refs,
@@ -7973,6 +7974,66 @@ class LoopRunnerTests(unittest.TestCase):
             [item["price"] for item in prioritized["place_orders"]],
             [0.14870, 0.14902, 0.14920],
         )
+
+    def test_blocked_best_quote_long_entry_reuses_short_entry_as_normal_long_reduce(self) -> None:
+        actions = {
+            "place_orders": [
+                {"role": "best_quote_entry_short", "side": "SELL", "position_side": "SHORT", "qty": 100.0, "price": 1.01, "notional": 101.0},
+                {"role": "frozen_inventory_manual_reduce_long", "side": "SELL", "position_side": "LONG", "qty": 20.0, "price": 1.20, "notional": 24.0, "force_reduce_only": True},
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+        }
+
+        converted = convert_blocked_best_quote_entry_to_actual_side_reduce(
+            actions=actions,
+            same_side_entry_guard={"blocked_long_entry": True, "report_only": False},
+            current_long_qty=250.0,
+            current_short_qty=20.0,
+            frozen_long_qty=200.0,
+            current_long_avg_price=1.0,
+            step_price=0.005,
+            tick_size=0.001,
+            min_profit_ratio=0.002,
+        )
+
+        self.assertTrue(converted["best_quote_actual_side_reduce"]["applied"])
+        self.assertEqual(converted["place_count"], 2)
+        reduce = converted["place_orders"][0]
+        self.assertEqual(reduce["role"], "best_quote_reduce_long")
+        self.assertEqual(reduce["side"], "SELL")
+        self.assertEqual(reduce["position_side"], "LONG")
+        self.assertTrue(reduce["force_reduce_only"])
+        self.assertAlmostEqual(reduce["qty"], 50.0, places=8)
+        self.assertAlmostEqual(reduce["price"], 1.01, places=8)
+        self.assertEqual(converted["place_orders"][1]["role"], "frozen_inventory_manual_reduce_long")
+
+    def test_blocked_best_quote_entry_does_not_use_frozen_inventory_as_reduce_capacity(self) -> None:
+        actions = {
+            "place_orders": [
+                {"role": "best_quote_entry_short", "side": "SELL", "position_side": "SHORT", "qty": 100.0, "price": 1.01, "notional": 101.0},
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+
+        converted = convert_blocked_best_quote_entry_to_actual_side_reduce(
+            actions=actions,
+            same_side_entry_guard={"blocked_long_entry": True, "report_only": False},
+            current_long_qty=200.0,
+            current_short_qty=0.0,
+            frozen_long_qty=200.0,
+            current_long_avg_price=1.0,
+            step_price=0.005,
+            tick_size=0.001,
+            min_profit_ratio=0.002,
+        )
+
+        self.assertFalse(converted["best_quote_actual_side_reduce"]["applied"])
+        self.assertEqual(converted["best_quote_actual_side_reduce"]["reason"], "no_blocked_ordinary_side")
+        self.assertEqual(converted["place_orders"][0]["role"], "best_quote_entry_short")
 
     def test_soonusdt_volume_profiles_use_entry_price_cost_basis(self) -> None:
         self.assertTrue(_uses_entry_price_cost_basis("chip_low_wear_guarded_v1"))
