@@ -2502,7 +2502,15 @@ def arx_side_cap_unwind_updates(
     short_soft_excess = max(side_short_notional - short_soft, 0.0)
     configured_net_limit = max(_safe_float(control.get("max_actual_net_notional")), 0.0)
     net_limit = configured_net_limit * 0.6 if configured_net_limit > 0 else 0.0
-    net_notional = _safe_float(actual_long_notional) - _safe_float(actual_short_notional)
+    # Frozen lots are part of the exchange-side risk.  Their ledger is
+    # deliberately excluded from ordinary profile caps, so using only the
+    # managed delta here can falsely latch a directional unwind while the
+    # real LONG/SHORT sides are balanced and well below the 2,000U limit.
+    net_notional = (
+        side_long_notional - side_short_notional
+        if ignore_profile_side_cap
+        else _safe_float(actual_long_notional) - _safe_float(actual_short_notional)
+    )
     current_direction = str(
         control.get("best_quote_maker_volume_directional_net_guard") or "off"
     ).lower()

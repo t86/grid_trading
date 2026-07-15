@@ -583,6 +583,20 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual("off", updates["best_quote_maker_volume_directional_net_guard"])
         self.assertFalse(updates["best_quote_maker_volume_allow_loss_reduce_only"])
 
+        managed_imbalance_with_balanced_exchange = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+            control={
+                "max_actual_net_notional": 1000.0,
+                "best_quote_maker_volume_directional_net_guard": "off",
+                "best_quote_maker_volume_allow_loss_reduce_only": False,
+            },
+            actual_long_notional=450.0,
+            actual_short_notional=1055.0,
+            exchange_long_notional=895.0,
+            exchange_short_notional=1210.0,
+            ignore_profile_side_cap=True,
+        )
+        self.assertFalse(managed_imbalance_with_balanced_exchange)
+
         hard_cap_updates = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
             control={
                 "max_actual_net_notional": 1000.0,
