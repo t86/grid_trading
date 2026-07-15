@@ -66,6 +66,7 @@ from grid_optimizer.web import (
     _volatility_trigger_orphan_recovery_action,
 )
 from grid_optimizer import web as web_module
+from grid_optimizer.loop_runner import _build_parser as _build_loop_runner_parser
 from grid_optimizer.running_status import _normalize_frozen_inventory_ledger
 
 
@@ -2646,6 +2647,126 @@ class WebSecurityTests(unittest.TestCase):
         config = _resolve_runner_start_config({"symbol": "ENSOUSDT", "strategy_profile": "synthetic_neutral_v1"})
         self.assertEqual(config["strategy_profile"], "synthetic_neutral_v1")
         self.assertEqual(config["strategy_mode"], "synthetic_neutral")
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_starts_bch_altcoins_probe_with_maker_safety_guards(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.01,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 20.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "234.71", "ask_price": "234.72"}]
+
+        config = _resolve_runner_start_config(
+            {"symbol": "BCHUSDT", "strategy_profile": "bchusdt_altcoins_probe_v1"}
+        )
+
+        self.assertEqual(config["strategy_profile"], "bchusdt_altcoins_probe_v1")
+        self.assertEqual(config["strategy_mode"], "hedge_best_quote_maker_volume_v1")
+        self.assertEqual(config["symbol"], "BCHUSDT")
+        self.assertEqual(config["state_path"], "output/bchusdt_loop_state.json")
+        self.assertEqual(config["buy_levels"], 1)
+        self.assertEqual(config["sell_levels"], 1)
+        self.assertEqual(config["max_new_orders"], 4)
+        self.assertEqual(config["per_order_notional"], 22.0)
+        self.assertEqual(config["best_quote_maker_volume_cycle_budget_notional"], 88.0)
+        self.assertEqual(config["best_quote_maker_volume_min_cycle_budget_notional"], 22.0)
+        self.assertEqual(config["best_quote_maker_volume_max_long_notional"], 200.0)
+        self.assertEqual(config["best_quote_maker_volume_max_short_notional"], 200.0)
+        self.assertEqual(config["best_quote_maker_volume_max_order_notional"], 22.0)
+        self.assertEqual(config["max_total_notional"], 320.0)
+        self.assertEqual(config["max_actual_net_notional"], 120.0)
+        self.assertEqual(config["max_cumulative_notional"], 20_000.0)
+        self.assertFalse(config["runtime_guard_stop_auto_flatten_enabled"])
+        self.assertTrue(config["best_quote_maker_volume_take_profit_guard_enabled"])
+        self.assertEqual(config["take_profit_min_profit_ratio"], 0.0002)
+        self.assertFalse(config["best_quote_maker_volume_active_pair_reduce_enabled"])
+        self.assertFalse(config["best_quote_maker_volume_net_loss_reduce_enabled"])
+        self.assertFalse(config["best_quote_maker_volume_allow_loss_reduce_only"])
+        self.assertEqual(config["best_quote_maker_volume_directional_net_guard"], "off")
+        self.assertFalse(config["adverse_reduce_enabled"])
+        self.assertFalse(config["hard_loss_forced_reduce_enabled"])
+        self.assertTrue(config["best_quote_maker_volume_reduce_freeze_enabled"])
+        self.assertEqual(config["best_quote_maker_volume_frozen_total_cap_notional"], 120.0)
+        self.assertEqual(config["best_quote_maker_volume_frozen_long_cap_notional"], 80.0)
+        self.assertEqual(config["best_quote_maker_volume_frozen_short_cap_notional"], 80.0)
+        self.assertTrue(config["best_quote_maker_volume_frozen_pair_release_enabled"])
+        self.assertTrue(config["best_quote_maker_volume_frozen_single_leg_take_profit_enabled"])
+        self.assertFalse(config["best_quote_maker_volume_frozen_pair_release_allow_loss"])
+        self.assertEqual(config["best_quote_maker_volume_frozen_pair_release_execution_type"], "maker")
+        self.assertTrue(config["adaptive_step_enabled"])
+        self.assertFalse(config["adaptive_step_dynamic_base_enabled"])
+        self.assertEqual(config["adaptive_step_max_scale"], 6.0)
+        self.assertEqual(config["best_quote_maker_volume_dynamic_control_high_volatility_budget_scale"], 0.50)
+        self.assertEqual(config["best_quote_maker_volume_dynamic_control_extreme_volatility_budget_scale"], 0.50)
+        self.assertTrue(config["volatility_entry_pause_enabled"])
+        self.assertEqual(config["volatility_entry_pause_recover_confirm_cycles"], 4)
+        self.assertEqual(config["volatility_entry_pause_min_observation_seconds"], 12.0)
+        self.assertEqual(config["volatility_entry_pause_inventory_recover_ratio"], 0.75)
+        self.assertEqual(config["volatility_entry_pause_tiny_inventory_ignore_notional"], 10.0)
+        self.assertFalse(config["elastic_volume_enabled"])
+        self.assertFalse(config["volatility_trigger_stop_close_all_positions"])
+        self.assertEqual(config["cycle_jitter_seconds"], 0.3)
+        self.assertFalse(config["runtime_guard_loss_recovery_enabled"])
+
+        _validate_runner_required_risk_guards(config)
+        command = _build_runner_command(config)
+        self.assertIn("--best-quote-maker-volume-enabled", command)
+        self.assertIn("--best-quote-maker-volume-max-order-notional", command)
+        self.assertIn("--no-best-quote-maker-volume-active-pair-reduce-enabled", command)
+        self.assertIn("--no-best-quote-maker-volume-allow-loss-reduce-only", command)
+        self.assertIn("--volatility-entry-pause-enabled", command)
+        self.assertIn("--no-adaptive-step-dynamic-base-enabled", command)
+        self.assertIn("--no-runtime-guard-stop-auto-flatten-enabled", command)
+        self.assertIn("--no-runtime-guard-loss-recovery-enabled", command)
+        recover_ratio_index = command.index("--volatility-entry-pause-inventory-recover-ratio")
+        self.assertEqual(command[recover_ratio_index + 1], "0.75")
+        tiny_inventory_index = command.index("--volatility-entry-pause-tiny-inventory-ignore-notional")
+        self.assertEqual(command[tiny_inventory_index + 1], "10.0")
+        cycle_jitter_index = command.index("--cycle-jitter-seconds")
+        self.assertEqual(command[cycle_jitter_index + 1], "0.3")
+        brush_order_count_index = command.index("--loss-recovery-brush-max-entry-orders-per-side")
+        self.assertEqual(command[brush_order_count_index + 1], "1")
+        runner_args = _build_loop_runner_parser().parse_args(command[3:])
+        self.assertEqual(runner_args.best_quote_maker_volume_max_order_notional, 22.0)
+        self.assertFalse(runner_args.adaptive_step_dynamic_base_enabled)
+        self.assertEqual(runner_args.adaptive_step_max_scale, 6.0)
+        self.assertEqual(runner_args.volatility_entry_pause_inventory_recover_ratio, 0.75)
+        self.assertEqual(runner_args.volatility_entry_pause_tiny_inventory_ignore_notional, 10.0)
+        self.assertEqual(runner_args.cycle_jitter_seconds, 0.3)
+        self.assertFalse(runner_args.runtime_guard_loss_recovery_enabled)
+
+    def test_resolve_runner_start_config_rejects_bch_altcoins_probe_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=BCHUSDT"):
+            _resolve_runner_start_config(
+                {"symbol": "ARXUSDT", "strategy_profile": "bchusdt_altcoins_probe_v1"}
+            )
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_rejects_bch_when_exchange_minimum_exceeds_order_cap(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.01,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 25.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "234.71", "ask_price": "234.72"}]
+
+        with self.assertRaisesRegex(ValueError, "max_order_notional=22.0.*minimum=25.0"):
+            _resolve_runner_start_config(
+                {"symbol": "BCHUSDT", "strategy_profile": "bchusdt_altcoins_probe_v1"}
+            )
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")

@@ -107,6 +107,7 @@ class BestQuoteMakerVolumeInputs:
     step_size: float | None = None
     min_qty: float | None = None
     min_notional: float | None = None
+    max_order_notional: float | None = None
     open_entry_long_notional: float = 0.0
     open_entry_short_notional: float = 0.0
     pending_entry_buffer_notional: float = 0.0
@@ -164,7 +165,9 @@ def _build_order(
     rounded_price = _round_order_price(price, inputs.tick_size, side)
     if rounded_price <= 0 or notional <= 0:
         return None
-    qty = _round_order_qty(notional / rounded_price, inputs.step_size)
+    max_order_notional = max(_safe_float(inputs.max_order_notional), 0.0)
+    effective_notional = min(notional, max_order_notional) if max_order_notional > 0 else notional
+    qty = _round_order_qty(effective_notional / rounded_price, inputs.step_size)
     order_notional = qty * rounded_price
     if qty <= 0:
         return None

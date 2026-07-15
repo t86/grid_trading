@@ -10188,6 +10188,7 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
     min_profit_ratio: float | None = None,
     fallback_price: float = 0.0,
     fallback_notional: float = 0.0,
+    max_order_notional: float | None = None,
     step_size: float | None = None,
     min_qty: float | None = None,
     min_notional: float | None = None,
@@ -10215,6 +10216,7 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
     }
     safe_step = max(_safe_float(step_price), _safe_float(tick_size), 0.0)
     safe_profit_ratio = max(_safe_float(min_profit_ratio), 0.0)
+    safe_max_order_notional = max(_safe_float(max_order_notional), 0.0)
     normal_long_qty = max(_safe_float(current_long_qty) - max(_safe_float(frozen_long_qty), 0.0), 0.0)
     normal_short_qty = max(_safe_float(current_short_qty) - max(_safe_float(frozen_short_qty), 0.0), 0.0)
     long_cost = max(_safe_float(current_long_avg_price), 0.0)
@@ -10248,6 +10250,8 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
     if candidate is None:
         raw_price = max(_safe_float(fallback_price), 0.0)
         raw_notional = max(_safe_float(fallback_notional), 0.0)
+        if safe_max_order_notional > 0:
+            raw_notional = min(raw_notional, safe_max_order_notional)
         if raw_price <= 0 or raw_notional <= 0:
             report["reason"] = "missing_opposite_entry_candidate"
             result["best_quote_actual_side_reduce"] = report
@@ -10278,8 +10282,18 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
     elif side == "BUY" and profit_bound > 0:
         price = min(price, profit_bound) if price > 0 else profit_bound
     price = _round_order_price(price, tick_size, side)
+    if safe_max_order_notional > 0 and price > 0:
+        qty = min(qty, _round_order_qty(safe_max_order_notional / price, step_size))
+    order_notional = qty * price
     if qty <= 1e-12 or price <= 0:
         report["reason"] = "invalid_reduce_candidate"
+        result["best_quote_actual_side_reduce"] = report
+        return result
+    if (
+        (min_qty is not None and qty + 1e-12 < _safe_float(min_qty))
+        or (min_notional is not None and order_notional + 1e-12 < _safe_float(min_notional))
+    ):
+        report["reason"] = "capped_reduce_below_exchange_minimum"
         result["best_quote_actual_side_reduce"] = report
         return result
 
@@ -10291,7 +10305,7 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
             "role": reduce_role,
             "client_order_role": reduce_role,
             "qty": qty,
-            "notional": qty * price,
+            "notional": order_notional,
             "price": price,
             "force_reduce_only": True,
             "execution_type": "maker",
@@ -10337,6 +10351,7 @@ def convert_blocked_best_quote_plan_entry_to_actual_side_reduce(
     bid_price: float = 0.0,
     ask_price: float = 0.0,
     fallback_order_notional: float = 0.0,
+    max_order_notional: float | None = None,
     step_size: float | None = None,
     min_qty: float | None = None,
     min_notional: float | None = None,
@@ -10371,6 +10386,7 @@ def convert_blocked_best_quote_plan_entry_to_actual_side_reduce(
         min_profit_ratio=min_profit_ratio,
         fallback_price=ask_price if bool((same_side_entry_guard or {}).get("blocked_long_entry")) else bid_price,
         fallback_notional=fallback_order_notional,
+        max_order_notional=max_order_notional,
         step_size=step_size,
         min_qty=min_qty,
         min_notional=min_notional,
@@ -11372,6 +11388,111 @@ def isolate_frozen_pair_release_place_orders(actions: dict[str, Any]) -> dict[st
     return result
 
 
+def _cap_best_quote_order_to_max_notional(
+    *,
+    order: Mapping[str, Any] | dict[str, Any],
+    price_field: str,
+    notional_field: str,
+    max_order_notional: float,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Apply one downward-only BQ order cap at the price actually being used."""
+    capped_order = dict(order)
+    safe_cap = max(_safe_float(max_order_notional), 0.0)
+    qty = max(_safe_float(capped_order.get("qty", capped_order.get("quantity"))), 0.0)
+    price = max(_safe_float(capped_order.get(price_field)), 0.0)
+    original_notional = qty * price
+    report: dict[str, Any] = {
+        "enabled": safe_cap > 0,
+        "applied": False,
+        "dropped": False,
+        "reason": None,
+        "max_order_notional": safe_cap,
+        "original_qty": qty,
+        "original_notional": original_notional,
+    }
+    if safe_cap <= 0:
+        report["reason"] = "disabled"
+        return capped_order, report
+    if qty <= 1e-12 or price <= 0:
+        report.update({"dropped": True, "reason": "invalid_order"})
+        return None, report
+
+    capped_qty = min(qty, _round_order_qty(safe_cap / price, step_size))
+    capped_notional = capped_qty * price
+    report.update({"capped_qty": capped_qty, "capped_notional": capped_notional})
+    if (
+        capped_qty <= 1e-12
+        or (min_qty is not None and capped_qty + 1e-12 < _safe_float(min_qty))
+        or (min_notional is not None and capped_notional + 1e-12 < _safe_float(min_notional))
+    ):
+        report.update({"dropped": True, "reason": "capped_order_below_exchange_minimum"})
+        return None, report
+
+    capped_order["qty"] = capped_qty
+    capped_order[notional_field] = capped_notional
+    if notional_field != "notional" and "notional" in capped_order:
+        capped_order["notional"] = capped_notional
+    report["applied"] = capped_qty + 1e-12 < qty
+    report["reason"] = "capped" if report["applied"] else "within_cap"
+    return capped_order, report
+
+
+def _cap_best_quote_place_orders_to_max_notional(
+    *,
+    actions: dict[str, Any],
+    max_order_notional: float,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> dict[str, Any]:
+    safe_cap = max(_safe_float(max_order_notional), 0.0)
+    if safe_cap <= 0:
+        return actions
+    kept_orders: list[dict[str, Any]] = []
+    capped_orders: list[dict[str, Any]] = []
+    dropped_orders: list[dict[str, Any]] = []
+    for item in actions.get("place_orders", []):
+        if not isinstance(item, dict):
+            continue
+        capped_order, cap_report = _cap_best_quote_order_to_max_notional(
+            order=item,
+            price_field="price",
+            notional_field="notional",
+            max_order_notional=safe_cap,
+            step_size=step_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+        )
+        if capped_order is None:
+            dropped = dict(item)
+            dropped["max_order_notional_cap"] = cap_report
+            dropped_orders.append(dropped)
+            continue
+        if cap_report.get("applied"):
+            capped = dict(capped_order)
+            capped["max_order_notional_cap"] = cap_report
+            capped_orders.append(capped)
+            capped_order = capped
+        kept_orders.append(capped_order)
+
+    result = dict(actions)
+    result["place_orders"] = kept_orders
+    result["place_count"] = len(kept_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_orders)
+    result["best_quote_max_order_notional_cap"] = {
+        "enabled": True,
+        "max_order_notional": safe_cap,
+        "capped_order_count": len(capped_orders),
+        "dropped_order_count": len(dropped_orders),
+        "capped_orders": capped_orders,
+        "dropped_orders": dropped_orders,
+    }
+    return result
+
+
 def _runtime_guard_has_allowed_frozen_inventory_places(actions: Mapping[str, Any] | dict[str, Any]) -> bool:
     if _safe_float((actions or {}).get("place_count")) <= 0:
         return False
@@ -12030,11 +12151,12 @@ def _maybe_handle_runtime_guard(
         ["rolling_hourly_loss_limit_hit"],
         ["rolling_hourly_loss_per_10k_limit_hit"],
     )
+    recoverable_loss_stop = loss_only_stop and _runtime_guard_loss_recovery_enabled(args)
     end_window_stop = runtime_guard_result.primary_reason == "after_end_window"
     frozen_inventory_present = _has_best_quote_frozen_inventory_position(state)
     manual_frozen_directive_pending = _has_pending_frozen_inventory_manual_directive(state)
     frozen_long_qty, frozen_short_qty = _best_quote_frozen_inventory_qtys(state)
-    if frozen_inventory_present and not manual_frozen_directive_pending:
+    if recoverable_loss_stop and frozen_inventory_present and not manual_frozen_directive_pending:
         if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
             stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
             if recovered_at is not None and (stopped_at is None or recovered_at >= stopped_at):
@@ -12096,7 +12218,7 @@ def _maybe_handle_runtime_guard(
         if cleared_manual_override or loss_only_stop:
             _write_json(state_path, state)
         return None
-    if frozen_inventory_present or manual_frozen_directive_pending:
+    if recoverable_loss_stop and (frozen_inventory_present or manual_frozen_directive_pending):
         if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
             stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
             if recovered_at is not None and (stopped_at is None or recovered_at >= stopped_at):
@@ -12185,7 +12307,19 @@ def _maybe_handle_runtime_guard(
     auto_flatten_on_runtime_stop = bool(
         getattr(args, "runtime_guard_stop_auto_flatten_enabled", True)
     )
-    if not auto_flatten_on_runtime_stop:
+    if frozen_inventory_present:
+        flatten_snapshot = {
+            "orders": [],
+            "warnings": [
+                f"{args.symbol.upper().strip()} runtime guard hard stop preserves frozen inventory"
+            ],
+            "allow_loss": False,
+            "max_loss_ratio": None,
+            "preserve_long_qty": frozen_long_qty,
+            "preserve_short_qty": frozen_short_qty,
+            "skip_reason": "runtime_guard_frozen_inventory_preserved",
+        }
+    elif not auto_flatten_on_runtime_stop:
         flatten_snapshot = {
             "orders": [],
             "warnings": [
@@ -21030,6 +21164,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
+                max_order_notional=getattr(
+                    effective_args,
+                    "best_quote_maker_volume_max_order_notional",
+                    None,
+                ),
                 open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
                 open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
                 pending_entry_buffer_notional=cycle_budget
@@ -21662,6 +21801,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             bid_price=bid_price,
             ask_price=ask_price,
             fallback_order_notional=cycle_budget / 2.0,
+            max_order_notional=getattr(
+                effective_args,
+                "best_quote_maker_volume_max_order_notional",
+                None,
+            ),
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
@@ -23190,6 +23334,10 @@ def _mark_submit_report_blocked(report: dict[str, Any], *, reason: str = "valida
 def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -> dict[str, Any]:
     strategy_mode = str(plan_report.get("strategy_mode") or getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
     effective_max_total_notional = _safe_float(plan_report.get("effective_max_total_notional"))
+    best_quote_max_order_notional = max(
+        _safe_float(getattr(args, "best_quote_maker_volume_max_order_notional", 0.0)),
+        0.0,
+    )
     validation = validate_plan_report(
         plan_report=plan_report,
         allow_symbol=args.symbol,
@@ -23224,6 +23372,8 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             f"live mid drift is {drift_steps:.2f} steps, above max_mid_drift_steps={args.max_mid_drift_steps:.2f}"
         )
         validation["ok"] = False
+    if _is_best_quote_maker_volume_mode(strategy_mode):
+        validation["actions"] = isolate_frozen_pair_release_place_orders(validation["actions"])
     validation["actions"] = preserve_queue_priority_in_execution_actions(
         actions=validation["actions"],
         live_bid_price=live_bid_price,
@@ -23233,6 +23383,14 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
     )
+    if _is_best_quote_maker_volume_mode(strategy_mode):
+        validation["actions"] = _cap_best_quote_place_orders_to_max_notional(
+            actions=validation["actions"],
+            max_order_notional=best_quote_max_order_notional,
+            step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+            min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+            min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        )
     validation["actions"] = apply_anti_chase_entry_guard_to_actions(
         actions=validation["actions"],
         plan_report=plan_report,
@@ -23727,6 +23885,10 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             or _safe_float(getattr(args, "step_price", 0.0)),
             tick_size=(plan_report.get("symbol_info") or {}).get("tick_size"),
             min_profit_ratio=(plan_report.get("take_profit_guard") or {}).get("effective_min_profit_ratio"),
+            max_order_notional=best_quote_max_order_notional,
+            step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+            min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+            min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         )
         validation["actions"] = cap_reduce_only_place_orders_to_position(
             actions=validation["actions"],
@@ -23779,6 +23941,14 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             getattr(args, "best_quote_maker_volume_directional_net_guard", "off") or "off"
         ),
     )
+    if _is_best_quote_maker_volume_mode(strategy_mode):
+        validation["actions"] = _cap_best_quote_place_orders_to_max_notional(
+            actions=validation["actions"],
+            max_order_notional=best_quote_max_order_notional,
+            step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+            min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+            min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        )
     if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
         validation["errors"] = [
             item for item in validation["errors"] if "plan contains no actions to execute" not in item
@@ -23960,6 +24130,35 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                 )
                 last_exc = None
                 break
+            if _is_best_quote_maker_volume_mode(strategy_mode):
+                prepared_order, max_order_cap = _cap_best_quote_order_to_max_notional(
+                    order=prepared_order,
+                    price_field="submitted_price",
+                    notional_field="submitted_notional",
+                    max_order_notional=best_quote_max_order_notional,
+                    step_size=symbol_info.get("step_size"),
+                    min_qty=min_qty,
+                    min_notional=min_notional,
+                )
+                if prepared_order is None:
+                    report["skipped_orders"].append(
+                        {
+                            "request": {
+                                "role": role,
+                                "side": side,
+                                "position_side": position_side,
+                                "qty": _safe_float(order.get("qty")),
+                                "desired_price": _safe_float(order.get("price")),
+                                "attempt": attempt + 1,
+                                "time_in_force": time_in_force,
+                            },
+                            "reason": max_order_cap,
+                        }
+                    )
+                    last_exc = None
+                    break
+                if max_order_cap.get("applied"):
+                    prepared_order["max_order_notional_cap"] = max_order_cap
             latest_open_orders = fetch_futures_open_orders(
                 symbol,
                 api_key,
@@ -24243,6 +24442,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-defensive-offset-ticks", type=int, default=3)
     parser.add_argument("--best-quote-maker-volume-max-long-notional", type=float, default=1_500.0)
     parser.add_argument("--best-quote-maker-volume-max-short-notional", type=float, default=1_500.0)
+    parser.add_argument("--best-quote-maker-volume-max-order-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-inventory-soft-ratio", type=float, default=0.60)
     parser.add_argument("--best-quote-maker-volume-loss-per-10k-15m", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-loss-per-10k-soft", type=float, default=0.5)

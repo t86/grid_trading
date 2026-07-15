@@ -290,7 +290,10 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "state.json"
-            state_path.write_text("{}", encoding="utf-8")
+            state_path.write_text(
+                json.dumps({"best_quote_frozen_inventory": {"short_qty": 80.0, "short_entry_price": 234.0}}),
+                encoding="utf-8",
+            )
             args = argparse.Namespace(
                 symbol="ARXUSDT",
                 recv_window=5000,
@@ -311,6 +314,7 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
                 max_synthetic_drift_notional=None,
                 max_unrealized_loss=None,
                 best_quote_maker_volume_reduce_freeze_loss_ratio=0.01,
+                runtime_guard_stop_auto_flatten_enabled=False,
                 auto_regime_enabled=False,
                 state_path=str(state_path),
                 plan_json=str(Path(tmpdir) / "plan.json"),
@@ -343,7 +347,14 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
 
         self.assertIsNotNone(summary)
         self.assertEqual(summary["stop_reason"], "after_end_window")
+        self.assertEqual(summary["canceled_count"], 2)
         self.assertFalse(summary["flatten_started"])
+        mock_cancel.assert_called_once_with(
+            symbol="ARXUSDT",
+            api_key="key",
+            api_secret="secret",
+            recv_window=5000,
+        )
         mock_snapshot.assert_not_called()
         mock_start_flatten.assert_not_called()
 
@@ -353,7 +364,7 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
     @patch("grid_optimizer.loop_runner.evaluate_runtime_guards")
     @patch("grid_optimizer.loop_runner._load_futures_runtime_guard_inputs")
-    def test_runtime_guard_non_loss_stop_allows_frozen_manual_override_without_flatten(
+    def test_runtime_guard_non_loss_stop_overrides_frozen_manual_directive_and_stops(
         self,
         mock_inputs,
         mock_evaluate,
@@ -393,10 +404,13 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
                 max_actual_net_notional=100.0,
                 max_synthetic_drift_notional=None,
                 max_unrealized_loss=None,
+                runtime_guard_stop_auto_flatten_enabled=False,
                 auto_regime_enabled=False,
                 state_path=str(state_path),
                 plan_json=str(Path(tmpdir) / "plan.json"),
             )
+            mock_credentials.return_value = ("key", "secret")
+            mock_cancel.return_value = 2
             now = datetime(2026, 5, 22, 15, 30, tzinfo=timezone.utc)
             mock_inputs.return_value = (1000.0, [], None)
             mock_evaluate.return_value = argparse.Namespace(
@@ -421,13 +435,19 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
                 summary_path=Path(tmpdir) / "events.jsonl",
             )
 
-            self.assertIsNone(summary)
+            self.assertIsNotNone(summary)
+            self.assertTrue(summary["stop_triggered"])
+            self.assertEqual(summary["stop_reason"], "max_actual_net_notional_hit")
+            self.assertEqual(summary["canceled_count"], 2)
+            self.assertFalse(summary["flatten_started"])
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            override = state["runtime_guard_manual_frozen_inventory_override"]
-            self.assertTrue(override["active"])
-            self.assertEqual(override["stop_reasons"], ["max_actual_net_notional_hit"])
-            mock_credentials.assert_not_called()
-            mock_cancel.assert_not_called()
+            self.assertNotIn("runtime_guard_manual_frozen_inventory_override", state)
+            mock_cancel.assert_called_once_with(
+                symbol="PHAROSUSDT",
+                api_key="key",
+                api_secret="secret",
+                recv_window=5000,
+            )
             mock_snapshot.assert_not_called()
             mock_start_flatten.assert_not_called()
 
@@ -742,7 +762,7 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
     @patch("grid_optimizer.loop_runner.evaluate_runtime_guards")
     @patch("grid_optimizer.loop_runner._load_futures_runtime_guard_inputs")
-    def test_runtime_guard_non_loss_stop_waits_when_frozen_inventory_exists(
+    def test_runtime_guard_hard_stop_cancels_orders_when_frozen_inventory_exists(
         self,
         mock_inputs,
         mock_evaluate,
@@ -772,10 +792,11 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
                 runtime_guard_loss_recovery_cooldown_seconds=180.0,
                 runtime_guard_loss_recovery_max_1m_amplitude_ratio=0.012,
                 runtime_guard_loss_recovery_max_3m_amplitude_ratio=0.025,
-                max_cumulative_notional=None,
-                max_actual_net_notional=100.0,
+                max_cumulative_notional=1_000.0,
+                max_actual_net_notional=None,
                 max_synthetic_drift_notional=None,
                 max_unrealized_loss=None,
+                runtime_guard_stop_auto_flatten_enabled=False,
                 auto_regime_enabled=False,
                 state_path=str(state_path),
                 plan_json=str(Path(tmpdir) / "plan.json"),
@@ -786,8 +807,8 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
                 tradable=False,
                 runtime_status="stopped",
                 stop_triggered=True,
-                primary_reason="max_actual_net_notional_hit",
-                matched_reasons=["max_actual_net_notional_hit"],
+                primary_reason="max_cumulative_notional_hit",
+                matched_reasons=["max_cumulative_notional_hit"],
                 triggered_at=now.isoformat(),
                 rolling_hourly_loss=0.0,
                 rolling_hourly_gross_notional=0.0,
@@ -796,6 +817,8 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
                 cumulative_gross_notional=1000.0,
                 unrealized_loss=0.0,
             )
+            mock_credentials.return_value = ("key", "secret")
+            mock_cancel.return_value = 3
 
             summary = _maybe_handle_runtime_guard(
                 args=args,
@@ -804,11 +827,95 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
                 summary_path=Path(tmpdir) / "events.jsonl",
             )
 
-            self.assertIsNone(summary)
+            self.assertIsNotNone(summary)
+            self.assertTrue(summary["stop_triggered"])
+            self.assertEqual(summary["stop_reason"], "max_cumulative_notional_hit")
+            self.assertEqual(summary["canceled_count"], 3)
+            self.assertFalse(summary["flatten_started"])
             state = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertNotIn("runtime_guard_manual_frozen_inventory_override", state)
-            mock_credentials.assert_not_called()
-            mock_cancel.assert_not_called()
+            mock_cancel.assert_called_once_with(
+                symbol="PHAROSUSDT",
+                api_key="key",
+                api_secret="secret",
+                recv_window=5000,
+            )
+            mock_snapshot.assert_not_called()
+            mock_start_flatten.assert_not_called()
+
+    @patch("grid_optimizer.loop_runner._start_futures_flatten_process")
+    @patch("grid_optimizer.loop_runner.load_live_flatten_snapshot")
+    @patch("grid_optimizer.loop_runner._cancel_futures_strategy_orders")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.evaluate_runtime_guards")
+    @patch("grid_optimizer.loop_runner._load_futures_runtime_guard_inputs")
+    def test_runtime_guard_loss_stop_is_hard_when_recovery_disabled_with_frozen_inventory(
+        self,
+        mock_inputs,
+        mock_evaluate,
+        mock_credentials,
+        mock_cancel,
+        mock_snapshot,
+        mock_start_flatten,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps({"best_quote_frozen_inventory": {"long_qty": 0.3, "long_entry_price": 234.0}}),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                symbol="BCHUSDT",
+                recv_window=5000,
+                strategy_profile="bchusdt_altcoins_probe_v1",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                runtime_guard_stats_start_time=None,
+                run_start_time=None,
+                run_end_time=None,
+                rolling_hourly_loss_limit=None,
+                rolling_hourly_loss_per_10k_limit=2.1,
+                rolling_hourly_loss_per_10k_min_notional=5_000.0,
+                runtime_guard_loss_recovery_enabled=False,
+                max_cumulative_notional=20_000.0,
+                max_actual_net_notional=120.0,
+                max_synthetic_drift_notional=None,
+                max_unrealized_loss=None,
+                runtime_guard_stop_auto_flatten_enabled=False,
+                auto_regime_enabled=False,
+                state_path=str(state_path),
+                plan_json=str(Path(tmpdir) / "plan.json"),
+            )
+            now = datetime(2026, 7, 15, 9, 0, tzinfo=timezone.utc)
+            mock_inputs.return_value = (5_500.0, [], None)
+            mock_evaluate.return_value = argparse.Namespace(
+                tradable=False,
+                runtime_status="stopped",
+                stop_triggered=True,
+                primary_reason="rolling_hourly_loss_per_10k_limit_hit",
+                matched_reasons=["rolling_hourly_loss_per_10k_limit_hit"],
+                triggered_at=now.isoformat(),
+                rolling_hourly_loss=1.2,
+                rolling_hourly_gross_notional=5_500.0,
+                rolling_hourly_loss_per_10k=2.18,
+                rolling_hourly_loss_per_10k_active=True,
+                cumulative_gross_notional=5_500.0,
+                unrealized_loss=0.0,
+            )
+            mock_credentials.return_value = ("key", "secret")
+            mock_cancel.return_value = 2
+
+            summary = _maybe_handle_runtime_guard(
+                args=args,
+                cycle=8,
+                cycle_started_at=now,
+                summary_path=Path(tmpdir) / "events.jsonl",
+            )
+
+            self.assertIsNotNone(summary)
+            self.assertTrue(summary["stop_triggered"])
+            self.assertEqual(summary["stop_reason"], "rolling_hourly_loss_per_10k_limit_hit")
+            self.assertEqual(summary["canceled_count"], 2)
+            self.assertFalse(summary["flatten_started"])
             mock_snapshot.assert_not_called()
             mock_start_flatten.assert_not_called()
 

@@ -7894,6 +7894,85 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(isolated["place_count"], 2)
         self.assertEqual(isolated["frozen_pair_release_exclusive"]["deferred_place_count"], 2)
 
+    def test_best_quote_max_order_cap_limits_post_merge_pair_release_bucket(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "role": "best_quote_reduce_long",
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "qty": 0.093,
+                    "price": 234.72,
+                    "notional": 21.832,
+                    "execution_type": "maker",
+                    "time_in_force": "GTX",
+                    "post_only": True,
+                },
+                {
+                    "role": "frozen_inventory_pair_release_long",
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "qty": 0.093,
+                    "price": 234.72,
+                    "notional": 21.832,
+                    "execution_type": "maker",
+                    "time_in_force": "GTX",
+                    "post_only": True,
+                    "frozen_inventory_pair_release": True,
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+        }
+        merged = loop_runner_module.preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=234.70,
+            live_ask_price=234.72,
+            tick_size=0.01,
+            min_qty=0.001,
+            min_notional=20.0,
+            step_size=0.001,
+        )
+        self.assertGreater(merged["place_orders"][0]["notional"], 22.0)
+
+        capped = loop_runner_module._cap_best_quote_place_orders_to_max_notional(
+            actions=merged,
+            max_order_notional=22.0,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=20.0,
+        )
+
+        self.assertEqual(capped["place_count"], 1)
+        self.assertGreaterEqual(capped["place_orders"][0]["notional"], 20.0)
+        self.assertLessEqual(capped["place_orders"][0]["notional"], 22.0)
+        self.assertEqual(capped["best_quote_max_order_notional_cap"]["capped_order_count"], 1)
+
+    def test_best_quote_max_order_cap_rechecks_real_submitted_price(self) -> None:
+        prepared_order = {
+            "qty": 0.094,
+            "desired_price": 234.72,
+            "submitted_price": 234.73,
+            "submitted_notional": 22.06462,
+        }
+
+        capped, report = loop_runner_module._cap_best_quote_order_to_max_notional(
+            order=prepared_order,
+            price_field="submitted_price",
+            notional_field="submitted_notional",
+            max_order_notional=22.0,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=20.0,
+        )
+
+        self.assertIsNotNone(capped)
+        self.assertTrue(report["applied"])
+        self.assertEqual(capped["qty"], 0.093)
+        self.assertGreaterEqual(capped["submitted_notional"], 20.0)
+        self.assertLessEqual(capped["submitted_notional"], 22.0)
+
     def test_inventory_reducing_place_priority_keeps_long_exits_before_new_buys(self) -> None:
         actions = {
             "place_orders": [
@@ -8086,6 +8165,7 @@ class LoopRunnerTests(unittest.TestCase):
             bid_price=1.009,
             ask_price=1.010,
             fallback_order_notional=60.0,
+            max_order_notional=22.0,
             step_size=1.0,
             min_qty=1.0,
             min_notional=5.0,
@@ -8096,6 +8176,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(plan["sell_orders"][0]["actual_side_reduce_fallback"])
         self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_reduce_long")
         self.assertEqual(plan["sell_orders"][0]["position_side"], "LONG")
+        self.assertLessEqual(plan["sell_orders"][0]["notional"], 22.0)
 
     def test_soonusdt_volume_profiles_use_entry_price_cost_basis(self) -> None:
         self.assertTrue(_uses_entry_price_cost_basis("chip_low_wear_guarded_v1"))

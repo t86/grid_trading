@@ -43,6 +43,118 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual(plan["buy_orders"][0]["execution_type"], "maker")
         self.assertTrue(plan["buy_orders"][0]["post_only"])
 
+    def test_max_order_notional_caps_two_sided_entry_and_one_sided_reduce_orders(self) -> None:
+        config = BestQuoteMakerVolumeConfig(
+            enabled=True,
+            max_entry_orders_per_side=2,
+            max_long_notional=200.0,
+            max_short_notional=200.0,
+            inventory_soft_ratio=0.70,
+        )
+        flat_plan = build_best_quote_maker_volume_plan(
+            config=config,
+            inputs=_inputs(
+                bid_price=234.71,
+                ask_price=234.72,
+                mid_price=234.715,
+                cycle_budget_notional=88.0,
+                target_volume_remaining=20_000.0,
+                tick_size=0.01,
+                step_size=0.001,
+                min_qty=0.001,
+                min_notional=20.0,
+                max_order_notional=22.0,
+                entry_ladder_spacing=0.05,
+                position_side_mode="hedge",
+                current_long_qty=0.0,
+                current_short_qty=0.0,
+            ),
+        )
+
+        self.assertEqual(len(flat_plan["buy_orders"]), 2)
+        self.assertEqual(len(flat_plan["sell_orders"]), 2)
+        self.assertTrue(
+            all(order["notional"] <= 22.0 for order in flat_plan["buy_orders"] + flat_plan["sell_orders"])
+        )
+
+        reduce_plan = build_best_quote_maker_volume_plan(
+            config=config,
+            inputs=_inputs(
+                bid_price=234.71,
+                ask_price=234.72,
+                mid_price=234.715,
+                current_net_qty=0.70,
+                current_long_qty=0.70,
+                current_short_qty=0.0,
+                current_long_avg_price=230.0,
+                cycle_budget_notional=88.0,
+                target_volume_remaining=20_000.0,
+                tick_size=0.01,
+                step_size=0.001,
+                min_qty=0.001,
+                min_notional=20.0,
+                max_order_notional=22.0,
+                entry_ladder_spacing=0.05,
+                position_side_mode="hedge",
+            ),
+        )
+
+        reduce_orders = [
+            order
+            for order in reduce_plan["sell_orders"]
+            if order["role"] == "best_quote_reduce_long"
+        ]
+        self.assertTrue(reduce_orders)
+        self.assertTrue(all(order["notional"] <= 22.0 for order in reduce_orders))
+
+    def test_bch_high_volatility_budget_consolidates_to_valid_20_to_22_notional_orders(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_entry_orders_per_side=2,
+                max_long_notional=200.0,
+                max_short_notional=200.0,
+                inventory_soft_ratio=0.70,
+                min_cycle_budget_notional=22.0,
+                dynamic_control_enabled=True,
+                dynamic_control_low_volatility_ratio=0.0006,
+                dynamic_control_high_volatility_ratio=0.0015,
+                dynamic_control_extreme_volatility_ratio=0.0025,
+                dynamic_control_high_volatility_budget_scale=0.50,
+                dynamic_control_extreme_volatility_budget_scale=0.50,
+                dynamic_control_trend_bias_max=0.0,
+            ),
+            inputs=_inputs(
+                bid_price=234.71,
+                ask_price=234.72,
+                mid_price=234.715,
+                cycle_budget_notional=88.0,
+                target_volume_remaining=20_000.0,
+                tick_size=0.01,
+                step_size=0.001,
+                min_qty=0.001,
+                min_notional=20.0,
+                max_order_notional=22.0,
+                entry_ladder_spacing=0.05,
+                position_side_mode="hedge",
+                current_long_qty=0.0,
+                current_short_qty=0.0,
+                market_return_1m=0.0018,
+                market_amplitude_1m=0.0020,
+                market_amplitude_5m=0.0020,
+            ),
+        )
+
+        self.assertEqual(plan["metrics"]["dynamic_control"]["reason"], "high_volatility_defensive")
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertTrue(
+            all(
+                20.0 <= order["notional"] <= 22.0
+                for order in plan["buy_orders"] + plan["sell_orders"]
+            )
+        )
+
     def test_long_inventory_biases_toward_reduce_long(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(enabled=True, max_long_notional=1_000.0),
