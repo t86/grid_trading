@@ -1321,6 +1321,21 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
         )
 
+    def test_arx_zero_entry_sla_relaxes_soft_blockers_even_when_hourly_pace_is_ahead(self) -> None:
+        self.assertTrue(
+            bq_volume_recovery_guard.should_relax_arx_zero_order_volume_blockers(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=1.5,
+                active_order_count=0,
+                planned_order_count=1,
+                near_cap=False,
+                volatility_entry_pause_active=False,
+                pause_reasons=["low_volatility_expand"],
+                one_sided_entry_stalled=True,
+            )
+        )
+
     def test_arx_exchange_order_drift_requires_actual_empty_book(self) -> None:
         self.assertTrue(
             bq_volume_recovery_guard.should_restart_arx_for_exchange_order_drift(

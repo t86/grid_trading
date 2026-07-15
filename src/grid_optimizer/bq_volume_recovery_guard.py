@@ -2551,14 +2551,22 @@ def should_relax_arx_zero_order_volume_blockers(
         "inventory_bias",
         "low_volatility_expand",
     }
+    empty_book = (
+        int(active_order_count) <= 0
+        and int(planned_order_count) <= 1
+    )
+    empty_book_sla_due = empty_book and bool(one_sided_entry_stalled)
     return (
         symbol.upper().strip() == "ARXUSDT"
         and bool(target_pace_behind)
-        and float(pace_ratio) < 0.75
+        # A temporarily healthy trailing hour must not mask a live empty
+        # maker book after the no-fill SLA has elapsed. This remains bounded
+        # to soft blockers; hard cap and volatility gates below still win.
+        and (float(pace_ratio) < 0.75 or empty_book_sla_due)
         and (
             # One unplaced plan leg is operationally equivalent to an empty
             # book: it cannot restore two-sided maker flow by itself.
-            (int(active_order_count) <= 0 and int(planned_order_count) <= 1)
+            empty_book
             # An active leg on only one side is equally unsafe for a volume
             # target when the anti-chase guard is what rejected its opposite.
             # Do not wait for the book to become fully empty before restoring
