@@ -1312,6 +1312,51 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 same_side_entry_blocked=True,
             )
         )
+        self.assertTrue(
+            bq_volume_recovery_guard.should_relax_arx_zero_order_volume_blockers(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.53,
+                active_order_count=2,
+                planned_order_count=2,
+                near_cap=False,
+                volatility_entry_pause_active=False,
+                pause_reasons=["low_volatility_expand"],
+                same_side_entry_blocked=True,
+                planned_entry_one_sided=True,
+                one_sided_entry_stalled=True,
+            )
+        )
+        self.assertFalse(
+            bq_volume_recovery_guard.should_relax_arx_zero_order_volume_blockers(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.53,
+                active_order_count=2,
+                planned_order_count=2,
+                near_cap=False,
+                volatility_entry_pause_active=False,
+                pause_reasons=["low_volatility_expand"],
+                same_side_entry_blocked=True,
+                planned_entry_one_sided=False,
+                one_sided_entry_stalled=True,
+            )
+        )
+        self.assertFalse(
+            bq_volume_recovery_guard.should_relax_arx_zero_order_volume_blockers(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.53,
+                active_order_count=2,
+                planned_order_count=2,
+                near_cap=False,
+                volatility_entry_pause_active=False,
+                pause_reasons=["low_volatility_expand"],
+                same_side_entry_blocked=True,
+                planned_entry_one_sided=True,
+                one_sided_entry_stalled=False,
+            )
+        )
         self.assertFalse(
             bq_volume_recovery_guard.should_relax_arx_zero_order_volume_blockers(
                 symbol="ARXUSDT",

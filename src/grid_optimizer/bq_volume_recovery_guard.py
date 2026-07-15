@@ -2176,8 +2176,10 @@ def should_relax_arx_zero_order_volume_blockers(
     volatility_entry_pause_active: bool,
     pause_reasons: list[str] | set[str] | tuple[str, ...],
     same_side_entry_blocked: bool = False,
+    planned_entry_one_sided: bool = False,
+    one_sided_entry_stalled: bool = False,
 ) -> bool:
-    """Permit a bounded ARX escape when soft guards leave the book empty.
+    """Permit a bounded ARX escape when soft guards remove a maker entry leg.
 
     The runner's hard position caps and volatility pause remain authoritative.
     This only gives the recovery guard a reversible way to restore maker
@@ -2192,11 +2194,21 @@ def should_relax_arx_zero_order_volume_blockers(
     return (
         symbol.upper().strip() == "ARXUSDT"
         and bool(target_pace_behind)
-        and float(pace_ratio) < 0.30
-        and int(active_order_count) <= 0
-        # One unplaced plan leg is operationally equivalent to an empty book:
-        # it cannot restore two-sided maker flow by itself.
-        and int(planned_order_count) <= 1
+        and float(pace_ratio) < 0.75
+        and (
+            # One unplaced plan leg is operationally equivalent to an empty
+            # book: it cannot restore two-sided maker flow by itself.
+            (int(active_order_count) <= 0 and int(planned_order_count) <= 1)
+            # An active leg on only one side is equally unsafe for a volume
+            # target when the anti-chase guard is what rejected its opposite.
+            # Do not wait for the book to become fully empty before restoring
+            # the missing maker leg.
+            or (
+                bool(same_side_entry_blocked)
+                and bool(planned_entry_one_sided)
+                and bool(one_sided_entry_stalled)
+            )
+        )
         and not bool(near_cap)
         and not bool(volatility_entry_pause_active)
         and (
@@ -4074,6 +4086,11 @@ def check_symbol(
         )
         if isinstance(preflight_same_side_guard, dict)
         else False,
+        planned_entry_one_sided=planned_entry_one_sided,
+        one_sided_entry_stalled=(
+            no_fill_seconds >= fast_sla_seconds
+            or one_sided_entry_seconds >= fast_sla_seconds
+        ),
     ):
         for key in (
             "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled",
