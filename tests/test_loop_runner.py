@@ -9825,6 +9825,57 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(short_pause or 0.0, 2725.0)
         self.assertAlmostEqual(long_pause or 0.0, 2725.0)
 
+    def test_best_quote_inventory_unlock_uses_active_volatility_recovery_threshold(self) -> None:
+        args = SimpleNamespace(
+            best_quote_maker_volume_inventory_soft_ratio=0.70,
+            best_quote_maker_volume_max_long_notional=200.0,
+            best_quote_maker_volume_max_short_notional=200.0,
+            volatility_entry_pause_inventory_recover_ratio=0.75,
+        )
+
+        pause_notional = _resolve_inventory_unlock_pause_notional(
+            args=args,
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            side="short",
+            fallback_pause_notional=140.0,
+            volatility_entry_pause={
+                "active": True,
+                "inventory_gate_active": True,
+                "state": {"trigger_inventory_notional": 109.68728},
+            },
+        )
+
+        self.assertAlmostEqual(pause_notional or 0.0, 82.26546)
+        plan = {"buy_orders": [], "sell_orders": []}
+        state = {"inventory_unlock_release": {"side": "short", "stall_count": 2}}
+        report = apply_inventory_unlock_release(
+            plan=plan,
+            state=state,
+            side="short",
+            entry_paused=True,
+            take_profit_guard={"enabled": True, "short_active": True, "short_ceiling_price": 236.41},
+            current_qty=0.464,
+            current_notional=109.84,
+            pause_notional=pause_notional,
+            release_cap_notional=22.0,
+            per_order_notional=22.0,
+            step_price=0.05,
+            tick_size=0.01,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=20.0,
+            bid_price=236.71,
+            ask_price=236.72,
+            position_side="SHORT",
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["reason"], "stalled_inventory_pause")
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertEqual(plan["buy_orders"][0]["role"], "inventory_unlock_reduce_short")
+        self.assertEqual(plan["buy_orders"][0]["time_in_force"], "GTX")
+        self.assertLessEqual(plan["buy_orders"][0]["notional"], 22.0)
+
     def test_inventory_unlock_release_fires_for_best_quote_short_soft_stall(self) -> None:
         plan = {
             "buy_orders": [],

@@ -14216,6 +14216,7 @@ def _resolve_inventory_unlock_pause_notional(
     fallback_pause_notional: float | None,
     open_entry_notional: float = 0.0,
     pending_entry_buffer_notional: float = 0.0,
+    volatility_entry_pause: Mapping[str, Any] | dict[str, Any] | None = None,
 ) -> float | None:
     if not _is_best_quote_maker_volume_mode(strategy_mode):
         return fallback_pause_notional
@@ -14235,6 +14236,20 @@ def _resolve_inventory_unlock_pause_notional(
     )
     if soft_notional <= 0:
         return fallback_pause_notional
+    volatility_pause = dict(volatility_entry_pause or {})
+    if bool(volatility_pause.get("active")) and bool(volatility_pause.get("inventory_gate_active")):
+        pause_state = volatility_pause.get("state")
+        pause_state = dict(pause_state) if isinstance(pause_state, dict) else {}
+        trigger_inventory_notional = max(
+            _safe_float(pause_state.get("trigger_inventory_notional")),
+            0.0,
+        )
+        recover_ratio = _clamp_ratio(
+            _safe_float(getattr(args, "volatility_entry_pause_inventory_recover_ratio", 1.0))
+        )
+        volatility_recover_notional = trigger_inventory_notional * recover_ratio
+        if volatility_recover_notional > 0:
+            soft_notional = min(soft_notional, volatility_recover_notional)
     fallback = max(_safe_float(fallback_pause_notional), 0.0)
     if fallback <= 0:
         return soft_notional
@@ -22666,6 +22681,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         fallback_pause_notional=effective_args.pause_buy_position_notional,
         open_entry_notional=_safe_float(best_quote_metrics.get("open_entry_long_notional")),
         pending_entry_buffer_notional=_safe_float(best_quote_metrics.get("pending_entry_buffer_notional")),
+        volatility_entry_pause=volatility_entry_pause,
     )
     unlock_short_pause_notional = _resolve_inventory_unlock_pause_notional(
         args=effective_args,
@@ -22674,6 +22690,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         fallback_pause_notional=effective_args.pause_short_position_notional,
         open_entry_notional=_safe_float(best_quote_metrics.get("open_entry_short_notional")),
         pending_entry_buffer_notional=_safe_float(best_quote_metrics.get("pending_entry_buffer_notional")),
+        volatility_entry_pause=volatility_entry_pause,
     )
     unlock_long_entry_paused = bool(controls.get("buy_paused")) or (
         best_quote_unlock_mode
