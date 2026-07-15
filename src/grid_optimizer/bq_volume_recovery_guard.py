@@ -4378,7 +4378,12 @@ def check_symbol(
         symbol=normalized_symbol,
         control=control,
         temporary_anti_chase_relief=(
-            _safe_float(
+            bool(
+                recovery_expected_controls.get(
+                    "best_quote_maker_volume_same_side_entry_price_guard_report_only"
+                )
+            )
+            or _safe_float(
                 recovery_expected_controls.get(
                     "best_quote_maker_volume_same_side_entry_price_guard_min_notional"
                 )
