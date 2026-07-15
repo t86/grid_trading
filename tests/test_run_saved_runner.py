@@ -81,6 +81,35 @@ class RunSavedRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.run_saved_runner.os.execvpe")
     @patch("grid_optimizer.run_saved_runner._build_runner_command")
     @patch("grid_optimizer.run_saved_runner._load_runner_control_config")
+    def test_main_binds_command_symbol_to_service_instance(
+        self,
+        mock_load_runner_control_config,
+        mock_build_runner_command,
+        _mock_execvpe,
+        _mock_write_pid,
+        _mock_atexit_register,
+        _mock_getcwd,
+        _mock_chdir,
+    ) -> None:
+        mock_load_runner_control_config.return_value = {"symbol": "NIGHTUSDT", "strategy_profile": "volume_long_v4"}
+        mock_build_runner_command.return_value = ["python", "-m", "grid_optimizer.loop_runner", "--symbol", "ARXUSDT"]
+
+        with patch.dict("os.environ", {}, clear=True), patch.object(
+            sys, "argv", ["run_saved_runner.py", "--symbol", "arxusdt"]
+        ):
+            run_saved_runner.main()
+
+        mock_build_runner_command.assert_called_once_with(
+            {"symbol": "ARXUSDT", "strategy_profile": "volume_long_v4"}
+        )
+
+    @patch("grid_optimizer.run_saved_runner.os.chdir")
+    @patch("grid_optimizer.run_saved_runner.os.getcwd", return_value="/repo")
+    @patch("grid_optimizer.run_saved_runner.atexit.register")
+    @patch("grid_optimizer.run_saved_runner._write_pid")
+    @patch("grid_optimizer.run_saved_runner.os.execvpe")
+    @patch("grid_optimizer.run_saved_runner._build_runner_command")
+    @patch("grid_optimizer.run_saved_runner._load_runner_control_config")
     def test_main_anchors_relative_runtime_paths_to_runner_work_dir(
         self,
         mock_load_runner_control_config,

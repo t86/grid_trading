@@ -1311,6 +1311,42 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
         )
 
+    def test_arx_effective_control_drift_restarts_once_and_keeps_recovery_running(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            _write_json(
+                output_dir / "arxusdt_loop_runner_control.json",
+                {"sticky_entry_preserve_less_aggressive": False},
+            )
+            _write_json(output_dir / "arxusdt_loop_latest_plan.json", {})
+            state: dict[str, object] = {}
+            restarted: list[str] = []
+            first = bq_volume_recovery_guard.recover_arx_effective_control_drift(
+                output_dir=output_dir,
+                symbol="ARXUSDT",
+                state=state,
+                now=datetime(2026, 7, 14, tzinfo=timezone.utc),
+                cooldown_seconds=60.0,
+                dry_run=False,
+                runner_wrapper="unused",
+                restart_runner=lambda symbol: restarted.append(symbol),
+            )
+            repeated = bq_volume_recovery_guard.recover_arx_effective_control_drift(
+                output_dir=output_dir,
+                symbol="ARXUSDT",
+                state=state,
+                now=datetime(2026, 7, 14, 0, 2, tzinfo=timezone.utc),
+                cooldown_seconds=60.0,
+                dry_run=False,
+                runner_wrapper="unused",
+                restart_runner=lambda symbol: restarted.append(symbol),
+            )
+
+        self.assertEqual("restart_arx_effective_control_drift", first["action"])
+        self.assertEqual("hold_arx_effective_control_drift_already_restarted", repeated["action"])
+        self.assertTrue(repeated["allow_recovery_check"])
+        self.assertEqual(["ARXUSDT"], restarted)
+
     def test_arx_severe_target_gap_releases_during_post_restore_cooldown(self) -> None:
         now = datetime(2026, 7, 12, 11, 56, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

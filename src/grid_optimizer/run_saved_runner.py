@@ -176,6 +176,10 @@ def main() -> None:
         # the process being replaced.  Otherwise a stale one-way command can
         # overwrite a corrected hedge-mode control during bootstrap.
         config = _load_runner_control_config(symbol, include_running_process=False)
+        # The systemd instance is the authority for its symbol.  A stale or
+        # cross-symbol control document must never make grid-loop@ARXUSDT
+        # launch another market while still writing ARX runtime artifacts.
+        config["symbol"] = symbol
         command_builder = _build_runner_command
     command = command_builder(config)
     command = _anchor_relative_runtime_paths(command, runner_work_dir)
