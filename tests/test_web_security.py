@@ -2768,6 +2768,18 @@ class WebSecurityTests(unittest.TestCase):
                 {"symbol": "BCHUSDT", "strategy_profile": "bchusdt_altcoins_probe_v1"}
             )
 
+    def test_runner_start_safety_preflight_accepts_fresh_symbol_without_runtime_artifacts(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            web_module._runner_start_safety_preflight(
+                {
+                    "symbol": "BCHUSDT",
+                    "plan_json": str(root / "missing_plan.json"),
+                    "submit_report_json": str(root / "missing_submit.json"),
+                    "summary_jsonl": str(root / "missing_events.jsonl"),
+                }
+            )
+
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     def test_resolve_runner_start_config_starts_volume_neutral_ping_pong_profile(self, mock_symbol_config, mock_book_tickers) -> None:

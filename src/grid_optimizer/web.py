@@ -8980,8 +8980,8 @@ def _runner_start_safety_preflight(
     submit_path = Path(str(config.get("submit_report_json", "")).strip()) if not spot else None
     events_path = Path(str(config.get("summary_jsonl", "")).strip())
 
-    plan = _read_json_dict(plan_path) if plan_path and str(plan_path) else {}
-    submit = _read_json_dict(submit_path) if submit_path and str(submit_path) else {}
+    plan = (_read_json_dict(plan_path) or {}) if plan_path and str(plan_path) else {}
+    submit = (_read_json_dict(submit_path) or {}) if submit_path and str(submit_path) else {}
     recent_events = _tail_jsonl_dicts(events_path, limit=40) if str(events_path) else []
 
     open_order_diffs: list[int] = []
