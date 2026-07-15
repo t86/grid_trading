@@ -179,6 +179,22 @@ def _fetch_arx_strategy_order_snapshot(symbol: str) -> dict[str, Any]:
     }
 
 
+def _planned_entry_order_count(plan: Mapping[str, Any]) -> int:
+    count = 0
+    for key in ("buy_orders", "sell_orders"):
+        for order in plan.get(key) or []:
+            if not isinstance(order, Mapping):
+                continue
+            if bool(
+                order.get("force_reduce_only")
+                or order.get("reduce_only")
+                or order.get("reduceOnly")
+            ):
+                continue
+            count += 1
+    return count
+
+
 def _salvage_truncated_order_refs_state(
     *,
     state_path: Path,
@@ -1750,6 +1766,7 @@ def recover_arx_exchange_order_drift(
     *,
     symbol: str,
     local_active_order_count: int,
+    expected_entry_order_count: int = 0,
     submit: dict[str, Any] | None = None,
     state: dict[str, Any],
     now: datetime,
@@ -1759,11 +1776,12 @@ def recover_arx_exchange_order_drift(
     restart_runner: RestartRunner | None = None,
     exchange_snapshot_fetcher: CorruptStateExchangeFetcher | None = None,
 ) -> dict[str, Any] | None:
-    """Restart ARX only when Binance confirms the runner book is empty.
+    """Restart ARX when Binance loses the runner's expected maker capacity.
 
     The runner's websocket/cache view can preserve a filled or cancelled order
     briefly.  That must not suppress recovery while the exchange has no
-    runner-owned maker order at all.
+    runner-owned maker order at all, or has lost two legs of a four-leg
+    two-sided entry plan.
     """
     normalized_symbol = symbol.upper().strip()
     if normalized_symbol != "ARXUSDT" or int(local_active_order_count) <= 0:
@@ -1787,6 +1805,7 @@ def recover_arx_exchange_order_drift(
     if not should_restart_arx_for_exchange_order_drift(
         symbol=normalized_symbol,
         local_active_order_count=local_active_order_count,
+        expected_entry_order_count=expected_entry_order_count,
         exchange_open_order_count=exchange_open_order_count,
     ):
         return None
@@ -1817,6 +1836,7 @@ def recover_arx_exchange_order_drift(
         "dry_run": dry_run,
         "restart_failed": None,
         "local_active_order_count": int(local_active_order_count),
+        "expected_entry_order_count": int(expected_entry_order_count),
         "exchange_open_order_count": exchange_open_order_count,
         "exchange_strategy_order_ids": exchange.get("strategy_order_ids") or [],
     }
@@ -1843,11 +1863,17 @@ def recover_arx_exchange_order_drift(
         {
             "last_exchange_order_drift_restart_at": now.isoformat(),
             "last_recovery_action_at": now.isoformat(),
-            "last_recovery_action": "restart_arx_exchange_order_drift",
+            "last_recovery_action": "restart_arx_partial_exchange_order_drift"
+            if exchange_open_order_count > 0
+            else "restart_arx_exchange_order_drift",
             "status": "exchange_order_drift_recovery_active",
         }
     )
-    result["action"] = "restart_arx_exchange_order_drift"
+    result["action"] = (
+        "restart_arx_partial_exchange_order_drift"
+        if exchange_open_order_count > 0
+        else "restart_arx_exchange_order_drift"
+    )
     return result
 
 
@@ -2228,12 +2254,25 @@ def should_restart_arx_for_exchange_order_drift(
     symbol: str,
     local_active_order_count: int,
     exchange_open_order_count: int,
+    expected_entry_order_count: int = 0,
 ) -> bool:
-    """A stream-only order count must not suppress ARX recovery."""
+    """A stream-only order count must not suppress ARX recovery.
+
+    A normal ARX maker plan has two entry levels per side.  If Binance has
+    lost two of those four runner-owned orders, the surviving half-book is a
+    material throughput fault, not a healthy partial replacement window.
+    """
+    expected_entries = max(int(expected_entry_order_count), 0)
     return (
         symbol.upper().strip() == "ARXUSDT"
         and int(local_active_order_count) > 0
-        and int(exchange_open_order_count) == 0
+        and (
+            int(exchange_open_order_count) == 0
+            or (
+                expected_entries >= 4
+                and int(exchange_open_order_count) <= expected_entries - 2
+            )
+        )
     )
 
 
@@ -8499,6 +8538,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         item.pop("exchange_trade_fetch_deferred_until", None)
         submit = _read_json(_submit_path(output_dir, symbol))
+        plan_for_drift_recovery = _read_json(_plan_path(output_dir, symbol))
         local_active_order_count = _safe_int(
             (submit.get("observed_strategy_open_order_state") or {}).get(
                 "active_order_count"
@@ -8512,6 +8552,7 @@ def main(argv: list[str] | None = None) -> int:
         exchange_order_drift_result = recover_arx_exchange_order_drift(
             symbol=symbol,
             local_active_order_count=local_active_order_count,
+            expected_entry_order_count=_planned_entry_order_count(plan_for_drift_recovery),
             submit=submit,
             state=state,
             now=now,

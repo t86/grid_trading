@@ -1203,6 +1203,24 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
         )
 
+    def test_arx_exchange_order_drift_restarts_for_missing_two_sided_entry_legs(self) -> None:
+        self.assertTrue(
+            bq_volume_recovery_guard.should_restart_arx_for_exchange_order_drift(
+                symbol="ARXUSDT",
+                local_active_order_count=2,
+                expected_entry_order_count=4,
+                exchange_open_order_count=2,
+            )
+        )
+        self.assertFalse(
+            bq_volume_recovery_guard.should_restart_arx_for_exchange_order_drift(
+                symbol="ARXUSDT",
+                local_active_order_count=2,
+                expected_entry_order_count=4,
+                exchange_open_order_count=3,
+            )
+        )
+
     def test_arx_exchange_order_drift_restarts_only_when_exchange_is_empty(self) -> None:
         restarted: list[str] = []
         state: dict[str, object] = {}
