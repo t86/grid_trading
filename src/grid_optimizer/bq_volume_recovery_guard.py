@@ -3071,6 +3071,35 @@ def arx_low_pace_two_sided_maker_restore_updates(
     return {key: value for key, value in targets.items() if control.get(key) != value}
 
 
+def arx_two_sided_entry_restore_pending(
+    *,
+    symbol: str,
+    item: dict[str, Any],
+    assessment: dict[str, Any],
+    now: datetime,
+) -> bool:
+    """Keep ARX recovery controls until both near-maker entry legs are observed."""
+    if symbol.upper().strip() != "ARXUSDT":
+        return False
+    pending_until = _parse_time(item.get("arx_two_sided_restore_pending_until"))
+    if pending_until is None:
+        return False
+    if now >= pending_until:
+        item.pop("arx_two_sided_restore_pending_until", None)
+        return False
+    both_entry_legs_live = (
+        _safe_int(assessment.get("active_order_count")) >= 2
+        and _safe_int(assessment.get("near_market_entry_order_count")) >= 2
+        and _safe_int(assessment.get("planned_entry_buy_order_count")) > 0
+        and _safe_int(assessment.get("planned_entry_sell_order_count")) > 0
+        and not bool(assessment.get("ineffective_orders"))
+    )
+    if both_entry_legs_live:
+        item.pop("arx_two_sided_restore_pending_until", None)
+        return False
+    return True
+
+
 def should_keep_arx_low_pace_two_sided_flow(
     *,
     target_pace_behind: bool,
@@ -4280,6 +4309,12 @@ def check_symbol(
         else {}
     )
     recovery_started_at = _parse_time(item.get("recovery_started_at"))
+    arx_two_sided_restore_pending = arx_two_sided_entry_restore_pending(
+        symbol=normalized_symbol,
+        item=item,
+        assessment=assessment,
+        now=now,
+    )
     recovery_timed_out = (
         recovery_started_at is not None
         and (now - recovery_started_at).total_seconds() >= max(float(max_recovery_seconds), 0.0)
@@ -4943,6 +4978,10 @@ def check_symbol(
                     "last_recovery_action_at": now.isoformat(),
                     "last_recovery_action": action,
                     "last_sla_action_at": now.isoformat(),
+                    "arx_two_sided_restore_pending_until": (
+                        now
+                        + timedelta(seconds=max(min(float(max_recovery_seconds), 300.0), 120.0))
+                    ).isoformat(),
                 }
             )
             changed, backup_path = _apply_control_update(
@@ -5001,6 +5040,10 @@ def check_symbol(
                     now=now,
                     cooldown_seconds=post_restore_cooldown_seconds,
                 )
+                item["arx_two_sided_restore_pending_until"] = (
+                    now
+                    + timedelta(seconds=max(min(float(max_recovery_seconds), 300.0), 120.0))
+                ).isoformat()
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
@@ -5601,6 +5644,15 @@ def check_symbol(
                 now=now,
                 dry_run=dry_run,
                 restart_runner=restart,
+            )
+        elif arx_two_sided_restore_pending:
+            action = "hold_arx_two_sided_entry_verification"
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "last_recovery_action": action,
+                    "last_recovery_action_at": now.isoformat(),
+                }
             )
         elif pause_baseline_updates:
             updates = {

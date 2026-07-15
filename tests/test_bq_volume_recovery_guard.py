@@ -674,6 +674,38 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(0, updates["best_quote_maker_volume_quote_offset_ticks"])
         self.assertTrue(updates["best_quote_maker_volume_same_side_entry_price_guard_report_only"])
 
+    def test_arx_two_sided_restore_holds_baseline_until_both_entry_legs_are_live(self) -> None:
+        now = datetime(2026, 7, 15, 14, 40, tzinfo=timezone.utc)
+        item = {
+            "arx_two_sided_restore_pending_until": (now + timedelta(minutes=5)).isoformat()
+        }
+        waiting = {
+            "active_order_count": 0,
+            "near_market_entry_order_count": 0,
+            "planned_entry_buy_order_count": 0,
+            "planned_entry_sell_order_count": 0,
+            "ineffective_orders": True,
+        }
+        self.assertTrue(
+            bq_volume_recovery_guard.arx_two_sided_entry_restore_pending(
+                symbol="ARXUSDT", item=item, assessment=waiting, now=now
+            )
+        )
+
+        two_sided = {
+            "active_order_count": 2,
+            "near_market_entry_order_count": 2,
+            "planned_entry_buy_order_count": 1,
+            "planned_entry_sell_order_count": 1,
+            "ineffective_orders": False,
+        }
+        self.assertFalse(
+            bq_volume_recovery_guard.arx_two_sided_entry_restore_pending(
+                symbol="ARXUSDT", item=item, assessment=two_sided, now=now
+            )
+        )
+        self.assertNotIn("arx_two_sided_restore_pending_until", item)
+
     def test_arx_critical_low_pace_doubles_temporary_maker_cycle_budget(self) -> None:
         updates = bq_volume_recovery_guard.arx_low_pace_two_sided_maker_restore_updates(
             control={
