@@ -2254,6 +2254,51 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(actual["best_quote_maker_volume_quote_offset_ticks"], 1)
             self.assertEqual(actual["external_monitor_generation"], 9)
 
+    def test_arx_control_write_cannot_restore_active_side_above_cap(self) -> None:
+        now = datetime(2026, 7, 15, 7, 55, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "arxusdt_loop_runner_control.json"
+            control = {
+                "pause_buy_position_notional": 900.0,
+                "pause_short_position_notional": 900.0,
+                "max_position_notional": 1000.0,
+                "max_short_position_notional": 1000.0,
+                "maker_max_long_notional": 1000.0,
+                "maker_max_short_notional": 1000.0,
+                "best_quote_maker_volume_max_long_notional": 1000.0,
+                "best_quote_maker_volume_max_short_notional": 1000.0,
+            }
+            _write_json(control_path, control)
+
+            _apply_control_update(
+                symbol="ARXUSDT",
+                control_path=control_path,
+                control=control,
+                updates={
+                    "pause_buy_position_notional": 1800.0,
+                    "pause_short_position_notional": 1800.0,
+                    "max_position_notional": 2000.0,
+                    "max_short_position_notional": 2000.0,
+                    "maker_max_long_notional": 2000.0,
+                    "maker_max_short_notional": 2000.0,
+                    "best_quote_maker_volume_max_long_notional": 2000.0,
+                    "best_quote_maker_volume_max_short_notional": 2000.0,
+                },
+                now=now,
+                dry_run=False,
+                restart_runner=lambda _symbol: None,
+            )
+
+            actual = json.loads(control_path.read_text(encoding="utf-8"))
+            self.assertEqual(actual["pause_buy_position_notional"], 900.0)
+            self.assertEqual(actual["pause_short_position_notional"], 900.0)
+            self.assertEqual(actual["max_position_notional"], 1000.0)
+            self.assertEqual(actual["max_short_position_notional"], 1000.0)
+            self.assertEqual(actual["maker_max_long_notional"], 1000.0)
+            self.assertEqual(actual["maker_max_short_notional"], 1000.0)
+            self.assertEqual(actual["best_quote_maker_volume_max_long_notional"], 1000.0)
+            self.assertEqual(actual["best_quote_maker_volume_max_short_notional"], 1000.0)
+
     def test_effective_near_market_flow_blocks_loss_reduce_for_twelve_cycles(self) -> None:
         """Existing maker flow is never replaced by loss-reduce on a noisy window."""
         decide = bq_volume_recovery_guard.should_enter_loss_reduce

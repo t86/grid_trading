@@ -1665,6 +1665,9 @@ def _apply_control_update(
     dry_run: bool,
     restart_runner: RestartRunner,
 ) -> tuple[list[str], str | None]:
+    if symbol.upper().strip() == "ARXUSDT":
+        proposed = {**control, **updates}
+        updates = {**updates, **arx_single_side_cap_updates(proposed)}
     if dry_run:
         changed = [key for key, value in updates.items() if control.get(key) != value]
         return changed, None
@@ -1673,6 +1676,9 @@ def _apply_control_update(
     # by a stale whole-document write, then keep the lock through restart.
     with exclusive_control_lock(control_path):
         current = _read_json(control_path) or dict(control)
+        if symbol.upper().strip() == "ARXUSDT":
+            proposed = {**current, **updates}
+            updates = {**updates, **arx_single_side_cap_updates(proposed)}
         changed = [key for key, value in updates.items() if current.get(key) != value]
         if not changed:
             return [], None
