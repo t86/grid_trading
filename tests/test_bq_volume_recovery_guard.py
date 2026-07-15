@@ -761,6 +761,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertTrue(start["best_quote_maker_volume_allow_loss_reduce_only"])
         self.assertEqual(900.0, start["pause_buy_position_notional"])
         self.assertEqual(900.0, start["pause_short_position_notional"])
+        self.assertEqual(160.0, start["maker_order_notional"])
 
         one_sided_cap = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
             control=control,

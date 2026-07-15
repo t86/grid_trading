@@ -92,6 +92,7 @@ _RECOVERY_CONTROL_KEYS = (
     "max_actual_net_notional",
     "max_position_notional",
     "max_short_position_notional",
+    "maker_order_notional",
     "maker_max_long_notional",
     "maker_max_short_notional",
     "best_quote_maker_volume_max_long_notional",
@@ -2757,6 +2758,14 @@ def arx_side_cap_unwind_updates(
             # ordinary entry refill the just-released side.
             "pause_buy_position_notional": long_recovery_target,
             "pause_short_position_notional": short_recovery_target,
+            # At the 1,800–2,000U real-side boundary the default 48U
+            # directional fallback cannot create room before the next
+            # recovery cycle.  Keep the order maker-only but make the
+            # temporary relief materially large enough to restore two-sided
+            # capacity without breaching the hard cap.
+            "maker_order_notional": max(
+                _safe_float(control.get("maker_order_notional")), 160.0
+            ),
             "loss_inventory_no_cross_small_entry_notional": 200.0,
             "best_quote_maker_volume_quote_offset_ticks": max(
                 _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) - 1,
