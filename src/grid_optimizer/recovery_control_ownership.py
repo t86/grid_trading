@@ -47,6 +47,11 @@ def write_control_json_atomically(control_path: Path, payload: dict[str, Any]) -
         json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
         temporary_path = Path(handle.name)
+    # The guard can run as root while the symbol runner runs as an unprivileged
+    # service user.  Control is not secret material (credentials live in the
+    # service environment), so the replacement must remain readable by that
+    # runner after os.replace.
+    os.chmod(temporary_path, 0o644)
     os.replace(temporary_path, control_path)
 
 
