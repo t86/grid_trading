@@ -2686,6 +2686,22 @@ def arx_low_pace_two_sided_maker_restore_updates(
     ).lower().strip()
     allow_loss = bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
     quote_offset = _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks"))
+    critical_low_pace = float(pace_ratio) < 0.5
+    current_cycle_budget = _safe_float(
+        control.get("best_quote_maker_volume_cycle_budget_notional")
+    )
+    has_exchange_sides = (
+        _safe_float(actual_long_notional) > 0.0
+        and _safe_float(actual_short_notional) > 0.0
+    )
+    needs_restore = (
+        active_direction != "off" or allow_loss or quote_offset > 0
+    )
+    needs_capacity = (
+        critical_low_pace
+        and has_exchange_sides
+        and current_cycle_budget < 720.0
+    )
     if (
         not target_pace_behind
         or float(pace_ratio) >= 0.75
@@ -2693,7 +2709,7 @@ def arx_low_pace_two_sided_maker_restore_updates(
         or bool(volatility_entry_pause_active)
         or bool(high_recovery_wear)
         or max(_safe_float(actual_long_notional), _safe_float(actual_short_notional)) >= 1800.0
-        or (active_direction == "off" and not allow_loss and quote_offset <= 0)
+        or not (needs_restore or needs_capacity)
     ):
         return {}
     targets = {
@@ -2705,6 +2721,12 @@ def arx_low_pace_two_sided_maker_restore_updates(
         "best_quote_maker_volume_same_side_entry_price_guard_report_only": True,
         "sticky_entry_price_tolerance_steps": 1.0,
     }
+    if needs_capacity:
+        # The normal ARX profile is 360U per maker cycle.  At less than half
+        # of the required pace, one temporary 2x cycle is the smallest
+        # capacity change that can close the gap; the runner's side caps still
+        # bound any individual fill.
+        targets["best_quote_maker_volume_cycle_budget_notional"] = 720.0
     return {key: value for key, value in targets.items() if control.get(key) != value}
 
 
