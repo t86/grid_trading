@@ -2059,8 +2059,20 @@ def _restore_arx_frozen_ledger_after_reset(
     archive_path = state_path.with_name(
         state_path.name + f".before_bq_frozen_ledger_recovery_{now.strftime('%Y%m%dT%H%M%SZ')}"
     )
+    try:
+        state_owner = state_path.stat()
+    except OSError:
+        state_owner = None
     _write_json(archive_path, current)
     _write_json(state_path, restored)
+    if state_owner is not None:
+        for path in (archive_path, state_path):
+            try:
+                os.chown(path, state_owner.st_uid, state_owner.st_gid)
+            except PermissionError:
+                # The guard can also run as the runner user, which cannot
+                # change ownership but already creates a writable file.
+                pass
     result["archived_state_path"] = str(archive_path)
     return result
 
