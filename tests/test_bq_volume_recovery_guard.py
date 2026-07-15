@@ -1653,6 +1653,19 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             ),
             {},
         )
+        control["best_quote_maker_volume_same_side_entry_price_guard_report_only"] = True
+        self.assertEqual(
+            _arx_independent_freeze_policy_updates(
+                symbol="ARXUSDT",
+                control=control,
+                temporary_anti_chase_relief=True,
+            ),
+            {},
+        )
+        self.assertEqual(
+            _arx_independent_freeze_policy_updates(symbol="ARXUSDT", control=control),
+            {"best_quote_maker_volume_same_side_entry_price_guard_report_only": False},
+        )
 
     def test_arx_high_wear_clears_stale_directional_unwind_below_soft_limit(self) -> None:
         control = {

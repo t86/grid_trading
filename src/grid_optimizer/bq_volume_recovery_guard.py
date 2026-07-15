@@ -1705,11 +1705,16 @@ def _arx_independent_freeze_policy_updates(
         "best_quote_maker_volume_frozen_pair_release_enabled": False,
         "best_quote_maker_volume_frozen_pair_release_allow_loss": False,
         "best_quote_maker_volume_same_side_entry_price_guard_enabled": True,
-        "best_quote_maker_volume_same_side_entry_price_guard_report_only": False,
         "best_quote_maker_volume_net_loss_reduce_enabled": False,
         "adverse_reduce_enabled": False,
         "hard_loss_forced_reduce_enabled": False,
     }
+    # A low-pace recovery may temporarily make the anti-chase guard
+    # observational so its missing maker leg can return.  Freeze policy
+    # reconciliation must not immediately write the runtime default back and
+    # erase that recovery action.
+    if not temporary_anti_chase_relief:
+        expected["best_quote_maker_volume_same_side_entry_price_guard_report_only"] = False
     return {key: value for key, value in expected.items() if control.get(key) != value}
 
 
