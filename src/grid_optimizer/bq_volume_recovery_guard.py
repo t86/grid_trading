@@ -2835,9 +2835,15 @@ def arx_low_pace_two_sided_maker_restore_updates(
         # The normal ARX profile is 360U per maker cycle.  A lagging pace gets
         # 2x capacity; a critical miss gets a 1,000U cycle.  This is maker
         # flow only, so elevated recent wear does not suppress the user-asked
-        # volume recovery. The profile soft band remains below the approved
-        # 1,000U ordinary-inventory hard boundary.
+        # volume recovery.  The submitter limits the *combined* notional of
+        # both maker legs, so it must have room for two recovery legs; without
+        # that the runner builds a valid two-sided plan which submit rejects
+        # wholesale.  This does not raise either ordinary-inventory side cap.
         targets["best_quote_maker_volume_cycle_budget_notional"] = target_cycle_budget
+        targets["max_total_notional"] = max(
+            _safe_float(control.get("max_total_notional")),
+            target_cycle_budget * 2.0,
+        )
     return {key: value for key, value in targets.items() if control.get(key) != value}
 
 

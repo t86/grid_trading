@@ -691,6 +691,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         )
 
         self.assertEqual(1000.0, updates["best_quote_maker_volume_cycle_budget_notional"])
+        self.assertEqual(2000.0, updates["max_total_notional"])
 
         updates = bq_volume_recovery_guard.arx_low_pace_two_sided_maker_restore_updates(
             control={
@@ -708,6 +709,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             high_recovery_wear=True,
         )
         self.assertEqual(720.0, updates["best_quote_maker_volume_cycle_budget_notional"])
+        self.assertEqual(1440.0, updates["max_total_notional"])
 
     def test_arx_low_pace_headroom_blocks_reduce_only_branch_below_real_cap(self) -> None:
         self.assertTrue(
