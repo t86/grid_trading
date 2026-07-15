@@ -2533,7 +2533,7 @@ def arx_side_cap_unwind_updates(
     ).lower()
     if long_excess > 0.0 or short_excess > 0.0:
         direction: str | None = "net_long" if long_excess >= short_excess else "net_short"
-    elif abs(net_notional) > net_limit:
+    elif not ignore_profile_side_cap and abs(net_notional) > net_limit:
         direction = "net_long" if net_notional > 0.0 else "net_short"
     elif long_soft_excess > 0.0 or short_soft_excess > 0.0:
         direction = "net_long" if long_soft_excess >= short_soft_excess else "net_short"
@@ -2619,6 +2619,53 @@ def arx_side_cap_unwind_updates(
                 0,
             ),
         }
+    return {key: value for key, value in targets.items() if control.get(key) != value}
+
+
+def arx_low_pace_two_sided_maker_restore_updates(
+    *,
+    control: Mapping[str, Any],
+    target_pace_behind: bool,
+    pace_ratio: float,
+    low_pace_seconds: float,
+    actual_long_notional: float,
+    actual_short_notional: float,
+    volatility_entry_pause_active: bool,
+    high_recovery_wear: bool,
+) -> dict[str, Any]:
+    """Exit temporary ARX reduction mode before a low-pace deadlock forms.
+
+    A directional unwind is justified only by an exchange side nearing the
+    2,000U hard boundary.  Below 1,800U, a prolonged pace miss must restore
+    near-touch two-sided maker flow instead of waiting for a reduce-only
+    action to fill.  The restoration remains temporary: the normal recovery
+    ownership machinery restores the original same-side guard once pace is
+    healthy again.
+    """
+    active_direction = str(
+        control.get("best_quote_maker_volume_directional_net_guard") or "off"
+    ).lower().strip()
+    allow_loss = bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+    quote_offset = _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks"))
+    if (
+        not target_pace_behind
+        or float(pace_ratio) >= 0.75
+        or float(low_pace_seconds) < 120.0
+        or bool(volatility_entry_pause_active)
+        or bool(high_recovery_wear)
+        or max(_safe_float(actual_long_notional), _safe_float(actual_short_notional)) >= 1800.0
+        or (active_direction == "off" and not allow_loss and quote_offset <= 0)
+    ):
+        return {}
+    targets = {
+        "best_quote_maker_volume_directional_net_guard": "off",
+        "best_quote_maker_volume_allow_loss_reduce_only": False,
+        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+        "best_quote_maker_volume_active_pair_reduce_enabled": False,
+        "best_quote_maker_volume_quote_offset_ticks": 0,
+        "best_quote_maker_volume_same_side_entry_price_guard_report_only": True,
+        "sticky_entry_price_tolerance_steps": 1.0,
+    }
     return {key: value for key, value in targets.items() if control.get(key) != value}
 
 
@@ -4065,6 +4112,20 @@ def check_symbol(
             "sla_action_debounced": sla_action_debounced,
         }
     )
+    arx_low_pace_two_sided_restore = (
+        arx_low_pace_two_sided_maker_restore_updates(
+            control=control,
+            target_pace_behind=target_pace_behind,
+            pace_ratio=pace_ratio,
+            low_pace_seconds=low_pace_seconds,
+            actual_long_notional=_safe_float(assessment.get("actual_long_notional")),
+            actual_short_notional=_safe_float(assessment.get("actual_short_notional")),
+            volatility_entry_pause_active=bool(assessment.get("volatility_entry_pause_active")),
+            high_recovery_wear=high_recovery_wear or confirmed_loss_reduce_wear,
+        )
+        if normalized_symbol == "ARXUSDT"
+        else {}
+    )
     arx_severe_near_maker_entry = should_force_arx_severe_near_maker_entry(
         symbol=normalized_symbol,
         target_pace_behind=target_pace_behind,
@@ -4379,6 +4440,37 @@ def check_symbol(
             and not recovery_timeout_required
         ):
             action = "skip_recovery_safety_gate"
+        elif arx_low_pace_two_sided_restore:
+            _remember_recovery_controls(
+                item,
+                control,
+                tuple(arx_low_pace_two_sided_restore),
+            )
+            _remember_recovery_updates(item, arx_low_pace_two_sided_restore)
+            action = (
+                "dry_run_restore_arx_two_sided_near_maker_for_low_pace"
+                if dry_run
+                else "restore_arx_two_sided_near_maker_for_low_pace"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                    "last_sla_action_at": now.isoformat(),
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=arx_low_pace_two_sided_restore,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
         elif action_verification == "pending":
             action = "hold_recovery_action_verification_pending"
         elif action_verification == "failed":

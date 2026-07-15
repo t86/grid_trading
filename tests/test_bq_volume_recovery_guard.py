@@ -613,6 +613,48 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             "net_long", hard_cap_updates["best_quote_maker_volume_directional_net_guard"]
         )
 
+    def test_arx_frozen_inventory_net_imbalance_below_real_side_cap_keeps_two_sided_flow(self) -> None:
+        updates = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+            control={
+                "max_actual_net_notional": 1000.0,
+                "best_quote_maker_volume_directional_net_guard": "net_long",
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
+            },
+            actual_long_notional=840.0,
+            actual_short_notional=310.0,
+            exchange_long_notional=1260.0,
+            exchange_short_notional=316.0,
+            ignore_profile_side_cap=True,
+        )
+
+        self.assertEqual("off", updates["best_quote_maker_volume_directional_net_guard"])
+        self.assertFalse(updates["best_quote_maker_volume_allow_loss_reduce_only"])
+
+    def test_arx_low_pace_restores_two_sided_near_maker_below_real_side_cap(self) -> None:
+        updates = bq_volume_recovery_guard.arx_low_pace_two_sided_maker_restore_updates(
+            control={
+                "best_quote_maker_volume_directional_net_guard": "net_long",
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
+                "best_quote_maker_volume_net_loss_reduce_enabled": True,
+                "best_quote_maker_volume_active_pair_reduce_enabled": True,
+                "best_quote_maker_volume_quote_offset_ticks": 41,
+                "best_quote_maker_volume_same_side_entry_price_guard_report_only": False,
+                "sticky_entry_price_tolerance_steps": 3.0,
+            },
+            target_pace_behind=True,
+            pace_ratio=0.45,
+            low_pace_seconds=300.0,
+            actual_long_notional=1260.0,
+            actual_short_notional=316.0,
+            volatility_entry_pause_active=False,
+            high_recovery_wear=False,
+        )
+
+        self.assertEqual("off", updates["best_quote_maker_volume_directional_net_guard"])
+        self.assertFalse(updates["best_quote_maker_volume_allow_loss_reduce_only"])
+        self.assertEqual(0, updates["best_quote_maker_volume_quote_offset_ticks"])
+        self.assertTrue(updates["best_quote_maker_volume_same_side_entry_price_guard_report_only"])
+
     def test_arx_two_sided_near_cap_relief_keeps_a_shared_buffer(self) -> None:
         control = {
             "max_position_notional": 1000.0,
