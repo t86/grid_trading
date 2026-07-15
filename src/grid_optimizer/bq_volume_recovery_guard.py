@@ -6655,6 +6655,7 @@ def check_symbol(
             elif (
                 recovery_timed_out
                 and not arx_recovery_baseline_net_limit_blocked
+                and not arx_low_pace_two_sided_headroom
                 and not should_hold_arx_volume_priority_release(
                     symbol=normalized_symbol,
                     target_pace_behind=target_pace_behind,
@@ -7516,6 +7517,7 @@ def check_symbol(
             if (
                 recovery_stage_timed_out
                 and not arx_recovery_baseline_net_limit_blocked
+                and not arx_low_pace_two_sided_headroom
                 and not should_hold_arx_volume_priority_release(
                     symbol=normalized_symbol,
                     target_pace_behind=target_pace_behind,
