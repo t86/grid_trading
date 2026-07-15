@@ -2579,9 +2579,27 @@ def should_bypass_arx_recovery_drift_debounce(
 
 
 def arx_single_side_cap_updates(control: dict[str, Any]) -> dict[str, Any]:
-    """Capacity may only come from the profile baseline, never recovery code."""
-    del control
-    return {}
+    """Keep ordinary ARX inventory inside the approved 900/1,000U band.
+
+    Frozen lots use a separate ledger and release policy. These controls apply
+    only to runner-managed inventory, so pace recovery cannot widen ordinary
+    exposure merely because frozen inventory exists.
+    """
+    ceilings = {
+        "pause_buy_position_notional": 900.0,
+        "pause_short_position_notional": 900.0,
+        "max_position_notional": 1000.0,
+        "max_short_position_notional": 1000.0,
+        "maker_max_long_notional": 1000.0,
+        "maker_max_short_notional": 1000.0,
+        "best_quote_maker_volume_max_long_notional": 1000.0,
+        "best_quote_maker_volume_max_short_notional": 1000.0,
+    }
+    return {
+        key: ceiling
+        for key, ceiling in ceilings.items()
+        if _safe_float(control.get(key)) > ceiling
+    }
 
 
 def arx_frozen_inventory_headroom_updates(
@@ -2626,34 +2644,16 @@ def arx_side_cap_unwind_updates(
     exchange_short_notional: float | None = None,
 ) -> dict[str, Any]:
     """Route bounded maker-only relief before resuming two-sided ARX entry."""
-    profile_long_hard = max(
-        _safe_float(control.get("max_position_notional")),
-        _safe_float(control.get("best_quote_maker_volume_max_long_notional")),
-    )
-    profile_short_hard = max(
-        _safe_float(control.get("max_short_position_notional")),
-        _safe_float(control.get("best_quote_maker_volume_max_short_notional")),
-    )
-    profile_long_soft = max(_safe_float(control.get("pause_buy_position_notional")), 0.0)
-    profile_short_soft = max(_safe_float(control.get("pause_short_position_notional")), 0.0)
-    if ignore_profile_side_cap:
-        # A frozen lot already occupies part of the exchange side.  The
-        # profile's ordinary-ledger cap is therefore not the exchange cap.
-        # Keep the user-mandated 2,000U real-side boundary, while using the
-        # managed ledger only for the net-balance decision below.
-        long_hard = 2000.0
-        short_hard = 2000.0
-        long_soft = 1800.0
-        short_soft = 1800.0
-        side_long_notional = _safe_float(exchange_long_notional)
-        side_short_notional = _safe_float(exchange_short_notional)
-    else:
-        long_hard = profile_long_hard
-        short_hard = profile_short_hard
-        long_soft = profile_long_soft
-        short_soft = profile_short_soft
-        side_long_notional = _safe_float(actual_long_notional)
-        side_short_notional = _safe_float(actual_short_notional)
+    del exchange_long_notional, exchange_short_notional, ignore_profile_side_cap
+    # Frozen inventory is deliberately excluded here.  The caller passes the
+    # runner-managed side notional whenever frozen lots exist, and active
+    # entry must remain in the user-approved 900/1,000U band either way.
+    long_hard = 1000.0
+    short_hard = 1000.0
+    long_soft = 900.0
+    short_soft = 900.0
+    side_long_notional = _safe_float(actual_long_notional)
+    side_short_notional = _safe_float(actual_short_notional)
     recovery_ratio = min(max(float(recover_cap_ratio), 0.0), 1.0)
     near_ratio = min(max(float(near_cap_ratio), 0.0), 1.0)
     long_recovery_target = long_hard * recovery_ratio
@@ -2664,39 +2664,28 @@ def arx_side_cap_unwind_updates(
     short_soft_excess = max(side_short_notional - short_soft, 0.0)
     configured_net_limit = max(_safe_float(control.get("max_actual_net_notional")), 0.0)
     net_limit = configured_net_limit * 0.6 if configured_net_limit > 0 else 0.0
-    # Frozen lots are part of the exchange-side risk.  Their ledger is
-    # deliberately excluded from ordinary profile caps, so using only the
-    # managed delta here can falsely latch a directional unwind while the
-    # real LONG/SHORT sides are balanced and well below the 2,000U limit.
-    net_notional = (
-        side_long_notional - side_short_notional
-        if ignore_profile_side_cap
-        else _safe_float(actual_long_notional) - _safe_float(actual_short_notional)
-    )
+    net_notional = _safe_float(actual_long_notional) - _safe_float(actual_short_notional)
     current_direction = str(
         control.get("best_quote_maker_volume_directional_net_guard") or "off"
     ).lower()
     if long_excess > 0.0 or short_excess > 0.0:
         direction: str | None = "net_long" if long_excess >= short_excess else "net_short"
-    elif not ignore_profile_side_cap and abs(net_notional) > net_limit:
+    elif abs(net_notional) > net_limit:
         direction = "net_long" if net_notional > 0.0 else "net_short"
     elif long_soft_excess > 0.0 or short_soft_excess > 0.0:
         direction = "net_long" if long_soft_excess >= short_soft_excess else "net_short"
     elif (
-            not ignore_profile_side_cap
-        and current_direction == "net_long"
+            current_direction == "net_long"
         and _safe_float(actual_long_notional) > long_soft
     ):
         direction = "net_long"
     elif (
-            not ignore_profile_side_cap
-        and current_direction == "net_short"
+            current_direction == "net_short"
         and _safe_float(actual_short_notional) > short_soft
     ):
         direction = "net_short"
     elif (
         force_active_relief
-        and not ignore_profile_side_cap
         and long_hard > 0
         and short_hard > 0
     ):
@@ -2758,7 +2747,7 @@ def arx_side_cap_unwind_updates(
             # ordinary entry refill the just-released side.
             "pause_buy_position_notional": long_recovery_target,
             "pause_short_position_notional": short_recovery_target,
-            # At the 1,800–2,000U real-side boundary the default 48U
+            # At the 900–1,000U active-side boundary the default 48U
             # directional fallback cannot create room before the next
             # recovery cycle.  Keep the order maker-only but make the
             # temporary relief materially large enough to restore two-sided
@@ -2788,8 +2777,8 @@ def arx_low_pace_two_sided_maker_restore_updates(
 ) -> dict[str, Any]:
     """Exit temporary ARX reduction mode before a low-pace deadlock forms.
 
-    A directional unwind is justified only by an exchange side nearing the
-    2,000U hard boundary.  Below 1,800U, a prolonged pace miss must restore
+    A directional unwind is justified only by a runner-managed side nearing
+    the 1,000U hard boundary. Below 900U, a prolonged pace miss must restore
     near-touch two-sided maker flow instead of waiting for a reduce-only
     action to fill.  The restoration remains temporary: the normal recovery
     ownership machinery restores the original same-side guard once pace is
@@ -2812,16 +2801,10 @@ def arx_low_pace_two_sided_maker_restore_updates(
     needs_restore = (
         active_direction != "off" or allow_loss or quote_offset > 0
     )
-    needs_headroom = (
-        _safe_float(control.get("pause_buy_position_notional")) < 1800.0
-        or _safe_float(control.get("pause_short_position_notional")) < 1800.0
-        or _safe_float(control.get("max_position_notional")) < 2000.0
-        or _safe_float(control.get("max_short_position_notional")) < 2000.0
-    )
     needs_capacity = (
         float(pace_ratio) < 0.9
         and has_exchange_sides
-        and (current_cycle_budget < target_cycle_budget or needs_headroom)
+        and current_cycle_budget < target_cycle_budget
     )
     if (
         not target_pace_behind
@@ -2829,7 +2812,7 @@ def arx_low_pace_two_sided_maker_restore_updates(
         or float(low_pace_seconds) < 120.0
         or bool(volatility_entry_pause_active)
         or (bool(high_recovery_wear) and not needs_capacity)
-        or max(_safe_float(actual_long_notional), _safe_float(actual_short_notional)) >= 1800.0
+        or max(_safe_float(actual_long_notional), _safe_float(actual_short_notional)) >= 900.0
         or not (needs_restore or needs_capacity)
     ):
         return {}
@@ -2846,20 +2829,9 @@ def arx_low_pace_two_sided_maker_restore_updates(
         # The normal ARX profile is 360U per maker cycle.  A lagging pace gets
         # 2x capacity; a critical miss gets a 1,000U cycle.  This is maker
         # flow only, so elevated recent wear does not suppress the user-asked
-        # volume recovery.  The profile soft band remains below the approved
-        # 2,000U hard boundary.
+        # volume recovery. The profile soft band remains below the approved
+        # 1,000U ordinary-inventory hard boundary.
         targets["best_quote_maker_volume_cycle_budget_notional"] = target_cycle_budget
-        targets["pause_buy_position_notional"] = 1800.0
-        targets["pause_short_position_notional"] = 1800.0
-        targets["max_position_notional"] = 2000.0
-        targets["max_short_position_notional"] = 2000.0
-        targets["best_quote_maker_volume_max_long_notional"] = 2000.0
-        targets["best_quote_maker_volume_max_short_notional"] = 2000.0
-        # The runner derives its entry pause from this ratio as well as the
-        # absolute pause lines.  Leaving a stale 0.5 here recreates an
-        # inventory_soft reduce-only book immediately after the recovery
-        # raises the absolute lines to 1,800U.
-        targets["best_quote_maker_volume_inventory_soft_ratio"] = 1.0
     return {key: value for key, value in targets.items() if control.get(key) != value}
 
 
@@ -2873,8 +2845,8 @@ def should_keep_arx_low_pace_two_sided_flow(
 ) -> bool:
     """Keep recovery branches from replacing safe ARX maker flow with unwind.
 
-    The real exchange sides, not the ordinary-ledger soft band, decide this
-    hand-off.  Below 1,800U on both sides, a material pace miss has enough
+    The ordinary-ledger sides, not frozen inventory, decide this hand-off.
+    Below 900U on both sides, a material pace miss has enough
     approved headroom to rebuild two-sided maker flow.  A reduce-only branch
     in that interval merely flips the control back and forth every guard tick.
     """
@@ -2884,7 +2856,7 @@ def should_keep_arx_low_pace_two_sided_flow(
         and _safe_float(actual_long_notional) > 0.0
         and _safe_float(actual_short_notional) > 0.0
         and max(_safe_float(actual_long_notional), _safe_float(actual_short_notional))
-        < 1800.0
+        < 900.0
         and not bool(volatility_entry_pause_active)
     )
 
@@ -4340,20 +4312,37 @@ def check_symbol(
             "sla_action_debounced": sla_action_debounced,
         }
     )
-    arx_low_pace_two_sided_restore = (
-        arx_low_pace_two_sided_maker_restore_updates(
+    arx_active_side_cap = (
+        arx_single_side_cap_updates(control)
+        if normalized_symbol == "ARXUSDT"
+        else {}
+    )
+    if normalized_symbol == "ARXUSDT":
+        arx_low_pace_two_sided_restore = arx_low_pace_two_sided_maker_restore_updates(
             control=control,
             target_pace_behind=target_pace_behind,
             pace_ratio=pace_ratio,
             low_pace_seconds=low_pace_seconds,
-            actual_long_notional=_safe_float(assessment.get("actual_long_notional")),
-            actual_short_notional=_safe_float(assessment.get("actual_short_notional")),
+            actual_long_notional=_safe_float(
+                assessment.get("current_long_notional")
+                if _safe_float(assessment.get("frozen_long_notional")) > 0.0
+                else assessment.get("actual_long_notional")
+            ),
+            actual_short_notional=_safe_float(
+                assessment.get("current_short_notional")
+                if _safe_float(assessment.get("frozen_short_notional")) > 0.0
+                else assessment.get("actual_short_notional")
+            ),
             volatility_entry_pause_active=bool(assessment.get("volatility_entry_pause_active")),
             high_recovery_wear=high_recovery_wear or confirmed_loss_reduce_wear,
         )
-        if normalized_symbol == "ARXUSDT"
-        else {}
-    )
+    else:
+        arx_low_pace_two_sided_restore = {}
+    if arx_low_pace_two_sided_restore:
+        arx_low_pace_two_sided_restore = {
+            **arx_active_side_cap,
+            **arx_low_pace_two_sided_restore,
+        }
     arx_severe_near_maker_entry = should_force_arx_severe_near_maker_entry(
         symbol=normalized_symbol,
         target_pace_behind=target_pace_behind,
@@ -4464,6 +4453,7 @@ def check_symbol(
         )
     )
     arx_side_cap_unwind = {
+        **arx_active_side_cap,
         **arx_frozen_inventory_headroom,
         **arx_side_cap_unwind_updates(
             control=control,
@@ -4505,8 +4495,16 @@ def check_symbol(
         and should_keep_arx_low_pace_two_sided_flow(
             target_pace_behind=target_pace_behind,
             pace_ratio=pace_ratio,
-            actual_long_notional=_safe_float(assessment.get("actual_long_notional")),
-            actual_short_notional=_safe_float(assessment.get("actual_short_notional")),
+            actual_long_notional=_safe_float(
+                assessment.get("current_long_notional")
+                if _safe_float(assessment.get("frozen_long_notional")) > 0.0
+                else assessment.get("actual_long_notional")
+            ),
+            actual_short_notional=_safe_float(
+                assessment.get("current_short_notional")
+                if _safe_float(assessment.get("frozen_short_notional")) > 0.0
+                else assessment.get("actual_short_notional")
+            ),
             volatility_entry_pause_active=bool(
                 assessment.get("volatility_entry_pause_active")
             ),
