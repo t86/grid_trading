@@ -2716,13 +2716,13 @@ def arx_low_pace_two_sided_maker_restore_updates(
         or _safe_float(control.get("max_short_position_notional")) < 2000.0
     )
     needs_capacity = (
-        float(pace_ratio) < 0.75
+        float(pace_ratio) < 0.9
         and has_exchange_sides
         and (current_cycle_budget < target_cycle_budget or needs_headroom)
     )
     if (
         not target_pace_behind
-        or float(pace_ratio) >= 0.75
+        or float(pace_ratio) >= 0.9
         or float(low_pace_seconds) < 120.0
         or bool(volatility_entry_pause_active)
         or (bool(high_recovery_wear) and not needs_capacity)
@@ -2777,7 +2777,7 @@ def should_keep_arx_low_pace_two_sided_flow(
     """
     return (
         bool(target_pace_behind)
-        and float(pace_ratio) < 0.75
+        and float(pace_ratio) < 0.9
         and _safe_float(actual_long_notional) > 0.0
         and _safe_float(actual_short_notional) > 0.0
         and max(_safe_float(actual_long_notional), _safe_float(actual_short_notional))

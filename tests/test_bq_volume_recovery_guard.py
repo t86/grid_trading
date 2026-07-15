@@ -364,7 +364,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertTrue(
             bq_volume_recovery_guard.should_keep_arx_low_pace_two_sided_flow(
                 target_pace_behind=True,
-                pace_ratio=0.3,
+                pace_ratio=0.84,
                 actual_long_notional=1725.0,
                 actual_short_notional=1475.0,
                 volatility_entry_pause_active=False,
@@ -373,7 +373,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertFalse(
             bq_volume_recovery_guard.should_keep_arx_low_pace_two_sided_flow(
                 target_pace_behind=True,
-                pace_ratio=0.3,
+                pace_ratio=0.9,
                 actual_long_notional=1800.0,
                 actual_short_notional=1475.0,
                 volatility_entry_pause_active=False,
