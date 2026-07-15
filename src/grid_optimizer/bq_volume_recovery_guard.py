@@ -1974,6 +1974,100 @@ def recover_arx_effective_control_drift(
     control = _read_json(_control_path(Path(output_dir), normalized_symbol))
     plan = _read_json(_plan_path(Path(output_dir), normalized_symbol))
     item = _symbol_state(state, normalized_symbol)
+    best_quote = plan.get("best_quote_maker_volume")
+    plan_direction = str(
+        (best_quote.get("directional_net_guard") or {}).get("direction")
+        if isinstance(best_quote, dict)
+        else ""
+    ).lower()
+    control_direction = str(
+        control.get("best_quote_maker_volume_directional_net_guard") or "off"
+    ).lower()
+    control_expects_two_sided = (
+        control_direction == "off"
+        and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+    )
+    plan_pause_long = _safe_float(plan.get("effective_pause_buy_position_notional"))
+    plan_pause_short = _safe_float(plan.get("effective_pause_short_position_notional"))
+    control_pause_long = _safe_float(control.get("pause_buy_position_notional"))
+    control_pause_short = _safe_float(control.get("pause_short_position_notional"))
+    two_sided_control_drift = control_expects_two_sided and (
+        plan_direction in {"net_long", "net_short"}
+        or (
+            control_pause_long > 0
+            and control_pause_short > 0
+            and (
+                abs(plan_pause_long - control_pause_long) > 1.0
+                or abs(plan_pause_short - control_pause_short) > 1.0
+            )
+        )
+    )
+    if two_sided_control_drift:
+        signature = (
+            f"{control_direction}:{plan_direction}:"
+            f"{control_pause_long:.1f}:{plan_pause_long:.1f}:"
+            f"{control_pause_short:.1f}:{plan_pause_short:.1f}"
+        )
+        if item.get("effective_control_drift_two_sided_signature") == signature:
+            return {
+                "symbol": normalized_symbol,
+                "action": "hold_arx_two_sided_control_drift_already_restarted",
+                "changed_keys": [],
+                "backup_path": None,
+                "dry_run": dry_run,
+                "restart_failed": None,
+                "allow_recovery_check": True,
+                "control_direction": control_direction,
+                "plan_direction": plan_direction,
+            }
+        last_restart_at = _parse_time(item.get("last_effective_control_drift_restart_at"))
+        if (
+            last_restart_at is not None
+            and (now - last_restart_at).total_seconds() < max(float(cooldown_seconds), 0.0)
+        ):
+            return {
+                "symbol": normalized_symbol,
+                "action": "hold_arx_two_sided_control_drift_restart_cooldown",
+                "changed_keys": [],
+                "backup_path": None,
+                "dry_run": dry_run,
+                "restart_failed": None,
+                "allow_recovery_check": True,
+                "control_direction": control_direction,
+                "plan_direction": plan_direction,
+            }
+        result = {
+            "symbol": normalized_symbol,
+            "changed_keys": [],
+            "backup_path": None,
+            "dry_run": dry_run,
+            "restart_failed": None,
+            "control_direction": control_direction,
+            "plan_direction": plan_direction,
+        }
+        if dry_run:
+            result["action"] = "dry_run_restart_arx_two_sided_control_drift"
+            return result
+        restart = restart_runner or (
+            lambda item_symbol: _default_restart_runner(item_symbol, runner_wrapper=runner_wrapper)
+        )
+        try:
+            restart(normalized_symbol)
+        except subprocess.CalledProcessError as exc:
+            result["action"] = "restart_arx_two_sided_control_drift_failed"
+            result["restart_failed"] = str(exc)
+            return result
+        item.update(
+            {
+                "last_effective_control_drift_restart_at": now.isoformat(),
+                "effective_control_drift_two_sided_signature": signature,
+                "last_recovery_action_at": now.isoformat(),
+                "last_recovery_action": "restart_arx_two_sided_control_drift",
+                "status": "effective_control_drift_recovery_active",
+            }
+        )
+        result["action"] = "restart_arx_two_sided_control_drift"
+        return result
     control_sticky = control.get("sticky_entry_preserve_less_aggressive")
     if control_sticky is not False:
         # A later false setting is a new request and may be restarted once.

@@ -1476,6 +1476,43 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
         self.assertEqual("restart_arx_effective_control_drift", result["action"])
         self.assertEqual(["ARXUSDT"], restarted)
+
+    def test_arx_two_sided_control_drift_restarts_runner(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            _write_json(
+                output_dir / "arxusdt_loop_runner_control.json",
+                {
+                    "best_quote_maker_volume_directional_net_guard": "off",
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "pause_buy_position_notional": 1800.0,
+                    "pause_short_position_notional": 1800.0,
+                },
+            )
+            _write_json(
+                output_dir / "arxusdt_loop_latest_plan.json",
+                {
+                    "effective_pause_buy_position_notional": 1920.0,
+                    "effective_pause_short_position_notional": 1920.0,
+                    "best_quote_maker_volume": {
+                        "directional_net_guard": {"direction": "net_long"}
+                    },
+                },
+            )
+            restarted: list[str] = []
+            result = bq_volume_recovery_guard.recover_arx_effective_control_drift(
+                output_dir=output_dir,
+                symbol="ARXUSDT",
+                state={},
+                now=datetime.now(timezone.utc),
+                cooldown_seconds=60.0,
+                dry_run=False,
+                runner_wrapper="unused",
+                restart_runner=restarted.append,
+            )
+
+        self.assertEqual("restart_arx_two_sided_control_drift", result["action"])
+        self.assertEqual(["ARXUSDT"], restarted)
         self.assertFalse(
             bq_volume_recovery_guard.should_relax_arx_zero_order_volume_blockers(
                 symbol="ARXUSDT",
