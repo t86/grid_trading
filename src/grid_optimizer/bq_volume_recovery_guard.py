@@ -983,9 +983,14 @@ def _restore_recovery_controls(
     cycle_budget_floor_notional: float = 0.0,
 ) -> dict[str, Any]:
     original = item.get("guard_original_controls")
-    updates = {"best_quote_maker_volume_allow_loss_reduce_only": False}
+    updates = {}
     if isinstance(original, dict):
         for key, value in original.items():
+            if key in {
+                "best_quote_maker_volume_allow_loss_reduce_only",
+                "best_quote_maker_volume_net_loss_reduce_enabled",
+            }:
+                continue
             if key in _RECOVERY_CONTROL_KEYS:
                 updates[key] = value
     budget_key = "best_quote_maker_volume_cycle_budget_notional"
@@ -995,6 +1000,10 @@ def _restore_recovery_controls(
         current_budget = control.get(budget_key)
     if budget_floor > 0 and current_budget is not None and _safe_float(current_budget) < budget_floor:
         updates[budget_key] = budget_floor
+    # ``allow_loss`` is a temporary recovery permission, never a baseline
+    # value.  An older guard could remember an already-active permission as
+    # the "original" value and otherwise reopen it while restoring controls.
+    updates["best_quote_maker_volume_allow_loss_reduce_only"] = False
     updates["best_quote_maker_volume_net_loss_reduce_enabled"] = False
     return updates
 
@@ -5001,9 +5010,9 @@ def check_symbol(
                 dry_run=dry_run,
                 restart_runner=restart,
             )
-        elif action_verification == "pending":
+        elif action_verification == "pending" and not recovery_timeout_required:
             action = "hold_recovery_action_verification_pending"
-        elif action_verification == "failed":
+        elif action_verification == "failed" and not recovery_timeout_required:
             action = "recovery_action_verification_failed_hold"
             item["status"] = "recovery_verification_failed"
         elif arx_side_cap_unwind:

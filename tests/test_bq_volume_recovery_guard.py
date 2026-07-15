@@ -7950,6 +7950,101 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertNotIn("guard_recovery_controls", item)
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_restore_never_promotes_temporary_loss_flags_into_baseline(self) -> None:
+        updates = bq_volume_recovery_guard._restore_recovery_controls(
+            {
+                "guard_original_controls": {
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 48.0,
+                }
+            }
+        )
+
+        self.assertFalse(
+            updates["best_quote_maker_volume_allow_loss_reduce_only"]
+        )
+        self.assertFalse(updates["best_quote_maker_volume_net_loss_reduce_enabled"])
+        self.assertEqual(
+            updates["best_quote_maker_volume_cycle_budget_notional"], 48.0
+        )
+
+    def test_failed_action_verification_cannot_preempt_absolute_recovery_timeout(self) -> None:
+        now = datetime(2026, 7, 15, 1, 30, tzinfo=timezone.utc)
+        control_updated_at = now - timedelta(minutes=4)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 60.0,
+                    "recovery_control_updated_at": control_updated_at.isoformat(),
+                },
+                long_notional=800.0,
+                short_notional=700.0,
+                open_order_count=1,
+                active_order_count=0,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "recovery_active",
+                        "recovery_owned": True,
+                        "recovery_started_at": (now - timedelta(minutes=6)).isoformat(),
+                        "action_verification_failures": 1,
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_allow_loss_reduce_only": False,
+                            "best_quote_maker_volume_cycle_budget_notional": 48.0,
+                        },
+                        "guard_recovery_controls": {
+                            "best_quote_maker_volume_allow_loss_reduce_only": True,
+                            "best_quote_maker_volume_cycle_budget_notional": 60.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                max_recovery_seconds=300,
+                cooldown_seconds=600,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertIn(
+                result["action"],
+                {
+                    "recovery_timeout_cooldown",
+                    "restore_after_inventory_below_soft",
+                },
+            )
+            self.assertNotEqual(
+                result["action"], "recovery_action_verification_failed_hold"
+            )
+            self.assertFalse(
+                control["best_quote_maker_volume_allow_loss_reduce_only"]
+            )
+            self.assertIn(
+                state["symbols"]["REUSDT"]["status"], {"normal", "cooldown"}
+            )
+            self.assertEqual(restarts, ["REUSDT"])
+
     def test_recovered_volume_clears_recovery_instead_of_reapplying_drifted_control(self) -> None:
         now = datetime(2026, 6, 26, 8, 35, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
