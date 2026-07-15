@@ -2698,6 +2698,7 @@ def arx_low_pace_two_sided_maker_restore_updates(
     allow_loss = bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
     quote_offset = _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks"))
     critical_low_pace = float(pace_ratio) < 0.5
+    target_cycle_budget = 1000.0 if critical_low_pace else 720.0
     current_cycle_budget = _safe_float(
         control.get("best_quote_maker_volume_cycle_budget_notional")
     )
@@ -2715,16 +2716,16 @@ def arx_low_pace_two_sided_maker_restore_updates(
         or _safe_float(control.get("max_short_position_notional")) < 2000.0
     )
     needs_capacity = (
-        critical_low_pace
+        float(pace_ratio) < 0.75
         and has_exchange_sides
-        and (current_cycle_budget < 720.0 or needs_headroom)
+        and (current_cycle_budget < target_cycle_budget or needs_headroom)
     )
     if (
         not target_pace_behind
         or float(pace_ratio) >= 0.75
         or float(low_pace_seconds) < 120.0
         or bool(volatility_entry_pause_active)
-        or bool(high_recovery_wear)
+        or (bool(high_recovery_wear) and not needs_capacity)
         or max(_safe_float(actual_long_notional), _safe_float(actual_short_notional)) >= 1800.0
         or not (needs_restore or needs_capacity)
     ):
@@ -2739,12 +2740,12 @@ def arx_low_pace_two_sided_maker_restore_updates(
         "sticky_entry_price_tolerance_steps": 1.0,
     }
     if needs_capacity:
-        # The normal ARX profile is 360U per maker cycle.  At less than half
-        # of the required pace, one temporary 2x cycle is the smallest
-        # capacity change that can close the gap.  The profile soft band must
-        # also stay below the user-approved 2,000U hard boundary; otherwise a
-        # 1,000U soft pause immediately trims the enlarged maker book.
-        targets["best_quote_maker_volume_cycle_budget_notional"] = 720.0
+        # The normal ARX profile is 360U per maker cycle.  A lagging pace gets
+        # 2x capacity; a critical miss gets a 1,000U cycle.  This is maker
+        # flow only, so elevated recent wear does not suppress the user-asked
+        # volume recovery.  The profile soft band remains below the approved
+        # 2,000U hard boundary.
+        targets["best_quote_maker_volume_cycle_budget_notional"] = target_cycle_budget
         targets["pause_buy_position_notional"] = 1800.0
         targets["pause_short_position_notional"] = 1800.0
         targets["max_position_notional"] = 2000.0
