@@ -1,4 +1,5 @@
 from datetime import datetime
+import stat
 from zoneinfo import ZoneInfo
 
 from deploy.oracle.roll_competition_window import (
@@ -7,6 +8,7 @@ from deploy.oracle.roll_competition_window import (
     load_usable_control,
     reset_runtime_guard_baseline,
     roll_control_window,
+    write_json_atomically,
 )
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,6 +16,14 @@ import json
 
 
 BEIJING = ZoneInfo("Asia/Shanghai")
+
+
+def test_atomic_control_write_keeps_runner_read_permission() -> None:
+    with TemporaryDirectory() as temp_dir:
+        path = Path(temp_dir) / "arxusdt_loop_runner_control.json"
+        write_json_atomically(path, {"symbol": "ARXUSDT"})
+
+        assert stat.S_IMODE(path.stat().st_mode) == 0o644
 
 
 def test_rolls_an_expired_window_to_the_current_trade_day() -> None:

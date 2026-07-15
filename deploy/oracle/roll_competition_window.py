@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -18,6 +19,7 @@ BEIJING = ZoneInfo("Asia/Shanghai")
 # recovery overrides between daily resets.
 PROFILE_BASELINE_KEYS = (
     "step_price",
+    "maker_order_notional",
     "best_quote_maker_volume_cycle_budget_notional",
     "best_quote_maker_volume_min_cycle_budget_notional",
     "best_quote_maker_volume_max_long_notional",
@@ -30,6 +32,8 @@ PROFILE_BASELINE_KEYS = (
     "max_short_position_notional",
     "max_total_notional",
     "max_actual_net_notional",
+    "execution_place_budget_per_cycle",
+    "max_new_orders",
     "best_quote_maker_volume_allow_loss_reduce_only",
     "best_quote_maker_volume_net_loss_reduce_enabled",
     "hard_loss_forced_reduce_enabled",
@@ -208,6 +212,9 @@ def write_json_atomically(path: Path, payload: dict[str, object]) -> None:
         json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
         temporary_path = Path(handle.name)
+    # Deployment jobs may run as root while the runner runs unprivileged.
+    # Control documents carry no credentials, so keep them runner-readable.
+    os.chmod(temporary_path, 0o644)
     temporary_path.replace(path)
 
 
