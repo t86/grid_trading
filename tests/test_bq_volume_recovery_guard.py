@@ -564,6 +564,41 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             stale_allow_loss["best_quote_maker_volume_allow_loss_reduce_only"]
         )
 
+    def test_arx_frozen_inventory_does_not_unwind_at_profile_side_cap(self) -> None:
+        updates = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+            control={
+                "max_actual_net_notional": 1000.0,
+                "max_position_notional": 1000.0,
+                "max_short_position_notional": 1000.0,
+                "pause_buy_position_notional": 1000.0,
+                "pause_short_position_notional": 1000.0,
+                "best_quote_maker_volume_directional_net_guard": "net_short",
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
+            },
+            actual_long_notional=624.0,
+            actual_short_notional=1003.0,
+            ignore_profile_side_cap=True,
+        )
+
+        self.assertEqual("off", updates["best_quote_maker_volume_directional_net_guard"])
+        self.assertFalse(updates["best_quote_maker_volume_allow_loss_reduce_only"])
+
+        hard_cap_updates = bq_volume_recovery_guard.arx_side_cap_unwind_updates(
+            control={
+                "max_actual_net_notional": 1000.0,
+                "max_position_notional": 1000.0,
+                "max_short_position_notional": 1000.0,
+            },
+            actual_long_notional=300.0,
+            actual_short_notional=300.0,
+            exchange_long_notional=2001.0,
+            exchange_short_notional=300.0,
+            ignore_profile_side_cap=True,
+        )
+        self.assertEqual(
+            "net_long", hard_cap_updates["best_quote_maker_volume_directional_net_guard"]
+        )
+
     def test_arx_two_sided_near_cap_relief_keeps_a_shared_buffer(self) -> None:
         control = {
             "max_position_notional": 1000.0,

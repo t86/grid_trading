@@ -2435,26 +2435,47 @@ def arx_side_cap_unwind_updates(
     recover_cap_ratio: float = 0.96,
     force_active_relief: bool = False,
     near_cap_ratio: float = 0.95,
+    ignore_profile_side_cap: bool = False,
+    exchange_long_notional: float | None = None,
+    exchange_short_notional: float | None = None,
 ) -> dict[str, Any]:
     """Route bounded maker-only relief before resuming two-sided ARX entry."""
-    long_hard = max(
+    profile_long_hard = max(
         _safe_float(control.get("max_position_notional")),
         _safe_float(control.get("best_quote_maker_volume_max_long_notional")),
     )
-    short_hard = max(
+    profile_short_hard = max(
         _safe_float(control.get("max_short_position_notional")),
         _safe_float(control.get("best_quote_maker_volume_max_short_notional")),
     )
-    long_soft = max(_safe_float(control.get("pause_buy_position_notional")), 0.0)
-    short_soft = max(_safe_float(control.get("pause_short_position_notional")), 0.0)
+    profile_long_soft = max(_safe_float(control.get("pause_buy_position_notional")), 0.0)
+    profile_short_soft = max(_safe_float(control.get("pause_short_position_notional")), 0.0)
+    if ignore_profile_side_cap:
+        # A frozen lot already occupies part of the exchange side.  The
+        # profile's ordinary-ledger cap is therefore not the exchange cap.
+        # Keep the user-mandated 2,000U real-side boundary, while using the
+        # managed ledger only for the net-balance decision below.
+        long_hard = 2000.0
+        short_hard = 2000.0
+        long_soft = 1800.0
+        short_soft = 1800.0
+        side_long_notional = _safe_float(exchange_long_notional)
+        side_short_notional = _safe_float(exchange_short_notional)
+    else:
+        long_hard = profile_long_hard
+        short_hard = profile_short_hard
+        long_soft = profile_long_soft
+        short_soft = profile_short_soft
+        side_long_notional = _safe_float(actual_long_notional)
+        side_short_notional = _safe_float(actual_short_notional)
     recovery_ratio = min(max(float(recover_cap_ratio), 0.0), 1.0)
     near_ratio = min(max(float(near_cap_ratio), 0.0), 1.0)
     long_recovery_target = long_hard * recovery_ratio
     short_recovery_target = short_hard * recovery_ratio
-    long_excess = max(_safe_float(actual_long_notional) - long_hard, 0.0)
-    short_excess = max(_safe_float(actual_short_notional) - short_hard, 0.0)
-    long_soft_excess = max(_safe_float(actual_long_notional) - long_soft, 0.0)
-    short_soft_excess = max(_safe_float(actual_short_notional) - short_soft, 0.0)
+    long_excess = max(side_long_notional - long_hard, 0.0)
+    short_excess = max(side_short_notional - short_hard, 0.0)
+    long_soft_excess = max(side_long_notional - long_soft, 0.0)
+    short_soft_excess = max(side_short_notional - short_soft, 0.0)
     configured_net_limit = max(_safe_float(control.get("max_actual_net_notional")), 0.0)
     net_limit = configured_net_limit * 0.6 if configured_net_limit > 0 else 0.0
     net_notional = _safe_float(actual_long_notional) - _safe_float(actual_short_notional)
@@ -2468,16 +2489,23 @@ def arx_side_cap_unwind_updates(
     elif long_soft_excess > 0.0 or short_soft_excess > 0.0:
         direction = "net_long" if long_soft_excess >= short_soft_excess else "net_short"
     elif (
-            current_direction == "net_long"
+            not ignore_profile_side_cap
+        and current_direction == "net_long"
         and _safe_float(actual_long_notional) > long_soft
     ):
         direction = "net_long"
     elif (
-            current_direction == "net_short"
+            not ignore_profile_side_cap
+        and current_direction == "net_short"
         and _safe_float(actual_short_notional) > short_soft
     ):
         direction = "net_short"
-    elif force_active_relief and long_hard > 0 and short_hard > 0:
+    elif (
+        force_active_relief
+        and not ignore_profile_side_cap
+        and long_hard > 0
+        and short_hard > 0
+    ):
         long_relief = (
             _safe_float(actual_long_notional) - long_recovery_target
             if _safe_float(actual_long_notional) >= long_hard * near_ratio
@@ -4094,6 +4122,12 @@ def check_symbol(
             high_recovery_wear=high_recovery_wear or confirmed_loss_reduce_wear,
             recover_cap_ratio=recover_cap_ratio,
             near_cap_ratio=near_cap_ratio,
+            # The runner profile caps only the ordinary ledger.  Once frozen
+            # lots exist, use exchange-side 2,000U limits for side relief and
+            # managed inventory for net balancing.
+            ignore_profile_side_cap=frozen_inventory_present,
+            exchange_long_notional=_safe_float(assessment.get("actual_long_notional")),
+            exchange_short_notional=_safe_float(assessment.get("actual_short_notional")),
             # A normal directional guard only reacts after a soft breach.
             # When a lagging run loses either entry leg to an active cap, keep
             # a bounded release state so ordinary entry cannot refill that
