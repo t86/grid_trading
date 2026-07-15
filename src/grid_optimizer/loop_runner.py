@@ -10297,6 +10297,55 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
     return result
 
 
+def convert_blocked_best_quote_plan_entry_to_actual_side_reduce(
+    *,
+    plan: dict[str, Any],
+    current_long_qty: float,
+    current_short_qty: float,
+    current_long_avg_price: float = 0.0,
+    current_short_avg_price: float = 0.0,
+    step_price: float = 0.0,
+    tick_size: float | None = None,
+    min_profit_ratio: float | None = None,
+) -> dict[str, Any]:
+    """Apply actual-side BQ reduction while the desired order set is built.
+
+    This must happen before stale-order reconciliation.  Doing it only at
+    submit time leaves an already-open opposite entry in the desired set, so
+    bucket suppression prevents the replacement and the one-sided order stays
+    live forever.
+    """
+    metrics = plan.get("metrics") if isinstance(plan, dict) else None
+    same_side_entry_guard = (
+        metrics.get("same_side_entry_price_guard") if isinstance(metrics, Mapping) else None
+    )
+    actions = {
+        "place_orders": [
+            *[dict(item) for item in list(plan.get("buy_orders") or []) if isinstance(item, dict)],
+            *[dict(item) for item in list(plan.get("sell_orders") or []) if isinstance(item, dict)],
+        ],
+        "cancel_orders": [],
+    }
+    converted = convert_blocked_best_quote_entry_to_actual_side_reduce(
+        actions=actions,
+        same_side_entry_guard=same_side_entry_guard if isinstance(same_side_entry_guard, Mapping) else None,
+        current_long_qty=current_long_qty,
+        current_short_qty=current_short_qty,
+        current_long_avg_price=current_long_avg_price,
+        current_short_avg_price=current_short_avg_price,
+        step_price=step_price,
+        tick_size=tick_size,
+        min_profit_ratio=min_profit_ratio,
+    )
+    plan["buy_orders"] = [
+        item for item in converted.get("place_orders", []) if str(item.get("side", "")).upper().strip() == "BUY"
+    ]
+    plan["sell_orders"] = [
+        item for item in converted.get("place_orders", []) if str(item.get("side", "")).upper().strip() == "SELL"
+    ]
+    return dict(converted.get("best_quote_actual_side_reduce") or {})
+
+
 def _maybe_sleep_between_execution_requests(args: argparse.Namespace) -> None:
     interval = _safe_float(getattr(args, "execution_request_min_interval_seconds", 0.0))
     if interval > 0:
@@ -21563,6 +21612,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 best_quote_short_reduce_suppression["dropped_notional"] = sum(
                     _safe_float(item.get("notional")) for item in dropped_buy_orders
                 )
+        best_quote_actual_side_reduce = convert_blocked_best_quote_plan_entry_to_actual_side_reduce(
+            plan=plan,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            step_price=effective_args.step_price,
+            tick_size=symbol_info.get("tick_size"),
+            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+        )
         best_quote_directional_net_guard = {
             "enabled": False,
             "direction": "off",
@@ -21587,6 +21646,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "frozen_pair_release": dict(best_quote_frozen_pair_release),
             "frozen_total_cap": dict(best_quote_frozen_total_cap),
             "short_reduce_suppression": dict(best_quote_short_reduce_suppression),
+            "actual_side_reduce": dict(best_quote_actual_side_reduce),
             "directional_net_guard": dict(best_quote_directional_net_guard),
         }
         inventory_tier = {

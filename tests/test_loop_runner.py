@@ -72,6 +72,7 @@ from grid_optimizer.loop_runner import (
     _separate_paired_best_quote_reduce_orders,
     prioritize_inventory_reducing_place_orders,
     convert_blocked_best_quote_entry_to_actual_side_reduce,
+    convert_blocked_best_quote_plan_entry_to_actual_side_reduce,
     apply_execution_request_budget_to_actions,
     StartupProtectionError,
     _update_inventory_grid_order_refs,
@@ -8034,6 +8035,32 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(converted["best_quote_actual_side_reduce"]["applied"])
         self.assertEqual(converted["best_quote_actual_side_reduce"]["reason"], "no_blocked_ordinary_side")
         self.assertEqual(converted["place_orders"][0]["role"], "best_quote_entry_short")
+
+    def test_blocked_best_quote_plan_replaces_desired_short_entry_before_reconcile(self) -> None:
+        plan = {
+            "metrics": {"same_side_entry_price_guard": {"blocked_long_entry": True, "report_only": False}},
+            "buy_orders": [],
+            "sell_orders": [
+                {"role": "best_quote_entry_short", "side": "SELL", "position_side": "SHORT", "qty": 100.0, "price": 1.01, "notional": 101.0},
+            ],
+        }
+
+        report = convert_blocked_best_quote_plan_entry_to_actual_side_reduce(
+            plan=plan,
+            current_long_qty=50.0,
+            current_short_qty=10.0,
+            current_long_avg_price=1.0,
+            step_price=0.005,
+            tick_size=0.001,
+            min_profit_ratio=0.002,
+        )
+
+        self.assertTrue(report["applied"])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_reduce_long")
+        self.assertEqual(plan["sell_orders"][0]["position_side"], "LONG")
+        self.assertTrue(plan["sell_orders"][0]["force_reduce_only"])
 
     def test_soonusdt_volume_profiles_use_entry_price_cost_basis(self) -> None:
         self.assertTrue(_uses_entry_price_cost_basis("chip_low_wear_guarded_v1"))
