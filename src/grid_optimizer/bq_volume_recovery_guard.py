@@ -2735,9 +2735,16 @@ def arx_low_pace_two_sided_maker_restore_updates(
     if needs_capacity:
         # The normal ARX profile is 360U per maker cycle.  At less than half
         # of the required pace, one temporary 2x cycle is the smallest
-        # capacity change that can close the gap; the runner's side caps still
-        # bound any individual fill.
+        # capacity change that can close the gap.  The profile soft band must
+        # also stay below the user-approved 2,000U hard boundary; otherwise a
+        # 1,000U soft pause immediately trims the enlarged maker book.
         targets["best_quote_maker_volume_cycle_budget_notional"] = 720.0
+        targets["pause_buy_position_notional"] = 1800.0
+        targets["pause_short_position_notional"] = 1800.0
+        targets["max_position_notional"] = 2000.0
+        targets["max_short_position_notional"] = 2000.0
+        targets["best_quote_maker_volume_max_long_notional"] = 2000.0
+        targets["best_quote_maker_volume_max_short_notional"] = 2000.0
     return {key: value for key, value in targets.items() if control.get(key) != value}
 
 

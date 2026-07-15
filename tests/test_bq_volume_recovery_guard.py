@@ -672,6 +672,10 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         )
 
         self.assertEqual(720.0, updates["best_quote_maker_volume_cycle_budget_notional"])
+        self.assertEqual(1800.0, updates["pause_buy_position_notional"])
+        self.assertEqual(1800.0, updates["pause_short_position_notional"])
+        self.assertEqual(2000.0, updates["max_position_notional"])
+        self.assertEqual(2000.0, updates["max_short_position_notional"])
 
     def test_arx_two_sided_near_cap_relief_keeps_a_shared_buffer(self) -> None:
         control = {
