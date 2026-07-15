@@ -2163,7 +2163,7 @@ def should_force_arx_severe_near_maker_entry(
     return (
         symbol.upper().strip() == "ARXUSDT"
         and bool(target_pace_behind)
-        and float(pace_ratio) < 0.30
+        and float(pace_ratio) < 0.35
         and int(planned_entry_order_count) > 0
         and not bool(effective_inventory_soft_pressure)
         and not bool(allow_loss_reduce_only)

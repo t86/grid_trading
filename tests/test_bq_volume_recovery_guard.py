@@ -1080,6 +1080,16 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 allow_loss_reduce_only=False,
             )
         )
+        self.assertTrue(
+            bq_volume_recovery_guard.should_force_arx_severe_near_maker_entry(
+                symbol="ARXUSDT",
+                target_pace_behind=True,
+                pace_ratio=0.34,
+                planned_entry_order_count=2,
+                effective_inventory_soft_pressure=False,
+                allow_loss_reduce_only=False,
+            )
+        )
         self.assertFalse(
             bq_volume_recovery_guard.should_force_arx_severe_near_maker_entry(
                 symbol="ARXUSDT",
