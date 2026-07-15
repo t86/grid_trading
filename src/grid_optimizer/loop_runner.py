@@ -9878,15 +9878,28 @@ def _resolve_runner_account_snapshot(
         symbol,
         max_account_position_stream_age_seconds=ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS,
     )
-    if open_orders is None:
+    # A freshly connected user-data stream has an authoritative-but-empty
+    # local order cache until it receives a new ORDER_TRADE_UPDATE.  Existing
+    # orders from a prior runner session are not replayed, so trusting that
+    # first empty cache strands stale strategy orders outside diff_open_orders.
+    # Hydrate once from REST at process start, then continue preferring the
+    # stream on later cycles.
+    stream_needs_initial_order_hydration = (
+        open_orders == []
+        and not bool(getattr(args, "_open_orders_rest_hydrated", False))
+    )
+    if open_orders is None or stream_needs_initial_order_hydration:
         open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window)
-        sources["open_orders"] = "rest"
+        sources["open_orders"] = (
+            "rest_initial_stream_hydration" if stream_needs_initial_order_hydration else "rest"
+        )
         stream = getattr(args, "user_data_stream", None)
         if stream is not None and hasattr(stream, "replace_open_orders_from_rest"):
             try:
                 stream.replace_open_orders_from_rest(_filter_futures_strategy_orders(open_orders, symbol))
             except Exception:
                 pass
+        setattr(args, "_open_orders_rest_hydrated", True)
     else:
         sources["open_orders"] = "user_data_stream"
     return account_info, list(open_orders), sources
