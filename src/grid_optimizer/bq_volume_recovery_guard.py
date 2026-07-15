@@ -1812,7 +1812,7 @@ def recover_arx_exchange_order_drift(
     if has_recent_arx_submit_activity(
         submit=submit or {}, now=now, max_age_seconds=cooldown_seconds
     ):
-        return {
+        result = {
             "symbol": normalized_symbol,
             "action": "hold_arx_exchange_order_drift_after_recent_activity",
             "changed_keys": [],
@@ -1823,6 +1823,17 @@ def recover_arx_exchange_order_drift(
             "exchange_open_order_count": exchange_open_order_count,
             "exchange_strategy_order_ids": exchange.get("strategy_order_ids") or [],
         }
+        if (
+            exchange_open_order_count > 0
+            and int(expected_entry_order_count) >= 4
+            and exchange_open_order_count <= int(expected_entry_order_count) - 2
+        ):
+            # A recent submit proves the runner is still replacing orders, so
+            # defer the restart.  It must not also suppress the independent
+            # low-pace capacity recovery while only half of the intended book
+            # is live.
+            result["allow_recovery_check"] = True
+        return result
     item = _symbol_state(state, normalized_symbol)
     last_restart_at = _parse_time(item.get("last_exchange_order_drift_restart_at"))
     cooldown_active = (

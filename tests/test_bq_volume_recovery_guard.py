@@ -1304,6 +1304,27 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             recent_activity["action"],
         )
         self.assertEqual(["ARXUSDT"], restarted)
+        partial_recent_activity = bq_volume_recovery_guard.recover_arx_exchange_order_drift(
+            symbol="ARXUSDT",
+            local_active_order_count=2,
+            expected_entry_order_count=4,
+            submit={
+                "observed_execution_events": [
+                    {"kind": "ORDER_NEW", "event_time": int(now.timestamp() * 1000)}
+                ]
+            },
+            state={},
+            now=now + timedelta(seconds=10),
+            cooldown_seconds=60.0,
+            dry_run=False,
+            runner_wrapper="unused",
+            restart_runner=lambda symbol: restarted.append(symbol),
+            exchange_snapshot_fetcher=lambda _symbol: {
+                "strategy_open_order_count": 2,
+                "strategy_order_ids": ["123", "124"],
+            },
+        )
+        self.assertTrue(partial_recent_activity["allow_recovery_check"])
         self.assertIsNone(
             bq_volume_recovery_guard.recover_arx_exchange_order_drift(
                 symbol="ARXUSDT",
