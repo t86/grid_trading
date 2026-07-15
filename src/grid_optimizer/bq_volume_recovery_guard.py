@@ -1979,7 +1979,11 @@ def _restore_arx_frozen_ledger_after_reset(
     if not bool(backup_ledger.get("initialized")):
         return None
     backup_age_seconds = max(now.timestamp() - backup_path.stat().st_mtime, 0.0)
-    if backup_age_seconds > 900.0:
+    # A systemd restart loop can consume several 20-error cycles before the
+    # guard is upgraded.  Exchange coverage is still mandatory below, so a
+    # one-hour window preserves a valid restart snapshot without trusting an
+    # old ledger indefinitely.
+    if backup_age_seconds > 3600.0:
         return None
 
     frozen_long_qty = _best_quote_lot_quantity(backup_frozen.get("long_lots"))
