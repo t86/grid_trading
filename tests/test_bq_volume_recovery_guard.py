@@ -1451,6 +1451,75 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual("restart_arx_runner_error_loop", result["action"])
         self.assertEqual(["ARXUSDT"], restarted)
 
+    def test_arx_runner_error_loop_restores_frozen_ledger_after_reset(self) -> None:
+        now = datetime(2026, 7, 14, tzinfo=timezone.utc)
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            state_path = output_dir / "arxusdt_loop_state.json"
+            backup_path = state_path.with_name(state_path.name + ".bak_bq_recovery_restart")
+            _write_json(
+                state_path,
+                {
+                    "best_quote_volume_ledger": {
+                        "initialized": True,
+                        "bootstrap_source": "empty_due_to_reduce_freeze_isolation",
+                        "long_lots": [],
+                        "short_lots": [],
+                    }
+                },
+            )
+            _write_json(
+                backup_path,
+                {
+                    "best_quote_frozen_inventory": {
+                        "long_lots": [{"qty": 100.0, "price": 11.0}],
+                        "short_lots": [{"qty": 50.0, "price": 8.0}],
+                    },
+                    "best_quote_volume_ledger": {
+                        "initialized": True,
+                        "long_lots": [{"qty": 20.0, "price": 10.0}],
+                        "short_lots": [{"qty": 30.0, "price": 9.0}],
+                    },
+                },
+            )
+            os.utime(backup_path, (now.timestamp(), now.timestamp()))
+            _append_jsonl(
+                output_dir / "arxusdt_loop_events.jsonl",
+                [
+                    {
+                        "error_type": "RuntimeError",
+                        "error_message": "当前持仓与计划生成时不一致，请等待下一轮刷新",
+                        "consecutive_errors": 3,
+                    }
+                ],
+            )
+            restarted: list[str] = []
+            result = bq_volume_recovery_guard.recover_arx_runner_error_loop(
+                output_dir=output_dir,
+                symbol="ARXUSDT",
+                state={},
+                now=now,
+                cooldown_seconds=60.0,
+                dry_run=False,
+                runner_wrapper="unused",
+                restart_runner=restarted.append,
+                position_snapshot_fetcher=lambda _symbol: {
+                    "long": {"qty": 120.0, "entry_price": 10.0},
+                    "short": {"qty": 55.0, "entry_price": 9.0},
+                },
+            )
+
+            self.assertEqual("restore_arx_frozen_ledger_after_reset_and_restart", result["action"])
+            self.assertEqual(["ARXUSDT"], restarted)
+            restored = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [{"qty": 100.0, "price": 11.0}],
+                restored["best_quote_frozen_inventory"]["long_lots"],
+            )
+            self.assertEqual(20.0, restored["best_quote_volume_ledger"]["long_lots"][0]["qty"])
+            self.assertEqual(5.0, restored["best_quote_volume_ledger"]["short_lots"][0]["qty"])
+            self.assertTrue(Path(result["archived_state_path"]).exists())
+
     def test_arx_runner_error_loop_ignores_old_error_after_success(self) -> None:
         with TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir)

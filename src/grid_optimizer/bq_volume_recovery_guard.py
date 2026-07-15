@@ -22,6 +22,7 @@ from .recovery_control_ownership import (
 RestartRunner = Callable[[str], object]
 UserTradesPageFetcher = Callable[..., list[dict[str, Any]]]
 CorruptStateExchangeFetcher = Callable[[str], dict[str, Any]]
+HedgePositionFetcher = Callable[[str], dict[str, dict[str, float]]]
 
 
 @dataclass(frozen=True)
@@ -194,6 +195,30 @@ def _planned_entry_order_count(plan: Mapping[str, Any]) -> int:
                 continue
             count += 1
     return count
+
+
+def _fetch_hedge_position_snapshot(symbol: str) -> dict[str, dict[str, float]]:
+    """Read live hedge quantities used to safely rebuild a reset BQ ledger."""
+    from .data import fetch_futures_position_risk_v3
+
+    api_key = os.environ["BINANCE_API_KEY"]
+    api_secret = os.environ["BINANCE_API_SECRET"]
+    rows = fetch_futures_position_risk_v3(api_key, api_secret, symbol)
+    snapshot = {
+        "long": {"qty": 0.0, "entry_price": 0.0},
+        "short": {"qty": 0.0, "entry_price": 0.0},
+    }
+    for row in rows:
+        side = str(row.get("positionSide") or "").upper()
+        if side not in {"LONG", "SHORT"}:
+            continue
+        key = side.lower()
+        quantity = abs(_safe_float(row.get("positionAmt")))
+        snapshot[key] = {
+            "qty": quantity,
+            "entry_price": max(_safe_float(row.get("entryPrice")), 0.0),
+        }
+    return snapshot
 
 
 def _salvage_truncated_order_refs_state(
@@ -1895,6 +1920,151 @@ def recover_arx_exchange_order_drift(
     return result
 
 
+def _best_quote_lot_quantity(lots: Any) -> float:
+    if not isinstance(lots, list):
+        return 0.0
+    return sum(max(_safe_float(lot.get("qty")), 0.0) for lot in lots if isinstance(lot, dict))
+
+
+def _best_quote_lot_average_price(lots: Any, fallback: float) -> float:
+    if not isinstance(lots, list):
+        return max(float(fallback), 0.0)
+    quantity = 0.0
+    cost = 0.0
+    for lot in lots:
+        if not isinstance(lot, dict):
+            continue
+        lot_qty = max(_safe_float(lot.get("qty")), 0.0)
+        lot_price = max(_safe_float(lot.get("price")), 0.0)
+        quantity += lot_qty
+        cost += lot_qty * lot_price
+    if quantity > 1e-12 and cost > 0:
+        return cost / quantity
+    return max(float(fallback), 0.0)
+
+
+def _restore_arx_frozen_ledger_after_reset(
+    *,
+    output_dir: Path,
+    symbol: str,
+    now: datetime,
+    dry_run: bool,
+    position_snapshot_fetcher: HedgePositionFetcher | None = None,
+) -> dict[str, Any] | None:
+    """Recover only the frozen ledger when a reset-state runner loses it.
+
+    A state reset must never turn existing frozen inventory into ordinary active
+    exposure.  The recovery is deliberately narrow: it requires a recent
+    restart backup, an empty isolated bootstrap, and live position quantities
+    that still cover every backed-up frozen lot.  Active lots are rebuilt from
+    the exchange remainder, so fills that occurred after the backup are not
+    replayed as stale inventory.
+    """
+    normalized_symbol = symbol.upper().strip()
+    if normalized_symbol != "ARXUSDT":
+        return None
+    state_path = Path(output_dir) / f"{normalized_symbol.lower()}_loop_state.json"
+    backup_path = state_path.with_name(state_path.name + ".bak_bq_recovery_restart")
+    current = _read_json(state_path)
+    backup = _read_json(backup_path)
+    current_ledger = current.get("best_quote_volume_ledger")
+    backup_frozen = backup.get("best_quote_frozen_inventory")
+    backup_ledger = backup.get("best_quote_volume_ledger")
+    if not isinstance(current_ledger, dict) or not isinstance(backup_frozen, dict) or not isinstance(backup_ledger, dict):
+        return None
+    if str(current_ledger.get("bootstrap_source") or "") != "empty_due_to_reduce_freeze_isolation":
+        return None
+    if current.get("best_quote_frozen_inventory"):
+        return None
+    if not bool(backup_ledger.get("initialized")):
+        return None
+    backup_age_seconds = max(now.timestamp() - backup_path.stat().st_mtime, 0.0)
+    if backup_age_seconds > 900.0:
+        return None
+
+    frozen_long_qty = _best_quote_lot_quantity(backup_frozen.get("long_lots"))
+    frozen_short_qty = _best_quote_lot_quantity(backup_frozen.get("short_lots"))
+    if frozen_long_qty <= 1e-12 and frozen_short_qty <= 1e-12:
+        return None
+    try:
+        live_positions = (position_snapshot_fetcher or _fetch_hedge_position_snapshot)(normalized_symbol)
+    except (KeyError, OSError, RuntimeError, ValueError):
+        return None
+    live_long = max(_safe_float((live_positions.get("long") or {}).get("qty")), 0.0)
+    live_short = max(_safe_float((live_positions.get("short") or {}).get("qty")), 0.0)
+    if live_long + 1e-9 < frozen_long_qty or live_short + 1e-9 < frozen_short_qty:
+        return None
+
+    result = {
+        "symbol": normalized_symbol,
+        "action": "dry_run_restore_arx_frozen_ledger_after_reset" if dry_run else "restore_arx_frozen_ledger_after_reset",
+        "changed_keys": ["best_quote_frozen_inventory", "best_quote_volume_ledger"],
+        "backup_path": str(backup_path),
+        "dry_run": dry_run,
+        "restart_failed": None,
+        "backup_age_seconds": round(backup_age_seconds, 3),
+        "frozen_long_qty": frozen_long_qty,
+        "frozen_short_qty": frozen_short_qty,
+        "live_long_qty": live_long,
+        "live_short_qty": live_short,
+    }
+    if dry_run:
+        return result
+
+    restored = dict(current)
+    restored["best_quote_frozen_inventory"] = backup_frozen
+    ledger = dict(backup_ledger)
+    rebuilt_at = now.isoformat()
+    for side, live_qty, frozen_qty in (
+        ("long", live_long, frozen_long_qty),
+        ("short", live_short, frozen_short_qty),
+    ):
+        active_qty = max(live_qty - frozen_qty, 0.0)
+        old_lots = backup_ledger.get(f"{side}_lots")
+        fallback_price = _safe_float((live_positions.get(side) or {}).get("entry_price"))
+        active_price = _best_quote_lot_average_price(old_lots, fallback_price)
+        ledger[f"{side}_lots"] = (
+            [
+                {
+                    "qty": active_qty,
+                    "price": active_price,
+                    "source": "bq_recovery_exchange_minus_restored_frozen",
+                    "opened_at": rebuilt_at,
+                }
+            ]
+            if active_qty > 1e-12 and active_price > 0
+            else []
+        )
+    ledger.update(
+        {
+            "initialized": True,
+            "sync_ok": True,
+            "bootstrap_source": "recovered_from_restart_backup_exchange_minus_frozen",
+            "exchange_position_bootstrap_allowed": False,
+            "exchange_position_bootstrap_blocked_long_qty": 0.0,
+            "exchange_position_bootstrap_blocked_short_qty": 0.0,
+            "recovered_from_restart_backup_at": rebuilt_at,
+            "recovered_from_restart_backup_path": str(backup_path),
+        }
+    )
+    restored["best_quote_volume_ledger"] = ledger
+    restored["bq_frozen_ledger_recovery"] = {
+        "at": rebuilt_at,
+        "source": str(backup_path),
+        "live_long_qty": live_long,
+        "live_short_qty": live_short,
+        "frozen_long_qty": frozen_long_qty,
+        "frozen_short_qty": frozen_short_qty,
+    }
+    archive_path = state_path.with_name(
+        state_path.name + f".before_bq_frozen_ledger_recovery_{now.strftime('%Y%m%dT%H%M%SZ')}"
+    )
+    _write_json(archive_path, current)
+    _write_json(state_path, restored)
+    result["archived_state_path"] = str(archive_path)
+    return result
+
+
 def recover_arx_runner_error_loop(
     *,
     output_dir: Path,
@@ -1905,6 +2075,7 @@ def recover_arx_runner_error_loop(
     dry_run: bool,
     runner_wrapper: str,
     restart_runner: RestartRunner | None = None,
+    position_snapshot_fetcher: HedgePositionFetcher | None = None,
 ) -> dict[str, Any] | None:
     """Break a live ARX runner error loop before it exhausts its retries."""
     normalized_symbol = symbol.upper().strip()
@@ -1914,6 +2085,36 @@ def recover_arx_runner_error_loop(
     consecutive_errors = _safe_int(event.get("consecutive_errors"))
     if consecutive_errors < 3:
         return None
+    if "当前持仓与计划生成时不一致" in str(event.get("error_message") or ""):
+        repaired = _restore_arx_frozen_ledger_after_reset(
+            output_dir=Path(output_dir),
+            symbol=normalized_symbol,
+            now=now,
+            dry_run=dry_run,
+            position_snapshot_fetcher=position_snapshot_fetcher,
+        )
+        if repaired is not None:
+            if not dry_run:
+                restart = restart_runner or (
+                    lambda item_symbol: _default_restart_runner(item_symbol, runner_wrapper=runner_wrapper)
+                )
+                try:
+                    restart(normalized_symbol)
+                except subprocess.CalledProcessError as exc:
+                    repaired["action"] = "restore_arx_frozen_ledger_after_reset_restart_failed"
+                    repaired["restart_failed"] = str(exc)
+                    return repaired
+                repaired["action"] = "restore_arx_frozen_ledger_after_reset_and_restart"
+                item = _symbol_state(state, normalized_symbol)
+                item.update(
+                    {
+                        "last_runner_error_restart_at": now.isoformat(),
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": repaired["action"],
+                        "status": "frozen_ledger_recovery_active",
+                    }
+                )
+            return repaired
     item = _symbol_state(state, normalized_symbol)
     last_restart_at = _parse_time(item.get("last_runner_error_restart_at"))
     if (
