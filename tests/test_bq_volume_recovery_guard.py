@@ -357,6 +357,27 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(1800.0, updates["pause_short_position_notional"])
         self.assertEqual(2000.0, updates["max_position_notional"])
         self.assertEqual(2000.0, updates["max_short_position_notional"])
+
+        updates = bq_volume_recovery_guard.arx_low_pace_two_sided_maker_restore_updates(
+            control={
+                "best_quote_maker_volume_directional_net_guard": "off",
+                "best_quote_maker_volume_allow_loss_reduce_only": False,
+                "best_quote_maker_volume_quote_offset_ticks": 0,
+                "best_quote_maker_volume_cycle_budget_notional": 720.0,
+                "pause_buy_position_notional": 1000.0,
+                "pause_short_position_notional": 1000.0,
+                "max_position_notional": 1500.0,
+                "max_short_position_notional": 1500.0,
+            },
+            target_pace_behind=True,
+            pace_ratio=0.4,
+            low_pace_seconds=300.0,
+            actual_long_notional=1200.0,
+            actual_short_notional=1100.0,
+            volatility_entry_pause_active=False,
+            high_recovery_wear=False,
+        )
+        self.assertEqual(1800.0, updates["pause_buy_position_notional"])
         self.assertEqual(2000.0, updates["maker_max_long_notional"])
         self.assertEqual(2000.0, updates["maker_max_short_notional"])
 

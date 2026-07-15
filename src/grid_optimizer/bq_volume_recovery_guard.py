@@ -2708,10 +2708,16 @@ def arx_low_pace_two_sided_maker_restore_updates(
     needs_restore = (
         active_direction != "off" or allow_loss or quote_offset > 0
     )
+    needs_headroom = (
+        _safe_float(control.get("pause_buy_position_notional")) < 1800.0
+        or _safe_float(control.get("pause_short_position_notional")) < 1800.0
+        or _safe_float(control.get("max_position_notional")) < 2000.0
+        or _safe_float(control.get("max_short_position_notional")) < 2000.0
+    )
     needs_capacity = (
         critical_low_pace
         and has_exchange_sides
-        and current_cycle_budget < 720.0
+        and (current_cycle_budget < 720.0 or needs_headroom)
     )
     if (
         not target_pace_behind
