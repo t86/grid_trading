@@ -2800,6 +2800,7 @@ def arx_low_pace_two_sided_maker_restore_updates(
     current_cycle_budget = _safe_float(
         control.get("best_quote_maker_volume_cycle_budget_notional")
     )
+    required_max_total_notional = target_cycle_budget * 2.0
     has_exchange_sides = (
         _safe_float(actual_long_notional) > 0.0
         and _safe_float(actual_short_notional) > 0.0
@@ -2812,6 +2813,11 @@ def arx_low_pace_two_sided_maker_restore_updates(
         and has_exchange_sides
         and current_cycle_budget < target_cycle_budget
     )
+    needs_submit_capacity = (
+        float(pace_ratio) < 0.9
+        and has_exchange_sides
+        and _safe_float(control.get("max_total_notional")) < required_max_total_notional
+    )
     if (
         not target_pace_behind
         or float(pace_ratio) >= 0.9
@@ -2819,7 +2825,7 @@ def arx_low_pace_two_sided_maker_restore_updates(
         or bool(volatility_entry_pause_active)
         or (bool(high_recovery_wear) and not needs_capacity)
         or max(_safe_float(actual_long_notional), _safe_float(actual_short_notional)) >= 900.0
-        or not (needs_restore or needs_capacity)
+        or not (needs_restore or needs_capacity or needs_submit_capacity)
     ):
         return {}
     targets = {
@@ -2831,7 +2837,7 @@ def arx_low_pace_two_sided_maker_restore_updates(
         "best_quote_maker_volume_same_side_entry_price_guard_report_only": True,
         "sticky_entry_price_tolerance_steps": 1.0,
     }
-    if needs_capacity:
+    if needs_capacity or needs_submit_capacity:
         # The normal ARX profile is 360U per maker cycle.  A lagging pace gets
         # 2x capacity; a critical miss gets a 1,000U cycle.  This is maker
         # flow only, so elevated recent wear does not suppress the user-asked
@@ -2839,10 +2845,11 @@ def arx_low_pace_two_sided_maker_restore_updates(
         # both maker legs, so it must have room for two recovery legs; without
         # that the runner builds a valid two-sided plan which submit rejects
         # wholesale.  This does not raise either ordinary-inventory side cap.
-        targets["best_quote_maker_volume_cycle_budget_notional"] = target_cycle_budget
+        if needs_capacity:
+            targets["best_quote_maker_volume_cycle_budget_notional"] = target_cycle_budget
         targets["max_total_notional"] = max(
             _safe_float(control.get("max_total_notional")),
-            target_cycle_budget * 2.0,
+            required_max_total_notional,
         )
     return {key: value for key, value in targets.items() if control.get(key) != value}
 

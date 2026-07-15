@@ -711,6 +711,27 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(720.0, updates["best_quote_maker_volume_cycle_budget_notional"])
         self.assertEqual(1440.0, updates["max_total_notional"])
 
+    def test_arx_low_pace_repairs_missing_submit_capacity_without_rewriting_budget(self) -> None:
+        updates = bq_volume_recovery_guard.arx_low_pace_two_sided_maker_restore_updates(
+            control={
+                "best_quote_maker_volume_directional_net_guard": "off",
+                "best_quote_maker_volume_allow_loss_reduce_only": False,
+                "best_quote_maker_volume_quote_offset_ticks": 0,
+                "best_quote_maker_volume_cycle_budget_notional": 720.0,
+                "max_total_notional": 1200.0,
+            },
+            target_pace_behind=True,
+            pace_ratio=0.7,
+            low_pace_seconds=300.0,
+            actual_long_notional=800.0,
+            actual_short_notional=700.0,
+            volatility_entry_pause_active=False,
+            high_recovery_wear=False,
+        )
+
+        self.assertEqual(1440.0, updates["max_total_notional"])
+        self.assertNotIn("best_quote_maker_volume_cycle_budget_notional", updates)
+
     def test_arx_low_pace_headroom_blocks_reduce_only_branch_below_real_cap(self) -> None:
         self.assertTrue(
             bq_volume_recovery_guard.should_keep_arx_low_pace_two_sided_flow(
