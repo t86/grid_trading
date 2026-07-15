@@ -788,6 +788,24 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         }
         self.assertEqual({}, bq_volume_recovery_guard.arx_single_side_cap_updates(control))
         self.assertEqual(
+            {"best_quote_maker_volume_inventory_soft_ratio": 1.0},
+            bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
+                control={
+                    **control,
+                    "best_quote_maker_volume_max_long_notional": 1500.0,
+                    "best_quote_maker_volume_max_short_notional": 1500.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.85,
+                },
+                target_pace_behind=True,
+                pace_ratio=0.43,
+                near_cap=False,
+                volatility_entry_pause_active=False,
+                frozen_total_notional=600.0,
+                actual_long_notional=1204.0,
+                actual_short_notional=1498.0,
+            ),
+        )
+        self.assertEqual(
             {},
             bq_volume_recovery_guard.arx_frozen_inventory_headroom_updates(
                 control=control,

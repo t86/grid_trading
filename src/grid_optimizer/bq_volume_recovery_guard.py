@@ -2655,20 +2655,32 @@ def arx_severe_pace_capacity_updates(
     actual_long_notional: float = 0.0,
     actual_short_notional: float = 0.0,
 ) -> dict[str, Any]:
-    """Pace recovery must not expand ARX capacity or disable quality gates."""
-    del (
-        control,
-        target_pace_behind,
-        pace_ratio,
-        near_cap,
-        volatility_entry_pause_active,
-        frozen_total_notional,
-        frozen_long_notional,
-        frozen_short_notional,
-        actual_long_notional,
-        actual_short_notional,
+    """Temporarily use the profile hard cap before blocking a lagging ARX book.
+
+    This does not expand either profile side cap.  It only prevents the 85%
+    soft band from converting a still-safe (under 1,800U exchange side)
+    book into reduce-only while a materially behind target needs maker flow.
+    """
+    del frozen_long_notional, frozen_short_notional
+    profile_cap = max(
+        _safe_float(control.get("max_position_notional")),
+        _safe_float(control.get("max_short_position_notional")),
+        _safe_float(control.get("best_quote_maker_volume_max_long_notional")),
+        _safe_float(control.get("best_quote_maker_volume_max_short_notional")),
     )
-    return {}
+    if (
+        not bool(target_pace_behind)
+        or float(pace_ratio) >= 0.75
+        or bool(near_cap)
+        or bool(volatility_entry_pause_active)
+        or float(frozen_total_notional) <= 0.0
+        or profile_cap <= 0
+        or profile_cap > 1500.0
+        or max(float(actual_long_notional), float(actual_short_notional)) >= 1800.0
+        or _safe_float(control.get("best_quote_maker_volume_inventory_soft_ratio")) >= 1.0
+    ):
+        return {}
+    return {"best_quote_maker_volume_inventory_soft_ratio": 1.0}
 
 
 def arx_balanced_fast_sla_capacity_updates(
