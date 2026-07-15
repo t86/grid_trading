@@ -4300,8 +4300,12 @@ def check_symbol(
     assessment["critical_ousdt_reduce_budget_ramp"] = (
         critical_ousdt_reduce_budget_ramp
     )
+    # ARX needs to hold its catch-up mode until 90% of target pace.  The
+    # former shared 75% reset created a blind band where ARX was still behind
+    # but its low-pace timer restarted on every guard pass.
+    low_pace_recovery_ratio = 0.9 if normalized_symbol == "ARXUSDT" else 0.75
     low_pace_since = _parse_time(item.get("low_pace_since"))
-    if pace_ratio >= 0.75:
+    if pace_ratio >= low_pace_recovery_ratio:
         item.pop("low_pace_since", None)
         low_pace_since = None
     elif low_pace_since is None:
@@ -4316,7 +4320,11 @@ def check_symbol(
     sla_recovery_due = (
         no_fill_seconds >= fast_sla_seconds
         or one_sided_entry_seconds >= fast_sla_seconds
-        or (required_hourly_notional > 0 and pace_ratio < 0.75 and low_pace_seconds >= 120.0)
+        or (
+            required_hourly_notional > 0
+            and pace_ratio < low_pace_recovery_ratio
+            and low_pace_seconds >= 120.0
+        )
     ) and not sla_action_debounced
     assessment.update(
         {
