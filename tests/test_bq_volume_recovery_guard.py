@@ -1158,6 +1158,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             },
         )
         self.assertEqual("hold_arx_exchange_order_drift_restart_cooldown", held["action"])
+        self.assertTrue(held["allow_recovery_check"])
         self.assertEqual(["ARXUSDT"], restarted)
         recent_activity = bq_volume_recovery_guard.recover_arx_exchange_order_drift(
             symbol="ARXUSDT",

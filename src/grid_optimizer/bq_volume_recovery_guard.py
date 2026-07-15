@@ -1817,6 +1817,10 @@ def recover_arx_exchange_order_drift(
     }
     if cooldown_active:
         result["action"] = "hold_arx_exchange_order_drift_restart_cooldown"
+        # The restart itself is rate-limited, not the recovery assessment.
+        # A stale local order cache can otherwise make every guard cycle end
+        # here while Binance has no strategy order at all.
+        result["allow_recovery_check"] = True
         return result
     if dry_run:
         result["action"] = "dry_run_restart_arx_exchange_order_drift"
@@ -8376,7 +8380,8 @@ def main(argv: list[str] | None = None) -> int:
                 results.append(exchange_order_drift_result)
                 if exchange_order_drift_result.get("restart_failed"):
                     exit_code = 1
-                continue
+                if not bool(exchange_order_drift_result.get("allow_recovery_check")):
+                    continue
         result = check_symbol(
             symbol=symbol,
             output_dir=output_dir,
