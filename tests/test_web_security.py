@@ -2700,6 +2700,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertTrue(config["best_quote_maker_volume_frozen_single_leg_take_profit_enabled"])
         self.assertFalse(config["best_quote_maker_volume_frozen_pair_release_allow_loss"])
         self.assertEqual(config["best_quote_maker_volume_frozen_pair_release_execution_type"], "maker")
+        self.assertEqual(config["best_quote_maker_volume_inventory_bias_reduce_share"], 0.50)
         self.assertTrue(config["adaptive_step_enabled"])
         self.assertFalse(config["adaptive_step_dynamic_base_enabled"])
         self.assertEqual(config["adaptive_step_max_scale"], 6.0)

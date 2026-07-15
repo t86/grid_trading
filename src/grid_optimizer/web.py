@@ -556,7 +556,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_inventory_bias_min_ratio_gap": 0.05,
             "best_quote_maker_volume_inventory_bias_min_notional_gap": 70.0,
             "best_quote_maker_volume_inventory_bias_opposite_entry_enabled": True,
-            "best_quote_maker_volume_inventory_bias_reduce_share": 0.70,
+            "best_quote_maker_volume_inventory_bias_reduce_share": 0.50,
             "best_quote_maker_volume_inventory_bias_same_side_extra_ticks": 2,
             "best_quote_maker_volume_inventory_bias_reduce_extra_ticks": 0,
             "volatility_entry_pause_enabled": True,

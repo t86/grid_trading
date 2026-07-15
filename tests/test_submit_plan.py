@@ -210,6 +210,54 @@ class SubmitPlanTests(unittest.TestCase):
         ])
         self.assertEqual(guarded["same_side_spacing_guard"]["suppressed_place_count"], 3)
 
+    def test_same_side_spacing_keeps_orders_for_different_hedge_legs(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 236.36,
+                    "qty": 0.092,
+                    "notional": 21.74512,
+                    "role": "best_quote_reduce_short",
+                    "position_side": "SHORT",
+                    "force_reduce_only": True,
+                    "execution_type": "maker",
+                },
+                {
+                    "side": "BUY",
+                    "price": 236.37,
+                    "qty": 0.092,
+                    "notional": 21.74604,
+                    "role": "best_quote_entry_long",
+                    "position_side": "LONG",
+                    "execution_type": "maker",
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+        }
+
+        guarded = suppress_same_side_nearby_place_orders(
+            actions=actions,
+            min_price_spacing=0.03,
+            live_bid_price=236.36,
+            live_ask_price=236.37,
+            tick_size=0.01,
+            min_qty=0.001,
+            min_notional=20.0,
+            step_size=0.001,
+        )
+
+        self.assertEqual(guarded["place_count"], 2)
+        self.assertEqual(
+            [(order["role"], order["position_side"]) for order in guarded["place_orders"]],
+            [
+                ("best_quote_reduce_short", "SHORT"),
+                ("best_quote_entry_long", "LONG"),
+            ],
+        )
+
     def test_reduce_only_no_loss_guard_drops_cost_gate_short_cover_above_ceiling(self) -> None:
         actions = {
             "place_orders": [

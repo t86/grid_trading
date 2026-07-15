@@ -382,6 +382,87 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual([order["price"] for order in pruned], [0.15968, 0.15964])
         self.assertTrue(pruned[0]["force_reduce_only"])
 
+    def test_same_side_entry_cluster_pruning_keeps_entry_for_other_hedge_leg(self) -> None:
+        orders = [
+            {
+                "side": "BUY",
+                "price": 236.36,
+                "role": "best_quote_reduce_short",
+                "position_side": "SHORT",
+                "force_reduce_only": True,
+            },
+            {
+                "side": "BUY",
+                "price": 236.37,
+                "role": "best_quote_entry_long",
+                "position_side": "LONG",
+            },
+        ]
+
+        pruned, dropped = _prune_clustered_same_side_entry_orders(
+            orders,
+            side="BUY",
+            min_gap=0.03,
+        )
+
+        self.assertEqual(dropped, 0)
+        self.assertEqual([order["role"] for order in pruned], [
+            "best_quote_reduce_short",
+            "best_quote_entry_long",
+        ])
+
+    def test_inventory_bias_keeps_maker_entry_that_offsets_other_hedge_leg(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_entry_orders_per_side=2,
+                max_long_notional=200.0,
+                max_short_notional=200.0,
+                inventory_soft_ratio=0.70,
+                inventory_bias_enabled=True,
+                inventory_bias_start_ratio=0.35,
+                inventory_bias_min_ratio_gap=0.05,
+                inventory_bias_min_notional_gap=70.0,
+                inventory_bias_opposite_entry_enabled=True,
+                inventory_bias_reduce_share=0.50,
+                same_side_entry_price_guard_enabled=True,
+                same_side_entry_price_guard_report_only=False,
+                same_side_entry_price_guard_min_notional=70.0,
+                same_side_entry_price_guard_gap_ticks=3,
+            ),
+            inputs=_inputs(
+                bid_price=236.66,
+                ask_price=236.67,
+                mid_price=236.665,
+                current_net_qty=-0.368,
+                current_long_qty=0.096,
+                current_short_qty=0.464,
+                current_long_avg_price=236.19,
+                current_short_avg_price=236.417,
+                cycle_budget_notional=44.0,
+                target_volume_remaining=20_000.0,
+                loss_per_10k_15m=0.0,
+                tick_size=0.01,
+                step_size=0.001,
+                min_qty=0.001,
+                min_notional=20.0,
+                max_order_notional=22.0,
+                entry_ladder_spacing=0.05,
+                position_side_mode="hedge",
+            ),
+        )
+
+        self.assertEqual(
+            [(order["role"], order["position_side"]) for order in plan["buy_orders"]],
+            [
+                ("best_quote_reduce_short", "SHORT"),
+                ("best_quote_entry_long", "LONG"),
+            ],
+        )
+        self.assertTrue(all(20.0 <= order["notional"] <= 22.0 for order in plan["buy_orders"]))
+        self.assertTrue(all(order["execution_type"] == "maker" for order in plan["buy_orders"]))
+        self.assertTrue(all(order["post_only"] for order in plan["buy_orders"]))
+
     def test_ladder_falls_back_to_fewer_slots_when_split_orders_are_too_small(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(

@@ -1527,16 +1527,21 @@ def suppress_same_side_nearby_place_orders(
         if not entries:
             continue
         reverse = side == "BUY"
-        selected: list[tuple[int, dict[str, Any], float]] = []
+        selected: list[tuple[int, dict[str, Any], float, str]] = []
         for index, order, price in sorted(entries, key=lambda item: item[2], reverse=reverse):
-            if any(abs(price - selected_price) < safe_spacing - 1e-12 for _, _, selected_price in selected):
+            position_side = _order_position_side(order)
+            if any(
+                position_side == selected_position_side
+                and abs(price - selected_price) < safe_spacing - 1e-12
+                for _, _, selected_price, selected_position_side in selected
+            ):
                 suppressed = dict(order)
                 suppressed["defer_reason"] = "same_side_nearby_place_order"
                 suppressed["min_price_spacing"] = safe_spacing
                 suppressed_orders.append(suppressed)
                 suppressed_indices.add(index)
                 continue
-            selected.append((index, order, price))
+            selected.append((index, order, price, position_side))
             kept_by_index[index] = order
 
     if not suppressed_orders:

@@ -257,17 +257,33 @@ def _prune_clustered_same_side_entry_orders(
     if not entries:
         return orders, 0
 
+    def _position_leg(order: dict[str, Any]) -> str:
+        value = str(order.get("position_side", "BOTH") or "BOTH").upper().strip()
+        return value if value in {"LONG", "SHORT"} else "BOTH"
+
+    def _same_cluster_scope(left: str, right: str) -> bool:
+        return left == "BOTH" or right == "BOTH" or left == right
+
     kept_entries: list[dict[str, Any]] = []
-    anchor_prices = [_safe_float(order.get("price")) for order in protected if _safe_float(order.get("price")) > 0]
+    anchor_prices = [
+        (_safe_float(order.get("price")), _position_leg(order))
+        for order in protected
+        if _safe_float(order.get("price")) > 0
+    ]
     reverse = side == "SELL"
     for order in sorted(entries, key=lambda item: _safe_float(item.get("price")), reverse=reverse):
         price = _safe_float(order.get("price"))
         if price <= 0:
             continue
-        if any(abs(price - existing) < min_gap - 1e-12 for existing in anchor_prices):
+        position_leg = _position_leg(order)
+        if any(
+            _same_cluster_scope(position_leg, existing_leg)
+            and abs(price - existing_price) < min_gap - 1e-12
+            for existing_price, existing_leg in anchor_prices
+        ):
             continue
         kept_entries.append(order)
-        anchor_prices.append(price)
+        anchor_prices.append((price, position_leg))
 
     kept_entry_ids = {id(order) for order in kept_entries}
     protected_ids = {id(order) for order in protected}
