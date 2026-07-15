@@ -2752,7 +2752,38 @@ def arx_low_pace_two_sided_maker_restore_updates(
         targets["max_short_position_notional"] = 2000.0
         targets["best_quote_maker_volume_max_long_notional"] = 2000.0
         targets["best_quote_maker_volume_max_short_notional"] = 2000.0
+        # The runner derives its entry pause from this ratio as well as the
+        # absolute pause lines.  Leaving a stale 0.5 here recreates an
+        # inventory_soft reduce-only book immediately after the recovery
+        # raises the absolute lines to 1,800U.
+        targets["best_quote_maker_volume_inventory_soft_ratio"] = 1.0
     return {key: value for key, value in targets.items() if control.get(key) != value}
+
+
+def should_keep_arx_low_pace_two_sided_flow(
+    *,
+    target_pace_behind: bool,
+    pace_ratio: float,
+    actual_long_notional: float,
+    actual_short_notional: float,
+    volatility_entry_pause_active: bool,
+) -> bool:
+    """Keep recovery branches from replacing safe ARX maker flow with unwind.
+
+    The real exchange sides, not the ordinary-ledger soft band, decide this
+    hand-off.  Below 1,800U on both sides, a material pace miss has enough
+    approved headroom to rebuild two-sided maker flow.  A reduce-only branch
+    in that interval merely flips the control back and forth every guard tick.
+    """
+    return (
+        bool(target_pace_behind)
+        and float(pace_ratio) < 0.75
+        and _safe_float(actual_long_notional) > 0.0
+        and _safe_float(actual_short_notional) > 0.0
+        and max(_safe_float(actual_long_notional), _safe_float(actual_short_notional))
+        < 1800.0
+        and not bool(volatility_entry_pause_active)
+    )
 
 
 def should_bypass_arx_side_unwind_recovery_gate(
@@ -4358,6 +4389,22 @@ def check_symbol(
             ),
         ),
     } if normalized_symbol == "ARXUSDT" else {}
+    arx_low_pace_two_sided_headroom = (
+        normalized_symbol == "ARXUSDT"
+        and should_keep_arx_low_pace_two_sided_flow(
+            target_pace_behind=target_pace_behind,
+            pace_ratio=pace_ratio,
+            actual_long_notional=_safe_float(assessment.get("actual_long_notional")),
+            actual_short_notional=_safe_float(assessment.get("actual_short_notional")),
+            volatility_entry_pause_active=bool(
+                assessment.get("volatility_entry_pause_active")
+            ),
+        )
+    )
+    if arx_low_pace_two_sided_headroom:
+        # A stale ordinary-ledger soft band is not a real-side cap.  Keep the
+        # 1,800/2,000U recovery band in ownership until either side reaches it.
+        arx_side_cap_unwind = {}
     arx_fast_sla_capacity_reapply = should_bypass_arx_recovery_drift_debounce(
         symbol=normalized_symbol,
         target_pace_behind=target_pace_behind,
@@ -4924,6 +4971,7 @@ def check_symbol(
         elif (
             arx_severe_volume_priority_recovery
             and bool(assessment.get("inventory_soft_pressure"))
+            and not arx_low_pace_two_sided_headroom
             and not critical_arx_inventory_pace_override
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
         ):
