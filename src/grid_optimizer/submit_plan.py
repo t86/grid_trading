@@ -1227,6 +1227,117 @@ def _entry_side_from_order(order: dict[str, Any], *, strategy_mode: str) -> str 
     return None
 
 
+def _hedge_entry_side_from_order(order: dict[str, Any]) -> str | None:
+    """Return the hedge-side exposure an order can add, if any."""
+
+    if _truthy(order.get("force_reduce_only")) or _truthy(order.get("reduceOnly")):
+        return None
+    side = str(order.get("side", "")).upper().strip()
+    position_side = _order_position_side(order)
+    if position_side == "LONG" and side == "BUY":
+        return "long"
+    if position_side == "SHORT" and side == "SELL":
+        return "short"
+    return None
+
+
+def _order_notional(order: dict[str, Any]) -> float:
+    notional = abs(_safe_float(order.get("notional")))
+    if notional > 0:
+        return notional
+    return abs(_safe_float(order.get("price"))) * abs(
+        _safe_float(
+            order.get("origQty", order.get("qty", order.get("quantity")))
+        )
+    )
+
+
+def apply_projected_entry_exposure_cap_to_actions(
+    *,
+    actions: dict[str, Any],
+    strategy_mode: str,
+    current_long_notional: float,
+    current_short_notional: float,
+    current_open_orders: Iterable[Any],
+    max_long_notional: float,
+    max_short_notional: float,
+) -> dict[str, Any]:
+    """Drop entries whose worst-case same-side fills would cross a cap.
+
+    Existing live entries and each accepted candidate reserve capacity in
+    order.  Reduce-only/frozen exits remain outside this entry-only guard.
+    """
+
+    normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
+    active_notional = {
+        "long": max(_safe_float(current_long_notional), 0.0),
+        "short": max(_safe_float(current_short_notional), 0.0),
+    }
+    caps = {
+        "long": max(_safe_float(max_long_notional), 0.0),
+        "short": max(_safe_float(max_short_notional), 0.0),
+    }
+    reserved = {"long": 0.0, "short": 0.0}
+
+    def entry_side(order: dict[str, Any]) -> str | None:
+        if normalized_mode in {
+            "hedge_neutral",
+            "hedge_best_quote_maker_volume_v1",
+        }:
+            return _hedge_entry_side_from_order(order)
+        return _entry_side_from_order(order, strategy_mode=normalized_mode)
+
+    for raw_order in current_open_orders:
+        if not isinstance(raw_order, dict):
+            continue
+        side = entry_side(raw_order)
+        if side is not None:
+            reserved[side] += _order_notional(raw_order)
+
+    kept_orders: list[dict[str, Any]] = []
+    dropped_orders: list[dict[str, Any]] = []
+    for raw_order in actions.get("place_orders", []):
+        if not isinstance(raw_order, dict):
+            continue
+        order = dict(raw_order)
+        side = entry_side(order)
+        notional = _order_notional(order)
+        cap = caps[side] if side is not None else 0.0
+        projected = (
+            active_notional[side] + reserved[side] + notional
+            if side is not None
+            else 0.0
+        )
+        if side is not None and cap > 0 and projected > cap + 1e-9:
+            order["projected_entry_exposure_cap_drop_reason"] = (
+                f"{side}_projected_notional={projected:.8f}>cap={cap:.8f}"
+            )
+            dropped_orders.append(order)
+            continue
+        kept_orders.append(order)
+        if side is not None:
+            reserved[side] += notional
+
+    result = dict(actions)
+    result["place_orders"] = kept_orders
+    result["place_count"] = len(kept_orders)
+    result["place_notional"] = sum(
+        _order_notional(item) for item in kept_orders
+    )
+    result["projected_entry_exposure_cap"] = {
+        "enabled": bool(caps["long"] > 0 or caps["short"] > 0),
+        "current_long_notional": active_notional["long"],
+        "current_short_notional": active_notional["short"],
+        "max_long_notional": caps["long"],
+        "max_short_notional": caps["short"],
+        "reserved_long_entry_notional": reserved["long"],
+        "reserved_short_entry_notional": reserved["short"],
+        "dropped_order_count": len(dropped_orders),
+        "dropped_orders": dropped_orders,
+    }
+    return result
+
+
 def _is_best_quote_volume_entry_order(order: dict[str, Any]) -> bool:
     role = str(order.get("role", "") or "").strip().lower()
     return role in {"best_quote_entry_long", "best_quote_entry_short"}

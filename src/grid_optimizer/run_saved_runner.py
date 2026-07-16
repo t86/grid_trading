@@ -2,11 +2,26 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
+from .futures_run_lifecycle import (
+    RUN_CONTRACT_OWNER_KEY,
+    bind_run_contract_owner,
+    validate_run_contract,
+)
+from .futures_recovery_store import (
+    decode_recovery_control_state,
+    recovery_coordinator_registered,
+)
 from .monitor import RUNNER_PID_PATH, runner_pid_path_for_symbol
+from .recovery_control_ownership import (
+    exclusive_control_lock,
+    write_control_json_atomically,
+)
 from .spot_app_loss_audit import main as spot_app_loss_audit_main
 from .web import (
     _build_runner_command,
@@ -22,6 +37,7 @@ from .web import (
 DEFAULT_RUNNER_SYMBOL = "SOONUSDT"
 RUNTIME_PATH_FLAGS = {
     "--plan-json",
+    "--recovery-control-path",
     "--state-path",
     "--submit-report-json",
     "--summary-jsonl",
@@ -81,6 +97,85 @@ def _should_use_spot_runner(symbol: str) -> bool:
     if not normalized:
         return False
     return _spot_runner_control_path(normalized).exists() and not _runner_control_path(normalized).exists()
+
+
+def _validate_futures_run_contract(config: dict[str, object]) -> None:
+    validate_run_contract(
+        run_start_time=config.get("run_start_time"),
+        runtime_guard_stats_start_time=config.get("runtime_guard_stats_start_time"),
+        run_end_time=config.get("run_end_time"),
+        target_value=config.get("max_cumulative_notional"),
+        exit_policy=config.get("terminal_drain_exit_policy"),
+        loss_budget=config.get("terminal_drain_absolute_loss_budget"),
+        max_wait_seconds=config.get("terminal_drain_max_wait_seconds"),
+        preserve_reason=config.get("terminal_drain_stop_preserve_reason"),
+        wear_stop_per_10k=config.get("lifecycle_wear_stop_per_10k"),
+        wear_stop_min_gross_notional=config.get(
+            "lifecycle_wear_stop_min_gross_notional"
+        ),
+    )
+
+
+def _persist_run_contract_owner(
+    control_path: Path,
+    *,
+    effective_config: dict[str, object],
+    prepared_config: dict[str, object],
+) -> None:
+    """Persist only the new owner alongside the operator's raw control."""
+
+    raw_control: dict[str, object]
+    try:
+        payload = json.loads(control_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        payload = None
+    raw_control = dict(payload) if isinstance(payload, dict) else dict(effective_config)
+    if recovery_coordinator_registered(raw_control):
+        decode_recovery_control_state(
+            raw_control,
+            expected_symbol=str(
+                raw_control.get("symbol") or effective_config.get("symbol") or ""
+            ),
+        )
+    raw_control[RUN_CONTRACT_OWNER_KEY] = prepared_config[RUN_CONTRACT_OWNER_KEY]
+    raw_control["terminal_drain_max_order_notional"] = prepared_config[
+        "terminal_drain_max_order_notional"
+    ]
+    write_control_json_atomically(control_path, raw_control)
+
+
+def _load_and_bind_futures_run_config(symbol: str) -> dict[str, object]:
+    """Load the effective control and freeze a bounded contract before exec."""
+
+    config = _load_runner_control_config(symbol, include_running_process=False)
+    config["symbol"] = symbol
+    _validate_futures_run_contract(config)
+    prepared, owner_changed = bind_run_contract_owner(
+        config,
+        activated_at=datetime.now(timezone.utc),
+    )
+    if not owner_changed:
+        return prepared
+
+    # Re-read under the same cross-process actuator lock used by the Web and
+    # recovery writers.  This prevents first-start owner creation from
+    # overwriting a control change that raced the initial read.
+    control_path = _runner_control_path(symbol)
+    with exclusive_control_lock(control_path):
+        current = _load_runner_control_config(symbol, include_running_process=False)
+        current["symbol"] = symbol
+        _validate_futures_run_contract(current)
+        prepared, owner_changed = bind_run_contract_owner(
+            current,
+            activated_at=datetime.now(timezone.utc),
+        )
+        if owner_changed:
+            _persist_run_contract_owner(
+                control_path,
+                effective_config=current,
+                prepared_config=prepared,
+            )
+    return prepared
 
 
 def _run_spot_app_loss_prestart_gate(config: dict[str, object]) -> int:
@@ -158,8 +253,6 @@ def main() -> None:
         os.environ["GRID_RUNNER_SERVICE_TEMPLATE"] = "grid-loop@{symbol}.service"
     pid_path = runner_pid_path_for_symbol(symbol) if symbol else RUNNER_PID_PATH
     pid_path = Path(pid_path).resolve()
-    _write_pid(pid_path)
-    atexit.register(_cleanup_pid, pid_path)
     if _should_use_spot_runner(symbol):
         config = _load_spot_runner_control_config(symbol)
         try:
@@ -175,14 +268,19 @@ def main() -> None:
         # A restart must honor the persisted control, not the arguments from
         # the process being replaced.  Otherwise a stale one-way command can
         # overwrite a corrected hedge-mode control during bootstrap.
-        config = _load_runner_control_config(symbol, include_running_process=False)
-        # The systemd instance is the authority for its symbol.  A stale or
-        # cross-symbol control document must never make grid-loop@ARXUSDT
-        # launch another market while still writing ARX runtime artifacts.
-        config["symbol"] = symbol
+        try:
+            # The systemd instance is the authority for its symbol.  A stale
+            # cross-symbol document is rebound before its immutable run owner
+            # is verified and persisted.
+            config = _load_and_bind_futures_run_config(symbol)
+        except ValueError as exc:
+            print(f"{symbol} 运行终止契约无效：{exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
         command_builder = _build_runner_command
     command = command_builder(config)
     command = _anchor_relative_runtime_paths(command, runner_work_dir)
+    _write_pid(pid_path)
+    atexit.register(_cleanup_pid, pid_path)
     if runner_work_dir:
         os.chdir(original_cwd)
     exec_env = os.environ.copy()

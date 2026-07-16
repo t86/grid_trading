@@ -140,6 +140,11 @@ def resolve_runtime_guard_stats_start_time(
         )
     except ValueError:
         explicit_start = None
+    # An explicit start belongs to the run contract.  Competition-board
+    # metadata is only a legacy/default fallback when no explicit boundary was
+    # supplied; it must never move a running contract's accounting window.
+    if explicit_start is not None:
+        return explicit_start
     normalized_symbol = str(symbol or "").upper().strip()
     normalized_market = str(market or "").strip().lower()
     if not normalized_symbol or not normalized_market:
@@ -154,11 +159,7 @@ def resolve_runtime_guard_stats_start_time(
         board_start = _parse_datetime(board.get("activity_start_at"), "activity_start_at", now=now)
     except ValueError:
         return explicit_start
-    if explicit_start is None:
-        return board_start
-    if board_start is None:
-        return explicit_start
-    return max(explicit_start, board_start)
+    return board_start
 
 
 def summarize_futures_runtime_guard_inputs(
@@ -169,14 +170,29 @@ def summarize_futures_runtime_guard_inputs(
     now: datetime | None = None,
     bq_order_refs_path: Path | None = None,
     bq_book_scope: str | None = None,
+    immutable_window: bool = False,
+    runtime_guard_stats_end_time: Any = None,
 ) -> tuple[float, list[dict[str, Any]], datetime | None]:
     audit_paths = build_audit_paths(summary_path)
     trade_rows = read_jsonl(audit_paths["trade_audit"], limit=0)
     income_rows = read_jsonl(audit_paths["income_audit"], limit=0)
-    metrics_start_time = resolve_runtime_guard_stats_start_time(
-        runtime_guard_stats_start_time=runtime_guard_stats_start_time,
-        symbol=symbol,
-        market="futures",
+    metrics_start_time = (
+        _parse_datetime(
+            runtime_guard_stats_start_time,
+            "runtime_guard_stats_start_time",
+            now=now,
+        )
+        if immutable_window
+        else resolve_runtime_guard_stats_start_time(
+            runtime_guard_stats_start_time=runtime_guard_stats_start_time,
+            symbol=symbol,
+            market="futures",
+            now=now,
+        )
+    )
+    metrics_end_time = _parse_datetime(
+        runtime_guard_stats_end_time,
+        "runtime_guard_stats_end_time",
         now=now,
     )
     cumulative_gross_notional = 0.0
@@ -223,6 +239,9 @@ def summarize_futures_runtime_guard_inputs(
         if metrics_start_time is not None:
             if trade_ts is None or trade_ts < metrics_start_time:
                 continue
+        if metrics_end_time is not None:
+            if trade_ts is None or trade_ts >= metrics_end_time:
+                continue
         if normalized_bq_book_scope:
             order_id = str(row.get("orderId") or row.get("order_id") or "").strip()
             if bq_order_books.get(order_id, "unknown") != normalized_bq_book_scope:
@@ -268,6 +287,8 @@ def summarize_futures_runtime_guard_inputs(
             continue
         income_ts = datetime.fromtimestamp(income_time_ms / 1000.0, tz=timezone.utc)
         if metrics_start_time is not None and income_ts < metrics_start_time:
+            continue
+        if metrics_end_time is not None and income_ts >= metrics_end_time:
             continue
         pnl_events.append(
             {
@@ -335,11 +356,15 @@ def normalize_runtime_guard_payload(
 ) -> dict[str, Any]:
     config = normalize_runtime_guard_config(raw, now=now)
     normalized_symbol = str(symbol or raw.get("symbol") or "").upper().strip() or None
-    resolved_stats_start_time = resolve_runtime_guard_stats_start_time(
-        runtime_guard_stats_start_time=config.runtime_guard_stats_start_time,
-        symbol=normalized_symbol,
-        market=market,
-        now=now,
+    resolved_stats_start_time = (
+        config.runtime_guard_stats_start_time
+        if config.max_cumulative_notional is not None
+        else resolve_runtime_guard_stats_start_time(
+            runtime_guard_stats_start_time=config.runtime_guard_stats_start_time,
+            symbol=normalized_symbol,
+            market=market,
+            now=now,
+        )
     )
     return {
         "run_start_time": config.run_start_time.isoformat() if config.run_start_time else None,

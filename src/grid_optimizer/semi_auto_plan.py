@@ -25,6 +25,20 @@ from .live_check import extract_symbol_position
 from .types import Candle
 
 STATE_VERSION = 1
+RECOVERY_RECEIPT_JOURNAL_KEYS = (
+    "_futures_recovery_config_applied_receipts",
+    "_futures_ordinary_recovery_runner_receipts",
+    "_futures_inventory_recovery_runner_receipts",
+    "_futures_recovery_runner_receipts",
+)
+TERMINAL_LIFECYCLE_STATE_KEYS = (
+    "futures_terminal_drain",
+    "futures_terminal_drain_history",
+    "futures_terminal_intent",
+    "futures_terminal_intent_history",
+    "futures_terminal_handoff",
+    "futures_terminal_handoff_history",
+)
 
 
 @dataclass(frozen=True)
@@ -2351,14 +2365,18 @@ def load_or_initialize_state(
     preserved_frozen_manual_reduce: dict[str, Any] = {}
     preserved_frozen_manual_limit: dict[str, Any] = {}
     preserved_frozen_pair_release: dict[str, Any] = {}
+    preserved_recovery_receipt_journals: dict[str, Any] = {}
+    preserved_terminal_lifecycle: dict[str, Any] = {}
 
-    def _preserve_best_quote_ledgers(existing_state: dict[str, Any]) -> None:
+    def _preserve_reset_safe_state(existing_state: dict[str, Any]) -> None:
         nonlocal preserved_best_quote_volume_ledger
         nonlocal preserved_best_quote_volume_order_refs
         nonlocal preserved_frozen_inventory
         nonlocal preserved_frozen_manual_reduce
         nonlocal preserved_frozen_manual_limit
         nonlocal preserved_frozen_pair_release
+        nonlocal preserved_recovery_receipt_journals
+        nonlocal preserved_terminal_lifecycle
         if isinstance(existing_state.get("best_quote_volume_ledger"), dict):
             preserved_best_quote_volume_ledger = dict(existing_state["best_quote_volume_ledger"])
         if isinstance(existing_state.get("best_quote_volume_order_refs"), dict):
@@ -2371,12 +2389,18 @@ def load_or_initialize_state(
             preserved_frozen_manual_limit = dict(existing_state["best_quote_frozen_inventory_manual_limit"])
         if isinstance(existing_state.get("best_quote_frozen_inventory_pair_release"), dict):
             preserved_frozen_pair_release = dict(existing_state["best_quote_frozen_inventory_pair_release"])
+        for key in RECOVERY_RECEIPT_JOURNAL_KEYS:
+            if key in existing_state:
+                preserved_recovery_receipt_journals[key] = existing_state[key]
+        for key in TERMINAL_LIFECYCLE_STATE_KEYS:
+            if key in existing_state:
+                preserved_terminal_lifecycle[key] = existing_state[key]
 
     if state_path.exists() and not reset_state:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if str(state.get("config_signature", "")).strip() != _config_signature(config):
             if os.environ.get("GRID_AUTO_RESET_ON_CONFIG_CHANGE") == "1":
-                _preserve_best_quote_ledgers(state if isinstance(state, dict) else {})
+                _preserve_reset_safe_state(state if isinstance(state, dict) else {})
                 print(
                     "State config does not match current CLI arguments; "
                     "auto-resetting state because GRID_AUTO_RESET_ON_CONFIG_CHANGE=1."
@@ -2390,7 +2414,7 @@ def load_or_initialize_state(
             existing_state = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             existing_state = {}
-        _preserve_best_quote_ledgers(existing_state if isinstance(existing_state, dict) else {})
+        _preserve_reset_safe_state(existing_state if isinstance(existing_state, dict) else {})
 
     center_price = args.center_price if args.center_price is not None else mid_price
     center_price = _round_to_nearest_step(center_price, symbol_info.get("tick_size"))
@@ -2417,6 +2441,8 @@ def load_or_initialize_state(
         state["best_quote_frozen_inventory_manual_limit"] = preserved_frozen_manual_limit
     if preserved_frozen_pair_release:
         state["best_quote_frozen_inventory_pair_release"] = preserved_frozen_pair_release
+    state.update(preserved_recovery_receipt_journals)
+    state.update(preserved_terminal_lifecycle)
     if getattr(args, "custom_grid_enabled", False):
         state.update(
             {

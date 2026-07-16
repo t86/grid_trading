@@ -351,6 +351,8 @@ def _parse_runner_args(args_text: str) -> dict[str, Any]:
             "--max-total-notional",
             "--rolling-hourly-loss-limit",
             "--max-cumulative-notional",
+            "--terminal-drain-absolute-loss-budget",
+            "--terminal-drain-max-wait-seconds",
             "--max-mid-drift-steps",
             "--sleep-seconds",
             "--execution-regime-vol-p50-ratio",
@@ -414,7 +416,10 @@ def _parse_runner_args(args_text: str) -> dict[str, Any]:
             "--submit-report-json",
             "--summary-jsonl",
             "--run-start-time",
+            "--runtime-guard-stats-start-time",
             "--run-end-time",
+            "--terminal-drain-exit-policy",
+            "--terminal-drain-stop-preserve-reason",
         }:
             config[key] = next_token
             i += 2

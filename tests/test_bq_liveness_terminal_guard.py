@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -73,6 +74,37 @@ class BqLivenessTerminalGuardTests(TestCase):
             (output_dir / "arxusdt_loop_state.json").write_text("{}", encoding="utf-8")
             with patch("grid_optimizer.bq_liveness_terminal_guard.runpy.run_path") as run_path:
                 self.assertEqual(main(["--symbol", "ARXUSDT", "--workdir", str(workdir), "--enforce"]), 0)
+            run_path.assert_not_called()
+
+    def test_registered_bch_presence_never_executes_untracked_legacy_watchdog(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir)
+            output_dir = workdir / "output"
+            legacy = output_dir / "ops" / "bq_liveness_watchdog.py"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text("raise AssertionError('must not run')", encoding="utf-8")
+            (output_dir / "bchusdt_loop_state.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            (output_dir / "bchusdt_loop_runner_control.json").write_text(
+                json.dumps({"_futures_recovery_state": None}),
+                encoding="utf-8",
+            )
+            with patch(
+                "grid_optimizer.bq_liveness_terminal_guard.runpy.run_path"
+            ) as run_path:
+                self.assertEqual(
+                    main(
+                        [
+                            "--symbol",
+                            "BCHUSDT",
+                            "--workdir",
+                            str(workdir),
+                            "--enforce",
+                        ]
+                    ),
+                    0,
+                )
             run_path.assert_not_called()
 
     def test_clears_stale_drift_flag_after_fresh_safe_reconcile(self) -> None:

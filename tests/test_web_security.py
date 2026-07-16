@@ -4,9 +4,10 @@ import base64
 import io
 import json
 import os
+import shlex
 import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -66,11 +67,179 @@ from grid_optimizer.web import (
     _volatility_trigger_orphan_recovery_action,
 )
 from grid_optimizer import web as web_module
+from grid_optimizer.futures_run_lifecycle import (
+    RUN_CONTRACT_OWNER_KEY,
+    bind_run_contract_owner,
+    run_contract_identity_from_config,
+)
+from grid_optimizer.futures_recovery_store import (
+    RECOVERY_STATE_MIRROR_KEY,
+    RECOVERY_STATE_KEY,
+    JsonRecoveryStore,
+    RecoveryStateCorruptError,
+)
+from grid_optimizer.futures_recovery_coordinator import (
+    ActionId,
+    ActivationReceipt,
+    EffectReceipt,
+    EffectStage,
+    FlowBlockerAssessment,
+    FuturesRecoveryDecisionEngine,
+    ManagedOrderIdentity,
+    ManagedOrderManifest,
+    OrderRole,
+    RecoveryPhase,
+    RecoveryPolicy,
+    Side,
+    SymbolSnapshot,
+)
+from grid_optimizer.competition_target_gate import _run_contract_config_from_command
 from grid_optimizer.loop_runner import _build_parser as _build_loop_runner_parser
 from grid_optimizer.running_status import _normalize_frozen_inventory_ledger
 
 
 class WebSecurityTests(unittest.TestCase):
+    def _write_registered_recovery_control(
+        self,
+        control_path: Path,
+        *,
+        phase: RecoveryPhase,
+    ) -> dict[str, object]:
+        now = datetime(2026, 7, 16, tzinfo=timezone.utc)
+        control_path.write_text(
+            json.dumps({"symbol": "ARXUSDT"}),
+            encoding="utf-8",
+        )
+        store = JsonRecoveryStore(control_path)
+        initial = store.register_symbol(
+            "ARXUSDT",
+            {
+                "best_quote_maker_volume_cycle_budget_notional": 360.0,
+                "volatility_entry_pause_enabled": True,
+            },
+            now=now,
+        )
+        if phase is RecoveryPhase.STABLE:
+            return json.loads(control_path.read_text(encoding="utf-8"))
+
+        engine = FuturesRecoveryDecisionEngine(
+            policy=RecoveryPolicy(
+                action_progress_timeout=timedelta(seconds=30),
+                action_hard_ttl=timedelta(seconds=60),
+            )
+        )
+        assessment = FlowBlockerAssessment(
+            inventory_reduce_sides=(Side.SELL,),
+            loss_only_blocked_sides=(Side.SELL,),
+        )
+        exhausted = initial.with_exhausted_attempt(
+            ActionId.INVENTORY_RECOVER,
+            Side.SELL,
+            OrderRole.REDUCE_ONLY,
+            now=now,
+        )
+        entered = engine.plan_round(
+            snapshot=SymbolSnapshot(
+                symbol="ARXUSDT",
+                captured_at=now,
+                assessment=assessment,
+            ),
+            state=exhausted,
+            now=now,
+            round_id="web-tlr-enter",
+        )
+        store.compare_and_swap(
+            "ARXUSDT",
+            expected_revision=0,
+            next_state=entered.next_state,
+        )
+        lease = entered.next_state.action_lease
+        self.assertIsNotNone(lease)
+        activated_at = now + timedelta(seconds=1)
+        activated = engine.plan_round(
+            snapshot=SymbolSnapshot(
+                symbol="ARXUSDT",
+                captured_at=activated_at,
+                assessment=assessment,
+                activation_receipt=ActivationReceipt(
+                    decision_id=entered.next_state.decision_id,
+                    generation=entered.next_state.generation,
+                    profile_digest=entered.next_state.desired_profile.digest,
+                    action_lease_epoch=lease.epoch,
+                    observed_at=activated_at,
+                ),
+            ),
+            state=entered.next_state,
+            now=activated_at,
+            round_id="web-tlr-activate",
+        )
+        store.compare_and_swap(
+            "ARXUSDT",
+            expected_revision=entered.next_state.document_revision,
+            next_state=activated.next_state,
+        )
+        acknowledged_at = activated_at + timedelta(microseconds=1)
+        active = engine.plan_round(
+            snapshot=SymbolSnapshot(
+                symbol="ARXUSDT",
+                captured_at=acknowledged_at,
+                assessment=assessment,
+                effect_receipt=EffectReceipt(
+                    decision_id=activated.next_state.decision_id,
+                    stage=EffectStage.RUNNER_RESTART,
+                    effect_epoch=activated.effect_epoch,
+                    observed_at=acknowledged_at,
+                ),
+            ),
+            state=activated.next_state,
+            now=acknowledged_at,
+            round_id="web-tlr-restart-ack",
+        )
+        store.compare_and_swap(
+            "ARXUSDT",
+            expected_revision=activated.next_state.document_revision,
+            next_state=active.next_state,
+        )
+        if phase is RecoveryPhase.ACTIVE:
+            return json.loads(control_path.read_text(encoding="utf-8"))
+
+        cleaning_at = now + timedelta(seconds=61)
+        cleaning = engine.plan_round(
+            snapshot=SymbolSnapshot(
+                symbol="ARXUSDT",
+                captured_at=cleaning_at,
+                assessment=assessment,
+                exchange_observation_available=False,
+                managed_order_manifest=ManagedOrderManifest(
+                    symbol=active.next_state.symbol,
+                    generation=active.next_state.generation,
+                    decision_id=active.next_state.decision_id,
+                    profile_digest=active.next_state.desired_profile.digest,
+                    action_id=active.next_state.active_action,
+                    side=active.next_state.side,
+                    order_role=active.next_state.order_role,
+                    issued_at=active.next_state.issued_at,
+                    orders=(
+                        ManagedOrderIdentity("123", "gx-arxu-tlr-test-123"),
+                    ),
+                    action_lease_epoch=active.next_state.action_lease.epoch,
+                    hard_expires_at=(
+                        active.next_state.action_lease.hard_expires_at
+                    ),
+                ),
+            ),
+            state=active.next_state,
+            now=cleaning_at,
+            round_id="web-tlr-cleaning",
+        )
+        store.compare_and_swap(
+            "ARXUSDT",
+            expected_revision=active.next_state.document_revision,
+            next_state=cleaning.next_state,
+        )
+        self.assertIs(cleaning.next_state.phase, RecoveryPhase.CLEANING)
+        return json.loads(control_path.read_text(encoding="utf-8"))
+
     def _mock_symbol_config(self) -> dict[str, float]:
         return {
             "tick_size": 0.0001,
@@ -164,10 +333,14 @@ class WebSecurityTests(unittest.TestCase):
             "buy_pause_amp_trigger_ratio": 0.003,
             "buy_pause_down_return_trigger_ratio": -0.0015,
             "volatility_entry_pause_enabled": True,
+            "volatility_entry_pause_10s_abs_return_ratio": 0.001,
+            "volatility_entry_pause_10s_amplitude_ratio": 0.0015,
             "volatility_entry_pause_30s_abs_return_ratio": 0.0015,
             "volatility_entry_pause_30s_amplitude_ratio": 0.0025,
             "volatility_entry_pause_1m_abs_return_ratio": 0.0025,
             "volatility_entry_pause_1m_amplitude_ratio": 0.0035,
+            "volatility_entry_pause_min_observation_seconds": 10.0,
+            "volatility_entry_pause_inventory_recover_ratio": 0.75,
             "anti_chase_entry_guard_enabled": True,
             "anti_chase_entry_guard_1m_abs_return_ratio": 0.0025,
             "anti_chase_entry_guard_1m_amplitude_ratio": 0.0035,
@@ -194,10 +367,14 @@ class WebSecurityTests(unittest.TestCase):
         return {
             "pause_short_position_notional": pause,
             "volatility_entry_pause_enabled": True,
+            "volatility_entry_pause_10s_abs_return_ratio": 0.001,
+            "volatility_entry_pause_10s_amplitude_ratio": 0.0015,
             "volatility_entry_pause_30s_abs_return_ratio": 0.0015,
             "volatility_entry_pause_30s_amplitude_ratio": 0.0025,
             "volatility_entry_pause_1m_abs_return_ratio": 0.0025,
             "volatility_entry_pause_1m_amplitude_ratio": 0.0035,
+            "volatility_entry_pause_min_observation_seconds": 10.0,
+            "volatility_entry_pause_inventory_recover_ratio": 0.75,
             "anti_chase_entry_guard_enabled": True,
             "anti_chase_entry_guard_1m_abs_return_ratio": 0.0025,
             "anti_chase_entry_guard_1m_amplitude_ratio": 0.0035,
@@ -269,6 +446,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('id="monitor_runtime_guard_stats_start_time"', MONITOR_PAGE)
         self.assertIn('id="monitor_rolling_hourly_loss_limit"', MONITOR_PAGE)
         self.assertIn('id="monitor_max_cumulative_notional"', MONITOR_PAGE)
+        self.assertIn('id="monitor_terminal_drain_exit_policy"', MONITOR_PAGE)
+        self.assertIn('id="monitor_terminal_drain_absolute_loss_budget"', MONITOR_PAGE)
+        self.assertIn('id="monitor_terminal_drain_max_wait_seconds"', MONITOR_PAGE)
+        self.assertIn('id="monitor_terminal_drain_stop_preserve_reason"', MONITOR_PAGE)
         self.assertIn('id="monitor_volume_trigger_enabled"', MONITOR_PAGE)
         self.assertIn('id="monitor_volume_trigger_window"', MONITOR_PAGE)
         self.assertIn('id="monitor_volume_trigger_start_threshold"', MONITOR_PAGE)
@@ -280,6 +461,17 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('id="monitor_volatility_trigger_stop_reduce_to_notional"', MONITOR_PAGE)
         self.assertIn('id="monitor_volatility_trigger_reduce_max_loss_ratio"', MONITOR_PAGE)
         self.assertIn('id="save_params_btn"', MONITOR_PAGE)
+
+    def test_monitor_page_wires_predictable_terminal_contract(self) -> None:
+        self.assertIn("terminal_drain_exit_policy: monitorTerminalDrainExitPolicyEl.value || null", MONITOR_PAGE)
+        self.assertIn("terminal_drain_absolute_loss_budget: monitorTerminalDrainAbsoluteLossBudgetEl.value", MONITOR_PAGE)
+        self.assertIn("terminal_drain_max_wait_seconds: monitorTerminalDrainMaxWaitSecondsEl.value", MONITOR_PAGE)
+        self.assertIn("terminal_drain_stop_preserve_reason: monitorTerminalDrainStopPreserveReasonEl.value.trim() || null", MONITOR_PAGE)
+        self.assertIn("monitorTerminalDrainAbsoluteLossBudgetEl.value = source.terminal_drain_absolute_loss_budget ?? \"\"", MONITOR_PAGE)
+        self.assertIn("monitorTerminalDrainMaxWaitSecondsEl.value = source.terminal_drain_max_wait_seconds ?? \"\"", MONITOR_PAGE)
+        self.assertIn("monitorTerminalDrainStopPreserveReasonEl.value = source.terminal_drain_stop_preserve_reason || \"\"", MONITOR_PAGE)
+        self.assertIn("运行结束契约", MONITOR_PAGE)
+        self.assertIn("目标未达成也会按明确路径退出", MONITOR_PAGE)
 
     def test_monitor_page_contains_reduce_state_panel(self) -> None:
         self.assertIn('id="reduce_state_box"', MONITOR_PAGE)
@@ -1547,6 +1739,124 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertEqual(decision["action"], "stop")
         self.assertEqual(decision["reason"], "volume_below_stop_threshold")
+
+    def test_registered_futures_volume_trigger_defers_stop_and_keeps_signal(self) -> None:
+        config = {
+            "symbol": "ARXUSDT",
+            "volume_trigger_enabled": True,
+            "volume_trigger_window": "5m",
+            "volume_trigger_stop_threshold": 100.0,
+            "_futures_recovery_state": {"schema_version": 1},
+        }
+        with (
+            patch(
+                "grid_optimizer.web.fetch_futures_quote_volume_sum",
+                return_value=20.0,
+            ),
+            patch(
+                "grid_optimizer.web._read_runner_process_for_symbol",
+                return_value={"is_running": True},
+            ),
+            patch(
+                "grid_optimizer.web._read_flatten_process_for_symbol",
+                return_value={"is_running": False},
+            ),
+            patch("grid_optimizer.web._start_runner_process") as mock_start,
+            patch("grid_optimizer.web._stop_runner_process") as mock_stop,
+            patch("grid_optimizer.web._update_volume_trigger_status") as mock_update,
+        ):
+            web_module._reconcile_runner_volume_trigger(config)
+
+        mock_start.assert_not_called()
+        mock_stop.assert_not_called()
+        status = mock_update.call_args.args[1]
+        self.assertIsNone(status["action"])
+        self.assertEqual(status["reason"], "volume_below_stop_threshold")
+        self.assertIsNone(status["orchestrator_observation"])
+        self.assertIsNone(status["requested_action"])
+        self.assertIn("RecoveryStateCorruptError", status["orchestrator_observation_error"])
+
+    def test_registered_futures_volatility_trigger_defers_flatten_and_keeps_signal(self) -> None:
+        config = {
+            "symbol": "ARXUSDT",
+            "volatility_trigger_enabled": True,
+            "volatility_trigger_window": "15m",
+            "volatility_trigger_amplitude_ratio": 0.02,
+            "volatility_trigger_abs_return_ratio": 0.01,
+            "volatility_trigger_stop_close_all_positions": True,
+            "_futures_recovery_state": {"schema_version": 1},
+        }
+        with (
+            patch(
+                "grid_optimizer.web.fetch_futures_window_price_stats",
+                return_value={"amplitude_ratio": 0.05, "return_ratio": -0.03},
+            ),
+            patch(
+                "grid_optimizer.web._read_runner_process_for_symbol",
+                return_value={"is_running": True},
+            ),
+            patch(
+                "grid_optimizer.web._read_flatten_process_for_symbol",
+                return_value={"is_running": False},
+            ),
+            patch("grid_optimizer.web._runner_volatility_trigger_status", return_value={}),
+            patch("grid_optimizer.web._start_runner_process") as mock_start,
+            patch("grid_optimizer.web._stop_runner_process") as mock_stop,
+            patch("grid_optimizer.web._update_volatility_trigger_status") as mock_update,
+        ):
+            _reconcile_runner_volatility_trigger(config)
+
+        mock_start.assert_not_called()
+        mock_stop.assert_not_called()
+        status = mock_update.call_args.args[1]
+        self.assertIsNone(status["action"])
+        self.assertEqual(status["reason"], "deferred_to_futures_recovery_coordinator")
+        self.assertEqual(status["orchestrator_signal"]["action"], "stop")
+        self.assertEqual(
+            status["orchestrator_signal"]["reason"],
+            "volatility_above_threshold",
+        )
+        self.assertTrue(status["orchestrator_signal"]["hit"])
+        self.assertTrue(
+            status["orchestrator_signal"]["stop_close_all_positions"]
+        )
+
+    def test_spot_volatility_trigger_is_not_fenced_by_futures_recovery_marker(self) -> None:
+        config = {
+            "symbol": "BTCUSDT",
+            "market_type": "spot",
+            "strategy_mode": "spot_loop",
+            "volatility_trigger_enabled": True,
+            "volatility_trigger_window": "15m",
+            "volatility_trigger_amplitude_ratio": 0.02,
+            "volatility_trigger_abs_return_ratio": 0.01,
+            "volatility_trigger_stop_close_all_positions": False,
+            "_futures_recovery_state": {"schema_version": 1},
+        }
+        with (
+            patch(
+                "grid_optimizer.web.fetch_futures_window_price_stats",
+                return_value={"amplitude_ratio": 0.05, "return_ratio": -0.03},
+            ),
+            patch(
+                "grid_optimizer.web._read_volatility_runner_process",
+                return_value={"is_running": True},
+            ),
+            patch(
+                "grid_optimizer.web._read_flatten_process_for_symbol",
+                return_value={"is_running": False},
+            ),
+            patch("grid_optimizer.web._runner_volatility_trigger_status", return_value={}),
+            patch(
+                "grid_optimizer.web._stop_volatility_runner_process",
+                return_value={"stopped": True, "already_stopped": False},
+            ) as mock_stop,
+            patch("grid_optimizer.web._update_volatility_trigger_status"),
+        ):
+            _reconcile_runner_volatility_trigger(config)
+
+        mock_stop.assert_called_once()
+        self.assertTrue(mock_stop.call_args.kwargs["spot"])
 
     def test_resolve_runner_volatility_trigger_action_stops_when_threshold_hit(self) -> None:
         decision = _resolve_runner_volatility_trigger_action(
@@ -4414,7 +4724,7 @@ class WebSecurityTests(unittest.TestCase):
 
     @patch("grid_optimizer.web.resolve_runtime_guard_stats_start_time")
     @patch("grid_optimizer.web.resolve_active_competition_board")
-    def test_running_status_stats_start_time_prefers_competition_start(
+    def test_running_status_stats_start_time_prefers_explicit_contract_start(
         self,
         mock_board,
         mock_guard_start,
@@ -4427,8 +4737,8 @@ class WebSecurityTests(unittest.TestCase):
             {"config": {"runtime_guard_stats_start_time": "2026-04-25T11:30:00+08:00"}},
         )
 
-        self.assertEqual(resolved, datetime(2026, 4, 22, 10, 0, tzinfo=timezone.utc))
-        mock_guard_start.assert_not_called()
+        self.assertEqual(resolved, datetime(2026, 4, 25, 3, 30, tzinfo=timezone.utc))
+        mock_board.assert_not_called()
 
     @patch("grid_optimizer.web.resolve_runtime_guard_stats_start_time")
     @patch("grid_optimizer.web.resolve_active_competition_board")
@@ -4448,12 +4758,16 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertEqual(resolved, guard_start)
 
+    @patch("grid_optimizer.web.daily_vol_wear")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     def test_start_runner_process_blocks_when_cumulative_notional_already_hit(
         self,
         mock_symbol_config,
         mock_book_tickers,
+        mock_credentials,
+        mock_daily_vol_wear,
     ) -> None:
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -4477,13 +4791,25 @@ class WebSecurityTests(unittest.TestCase):
             events_path.write_text("", encoding="utf-8")
             mock_symbol_config.return_value = self._mock_symbol_config()
             mock_book_tickers.return_value = self._mock_book()
+            mock_credentials.return_value = ("key", "secret")
+            mock_daily_vol_wear.return_value = {
+                "gross_notional": 200.0,
+                "realized_pnl": 0.0,
+                "wear_per_10k": 0.0,
+                "trade_count": 1,
+            }
 
             config = _resolve_runner_start_config(
                 {
                     "strategy_profile": "bard_12h_push_neutral_v2",
                     "symbol": "BARDUSDT",
                     "summary_jsonl": str(events_path),
+                    "runtime_guard_stats_start_time": "2026-04-05T00:00:00+00:00",
+                    "run_end_time": "2026-04-06T00:00:00+00:00",
                     "max_cumulative_notional": 150.0,
+                    "terminal_drain_exit_policy": "drain_then_preserve",
+                    "terminal_drain_absolute_loss_budget": 5.0,
+                    "terminal_drain_max_wait_seconds": 600.0,
                     **self._required_neutral_risk_guards(),
                 }
             )
@@ -4559,6 +4885,294 @@ class WebSecurityTests(unittest.TestCase):
         self.assertGreater(payload["volatility_entry_pause_10s_abs_return_ratio"], 0.0)
         self.assertGreater(payload["volatility_entry_pause_1m_amplitude_ratio"], 0.0)
 
+    def test_runner_defaults_leave_terminal_contract_unset(self) -> None:
+        payload = _normalize_runner_control_payload({})
+
+        self.assertIsNone(payload["terminal_drain_exit_policy"])
+        self.assertIsNone(payload["terminal_drain_absolute_loss_budget"])
+        self.assertIsNone(payload["terminal_drain_max_wait_seconds"])
+        self.assertIsNone(payload["terminal_drain_stop_preserve_reason"])
+        self.assertEqual(payload["terminal_drain_max_order_notional"], 0.0)
+        self.assertEqual(payload["terminal_drain_loss_lease_seconds"], 300.0)
+        self.assertEqual(payload["terminal_drain_order_reprice_seconds"], 120.0)
+        self.assertEqual(payload["terminal_drain_flat_confirm_cycles"], 2)
+        self.assertIsNone(payload["lifecycle_wear_stop_per_10k"])
+        self.assertIsNone(payload["lifecycle_wear_stop_min_gross_notional"])
+
+    def test_normalize_runner_control_payload_preserves_terminal_contract_fields(self) -> None:
+        payload = _normalize_runner_control_payload(
+            {
+                "symbol": "BCHUSDT",
+                "terminal_drain_exit_policy": "drain_then_preserve",
+                "terminal_drain_absolute_loss_budget": 8.5,
+                "terminal_drain_max_wait_seconds": 900,
+                "terminal_drain_stop_preserve_reason": "probe_window_expired",
+                "terminal_drain_max_order_notional": 40.0,
+                "terminal_drain_loss_lease_seconds": 180.0,
+                "terminal_drain_order_reprice_seconds": 45.0,
+                "terminal_drain_flat_confirm_cycles": 3,
+                "lifecycle_wear_stop_per_10k": 2.0,
+                "lifecycle_wear_stop_min_gross_notional": 75_000.0,
+                "futures_run_contract_owner": {"schema": "owner-test"},
+            }
+        )
+
+        self.assertEqual(payload["terminal_drain_exit_policy"], "drain_then_preserve")
+        self.assertEqual(payload["terminal_drain_absolute_loss_budget"], 8.5)
+        self.assertEqual(payload["terminal_drain_max_wait_seconds"], 900.0)
+        self.assertEqual(payload["terminal_drain_stop_preserve_reason"], "probe_window_expired")
+        self.assertEqual(payload["terminal_drain_max_order_notional"], 40.0)
+        self.assertEqual(payload["terminal_drain_loss_lease_seconds"], 180.0)
+        self.assertEqual(payload["terminal_drain_order_reprice_seconds"], 45.0)
+        self.assertEqual(payload["terminal_drain_flat_confirm_cycles"], 3)
+        self.assertEqual(payload["lifecycle_wear_stop_per_10k"], 2.0)
+        self.assertEqual(payload["lifecycle_wear_stop_min_gross_notional"], 75_000.0)
+        self.assertEqual(
+            payload["futures_run_contract_owner"],
+            {"schema": "owner-test"},
+        )
+
+    def test_target_preset_cannot_clear_declared_target_with_null(self) -> None:
+        with self.assertRaisesRegex(ValueError, "不能用空值清除"):
+            _runner_preset_payload(
+                "bchusdt_altcoins_probe_v1",
+                {
+                    "symbol": "BCHUSDT",
+                    "max_cumulative_notional": None,
+                },
+            )
+
+    def test_target_preset_summaries_require_explicit_run_contract_before_direct_start(self) -> None:
+        target_summaries = [
+            item
+            for item in _runner_preset_summaries()
+            if float((item.get("config") or {}).get("max_cumulative_notional") or 0) > 0
+        ]
+
+        self.assertTrue(target_summaries)
+        for summary in target_summaries:
+            with self.subTest(profile=summary["key"]):
+                self.assertTrue(summary["requires_run_contract"])
+                self.assertFalse(summary["direct_startable"])
+
+    def test_saved_target_contract_never_inherits_missing_terms_from_running_process(self) -> None:
+        saved = {
+            "symbol": "BCHUSDT",
+            "strategy_profile": "bchusdt_altcoins_probe_v1",
+            "max_cumulative_notional": 20_000.0,
+        }
+        running_contract = {
+            **saved,
+            "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+            "run_end_time": "2026-07-16T01:00:00+00:00",
+            "terminal_drain_exit_policy": "stop_preserve",
+            "terminal_drain_absolute_loss_budget": 0.0,
+            "terminal_drain_stop_preserve_reason": "old_run_complete",
+        }
+
+        with patch.object(web_module, "_read_json_dict", return_value=saved), patch.object(
+            web_module,
+            "_load_runner_control_config",
+            return_value=running_contract,
+        ) as mock_load_existing, patch.object(
+            web_module,
+            "_autotune_runner_symbol_config",
+            side_effect=lambda config: config,
+        ):
+            normalized, source = web_module._load_last_runner_control_config("BCHUSDT")
+
+        self.assertEqual(source, "saved_control")
+        self.assertIsNone(normalized["runtime_guard_stats_start_time"])
+        self.assertIsNone(normalized["run_end_time"])
+        self.assertIsNone(normalized["terminal_drain_exit_policy"])
+        mock_load_existing.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "requires run_end_time"):
+            web_module._validate_runner_run_contract(normalized)
+
+    def test_save_runner_config_rejects_invalid_bounded_contract_before_write(self) -> None:
+        invalid = {
+            "symbol": "BCHUSDT",
+            "run_end_time": "2026-07-16T12:00:00+00:00",
+            "terminal_drain_exit_policy": None,
+        }
+
+        with patch.object(web_module, "_resolve_runner_start_config", return_value=invalid), patch.object(
+            web_module, "_save_runner_control_config"
+        ) as mock_save, patch.object(web_module, "_clear_volatility_trigger_status") as mock_clear:
+            with self.assertRaisesRegex(ValueError, "bounded run requires exit_policy"):
+                web_module._save_runner_config_without_start({"symbol": "BCHUSDT"})
+
+        mock_save.assert_not_called()
+        mock_clear.assert_not_called()
+
+    def test_registered_recovery_start_apply_and_restart_are_deferred_without_effects(
+        self,
+    ) -> None:
+        for phase in (
+            RecoveryPhase.STABLE,
+            RecoveryPhase.ACTIVE,
+            RecoveryPhase.CLEANING,
+        ):
+            with self.subTest(phase=phase.value), TemporaryDirectory() as tmpdir:
+                control_path = Path(tmpdir) / "arx-control.json"
+                self._write_registered_recovery_control(
+                    control_path,
+                    phase=phase,
+                )
+                before = control_path.read_bytes()
+                desired = {
+                    "symbol": "ARXUSDT",
+                    "strategy_profile": "operator-change",
+                }
+                with patch.object(
+                    web_module,
+                    "_runner_control_path",
+                    return_value=control_path,
+                ), patch.object(
+                    web_module,
+                    "_validate_runner_run_contract",
+                ), patch.object(
+                    web_module,
+                    "_validate_runner_required_risk_guards",
+                ), patch.object(
+                    web_module,
+                    "_runner_start_safety_preflight",
+                ), patch.object(
+                    web_module,
+                    "_preflight_runner_runtime_guards",
+                ), patch.object(
+                    web_module,
+                    "_stop_flatten_process",
+                ) as mock_stop_flatten, patch.object(
+                    web_module,
+                    "_read_runner_process_for_symbol",
+                    return_value={
+                        "is_running": True,
+                        "config": {"symbol": "ARXUSDT", "strategy_profile": "old"},
+                    },
+                ) as mock_read_runner, patch.object(
+                    web_module,
+                    "_stop_runner_process",
+                ) as mock_stop_runner, patch.object(
+                    web_module,
+                    "_save_runner_control_config",
+                ) as mock_save, patch.object(
+                    web_module,
+                    "_clear_volatility_trigger_status",
+                ) as mock_clear, patch.object(
+                    web_module,
+                    "_runner_service_available",
+                    return_value=True,
+                ), patch.object(
+                    web_module,
+                    "_run_systemctl",
+                ) as mock_systemctl:
+                    result = _start_runner_process(desired)
+
+                self.assertTrue(result["actuation_deferred"])
+                self.assertEqual(
+                    result["reason"],
+                    "deferred_to_futures_recovery_coordinator",
+                )
+                self.assertEqual(result["requested_action"], "start_or_restart")
+                mock_stop_flatten.assert_not_called()
+                mock_read_runner.assert_not_called()
+                mock_stop_runner.assert_not_called()
+                mock_save.assert_not_called()
+                mock_clear.assert_not_called()
+                mock_systemctl.assert_not_called()
+                self.assertEqual(control_path.read_bytes(), before)
+
+    def test_malformed_registered_recovery_marker_still_blocks_web_start(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "arx-control.json"
+            malformed = {
+                "symbol": "ARXUSDT",
+                RECOVERY_STATE_KEY: None,
+            }
+            control_path.write_text(json.dumps(malformed), encoding="utf-8")
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ), patch.object(
+                web_module,
+                "_validate_runner_run_contract",
+            ), patch.object(
+                web_module,
+                "_stop_flatten_process",
+            ) as mock_stop_flatten, patch.object(
+                web_module,
+                "_stop_runner_process",
+            ) as mock_stop_runner, patch.object(
+                web_module,
+                "_save_runner_control_config",
+            ) as mock_save:
+                result = _start_runner_process({"symbol": "ARXUSDT"})
+
+        self.assertTrue(result["actuation_deferred"])
+        mock_stop_flatten.assert_not_called()
+        mock_stop_runner.assert_not_called()
+        mock_save.assert_not_called()
+
+    def test_registered_recovery_control_change_is_deferred_without_write(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "arx-control.json"
+            self._write_registered_recovery_control(
+                control_path,
+                phase=RecoveryPhase.STABLE,
+            )
+            before = control_path.read_bytes()
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ), patch.object(
+                web_module,
+                "_resolve_runner_start_config",
+                return_value={"symbol": "ARXUSDT"},
+            ) as mock_resolve, patch.object(
+                web_module,
+                "_save_runner_control_config",
+            ) as mock_save, patch.object(
+                web_module,
+                "_clear_volatility_trigger_status",
+            ) as mock_clear, patch.object(
+                web_module,
+                "_read_runner_process_for_symbol",
+            ) as mock_read_runner:
+                result = web_module._save_runner_config_without_start(
+                    {"symbol": "ARXUSDT", "step_price": 999.0}
+                )
+
+            self.assertTrue(result["actuation_deferred"])
+            self.assertEqual(result["requested_action"], "change_control")
+            mock_resolve.assert_not_called()
+            mock_save.assert_not_called()
+            mock_clear.assert_not_called()
+            mock_read_runner.assert_not_called()
+            self.assertEqual(control_path.read_bytes(), before)
+
+    def test_start_runner_process_rejects_invalid_bounded_contract_before_side_effects(self) -> None:
+        invalid = {
+            "symbol": "BCHUSDT",
+            "run_end_time": "2026-07-16T12:00:00+00:00",
+            "terminal_drain_exit_policy": None,
+        }
+
+        with patch.object(web_module, "_stop_flatten_process") as mock_stop_flatten, patch.object(
+            web_module, "_stop_runner_process"
+        ) as mock_stop_runner, patch.object(web_module, "_save_runner_control_config") as mock_save, patch.object(
+            web_module, "_read_runner_process_for_symbol"
+        ) as mock_read_runner:
+            with self.assertRaisesRegex(ValueError, "bounded run requires exit_policy"):
+                _start_runner_process(invalid)
+
+        mock_stop_flatten.assert_not_called()
+        mock_stop_runner.assert_not_called()
+        mock_save.assert_not_called()
+        mock_read_runner.assert_not_called()
+
     @patch("grid_optimizer.web._stop_flatten_process")
     def test_start_runner_process_validates_risk_guards_before_stopping_flatten(self, mock_stop_flatten) -> None:
         config = {
@@ -4571,6 +5185,61 @@ class WebSecurityTests(unittest.TestCase):
             _start_runner_process(config)
 
         mock_stop_flatten.assert_not_called()
+
+    def test_start_runner_process_runtime_preflight_runs_before_stopping_flatten(self) -> None:
+        config = {
+            "symbol": "BCHUSDT",
+            "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+            "run_end_time": "2026-07-16T01:00:00+00:00",
+            "max_cumulative_notional": 20_000.0,
+            "terminal_drain_exit_policy": "stop_preserve",
+            "terminal_drain_absolute_loss_budget": 0.0,
+            "terminal_drain_stop_preserve_reason": "probe_complete",
+        }
+
+        with patch.object(web_module, "_validate_runner_required_risk_guards"), patch.object(
+            web_module, "_runner_start_safety_preflight"
+        ), patch.object(
+            web_module,
+            "_preflight_runner_runtime_guards",
+            side_effect=ValueError("target already reached"),
+        ) as mock_preflight, patch.object(
+            web_module, "_stop_flatten_process"
+        ) as mock_stop_flatten, patch.object(
+            web_module, "_read_runner_process_for_symbol"
+        ) as mock_read_runner:
+            with self.assertRaisesRegex(ValueError, "target already reached"):
+                _start_runner_process(config)
+
+        mock_preflight.assert_called_once_with(config)
+        mock_stop_flatten.assert_not_called()
+        mock_read_runner.assert_not_called()
+
+    def test_target_preflight_fails_closed_when_exchange_truth_is_unavailable(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            summary_path = Path(tmpdir) / "bch_loop_events.jsonl"
+            summary_path.write_text("", encoding="utf-8")
+            config = {
+                "symbol": "BCHUSDT",
+                "summary_jsonl": str(summary_path),
+                "run_start_time": "2026-07-16T00:00:00+00:00",
+                "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+                "run_end_time": "2026-07-16T01:00:00+00:00",
+                "max_cumulative_notional": 20_000.0,
+            }
+
+            with patch.object(
+                web_module,
+                "load_binance_api_credentials",
+                return_value=None,
+            ), patch.object(web_module, "daily_vol_wear") as mock_progress:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "target progress exchange truth unavailable",
+                ):
+                    web_module._preflight_runner_runtime_guards(config)
+
+        mock_progress.assert_not_called()
 
     def test_build_runner_command_includes_runtime_guard_arguments(self) -> None:
         command = _build_runner_command(
@@ -4600,6 +5269,16 @@ class WebSecurityTests(unittest.TestCase):
                 "reset_state": True,
                 "run_start_time": "2026-03-31T01:00:00+00:00",
                 "run_end_time": "2026-03-31T03:00:00+00:00",
+                "terminal_drain_exit_policy": "drain_then_preserve",
+                "terminal_drain_absolute_loss_budget": 12.5,
+                "terminal_drain_max_wait_seconds": 600.0,
+                "terminal_drain_stop_preserve_reason": "deadline_cleanup_timeout",
+                "terminal_drain_max_order_notional": 37.5,
+                "terminal_drain_loss_lease_seconds": 180.0,
+                "terminal_drain_order_reprice_seconds": 45.0,
+                "terminal_drain_flat_confirm_cycles": 3,
+                "lifecycle_wear_stop_per_10k": 2.0,
+                "lifecycle_wear_stop_min_gross_notional": 75_000.0,
                 "runtime_guard_stats_start_time": "2026-03-31T02:00:00+00:00",
                 "rolling_hourly_loss_limit": 150.0,
                 "max_cumulative_notional": 100000.0,
@@ -4612,6 +5291,48 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--run-start-time", command)
         self.assertIn("2026-03-31T01:00:00+00:00", command)
         self.assertIn("--run-end-time", command)
+        self.assertEqual(
+            command[command.index("--terminal-drain-exit-policy") + 1],
+            "drain_then_preserve",
+        )
+        self.assertEqual(
+            command[command.index("--terminal-drain-absolute-loss-budget") + 1],
+            "12.5",
+        )
+        self.assertEqual(
+            command[command.index("--terminal-drain-max-wait-seconds") + 1],
+            "600.0",
+        )
+        self.assertEqual(
+            command[command.index("--terminal-drain-stop-preserve-reason") + 1],
+            "deadline_cleanup_timeout",
+        )
+        self.assertEqual(
+            command[command.index("--terminal-drain-max-order-notional") + 1],
+            "37.5",
+        )
+        self.assertEqual(
+            command[command.index("--terminal-drain-loss-lease-seconds") + 1],
+            "180.0",
+        )
+        self.assertEqual(
+            command[command.index("--terminal-drain-order-reprice-seconds") + 1],
+            "45.0",
+        )
+        self.assertEqual(
+            command[command.index("--terminal-drain-flat-confirm-cycles") + 1],
+            "3",
+        )
+        self.assertEqual(
+            command[command.index("--lifecycle-wear-stop-per-10k") + 1],
+            "2.0",
+        )
+        self.assertEqual(
+            command[
+                command.index("--lifecycle-wear-stop-min-gross-notional") + 1
+            ],
+            "75000.0",
+        )
         self.assertIn("--runtime-guard-stats-start-time", command)
         self.assertIn("2026-03-31T02:00:00+00:00", command)
         self.assertIn("--rolling-hourly-loss-limit", command)
@@ -4621,6 +5342,39 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--unrealized-loss-entry-guard-enabled", command)
         self.assertIn("--unrealized-loss-entry-guard-ratio", command)
         self.assertIn("0.015", command)
+
+    def test_built_live_command_reconstructs_authoritative_owner_identity(self) -> None:
+        config = _normalize_runner_control_payload(
+            {
+                "symbol": "BCHUSDT",
+                "strategy_profile": "bch-volume-v1",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "per_order_notional": 20.0,
+                "run_start_time": "2026-07-16T00:00:00+00:00",
+                "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+                "run_end_time": "2026-07-17T00:00:00+00:00",
+                "max_cumulative_notional": 20_000.0,
+                "terminal_drain_exit_policy": "drain_then_preserve",
+                "terminal_drain_absolute_loss_budget": 2.0,
+                "terminal_drain_max_wait_seconds": 600.0,
+                "terminal_drain_loss_lease_seconds": 180.0,
+                "terminal_drain_order_reprice_seconds": 45.0,
+                "terminal_drain_flat_confirm_cycles": 3,
+            },
+            inherit_existing=False,
+        )
+        owned, _ = bind_run_contract_owner(
+            config,
+            activated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        )
+
+        command = _build_runner_command(owned)
+        live_contract = _run_contract_config_from_command(shlex.join(command))
+
+        self.assertEqual(
+            run_contract_identity_from_config(live_contract),
+            owned[RUN_CONTRACT_OWNER_KEY]["run_contract_id"],
+        )
 
     def test_build_runner_command_includes_adverse_reduce_arguments(self) -> None:
         command = _build_runner_command(
@@ -5283,6 +6037,255 @@ class WebSecurityTests(unittest.TestCase):
             if control_path.exists():
                 control_path.unlink()
 
+    def test_web_save_defers_registered_owner_and_control_changes(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "bch-control.json"
+            existing, _ = bind_run_contract_owner(
+                {
+                    "symbol": "BCHUSDT",
+                    "strategy_profile": "bch-volume-v1",
+                    "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                    "per_order_notional": 20.0,
+                    "run_start_time": "2026-07-16T00:00:00+00:00",
+                    "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+                    "run_end_time": "2026-07-17T00:00:00+00:00",
+                    "max_cumulative_notional": 20_000.0,
+                    "terminal_drain_exit_policy": "drain_then_preserve",
+                    "terminal_drain_absolute_loss_budget": 2.0,
+                    "terminal_drain_max_wait_seconds": 600.0,
+                },
+                activated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            control_path.write_text(json.dumps(existing), encoding="utf-8")
+            JsonRecoveryStore(control_path).register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_cycle_budget_notional": 360.0,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            existing = json.loads(control_path.read_text(encoding="utf-8"))
+            desired = dict(existing)
+            desired.pop(RUN_CONTRACT_OWNER_KEY)
+            desired.pop(RECOVERY_STATE_KEY)
+            desired.pop("best_quote_maker_volume_cycle_budget_notional")
+            desired.pop("volatility_entry_pause_enabled")
+            desired["per_order_notional"] = 30.0
+
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ), self.assertRaisesRegex(ValueError, "recovery coordinator"):
+                _save_runner_control_config(desired, symbol="BCHUSDT")
+
+            saved = json.loads(control_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved, existing)
+
+    def test_web_save_rejects_contract_change_without_explicit_handoff(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "bch-control.json"
+            existing, _ = bind_run_contract_owner(
+                {
+                    "symbol": "BCHUSDT",
+                    "strategy_profile": "bch-volume-v1",
+                    "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                    "per_order_notional": 20.0,
+                    "run_start_time": "2026-07-16T00:00:00+00:00",
+                    "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+                    "run_end_time": "2026-07-17T00:00:00+00:00",
+                    "max_cumulative_notional": 20_000.0,
+                    "terminal_drain_exit_policy": "drain_then_preserve",
+                    "terminal_drain_absolute_loss_budget": 2.0,
+                    "terminal_drain_max_wait_seconds": 600.0,
+                },
+                activated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            control_path.write_text(json.dumps(existing), encoding="utf-8")
+            desired = dict(existing)
+            desired.pop(RUN_CONTRACT_OWNER_KEY)
+            desired["max_cumulative_notional"] = 25_000.0
+
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ), self.assertRaisesRegex(ValueError, "explicit run contract handoff"):
+                _save_runner_control_config(desired, symbol="BCHUSDT")
+
+            unchanged = json.loads(control_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(unchanged, existing)
+
+    def test_web_save_rejects_recovery_managed_flat_field_change(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "arx-control.json"
+            existing = {"symbol": "ARXUSDT"}
+            control_path.write_text(json.dumps(existing), encoding="utf-8")
+            JsonRecoveryStore(control_path).register_symbol(
+                "ARXUSDT",
+                {"volatility_entry_pause_enabled": True},
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            existing = json.loads(control_path.read_text(encoding="utf-8"))
+            desired = dict(existing)
+            desired["volatility_entry_pause_enabled"] = False
+
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ), self.assertRaisesRegex(ValueError, "recovery coordinator"):
+                _save_runner_control_config(desired, symbol="ARXUSDT")
+
+            unchanged = json.loads(control_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(unchanged, existing)
+
+    def test_web_save_defers_even_unmanaged_changes_for_registered_control(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "arx-control.json"
+            control_path.write_text(
+                json.dumps({"symbol": "ARXUSDT", "unmanaged_note": "keep"}),
+                encoding="utf-8",
+            )
+            JsonRecoveryStore(control_path).register_symbol(
+                "ARXUSDT",
+                {
+                    "best_quote_maker_volume_cycle_budget_notional": 360.0,
+                    "pause_buy_position_notional": 120.0,
+                    "pause_short_position_notional": 140.0,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            existing = json.loads(control_path.read_text(encoding="utf-8"))
+
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ), self.assertRaisesRegex(ValueError, "recovery coordinator"):
+                omitted = {"symbol": "ARXUSDT", "unmanaged_note": "changed"}
+                _save_runner_control_config(omitted, symbol="ARXUSDT")
+
+            unchanged = json.loads(control_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(unchanged, existing)
+
+    def test_preserve_active_runner_ownership_uses_all_embedded_desired_fields(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "arx-control.json"
+            control_path.write_text(
+                json.dumps({"symbol": "ARXUSDT"}),
+                encoding="utf-8",
+            )
+            JsonRecoveryStore(control_path).register_symbol(
+                "ARXUSDT",
+                {
+                    "best_quote_maker_volume_cycle_budget_notional": 360.0,
+                    "pause_buy_position_notional": 120.0,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            inherited = json.loads(control_path.read_text(encoding="utf-8"))
+            inherited["volatility_entry_pause_enabled"] = False
+
+        resolved = web_module._preserve_active_runner_ownership(
+            {
+                "symbol": "ARXUSDT",
+                "best_quote_maker_volume_cycle_budget_notional": 999.0,
+                "pause_buy_position_notional": 999.0,
+            },
+            inherited=inherited,
+            raw_payload={"symbol": "ARXUSDT"},
+        )
+
+        self.assertEqual(
+            resolved["best_quote_maker_volume_cycle_budget_notional"],
+            360.0,
+        )
+        self.assertEqual(resolved["pause_buy_position_notional"], 120.0)
+        self.assertTrue(resolved["volatility_entry_pause_enabled"])
+        self.assertEqual(resolved[RECOVERY_STATE_KEY], inherited[RECOVERY_STATE_KEY])
+        self.assertEqual(
+            resolved[RECOVERY_STATE_MIRROR_KEY],
+            inherited[RECOVERY_STATE_MIRROR_KEY],
+        )
+
+        with self.assertRaisesRegex(ValueError, "recovery store"):
+            web_module._preserve_active_runner_ownership(
+                {
+                    "symbol": "ARXUSDT",
+                    "best_quote_maker_volume_cycle_budget_notional": 999.0,
+                },
+                inherited=inherited,
+                raw_payload={
+                    "symbol": "ARXUSDT",
+                    "best_quote_maker_volume_cycle_budget_notional": 999.0,
+                },
+            )
+
+    def test_recovery_envelope_is_decoded_strictly_and_fails_closed(self) -> None:
+        malformed = {
+            "symbol": "ARXUSDT",
+            RECOVERY_STATE_KEY: {"schema_version": 1, "state": {}},
+        }
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "arx-control.json"
+            control_path.write_text(json.dumps(malformed), encoding="utf-8")
+
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ), self.assertRaisesRegex(ValueError, "recovery coordinator"):
+                _save_runner_control_config(
+                    {"symbol": "ARXUSDT"},
+                    symbol="ARXUSDT",
+                )
+
+            unchanged = json.loads(control_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(unchanged, malformed)
+        with self.assertRaises(RecoveryStateCorruptError):
+            web_module._preserve_active_runner_ownership(
+                {"symbol": "ARXUSDT"},
+                inherited=malformed,
+                raw_payload={"symbol": "ARXUSDT"},
+            )
+
+    def test_mirror_only_presence_keeps_web_actions_deferred_to_coordinator(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "bch-control.json"
+            control_path.write_text(
+                json.dumps(
+                    {
+                        "symbol": "BCHUSDT",
+                        RECOVERY_STATE_MIRROR_KEY: {"schema_version": 1},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ):
+                deferred = web_module._defer_registered_runner_web_action(
+                    symbol="BCHUSDT",
+                    requested_action="start_or_restart",
+                )
+
+        self.assertIsNotNone(deferred)
+        assert deferred is not None
+        self.assertTrue(deferred["recovery_coordinator_registered"])
+        self.assertTrue(deferred["actuation_deferred"])
+        self.assertFalse(deferred["started"])
+
     def test_monitor_page_uses_symbol_dropdown_for_supported_symbols(self) -> None:
         self.assertIn('<select id="symbol">', MONITOR_PAGE)
         self.assertIn("loadMonitorSymbols", MONITOR_PAGE)
@@ -5493,6 +6496,38 @@ class WebSecurityTests(unittest.TestCase):
         mock_popen.return_value.pid = 12345
         result = _start_runner_process(desired)
         mock_stop_runner.assert_called_once_with("OPNUSDT")
+        self.assertTrue(result["started"])
+        self.assertTrue(result["restarted"])
+
+    def test_start_runner_process_restarts_when_terminal_contract_changes(self) -> None:
+        current = {
+            "symbol": "BCHUSDT",
+            "terminal_drain_absolute_loss_budget": 5.0,
+        }
+        desired = {
+            **current,
+            "terminal_drain_absolute_loss_budget": 8.0,
+        }
+
+        with patch.dict("os.environ", {"GRID_RUNNER_SERVICE_TEMPLATE": "grid-loop@{symbol}.service"}), patch.object(
+            web_module, "_validate_runner_required_risk_guards"
+        ), patch.object(web_module, "_runner_start_safety_preflight"), patch.object(
+            web_module, "_preflight_runner_runtime_guards"
+        ), patch.object(web_module, "_stop_flatten_process"), patch.object(
+            web_module,
+            "_read_runner_process_for_symbol",
+            side_effect=[
+                {"is_running": True, "config": current},
+                {"is_running": True, "config": desired},
+            ],
+        ), patch.object(web_module, "_stop_runner_process") as mock_stop, patch.object(
+            web_module, "_save_runner_control_config"
+        ), patch.object(web_module, "_clear_volatility_trigger_status"), patch.object(
+            web_module, "_runner_service_available", return_value=True
+        ), patch.object(web_module, "_run_systemctl"):
+            result = _start_runner_process(desired)
+
+        mock_stop.assert_called_once_with("BCHUSDT")
         self.assertTrue(result["started"])
         self.assertTrue(result["restarted"])
 

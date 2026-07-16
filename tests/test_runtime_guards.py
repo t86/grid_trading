@@ -496,7 +496,7 @@ class RuntimeGuardsTests(unittest.TestCase):
         self.assertEqual(result.primary_reason, "after_end_window")
 
     @patch("grid_optimizer.runtime_guards.resolve_active_competition_board")
-    def test_resolve_runtime_guard_stats_start_time_clamps_stale_explicit_start_to_active_phase(self, mock_board) -> None:
+    def test_resolve_runtime_guard_stats_start_time_keeps_explicit_contract_start(self, mock_board) -> None:
         mock_board.return_value = {
             "activity_start_at": "2026-04-05T08:00:00+08:00",
             "activity_end_at": "2026-04-15T07:59:00+08:00",
@@ -509,7 +509,8 @@ class RuntimeGuardsTests(unittest.TestCase):
             now=datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc),
         )
 
-        self.assertEqual(resolved, datetime(2026, 4, 5, 0, 0, tzinfo=timezone.utc))
+        self.assertEqual(resolved, datetime(2026, 3, 26, 10, 0, tzinfo=timezone.utc))
+        mock_board.assert_not_called()
 
     @patch("grid_optimizer.runtime_guards.resolve_active_competition_board")
     def test_resolve_runtime_guard_stats_start_time_keeps_later_manual_start(self, mock_board) -> None:
@@ -528,7 +529,7 @@ class RuntimeGuardsTests(unittest.TestCase):
         self.assertEqual(resolved, datetime(2026, 4, 6, 1, 30, tzinfo=timezone.utc))
 
     @patch("grid_optimizer.runtime_guards.resolve_active_competition_board")
-    def test_normalize_runtime_guard_payload_uses_active_competition_phase_start(self, mock_board) -> None:
+    def test_normalize_runtime_guard_payload_keeps_explicit_contract_start(self, mock_board) -> None:
         mock_board.return_value = {
             "activity_start_at": "2026-04-05T08:00:00+08:00",
             "activity_end_at": "2026-04-15T07:59:00+08:00",
@@ -544,7 +545,29 @@ class RuntimeGuardsTests(unittest.TestCase):
             now=datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc),
         )
 
-        self.assertEqual(payload["runtime_guard_stats_start_time"], "2026-04-05T00:00:00+00:00")
+        self.assertEqual(payload["runtime_guard_stats_start_time"], "2026-03-26T10:00:00+00:00")
+        mock_board.assert_not_called()
+
+    @patch("grid_optimizer.runtime_guards.resolve_active_competition_board")
+    def test_target_payload_does_not_invent_missing_start_from_board(self, mock_board) -> None:
+        mock_board.return_value = {
+            "activity_start_at": "2026-04-05T08:00:00+08:00",
+        }
+
+        payload = normalize_runtime_guard_payload(
+            {
+                "symbol": "BARDUSDT",
+                "run_end_time": "2026-04-06T08:00:00+08:00",
+                "max_cumulative_notional": 20_000.0,
+                "runtime_guard_stats_start_time": None,
+            },
+            symbol="BARDUSDT",
+            market="futures",
+            now=datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertIsNone(payload["runtime_guard_stats_start_time"])
+        mock_board.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from grid_optimizer.monitor import (
     _load_or_fetch_income_rows,
     _load_or_fetch_trade_rows,
     _extract_futures_asset_snapshot,
+    _parse_runner_args,
     _read_event_window,
     _read_runner_process,
     build_monitor_alerts,
@@ -1281,6 +1282,25 @@ class MonitorTests(unittest.TestCase):
 
             self.assertEqual(result["config"]["strategy_profile"], "volume_long_v4")
             self.assertEqual(result["config"]["symbol"], "NIGHTUSDT")
+
+    def test_parse_runner_args_keeps_terminal_contract_flags(self) -> None:
+        config = _parse_runner_args(
+            "python -m grid_optimizer.loop_runner --symbol BCHUSDT "
+            "--runtime-guard-stats-start-time 2026-07-16T09:00:00+08:00 "
+            "--terminal-drain-exit-policy drain_then_preserve "
+            "--terminal-drain-absolute-loss-budget 8.5 "
+            "--terminal-drain-max-wait-seconds 900 "
+            "--terminal-drain-stop-preserve-reason probe_window_expired"
+        )
+
+        self.assertEqual(config["terminal_drain_exit_policy"], "drain_then_preserve")
+        self.assertEqual(
+            config["runtime_guard_stats_start_time"],
+            "2026-07-16T09:00:00+08:00",
+        )
+        self.assertEqual(config["terminal_drain_absolute_loss_budget"], 8.5)
+        self.assertEqual(config["terminal_drain_max_wait_seconds"], 900.0)
+        self.assertEqual(config["terminal_drain_stop_preserve_reason"], "probe_window_expired")
 
     def test_read_runner_process_removes_stale_pid_file_when_process_missing(self) -> None:
         with TemporaryDirectory() as tmpdir:

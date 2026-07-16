@@ -15537,6 +15537,7 @@ class LoopRunnerTests(unittest.TestCase):
             hedge_best_quote=True,
             enabled=True,
             allow_loss_reduce_only=True,
+            authorized_loss_roles={"best_quote_reduce_short"},
         )
         plan = {
             "bootstrap_orders": [],
@@ -15658,7 +15659,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(result["adjusted_buy_orders"], 0)
         self.assertAlmostEqual(plan["buy_orders"][0]["price"], 0.6400, places=8)
 
-    def test_best_quote_submit_allow_loss_roles_include_normal_bq_reduces(self) -> None:
+    def test_best_quote_submit_raw_allow_loss_without_lease_is_fail_closed(self) -> None:
         roles = _best_quote_submit_allow_loss_roles(
             SimpleNamespace(
                 best_quote_maker_volume_allow_loss_reduce_only=True,
@@ -15669,8 +15670,6 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(
             roles,
             {
-                "best_quote_reduce_long",
-                "best_quote_reduce_short",
                 "inventory_unlock_reduce_long",
                 "inventory_unlock_reduce_short",
             },
@@ -17690,6 +17689,162 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(args.unrealized_loss_entry_guard_min_loss, 3.0)
         self.assertEqual(args.unrealized_loss_entry_guard_ratio, 0.015)
 
+    def test_build_parser_defaults_to_safe_predictable_terminal_lifecycle(self) -> None:
+        args = _build_parser().parse_args([])
+
+        self.assertTrue(args.volatility_entry_pause_enabled)
+        self.assertGreater(args.volatility_entry_pause_10s_abs_return_ratio, 0.0)
+        self.assertGreater(args.volatility_entry_pause_10s_amplitude_ratio, 0.0)
+        self.assertGreater(args.volatility_entry_pause_30s_abs_return_ratio, 0.0)
+        self.assertGreater(args.volatility_entry_pause_30s_amplitude_ratio, 0.0)
+        self.assertGreater(args.volatility_entry_pause_1m_abs_return_ratio, 0.0)
+        self.assertGreater(args.volatility_entry_pause_1m_amplitude_ratio, 0.0)
+        self.assertGreater(args.volatility_entry_pause_3m_abs_return_ratio, 0.0)
+        self.assertGreater(args.volatility_entry_pause_3m_amplitude_ratio, 0.0)
+        self.assertGreater(args.volatility_entry_pause_5m_abs_return_ratio, 0.0)
+        self.assertGreater(args.volatility_entry_pause_5m_amplitude_ratio, 0.0)
+        self.assertTrue(args.anti_chase_entry_guard_enabled)
+        self.assertIsNone(args.terminal_drain_exit_policy)
+        self.assertEqual(args.terminal_drain_flat_confirm_cycles, 2)
+        self.assertEqual(args.terminal_drain_loss_lease_seconds, 300.0)
+        self.assertEqual(args.terminal_drain_order_reprice_seconds, 120.0)
+        self.assertIsNone(args.terminal_drain_absolute_loss_budget)
+        self.assertIsNone(args.terminal_drain_max_wait_seconds)
+
+    def test_targeted_run_rejects_implicit_zero_terminal_loss_budget(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--max-cumulative-notional",
+                "20000",
+                "--runtime-guard-stats-start-time",
+                "2026-07-16T09:00:00+08:00",
+                "--run-end-time",
+                "2026-07-16T10:00:00+08:00",
+                "--terminal-drain-exit-policy",
+                "drain_then_preserve",
+                "--terminal-drain-max-wait-seconds",
+                "900",
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            SystemExit,
+            "loss_budget is required",
+        ):
+            loop_runner_module._validate_terminal_run_contract(args)
+
+    def test_targeted_run_accepts_explicit_clean_exit_budget(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--max-cumulative-notional",
+                "20000",
+                "--runtime-guard-stats-start-time",
+                "2026-07-16T09:00:00+08:00",
+                "--run-end-time",
+                "2026-07-16T10:00:00+08:00",
+                "--terminal-drain-absolute-loss-budget",
+                "5",
+                "--terminal-drain-exit-policy",
+                "drain_then_preserve",
+                "--terminal-drain-max-wait-seconds",
+                "900",
+            ]
+        )
+
+        loop_runner_module._validate_terminal_run_contract(args)
+
+    def test_targeted_run_rejects_unbounded_clean_only_exit(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--max-cumulative-notional",
+                "20000",
+                "--runtime-guard-stats-start-time",
+                "2026-07-16T09:00:00+08:00",
+                "--run-end-time",
+                "2026-07-16T10:00:00+08:00",
+                "--terminal-drain-exit-policy",
+                "drain_clean",
+                "--terminal-drain-absolute-loss-budget",
+                "5",
+            ]
+        )
+
+        with self.assertRaisesRegex(SystemExit, "drain_then_preserve or stop_preserve"):
+            loop_runner_module._validate_terminal_run_contract(args)
+
+    def test_targeted_stop_preserve_requires_reason_instead_of_loss_budget(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--max-cumulative-notional",
+                "20000",
+                "--runtime-guard-stats-start-time",
+                "2026-07-16T09:00:00+08:00",
+                "--terminal-drain-exit-policy",
+                "stop_preserve",
+                "--terminal-drain-stop-preserve-reason",
+                "operator_keep_for_validation",
+                "--terminal-drain-absolute-loss-budget",
+                "0",
+                "--run-end-time",
+                "2026-07-16T10:00:00+08:00",
+            ]
+        )
+
+        loop_runner_module._validate_terminal_run_contract(args)
+
+    def test_bounded_target_run_rejects_iteration_shortcut(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--max-cumulative-notional",
+                "20000",
+                "--runtime-guard-stats-start-time",
+                "2026-07-16T09:00:00+08:00",
+                "--run-end-time",
+                "2026-07-16T10:00:00+08:00",
+                "--terminal-drain-exit-policy",
+                "stop_preserve",
+                "--terminal-drain-stop-preserve-reason",
+                "operator_keep_for_validation",
+                "--terminal-drain-absolute-loss-budget",
+                "0",
+                "--iterations",
+                "1",
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            SystemExit,
+            "bounded run cannot use --iterations",
+        ):
+            loop_runner_module._validate_terminal_run_contract(args)
+
+    def test_deadline_only_run_rejects_iteration_shortcut(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--run-end-time",
+                "2026-07-16T10:00:00+08:00",
+                "--terminal-drain-exit-policy",
+                "stop_preserve",
+                "--terminal-drain-stop-preserve-reason",
+                "operator_keep_for_validation",
+                "--terminal-drain-absolute-loss-budget",
+                "0",
+                "--iterations",
+                "2",
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            SystemExit,
+            "bounded run cannot use --iterations",
+        ):
+            loop_runner_module._validate_terminal_run_contract(args)
+
+    def test_unbounded_diagnostic_run_keeps_iteration_limit(self) -> None:
+        args = _build_parser().parse_args(["--iterations", "2"])
+
+        loop_runner_module._validate_terminal_run_contract(args)
+
     def test_build_parser_accepts_static_quote_offset_thresholds(self) -> None:
         args = _build_parser().parse_args(
             [
@@ -17880,6 +18035,10 @@ class LoopRunnerTests(unittest.TestCase):
             hedge_best_quote=True,
             enabled=True,
             allow_loss_reduce_only=True,
+            authorized_loss_roles={
+                "best_quote_reduce_long",
+                "best_quote_reduce_short",
+            },
         )
 
         self.assertEqual(long_roles, set())
@@ -17890,6 +18049,10 @@ class LoopRunnerTests(unittest.TestCase):
             hedge_best_quote=False,
             enabled=True,
             allow_loss_reduce_only=True,
+            authorized_loss_roles={
+                "best_quote_reduce_long",
+                "best_quote_reduce_short",
+            },
         )
 
         self.assertEqual(long_roles, {"best_quote_entry_short"})

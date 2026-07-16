@@ -4,7 +4,7 @@
 Tracked, deploy-via-git form of ``output/ops/reusdt_health_monitor.py``. It is the
 "稳健" (stable) automation model: it NEVER boosts budget to chase a target the way a
 pace controller does; it only keeps the runner alive and brakes wear. Complements
-:mod:`grid_optimizer.competition_target_gate` (target / wear -> stop+flatten) and the
+:mod:`grid_optimizer.competition_target_gate` (target / wear -> lifecycle intent) and the
 daily reset cron (08:00 restart). Intended cron cadence: ``*/10``. Run as::
 
     python -m grid_optimizer.competition_health_monitor --symbol ARXUSDT \

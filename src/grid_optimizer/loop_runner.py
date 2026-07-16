@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import copy
+import hashlib
 import json
 import math
 import os
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import time
 import traceback
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -78,7 +80,12 @@ from .maker_flatten_runner import (
     is_flatten_order,
     load_live_flatten_snapshot,
 )
-from .runtime_guards import evaluate_runtime_guards, normalize_runtime_guard_config, summarize_futures_runtime_guard_inputs
+from .runtime_guards import (
+    RuntimeGuardResult,
+    evaluate_runtime_guards,
+    normalize_runtime_guard_config,
+    summarize_futures_runtime_guard_inputs,
+)
 from .trade_database import ensure_trade_database_schema, persist_cycle_snapshot, persist_trade_rows, trade_database_enabled
 from .semi_auto_plan import (
     STATE_VERSION,
@@ -109,6 +116,7 @@ from .submit_plan import (
     apply_hard_loss_rescue_entry_guard_to_actions,
     apply_loss_inventory_no_cross_entry_guard_to_actions,
     apply_loss_reduce_reentry_guard_to_actions,
+    apply_projected_entry_exposure_cap_to_actions,
     apply_reduce_only_no_loss_guard_to_actions,
     cap_reduce_only_place_orders_to_position,
     estimate_mid_drift_steps,
@@ -122,6 +130,65 @@ from .submit_plan import (
 )
 from .dry_run import _round_order_price, _round_order_qty
 from .execution_events import FuturesUserDataStream
+from .futures_terminal_drain import (
+    DrainActionId,
+    DrainStage,
+    TerminalDrainPolicy,
+    TerminalDrainSnapshot,
+    TerminalDrainState,
+    decide_terminal_drain,
+    settle_breached_loss_lease,
+    settle_loss_lease,
+    terminal_drain_state_from_dict,
+    terminal_drain_state_to_dict,
+)
+from .futures_recovery_coordinator import (
+    ActionId,
+    EffectStage,
+    LedgerClass,
+    OrderRole,
+    RecoveryPhase,
+    RecoveryState,
+    Side,
+    temporary_loss_authorized,
+)
+from .futures_recovery_store import (
+    JsonRecoveryStore,
+    RecoveryStateUnavailableError,
+)
+from .futures_recovery_runtime_adapter import (
+    RecoveryConfigAppliedReceiptJournalError,
+    load_recovery_config_applied_evidence,
+    temporary_loss_client_order_prefix_for_binding,
+)
+from .futures_managed_order_manifest import (
+    build_managed_order_client_order_id,
+    ordinary_recovery_client_order_prefix,
+)
+from .futures_recovery_runtime_signal import (
+    RUNTIME_SAFETY_SIGNAL_KEY,
+    RUNTIME_SAFETY_SIGNAL_MAX_TTL,
+    RuntimeSafetyCondition,
+    RuntimeSafetySignal,
+    decode_runtime_safety_signal,
+    replace_runtime_safety_source,
+    runtime_safety_condition,
+    validate_runtime_safety_signal,
+)
+from .futures_run_lifecycle import (
+    resolve_authoritative_run_contract,
+    run_contract_identity_from_config,
+    run_contract_snapshot_from_config,
+    validate_run_contract,
+)
+from .futures_terminal_ownership import (
+    TERMINAL_INTENT_COMPLETED_STATUSES,
+    TerminalIntentValidationError,
+    terminal_intent_id,
+    validate_terminal_intent,
+)
+from .futures_trade_window import fetch_exact_futures_trade_window
+from .recovery_control_ownership import exclusive_control_lock
 from .execution_regime import (
     ExecutionRegimeConfig,
     ExecutionRegimeFeatures,
@@ -163,11 +230,36 @@ PROTECTIVE_SYNTHETIC_DRIFT_MIN_NOTIONAL = 100.0
 BEST_QUOTE_FROZEN_RELEASE_RETAIN_NOTIONAL = 1.0
 PROTECTIVE_OPEN_ORDER_DIFF_LIMIT = 10
 PROTECTIVE_OPEN_ORDER_DIFF_CONFIRM_CHECKS = 2
+RUNTIME_SAFETY_COORDINATOR_POLL_SECONDS = 60.0
+RUNTIME_SAFETY_SIGNAL_MARGIN_SECONDS = 30.0
+RUNTIME_SAFETY_SIGNAL_MIN_TTL_SECONDS = 120.0
 POSITION_MODE_CACHE_TTL_SECONDS = 10 * 60.0
 EXECUTION_MARKET_SNAPSHOT_CACHE_TTL_SECONDS = 0.25
 RUNNER_MARKET_SNAPSHOT_MAX_AGE_SECONDS = 15.0
 RUNNER_MARKET_STREAM_WARMUP_SECONDS = 8.0
 RUNNER_RATE_LIMIT_BACKOFF_SECONDS = 30.0
+TEMPORARY_LOSS_RUNNER_RECEIPTS_KEY = "_futures_recovery_runner_receipts"
+TEMPORARY_LOSS_RUNNER_RECEIPTS_SCHEMA = "temporary_loss_runner_receipts_v1"
+TEMPORARY_LOSS_RUNNER_RECEIPTS_MAX_EVENTS = 128
+ORDINARY_RECOVERY_RUNNER_RECEIPTS_KEY = (
+    "_futures_ordinary_recovery_runner_receipts"
+)
+ORDINARY_RECOVERY_RUNNER_RECEIPTS_SCHEMA = (
+    "ordinary_recovery_runner_receipts_v1"
+)
+ORDINARY_RECOVERY_RUNNER_RECEIPTS_MAX_EVENTS = 128
+# Compatibility names retained for callers/tests written when inventory was
+# the only ordinary action with typed submit progress.
+INVENTORY_RECOVERY_RUNNER_RECEIPTS_KEY = ORDINARY_RECOVERY_RUNNER_RECEIPTS_KEY
+INVENTORY_RECOVERY_RUNNER_RECEIPTS_SCHEMA = ORDINARY_RECOVERY_RUNNER_RECEIPTS_SCHEMA
+INVENTORY_RECOVERY_RUNNER_RECEIPTS_MAX_EVENTS = ORDINARY_RECOVERY_RUNNER_RECEIPTS_MAX_EVENTS
+RECOVERY_CONFIG_APPLIED_RECEIPTS_KEY = (
+    "_futures_recovery_config_applied_receipts"
+)
+RECOVERY_CONFIG_APPLIED_RECEIPTS_SCHEMA = (
+    "futures_recovery_config_applied_receipts_v1"
+)
+RECOVERY_CONFIG_APPLIED_RECEIPTS_MAX_EVENTS = 128
 AUTO_REGIME_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
     AUTO_REGIME_STABLE_PROFILE: {
         "buy_levels": 8,
@@ -10572,15 +10664,148 @@ def _load_futures_runtime_guard_inputs(
     now: datetime | None = None,
     state_path: Path | None = None,
     bq_book_scope: str | None = None,
+    run_end_time: Any = None,
+    max_cumulative_notional: Any = None,
+    recv_window: int = 5000,
+    authoritative_target_progress: bool = False,
+    immutable_contract_window: bool = False,
 ) -> tuple[float, list[dict[str, Any]], datetime | None]:
-    return summarize_futures_runtime_guard_inputs(
-        summary_path,
-        runtime_guard_stats_start_time=runtime_guard_stats_start_time,
-        symbol=symbol,
-        now=now,
-        bq_order_refs_path=state_path,
-        bq_book_scope=bq_book_scope,
+    use_immutable_window = bool(
+        immutable_contract_window or authoritative_target_progress
     )
+    cumulative_gross_notional, pnl_events, metrics_start_time = (
+        summarize_futures_runtime_guard_inputs(
+            summary_path,
+            runtime_guard_stats_start_time=runtime_guard_stats_start_time,
+            symbol=symbol,
+            now=now,
+            bq_order_refs_path=state_path,
+            bq_book_scope=bq_book_scope,
+            immutable_window=use_immutable_window,
+            runtime_guard_stats_end_time=(
+                run_end_time if use_immutable_window else None
+            ),
+        )
+    )
+    if not authoritative_target_progress:
+        return cumulative_gross_notional, pnl_events, metrics_start_time
+
+    target = _safe_float(max_cumulative_notional)
+    if target <= 0:
+        raise ValueError("authoritative target progress requires a positive target")
+    if metrics_start_time is None:
+        raise ValueError(
+            "authoritative target progress requires runtime_guard_stats_start_time"
+        )
+    query_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    parsed_end = _parse_state_datetime(run_end_time)
+    if parsed_end is None:
+        raise ValueError("authoritative target progress requires run_end_time")
+    query_end = min(query_now, parsed_end.astimezone(timezone.utc))
+    start_ms = int(metrics_start_time.timestamp() * 1000)
+    end_exclusive_ms = int(query_end.timestamp() * 1000)
+    if end_exclusive_ms <= start_ms:
+        return 0.0, pnl_events, metrics_start_time
+
+    credentials = load_binance_api_credentials()
+    if credentials is None:
+        raise RuntimeError(
+            "authoritative target progress requires Binance credentials"
+        )
+    api_key, api_secret = credentials
+    trades = _terminal_drain_fetch_user_trades_exact(
+        symbol=str(symbol).upper().strip(),
+        api_key=api_key,
+        api_secret=api_secret,
+        start_time_ms=start_ms,
+        end_time_ms=end_exclusive_ms - 1,
+        recv_window=int(recv_window),
+    )
+    exact_gross_notional = 0.0
+    for row in trades:
+        raw_quote_qty = row.get("quoteQty")
+        if raw_quote_qty in {None, ""}:
+            raw_quote_qty = row.get("quote_qty")
+        try:
+            quote_qty = (
+                float(raw_quote_qty)
+                if raw_quote_qty not in {None, ""}
+                else 0.0
+            )
+            if abs(quote_qty) <= 0.0:
+                price = float(row.get("price"))
+                qty = float(row.get("qty"))
+                quote_qty = price * qty
+        except (TypeError, ValueError) as exc:
+            raise ValueError("target progress trade notional is invalid") from exc
+        if not math.isfinite(quote_qty) or abs(quote_qty) <= 0.0:
+            raise ValueError("target progress trade notional must be positive")
+        exact_gross_notional += abs(quote_qty)
+    return exact_gross_notional, pnl_events, metrics_start_time
+
+
+def _persisted_futures_target_progress(
+    *,
+    state: Mapping[str, Any],
+    args: argparse.Namespace,
+    runtime_guard_config: Any,
+) -> float | None:
+    """Return the cycle's authoritative target snapshot or fail closed.
+
+    The post-submit summary must not recalculate target volume from the local
+    audit using different deduplication/window rules.  The pre-guard exchange
+    query persists the only target snapshot that is legal for the cycle.
+    """
+
+    target_raw = getattr(runtime_guard_config, "max_cumulative_notional", None)
+    if target_raw is None:
+        return None
+    raw_progress = state.get("futures_target_progress")
+    if not isinstance(raw_progress, Mapping):
+        raise ValueError("authoritative target progress snapshot is missing")
+    expected_contract_id = run_contract_identity_from_config(vars(args))
+    symbol = str(args.symbol).upper().strip()
+    if raw_progress.get("schema") != "futures_target_progress_v1":
+        raise ValueError("authoritative target progress schema mismatch")
+    if str(raw_progress.get("symbol") or "").upper().strip() != symbol:
+        raise ValueError("authoritative target progress symbol mismatch")
+    if str(raw_progress.get("run_contract_id") or "") != expected_contract_id:
+        raise ValueError("authoritative target progress contract mismatch")
+    expected_start = getattr(
+        runtime_guard_config,
+        "runtime_guard_stats_start_time",
+        None,
+    )
+    expected_end = getattr(runtime_guard_config, "run_end_time", None)
+    if expected_start is None or expected_end is None:
+        raise ValueError("authoritative target progress window is invalid")
+    if str(raw_progress.get("window_start") or "") != expected_start.isoformat():
+        raise ValueError("authoritative target progress start mismatch")
+    if str(raw_progress.get("window_end") or "") != expected_end.isoformat():
+        raise ValueError("authoritative target progress end mismatch")
+    try:
+        target = float(raw_progress.get("target_value"))
+        gross_notional = float(raw_progress.get("gross_notional"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("authoritative target progress numeric field is invalid") from exc
+    if (
+        not math.isfinite(target)
+        or target <= 0
+        or abs(target - float(target_raw)) > 1e-9
+    ):
+        raise ValueError("authoritative target progress target mismatch")
+    if not math.isfinite(gross_notional) or gross_notional < 0:
+        raise ValueError("authoritative target progress notional is invalid")
+    query_end = _parse_state_datetime(raw_progress.get("query_end"))
+    observed_at = _parse_state_datetime(raw_progress.get("observed_at"))
+    if (
+        query_end is None
+        or observed_at is None
+        or query_end > expected_end
+        or query_end > observed_at
+    ):
+        raise ValueError("authoritative target progress observation is invalid")
+    return gross_notional
 
 
 def _cancel_futures_strategy_orders(
@@ -10683,6 +10908,154 @@ def _protective_synthetic_drift_threshold_notional(args: argparse.Namespace) -> 
     return max(candidates)
 
 
+def _registered_runtime_safety_binding(
+    args: Any,
+    *,
+    now: datetime,
+    run_contract_id: str | None = None,
+) -> tuple[Any, str] | None:
+    """Return the exact registered decision observed by this runner process."""
+
+    gate = _load_recovery_order_profile_gate(args, now=now)
+    if not gate.managed:
+        return None
+    expected_generation = getattr(args, "recovery_generation", None)
+    if (
+        type(expected_generation) is not int
+        or gate.generation != expected_generation
+    ):
+        raise ValueError("runtime safety signal recovery generation mismatch")
+    contract_id = run_contract_id
+    if contract_id is None:
+        _snapshot, contract_id = _resolve_loop_authoritative_run_contract(args)
+    if not str(contract_id or "").strip():
+        raise ValueError("runtime safety signal run contract is unavailable")
+    return gate, str(contract_id)
+
+
+def _replace_registered_runtime_safety_source(
+    *,
+    args: Any,
+    state: dict[str, Any],
+    state_path: Path,
+    source: str,
+    conditions: Iterable[RuntimeSafetyCondition],
+    now: datetime,
+    run_contract_id: str | None = None,
+) -> bool:
+    binding = _registered_runtime_safety_binding(
+        args,
+        now=now,
+        run_contract_id=run_contract_id,
+    )
+    if binding is None:
+        return False
+    gate, contract_id = binding
+    signal = replace_runtime_safety_source(
+        state.get(RUNTIME_SAFETY_SIGNAL_KEY)
+        if isinstance(state.get(RUNTIME_SAFETY_SIGNAL_KEY), Mapping)
+        else None,
+        symbol=gate.symbol,
+        run_contract_id=contract_id,
+        generation=int(gate.generation),
+        decision_id=gate.decision_id,
+        source=source,
+        conditions=tuple(conditions),
+        now=now,
+    )
+    if signal is None:
+        changed = state.pop(RUNTIME_SAFETY_SIGNAL_KEY, None) is not None
+    else:
+        encoded = signal.as_dict()
+        changed = state.get(RUNTIME_SAFETY_SIGNAL_KEY) != encoded
+        state[RUNTIME_SAFETY_SIGNAL_KEY] = encoded
+    if changed:
+        _write_json(state_path, state)
+    return True
+
+
+def _runtime_guard_safety_conditions(
+    *,
+    runtime_guard_result: RuntimeGuardResult,
+    actual_net_notional: float,
+    observed_at: datetime,
+    ttl: timedelta,
+) -> tuple[RuntimeSafetyCondition, ...]:
+    details = {
+        "rolling_hourly_loss": getattr(
+            runtime_guard_result, "rolling_hourly_loss", 0.0
+        ),
+        "rolling_hourly_loss_per_10k": (
+            getattr(runtime_guard_result, "rolling_hourly_loss_per_10k", 0.0)
+        ),
+        "actual_net_notional": actual_net_notional,
+        "actual_net_notional_abs": getattr(
+            runtime_guard_result,
+            "actual_net_notional_abs",
+            abs(actual_net_notional),
+        ),
+        "synthetic_drift_notional": (
+            getattr(runtime_guard_result, "synthetic_drift_notional", 0.0)
+        ),
+        "unrealized_loss": getattr(runtime_guard_result, "unrealized_loss", 0.0),
+    }
+    conditions: list[RuntimeSafetyCondition] = []
+    for reason in dict.fromkeys(runtime_guard_result.matched_reasons or []):
+        side = None
+        if reason == "max_actual_net_notional_hit" and abs(actual_net_notional) > 1e-12:
+            action_id = ActionId.INVENTORY_RECOVER
+            side = Side.SELL if actual_net_notional > 0 else Side.BUY
+        elif reason == "max_synthetic_drift_notional_hit":
+            action_id = ActionId.RUNNER_RECOVER
+        else:
+            action_id = ActionId.SAFETY_CONVERGE
+        conditions.append(
+            runtime_safety_condition(
+                source="runtime_guard",
+                action_id=action_id,
+                reason=str(reason),
+                side=side,
+                observed_at=observed_at,
+                details=details,
+                ttl=ttl,
+            )
+        )
+    return tuple(conditions)
+
+
+def _runtime_safety_signal_ttl(args: Any) -> timedelta:
+    sleep_seconds = _safe_float(getattr(args, "sleep_seconds", 0.0))
+    jitter_seconds = _safe_float(
+        getattr(args, "cycle_jitter_seconds", 0.0)
+    )
+    if not math.isfinite(sleep_seconds) or not math.isfinite(jitter_seconds):
+        raise ValueError("runtime safety signal cycle gap must be finite")
+    ttl_seconds = max(
+        RUNTIME_SAFETY_SIGNAL_MIN_TTL_SECONDS,
+        max(sleep_seconds, 0.0)
+        + max(jitter_seconds, 0.0)
+        + RUNTIME_SAFETY_COORDINATOR_POLL_SECONDS
+        + RUNTIME_SAFETY_SIGNAL_MARGIN_SECONDS,
+    )
+    if ttl_seconds > RUNTIME_SAFETY_SIGNAL_MAX_TTL.total_seconds():
+        raise ValueError(
+            "configured runtime safety cycle gap exceeds maximum typed signal TTL"
+        )
+    return timedelta(seconds=ttl_seconds)
+
+
+def _validate_registered_runtime_safety_ttl(
+    args: Any,
+    *,
+    now: datetime | None = None,
+) -> timedelta | None:
+    observed_at = now or _utc_now()
+    gate = _load_recovery_order_profile_gate(args, now=observed_at)
+    if not gate.managed:
+        return None
+    return _runtime_safety_signal_ttl(args)
+
+
 def _protective_entry_stop(
     *,
     args: argparse.Namespace,
@@ -10695,6 +11068,58 @@ def _protective_entry_stop(
     state: dict[str, Any] | None = None,
     state_path: Path | None = None,
 ) -> None:
+    observed_at = _utc_now()
+    effective_state_path = state_path
+    if effective_state_path is None:
+        configured_state_path = str(getattr(args, "state_path", "") or "").strip()
+        if configured_state_path:
+            effective_state_path = Path(configured_state_path)
+    runtime_state = state
+    if not isinstance(runtime_state, dict) and effective_state_path is not None:
+        loaded_runtime_state = read_json(effective_state_path)
+        runtime_state = (
+            loaded_runtime_state
+            if isinstance(loaded_runtime_state, dict)
+            else {}
+        )
+    if isinstance(runtime_state, dict) and effective_state_path is not None:
+        try:
+            signal_ttl = _runtime_safety_signal_ttl(args)
+            protective_condition = runtime_safety_condition(
+                source="protective_entry_stop",
+                action_id=ActionId.RUNNER_RECOVER,
+                reason=reason,
+                observed_at=observed_at,
+                details=details,
+                ttl=signal_ttl,
+            )
+            registered = _replace_registered_runtime_safety_source(
+                args=args,
+                state=runtime_state,
+                state_path=effective_state_path,
+                source="protective_entry_stop",
+                conditions=(protective_condition,),
+                now=observed_at,
+            )
+        except (OSError, TypeError, ValueError):
+            # Presence of a registered envelope remains fail-closed in the
+            # recovery profile gate; never fall through to the legacy cancel
+            # actuator merely because its typed observation cannot be bound.
+            registered = _load_recovery_order_profile_gate(
+                args,
+                now=observed_at,
+            ).managed
+        if registered:
+            runtime_state["protective_entry_stop"] = {
+                "triggered": True,
+                "triggered_at": _isoformat(observed_at),
+                "reason": reason,
+                "details": dict(details),
+                "canceled_entry_order_count": 0,
+                "delegated_to_recovery_coordinator": True,
+            }
+            _write_json(effective_state_path, runtime_state)
+            return
     canceled_count = _cancel_futures_strategy_entry_orders(
         symbol=symbol,
         strategy_mode=strategy_mode,
@@ -10706,7 +11131,7 @@ def _protective_entry_stop(
     if isinstance(state, dict):
         state["protective_entry_stop"] = {
             "triggered": True,
-            "triggered_at": _isoformat(_utc_now()),
+            "triggered_at": _isoformat(observed_at),
             "reason": reason,
             "details": dict(details),
             "canceled_entry_order_count": canceled_count,
@@ -12059,6 +12484,3668 @@ def _runtime_guard_exposure_inputs(
     return live[0], live[1], "live_position_risk"
 
 
+TERMINAL_DRAIN_STATE_KEY = "futures_terminal_drain"
+TERMINAL_DRAIN_HISTORY_KEY = "futures_terminal_drain_history"
+TERMINAL_DRAIN_SCHEMA = "futures_terminal_drain_runtime_v1"
+TERMINAL_HANDOFF_STATE_KEY = "futures_terminal_handoff"
+TERMINAL_HANDOFF_HISTORY_KEY = "futures_terminal_handoff_history"
+TERMINAL_HANDOFF_SCHEMA = "futures_terminal_handoff_v1"
+TERMINAL_DRAIN_TERMINAL_ORDER_STATUSES = frozenset({"FILLED", "CANCELED", "EXPIRED", "REJECTED"})
+TERMINAL_DRAIN_COMPLETED_EXIT_STATUSES = frozenset({"stopped_clean", "stopped_preserved"})
+TERMINAL_INTENT_STATE_KEY = "futures_terminal_intent"
+TERMINAL_INTENT_HISTORY_KEY = "futures_terminal_intent_history"
+TERMINAL_INTENT_SCHEMA = "futures_lifecycle_intent_v2"
+TERMINAL_INTENT_RESUMABLE_STATUSES = frozenset(
+    {"pending", "accepted", "executing", "exit_blocked"}
+)
+TERMINAL_DRAIN_AMBIGUOUS_PROOF_QUIET_SECONDS = 10.0
+
+
+def _terminal_intent_path(*, state_path: Path, symbol: str) -> Path:
+    return state_path.parent / f"{str(symbol).lower().strip()}_terminal_intent.json"
+
+
+def _read_resumable_terminal_intent(
+    *,
+    state_path: Path,
+    symbol: str,
+) -> tuple[Path, dict[str, Any] | None]:
+    path = _terminal_intent_path(state_path=state_path, symbol=symbol)
+    payload = read_json(path)
+    if not isinstance(payload, dict):
+        if path.exists():
+            return path, {"_invalid_reason": "terminal_intent_unreadable"}
+        return path, None
+    try:
+        validated = validate_terminal_intent(payload, expected_symbol=symbol)
+    except TerminalIntentValidationError as exc:
+        invalid = dict(payload)
+        invalid["_invalid_reason"] = exc.code
+        return path, invalid
+    if validated.status in TERMINAL_INTENT_COMPLETED_STATUSES:
+        return path, None
+    return path, dict(payload)
+
+
+def _terminal_intent_runtime_args(
+    *,
+    args: argparse.Namespace,
+    terminal_intent: dict[str, Any] | None,
+) -> tuple[argparse.Namespace, str | None]:
+    """Verify an intent snapshot and rebuild the exact owner contract args."""
+
+    if terminal_intent is None:
+        return args, None
+    if terminal_intent.get("_invalid_reason"):
+        return args, str(terminal_intent["_invalid_reason"])
+    try:
+        validated = validate_terminal_intent(
+            terminal_intent,
+            expected_symbol=str(args.symbol).upper().strip(),
+        )
+    except TerminalIntentValidationError as exc:
+        return args, exc.code
+    return argparse.Namespace(
+        **{**vars(args), **validated.run_contract_snapshot}
+    ), None
+
+
+def _persist_registered_runtime_terminal_intent(
+    *,
+    args: argparse.Namespace,
+    state_path: Path,
+    run_contract_snapshot: Mapping[str, Any],
+    run_contract_id: str,
+    runtime_guard_result: Any,
+    cumulative_gross_notional: float,
+    pnl_events: Iterable[Mapping[str, Any]],
+    requested_at: datetime,
+) -> dict[str, Any] | None:
+    """Publish one internal terminal fact before a registered runner drains."""
+
+    control_path = str(
+        getattr(args, "recovery_control_path", "") or ""
+    ).strip()
+    symbol = str(getattr(args, "symbol", "") or "").upper().strip()
+    if not control_path or not symbol:
+        return None
+    try:
+        recovery_state = JsonRecoveryStore(control_path).read(symbol)
+    except RecoveryStateUnavailableError:
+        return None
+    except Exception as exc:
+        return {
+            "intent": None,
+            "created": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "recovery_phase": "unavailable",
+            "recovery_action": None,
+            "recovery_generation": None,
+        }
+
+    canonical_snapshot = run_contract_snapshot_from_config(run_contract_snapshot)
+    canonical_contract_id = run_contract_identity_from_config(canonical_snapshot)
+    if (
+        canonical_snapshot != dict(run_contract_snapshot)
+        or canonical_contract_id != run_contract_id
+        or canonical_snapshot.get("symbol") != symbol
+    ):
+        return {
+            "intent": None,
+            "created": False,
+            "error": "internal terminal run contract is not authoritative",
+            "recovery_phase": recovery_state.phase.value,
+            "recovery_action": recovery_state.active_action.value,
+            "recovery_generation": recovery_state.generation,
+        }
+
+    gross_notional = max(float(cumulative_gross_notional), 0.0)
+    target = _safe_float(canonical_snapshot.get("max_cumulative_notional"))
+    matched_reasons = [
+        str(item)
+        for item in list(getattr(runtime_guard_result, "matched_reasons", []) or [])
+        if str(item)
+    ]
+    primary_reason = str(
+        getattr(runtime_guard_result, "primary_reason", "") or ""
+    )
+    if target > 0 and gross_notional >= target:
+        trigger_reason = "target_reached"
+    elif "after_end_window" in matched_reasons:
+        trigger_reason = "target_unmet_deadline"
+    else:
+        return {
+            "intent": None,
+            "created": False,
+            "error": "internal runtime condition remains recovery-owned",
+            "recovery_phase": recovery_state.phase.value,
+            "recovery_action": recovery_state.active_action.value,
+            "recovery_generation": recovery_state.generation,
+        }
+
+    window_start = str(
+        canonical_snapshot.get("runtime_guard_stats_start_time") or ""
+    )
+    window_end = str(canonical_snapshot.get("run_end_time") or "")
+    parsed_window_end = _parse_state_datetime(window_end)
+    requested_utc = requested_at.astimezone(timezone.utc)
+    query_end = (
+        parsed_window_end
+        if trigger_reason == "target_unmet_deadline"
+        else (
+            min(requested_utc, parsed_window_end)
+            if parsed_window_end is not None
+            else requested_utc
+        )
+    )
+    pnl_rows = tuple(item for item in pnl_events if isinstance(item, Mapping))
+    realized_pnl = sum(
+        _safe_float(item.get("net_pnl"))
+        for item in pnl_rows
+    )
+    wear_per_10k = (
+        -realized_pnl / gross_notional * 10_000.0
+        if gross_notional > 0
+        else 0.0
+    )
+    intent: dict[str, Any] = {
+        "schema": TERMINAL_INTENT_SCHEMA,
+        "intent_id": terminal_intent_id(
+            symbol=symbol,
+            source="loop_runner_runtime_guard",
+            trigger_reason=trigger_reason,
+            run_contract_id=run_contract_id,
+        ),
+        "symbol": symbol,
+        "source": "loop_runner_runtime_guard",
+        "action": "lifecycle_drain",
+        "trigger_reason": trigger_reason,
+        "requested_at": requested_utc.isoformat(),
+        "status": "pending",
+        "exit_policy": "use_immutable_run_contract",
+        "run_contract_id": run_contract_id,
+        "run_contract_snapshot": canonical_snapshot,
+        "observed": {
+            "gross_notional": gross_notional,
+            "target": target,
+            "realized_pnl": realized_pnl,
+            "wear_per_10k": wear_per_10k,
+            "trade_count": len(pnl_rows),
+            "window_start": window_start,
+            "window_end": window_end,
+            "query_end": query_end.isoformat() if query_end is not None else "",
+            "runtime_guard_primary_reason": primary_reason,
+            "runtime_guard_matched_reasons": matched_reasons,
+        },
+    }
+    _effective_args, validation_error = _terminal_intent_runtime_args(
+        args=args,
+        terminal_intent=intent,
+    )
+    if validation_error is not None:
+        return {
+            "intent": None,
+            "created": False,
+            "error": validation_error,
+            "recovery_phase": recovery_state.phase.value,
+            "recovery_action": recovery_state.active_action.value,
+            "recovery_generation": recovery_state.generation,
+        }
+
+    intent_path = _terminal_intent_path(state_path=state_path, symbol=symbol)
+    try:
+        with exclusive_control_lock(intent_path):
+            existing = read_json(intent_path)
+            if intent_path.exists():
+                if not isinstance(existing, dict):
+                    raise ValueError("existing terminal intent is unreadable")
+                _existing_args, existing_error = _terminal_intent_runtime_args(
+                    args=args,
+                    terminal_intent=existing,
+                )
+                if existing_error is not None:
+                    raise ValueError(existing_error)
+                if existing.get("run_contract_id") != run_contract_id:
+                    raise ValueError("existing terminal intent contract conflict")
+                intent = dict(existing)
+                created = False
+            else:
+                _write_json(intent_path, intent)
+                created = True
+    except (OSError, TimeoutError, TypeError, ValueError) as exc:
+        return {
+            "intent": None,
+            "created": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "recovery_phase": recovery_state.phase.value,
+            "recovery_action": recovery_state.active_action.value,
+            "recovery_generation": recovery_state.generation,
+        }
+    return {
+        "intent": intent,
+        "created": created,
+        "error": None,
+        "recovery_phase": recovery_state.phase.value,
+        "recovery_action": recovery_state.active_action.value,
+        "recovery_generation": recovery_state.generation,
+    }
+
+
+def _registered_runtime_terminal_handoff_summary(
+    *,
+    args: argparse.Namespace,
+    cycle: int,
+    cycle_started_at: datetime,
+    handoff: Mapping[str, Any],
+) -> dict[str, Any]:
+    intent = handoff.get("intent")
+    intent = intent if isinstance(intent, Mapping) else {}
+    error = str(handoff.get("error") or "") or None
+    reason = (
+        "recovery_terminal_handoff_intent_persist_failed"
+        if error is not None
+        else "recovery_terminal_handoff_pending"
+    )
+    return {
+        "ts": cycle_started_at.isoformat(),
+        "cycle": cycle,
+        "symbol": str(args.symbol).upper().strip(),
+        "runtime_status": "handoff_pending",
+        "stop_triggered": False,
+        "runner_exit_allowed": False,
+        "stop_reason": reason,
+        "terminal_drain_action": DrainActionId.HOLD_BLOCKED.value,
+        "terminal_drain_reasons": [reason],
+        "exit_status": "handoff_pending",
+        "terminal_drain_errors": (
+            [{"reason": reason, "message": error}] if error is not None else []
+        ),
+        "terminal_owner_handoff_pending": True,
+        "global_allow_loss": False,
+        "terminal_drain_intent_id": intent.get("intent_id"),
+        "terminal_drain_intent_status": intent.get("status"),
+        "terminal_drain_intent_created": bool(handoff.get("created")),
+        "recovery_phase": handoff.get("recovery_phase"),
+        "recovery_action": handoff.get("recovery_action"),
+        "recovery_generation": handoff.get("recovery_generation"),
+    }
+
+
+def _terminal_drain_decision_id(args: argparse.Namespace, runtime_guard_config: Any) -> str:
+    symbol = str(args.symbol).upper().strip()
+    del runtime_guard_config
+    return f"{symbol}|{run_contract_identity_from_config(vars(args))}"
+
+
+def _terminal_drain_exit_contract_from_snapshot(
+    snapshot: dict[str, Any],
+    *,
+    captured_at: str,
+) -> dict[str, Any]:
+    """Materialize terminal terms only from the canonical run snapshot."""
+
+    return {
+        "policy": snapshot.get("terminal_drain_exit_policy"),
+        "absolute_loss_budget": snapshot.get(
+            "terminal_drain_absolute_loss_budget"
+        ),
+        "max_wait_seconds": snapshot.get("terminal_drain_max_wait_seconds"),
+        "preserve_reason": snapshot.get("terminal_drain_stop_preserve_reason"),
+        "strategy_mode": snapshot.get("strategy_mode"),
+        "captured_at": str(captured_at),
+        "max_order_notional": snapshot.get("terminal_drain_max_order_notional"),
+        "loss_lease_seconds": snapshot.get("terminal_drain_loss_lease_seconds"),
+        "order_reprice_seconds": snapshot.get(
+            "terminal_drain_order_reprice_seconds"
+        ),
+        "flat_confirm_cycles": snapshot.get("terminal_drain_flat_confirm_cycles"),
+    }
+
+
+def _terminal_drain_owner_integrity_digest(envelope: Mapping[str, Any]) -> str:
+    """Hash immutable crash-resume ownership facts for one terminal owner."""
+
+    payload = {
+        "schema": envelope.get("schema"),
+        "decision_id": envelope.get("decision_id"),
+        "run_contract_id": envelope.get("run_contract_id"),
+        "started_at": envelope.get("started_at"),
+        "initial_frozen_long_qty": envelope.get("initial_frozen_long_qty"),
+        "initial_frozen_short_qty": envelope.get("initial_frozen_short_qty"),
+    }
+    if envelope.get("initial_owned_ledger_digest") is not None:
+        payload.update(
+            {
+                "initial_owned_ledger_digest": envelope.get(
+                    "initial_owned_ledger_digest"
+                ),
+                "initial_normal_long_qty": envelope.get(
+                    "initial_normal_long_qty"
+                ),
+                "initial_normal_short_qty": envelope.get(
+                    "initial_normal_short_qty"
+                ),
+                "initial_normal_long_cost_basis": envelope.get(
+                    "initial_normal_long_cost_basis"
+                ),
+                "initial_normal_short_cost_basis": envelope.get(
+                    "initial_normal_short_cost_basis"
+                ),
+            }
+        )
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "futures-terminal-owner-v1-" + hashlib.sha256(
+        encoded.encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def _terminal_drain_runtime_integrity_digest(envelope: Mapping[str, Any]) -> str:
+    """Hash the complete mutable terminal state written at one commit."""
+
+    payload = {
+        str(key): value
+        for key, value in envelope.items()
+        if key != "runtime_integrity_digest"
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return "futures-terminal-runtime-v1-" + hashlib.sha256(
+        encoded.encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def _terminal_drain_runtime_owner_is_integral(
+    envelope: Mapping[str, Any],
+    *,
+    symbol: str,
+    loop_state: Mapping[str, Any] | None = None,
+) -> bool:
+    """Validate one active or completed terminal owner without side effects."""
+
+    try:
+        if envelope.get("schema") != TERMINAL_DRAIN_SCHEMA:
+            return False
+        snapshot = envelope.get("run_contract_snapshot")
+        if not isinstance(snapshot, dict):
+            return False
+        canonical = run_contract_snapshot_from_config(snapshot)
+        if canonical != snapshot or canonical.get("symbol") != symbol:
+            return False
+        contract_id = run_contract_identity_from_config(canonical)
+        decision_id = f"{symbol}|{contract_id}"
+        if envelope.get("run_contract_id") != contract_id:
+            return False
+        if envelope.get("decision_id") != decision_id:
+            return False
+        if _parse_state_datetime(envelope.get("started_at")) is None:
+            return False
+        if envelope.get("exit_contract") != (
+            _terminal_drain_exit_contract_from_snapshot(
+                canonical,
+                captured_at=str(envelope.get("started_at") or ""),
+            )
+        ):
+            return False
+        if envelope.get("owner_integrity_digest") != (
+            _terminal_drain_owner_integrity_digest(envelope)
+        ):
+            return False
+        if envelope.get("runtime_integrity_digest") != (
+            _terminal_drain_runtime_integrity_digest(envelope)
+        ):
+            return False
+        raw_drain_state = envelope.get("drain_state")
+        if not isinstance(raw_drain_state, dict):
+            return False
+        drain_state = terminal_drain_state_from_dict(raw_drain_state)
+        if drain_state.symbol != symbol or drain_state.decision_id != decision_id:
+            return False
+        initial_frozen_long = float(envelope.get("initial_frozen_long_qty"))
+        initial_frozen_short = float(envelope.get("initial_frozen_short_qty"))
+        if (
+            not math.isfinite(initial_frozen_long)
+            or not math.isfinite(initial_frozen_short)
+            or initial_frozen_long < 0
+            or initial_frozen_short < 0
+        ):
+            return False
+        if loop_state is not None:
+            durable_long, durable_short = _best_quote_frozen_inventory_qtys(
+                loop_state
+            )
+            if (
+                abs(initial_frozen_long - durable_long) > 1e-12
+                or abs(initial_frozen_short - durable_short) > 1e-12
+            ):
+                return False
+        exit_status = str(envelope.get("exit_status") or "")
+        if exit_status in {"exiting", "exit_blocked"}:
+            return drain_state.stage not in {
+                DrainStage.STOPPED_CLEAN,
+                DrainStage.STOPPED_PRESERVED,
+            }
+        if exit_status == "stopped_clean":
+            return drain_state.stage is DrainStage.STOPPED_CLEAN
+        if exit_status == "stopped_preserved":
+            return drain_state.stage is DrainStage.STOPPED_PRESERVED
+        return False
+    except (TypeError, ValueError):
+        return False
+
+
+def _terminal_drain_completed_owner_is_integral(
+    envelope: Mapping[str, Any],
+    *,
+    symbol: str,
+    loop_state: Mapping[str, Any] | None = None,
+) -> bool:
+    """Permit archival only for a fully verified completed owner."""
+
+    return bool(
+        str(envelope.get("exit_status") or "")
+        in TERMINAL_DRAIN_COMPLETED_EXIT_STATUSES
+        and _terminal_drain_runtime_owner_is_integral(
+            envelope,
+            symbol=symbol,
+            loop_state=loop_state,
+        )
+    )
+
+
+def _merge_late_terminal_intent_with_existing_owner(
+    *,
+    state: dict[str, Any],
+    state_path: Path,
+    intent_path: Path,
+    terminal_intent: dict[str, Any],
+    owner: dict[str, Any],
+    current_decision_id: str,
+    now: datetime,
+) -> bool:
+    """Attach one late same-contract intent to the existing lifecycle owner.
+
+    The loop state is the durable authority and is committed before mirroring
+    the receipt to the external intent file.  Repeating the merge after a
+    crash is therefore safe and cannot create a second terminal owner.
+    """
+
+    symbol = current_decision_id.split("|", 1)[0]
+    intent_id = str(terminal_intent.get("intent_id") or "").strip()
+    owner_decision_id = str(owner.get("decision_id") or "").strip()
+    owner_contract_id = str(owner.get("run_contract_id") or "").strip()
+    intent_contract_id = str(terminal_intent.get("run_contract_id") or "").strip()
+    if (
+        not intent_id
+        or owner_decision_id != current_decision_id
+        or not owner_contract_id
+        or intent_contract_id != owner_contract_id
+        or not _terminal_drain_runtime_owner_is_integral(
+            owner,
+            symbol=symbol,
+            loop_state=state,
+        )
+    ):
+        return False
+
+    committed_at = now.astimezone(timezone.utc).isoformat()
+    exit_status = str(owner.get("exit_status") or "exiting")
+    if exit_status in TERMINAL_DRAIN_COMPLETED_EXIT_STATUSES:
+        intent_status = exit_status
+    elif exit_status == "exit_blocked":
+        intent_status = "exit_blocked"
+    else:
+        intent_status = "accepted"
+    receipt = dict(terminal_intent)
+    receipt.pop("_invalid_reason", None)
+    receipt.update(
+        {
+            "status": intent_status,
+            "accepted_at": str(
+                receipt.get("accepted_at") or committed_at
+            ),
+            "decision_id": owner_decision_id,
+            "updated_at": committed_at,
+        }
+    )
+
+    prior_receipt = state.get(TERMINAL_INTENT_STATE_KEY)
+    if (
+        isinstance(prior_receipt, dict)
+        and str(prior_receipt.get("intent_id") or "") != intent_id
+    ):
+        archived_receipt = dict(prior_receipt)
+        archived_receipt.update(
+            {
+                "archived_at": committed_at,
+                "replaced_by_intent_id": intent_id,
+                "decision_id": owner_decision_id,
+            }
+        )
+        raw_history = state.get(TERMINAL_INTENT_HISTORY_KEY)
+        history = list(raw_history) if isinstance(raw_history, list) else []
+        history.append(archived_receipt)
+        state[TERMINAL_INTENT_HISTORY_KEY] = history[-20:]
+
+    state[TERMINAL_INTENT_STATE_KEY] = receipt
+    _write_json(state_path, state)
+    terminal_intent.update(receipt)
+    _write_json(intent_path, terminal_intent)
+    return True
+
+
+def _terminal_drain_owner_transition(
+    *,
+    state: dict[str, Any],
+    state_path: Path,
+    current_decision_id: str,
+    now: datetime,
+) -> str:
+    """Return ``resume``/``archived``/``none`` for the persisted exit owner.
+
+    An active exit owns the symbol even when the current guard happens to be
+    tradable (for example after a process restart reset local volume inputs).
+    Only an explicitly different run contract may release a *completed* owner;
+    incomplete exits are resumed first and can never be overwritten by a new
+    target.
+    """
+
+    raw_envelope = state.get(TERMINAL_DRAIN_STATE_KEY)
+    if not isinstance(raw_envelope, dict):
+        return "none"
+    persisted_decision_id = str(raw_envelope.get("decision_id") or "")
+    if not persisted_decision_id:
+        return "none"
+    exit_status = str(raw_envelope.get("exit_status") or "exiting")
+    if (
+        persisted_decision_id == current_decision_id
+        or exit_status not in TERMINAL_DRAIN_COMPLETED_EXIT_STATUSES
+    ):
+        return "resume"
+    symbol = current_decision_id.split("|", 1)[0]
+    if not _terminal_drain_completed_owner_is_integral(
+        raw_envelope,
+        symbol=symbol,
+        loop_state=state,
+    ):
+        # A completed marker is not itself an archival receipt.  Resume the
+        # owner so the normal handler can expose a durable integrity failure;
+        # never release trading for one cycle on a corrupted handoff.
+        return "resume"
+
+    archived = dict(raw_envelope)
+    archived.update(
+        {
+            "archived_at": now.astimezone(timezone.utc).isoformat(),
+            "replaced_by_decision_id": current_decision_id,
+        }
+    )
+    raw_history = state.get(TERMINAL_DRAIN_HISTORY_KEY)
+    history = list(raw_history) if isinstance(raw_history, list) else []
+    history.append(archived)
+    state[TERMINAL_DRAIN_HISTORY_KEY] = history[-20:]
+    state.pop(TERMINAL_DRAIN_STATE_KEY, None)
+    state[TERMINAL_HANDOFF_STATE_KEY] = {
+        "schema": TERMINAL_HANDOFF_SCHEMA,
+        "symbol": symbol,
+        "status": "pending",
+        "from_decision_id": persisted_decision_id,
+        "to_decision_id": current_decision_id,
+        "run_contract_id": archived.get("run_contract_id"),
+        "run_contract_snapshot": archived.get("run_contract_snapshot"),
+        "created_at": now.astimezone(timezone.utc).isoformat(),
+    }
+
+    raw_receipt = state.get(TERMINAL_INTENT_STATE_KEY)
+    intent_path: Path | None = None
+    intent_id = ""
+    if isinstance(raw_receipt, dict):
+        receipt = dict(raw_receipt)
+        intent_id = str(receipt.get("intent_id") or "")
+        receipt.update(
+            {
+                "archived_at": now.astimezone(timezone.utc).isoformat(),
+                "replaced_by_decision_id": current_decision_id,
+            }
+        )
+        raw_intent_history = state.get(TERMINAL_INTENT_HISTORY_KEY)
+        intent_history = (
+            list(raw_intent_history) if isinstance(raw_intent_history, list) else []
+        )
+        intent_history.append(receipt)
+        state[TERMINAL_INTENT_HISTORY_KEY] = intent_history[-20:]
+        state.pop(TERMINAL_INTENT_STATE_KEY, None)
+        receipt_symbol = str(receipt.get("symbol") or current_decision_id.split("|", 1)[0])
+        intent_path = _terminal_intent_path(
+            state_path=state_path,
+            symbol=receipt_symbol,
+        )
+    _write_json(state_path, state)
+    if intent_path is not None:
+        persisted_intent = read_json(intent_path)
+        if (
+            isinstance(persisted_intent, dict)
+            and str(persisted_intent.get("intent_id") or "") == intent_id
+            and persisted_intent.get("status")
+            in {"completed", "stopped_clean", "stopped_preserved"}
+        ):
+            intent_path.unlink(missing_ok=True)
+    return "archived"
+
+
+def _validated_pending_terminal_handoff(
+    *,
+    args: argparse.Namespace,
+    state: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    raw_handoff = state.get(TERMINAL_HANDOFF_STATE_KEY)
+    if raw_handoff is None:
+        return None, None
+    if not isinstance(raw_handoff, dict):
+        return None, "terminal_handoff_envelope_invalid"
+    handoff = dict(raw_handoff)
+    if handoff.get("schema") != TERMINAL_HANDOFF_SCHEMA:
+        return None, "terminal_handoff_schema_invalid"
+    status = str(handoff.get("status") or "")
+    if status == "acknowledged":
+        return None, None
+    if status != "pending":
+        return None, "terminal_handoff_status_invalid"
+    symbol = str(args.symbol).upper().strip()
+    if str(handoff.get("symbol") or "").upper().strip() != symbol:
+        return None, "terminal_handoff_symbol_invalid"
+    snapshot = handoff.get("run_contract_snapshot")
+    if not isinstance(snapshot, dict):
+        return None, "terminal_handoff_source_snapshot_missing"
+    try:
+        canonical = run_contract_snapshot_from_config(snapshot)
+        source_contract_id = run_contract_identity_from_config(canonical)
+    except (TypeError, ValueError):
+        return None, "terminal_handoff_source_snapshot_invalid"
+    if canonical != snapshot or source_contract_id != str(
+        handoff.get("run_contract_id") or ""
+    ):
+        return None, "terminal_handoff_source_snapshot_digest_mismatch"
+    if str(handoff.get("from_decision_id") or "") != (
+        f"{symbol}|{source_contract_id}"
+    ):
+        return None, "terminal_handoff_source_decision_invalid"
+    try:
+        current_decision_id = _terminal_drain_decision_id(args, None)
+    except (TypeError, ValueError):
+        return None, "terminal_handoff_target_contract_invalid"
+    if str(handoff.get("to_decision_id") or "") != current_decision_id:
+        return None, "terminal_handoff_target_mismatch"
+    if _parse_state_datetime(handoff.get("created_at")) is None:
+        return None, "terminal_handoff_created_at_invalid"
+    return handoff, None
+
+
+def _terminal_drain_ack_handoff_after_normal_event(
+    *,
+    args: argparse.Namespace,
+    state_path: Path,
+    acknowledged_at: datetime,
+) -> bool:
+    """Acknowledge a handoff only after the new run emitted a normal event."""
+
+    state = read_json(state_path) or {}
+    if not isinstance(state, dict):
+        raise ValueError("terminal handoff state document is invalid")
+    handoff, validation_error = _validated_pending_terminal_handoff(
+        args=args,
+        state=state,
+    )
+    if validation_error is not None:
+        raise ValueError(validation_error)
+    if handoff is None:
+        return False
+    handoff.update(
+        {
+            "status": "acknowledged",
+            "acknowledged_at": acknowledged_at.astimezone(timezone.utc).isoformat(),
+        }
+    )
+    raw_history = state.get(TERMINAL_HANDOFF_HISTORY_KEY)
+    history = list(raw_history) if isinstance(raw_history, list) else []
+    history.append(handoff)
+    state[TERMINAL_HANDOFF_HISTORY_KEY] = history[-20:]
+    state.pop(TERMINAL_HANDOFF_STATE_KEY, None)
+    _write_json(state_path, state)
+    return True
+
+
+def _terminal_drain_client_order_id(
+    *,
+    symbol: str,
+    decision_id: str,
+    generation: int,
+    action_id: str,
+    leg_index: int,
+) -> str:
+    digest = hashlib.sha256(
+        f"{symbol}|{decision_id}|{generation}|{action_id}|{leg_index}".encode("utf-8")
+    ).hexdigest()[:20]
+    return f"gtd-{str(symbol).lower()[:7]}-{digest}"[:36]
+
+
+def _is_terminal_drain_order(order: Mapping[str, Any], symbol: str) -> bool:
+    return str(order.get("clientOrderId") or "").startswith(f"gtd-{str(symbol).lower()[:7]}-")
+
+
+def _terminal_drain_outcome(
+    *,
+    runtime_guard_result: Any,
+    runtime_guard_config: Any,
+    cumulative_gross_notional: float,
+) -> tuple[str, float | None, float, float]:
+    reasons = set(runtime_guard_result.matched_reasons or [])
+    target_raw = getattr(runtime_guard_config, "max_cumulative_notional", None)
+    target = float(target_raw) if target_raw is not None else None
+    achieved = max(float(cumulative_gross_notional), 0.0)
+    shortfall = max((target or 0.0) - achieved, 0.0) if target is not None else 0.0
+    if "max_cumulative_notional_hit" in reasons:
+        return "target_reached", target, achieved, 0.0
+    if "after_end_window" in reasons:
+        return "target_unmet_deadline", target, achieved, shortfall
+    return "condition_unmet", target, achieved, shortfall
+
+
+def _terminal_drain_position_snapshot(
+    positions: list[dict[str, Any]],
+    *,
+    symbol: str,
+    hedge_mode: bool,
+) -> tuple[float, float, float, float, tuple[str, ...]]:
+    long_qty = 0.0
+    short_qty = 0.0
+    long_cost = 0.0
+    short_cost = 0.0
+    errors: list[str] = []
+    expected_sides = {"LONG", "SHORT"} if hedge_mode else {"BOTH"}
+    side_counts = {side: 0 for side in expected_sides}
+    for row in positions:
+        if str(row.get("symbol") or "").upper().strip() != symbol:
+            continue
+        side = str(row.get("positionSide") or "BOTH").upper().strip() or "BOTH"
+        if side not in expected_sides:
+            errors.append(f"unexpected_position_side:{side}")
+            continue
+        side_counts[side] += 1
+        try:
+            amount = float(row.get("positionAmt"))
+        except (TypeError, ValueError):
+            errors.append(f"invalid_position_amount:{side}")
+            continue
+        if not math.isfinite(amount):
+            errors.append(f"non_finite_position_amount:{side}")
+            continue
+        raw_break_even = row.get("breakEvenPrice")
+        raw_entry = row.get("entryPrice")
+        try:
+            break_even = float(raw_break_even) if raw_break_even not in {None, ""} else 0.0
+            entry = float(raw_entry) if raw_entry not in {None, ""} else 0.0
+        except (TypeError, ValueError):
+            errors.append(f"invalid_position_cost_basis:{side}")
+            continue
+        if not math.isfinite(break_even) or not math.isfinite(entry):
+            errors.append(f"non_finite_position_cost_basis:{side}")
+            continue
+        cost = max(break_even or entry, 0.0)
+        if abs(amount) > 1e-12 and cost <= 0:
+            errors.append(f"missing_position_cost_basis:{side}")
+            continue
+        if hedge_mode:
+            if side == "LONG":
+                long_qty = abs(amount)
+                long_cost = cost if long_qty > 1e-12 else 0.0
+            elif side == "SHORT":
+                short_qty = abs(amount)
+                short_cost = cost if short_qty > 1e-12 else 0.0
+        elif amount > 0:
+            long_qty = amount
+            long_cost = cost
+        elif amount < 0:
+            short_qty = abs(amount)
+            short_cost = cost
+    for side, count in side_counts.items():
+        if count != 1:
+            errors.append(f"position_side_count:{side}:{count}")
+    return long_qty, short_qty, long_cost, short_cost, tuple(errors)
+
+
+def _terminal_drain_order_missing(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(token in text for token in ("-2013", "order does not exist", "unknown order"))
+
+
+def _terminal_drain_post_only_rejected(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "-5022",
+            "post only order will be rejected",
+            "post-only order will be rejected",
+        )
+    )
+
+
+def _terminal_drain_record_not_found_proof(
+    *,
+    record: dict[str, Any],
+    observed_at: datetime,
+    open_by_client_id: Mapping[str, Any],
+    long_qty: float,
+    short_qty: float,
+    trade_count: int,
+) -> tuple[int, bool]:
+    """Record one time-separated proof that an ambiguous client ID is absent."""
+
+    client_id = str(record.get("client_order_id") or "")
+    previous_at = _parse_state_datetime(record.get("not_found_last_observed_at"))
+    ambiguous_at = _parse_state_datetime(
+        record.get("ambiguous_at") or record.get("prepared_at")
+    )
+    quiet_since_submit = (
+        ambiguous_at is not None
+        and (
+            observed_at.astimezone(timezone.utc)
+            - ambiguous_at.astimezone(timezone.utc)
+        ).total_seconds()
+        >= TERMINAL_DRAIN_AMBIGUOUS_PROOF_QUIET_SECONDS
+    )
+    quiet_since_previous = (
+        previous_at is None
+        or (
+            observed_at.astimezone(timezone.utc)
+            - previous_at.astimezone(timezone.utc)
+        ).total_seconds()
+        >= TERMINAL_DRAIN_AMBIGUOUS_PROOF_QUIET_SECONDS
+    )
+    proof_is_fresh = quiet_since_submit and quiet_since_previous
+    proof_count = int(record.get("not_found_confirmations") or 0)
+    if proof_is_fresh:
+        proof_count += 1
+        proofs = [
+            dict(item)
+            for item in list(record.get("not_found_proofs") or [])
+            if isinstance(item, dict)
+        ]
+        proofs.append(
+            {
+                "client_order_id": client_id,
+                "observed_at": observed_at.isoformat(),
+                "client_id_absent_from_open_orders": (
+                    client_id not in open_by_client_id
+                ),
+                "open_orders_observed_at": observed_at.isoformat(),
+                "position_observed_at": observed_at.isoformat(),
+                "position_long_qty": long_qty,
+                "position_short_qty": short_qty,
+                "trade_watermark_end_at": observed_at.isoformat(),
+                "trade_count": trade_count,
+            }
+        )
+        record.update(
+            {
+                "not_found_confirmations": proof_count,
+                "not_found_last_observed_at": observed_at.isoformat(),
+                "not_found_proofs": proofs[-4:],
+            }
+        )
+    record["not_found_last_attempt_at"] = observed_at.isoformat()
+    return proof_count, proof_is_fresh
+
+
+def _terminal_drain_fetch_user_trades_exact(
+    *,
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    start_time_ms: int,
+    end_time_ms: int,
+    recv_window: int,
+    page_limit: int = 1000,
+    max_requests: int = 80,
+) -> list[dict[str, Any]]:
+    """Fetch a provably complete, deduplicated terminal-drain trade watermark."""
+
+    start_ms = int(start_time_ms)
+    end_inclusive_ms = int(end_time_ms)
+    limit = int(page_limit)
+    if start_ms > end_inclusive_ms:
+        return []
+    if limit <= 0 or max_requests <= 0:
+        raise ValueError("terminal trade watermark pagination is invalid")
+    rows = fetch_exact_futures_trade_window(
+        fetch_page=lambda range_start_ms, range_end_inclusive_ms, fetch_limit: (
+            fetch_futures_user_trades(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                start_time_ms=range_start_ms,
+                end_time_ms=range_end_inclusive_ms,
+                limit=fetch_limit,
+                recv_window=recv_window,
+                use_cache=False,
+            )
+        ),
+        start_time_ms=start_ms,
+        end_time_exclusive_ms=end_inclusive_ms + 1,
+        page_limit=limit,
+        max_requests=max_requests,
+    )
+    for raw_row in rows:
+        if raw_row.get("orderId") is None or not str(raw_row.get("orderId")).strip():
+            raise ValueError("terminal trade watermark orderId is required")
+        realized_raw = raw_row.get("realizedPnl")
+        if realized_raw is None or realized_raw == "":
+            raise ValueError("terminal trade watermark realizedPnl is required")
+        try:
+            realized_pnl = float(realized_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("terminal trade watermark realizedPnl is invalid") from exc
+        if not math.isfinite(realized_pnl):
+            raise ValueError("terminal trade watermark realizedPnl must be finite")
+    return rows
+
+
+def _terminal_drain_pending_submission_invalid_reason(
+    *,
+    record: Mapping[str, Any],
+    drain_state: TerminalDrainState,
+    observed_at: datetime,
+    long_qty: float,
+    short_qty: float,
+) -> str | None:
+    lease = drain_state.loss_lease
+    if lease is not None and observed_at >= lease.expires_at:
+        return "loss_lease_expired_before_submit"
+
+    order = record.get("order")
+    if not isinstance(order, Mapping):
+        return "prepared_order_missing"
+    side = str(order.get("side") or "").upper().strip()
+    position_side = str(order.get("position_side") or "").upper().strip()
+    if side == "SELL" and position_side in {"", "LONG"}:
+        current_position_qty = long_qty
+    elif side == "BUY" and position_side in {"", "SHORT"}:
+        current_position_qty = short_qty
+    else:
+        return "prepared_close_direction_invalid"
+    try:
+        prepared_position_qty = float(record.get("prepared_position_qty"))
+        order_qty = float(order.get("quantity"))
+    except (TypeError, ValueError) as exc:
+        del exc
+        return "prepared_position_snapshot_invalid"
+    if (
+        not math.isfinite(prepared_position_qty)
+        or prepared_position_qty < 0
+        or not math.isfinite(order_qty)
+        or order_qty <= 0
+    ):
+        return "prepared_position_snapshot_invalid"
+    if abs(prepared_position_qty - current_position_qty) > 1e-12:
+        return "prepared_position_changed_before_submit"
+    if order_qty > current_position_qty + 1e-12:
+        return "prepared_order_exceeds_current_position"
+    return None
+
+
+def _terminal_drain_retire_unsubmitted_action(
+    *,
+    envelope: dict[str, Any],
+    drain_state: TerminalDrainState,
+    action_records: list[dict[str, Any]],
+    rejected_record: dict[str, Any],
+    observed_at: datetime,
+    resolution: str,
+    status: str,
+    error: Exception | None = None,
+) -> TerminalDrainState:
+    terminal_status = str(status).upper().strip()
+    if terminal_status not in {"EXPIRED", "REJECTED"}:
+        raise ValueError("unsubmitted terminal action status must be EXPIRED or REJECTED")
+    rejected_record.update(
+        {
+            "status": terminal_status,
+            "terminal_resolution": resolution,
+            "terminal_at": observed_at.isoformat(),
+            "last_error": (
+                f"{type(error).__name__}: {error}" if error is not None else None
+            ),
+        }
+    )
+    for sibling in action_records:
+        if sibling is rejected_record:
+            continue
+        if str(sibling.get("status") or "").upper() == "PREPARED":
+            sibling.update(
+                {
+                    "status": terminal_status,
+                    "terminal_resolution": f"{resolution}_sibling_not_submitted",
+                    "terminal_at": observed_at.isoformat(),
+                    "last_error": None,
+                }
+            )
+
+    unresolved_records = [
+        item
+        for item in action_records
+        if str(item.get("status") or "").upper()
+        not in TERMINAL_DRAIN_TERMINAL_ORDER_STATUSES
+    ]
+    effectful_terminal_records = [
+        item
+        for item in action_records
+        if str(item.get("status") or "").upper()
+        in TERMINAL_DRAIN_TERMINAL_ORDER_STATUSES
+        and (
+            str(item.get("order_id") or "").strip()
+            or _safe_float(item.get("executed_qty")) > 1e-12
+        )
+    ]
+    if unresolved_records:
+        envelope["active_intent_ids"] = [
+            str(item.get("client_order_id") or "") for item in unresolved_records
+        ]
+    elif effectful_terminal_records:
+        envelope["active_intent_ids"] = [
+            str(item.get("client_order_id") or "")
+            for item in effectful_terminal_records
+        ]
+    else:
+        envelope["active_intent_ids"] = []
+        if drain_state.loss_lease is not None:
+            drain_state = settle_loss_lease(
+                drain_state,
+                action_id=drain_state.loss_lease.action_id,
+                realized_loss=0.0,
+            )
+            envelope["last_loss_receipt_at"] = observed_at.isoformat()
+
+    resolutions = [
+        dict(item)
+        for item in list(envelope.get("submission_resolutions") or [])
+        if isinstance(item, dict)
+    ]
+    resolutions.append(
+        {
+            "client_order_id": rejected_record.get("client_order_id"),
+            "status": terminal_status,
+            "resolution": resolution,
+            "observed_at": observed_at.isoformat(),
+        }
+    )
+    envelope["submission_resolutions"] = resolutions[-20:]
+    envelope["exit_status"] = "exiting"
+    envelope.pop("last_errors", None)
+    return drain_state
+
+
+def _terminal_drain_settle_loss_receipt(
+    *,
+    drain_state: TerminalDrainState,
+    active_records: list[dict[str, Any]],
+    trades: list[dict[str, Any]],
+) -> tuple[TerminalDrainState, dict[str, Any] | None]:
+    lease = drain_state.loss_lease
+    if lease is None:
+        return drain_state, None
+    if not math.isfinite(lease.maximum_loss) or lease.maximum_loss < 0:
+        return drain_state, {"reason": "loss_lease_invalid"}
+    if not active_records:
+        return drain_state, {
+            "reason": "loss_lease_has_no_active_intent",
+            "authorized_loss": lease.maximum_loss,
+        }
+    expected_qty_by_order: dict[str, float] = {}
+    client_order_ids: set[str] = set()
+    for item in active_records:
+        raw_executed_qty = item.get("executed_qty")
+        try:
+            executed_qty = float(raw_executed_qty or 0.0)
+        except (TypeError, ValueError):
+            executed_qty = math.nan
+        if not math.isfinite(executed_qty) or executed_qty < 0:
+            return drain_state, {"reason": "loss_receipt_quantity_invalid"}
+        client_order_id = str(item.get("client_order_id") or "").strip()
+        if client_order_id:
+            client_order_ids.add(client_order_id)
+        if executed_qty <= 1e-12:
+            continue
+        order_id = str(item.get("order_id") or "").strip()
+        if not order_id:
+            return drain_state, {
+                "reason": "loss_receipt_order_id_missing",
+                "client_order_id": client_order_id or None,
+                "executed_qty": executed_qty,
+            }
+        expected_qty_by_order[order_id] = (
+            expected_qty_by_order.get(order_id, 0.0) + executed_qty
+        )
+
+    if not expected_qty_by_order:
+        return (
+            settle_loss_lease(
+                drain_state,
+                action_id=lease.action_id,
+                realized_loss=0.0,
+            ),
+            None,
+        )
+
+    covered_qty_by_order = {order_id: 0.0 for order_id in expected_qty_by_order}
+    realized_pnl = 0.0
+    seen_trade_ids: set[str] = set()
+    for row in trades:
+        order_id = str(row.get("orderId") or "").strip()
+        if order_id not in expected_qty_by_order:
+            continue
+        trade_id = str(row.get("id") or "").strip()
+        if not trade_id:
+            return drain_state, {
+                "reason": "loss_receipt_trade_id_missing",
+                "order_id": order_id,
+            }
+        if trade_id in seen_trade_ids:
+            continue
+        seen_trade_ids.add(trade_id)
+        raw_qty = row.get("qty")
+        try:
+            trade_qty = float(raw_qty)
+        except (TypeError, ValueError):
+            trade_qty = math.nan
+        if not math.isfinite(trade_qty) or trade_qty <= 0:
+            return drain_state, {
+                "reason": "loss_receipt_trade_qty_invalid",
+                "order_id": order_id,
+                "trade_id": trade_id,
+            }
+        raw_value = row.get("realizedPnl")
+        if raw_value is None or raw_value == "":
+            return drain_state, {
+                "reason": "loss_receipt_realized_pnl_missing",
+                "order_id": order_id,
+                "trade_id": trade_id,
+            }
+        try:
+            raw_realized = float(raw_value)
+        except (TypeError, ValueError):
+            raw_realized = math.nan
+        if not math.isfinite(raw_realized):
+            return drain_state, {
+                "reason": "loss_receipt_non_finite",
+                "order_id": order_id,
+                "trade_id": trade_id,
+            }
+        covered_qty_by_order[order_id] += trade_qty
+        realized_pnl += raw_realized
+
+    for order_id, expected_qty in expected_qty_by_order.items():
+        covered_qty = covered_qty_by_order[order_id]
+        tolerance = max(1e-12, expected_qty * 1e-9)
+        if covered_qty + tolerance < expected_qty:
+            return drain_state, {
+                "reason": "loss_receipt_trade_coverage_incomplete",
+                "order_id": order_id,
+                "executed_qty": expected_qty,
+                "covered_qty": covered_qty,
+            }
+        if covered_qty > expected_qty + tolerance:
+            return drain_state, {
+                "reason": "loss_receipt_trade_coverage_exceeds_execution",
+                "order_id": order_id,
+                "executed_qty": expected_qty,
+                "covered_qty": covered_qty,
+            }
+
+    realized_loss = max(-realized_pnl, 0.0)
+    if not math.isfinite(realized_loss) or realized_loss < 0:
+        return drain_state, {"reason": "loss_receipt_invalid"}
+    if realized_loss > lease.maximum_loss + 1e-9:
+        breached = settle_breached_loss_lease(
+            drain_state,
+            action_id=lease.action_id,
+            realized_loss=realized_loss,
+        )
+        return breached, {
+            "reason": "realized_loss_exceeds_authorized_lease",
+            "decision_id": drain_state.decision_id,
+            "action_id": lease.action_id.value,
+            "realized_loss": realized_loss,
+            "authorized_loss": lease.maximum_loss,
+            "order_ids": sorted(expected_qty_by_order),
+            "client_order_ids": sorted(client_order_ids),
+            "lease_closed": True,
+        }
+    return (
+        settle_loss_lease(
+            drain_state,
+            action_id=lease.action_id,
+            realized_loss=realized_loss,
+        ),
+        None,
+    )
+
+
+def _terminal_drain_record_budget_breach(
+    *,
+    envelope: dict[str, Any],
+    receipt_error: dict[str, Any] | None,
+    observed_at: datetime,
+) -> bool:
+    if not isinstance(receipt_error, dict) or receipt_error.get("reason") != (
+        "realized_loss_exceeds_authorized_lease"
+    ):
+        return False
+    breach = dict(receipt_error)
+    breach["observed_at"] = observed_at.isoformat()
+    raw_breaches = envelope.get("budget_breaches")
+    breaches = list(raw_breaches) if isinstance(raw_breaches, list) else []
+    breaches.append(breach)
+    envelope["budget_breaches"] = breaches[-20:]
+    envelope["loss_budget_breached"] = True
+    return True
+
+
+def _terminal_drain_persist(
+    *,
+    state: dict[str, Any],
+    state_path: Path,
+    envelope: dict[str, Any],
+    drain_state: TerminalDrainState,
+) -> None:
+    envelope["drain_state"] = terminal_drain_state_to_dict(drain_state)
+    envelope["runtime_integrity_digest"] = (
+        _terminal_drain_runtime_integrity_digest(envelope)
+    )
+    state[TERMINAL_DRAIN_STATE_KEY] = envelope
+    raw_receipt = state.get(TERMINAL_INTENT_STATE_KEY)
+    receipt: dict[str, Any] | None = None
+    if isinstance(raw_receipt, dict) and raw_receipt.get("intent_id"):
+        receipt = dict(raw_receipt)
+        exit_status = str(envelope.get("exit_status") or "exiting")
+        intent_status = (
+            exit_status
+            if exit_status in {"stopped_clean", "stopped_preserved"}
+            else ("exit_blocked" if exit_status == "exit_blocked" else "executing")
+        )
+        receipt.update(
+            {
+                "status": intent_status,
+                "decision_id": envelope.get("decision_id"),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        state[TERMINAL_INTENT_STATE_KEY] = receipt
+    _write_json(state_path, state)
+    if receipt is not None:
+        intent_path = _terminal_intent_path(
+            state_path=state_path,
+            symbol=str(receipt.get("symbol") or drain_state.symbol),
+        )
+        persisted_intent = read_json(intent_path)
+        if (
+            isinstance(persisted_intent, dict)
+            and str(persisted_intent.get("intent_id") or "")
+            == str(receipt.get("intent_id") or "")
+        ):
+            persisted_intent.update(
+                {
+                    "status": receipt["status"],
+                    "decision_id": receipt.get("decision_id"),
+                    "updated_at": receipt["updated_at"],
+                }
+            )
+            _write_json(intent_path, persisted_intent)
+
+
+def _terminal_drain_summary(
+    *,
+    args: argparse.Namespace,
+    cycle: int,
+    cycle_started_at: datetime,
+    stats_start_time: datetime | None,
+    runtime_guard_config: Any,
+    runtime_guard_result: Any,
+    cumulative_gross_notional: float,
+    outcome: str,
+    target: float | None,
+    achieved: float,
+    shortfall: float,
+    action_id: str,
+    reasons: tuple[str, ...],
+    bid_price: float,
+    ask_price: float,
+    long_qty: float,
+    short_qty: float,
+    canceled_count: int = 0,
+    placed_count: int = 0,
+    stop_allowed: bool = False,
+    exit_status: str = "exiting",
+    errors: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    snapshot = {
+        "orders": [],
+        "bid_price": bid_price,
+        "ask_price": ask_price,
+        "long_qty": long_qty,
+        "short_qty": short_qty,
+        "net_qty": long_qty - short_qty,
+    }
+    summary = _build_runtime_guard_stop_summary(
+        args=args,
+        cycle=cycle,
+        cycle_started_at=cycle_started_at,
+        stats_start_time=stats_start_time,
+        runtime_guard_config=runtime_guard_config,
+        runtime_guard_result=runtime_guard_result,
+        canceled_count=canceled_count,
+        flatten_result={"started": False, "already_running": False},
+        flatten_snapshot=snapshot,
+    )
+    summary.update(
+        {
+            "runtime_status": "stopped" if stop_allowed else ("exit_blocked" if errors else "draining"),
+            "stop_triggered": bool(stop_allowed),
+            "runner_exit_allowed": bool(stop_allowed),
+            "terminal_drain_action": str(action_id),
+            "terminal_drain_reasons": list(reasons),
+            "run_outcome": outcome,
+            "target_value": target,
+            "achieved_value": achieved,
+            "target_shortfall": shortfall,
+            "exit_status": exit_status,
+            "placed_count": int(placed_count),
+            "terminal_drain_errors": list(errors or []),
+            "global_allow_loss": False,
+        }
+    )
+    return summary
+
+
+def _terminal_drain_strict_lot_book(
+    raw_lots: Any,
+    *,
+    ledger_name: str,
+    side: str,
+) -> tuple[float, float, list[dict[str, float]], list[dict[str, Any]]]:
+    """Read one ownership lot book without silently discarding bad rows."""
+
+    errors: list[dict[str, Any]] = []
+    canonical_lots: list[dict[str, float]] = []
+    if not isinstance(raw_lots, list):
+        return 0.0, 0.0, canonical_lots, [
+            {
+                "reason": f"run_contract_integrity_{ledger_name}_ledger_lots_invalid",
+                "side": side,
+                "message": "lot book must be a list",
+            }
+        ]
+    for index, raw_lot in enumerate(raw_lots):
+        if not isinstance(raw_lot, Mapping):
+            errors.append(
+                {
+                    "reason": f"run_contract_integrity_{ledger_name}_ledger_lots_invalid",
+                    "side": side,
+                    "lot_index": index,
+                    "message": "lot must be an object",
+                }
+            )
+            continue
+        try:
+            qty = float(raw_lot.get("qty"))
+            raw_price = raw_lot.get("price")
+            if raw_price in {None, ""}:
+                raw_price = raw_lot.get("entry_price")
+            price = float(raw_price)
+        except (TypeError, ValueError):
+            qty = math.nan
+            price = math.nan
+        if (
+            not math.isfinite(qty)
+            or not math.isfinite(price)
+            or qty <= 0
+            or price <= 0
+        ):
+            errors.append(
+                {
+                    "reason": f"run_contract_integrity_{ledger_name}_ledger_lots_invalid",
+                    "side": side,
+                    "lot_index": index,
+                    "message": "lot qty and price must be positive finite numbers",
+                }
+            )
+            continue
+        canonical_lots.append({"qty": qty, "price": price})
+    qty = sum(item["qty"] for item in canonical_lots)
+    cost = sum(item["qty"] * item["price"] for item in canonical_lots)
+    return qty, (cost / qty if qty > 0 else 0.0), canonical_lots, errors
+
+
+def _terminal_drain_bq_owned_ledger_snapshot(
+    state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Freeze auditable BQ ownership from normal and frozen lot ledgers."""
+
+    errors: list[dict[str, Any]] = []
+    normal_long_qty = 0.0
+    normal_short_qty = 0.0
+    normal_long_cost = 0.0
+    normal_short_cost = 0.0
+    normal_long_lots: list[dict[str, float]] = []
+    normal_short_lots: list[dict[str, float]] = []
+    raw_normal = state.get("best_quote_volume_ledger")
+    if not isinstance(raw_normal, Mapping):
+        errors.append(
+            {"reason": "run_contract_integrity_normal_ledger_missing"}
+        )
+    else:
+        if raw_normal.get("schema") != "best_quote_volume_ledger_v1":
+            errors.append(
+                {
+                    "reason": "run_contract_integrity_normal_ledger_invalid",
+                    "message": "normal BQ ledger schema mismatch",
+                }
+            )
+        if raw_normal.get("initialized") is not True:
+            errors.append(
+                {"reason": "run_contract_integrity_normal_ledger_uninitialized"}
+            )
+        if raw_normal.get("sync_ok") is not True or str(
+            raw_normal.get("sync_error") or ""
+        ):
+            errors.append(
+                {"reason": "run_contract_integrity_normal_ledger_unreconciled"}
+            )
+        (
+            normal_long_qty,
+            normal_long_cost,
+            normal_long_lots,
+            long_errors,
+        ) = _terminal_drain_strict_lot_book(
+            raw_normal.get("long_lots"),
+            ledger_name="normal",
+            side="long",
+        )
+        (
+            normal_short_qty,
+            normal_short_cost,
+            normal_short_lots,
+            short_errors,
+        ) = _terminal_drain_strict_lot_book(
+            raw_normal.get("short_lots"),
+            ledger_name="normal",
+            side="short",
+        )
+        errors.extend(long_errors)
+        errors.extend(short_errors)
+
+    frozen_long_qty = 0.0
+    frozen_short_qty = 0.0
+    frozen_long_lots: list[dict[str, float]] = []
+    frozen_short_lots: list[dict[str, float]] = []
+    raw_frozen = state.get("best_quote_frozen_inventory")
+    if raw_frozen is not None and not isinstance(raw_frozen, Mapping):
+        errors.append(
+            {"reason": "run_contract_integrity_frozen_ledger_invalid"}
+        )
+    elif isinstance(raw_frozen, Mapping):
+        (
+            frozen_long_lot_qty,
+            _frozen_long_cost,
+            frozen_long_lots,
+            long_errors,
+        ) = _terminal_drain_strict_lot_book(
+            raw_frozen.get("long_lots"),
+            ledger_name="frozen",
+            side="long",
+        )
+        (
+            frozen_short_lot_qty,
+            _frozen_short_cost,
+            frozen_short_lots,
+            short_errors,
+        ) = _terminal_drain_strict_lot_book(
+            raw_frozen.get("short_lots"),
+            ledger_name="frozen",
+            side="short",
+        )
+        errors.extend(long_errors)
+        errors.extend(short_errors)
+        for side, lot_qty in (
+            ("long", frozen_long_lot_qty),
+            ("short", frozen_short_lot_qty),
+        ):
+            raw_summary = raw_frozen.get(f"{side}_qty")
+            try:
+                summary_qty = float(raw_summary)
+            except (TypeError, ValueError):
+                summary_qty = math.nan
+            if not math.isfinite(summary_qty) or summary_qty < 0:
+                errors.append(
+                    {
+                        "reason": "run_contract_integrity_frozen_ledger_summary_invalid",
+                        "side": side,
+                    }
+                )
+                summary_qty = 0.0
+            tolerance = max(1e-12, max(summary_qty, lot_qty) * 1e-9)
+            if abs(summary_qty - lot_qty) > tolerance:
+                errors.append(
+                    {
+                        "reason": "run_contract_integrity_frozen_lot_summary_mismatch",
+                        "side": side,
+                        "summary_qty": summary_qty,
+                        "lot_qty": lot_qty,
+                    }
+                )
+            if side == "long":
+                frozen_long_qty = summary_qty
+            else:
+                frozen_short_qty = summary_qty
+
+    digest_payload = {
+        "schema": "futures-terminal-owned-ledger-v1",
+        "normal": {
+            "long_lots": normal_long_lots,
+            "short_lots": normal_short_lots,
+        },
+        "frozen": {
+            "long_qty": frozen_long_qty,
+            "short_qty": frozen_short_qty,
+            "long_lots": frozen_long_lots,
+            "short_lots": frozen_short_lots,
+        },
+    }
+    encoded = json.dumps(
+        digest_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return {
+        "normal_long_qty": normal_long_qty,
+        "normal_short_qty": normal_short_qty,
+        "normal_long_cost_basis": normal_long_cost,
+        "normal_short_cost_basis": normal_short_cost,
+        "frozen_long_qty": frozen_long_qty,
+        "frozen_short_qty": frozen_short_qty,
+        "digest": "futures-terminal-owned-ledger-v1-"
+        + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24],
+        "errors": errors,
+    }
+
+
+def _terminal_drain_owned_fill_progress(
+    envelope: dict[str, Any],
+    *,
+    trades: list[dict[str, Any]],
+) -> tuple[float, float, list[dict[str, Any]]]:
+    """Count only exchange trades tied to this terminal owner's order IDs."""
+
+    errors: list[dict[str, Any]] = []
+    expected_by_order: dict[str, dict[str, Any]] = {}
+    for raw_record in list(envelope.get("intents") or []):
+        if not isinstance(raw_record, Mapping):
+            errors.append({"reason": "terminal_owned_intent_invalid"})
+            continue
+        try:
+            executed_qty = float(raw_record.get("executed_qty") or 0.0)
+        except (TypeError, ValueError):
+            executed_qty = math.nan
+        if not math.isfinite(executed_qty) or executed_qty < 0:
+            errors.append({"reason": "terminal_owned_execution_qty_invalid"})
+            continue
+        order_id = str(raw_record.get("order_id") or "").strip()
+        if not order_id:
+            if executed_qty > 1e-12:
+                errors.append(
+                    {"reason": "terminal_owned_execution_order_id_missing"}
+                )
+            continue
+        if order_id in expected_by_order:
+            errors.append(
+                {
+                    "reason": "terminal_owned_order_id_duplicated",
+                    "order_id": order_id,
+                }
+            )
+            continue
+        raw_order = raw_record.get("order")
+        if not isinstance(raw_order, Mapping):
+            errors.append(
+                {"reason": "terminal_owned_order_intent_missing", "order_id": order_id}
+            )
+            continue
+        side = str(raw_order.get("side") or "").upper().strip()
+        position_side = str(
+            raw_order.get("position_side") or ""
+        ).upper().strip()
+        try:
+            intended_qty = float(raw_order.get("quantity"))
+        except (TypeError, ValueError):
+            intended_qty = math.nan
+        if not math.isfinite(intended_qty) or intended_qty <= 0:
+            errors.append(
+                {
+                    "reason": "terminal_owned_order_qty_invalid",
+                    "order_id": order_id,
+                }
+            )
+            continue
+        if side == "SELL" and position_side in {"", "LONG"}:
+            leg = "long"
+        elif side == "BUY" and position_side in {"", "SHORT"}:
+            leg = "short"
+        else:
+            errors.append(
+                {
+                    "reason": "terminal_owned_close_direction_invalid",
+                    "order_id": order_id,
+                }
+            )
+            continue
+        expected_by_order[order_id] = {
+            "executed_qty": executed_qty,
+            "side": side,
+            "position_side": position_side,
+            "leg": leg,
+            "intended_qty": intended_qty,
+            "record": raw_record,
+        }
+
+    covered_by_order = {order_id: 0.0 for order_id in expected_by_order}
+    seen_trade_ids: set[tuple[str, str]] = set()
+    for raw_trade in trades:
+        order_id = str(raw_trade.get("orderId") or "").strip()
+        expected = expected_by_order.get(order_id)
+        if expected is None:
+            continue
+        trade_id = str(raw_trade.get("id") or "").strip()
+        if not trade_id:
+            errors.append(
+                {
+                    "reason": "terminal_owned_trade_id_missing",
+                    "order_id": order_id,
+                }
+            )
+            continue
+        trade_key = (order_id, trade_id)
+        if trade_key in seen_trade_ids:
+            continue
+        seen_trade_ids.add(trade_key)
+        try:
+            trade_qty = float(raw_trade.get("qty"))
+        except (TypeError, ValueError):
+            trade_qty = math.nan
+        if not math.isfinite(trade_qty) or trade_qty <= 0:
+            errors.append(
+                {
+                    "reason": "terminal_owned_trade_qty_invalid",
+                    "order_id": order_id,
+                    "trade_id": trade_id,
+                }
+            )
+            continue
+        trade_side = str(raw_trade.get("side") or "").upper().strip()
+        trade_position_side = str(
+            raw_trade.get("positionSide") or ""
+        ).upper().strip()
+        if trade_side != expected["side"] or (
+            expected["position_side"]
+            and trade_position_side != expected["position_side"]
+        ):
+            errors.append(
+                {
+                    "reason": "terminal_owned_trade_direction_mismatch",
+                    "order_id": order_id,
+                    "trade_id": trade_id,
+                }
+            )
+            continue
+        covered_by_order[order_id] += trade_qty
+
+    filled = {"long": 0.0, "short": 0.0}
+    for order_id, expected in expected_by_order.items():
+        executed_qty = float(expected["executed_qty"])
+        intended_qty = float(expected["intended_qty"])
+        covered_qty = covered_by_order[order_id]
+        tolerance = max(1e-12, executed_qty * 1e-9)
+        if covered_qty + tolerance < executed_qty:
+            errors.append(
+                {
+                    "reason": "terminal_owned_trade_coverage_incomplete",
+                    "order_id": order_id,
+                    "executed_qty": executed_qty,
+                    "covered_qty": covered_qty,
+                }
+            )
+        elif covered_qty > intended_qty + max(1e-12, intended_qty * 1e-9):
+            errors.append(
+                {
+                    "reason": "terminal_owned_trade_coverage_exceeds_intent",
+                    "order_id": order_id,
+                    "intended_qty": intended_qty,
+                    "covered_qty": covered_qty,
+                }
+            )
+        elif covered_qty > executed_qty + tolerance:
+            record = expected["record"]
+            if isinstance(record, dict):
+                record["executed_qty"] = covered_qty
+        filled[str(expected["leg"])] += covered_qty
+
+    for side in ("long", "short"):
+        field = f"terminal_filled_{side}_qty"
+        try:
+            previous = float(envelope.get(field) or 0.0)
+        except (TypeError, ValueError):
+            previous = math.nan
+        if not math.isfinite(previous) or previous < 0:
+            errors.append(
+                {"reason": "terminal_owned_fill_progress_invalid", "side": side}
+            )
+            previous = 0.0
+        if filled[side] + 1e-12 < previous:
+            errors.append(
+                {
+                    "reason": "terminal_owned_fill_progress_regressed",
+                    "side": side,
+                    "previous_qty": previous,
+                    "observed_qty": filled[side],
+                }
+            )
+            filled[side] = previous
+        initial_qty = _safe_float(envelope.get(f"initial_normal_{side}_qty"))
+        if filled[side] > initial_qty + max(1e-12, initial_qty * 1e-9):
+            errors.append(
+                {
+                    "reason": "terminal_owned_fill_exceeds_initial_ledger",
+                    "side": side,
+                    "initial_qty": initial_qty,
+                    "filled_qty": filled[side],
+                }
+            )
+    return filled["long"], filled["short"], errors
+
+
+def _handle_terminal_drain_round(
+    *,
+    args: argparse.Namespace,
+    cycle: int,
+    cycle_started_at: datetime,
+    stats_start_time: datetime | None,
+    runtime_guard_config: Any,
+    runtime_guard_result: Any,
+    cumulative_gross_notional: float,
+    state: dict[str, Any],
+    state_path: Path,
+) -> dict[str, Any]:
+    """Advance exactly one symbol-scoped terminal-drain action.
+
+    This path stays inside the strategy runner until a reconciled clean proof is
+    durable.  It never enables the legacy global allow-loss flag and never
+    falls back from LIMIT/GTX to a taker order.
+    """
+
+    symbol = str(args.symbol).upper().strip()
+    decision_id = _terminal_drain_decision_id(args, runtime_guard_config)
+    outcome, target, achieved, shortfall = _terminal_drain_outcome(
+        runtime_guard_result=runtime_guard_result,
+        runtime_guard_config=runtime_guard_config,
+        cumulative_gross_notional=cumulative_gross_notional,
+    )
+    raw_envelope = state.get(TERMINAL_DRAIN_STATE_KEY)
+    has_persisted_owner = isinstance(raw_envelope, dict)
+    envelope = dict(raw_envelope) if has_persisted_owner else {}
+    contract_integrity_error: str | None = None
+    contract_integrity_details: dict[str, Any] = {}
+    bq_ownership_required = False
+    if has_persisted_owner:
+        raw_snapshot = envelope.get("run_contract_snapshot")
+        raw_exit_contract = envelope.get("exit_contract")
+        try:
+            if not isinstance(raw_snapshot, dict):
+                raise ValueError("run contract snapshot is missing")
+            canonical_snapshot = run_contract_snapshot_from_config(raw_snapshot)
+            bq_ownership_required = _is_hedge_best_quote_maker_volume_mode(
+                str(canonical_snapshot.get("strategy_mode") or "")
+            )
+            if canonical_snapshot != raw_snapshot:
+                raise ValueError("run contract snapshot is not canonical")
+            if envelope.get("schema") != TERMINAL_DRAIN_SCHEMA:
+                raise ValueError("terminal owner schema mismatch")
+            if str(canonical_snapshot.get("symbol") or "") != symbol:
+                raise ValueError("terminal owner symbol mismatch")
+            canonical_contract_id = run_contract_identity_from_config(
+                canonical_snapshot
+            )
+            if str(envelope.get("run_contract_id") or "") != canonical_contract_id:
+                raise ValueError("run contract snapshot digest mismatch")
+            expected_decision_id = f"{symbol}|{canonical_contract_id}"
+            if str(envelope.get("decision_id") or "") != expected_decision_id:
+                raise ValueError("terminal owner decision mismatch")
+            if _parse_state_datetime(envelope.get("started_at")) is None:
+                raise ValueError("terminal owner started_at is invalid")
+            if str(envelope.get("owner_integrity_digest") or "") != (
+                _terminal_drain_owner_integrity_digest(envelope)
+            ):
+                raise ValueError("terminal owner integrity digest mismatch")
+            raw_drain_state = envelope.get("drain_state")
+            if not isinstance(raw_drain_state, dict):
+                raise ValueError("terminal drain state is missing")
+            if str(raw_drain_state.get("symbol") or "").upper().strip() != symbol:
+                raise ValueError("terminal drain state symbol mismatch")
+            if str(raw_drain_state.get("decision_id") or "") != expected_decision_id:
+                raise ValueError("terminal drain state decision mismatch")
+            initial_frozen_long = float(envelope.get("initial_frozen_long_qty"))
+            initial_frozen_short = float(envelope.get("initial_frozen_short_qty"))
+            if (
+                not math.isfinite(initial_frozen_long)
+                or not math.isfinite(initial_frozen_short)
+                or initial_frozen_long < 0
+                or initial_frozen_short < 0
+            ):
+                raise ValueError("terminal frozen ledger snapshot is invalid")
+            if bq_ownership_required:
+                initial_owned_digest = str(
+                    envelope.get("initial_owned_ledger_digest") or ""
+                )
+                initial_normal_values = tuple(
+                    float(envelope.get(field))
+                    for field in (
+                        "initial_normal_long_qty",
+                        "initial_normal_short_qty",
+                        "initial_normal_long_cost_basis",
+                        "initial_normal_short_cost_basis",
+                    )
+                )
+                if (
+                    not initial_owned_digest.startswith(
+                        "futures-terminal-owned-ledger-v1-"
+                    )
+                    or any(
+                        not math.isfinite(value) or value < 0
+                        for value in initial_normal_values
+                    )
+                ):
+                    raise ValueError("terminal owned ledger snapshot is invalid")
+            expected_exit_contract = _terminal_drain_exit_contract_from_snapshot(
+                canonical_snapshot,
+                captured_at=str(envelope.get("started_at") or ""),
+            )
+            if contract_integrity_error is None and (
+                not isinstance(raw_exit_contract, dict)
+                or dict(raw_exit_contract) != expected_exit_contract
+            ):
+                contract_integrity_error = (
+                    "run_contract_integrity_exit_contract_mismatch"
+                )
+                contract_integrity_details = {
+                    "expected_exit_contract": expected_exit_contract,
+                    "observed_exit_contract": raw_exit_contract,
+                }
+            if (
+                contract_integrity_error is None
+                and str(envelope.get("runtime_integrity_digest") or "")
+                != _terminal_drain_runtime_integrity_digest(envelope)
+            ):
+                raise ValueError("terminal runtime integrity digest mismatch")
+            exit_contract = expected_exit_contract
+        except (TypeError, ValueError) as exc:
+            contract_integrity_error = "run_contract_integrity_snapshot_invalid"
+            contract_integrity_details = {"message": str(exc)}
+            canonical_snapshot = run_contract_snapshot_from_config(vars(args))
+            bq_ownership_required = _is_hedge_best_quote_maker_volume_mode(
+                str(canonical_snapshot.get("strategy_mode") or "")
+            )
+            canonical_contract_id = run_contract_identity_from_config(vars(args))
+            exit_contract = _terminal_drain_exit_contract_from_snapshot(
+                canonical_snapshot,
+                captured_at=cycle_started_at.isoformat(),
+            )
+    else:
+        canonical_snapshot = run_contract_snapshot_from_config(vars(args))
+        bq_ownership_required = _is_hedge_best_quote_maker_volume_mode(
+            str(canonical_snapshot.get("strategy_mode") or "")
+        )
+        canonical_contract_id = run_contract_identity_from_config(vars(args))
+        exit_contract = _terminal_drain_exit_contract_from_snapshot(
+            canonical_snapshot,
+            captured_at=cycle_started_at.isoformat(),
+        )
+    exit_policy = str(exit_contract.get("policy") or "drain_clean")
+    exit_loss_budget = _safe_float(exit_contract.get("absolute_loss_budget"))
+    exit_max_wait_seconds = _safe_float(exit_contract.get("max_wait_seconds"))
+    exit_max_order_notional = _safe_float(exit_contract.get("max_order_notional"))
+    exit_loss_lease_seconds = _safe_float(exit_contract.get("loss_lease_seconds"))
+    exit_order_reprice_seconds = _safe_float(exit_contract.get("order_reprice_seconds"))
+    exit_flat_confirm_cycles = int(exit_contract.get("flat_confirm_cycles") or 2)
+    persisted_decision_id = str(envelope.get("decision_id") or "")
+    if persisted_decision_id:
+        # The first terminal transition freezes the run result.  Later cycles
+        # only advance the exit state machine; they must never recompute a
+        # target result from mutable audit files, late fills or changed CLI
+        # values.  A different run contract also cannot erase an incomplete
+        # owner and must finish that persisted owner first.
+        if persisted_decision_id != decision_id:
+            decision_id = persisted_decision_id
+        outcome = str(envelope.get("run_outcome") or outcome)
+        target = (
+            float(envelope["target_value"])
+            if envelope.get("target_value") is not None
+            else None
+        )
+        achieved = _safe_float(envelope.get("achieved_value"))
+        shortfall = _safe_float(envelope.get("target_shortfall"))
+
+    owned_ledger_snapshot: dict[str, Any] | None = None
+    if bq_ownership_required:
+        owned_ledger_snapshot = _terminal_drain_bq_owned_ledger_snapshot(state)
+        ledger_errors = list(owned_ledger_snapshot.get("errors") or [])
+        if contract_integrity_error is None and ledger_errors:
+            contract_integrity_error = str(
+                ledger_errors[0].get("reason")
+                or "run_contract_integrity_owned_ledger_invalid"
+            )
+            contract_integrity_details = {
+                "ledger_errors": ledger_errors,
+            }
+        elif contract_integrity_error is None and has_persisted_owner:
+            durable_frozen_long = _safe_float(
+                owned_ledger_snapshot.get("frozen_long_qty")
+            )
+            durable_frozen_short = _safe_float(
+                owned_ledger_snapshot.get("frozen_short_qty")
+            )
+            initial_frozen_long = _safe_float(
+                envelope.get("initial_frozen_long_qty")
+            )
+            initial_frozen_short = _safe_float(
+                envelope.get("initial_frozen_short_qty")
+            )
+            if (
+                abs(initial_frozen_long - durable_frozen_long) > 1e-12
+                or abs(initial_frozen_short - durable_frozen_short) > 1e-12
+            ):
+                contract_integrity_error = (
+                    "run_contract_integrity_frozen_ledger_mismatch"
+                )
+                contract_integrity_details = {
+                    "initial_frozen_long_qty": initial_frozen_long,
+                    "initial_frozen_short_qty": initial_frozen_short,
+                    "durable_frozen_long_qty": durable_frozen_long,
+                    "durable_frozen_short_qty": durable_frozen_short,
+                }
+    elif has_persisted_owner and contract_integrity_error is None:
+        durable_frozen_long, durable_frozen_short = (
+            _best_quote_frozen_inventory_qtys(state)
+        )
+        initial_frozen_long = _safe_float(envelope.get("initial_frozen_long_qty"))
+        initial_frozen_short = _safe_float(envelope.get("initial_frozen_short_qty"))
+        if (
+            abs(initial_frozen_long - durable_frozen_long) > 1e-12
+            or abs(initial_frozen_short - durable_frozen_short) > 1e-12
+        ):
+            contract_integrity_error = (
+                "run_contract_integrity_frozen_ledger_mismatch"
+            )
+            contract_integrity_details = {
+                "initial_frozen_long_qty": initial_frozen_long,
+                "initial_frozen_short_qty": initial_frozen_short,
+                "durable_frozen_long_qty": durable_frozen_long,
+                "durable_frozen_short_qty": durable_frozen_short,
+            }
+
+    if contract_integrity_error is not None and not has_persisted_owner:
+        integrity_errors = [
+            {
+                "reason": contract_integrity_error,
+                **contract_integrity_details,
+            }
+        ]
+        return _terminal_drain_summary(
+            args=args,
+            cycle=cycle,
+            cycle_started_at=cycle_started_at,
+            stats_start_time=stats_start_time,
+            runtime_guard_config=runtime_guard_config,
+            runtime_guard_result=runtime_guard_result,
+            cumulative_gross_notional=cumulative_gross_notional,
+            outcome=outcome,
+            target=target,
+            achieved=achieved,
+            shortfall=shortfall,
+            action_id=DrainActionId.HOLD_BLOCKED.value,
+            reasons=(contract_integrity_error,),
+            bid_price=0.0,
+            ask_price=0.0,
+            long_qty=0.0,
+            short_qty=0.0,
+            exit_status="exit_blocked",
+            errors=integrity_errors,
+        )
+
+    raw_drain_state = envelope.get("drain_state")
+    if isinstance(raw_drain_state, dict):
+        try:
+            drain_state = terminal_drain_state_from_dict(dict(raw_drain_state))
+        except (TypeError, ValueError):
+            if contract_integrity_error is None:
+                raise
+            drain_state = TerminalDrainState.initial(symbol, decision_id=decision_id)
+        if contract_integrity_error is None:
+            envelope["exit_contract"] = exit_contract
+    else:
+        drain_state = TerminalDrainState.initial(symbol, decision_id=decision_id)
+        if bq_ownership_required and owned_ledger_snapshot is not None:
+            frozen_long = _safe_float(
+                owned_ledger_snapshot.get("frozen_long_qty")
+            )
+            frozen_short = _safe_float(
+                owned_ledger_snapshot.get("frozen_short_qty")
+            )
+            owned_ledger_fields = {
+                "initial_owned_ledger_digest": str(
+                    owned_ledger_snapshot.get("digest") or ""
+                ),
+                "initial_normal_long_qty": _safe_float(
+                    owned_ledger_snapshot.get("normal_long_qty")
+                ),
+                "initial_normal_short_qty": _safe_float(
+                    owned_ledger_snapshot.get("normal_short_qty")
+                ),
+                "initial_normal_long_cost_basis": _safe_float(
+                    owned_ledger_snapshot.get("normal_long_cost_basis")
+                ),
+                "initial_normal_short_cost_basis": _safe_float(
+                    owned_ledger_snapshot.get("normal_short_cost_basis")
+                ),
+                "terminal_filled_long_qty": 0.0,
+                "terminal_filled_short_qty": 0.0,
+            }
+        else:
+            frozen_long, frozen_short = _best_quote_frozen_inventory_qtys(state)
+            owned_ledger_fields = {}
+        envelope = {
+            "schema": TERMINAL_DRAIN_SCHEMA,
+            "decision_id": decision_id,
+            "run_contract_id": canonical_contract_id,
+            "run_contract_snapshot": canonical_snapshot,
+            "started_at": cycle_started_at.isoformat(),
+            "entries_blocked": False,
+            "run_outcome": outcome,
+            "target_value": target,
+            "achieved_value": achieved,
+            "target_shortfall": shortfall,
+            "exit_contract": exit_contract,
+            "terminal_intent": (
+                dict(state[TERMINAL_INTENT_STATE_KEY])
+                if isinstance(state.get(TERMINAL_INTENT_STATE_KEY), dict)
+                else None
+            ),
+            "initial_frozen_long_qty": frozen_long,
+            "initial_frozen_short_qty": frozen_short,
+            "intents": [],
+            "active_intent_ids": [],
+            **owned_ledger_fields,
+        }
+        envelope["owner_integrity_digest"] = (
+            _terminal_drain_owner_integrity_digest(envelope)
+        )
+
+    if contract_integrity_error is not None:
+        integrity_errors = [
+            {
+                "reason": contract_integrity_error,
+                **contract_integrity_details,
+            }
+        ]
+        envelope.update(
+            {
+                "entries_blocked": True,
+                "exit_status": "exit_blocked",
+                "last_errors": integrity_errors,
+            }
+        )
+        _terminal_drain_persist(
+            state=state,
+            state_path=state_path,
+            envelope=envelope,
+            drain_state=drain_state,
+        )
+        return _terminal_drain_summary(
+            args=args,
+            cycle=cycle,
+            cycle_started_at=cycle_started_at,
+            stats_start_time=stats_start_time,
+            runtime_guard_config=runtime_guard_config,
+            runtime_guard_result=runtime_guard_result,
+            cumulative_gross_notional=cumulative_gross_notional,
+            outcome=outcome,
+            target=target,
+            achieved=achieved,
+            shortfall=shortfall,
+            action_id=DrainActionId.HOLD_BLOCKED.value,
+            reasons=(contract_integrity_error,),
+            bid_price=0.0,
+            ask_price=0.0,
+            long_qty=0.0,
+            short_qty=0.0,
+            exit_status="exit_blocked",
+            errors=integrity_errors,
+        )
+
+    credentials = load_binance_api_credentials()
+    if credentials is None:
+        credential_errors = [
+            {
+                "reason": "credentials_unavailable",
+                "message": "BINANCE_API_KEY/BINANCE_API_SECRET are unavailable",
+            }
+        ]
+        envelope.update(
+            {
+                "entries_blocked": True,
+                "exit_status": "exit_blocked",
+                "last_errors": credential_errors,
+            }
+        )
+        _terminal_drain_persist(
+            state=state,
+            state_path=state_path,
+            envelope=envelope,
+            drain_state=drain_state,
+        )
+        return _terminal_drain_summary(
+            args=args,
+            cycle=cycle,
+            cycle_started_at=cycle_started_at,
+            stats_start_time=stats_start_time,
+            runtime_guard_config=runtime_guard_config,
+            runtime_guard_result=runtime_guard_result,
+            cumulative_gross_notional=cumulative_gross_notional,
+            outcome=outcome,
+            target=target,
+            achieved=achieved,
+            shortfall=shortfall,
+            action_id=DrainActionId.HOLD_BLOCKED.value,
+            reasons=("credentials_required_for_terminal_observation",),
+            bid_price=0.0,
+            ask_price=0.0,
+            long_qty=0.0,
+            short_qty=0.0,
+            exit_status="exit_blocked",
+            errors=credential_errors,
+        )
+    api_key, api_secret = credentials
+    recv_window = int(getattr(args, "recv_window", 5000))
+    observation_errors: list[dict[str, Any]] = []
+    symbol_info: dict[str, Any] = {}
+    bid_price = 0.0
+    ask_price = 0.0
+    positions: list[dict[str, Any]] = []
+    open_orders: list[dict[str, Any]] = []
+    trades: list[dict[str, Any]] = []
+    hedge_mode = True
+    try:
+        symbol_info = fetch_futures_symbol_config(symbol)
+        books = fetch_futures_book_tickers(symbol=symbol)
+        if books:
+            bid_price = _safe_float(books[0].get("bid_price"))
+            ask_price = _safe_float(books[0].get("ask_price"))
+        mode = fetch_futures_position_mode(api_key, api_secret, recv_window=recv_window)
+        hedge_mode = _truthy(mode.get("dualSidePosition"))
+        fetched_positions = fetch_futures_position_risk_v3(
+            api_key,
+            api_secret,
+            symbol=symbol,
+            recv_window=recv_window,
+        )
+        if not isinstance(fetched_positions, list):
+            raise ValueError("position observation must be a list")
+        positions = fetched_positions
+        fetched_open_orders = fetch_futures_open_orders(
+            symbol,
+            api_key,
+            api_secret,
+            recv_window=recv_window,
+            use_cache=False,
+        )
+        if not isinstance(fetched_open_orders, list):
+            raise ValueError("open-order observation must be a list")
+        open_orders = fetched_open_orders
+    except Exception as exc:
+        observation_errors.append({"reason": "exchange_observation_unavailable", "message": f"{type(exc).__name__}: {exc}"})
+
+    watermark_ok = False
+    try:
+        started_at = _parse_state_datetime(envelope.get("started_at")) or cycle_started_at
+        fetched_trades = _terminal_drain_fetch_user_trades_exact(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            start_time_ms=max(int(started_at.timestamp() * 1000) - 1000, 0),
+            end_time_ms=int(cycle_started_at.timestamp() * 1000),
+            recv_window=recv_window,
+        )
+        if not isinstance(fetched_trades, list):
+            raise ValueError("trade watermark observation must be a list")
+        trades = fetched_trades
+        watermark_ok = True
+    except Exception as exc:
+        observation_errors.append({"reason": "trade_watermark_unavailable", "message": f"{type(exc).__name__}: {exc}"})
+
+    long_qty, short_qty, long_cost, short_cost, position_errors = _terminal_drain_position_snapshot(
+        positions,
+        symbol=symbol,
+        hedge_mode=hedge_mode,
+    )
+    position_observation_ok = not position_errors and not any(
+        item.get("reason") == "exchange_observation_unavailable"
+        for item in observation_errors
+    )
+    if position_errors:
+        observation_errors.append(
+            {
+                "reason": "position_observation_incomplete",
+                "details": list(position_errors),
+            }
+        )
+    if position_observation_ok and "initial_actual_long_qty" not in envelope:
+        envelope["initial_actual_long_qty"] = long_qty
+        envelope["initial_actual_short_qty"] = short_qty
+        if "initial_normal_long_qty" not in envelope:
+            envelope["initial_normal_long_qty"] = max(
+                long_qty - _safe_float(envelope.get("initial_frozen_long_qty")),
+                0.0,
+            )
+            envelope["initial_normal_short_qty"] = max(
+                short_qty - _safe_float(
+                    envelope.get("initial_frozen_short_qty")
+                ),
+                0.0,
+            )
+
+    # A normal terminal-drain fill is not a frozen-ledger release receipt.
+    # Keep the durable frozen quantity unchanged for the whole drain owner so
+    # normal inventory can only decrease toward that protected floor.  If the
+    # exchange position ever falls below it, the pure decision fails closed as
+    # ``frozen_inventory_exceeds_owned`` instead of silently consuming frozen
+    # inventory.
+    frozen_long = max(
+        _safe_float(envelope.get("initial_frozen_long_qty")),
+        0.0,
+    )
+    frozen_short = max(
+        _safe_float(envelope.get("initial_frozen_short_qty")),
+        0.0,
+    )
+    strategy_prefix = _strategy_client_order_prefix(symbol)
+    terminal_open = [row for row in open_orders if _is_terminal_drain_order(row, symbol)]
+    entry_open = [
+        row
+        for row in open_orders
+        if str(row.get("clientOrderId") or "").startswith(strategy_prefix)
+        and not _is_terminal_drain_order(row, symbol)
+    ]
+    unmanaged_open = [
+        row for row in open_orders if row not in terminal_open and row not in entry_open
+    ]
+    intents = [
+        dict(item)
+        for item in list(envelope.get("intents") or [])
+        if isinstance(item, dict)
+    ]
+    by_client_id = {
+        str(item.get("client_order_id") or ""): item for item in intents
+    }
+    open_by_client_id = {
+        str(row.get("clientOrderId") or ""): row for row in terminal_open
+    }
+    for client_id, row in open_by_client_id.items():
+        record = by_client_id.get(client_id)
+        if record is not None:
+            record.update(
+                {
+                    "status": str(row.get("status") or "NEW").upper(),
+                    "order_id": row.get("orderId"),
+                    "executed_qty": _safe_float(row.get("executedQty")),
+                }
+            )
+    envelope["intents"] = intents
+    active_ids = [
+        str(value)
+        for value in list(envelope.get("active_intent_ids") or [])
+        if str(value)
+    ]
+    active_records = [
+        by_client_id[value] for value in active_ids if value in by_client_id
+    ]
+
+    owned_long_qty = long_qty
+    owned_short_qty = short_qty
+    owned_long_cost = long_cost
+    owned_short_cost = short_cost
+    ownership_errors: list[dict[str, Any]] = []
+    if bq_ownership_required:
+        (
+            terminal_filled_long,
+            terminal_filled_short,
+            fill_errors,
+        ) = _terminal_drain_owned_fill_progress(envelope, trades=trades)
+        ownership_errors.extend(fill_errors)
+        initial_normal_long = _safe_float(
+            envelope.get("initial_normal_long_qty")
+        )
+        initial_normal_short = _safe_float(
+            envelope.get("initial_normal_short_qty")
+        )
+        remaining_normal_long = max(
+            initial_normal_long - terminal_filled_long,
+            0.0,
+        )
+        remaining_normal_short = max(
+            initial_normal_short - terminal_filled_short,
+            0.0,
+        )
+        envelope.update(
+            {
+                "terminal_filled_long_qty": terminal_filled_long,
+                "terminal_filled_short_qty": terminal_filled_short,
+                "remaining_normal_long_qty": remaining_normal_long,
+                "remaining_normal_short_qty": remaining_normal_short,
+            }
+        )
+        owned_long_qty = remaining_normal_long + frozen_long
+        owned_short_qty = remaining_normal_short + frozen_short
+        owned_long_cost = _safe_float(
+            envelope.get("initial_normal_long_cost_basis")
+        )
+        owned_short_cost = _safe_float(
+            envelope.get("initial_normal_short_cost_basis")
+        )
+        long_tolerance = max(1e-12, owned_long_qty * 1e-9)
+        short_tolerance = max(1e-12, owned_short_qty * 1e-9)
+        if position_observation_ok and owned_long_qty > long_qty + long_tolerance:
+            ownership_errors.append(
+                {
+                    "reason": "owned_inventory_exceeds_exchange",
+                    "side": "long",
+                    "owned_qty": owned_long_qty,
+                    "actual_qty": long_qty,
+                }
+            )
+        if position_observation_ok and owned_short_qty > short_qty + short_tolerance:
+            ownership_errors.append(
+                {
+                    "reason": "owned_inventory_exceeds_exchange",
+                    "side": "short",
+                    "owned_qty": owned_short_qty,
+                    "actual_qty": short_qty,
+                }
+            )
+    if ownership_errors:
+        observation_errors.extend(ownership_errors)
+        ownership_reason = str(
+            ownership_errors[0].get("reason") or "terminal_ownership_not_reconciled"
+        )
+        envelope.update(
+            {
+                "entries_blocked": True,
+                "exit_status": "exit_blocked",
+                "last_errors": observation_errors,
+                "last_observed_at": cycle_started_at.isoformat(),
+                "last_action": DrainActionId.HOLD_BLOCKED.value,
+                "last_reasons": [ownership_reason],
+            }
+        )
+        _terminal_drain_persist(
+            state=state,
+            state_path=state_path,
+            envelope=envelope,
+            drain_state=drain_state,
+        )
+        return _terminal_drain_summary(
+            args=args,
+            cycle=cycle,
+            cycle_started_at=cycle_started_at,
+            stats_start_time=stats_start_time,
+            runtime_guard_config=runtime_guard_config,
+            runtime_guard_result=runtime_guard_result,
+            cumulative_gross_notional=cumulative_gross_notional,
+            outcome=outcome,
+            target=target,
+            achieved=achieved,
+            shortfall=shortfall,
+            action_id=DrainActionId.HOLD_BLOCKED.value,
+            reasons=(ownership_reason,),
+            bid_price=bid_price,
+            ask_price=ask_price,
+            long_qty=long_qty,
+            short_qty=short_qty,
+            exit_status="exit_blocked",
+            errors=observation_errors,
+        )
+
+    started_at = _parse_state_datetime(envelope.get("started_at")) or cycle_started_at
+    drain_elapsed_seconds = max(
+        (
+            cycle_started_at.astimezone(timezone.utc)
+            - started_at.astimezone(timezone.utc)
+        ).total_seconds(),
+        0.0,
+    )
+    timed_preserve = (
+        exit_policy == "drain_then_preserve"
+        and exit_max_wait_seconds > 0
+        and drain_elapsed_seconds >= exit_max_wait_seconds
+    )
+    preserve_requested = exit_policy == "stop_preserve" or timed_preserve
+    if preserve_requested:
+        preserve_reason = (
+            str(exit_contract.get("preserve_reason") or "operator_requested_preserve")
+            if exit_policy == "stop_preserve"
+            else "terminal_drain_max_wait_exceeded"
+        )
+        if not bool(envelope.get("entries_blocked")):
+            envelope.update(
+                {
+                    "entries_blocked": True,
+                    "exit_status": "exiting",
+                    "preserve_reason": preserve_reason,
+                }
+            )
+            _terminal_drain_persist(
+                state=state,
+                state_path=state_path,
+                envelope=envelope,
+                drain_state=drain_state,
+            )
+            return _terminal_drain_summary(
+                args=args,
+                cycle=cycle,
+                cycle_started_at=cycle_started_at,
+                stats_start_time=stats_start_time,
+                runtime_guard_config=runtime_guard_config,
+                runtime_guard_result=runtime_guard_result,
+                cumulative_gross_notional=cumulative_gross_notional,
+                outcome=outcome,
+                target=target,
+                achieved=achieved,
+                shortfall=shortfall,
+                action_id=DrainActionId.BLOCK_ENTRY.value,
+                reasons=("entry_block_required_before_preserve",),
+                bid_price=bid_price,
+                ask_price=ask_price,
+                long_qty=long_qty,
+                short_qty=short_qty,
+                exit_status="exiting",
+                errors=observation_errors,
+            )
+        if observation_errors:
+            envelope.update(
+                {
+                    "exit_status": "exit_blocked",
+                    "preserve_reason": preserve_reason,
+                    "last_errors": observation_errors,
+                }
+            )
+            _terminal_drain_persist(
+                state=state,
+                state_path=state_path,
+                envelope=envelope,
+                drain_state=drain_state,
+            )
+            return _terminal_drain_summary(
+                args=args,
+                cycle=cycle,
+                cycle_started_at=cycle_started_at,
+                stats_start_time=stats_start_time,
+                runtime_guard_config=runtime_guard_config,
+                runtime_guard_result=runtime_guard_result,
+                cumulative_gross_notional=cumulative_gross_notional,
+                outcome=outcome,
+                target=target,
+                achieved=achieved,
+                shortfall=shortfall,
+                action_id=DrainActionId.HOLD_BLOCKED.value,
+                reasons=("fresh_exchange_observation_required_before_preserve",),
+                bid_price=bid_price,
+                ask_price=ask_price,
+                long_qty=long_qty,
+                short_qty=short_qty,
+                exit_status="exit_blocked",
+                errors=observation_errors,
+            )
+        owned_open = entry_open + terminal_open
+        if owned_open:
+            order = owned_open[0]
+            try:
+                delete_futures_order(
+                    symbol=symbol,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    order_id=order.get("orderId"),
+                    orig_client_order_id=order.get("clientOrderId"),
+                    recv_window=recv_window,
+                )
+                canceled_count = 1
+                cancel_errors: list[dict[str, Any]] = []
+            except Exception as exc:
+                canceled_count = 0
+                cancel_errors = [
+                    {
+                        "reason": "terminal_preserve_cancel_failed",
+                        "message": f"{type(exc).__name__}: {exc}",
+                    }
+                ]
+            envelope["exit_status"] = "exit_blocked" if cancel_errors else "exiting"
+            envelope["preserve_reason"] = preserve_reason
+            _terminal_drain_persist(
+                state=state,
+                state_path=state_path,
+                envelope=envelope,
+                drain_state=drain_state,
+            )
+            return _terminal_drain_summary(
+                args=args,
+                cycle=cycle,
+                cycle_started_at=cycle_started_at,
+                stats_start_time=stats_start_time,
+                runtime_guard_config=runtime_guard_config,
+                runtime_guard_result=runtime_guard_result,
+                cumulative_gross_notional=cumulative_gross_notional,
+                outcome=outcome,
+                target=target,
+                achieved=achieved,
+                shortfall=shortfall,
+                action_id=DrainActionId.CANCEL_DRAIN_ORDER.value,
+                reasons=("cancel_owned_order_before_preserve",),
+                bid_price=bid_price,
+                ask_price=ask_price,
+                long_qty=long_qty,
+                short_qty=short_qty,
+                canceled_count=canceled_count,
+                exit_status=envelope["exit_status"],
+                errors=cancel_errors,
+            )
+        if unmanaged_open and not timed_preserve:
+            unmanaged_errors = [
+                {
+                    "reason": "unmanaged_orders_open",
+                    "client_order_ids": [
+                        str(row.get("clientOrderId") or "") for row in unmanaged_open
+                    ],
+                    "order_ids": [str(row.get("orderId") or "") for row in unmanaged_open],
+                }
+            ]
+            envelope.update(
+                {
+                    "exit_status": "exit_blocked",
+                    "preserve_reason": preserve_reason,
+                    "last_errors": unmanaged_errors,
+                }
+            )
+            _terminal_drain_persist(
+                state=state,
+                state_path=state_path,
+                envelope=envelope,
+                drain_state=drain_state,
+            )
+            return _terminal_drain_summary(
+                args=args,
+                cycle=cycle,
+                cycle_started_at=cycle_started_at,
+                stats_start_time=stats_start_time,
+                runtime_guard_config=runtime_guard_config,
+                runtime_guard_result=runtime_guard_result,
+                cumulative_gross_notional=cumulative_gross_notional,
+                outcome=outcome,
+                target=target,
+                achieved=achieved,
+                shortfall=shortfall,
+                action_id=DrainActionId.HOLD_BLOCKED.value,
+                reasons=("unmanaged_orders_open",),
+                bid_price=bid_price,
+                ask_price=ask_price,
+                long_qty=long_qty,
+                short_qty=short_qty,
+                exit_status="exit_blocked",
+                errors=unmanaged_errors,
+            )
+        unresolved_active = [
+            item
+            for item in active_records
+            if str(item.get("status") or "").upper()
+            not in TERMINAL_DRAIN_TERMINAL_ORDER_STATUSES
+        ]
+        if unresolved_active:
+            record = unresolved_active[0]
+            client_id = str(record.get("client_order_id") or "")
+            resolution_errors: list[dict[str, Any]] = []
+            resolution_action = DrainActionId.HOLD_BLOCKED.value
+            resolution_reason = "ambiguous_terminal_order_requires_fresh_proof"
+            canceled_count = 0
+            found: dict[str, Any] | None = None
+            try:
+                found = fetch_futures_order(
+                    symbol=symbol,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    order_id=(
+                        int(record["order_id"])
+                        if str(record.get("order_id") or "").strip()
+                        else None
+                    ),
+                    orig_client_order_id=client_id or None,
+                    recv_window=recv_window,
+                )
+            except Exception as exc:
+                if _terminal_drain_order_missing(exc):
+                    proof_count, proof_is_fresh = (
+                        _terminal_drain_record_not_found_proof(
+                            record=record,
+                            observed_at=cycle_started_at,
+                            open_by_client_id=open_by_client_id,
+                            long_qty=long_qty,
+                            short_qty=short_qty,
+                            trade_count=len(trades),
+                        )
+                    )
+                    if not proof_is_fresh:
+                        resolution_reason = (
+                            "ambiguous_terminal_order_quiet_window_pending"
+                        )
+                    record["last_error"] = f"{type(exc).__name__}: {exc}"
+                    if proof_count >= 2:
+                        record.update(
+                            {
+                                "status": "REJECTED",
+                                "terminal_resolution": (
+                                    "two_fresh_not_found_proofs_with_no_open_order"
+                                ),
+                                "terminal_at": cycle_started_at.isoformat(),
+                                "last_error": None,
+                            }
+                        )
+                        resolution_action = "reconcile_order_receipt"
+                        resolution_reason = "ambiguous_terminal_order_proven_absent"
+                else:
+                    resolution_errors.append(
+                        {
+                            "client_order_id": client_id,
+                            "reason": "terminal_preserve_order_query_failed",
+                            "message": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+            if found is not None:
+                found_status = str(found.get("status") or "").upper()
+                record.update(
+                    {
+                        "status": found_status or str(record.get("status") or "NEW"),
+                        "order_id": found.get("orderId", record.get("order_id")),
+                        "executed_qty": _safe_float(
+                            found.get("executedQty", record.get("executed_qty"))
+                        ),
+                        "last_error": None,
+                    }
+                )
+                if found_status not in TERMINAL_DRAIN_TERMINAL_ORDER_STATUSES:
+                    try:
+                        response = delete_futures_order(
+                            symbol=symbol,
+                            api_key=api_key,
+                            api_secret=api_secret,
+                            order_id=(
+                                int(record["order_id"])
+                                if str(record.get("order_id") or "").strip()
+                                else None
+                            ),
+                            orig_client_order_id=client_id or None,
+                            recv_window=recv_window,
+                        )
+                        record.update(
+                            {
+                                "status": str(
+                                    response.get("status") or "CANCELED"
+                                ).upper(),
+                                "executed_qty": _safe_float(
+                                    response.get(
+                                        "executedQty", record.get("executed_qty")
+                                    )
+                                ),
+                                "terminal_at": cycle_started_at.isoformat(),
+                            }
+                        )
+                        canceled_count = 1
+                        resolution_action = DrainActionId.CANCEL_DRAIN_ORDER.value
+                        resolution_reason = "cancel_queried_terminal_order_before_preserve"
+                    except Exception as exc:
+                        resolution_errors.append(
+                            {
+                                "client_order_id": client_id,
+                                "reason": "terminal_preserve_cancel_failed",
+                                "message": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+                else:
+                    record["terminal_at"] = cycle_started_at.isoformat()
+                    resolution_action = "reconcile_order_receipt"
+                    resolution_reason = "terminal_order_receipt_reconciled"
+
+            remaining_active_ids = [
+                value
+                for value in active_ids
+                if str(by_client_id.get(value, {}).get("status") or "").upper()
+                not in TERMINAL_DRAIN_TERMINAL_ORDER_STATUSES
+            ]
+            loss_receipt_error: dict[str, Any] | None = None
+            if not remaining_active_ids and drain_state.loss_lease is not None:
+                drain_state, loss_receipt_error = _terminal_drain_settle_loss_receipt(
+                    drain_state=drain_state,
+                    active_records=active_records,
+                    trades=trades,
+                )
+                if loss_receipt_error is None:
+                    envelope["last_loss_receipt_at"] = cycle_started_at.isoformat()
+                else:
+                    resolution_errors.append(loss_receipt_error)
+                    resolution_action = DrainActionId.HOLD_BLOCKED.value
+                    resolution_reason = str(loss_receipt_error.get("reason") or "loss_receipt_blocked")
+            budget_breach_recorded = _terminal_drain_record_budget_breach(
+                envelope=envelope,
+                receipt_error=loss_receipt_error,
+                observed_at=cycle_started_at,
+            )
+            envelope["active_intent_ids"] = (
+                active_ids
+                if loss_receipt_error is not None and not budget_breach_recorded
+                else remaining_active_ids
+            )
+            envelope["intents"] = intents
+            envelope["exit_status"] = (
+                "exit_blocked"
+                if resolution_errors
+                or resolution_action == DrainActionId.HOLD_BLOCKED.value
+                else "exiting"
+            )
+            envelope["preserve_reason"] = preserve_reason
+            _terminal_drain_persist(
+                state=state,
+                state_path=state_path,
+                envelope=envelope,
+                drain_state=drain_state,
+            )
+            return _terminal_drain_summary(
+                args=args,
+                cycle=cycle,
+                cycle_started_at=cycle_started_at,
+                stats_start_time=stats_start_time,
+                runtime_guard_config=runtime_guard_config,
+                runtime_guard_result=runtime_guard_result,
+                cumulative_gross_notional=cumulative_gross_notional,
+                outcome=outcome,
+                target=target,
+                achieved=achieved,
+                shortfall=shortfall,
+                action_id=resolution_action,
+                reasons=(resolution_reason,),
+                bid_price=bid_price,
+                ask_price=ask_price,
+                long_qty=long_qty,
+                short_qty=short_qty,
+                canceled_count=canceled_count,
+                exit_status=envelope["exit_status"],
+                errors=resolution_errors,
+            )
+        if active_records or drain_state.loss_lease is not None or drain_state.loss_reserved > 1e-12:
+            loss_receipt_error: dict[str, Any] | None = None
+            receipt_action = "reconcile_order_receipt"
+            receipt_reason = "terminal_order_receipt_reconciled_before_preserve"
+            if drain_state.loss_lease is not None:
+                drain_state, loss_receipt_error = _terminal_drain_settle_loss_receipt(
+                    drain_state=drain_state,
+                    active_records=active_records,
+                    trades=trades,
+                )
+                receipt_action = "reconcile_loss_receipt"
+                receipt_reason = "loss_lease_reclaimed_before_preserve"
+            if loss_receipt_error is not None:
+                budget_breach_recorded = _terminal_drain_record_budget_breach(
+                    envelope=envelope,
+                    receipt_error=loss_receipt_error,
+                    observed_at=cycle_started_at,
+                )
+                if budget_breach_recorded:
+                    envelope["active_intent_ids"] = []
+                envelope.update(
+                    {
+                        "exit_status": "exit_blocked",
+                        "preserve_reason": preserve_reason,
+                        "last_errors": [loss_receipt_error],
+                    }
+                )
+                _terminal_drain_persist(
+                    state=state,
+                    state_path=state_path,
+                    envelope=envelope,
+                    drain_state=drain_state,
+                )
+                return _terminal_drain_summary(
+                    args=args,
+                    cycle=cycle,
+                    cycle_started_at=cycle_started_at,
+                    stats_start_time=stats_start_time,
+                    runtime_guard_config=runtime_guard_config,
+                    runtime_guard_result=runtime_guard_result,
+                    cumulative_gross_notional=cumulative_gross_notional,
+                    outcome=outcome,
+                    target=target,
+                    achieved=achieved,
+                    shortfall=shortfall,
+                    action_id=DrainActionId.HOLD_BLOCKED.value,
+                    reasons=(str(loss_receipt_error.get("reason") or "loss_receipt_blocked"),),
+                    bid_price=bid_price,
+                    ask_price=ask_price,
+                    long_qty=long_qty,
+                    short_qty=short_qty,
+                    exit_status="exit_blocked",
+                    errors=[loss_receipt_error],
+                )
+            envelope["active_intent_ids"] = []
+            envelope["last_loss_receipt_at"] = cycle_started_at.isoformat()
+            envelope["exit_status"] = "exiting"
+            envelope["preserve_reason"] = preserve_reason
+            _terminal_drain_persist(
+                state=state,
+                state_path=state_path,
+                envelope=envelope,
+                drain_state=drain_state,
+            )
+            return _terminal_drain_summary(
+                args=args,
+                cycle=cycle,
+                cycle_started_at=cycle_started_at,
+                stats_start_time=stats_start_time,
+                runtime_guard_config=runtime_guard_config,
+                runtime_guard_result=runtime_guard_result,
+                cumulative_gross_notional=cumulative_gross_notional,
+                outcome=outcome,
+                target=target,
+                achieved=achieved,
+                shortfall=shortfall,
+                action_id=receipt_action,
+                reasons=(receipt_reason,),
+                bid_price=bid_price,
+                ask_price=ask_price,
+                long_qty=long_qty,
+                short_qty=short_qty,
+                exit_status="exiting",
+            )
+        if drain_state.stage is not DrainStage.STOPPED_PRESERVED:
+            drain_state = replace(
+                drain_state,
+                generation=drain_state.generation + 1,
+                stage=DrainStage.STOPPED_PRESERVED,
+                loss_reserved=0.0,
+                loss_lease=None,
+                global_allow_loss=False,
+            )
+        envelope.update(
+            {
+                "exit_status": "stopped_preserved",
+                "exit_resolution": "residual_preserved",
+                "preserved_by_user": exit_policy == "stop_preserve",
+                "preserved_by_contract": timed_preserve,
+                "preserve_reason": preserve_reason,
+                "preserved_at": cycle_started_at.isoformat(),
+                "drain_elapsed_seconds": drain_elapsed_seconds,
+                "residual_snapshot": {
+                    "captured_at": cycle_started_at.isoformat(),
+                    "long_qty": long_qty,
+                    "short_qty": short_qty,
+                    "frozen_long_qty": frozen_long,
+                    "frozen_short_qty": frozen_short,
+                    "open_order_ids": [str(row.get("clientOrderId") or "") for row in open_orders],
+                    "unmanaged_open_orders": [
+                        {
+                            "orderId": str(row.get("orderId") or ""),
+                            "clientOrderId": str(
+                                row.get("clientOrderId") or ""
+                            ),
+                        }
+                        for row in unmanaged_open
+                    ],
+                    "exchange_observation_complete": True,
+                },
+            }
+        )
+        _terminal_drain_persist(
+            state=state,
+            state_path=state_path,
+            envelope=envelope,
+            drain_state=drain_state,
+        )
+        return _terminal_drain_summary(
+            args=args,
+            cycle=cycle,
+            cycle_started_at=cycle_started_at,
+            stats_start_time=stats_start_time,
+            runtime_guard_config=runtime_guard_config,
+            runtime_guard_result=runtime_guard_result,
+            cumulative_gross_notional=cumulative_gross_notional,
+            outcome=outcome,
+            target=target,
+            achieved=achieved,
+            shortfall=shortfall,
+            action_id="stop_preserve",
+            reasons=(preserve_reason,),
+            bid_price=bid_price,
+            ask_price=ask_price,
+            long_qty=long_qty,
+            short_qty=short_qty,
+            stop_allowed=True,
+            exit_status="stopped_preserved",
+        )
+
+    pending_submission = [
+        item for item in active_records if str(item.get("status") or "").upper() in {"PREPARED", "AMBIGUOUS"}
+    ]
+    if pending_submission and not observation_errors:
+        submission_errors: list[dict[str, Any]] = []
+        resolved_submission_reason: str | None = None
+        for record in pending_submission:
+            client_id = str(record.get("client_order_id") or "")
+            found: dict[str, Any] | None = open_by_client_id.get(client_id)
+            not_found_error: Exception | None = None
+            if found is None:
+                try:
+                    found = fetch_futures_order(
+                        symbol=symbol,
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        orig_client_order_id=client_id,
+                        recv_window=recv_window,
+                    )
+                except Exception as exc:
+                    if _terminal_drain_order_missing(exc):
+                        not_found_error = exc
+                    else:
+                        record.update({"status": "AMBIGUOUS", "last_error": f"{type(exc).__name__}: {exc}"})
+                        record.setdefault("ambiguous_at", cycle_started_at.isoformat())
+                        submission_errors.append({"client_order_id": client_id, "message": record["last_error"]})
+                        _terminal_drain_persist(
+                            state=state,
+                            state_path=state_path,
+                            envelope=envelope,
+                            drain_state=drain_state,
+                        )
+                        break
+            if found is None:
+                invalid_reason = _terminal_drain_pending_submission_invalid_reason(
+                    record=record,
+                    drain_state=drain_state,
+                    observed_at=cycle_started_at,
+                    long_qty=long_qty,
+                    short_qty=short_qty,
+                )
+                if invalid_reason is not None:
+                    record["status"] = "AMBIGUOUS"
+                    record.setdefault("ambiguous_at", record.get("prepared_at"))
+                    record["submission_blocked_reason"] = invalid_reason
+                    if not_found_error is None:
+                        submission_errors.append(
+                            {
+                                "client_order_id": client_id,
+                                "reason": "ambiguous_terminal_order_requires_fresh_proof",
+                            }
+                        )
+                        resolved_submission_reason = (
+                            "ambiguous_terminal_order_requires_fresh_proof"
+                        )
+                    else:
+                        proof_count, proof_is_fresh = (
+                            _terminal_drain_record_not_found_proof(
+                                record=record,
+                                observed_at=cycle_started_at,
+                                open_by_client_id=open_by_client_id,
+                                long_qty=long_qty,
+                                short_qty=short_qty,
+                                trade_count=len(trades),
+                            )
+                        )
+                        record["last_error"] = (
+                            f"{type(not_found_error).__name__}: {not_found_error}"
+                        )
+                        if proof_count >= 2:
+                            drain_state = _terminal_drain_retire_unsubmitted_action(
+                                envelope=envelope,
+                                drain_state=drain_state,
+                                action_records=active_records,
+                                rejected_record=record,
+                                observed_at=cycle_started_at,
+                                resolution=invalid_reason,
+                                status="EXPIRED",
+                            )
+                            resolved_submission_reason = invalid_reason
+                        else:
+                            pending_reason = (
+                                f"{invalid_reason}_quiet_window_pending"
+                                if not proof_is_fresh
+                                else f"{invalid_reason}_second_proof_pending"
+                            )
+                            submission_errors.append(
+                                {
+                                    "client_order_id": client_id,
+                                    "reason": pending_reason,
+                                    "not_found_confirmations": proof_count,
+                                }
+                            )
+                            resolved_submission_reason = pending_reason
+                    _terminal_drain_persist(
+                        state=state,
+                        state_path=state_path,
+                        envelope=envelope,
+                        drain_state=drain_state,
+                    )
+                    break
+                order = dict(record.get("order") or {})
+                try:
+                    found = post_futures_order(
+                        symbol=symbol,
+                        side=str(order.get("side")),
+                        quantity=_safe_float(order.get("quantity")),
+                        price=_safe_float(order.get("price")),
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        time_in_force="GTX",
+                        recv_window=recv_window,
+                        new_client_order_id=client_id,
+                        reduce_only=order.get("reduce_only"),
+                        position_side=order.get("position_side"),
+                    )
+                except Exception as exc:
+                    if _terminal_drain_post_only_rejected(exc):
+                        drain_state = _terminal_drain_retire_unsubmitted_action(
+                            envelope=envelope,
+                            drain_state=drain_state,
+                            action_records=active_records,
+                            rejected_record=record,
+                            observed_at=cycle_started_at,
+                            resolution="gtx_post_only_rejected",
+                            status="REJECTED",
+                            error=exc,
+                        )
+                        resolved_submission_reason = "gtx_post_only_rejected"
+                    else:
+                        record.update({"status": "AMBIGUOUS", "last_error": f"{type(exc).__name__}: {exc}"})
+                        record.setdefault("ambiguous_at", cycle_started_at.isoformat())
+                        submission_errors.append({"client_order_id": client_id, "message": record["last_error"]})
+                    _terminal_drain_persist(
+                        state=state,
+                        state_path=state_path,
+                        envelope=envelope,
+                        drain_state=drain_state,
+                    )
+                    break
+            record.update(
+                {
+                    "status": str(found.get("status") or "NEW").upper(),
+                    "order_id": found.get("orderId"),
+                    "executed_qty": _safe_float(found.get("executedQty")),
+                    "last_error": None,
+                }
+            )
+            _terminal_drain_persist(
+                state=state,
+                state_path=state_path,
+                envelope=envelope,
+                drain_state=drain_state,
+            )
+        return _terminal_drain_summary(
+            args=args,
+            cycle=cycle,
+            cycle_started_at=cycle_started_at,
+            stats_start_time=stats_start_time,
+            runtime_guard_config=runtime_guard_config,
+            runtime_guard_result=runtime_guard_result,
+            cumulative_gross_notional=cumulative_gross_notional,
+            outcome=outcome,
+            target=target,
+            achieved=achieved,
+            shortfall=shortfall,
+            action_id=str(active_records[0].get("action_id") or "resume_terminal_action"),
+            reasons=(resolved_submission_reason or "resume_prepared_terminal_action",),
+            bid_price=bid_price,
+            ask_price=ask_price,
+            long_qty=long_qty,
+            short_qty=short_qty,
+            placed_count=sum(1 for item in active_records if str(item.get("status") or "") == "NEW"),
+            exit_status="exit_blocked" if submission_errors else "exiting",
+            errors=submission_errors,
+        )
+
+    if active_records and not terminal_open and watermark_ok:
+        all_terminal = True
+        for record in active_records:
+            status = str(record.get("status") or "").upper()
+            if status not in TERMINAL_DRAIN_TERMINAL_ORDER_STATUSES:
+                try:
+                    found = fetch_futures_order(
+                        symbol=symbol,
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        order_id=(int(record["order_id"]) if str(record.get("order_id") or "").strip() else None),
+                        orig_client_order_id=str(record.get("client_order_id") or "") or None,
+                        recv_window=recv_window,
+                    )
+                    status = str(found.get("status") or status).upper()
+                    record["status"] = status
+                    record["executed_qty"] = _safe_float(found.get("executedQty"))
+                    record["order_id"] = found.get("orderId", record.get("order_id"))
+                except Exception as exc:
+                    all_terminal = False
+                    record["last_error"] = f"{type(exc).__name__}: {exc}"
+            if status not in TERMINAL_DRAIN_TERMINAL_ORDER_STATUSES:
+                all_terminal = False
+        envelope["intents"] = intents
+        if all_terminal:
+            receipt_action = "reconcile_order_receipt"
+            receipt_reason = "terminal_order_receipt_reconciled"
+            loss_receipt_error: dict[str, Any] | None = None
+            if drain_state.loss_lease is not None:
+                drain_state, loss_receipt_error = _terminal_drain_settle_loss_receipt(
+                    drain_state=drain_state,
+                    active_records=active_records,
+                    trades=trades,
+                )
+                receipt_action = "reconcile_loss_receipt"
+                receipt_reason = "loss_lease_reclaimed"
+            if loss_receipt_error is not None:
+                budget_breach_recorded = _terminal_drain_record_budget_breach(
+                    envelope=envelope,
+                    receipt_error=loss_receipt_error,
+                    observed_at=cycle_started_at,
+                )
+                if budget_breach_recorded:
+                    envelope["active_intent_ids"] = []
+                envelope.update(
+                    {
+                        "exit_status": "exit_blocked",
+                        "last_errors": [loss_receipt_error],
+                    }
+                )
+                _terminal_drain_persist(
+                    state=state,
+                    state_path=state_path,
+                    envelope=envelope,
+                    drain_state=drain_state,
+                )
+                return _terminal_drain_summary(
+                    args=args,
+                    cycle=cycle,
+                    cycle_started_at=cycle_started_at,
+                    stats_start_time=stats_start_time,
+                    runtime_guard_config=runtime_guard_config,
+                    runtime_guard_result=runtime_guard_result,
+                    cumulative_gross_notional=cumulative_gross_notional,
+                    outcome=outcome,
+                    target=target,
+                    achieved=achieved,
+                    shortfall=shortfall,
+                    action_id=DrainActionId.HOLD_BLOCKED.value,
+                    reasons=(str(loss_receipt_error.get("reason") or "loss_receipt_blocked"),),
+                    bid_price=bid_price,
+                    ask_price=ask_price,
+                    long_qty=long_qty,
+                    short_qty=short_qty,
+                    exit_status="exit_blocked",
+                    errors=[loss_receipt_error],
+                )
+            envelope["active_intent_ids"] = []
+            envelope["last_loss_receipt_at"] = cycle_started_at.isoformat()
+            _terminal_drain_persist(
+                state=state,
+                state_path=state_path,
+                envelope=envelope,
+                drain_state=drain_state,
+            )
+            return _terminal_drain_summary(
+                args=args,
+                cycle=cycle,
+                cycle_started_at=cycle_started_at,
+                stats_start_time=stats_start_time,
+                runtime_guard_config=runtime_guard_config,
+                runtime_guard_result=runtime_guard_result,
+                cumulative_gross_notional=cumulative_gross_notional,
+                outcome=outcome,
+                target=target,
+                achieved=achieved,
+                shortfall=shortfall,
+                action_id=receipt_action,
+                reasons=(receipt_reason,),
+                bid_price=bid_price,
+                ask_price=ask_price,
+                long_qty=long_qty,
+                short_qty=short_qty,
+            )
+
+    min_notional = max(_safe_float(symbol_info.get("min_notional")), 0.0)
+    step_size = max(_safe_float(symbol_info.get("step_size")), 0.0)
+    tick_size = max(_safe_float(symbol_info.get("tick_size")), 0.0)
+    max_order_notional = max(exit_max_order_notional, 0.0)
+    policy_errors: list[dict[str, Any]] = []
+    if min_notional <= 0 or step_size <= 0 or tick_size <= 0 or max_order_notional < min_notional:
+        policy_errors.append(
+            {
+                "reason": "terminal_drain_policy_invalid",
+                "min_notional": min_notional,
+                "max_order_notional": max_order_notional,
+                "step_size": step_size,
+                "tick_size": tick_size,
+            }
+        )
+    if policy_errors:
+        observation_errors.extend(policy_errors)
+        min_notional = max(min_notional, 1.0)
+        max_order_notional = max(max_order_notional, min_notional)
+        step_size = max(step_size, 1e-8)
+        tick_size = max(tick_size, 1e-8)
+
+    active_unresolved_ids = [
+        str(item.get("client_order_id") or "")
+        for item in active_records
+        if str(item.get("status") or "").upper() not in TERMINAL_DRAIN_TERMINAL_ORDER_STATUSES
+    ]
+    open_drain_ids = tuple(
+        dict.fromkeys(
+            [str(row.get("clientOrderId") or "") for row in terminal_open]
+            + [value for value in active_unresolved_ids if value]
+        )
+    )
+    tail_below_min = any(
+        max(
+            _safe_float(row.get("origQty")) - _safe_float(row.get("executedQty")),
+            0.0,
+        )
+        * max(_safe_float(row.get("price")), bid_price, ask_price)
+        < min_notional - 1e-12
+        for row in terminal_open
+    )
+    open_created_times: list[datetime] = []
+    for row in terminal_open:
+        time_ms = int(_safe_float(row.get("time") or row.get("updateTime")))
+        if time_ms > 0:
+            open_created_times.append(datetime.fromtimestamp(time_ms / 1000.0, tz=timezone.utc))
+            continue
+        record = by_client_id.get(str(row.get("clientOrderId") or ""))
+        prepared_at = _parse_state_datetime((record or {}).get("prepared_at"))
+        if prepared_at is not None:
+            open_created_times.append(prepared_at)
+    snapshot = TerminalDrainSnapshot(
+        symbol=symbol,
+        captured_at=cycle_started_at,
+        bid_price=bid_price,
+        ask_price=ask_price,
+        actual_long_qty=long_qty,
+        actual_short_qty=short_qty,
+        owned_long_qty=owned_long_qty,
+        owned_short_qty=owned_short_qty,
+        frozen_long_qty=frozen_long,
+        frozen_short_qty=frozen_short,
+        long_cost_basis=owned_long_cost,
+        short_cost_basis=owned_short_cost,
+        entries_blocked=bool(envelope.get("entries_blocked")),
+        open_entry_order_ids=tuple(str(row.get("clientOrderId") or "") for row in entry_open),
+        open_drain_order_ids=open_drain_ids,
+        exchange_observation_available=position_observation_ok,
+        ledger_reconciled=(
+            watermark_ok and not policy_errors and not ownership_errors
+        ),
+        trade_watermark_reconciled=watermark_ok,
+        hedge_mode=hedge_mode,
+        open_drain_tail_below_min_notional=tail_below_min,
+        open_drain_oldest_created_at=min(open_created_times) if open_created_times else None,
+        unmanaged_open_order_ids=tuple(
+            str(row.get("clientOrderId") or row.get("orderId") or "")
+            for row in unmanaged_open
+        ),
+    )
+    policy = TerminalDrainPolicy(
+        max_order_notional=max_order_notional,
+        min_order_notional=min_notional,
+        step_size=step_size,
+        tick_size=tick_size,
+        absolute_loss_budget=max(exit_loss_budget, 0.0),
+        loss_lease_ttl=timedelta(
+            seconds=max(exit_loss_lease_seconds, 1.0)
+        ),
+        flat_confirm_cycles=max(exit_flat_confirm_cycles, 2),
+        active_order_timeout=timedelta(
+            seconds=max(exit_order_reprice_seconds, 1.0)
+        ),
+    )
+    plan = decide_terminal_drain(state=drain_state, snapshot=snapshot, policy=policy)
+    drain_state = plan.next_state
+    envelope["last_observed_at"] = cycle_started_at.isoformat()
+    envelope["last_action"] = plan.action_id.value
+    envelope["last_reasons"] = list(plan.reasons)
+    if plan.stop_allowed:
+        envelope["exit_status"] = (
+            "stopped_preserved" if plan.preserve_inventory else "stopped_clean"
+        )
+    elif plan.action_id in {
+        DrainActionId.HOLD_BLOCKED,
+        DrainActionId.DRAIN_DUST_BLOCKED,
+    }:
+        envelope["exit_status"] = "exit_blocked"
+    else:
+        envelope["exit_status"] = "exiting"
+    canceled_count = 0
+    placed_count = 0
+    effect_errors: list[dict[str, Any]] = list(observation_errors)
+
+    if plan.action_id is DrainActionId.BLOCK_ENTRY:
+        envelope["entries_blocked"] = True
+    elif plan.action_id in {DrainActionId.CANCEL_ENTRY, DrainActionId.CANCEL_DRAIN_ORDER}:
+        cancel_source = entry_open if plan.action_id is DrainActionId.CANCEL_ENTRY else terminal_open
+        entry_by_id = {str(row.get("clientOrderId") or ""): row for row in cancel_source}
+        for client_id in plan.cancel_order_ids:
+            row = entry_by_id.get(client_id, {})
+            try:
+                response = delete_futures_order(
+                    symbol=symbol,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    order_id=(int(row["orderId"]) if str(row.get("orderId") or "").strip() else None),
+                    orig_client_order_id=client_id or None,
+                    recv_window=recv_window,
+                )
+                canceled_count += 1
+                record = by_client_id.get(client_id)
+                if record is not None:
+                    record["status"] = str(response.get("status") or "CANCELED").upper()
+                    record["executed_qty"] = _safe_float(
+                        response.get("executedQty", record.get("executed_qty"))
+                    )
+            except Exception as exc:
+                if not _ignore_noop_error(exc, ("-2011", "unknown order sent")):
+                    effect_errors.append({"client_order_id": client_id, "message": f"{type(exc).__name__}: {exc}"})
+    elif plan.orders:
+        prepared_records: list[dict[str, Any]] = []
+        for index, order in enumerate(plan.orders):
+            client_id = _terminal_drain_client_order_id(
+                symbol=symbol,
+                decision_id=decision_id,
+                generation=drain_state.generation,
+                action_id=plan.action_id.value,
+                leg_index=index,
+            )
+            prepared_records.append(
+                {
+                    "client_order_id": client_id,
+                    "generation": drain_state.generation,
+                    "action_id": plan.action_id.value,
+                    "leg_index": index,
+                    "status": "PREPARED",
+                    "prepared_at": cycle_started_at.isoformat(),
+                    "prepared_position_qty": (
+                        long_qty if order.side == "SELL" else short_qty
+                    ),
+                    "order": {
+                        "side": order.side,
+                        "position_side": order.position_side,
+                        "quantity": order.quantity,
+                        "price": order.price,
+                        "reduce_only": order.reduce_only,
+                        "time_in_force": "GTX",
+                        "closes_position": True,
+                    },
+                }
+            )
+        intents.extend(prepared_records)
+        envelope["intents"] = intents
+        envelope["active_intent_ids"] = [item["client_order_id"] for item in prepared_records]
+        _terminal_drain_persist(
+            state=state,
+            state_path=state_path,
+            envelope=envelope,
+            drain_state=drain_state,
+        )
+        for record in prepared_records:
+            order = dict(record["order"])
+            try:
+                response = post_futures_order(
+                    symbol=symbol,
+                    side=str(order["side"]),
+                    quantity=_safe_float(order["quantity"]),
+                    price=_safe_float(order["price"]),
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    time_in_force="GTX",
+                    recv_window=recv_window,
+                    new_client_order_id=str(record["client_order_id"]),
+                    reduce_only=order.get("reduce_only"),
+                    position_side=order.get("position_side"),
+                )
+                record.update(
+                    {
+                        "status": str(response.get("status") or "NEW").upper(),
+                        "order_id": response.get("orderId"),
+                        "executed_qty": _safe_float(response.get("executedQty")),
+                    }
+                )
+                placed_count += 1
+            except Exception as exc:
+                if _terminal_drain_post_only_rejected(exc):
+                    drain_state = _terminal_drain_retire_unsubmitted_action(
+                        envelope=envelope,
+                        drain_state=drain_state,
+                        action_records=prepared_records,
+                        rejected_record=record,
+                        observed_at=cycle_started_at,
+                        resolution="gtx_post_only_rejected",
+                        status="REJECTED",
+                        error=exc,
+                    )
+                else:
+                    record.update({"status": "AMBIGUOUS", "last_error": f"{type(exc).__name__}: {exc}"})
+                    record.setdefault("ambiguous_at", cycle_started_at.isoformat())
+                    effect_errors.append(
+                        {
+                            "client_order_id": record["client_order_id"],
+                            "message": record["last_error"],
+                        }
+                    )
+                _terminal_drain_persist(
+                    state=state,
+                    state_path=state_path,
+                    envelope=envelope,
+                    drain_state=drain_state,
+                )
+                break
+            _terminal_drain_persist(
+                state=state,
+                state_path=state_path,
+                envelope=envelope,
+                drain_state=drain_state,
+            )
+    elif plan.stop_allowed:
+        if plan.preserve_inventory:
+            envelope.update(
+                {
+                    "exit_resolution": "frozen_inventory_preserved",
+                    "preserved_by_ledger_boundary": True,
+                    "preserve_reason": "frozen_inventory_preserved_by_ledger_boundary",
+                    "preserved_at": cycle_started_at.isoformat(),
+                    "residual_snapshot": {
+                        "captured_at": cycle_started_at.isoformat(),
+                        "long_qty": long_qty,
+                        "short_qty": short_qty,
+                        "frozen_long_qty": frozen_long,
+                        "frozen_short_qty": frozen_short,
+                        "open_order_ids": [
+                            str(row.get("clientOrderId") or row.get("orderId") or "")
+                            for row in open_orders
+                        ],
+                        "exchange_observation_complete": True,
+                    },
+                }
+            )
+        else:
+            if _is_hedge_best_quote_maker_volume_mode(
+                str(exit_contract.get("strategy_mode") or "")
+            ):
+                envelope["ledger_reset"] = reset_best_quote_hedge_ledgers_after_exchange_flat(
+                    state=state,
+                    mid_price=(bid_price + ask_price) / 2.0,
+                    reason="terminal_drain_reconciled_flat",
+                )
+            envelope["stopped_clean_at"] = cycle_started_at.isoformat()
+
+    if effect_errors:
+        envelope["exit_status"] = "exit_blocked"
+    _terminal_drain_persist(
+        state=state,
+        state_path=state_path,
+        envelope=envelope,
+        drain_state=drain_state,
+    )
+    exit_status = str(envelope.get("exit_status") or "exiting")
+    return _terminal_drain_summary(
+        args=args,
+        cycle=cycle,
+        cycle_started_at=cycle_started_at,
+        stats_start_time=stats_start_time,
+        runtime_guard_config=runtime_guard_config,
+        runtime_guard_result=runtime_guard_result,
+        cumulative_gross_notional=cumulative_gross_notional,
+        outcome=outcome,
+        target=target,
+        achieved=achieved,
+        shortfall=shortfall,
+        action_id=plan.action_id.value,
+        reasons=plan.reasons,
+        bid_price=bid_price,
+        ask_price=ask_price,
+        long_qty=long_qty,
+        short_qty=short_qty,
+        canceled_count=canceled_count,
+        placed_count=placed_count,
+        stop_allowed=plan.stop_allowed,
+        exit_status=exit_status,
+        errors=effect_errors,
+    )
+
+
+def _resolve_loop_authoritative_run_contract(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], str]:
+    """Verify bounded startup args against the durable control owner."""
+
+    args_snapshot = run_contract_snapshot_from_config(vars(args))
+    bounded = args_snapshot.get("run_end_time") is not None or args_snapshot.get(
+        "max_cumulative_notional"
+    ) is not None
+    if not bounded:
+        return args_snapshot, run_contract_identity_from_config(args_snapshot)
+
+    control_path_text = str(
+        getattr(args, "recovery_control_path", "") or ""
+    ).strip()
+    if not control_path_text:
+        raise ValueError("run_contract_owner_missing: recovery control path is missing")
+    control = read_json(Path(control_path_text))
+    if not isinstance(control, dict):
+        raise ValueError("run_contract_owner_missing: recovery control is unavailable")
+    try:
+        owner_snapshot, owner_contract_id = resolve_authoritative_run_contract(
+            control,
+            expected_symbol=str(args.symbol).upper().strip(),
+        )
+    except ValueError as exc:
+        text = str(exc)
+        reason = (
+            "run_contract_owner_missing"
+            if "owner is missing" in text
+            else "run_contract_control_owner_mismatch"
+        )
+        raise ValueError(f"{reason}: {text}") from exc
+    if args_snapshot != owner_snapshot:
+        raise ValueError(
+            "run_contract_args_owner_mismatch: startup args do not match authoritative owner"
+        )
+    return owner_snapshot, owner_contract_id
+
+
+def _registered_terminal_handoff_barrier(
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Hold lifecycle drain until the recovery owner has fully released.
+
+    This is a read-only runner fence.  The recovery coordinator remains the
+    sole writer that cleans action leases and restores the baseline; the
+    terminal owner may start only on the following cycle after a complete
+    ``STABLE`` state is durable.
+    """
+
+    control_path = str(
+        getattr(args, "recovery_control_path", "") or ""
+    ).strip()
+    symbol = str(getattr(args, "symbol", "") or "").upper().strip()
+    if not control_path or not symbol:
+        return None
+    try:
+        recovery_state = JsonRecoveryStore(control_path).read(symbol)
+    except RecoveryStateUnavailableError:
+        return None
+    except Exception as exc:
+        return {
+            "reason": "recovery_state_unavailable",
+            "error": f"{type(exc).__name__}: {exc}",
+            "recovery_phase": "unavailable",
+            "recovery_action": None,
+            "recovery_generation": None,
+            "recovery_decision_id": None,
+            "recovery_pending_effect": None,
+        }
+
+    handoff_ready = bool(
+        recovery_state.phase is RecoveryPhase.STABLE
+        and recovery_state.active_action is ActionId.NOOP
+        and recovery_state.decision_id is None
+        and recovery_state.action_lease is None
+        and recovery_state.safety_lease is None
+        and recovery_state.cleanup_obligation is None
+        and recovery_state.cleanup_successor_action is None
+        and recovery_state.pending_effect_stage is EffectStage.NONE
+        and recovery_state.pending_effect_epoch is None
+        and recovery_state.desired_runner_state == "running"
+        and recovery_state.desired_profile.digest
+        == recovery_state.baseline_profile.digest
+    )
+    if handoff_ready:
+        return None
+    return {
+        "reason": "recovery_terminal_handoff_pending",
+        "error": None,
+        "recovery_phase": recovery_state.phase.value,
+        "recovery_action": recovery_state.active_action.value,
+        "recovery_generation": recovery_state.generation,
+        "recovery_decision_id": recovery_state.decision_id,
+        "recovery_pending_effect": recovery_state.pending_effect_stage.value,
+    }
+
+
 def _maybe_handle_runtime_guard(
     *,
     args: argparse.Namespace,
@@ -12066,8 +16153,131 @@ def _maybe_handle_runtime_guard(
     cycle_started_at: datetime,
     summary_path: Path,
 ) -> dict[str, Any] | None:
-    runtime_guard_config = normalize_runtime_guard_config(vars(args))
-    if not any(
+    state_path = Path(getattr(args, "state_path", ""))
+    loaded_state = read_json(state_path)
+    if loaded_state is None and state_path.exists():
+        raise RuntimeError("runner state is unreadable; refusing to replace it")
+    state = loaded_state or {}
+    try:
+        _authoritative_snapshot, _authoritative_contract_id = (
+            _resolve_loop_authoritative_run_contract(args)
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        message = str(exc)
+        reason = message.split(":", 1)[0]
+        if reason not in {
+            "run_contract_owner_missing",
+            "run_contract_control_owner_mismatch",
+            "run_contract_args_owner_mismatch",
+        }:
+            reason = "run_contract_owner_invalid"
+        contract_error = {
+            "reason": reason,
+            "message": message,
+            "observed_at": cycle_started_at.astimezone(timezone.utc).isoformat(),
+        }
+        state["futures_run_contract_error"] = contract_error
+        _write_json(state_path, state)
+        return {
+            "ts": cycle_started_at.isoformat(),
+            "cycle": cycle,
+            "symbol": str(args.symbol).upper().strip(),
+            "runtime_status": "exit_blocked",
+            "stop_triggered": False,
+            "runner_exit_allowed": False,
+            "stop_reason": reason,
+            "terminal_drain_action": DrainActionId.HOLD_BLOCKED.value,
+            "terminal_drain_reasons": [reason],
+            "exit_status": "exit_blocked",
+            "terminal_drain_errors": [contract_error],
+            "global_allow_loss": False,
+        }
+    if state.pop("futures_run_contract_error", None) is not None:
+        _write_json(state_path, state)
+    intent_path, terminal_intent = _read_resumable_terminal_intent(
+        state_path=state_path,
+        symbol=str(args.symbol).upper().strip(),
+    )
+    raw_terminal_owner = state.get(TERMINAL_DRAIN_STATE_KEY)
+    if terminal_intent is not None or isinstance(raw_terminal_owner, dict):
+        recovery_handoff = _registered_terminal_handoff_barrier(args)
+        if recovery_handoff is not None:
+            reason = str(
+                recovery_handoff.get("reason")
+                or "recovery_terminal_handoff_pending"
+            )
+            error = recovery_handoff.get("error")
+            return {
+                "ts": cycle_started_at.isoformat(),
+                "cycle": cycle,
+                "symbol": str(args.symbol).upper().strip(),
+                "runtime_status": "handoff_pending",
+                "stop_triggered": False,
+                "runner_exit_allowed": False,
+                "stop_reason": reason,
+                "terminal_drain_action": DrainActionId.HOLD_BLOCKED.value,
+                "terminal_drain_reasons": [reason],
+                "exit_status": "handoff_pending",
+                "terminal_drain_errors": (
+                    [{"reason": reason, "message": error}] if error else []
+                ),
+                "terminal_owner_handoff_pending": True,
+                "global_allow_loss": False,
+                **recovery_handoff,
+            }
+    effective_runtime_args, terminal_intent_contract_error = (
+        _terminal_intent_runtime_args(
+            args=args,
+            terminal_intent=terminal_intent,
+        )
+    )
+    current_terminal_decision_id = _terminal_drain_decision_id(
+        effective_runtime_args,
+        None,
+    )
+    if (
+        terminal_intent is not None
+        and terminal_intent_contract_error is None
+        and isinstance(raw_terminal_owner, dict)
+    ):
+        _merge_late_terminal_intent_with_existing_owner(
+            state=state,
+            state_path=state_path,
+            intent_path=intent_path,
+            terminal_intent=terminal_intent,
+            owner=raw_terminal_owner,
+            current_decision_id=current_terminal_decision_id,
+            now=cycle_started_at,
+        )
+    _pending_handoff, handoff_validation_error = (
+        _validated_pending_terminal_handoff(
+            args=effective_runtime_args,
+            state=state,
+        )
+    )
+    if handoff_validation_error is not None:
+        handoff_error = {
+            "reason": handoff_validation_error,
+            "observed_at": cycle_started_at.astimezone(timezone.utc).isoformat(),
+        }
+        state["futures_terminal_handoff_error"] = handoff_error
+        _write_json(state_path, state)
+        return {
+            "ts": cycle_started_at.isoformat(),
+            "cycle": cycle,
+            "symbol": str(args.symbol).upper().strip(),
+            "runtime_status": "exit_blocked",
+            "stop_triggered": False,
+            "runner_exit_allowed": False,
+            "stop_reason": handoff_validation_error,
+            "terminal_drain_action": DrainActionId.HOLD_BLOCKED.value,
+            "terminal_drain_reasons": [handoff_validation_error],
+            "exit_status": "exit_blocked",
+            "terminal_drain_errors": [handoff_error],
+            "global_allow_loss": False,
+        }
+    runtime_guard_config = normalize_runtime_guard_config(vars(effective_runtime_args))
+    has_runtime_guard = any(
         (
             runtime_guard_config.run_start_time,
             runtime_guard_config.run_end_time,
@@ -12078,34 +16288,193 @@ def _maybe_handle_runtime_guard(
             runtime_guard_config.max_synthetic_drift_notional,
             runtime_guard_config.max_unrealized_loss,
         )
+    )
+    if (
+        not has_runtime_guard
+        and terminal_intent is None
+        and not isinstance(state.get(TERMINAL_DRAIN_STATE_KEY), dict)
     ):
         return None
-    state_path = Path(getattr(args, "state_path", ""))
-    state = read_json(state_path) or {}
-    if not isinstance(state, dict):
-        state = {}
     recovery = _runtime_guard_loss_recovery_state(state)
     recovered_at = _parse_state_datetime(recovery.get("recovered_at"))
 
-    cumulative_gross_notional, pnl_events, stats_start_time = _load_futures_runtime_guard_inputs(
-        summary_path,
-        runtime_guard_stats_start_time=getattr(args, "runtime_guard_stats_start_time", None),
-        symbol=args.symbol.upper().strip(),
-        now=cycle_started_at,
-        state_path=state_path,
-        bq_book_scope=(
-            BQ_BOOK_NORMAL
-            if _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", "")))
-            else None
-        ),
+    authoritative_target_progress = bool(
+        runtime_guard_config.max_cumulative_notional is not None
+        and terminal_intent is None
+        and not isinstance(raw_terminal_owner, dict)
     )
+    try:
+        cumulative_gross_notional, pnl_events, stats_start_time = (
+            _load_futures_runtime_guard_inputs(
+                summary_path,
+                runtime_guard_stats_start_time=(
+                    runtime_guard_config.runtime_guard_stats_start_time
+                ),
+                symbol=effective_runtime_args.symbol.upper().strip(),
+                now=cycle_started_at,
+                state_path=state_path,
+                bq_book_scope=(
+                    BQ_BOOK_NORMAL
+                    if _is_hedge_best_quote_maker_volume_mode(
+                        str(
+                            getattr(
+                                effective_runtime_args,
+                                "strategy_mode",
+                                "",
+                            )
+                        )
+                    )
+                    else None
+                ),
+                run_end_time=runtime_guard_config.run_end_time,
+                max_cumulative_notional=(
+                    runtime_guard_config.max_cumulative_notional
+                ),
+                recv_window=int(getattr(effective_runtime_args, "recv_window", 5000)),
+                authoritative_target_progress=authoritative_target_progress,
+                immutable_contract_window=bool(
+                    runtime_guard_config.run_end_time is not None
+                    or runtime_guard_config.max_cumulative_notional is not None
+                ),
+            )
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        if not authoritative_target_progress:
+            raise
+        contract_id = run_contract_identity_from_config(
+            vars(effective_runtime_args)
+        )
+        prior_progress = state.get("futures_target_progress")
+        prior_achieved = (
+            _safe_float(prior_progress.get("gross_notional"))
+            if isinstance(prior_progress, dict)
+            and str(prior_progress.get("run_contract_id") or "") == contract_id
+            else 0.0
+        )
+        error = {
+            "reason": "target_progress_exchange_truth_unavailable",
+            "message": f"{type(exc).__name__}: {exc}",
+            "observed_at": cycle_started_at.astimezone(timezone.utc).isoformat(),
+            "run_contract_id": contract_id,
+        }
+        state["futures_target_progress_error"] = error
+        _write_json(state_path, state)
+        target_value = float(runtime_guard_config.max_cumulative_notional)
+        run_start_time = runtime_guard_config.run_start_time
+        run_end_time = runtime_guard_config.run_end_time
+        now_utc = cycle_started_at.astimezone(timezone.utc)
+        if run_start_time is not None and now_utc < run_start_time:
+            return {
+                "ts": cycle_started_at.isoformat(),
+                "cycle": cycle,
+                "symbol": str(effective_runtime_args.symbol).upper().strip(),
+                "runtime_status": "waiting",
+                "stop_triggered": False,
+                "runner_exit_allowed": False,
+                "stop_reason": "before_start_window",
+                "stop_reasons": ["before_start_window"],
+                "lifecycle_action": "wait_for_start",
+                "target_progress_status": "observation_unavailable_before_start",
+                "run_contract_id": contract_id,
+                "target_value": target_value,
+                "achieved_value": prior_achieved,
+                "target_shortfall": max(target_value - prior_achieved, 0.0),
+                "global_allow_loss": False,
+            }
+        if run_end_time is None or now_utc < run_end_time:
+            # A transient progress read failure must not become an implicit
+            # strategy pause.  Keep the durable error visible and let the
+            # normal maker cycle continue; no stale snapshot may claim target
+            # completion.
+            return None
+
+        deadline_guard_result = RuntimeGuardResult(
+            tradable=False,
+            stop_triggered=True,
+            runtime_status="stopped",
+            primary_reason="after_end_window",
+            matched_reasons=["after_end_window"],
+            triggered_at=cycle_started_at.isoformat(),
+            rolling_hourly_loss=0.0,
+            rolling_hourly_gross_notional=0.0,
+            rolling_hourly_loss_per_10k=0.0,
+            rolling_hourly_loss_per_10k_active=False,
+            cumulative_gross_notional=prior_achieved,
+            actual_net_notional_abs=0.0,
+            synthetic_drift_notional=0.0,
+            unrealized_loss=0.0,
+        )
+        internal_handoff = _persist_registered_runtime_terminal_intent(
+            args=effective_runtime_args,
+            state_path=state_path,
+            run_contract_snapshot=_authoritative_snapshot,
+            run_contract_id=_authoritative_contract_id,
+            runtime_guard_result=deadline_guard_result,
+            cumulative_gross_notional=prior_achieved,
+            pnl_events=(),
+            requested_at=cycle_started_at,
+        )
+        if internal_handoff is not None:
+            terminal_summary = _registered_runtime_terminal_handoff_summary(
+                args=effective_runtime_args,
+                cycle=cycle,
+                cycle_started_at=cycle_started_at,
+                handoff=internal_handoff,
+            )
+            terminal_summary["target_progress_status"] = (
+                "observation_unavailable_at_deadline"
+            )
+            terminal_summary["target_progress_error"] = error
+            return terminal_summary
+        terminal_summary = _handle_terminal_drain_round(
+            args=effective_runtime_args,
+            cycle=cycle,
+            cycle_started_at=cycle_started_at,
+            stats_start_time=runtime_guard_config.runtime_guard_stats_start_time,
+            runtime_guard_config=runtime_guard_config,
+            runtime_guard_result=deadline_guard_result,
+            cumulative_gross_notional=prior_achieved,
+            state=state,
+            state_path=state_path,
+        )
+        terminal_summary["target_progress_status"] = (
+            "observation_unavailable_at_deadline"
+        )
+        terminal_summary["target_progress_error"] = error
+        return terminal_summary
+
+    if authoritative_target_progress:
+        contract_id = run_contract_identity_from_config(
+            vars(effective_runtime_args)
+        )
+        query_end = min(
+            cycle_started_at.astimezone(timezone.utc),
+            runtime_guard_config.run_end_time.astimezone(timezone.utc),
+        )
+        state["futures_target_progress"] = {
+            "schema": "futures_target_progress_v1",
+            "symbol": str(effective_runtime_args.symbol).upper().strip(),
+            "run_contract_id": contract_id,
+            "window_start": (
+                runtime_guard_config.runtime_guard_stats_start_time.isoformat()
+            ),
+            "window_end": runtime_guard_config.run_end_time.isoformat(),
+            "query_end": query_end.isoformat(),
+            "gross_notional": cumulative_gross_notional,
+            "target_value": runtime_guard_config.max_cumulative_notional,
+            "observed_at": cycle_started_at.astimezone(timezone.utc).isoformat(),
+        }
+        state.pop("futures_target_progress_error", None)
+        _write_json(state_path, state)
     pnl_events_for_guard = _filter_pnl_events_after(pnl_events, recovered_at)
     pnl_events_for_guard, runtime_guard_loss_scope = _runtime_guard_isolated_bq_pnl_events(
-        args=args,
+        args=effective_runtime_args,
         state=state,
         pnl_events=pnl_events_for_guard,
     )
-    latest_plan_report = read_json(Path(getattr(args, "plan_json", ""))) or {}
+    latest_plan_report = read_json(
+        Path(getattr(effective_runtime_args, "plan_json", ""))
+    ) or {}
     if not isinstance(latest_plan_report, dict):
         latest_plan_report = {}
     latest_mid_price = _safe_float(latest_plan_report.get("mid_price"))
@@ -12117,7 +16486,7 @@ def _maybe_handle_runtime_guard(
         _runtime_guard_exposure_inputs(
             latest_plan_report,
             now=cycle_started_at,
-            symbol=str(args.symbol).upper().strip(),
+            symbol=str(effective_runtime_args.symbol).upper().strip(),
         )
     )
     runtime_guard_result = evaluate_runtime_guards(
@@ -12129,7 +16498,235 @@ def _maybe_handle_runtime_guard(
         synthetic_drift_notional=latest_synthetic_drift_notional,
         unrealized_pnl=_safe_float(guard_unrealized_pnl),
     )
+    if (
+        runtime_guard_result.runtime_status == "waiting"
+        and terminal_intent is None
+        and not isinstance(raw_terminal_owner, dict)
+    ):
+        return {
+            "ts": cycle_started_at.isoformat(),
+            "cycle": cycle,
+            "symbol": str(effective_runtime_args.symbol).upper().strip(),
+            "runtime_status": "waiting",
+            "stop_triggered": False,
+            "runner_exit_allowed": False,
+            "stop_reason": "before_start_window",
+            "stop_reasons": ["before_start_window"],
+            "lifecycle_action": "wait_for_start",
+            "runtime_guard_stats_start_time": (
+                stats_start_time.isoformat() if stats_start_time else None
+            ),
+            "target_value": runtime_guard_config.max_cumulative_notional,
+            "achieved_value": cumulative_gross_notional,
+            "target_shortfall": max(
+                _safe_float(runtime_guard_config.max_cumulative_notional)
+                - cumulative_gross_notional,
+                0.0,
+            ),
+            "global_allow_loss": False,
+        }
+    persisted_terminal_decision_id = (
+        str(raw_terminal_owner.get("decision_id") or "")
+        if isinstance(raw_terminal_owner, dict)
+        else ""
+    )
+    terminal_owner_transition = _terminal_drain_owner_transition(
+        state=state,
+        state_path=state_path,
+        current_decision_id=current_terminal_decision_id,
+        now=cycle_started_at,
+    )
+    if terminal_owner_transition == "resume":
+        terminal_summary = _handle_terminal_drain_round(
+            args=effective_runtime_args,
+            cycle=cycle,
+            cycle_started_at=cycle_started_at,
+            stats_start_time=stats_start_time,
+            runtime_guard_result=runtime_guard_result,
+            cumulative_gross_notional=cumulative_gross_notional,
+            state=state,
+            state_path=state_path,
+        )
+        prior_owner_completed_for_new_run = (
+            bool(terminal_summary.get("runner_exit_allowed"))
+            and persisted_terminal_decision_id
+            and persisted_terminal_decision_id != current_terminal_decision_id
+        )
+        if prior_owner_completed_for_new_run:
+            archived = _terminal_drain_owner_transition(
+                state=state,
+                state_path=state_path,
+                current_decision_id=current_terminal_decision_id,
+                now=cycle_started_at,
+            )
+            if archived == "archived":
+                completed_exit_status = terminal_summary.get("exit_status")
+                terminal_summary.update(
+                    {
+                        "runtime_status": "handoff_pending",
+                        "stop_triggered": False,
+                        "runner_exit_allowed": False,
+                        "terminal_owner_handoff_pending": True,
+                        "completed_terminal_decision_id": persisted_terminal_decision_id,
+                        "next_terminal_decision_id": current_terminal_decision_id,
+                        "completed_exit_status": completed_exit_status,
+                    }
+                )
+        return terminal_summary
+    if terminal_intent is not None:
+        if terminal_intent_contract_error is not None:
+            blocked_reason = terminal_intent_contract_error
+            checked_at = cycle_started_at.astimezone(timezone.utc).isoformat()
+            receipt = dict(terminal_intent)
+            receipt.update(
+                {
+                    "status": "exit_blocked",
+                    "blocked_reason": blocked_reason,
+                    "last_checked_at": checked_at,
+                }
+            )
+            state[TERMINAL_INTENT_STATE_KEY] = receipt
+            _write_json(state_path, state)
+            terminal_intent.update(receipt)
+            _write_json(intent_path, terminal_intent)
+
+            observed = terminal_intent.get("observed")
+            observed_notional = (
+                _safe_float(observed.get("gross_notional"))
+                if isinstance(observed, dict)
+                else 0.0
+            )
+            achieved = observed_notional
+            observed_target = (
+                _safe_float(observed.get("target"))
+                if isinstance(observed, dict)
+                else 0.0
+            )
+            configured_target = _safe_float(
+                getattr(runtime_guard_config, "max_cumulative_notional", None)
+            )
+            target = observed_target or configured_target or None
+            shortfall = max((target or 0.0) - achieved, 0.0)
+            trigger_reason = str(
+                terminal_intent.get("trigger_reason") or "condition_unmet"
+            )
+            outcome = (
+                "target_reached"
+                if trigger_reason == "target_reached"
+                else (
+                    "target_unmet_deadline"
+                    if trigger_reason == "target_unmet_deadline"
+                    else "condition_unmet"
+                )
+            )
+            contract_error = {
+                "reason": blocked_reason,
+                "intent_run_contract_id": str(
+                    terminal_intent.get("run_contract_id") or ""
+                )
+                or None,
+            }
+            return _terminal_drain_summary(
+                args=args,
+                cycle=cycle,
+                cycle_started_at=cycle_started_at,
+                stats_start_time=stats_start_time,
+                runtime_guard_config=runtime_guard_config,
+                runtime_guard_result=runtime_guard_result,
+                cumulative_gross_notional=achieved,
+                outcome=outcome,
+                target=target,
+                achieved=achieved,
+                shortfall=shortfall,
+                action_id=DrainActionId.HOLD_BLOCKED.value,
+                reasons=(blocked_reason,),
+                bid_price=0.0,
+                ask_price=0.0,
+                long_qty=0.0,
+                short_qty=0.0,
+                exit_status="exit_blocked",
+                errors=[contract_error],
+            )
+
+        decision_id = current_terminal_decision_id
+        accepted_at = str(terminal_intent.get("accepted_at") or cycle_started_at.isoformat())
+        receipt = dict(terminal_intent)
+        receipt.update(
+            {
+                "status": "accepted",
+                "accepted_at": accepted_at,
+                "decision_id": decision_id,
+            }
+        )
+        state[TERMINAL_INTENT_STATE_KEY] = receipt
+        _write_json(state_path, state)
+        terminal_intent.update(
+            {
+                "status": "accepted",
+                "accepted_at": accepted_at,
+                "decision_id": decision_id,
+            }
+        )
+        _write_json(intent_path, terminal_intent)
+
+        trigger_reason = str(terminal_intent.get("trigger_reason") or "condition_unmet")
+        matched_reasons = (
+            ["max_cumulative_notional_hit"]
+            if trigger_reason == "target_reached"
+            else (
+                ["after_end_window"]
+                if trigger_reason == "target_unmet_deadline"
+                else [f"terminal_intent_{trigger_reason}"]
+            )
+        )
+        observed = terminal_intent.get("observed")
+        observed_notional = (
+            _safe_float(observed.get("gross_notional"))
+            if isinstance(observed, dict)
+            else 0.0
+        )
+        intent_cumulative_notional = observed_notional
+        intent_guard_result = argparse.Namespace(
+            tradable=False,
+            runtime_status="stopped",
+            stop_triggered=True,
+            primary_reason=f"terminal_intent_{trigger_reason}",
+            matched_reasons=matched_reasons,
+            triggered_at=str(terminal_intent.get("requested_at") or cycle_started_at.isoformat()),
+            rolling_hourly_loss=getattr(runtime_guard_result, "rolling_hourly_loss", 0.0),
+            rolling_hourly_gross_notional=getattr(
+                runtime_guard_result, "rolling_hourly_gross_notional", 0.0
+            ),
+            rolling_hourly_loss_per_10k=getattr(
+                runtime_guard_result, "rolling_hourly_loss_per_10k", 0.0
+            ),
+            rolling_hourly_loss_per_10k_active=getattr(
+                runtime_guard_result, "rolling_hourly_loss_per_10k_active", False
+            ),
+            cumulative_gross_notional=intent_cumulative_notional,
+            unrealized_loss=getattr(runtime_guard_result, "unrealized_loss", 0.0),
+        )
+        return _handle_terminal_drain_round(
+            args=effective_runtime_args,
+            cycle=cycle,
+            cycle_started_at=cycle_started_at,
+            stats_start_time=stats_start_time,
+            runtime_guard_config=runtime_guard_config,
+            runtime_guard_result=intent_guard_result,
+            cumulative_gross_notional=intent_cumulative_notional,
+            state=state,
+            state_path=state_path,
+        )
     if runtime_guard_result.tradable:
+        _replace_registered_runtime_safety_source(
+            args=args,
+            state=state,
+            state_path=state_path,
+            source="runtime_guard",
+            conditions=(),
+            now=cycle_started_at,
+            run_contract_id=_authoritative_contract_id,
+        )
         recovery["loss_scope"] = runtime_guard_loss_scope
         recovery_changed = False
         stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
@@ -12173,6 +16770,94 @@ def _maybe_handle_runtime_guard(
     )
     recoverable_loss_stop = loss_only_stop and _runtime_guard_loss_recovery_enabled(args)
     end_window_stop = runtime_guard_result.primary_reason == "after_end_window"
+    lifecycle_terminal_stop = any(
+        reason in {"after_end_window", "max_cumulative_notional_hit"}
+        for reason in list(runtime_guard_result.matched_reasons or [])
+    )
+    if lifecycle_terminal_stop:
+        internal_handoff = _persist_registered_runtime_terminal_intent(
+            args=effective_runtime_args,
+            state_path=state_path,
+            run_contract_snapshot=_authoritative_snapshot,
+            run_contract_id=_authoritative_contract_id,
+            runtime_guard_result=runtime_guard_result,
+            cumulative_gross_notional=cumulative_gross_notional,
+            pnl_events=pnl_events,
+            requested_at=cycle_started_at,
+        )
+        if internal_handoff is not None:
+            return _registered_runtime_terminal_handoff_summary(
+                args=effective_runtime_args,
+                cycle=cycle,
+                cycle_started_at=cycle_started_at,
+                handoff=internal_handoff,
+            )
+        return _handle_terminal_drain_round(
+            args=args,
+            cycle=cycle,
+            cycle_started_at=cycle_started_at,
+            stats_start_time=stats_start_time,
+            runtime_guard_config=runtime_guard_config,
+            runtime_guard_result=runtime_guard_result,
+            cumulative_gross_notional=cumulative_gross_notional,
+            state=state,
+            state_path=state_path,
+        )
+    runtime_conditions = _runtime_guard_safety_conditions(
+        runtime_guard_result=runtime_guard_result,
+        actual_net_notional=_safe_float(guard_actual_net_notional),
+        observed_at=cycle_started_at,
+        ttl=_runtime_safety_signal_ttl(args),
+    )
+    if _replace_registered_runtime_safety_source(
+        args=args,
+        state=state,
+        state_path=state_path,
+        source="runtime_guard",
+        conditions=runtime_conditions,
+        now=cycle_started_at,
+        run_contract_id=_authoritative_contract_id,
+    ):
+        # Registered runtime guards are observations only.  The local submit
+        # fence below allows normal GTX reduction but emits no cancel, flatten,
+        # process-stop, or restart effect; the BQ coordinator owns that action.
+        return None
+    bounded_run = (
+        getattr(runtime_guard_config, "run_end_time", None) is not None
+        or getattr(runtime_guard_config, "max_cumulative_notional", None) is not None
+    )
+    if bounded_run and not recoverable_loss_stop:
+        # Unregistered bounded runs retain the direct condition-unmet terminal
+        # owner.  Registered symbols returned through the recovery signal path
+        # above and keep trying to reach their target until the real deadline.
+        internal_handoff = _persist_registered_runtime_terminal_intent(
+            args=effective_runtime_args,
+            state_path=state_path,
+            run_contract_snapshot=_authoritative_snapshot,
+            run_contract_id=_authoritative_contract_id,
+            runtime_guard_result=runtime_guard_result,
+            cumulative_gross_notional=cumulative_gross_notional,
+            pnl_events=pnl_events,
+            requested_at=cycle_started_at,
+        )
+        if internal_handoff is not None:
+            return _registered_runtime_terminal_handoff_summary(
+                args=effective_runtime_args,
+                cycle=cycle,
+                cycle_started_at=cycle_started_at,
+                handoff=internal_handoff,
+            )
+        return _handle_terminal_drain_round(
+            args=args,
+            cycle=cycle,
+            cycle_started_at=cycle_started_at,
+            stats_start_time=stats_start_time,
+            runtime_guard_config=runtime_guard_config,
+            runtime_guard_result=runtime_guard_result,
+            cumulative_gross_notional=cumulative_gross_notional,
+            state=state,
+            state_path=state_path,
+        )
     frozen_inventory_present = _has_best_quote_frozen_inventory_position(state)
     manual_frozen_directive_pending = _has_pending_frozen_inventory_manual_directive(state)
     frozen_long_qty, frozen_short_qty = _best_quote_frozen_inventory_qtys(state)
@@ -12646,14 +17331,27 @@ def _best_quote_take_profit_guard_role_sets(
     hedge_best_quote: bool,
     enabled: bool,
     allow_loss_reduce_only: bool,
+    authorized_loss_roles: Iterable[str] | None = None,
 ) -> tuple[set[str] | None, set[str] | None]:
     if not enabled:
         return None, None
 
     long_roles: set[str] = set()
     short_roles: set[str] = set()
-    if not allow_loss_reduce_only:
+    authorized = {
+        str(role).strip()
+        for role in (authorized_loss_roles or ())
+        if str(role).strip()
+    }
+    if (
+        not allow_loss_reduce_only
+        or "best_quote_reduce_long" not in authorized
+    ):
         long_roles.add("best_quote_reduce_long")
+    if (
+        not allow_loss_reduce_only
+        or "best_quote_reduce_short" not in authorized
+    ):
         short_roles.add("best_quote_reduce_short")
     if not hedge_best_quote:
         long_roles.add("best_quote_entry_short")
@@ -12661,18 +17359,2025 @@ def _best_quote_take_profit_guard_role_sets(
     return long_roles, short_roles
 
 
-def _best_quote_submit_allow_loss_roles(args: Any) -> set[str] | None:
+@dataclass(frozen=True)
+class _RecoveryOrderProfileGate:
+    managed: bool
+    ready: bool
+    reason: str | None
+    symbol: str
+    generation: int | None
+    decision_id: str | None
+    profile_digest: str | None
+    active_action: ActionId
+    side: Side | None
+    order_role: OrderRole | None
+    ledger_class: LedgerClass | None
+    allowed_orders: tuple[tuple[str, str], ...]
+    progress_deadline_at: datetime | None = None
+    hard_expires_at: datetime | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "managed": self.managed,
+            "ready": self.ready,
+            "reason": self.reason,
+            "symbol": self.symbol,
+            "generation": self.generation,
+            "decision_id": self.decision_id,
+            "profile_digest": self.profile_digest,
+            "active_action": self.active_action.value,
+            "side": self.side.value if self.side is not None else None,
+            "order_role": (
+                self.order_role.value if self.order_role is not None else None
+            ),
+            "ledger_class": (
+                self.ledger_class.value if self.ledger_class is not None else None
+            ),
+            "allowed_orders": [
+                {"role": role, "side": side}
+                for role, side in self.allowed_orders
+            ],
+            "allowed_roles": [role for role, _side in self.allowed_orders],
+            "progress_deadline_at": (
+                self.progress_deadline_at.isoformat()
+                if self.progress_deadline_at is not None
+                else None
+            ),
+            "hard_expires_at": (
+                self.hard_expires_at.isoformat()
+                if self.hard_expires_at is not None
+                else None
+            ),
+        }
+
+    def matches(self, expected: Mapping[str, Any] | None) -> bool:
+        if not isinstance(expected, Mapping):
+            return False
+        current = self.as_dict()
+        return all(key in expected for key in current) and all(
+            expected[key] == value for key, value in current.items()
+        )
+
+    def allows_order(self, order: Mapping[str, Any]) -> bool:
+        if not self.managed or self.active_action is ActionId.NOOP:
+            return self.ready
+        role = str(order.get("role") or "").strip().lower()
+        side = str(order.get("side") or "").upper().strip()
+        post_only = (
+            str(order.get("execution_type", "post_only")).strip().lower()
+            != "aggressive"
+        )
+        return self.ready and post_only and (role, side) in self.allowed_orders
+
+
+def _unmanaged_recovery_order_profile_gate(args: Any) -> _RecoveryOrderProfileGate:
+    return _RecoveryOrderProfileGate(
+        managed=False,
+        ready=True,
+        reason=None,
+        symbol=str(getattr(args, "symbol", "") or "").upper().strip(),
+        generation=None,
+        decision_id=None,
+        profile_digest=None,
+        active_action=ActionId.NOOP,
+        side=None,
+        order_role=None,
+        ledger_class=None,
+        allowed_orders=(),
+    )
+
+
+def _load_recovery_order_profile_gate(
+    args: Any,
+    *,
+    now: datetime | None = None,
+) -> _RecoveryOrderProfileGate:
+    observed_at = now or datetime.now(timezone.utc)
+    control_path = str(getattr(args, "recovery_control_path", "") or "").strip()
+    expected_generation = getattr(args, "recovery_generation", None)
+    symbol = str(getattr(args, "symbol", "") or "").upper().strip()
+    if not control_path and expected_generation is None:
+        return _unmanaged_recovery_order_profile_gate(args)
+    base = {
+        "managed": True,
+        "symbol": symbol,
+        "generation": None,
+        "decision_id": None,
+        "profile_digest": None,
+        "active_action": ActionId.NOOP,
+        "side": None,
+        "order_role": None,
+        "ledger_class": None,
+        "allowed_orders": (),
+    }
+    if (
+        not control_path
+        or observed_at.tzinfo is None
+        or observed_at.utcoffset() is None
+    ):
+        return _RecoveryOrderProfileGate(
+            ready=False,
+            reason="recovery_runtime_fence_missing",
+            **base,
+        )
+    try:
+        state = JsonRecoveryStore(control_path).read(symbol)
+    except RecoveryStateUnavailableError:
+        if expected_generation is None:
+            return _unmanaged_recovery_order_profile_gate(args)
+        return _RecoveryOrderProfileGate(
+            ready=False,
+            reason="recovery_registration_missing",
+            **base,
+        )
+    except Exception:
+        return _RecoveryOrderProfileGate(
+            ready=False,
+            reason="recovery_state_unavailable",
+            **base,
+        )
+    base.update(
+        {
+            "symbol": state.symbol,
+            "generation": state.generation,
+            "decision_id": state.decision_id,
+            "profile_digest": state.desired_profile.digest,
+            "active_action": state.active_action,
+            "side": state.side,
+            "order_role": state.order_role,
+            "progress_deadline_at": state.progress_deadline_at,
+            "hard_expires_at": state.hard_expires_at,
+        }
+    )
+    if type(expected_generation) is not int or expected_generation < 0:
+        return _RecoveryOrderProfileGate(
+            ready=False,
+            reason="recovery_runtime_fence_missing",
+            **base,
+        )
+    if state.symbol != symbol or state.generation != expected_generation:
+        return _RecoveryOrderProfileGate(
+            ready=False,
+            reason="recovery_generation_mismatch",
+            **base,
+        )
+    if not _recovery_runtime_profile_is_applied(args, state):
+        return _RecoveryOrderProfileGate(
+            ready=False,
+            reason="recovery_profile_not_applied",
+            **base,
+        )
+    safe_restoring_baseline = bool(
+        state.phase is RecoveryPhase.RESTORING
+        and state.action_lease is None
+        and state.cleanup_obligation is None
+        and state.safety_lease is None
+        and state.desired_runner_state == "running"
+        and state.desired_profile.digest == state.baseline_profile.digest
+    )
+    if state.phase in {RecoveryPhase.STABLE, RecoveryPhase.COOLDOWN} or (
+        safe_restoring_baseline
+    ):
+        normal_base = {
+            **base,
+            "active_action": ActionId.NOOP,
+            "side": None,
+            "order_role": None,
+            "progress_deadline_at": None,
+            "hard_expires_at": None,
+        }
+        return _RecoveryOrderProfileGate(
+            ready=True,
+            reason=None,
+            **normal_base,
+        )
+    if state.phase is not RecoveryPhase.ACTIVE:
+        return _RecoveryOrderProfileGate(
+            ready=False,
+            reason=f"recovery_phase_{state.phase.value}_not_tradable",
+            **base,
+        )
+    if (
+        state.progress_deadline_at is not None
+        and observed_at >= state.progress_deadline_at
+    ):
+        return _RecoveryOrderProfileGate(
+            ready=False,
+            reason=f"{state.active_action.value}_progress_deadline_reached",
+            **base,
+        )
+    if state.hard_expires_at is not None and observed_at >= state.hard_expires_at:
+        return _RecoveryOrderProfileGate(
+            ready=False,
+            reason=f"{state.active_action.value}_hard_deadline_reached",
+            **base,
+        )
+
+    desired = state.desired_profile.fields
+    allowed_orders: tuple[tuple[str, str], ...] = ()
+    ledger_class: LedgerClass | None = None
+    ready = True
+    reason: str | None = None
+    if state.active_action in {
+        ActionId.INVENTORY_RECOVER,
+        ActionId.MAKER_FLOW_RECOVER,
+        ActionId.BASELINE_TUNE,
+    }:
+        if state.active_action is ActionId.INVENTORY_RECOVER:
+            expected_role = OrderRole.REDUCE_ONLY
+        elif state.active_action is ActionId.MAKER_FLOW_RECOVER:
+            expected_role = OrderRole.ENTRY
+        else:
+            expected_role = state.order_role
+        if not (
+            state.side is not None
+            and expected_role in {OrderRole.ENTRY, OrderRole.REDUCE_ONLY}
+            and state.order_role is expected_role
+            and desired.get("recovery_order_side") == state.side.value
+            and desired.get("recovery_order_role") == expected_role.value
+            and desired.get("recovery_order_ledger_class")
+            == LedgerClass.NORMAL_BQ.value
+        ):
+            ready = False
+            reason = "recovery_profile_overlay_mismatch"
+        else:
+            ledger_class = LedgerClass.NORMAL_BQ
+            roles = {
+                (ActionId.INVENTORY_RECOVER, Side.SELL): "best_quote_reduce_long",
+                (ActionId.INVENTORY_RECOVER, Side.BUY): "best_quote_reduce_short",
+                (ActionId.MAKER_FLOW_RECOVER, Side.BUY): "best_quote_entry_long",
+                (ActionId.MAKER_FLOW_RECOVER, Side.SELL): "best_quote_entry_short",
+                (ActionId.BASELINE_TUNE, OrderRole.ENTRY, Side.BUY): (
+                    "best_quote_entry_long"
+                ),
+                (ActionId.BASELINE_TUNE, OrderRole.ENTRY, Side.SELL): (
+                    "best_quote_entry_short"
+                ),
+                (ActionId.BASELINE_TUNE, OrderRole.REDUCE_ONLY, Side.SELL): (
+                    "best_quote_reduce_long"
+                ),
+                (ActionId.BASELINE_TUNE, OrderRole.REDUCE_ONLY, Side.BUY): (
+                    "best_quote_reduce_short"
+                ),
+            }
+            role_key = (
+                (state.active_action, expected_role, state.side)
+                if state.active_action is ActionId.BASELINE_TUNE
+                else (state.active_action, state.side)
+            )
+            allowed_orders = ((roles[role_key], state.side.value),)
+    elif state.active_action is ActionId.SAFETY_CONVERGE:
+        reduce_sides = desired.get("recovery_reduce_only_allowed_sides")
+        blocked_entry_sides = desired.get("recovery_entry_blocked_sides")
+        if not (
+            isinstance(reduce_sides, tuple)
+            and isinstance(blocked_entry_sides, tuple)
+            and set(blocked_entry_sides) == {"BUY", "SELL"}
+            and set(reduce_sides).issubset({"BUY", "SELL"})
+        ):
+            ready = False
+            reason = "recovery_safety_overlay_mismatch"
+        else:
+            allowed_orders = tuple(
+                (
+                    "best_quote_reduce_long"
+                    if side == "SELL"
+                    else "best_quote_reduce_short",
+                    side,
+                )
+                for side in sorted(set(reduce_sides))
+            )
+            ledger_class = LedgerClass.NORMAL_BQ
+    elif state.active_action is ActionId.TEMPORARY_LOSS_RELIEF:
+        try:
+            loss_ready = temporary_loss_authorized(state, now=observed_at)
+        except (TypeError, ValueError):
+            loss_ready = False
+        if not loss_ready or state.side is None:
+            ready = False
+            reason = "temporary_loss_lease_not_authorized"
+        else:
+            allowed_orders = (
+                (
+                    "best_quote_reduce_long"
+                    if state.side is Side.SELL
+                    else "best_quote_reduce_short",
+                    state.side.value,
+                ),
+            )
+            ledger_class = LedgerClass.NORMAL_BQ
+    else:
+        ready = False
+        reason = f"recovery_action_{state.active_action.value}_runner_unimplemented"
+    return _RecoveryOrderProfileGate(
+        ready=ready,
+        reason=reason,
+        ledger_class=ledger_class,
+        allowed_orders=allowed_orders,
+        **{key: value for key, value in base.items() if key not in {"ledger_class", "allowed_orders"}},
+    )
+
+
+def apply_recovery_profile_gate_to_plan(
+    *,
+    plan: dict[str, Any],
+    gate: _RecoveryOrderProfileGate,
+) -> dict[str, Any]:
+    report = {
+        **gate.as_dict(),
+        "dropped_order_count": 0,
+        "dropped_orders": [],
+    }
+    if not gate.managed or gate.active_action is ActionId.NOOP:
+        return report
+    for key in ("bootstrap_orders", "buy_orders", "sell_orders"):
+        kept: list[dict[str, Any]] = []
+        for raw in plan.get(key, []):
+            if not isinstance(raw, Mapping):
+                continue
+            order = dict(raw)
+            if gate.allows_order(order):
+                kept.append(order)
+            else:
+                report["dropped_orders"].append(
+                    {
+                        "order_key": key,
+                        "role": str(order.get("role") or ""),
+                        "side": str(order.get("side") or "").upper().strip(),
+                        "reason": gate.reason or "recovery_profile_scope_mismatch",
+                    }
+                )
+        plan[key] = kept
+    report["dropped_order_count"] = len(report["dropped_orders"])
+    return report
+
+
+def _registered_runtime_safety_signal_gate(
+    args: Any,
+    *,
+    now: datetime,
+) -> tuple[RuntimeSafetySignal | None, dict[str, Any]]:
+    recovery_gate = _load_recovery_order_profile_gate(args, now=now)
+    report: dict[str, Any] = {
+        "managed": recovery_gate.managed,
+        "active": False,
+        "reason": None,
+        "signal": None,
+    }
+    if not recovery_gate.managed:
+        return None, report
+    state_path = Path(str(getattr(args, "state_path", "") or ""))
+    state = read_json(state_path)
+    if not isinstance(state, Mapping):
+        if state_path.exists():
+            report.update(
+                {
+                    "active": True,
+                    "reason": "runtime_safety_state_unavailable",
+                }
+            )
+        return None, report
+    raw = state.get(RUNTIME_SAFETY_SIGNAL_KEY)
+    if raw is None:
+        return None, report
+    if not isinstance(raw, Mapping):
+        report.update(
+            {
+                "active": True,
+                "reason": "runtime_safety_signal_invalid",
+            }
+        )
+        return None, report
+    try:
+        _snapshot, contract_id = _resolve_loop_authoritative_run_contract(args)
+        if recovery_gate.generation is None:
+            raise ValueError("recovery generation is unavailable")
+        decoded = decode_runtime_safety_signal(raw)
+        if decoded.generation < recovery_gate.generation:
+            report["reason"] = "runtime_safety_signal_obsolete"
+            return None, report
+        signal = validate_runtime_safety_signal(
+            raw,
+            expected_symbol=recovery_gate.symbol,
+            expected_run_contract_id=contract_id,
+            expected_generation=recovery_gate.generation,
+            expected_decision_id=recovery_gate.decision_id,
+            now=now,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        report.update(
+            {
+                "active": True,
+                "reason": "runtime_safety_signal_invalid",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        return None, report
+    if signal is None:
+        report["reason"] = "runtime_safety_signal_stale"
+        return None, report
+    report.update(
+        {
+            "active": True,
+            "reason": "runtime_safety_signal_active",
+            "signal": signal.as_dict(),
+        }
+    )
+    return signal, report
+
+
+def _runtime_safety_normal_gtx_reduce(order: Mapping[str, Any]) -> bool:
+    role = str(order.get("role") or "").strip().lower()
+    side = str(order.get("side") or "").strip().upper()
+    if (role, side) not in {
+        ("best_quote_reduce_long", "SELL"),
+        ("best_quote_reduce_short", "BUY"),
+    }:
+        return False
+    if str(order.get("execution_type", "post_only")).strip().lower() == "aggressive":
+        return False
+    time_in_force = str(order.get("time_in_force") or "GTX").strip().upper()
+    return time_in_force == "GTX"
+
+
+def _apply_registered_runtime_safety_signal_to_plan(
+    *,
+    args: Any,
+    plan: dict[str, Any],
+    now: datetime,
+) -> dict[str, Any]:
+    _signal, report = _registered_runtime_safety_signal_gate(args, now=now)
+    dropped: list[dict[str, Any]] = []
+    if report["active"]:
+        for key in ("bootstrap_orders", "buy_orders", "sell_orders"):
+            kept = []
+            for raw in plan.get(key, []):
+                if not isinstance(raw, Mapping):
+                    continue
+                order = dict(raw)
+                if _runtime_safety_normal_gtx_reduce(order):
+                    kept.append(order)
+                else:
+                    dropped.append(
+                        {
+                            "order_key": key,
+                            "role": str(order.get("role") or ""),
+                            "side": str(order.get("side") or "").upper().strip(),
+                        }
+                    )
+            plan[key] = kept
+    report["dropped_order_count"] = len(dropped)
+    report["dropped_orders"] = dropped
+    return report
+
+
+def _apply_registered_runtime_safety_signal_to_actions(
+    *,
+    args: Any,
+    actions: Mapping[str, Any],
+    now: datetime,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    result = dict(actions)
+    _signal, report = _registered_runtime_safety_signal_gate(args, now=now)
+    places = [
+        dict(item)
+        for item in actions.get("place_orders", [])
+        if isinstance(item, Mapping)
+    ]
+    cancels = [
+        dict(item)
+        for item in actions.get("cancel_orders", [])
+        if isinstance(item, Mapping)
+    ]
+    dropped_places: list[dict[str, Any]] = []
+    dropped_cancels: list[dict[str, Any]] = []
+    if report["active"]:
+        kept_places = []
+        for order in places:
+            if _runtime_safety_normal_gtx_reduce(order):
+                kept_places.append(order)
+            else:
+                dropped_places.append(order)
+        places = kept_places
+        dropped_cancels = cancels
+        cancels = []
+    result["place_orders"] = places
+    result["place_count"] = len(places)
+    result["place_notional"] = sum(
+        _safe_float(item.get("notional"))
+        or _safe_float(item.get("price")) * _safe_float(item.get("qty"))
+        for item in places
+    )
+    result["cancel_orders"] = cancels
+    result["cancel_count"] = len(cancels)
+    report["dropped_place_count"] = len(dropped_places)
+    report["dropped_cancel_count"] = len(dropped_cancels)
+    report["dropped_orders"] = [
+        {
+            "role": str(item.get("role") or ""),
+            "side": str(item.get("side") or "").upper().strip(),
+        }
+        for item in dropped_places
+    ]
+    result["runtime_safety_signal_gate"] = report
+    return result, report
+
+
+def _guard_registered_runtime_safety_order_before_submit(
+    *,
+    args: Any,
+    order: Mapping[str, Any],
+    now: datetime,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    _signal, report = _registered_runtime_safety_signal_gate(args, now=now)
+    if not report["active"] or _runtime_safety_normal_gtx_reduce(order):
+        return dict(order), None
+    return None, {
+        "reason": "runtime_safety_signal_blocks_risk_increase",
+        "signal_reason": report.get("reason"),
+        "role": str(order.get("role") or ""),
+        "side": str(order.get("side") or "").upper().strip(),
+    }
+
+
+def _apply_recovery_profile_gate_to_actions(
+    *,
+    args: Any,
+    actions: Mapping[str, Any],
+    expected_gate: Mapping[str, Any] | None,
+    now: datetime | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Re-fence one planned mutation set against the current symbol decision."""
+
+    result = dict(actions)
+    place_orders = [
+        dict(item)
+        for item in actions.get("place_orders", [])
+        if isinstance(item, Mapping)
+    ]
+    cancel_orders = [
+        dict(item)
+        for item in actions.get("cancel_orders", [])
+        if isinstance(item, Mapping)
+    ]
+    gate = _load_recovery_order_profile_gate(args, now=now)
+    expected_managed = bool(
+        isinstance(expected_gate, Mapping) and expected_gate.get("managed")
+    )
+    managed = gate.managed or expected_managed
+    authorized = not managed or (
+        gate.ready and gate.matches(expected_gate)
+    )
+    dropped_places: list[dict[str, Any]] = []
+    dropped_cancels: list[dict[str, Any]] = []
+    if authorized and gate.managed:
+        kept_places: list[dict[str, Any]] = []
+        for order in place_orders:
+            if gate.allows_order(order):
+                kept_places.append(order)
+            else:
+                dropped_places.append(order)
+        place_orders = kept_places
+    elif not authorized:
+        dropped_places = place_orders
+        dropped_cancels = cancel_orders
+        place_orders = []
+        cancel_orders = []
+
+    result["place_orders"] = place_orders
+    result["place_count"] = len(place_orders)
+    result["place_notional"] = sum(
+        _safe_float(item.get("notional"))
+        or _safe_float(item.get("price")) * _safe_float(item.get("qty"))
+        for item in place_orders
+    )
+    result["cancel_orders"] = cancel_orders
+    result["cancel_count"] = len(cancel_orders)
+    reason = None
+    if not authorized:
+        reason = gate.reason or "recovery_profile_plan_fence_mismatch"
+    elif dropped_places:
+        reason = "recovery_profile_scope_mismatch"
+    report = {
+        "managed": managed,
+        "authorized": authorized,
+        "reason": reason,
+        "current_gate": gate.as_dict(),
+        "dropped_place_count": len(dropped_places),
+        "dropped_cancel_count": len(dropped_cancels),
+        "dropped_orders": [
+            {
+                "role": str(item.get("role") or ""),
+                "side": str(item.get("side") or "").upper().strip(),
+            }
+            for item in dropped_places
+        ],
+    }
+    result["recovery_profile_gate"] = report
+    return result, report
+
+
+def _guard_recovery_profile_order_before_submit(
+    *,
+    args: Any,
+    order: Mapping[str, Any],
+    expected_gate: Mapping[str, Any] | None,
+    now: datetime | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    gate = _load_recovery_order_profile_gate(args, now=now)
+    expected_managed = bool(
+        isinstance(expected_gate, Mapping) and expected_gate.get("managed")
+    )
+    if not expected_managed:
+        if gate.managed:
+            return None, {
+                "reason": "recovery_profile_not_authorized",
+                "active_action": gate.active_action.value,
+                "gate_reason": "recovery_registered_after_plan",
+                "role": str(order.get("role") or ""),
+                "side": str(order.get("side") or "").upper().strip(),
+            }
+        unmanaged_order = dict(order)
+        unmanaged_order.pop("_ordinary_recovery_client_order_prefix", None)
+        return unmanaged_order, None
+    if not gate.matches(expected_gate) or not gate.allows_order(order):
+        return None, {
+            "reason": "recovery_profile_not_authorized",
+            "active_action": gate.active_action.value,
+            "gate_reason": gate.reason,
+            "role": str(order.get("role") or ""),
+            "side": str(order.get("side") or "").upper().strip(),
+        }
+    guarded_order = dict(order)
+    guarded_order.pop("_ordinary_recovery_client_order_prefix", None)
+    binding = _ordinary_recovery_gate_binding(gate)
+    if binding is not None:
+        try:
+            guarded_order["_ordinary_recovery_client_order_prefix"] = (
+                ordinary_recovery_client_order_prefix(
+                    symbol=str(binding["symbol"]),
+                    generation=int(binding["generation"]),
+                    decision_id=str(binding["decision_id"]),
+                    profile_digest=str(binding["profile_digest"]),
+                    action_id=str(binding["action_id"]),
+                    side=str(binding["side"]),
+                    order_role=str(binding["order_role"]),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            return None, {
+                "reason": "recovery_client_order_manifest_invalid",
+                "active_action": gate.active_action.value,
+                "gate_reason": str(exc),
+                "role": str(order.get("role") or ""),
+                "side": str(order.get("side") or "").upper().strip(),
+            }
+    return guarded_order, None
+
+
+def _maintain_normal_recovery_profile_gate(
+    args: Any,
+    *,
+    state_path: Path,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    gate = _load_recovery_order_profile_gate(args, now=now)
+    if not gate.managed or gate.ready:
+        return None
+    if _temporary_loss_terminal_owner_pending(
+        state_path=state_path,
+        symbol=gate.symbol,
+    ):
+        return None
+    action = "recovery_profile_fence_wait"
+    if gate.reason == "inventory_recover_progress_deadline_reached":
+        action = "inventory_recovery_deadline_wait"
+    return {
+        "action": action,
+        "skip_normal_cycle": True,
+        "recovery_action_count": 1,
+        "reason": gate.reason,
+        "recovery_profile_gate": gate.as_dict(),
+    }
+
+
+@dataclass(frozen=True)
+class _TemporaryLossRuntimeAuthorization:
+    symbol: str
+    generation: int
+    profile_digest: str
+    decision_id: str
+    action_lease_epoch: int
+    side: Side
+    hard_expires_at: datetime
+
+    @property
+    def role(self) -> str:
+        if self.side is Side.SELL:
+            return "best_quote_reduce_long"
+        return "best_quote_reduce_short"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "generation": self.generation,
+            "profile_digest": self.profile_digest,
+            "decision_id": self.decision_id,
+            "action_lease_epoch": self.action_lease_epoch,
+            "side": self.side.value,
+            "role": self.role,
+            "hard_expires_at": self.hard_expires_at.isoformat(),
+        }
+
+    def matches(self, expected: Mapping[str, Any] | None) -> bool:
+        if not isinstance(expected, Mapping):
+            return False
+        return bool(
+            expected.get("symbol") == self.symbol
+            and expected.get("generation") == self.generation
+            and expected.get("profile_digest") == self.profile_digest
+            and expected.get("decision_id") == self.decision_id
+            and expected.get("action_lease_epoch") == self.action_lease_epoch
+            and expected.get("side") == self.side.value
+            and expected.get("role") == self.role
+            and expected.get("hard_expires_at") == self.hard_expires_at.isoformat()
+        )
+
+
+def _build_temporary_loss_client_order_id(
+    *,
+    prefix: str,
+    order_index: int,
+    nonce_ns: int | None = None,
+) -> str:
+    """Build a unique id under the lease prefix used by crash reconstruction."""
+
+    normalized_prefix = str(prefix).strip()
+    if (
+        not normalized_prefix.startswith("gx-")
+        or not normalized_prefix.endswith("-")
+        or len(normalized_prefix) > 30
+        or type(order_index) is not int
+        or order_index < 1
+    ):
+        raise ValueError("temporary-loss client order id binding is invalid")
+    suffix_length = 36 - len(normalized_prefix)
+    if suffix_length < 6:
+        raise ValueError("temporary-loss client order id has no nonce capacity")
+    nonce = time.time_ns() if nonce_ns is None else int(nonce_ns)
+    suffix = hashlib.sha256(
+        f"{order_index}:{nonce}".encode("utf-8")
+    ).hexdigest()[:suffix_length]
+    return normalized_prefix + suffix
+
+
+def _build_recovery_aware_client_order_id(
+    *,
+    symbol: str,
+    role: str,
+    index: int,
+    order: Mapping[str, Any],
+    nonce_ns: int | None = None,
+) -> str:
+    temporary_loss_prefix = str(
+        order.get("_temporary_loss_client_order_prefix") or ""
+    ).strip()
+    if temporary_loss_prefix:
+        return _build_temporary_loss_client_order_id(
+            prefix=temporary_loss_prefix,
+            order_index=index,
+            nonce_ns=nonce_ns,
+        )
+    ordinary_recovery_prefix = str(
+        order.get("_ordinary_recovery_client_order_prefix") or ""
+    ).strip()
+    if ordinary_recovery_prefix:
+        return build_managed_order_client_order_id(
+            prefix=ordinary_recovery_prefix,
+            order_index=index,
+            nonce_ns=nonce_ns,
+        )
+    return _build_client_order_id(
+        symbol=symbol,
+        role=str(order.get("client_order_role") or role),
+        index=index,
+    )
+
+
+_RECOVERY_REQUIRED_PROTECTED_PROFILE_FIELDS = (
+    "best_quote_maker_volume_allow_loss_reduce_only",
+    "best_quote_maker_volume_net_loss_reduce_enabled",
+    "hard_loss_forced_reduce_enabled",
+    "volatility_entry_pause_enabled",
+)
+
+
+def _runtime_profile_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _runtime_profile_json(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_runtime_profile_json(item) for item in value]
+    if value is None or type(value) in {bool, int, float, str}:
+        return value
+    raise TypeError(f"unsupported runtime profile value: {type(value).__name__}")
+
+
+def _runtime_profile_values_equal(expected: Any, actual: Any) -> bool:
+    try:
+        expected_json = json.dumps(
+            _runtime_profile_json(expected),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        actual_json = json.dumps(
+            _runtime_profile_json(actual),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        return False
+    return expected_json == actual_json
+
+
+def _recovery_runtime_profile_is_applied(
+    args: Any,
+    state: RecoveryState,
+) -> bool:
+    desired = state.desired_profile.fields
+    for key, expected in desired.items():
+        if key.startswith("recovery_"):
+            continue
+        if not hasattr(args, key):
+            return False
+        actual = getattr(args, key)
+        if not _runtime_profile_values_equal(expected, actual):
+            return False
+    for key in _RECOVERY_REQUIRED_PROTECTED_PROFILE_FIELDS:
+        if key not in desired or type(desired[key]) is not bool:
+            return False
+    return True
+
+
+def _temporary_loss_state_binding(
+    state: RecoveryState,
+) -> dict[str, Any] | None:
+    lease = state.action_lease
+    if not (
+        state.symbol
+        and state.phase in {RecoveryPhase.SETTLING, RecoveryPhase.ACTIVE}
+        and state.active_action is ActionId.TEMPORARY_LOSS_RELIEF
+        and state.decision_id
+        and lease is not None
+        and lease.action_id is ActionId.TEMPORARY_LOSS_RELIEF
+        and lease.order_role is OrderRole.REDUCE_ONLY
+        and state.side is lease.side
+        and state.order_role is lease.order_role
+        and state.action_lease_epoch == lease.epoch
+        and state.hard_expires_at == lease.hard_expires_at
+    ):
+        return None
+    role = (
+        "best_quote_reduce_long"
+        if lease.side is Side.SELL
+        else "best_quote_reduce_short"
+    )
+    return {
+        "symbol": state.symbol,
+        "generation": state.generation,
+        "decision_id": str(state.decision_id),
+        "profile_digest": state.desired_profile.digest,
+        "action_lease_epoch": lease.epoch,
+        "side": lease.side.value,
+        "role": role,
+        "order_role": lease.order_role.value,
+        "hard_expires_at": lease.hard_expires_at.isoformat(),
+    }
+
+
+def _temporary_loss_recovery_binding(
+    args: Any,
+    state: RecoveryState,
+) -> dict[str, Any] | None:
+    binding = _temporary_loss_state_binding(state)
+    symbol = str(getattr(args, "symbol", "") or "").upper().strip()
+    expected_generation = getattr(args, "recovery_generation", None)
+    if not (
+        binding is not None
+        and symbol == state.symbol
+        and type(expected_generation) is int
+        and expected_generation >= 0
+        and state.generation == expected_generation
+    ):
+        return None
+    return binding
+
+
+def _temporary_loss_restoration_binding(
+    state: RecoveryState,
+) -> dict[str, Any] | None:
+    if not (
+        state.symbol
+        and state.phase is RecoveryPhase.RESTORING
+        and state.active_action is ActionId.TEMPORARY_LOSS_RELIEF
+        and state.decision_id
+        and state.action_lease is None
+    ):
+        return None
+    return {
+        "symbol": state.symbol,
+        "generation": state.generation,
+        "decision_id": str(state.decision_id),
+        "profile_digest": state.desired_profile.digest,
+    }
+
+
+def _temporary_loss_cleanup_binding(
+    state: RecoveryState,
+) -> dict[str, Any] | None:
+    lease = state.action_lease
+    obligation = state.cleanup_obligation
+    if not (
+        state.symbol
+        and state.phase is RecoveryPhase.CLEANING
+        and lease is not None
+        and lease.action_id is ActionId.TEMPORARY_LOSS_RELIEF
+        and obligation is not None
+        and obligation.source_action_id is ActionId.TEMPORARY_LOSS_RELIEF
+        and obligation.action_lease_epoch == lease.epoch
+    ):
+        return None
+    return {
+        "symbol": state.symbol,
+        "generation": state.generation,
+        "decision_id": obligation.source_decision_id,
+        "profile_digest": state.desired_profile.digest,
+        "action_lease_epoch": lease.epoch,
+        "side": lease.side.value,
+        "role": (
+            "best_quote_reduce_long"
+            if lease.side is Side.SELL
+            else "best_quote_reduce_short"
+        ),
+        "order_role": lease.order_role.value,
+        "hard_expires_at": lease.hard_expires_at.isoformat(),
+    }
+
+
+def _temporary_loss_receipt_id(
+    *,
+    kind: str,
+    binding: Mapping[str, Any],
+    identity: Mapping[str, Any] | None = None,
+) -> str:
+    payload = {
+        "kind": str(kind),
+        "binding": dict(binding),
+        "identity": dict(identity or {}),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "tlr-" + hashlib.sha256(encoded).hexdigest()[:32]
+
+
+def _load_temporary_loss_receipt_journal(
+    state: Mapping[str, Any],
+    *,
+    symbol: str,
+) -> dict[str, Any]:
+    raw = state.get(TEMPORARY_LOSS_RUNNER_RECEIPTS_KEY)
+    if raw is None:
+        return {
+            "schema": TEMPORARY_LOSS_RUNNER_RECEIPTS_SCHEMA,
+            "symbol": symbol,
+            "next_observation_seq": 0,
+            "events": [],
+            "latest": {},
+        }
+    if not isinstance(raw, Mapping):
+        raise RuntimeError("temporary loss runner receipt journal is corrupt")
+    journal = dict(raw)
+    events = journal.get("events")
+    latest = journal.get("latest")
+    next_seq = journal.get("next_observation_seq")
+    if not (
+        journal.get("schema") == TEMPORARY_LOSS_RUNNER_RECEIPTS_SCHEMA
+        and journal.get("symbol") == symbol
+        and isinstance(events, list)
+        and all(isinstance(item, Mapping) for item in events)
+        and isinstance(latest, Mapping)
+        and type(next_seq) is int
+        and next_seq >= 0
+    ):
+        raise RuntimeError("temporary loss runner receipt journal is corrupt")
+    journal["events"] = [dict(item) for item in events]
+    journal["latest"] = dict(latest)
+    return journal
+
+
+def _persist_temporary_loss_runner_receipts(
+    *,
+    state_path: Path,
+    binding: Mapping[str, Any],
+    observed_at: datetime,
+    events: Iterable[tuple[str, Mapping[str, Any], Mapping[str, Any] | None]],
+) -> list[dict[str, Any]]:
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("temporary loss receipt time must be timezone-aware")
+    state = read_json(state_path) or {}
+    if not isinstance(state, dict):
+        state = {}
+    journal = _load_temporary_loss_receipt_journal(
+        state,
+        symbol=str(binding["symbol"]),
+    )
+    existing_by_id = {
+        str(item.get("receipt_id") or ""): item
+        for item in journal["events"]
+        if item.get("receipt_id")
+    }
+    receipts: list[dict[str, Any]] = []
+    changed = False
+    for kind, details, identity in events:
+        receipt_id = _temporary_loss_receipt_id(
+            kind=kind,
+            binding=binding,
+            identity=identity,
+        )
+        existing = existing_by_id.get(receipt_id)
+        if existing is not None:
+            expected_fields = {
+                "receipt_id": receipt_id,
+                "kind": kind,
+                **dict(binding),
+                **dict(details),
+            }
+            if any(existing.get(key) != value for key, value in expected_fields.items()):
+                raise RuntimeError(
+                    "temporary loss runner receipt identity collision"
+                )
+            receipts.append(dict(existing))
+            continue
+        receipt = {
+            "receipt_id": receipt_id,
+            "kind": kind,
+            **dict(binding),
+            "observed_at": observed_at.astimezone(timezone.utc).isoformat(),
+            "observation_seq": int(journal["next_observation_seq"]),
+            **dict(details),
+        }
+        journal["next_observation_seq"] = int(journal["next_observation_seq"]) + 1
+        journal["events"].append(receipt)
+        journal["latest"][kind] = receipt_id
+        existing_by_id[receipt_id] = receipt
+        receipts.append(dict(receipt))
+        changed = True
+    if changed:
+        journal["events"] = journal["events"][
+            -TEMPORARY_LOSS_RUNNER_RECEIPTS_MAX_EVENTS:
+        ]
+        retained_ids = {
+            str(item.get("receipt_id") or "") for item in journal["events"]
+        }
+        journal["latest"] = {
+            kind: receipt_id
+            for kind, receipt_id in journal["latest"].items()
+            if str(receipt_id) in retained_ids
+        }
+        state[TEMPORARY_LOSS_RUNNER_RECEIPTS_KEY] = journal
+        _write_json(state_path, state)
+    return receipts
+
+
+def _ordinary_recovery_gate_binding(
+    gate: _RecoveryOrderProfileGate,
+) -> dict[str, Any] | None:
+    if not (
+        gate.managed
+        and gate.ready
+        and gate.active_action
+        in {
+            ActionId.INVENTORY_RECOVER,
+            ActionId.MAKER_FLOW_RECOVER,
+            ActionId.BASELINE_TUNE,
+        }
+        and gate.generation is not None
+        and gate.decision_id
+        and gate.profile_digest
+        and gate.side is not None
+        and gate.order_role in {OrderRole.ENTRY, OrderRole.REDUCE_ONLY}
+        and gate.ledger_class is LedgerClass.NORMAL_BQ
+        and len(gate.allowed_orders) == 1
+    ):
+        return None
+    role, side = gate.allowed_orders[0]
+    return {
+        "symbol": gate.symbol,
+        "generation": gate.generation,
+        "decision_id": gate.decision_id,
+        "profile_digest": gate.profile_digest,
+        "action_id": gate.active_action.value,
+        "side": side,
+        "role": role,
+        "order_role": gate.order_role.value,
+        "ledger_class": LedgerClass.NORMAL_BQ.value,
+    }
+
+
+def _inventory_recovery_receipt_id(
+    *,
+    binding: Mapping[str, Any],
+    order_ids: list[str],
+    client_order_ids: list[str],
+) -> str:
+    encoded = json.dumps(
+        {
+            "kind": "progress",
+            "binding": dict(binding),
+            "identity": {
+                "accepted_order_ids": order_ids,
+                "accepted_client_order_ids": client_order_ids,
+            },
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "irr-" + hashlib.sha256(encoded).hexdigest()[:32]
+
+
+def _record_ordinary_recovery_progress(
+    args: Any,
+    *,
+    state_path: Path,
+    expected_gate: Mapping[str, Any] | None,
+    submit_report: Mapping[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    observed_at = now or datetime.now(timezone.utc)
+    gate = _load_recovery_order_profile_gate(args, now=observed_at)
+    binding = _ordinary_recovery_gate_binding(gate)
+    if binding is None or not gate.matches(expected_gate):
+        return None
+    expected_client_prefix = ordinary_recovery_client_order_prefix(
+        symbol=str(binding["symbol"]),
+        generation=int(binding["generation"]),
+        decision_id=str(binding["decision_id"]),
+        profile_digest=str(binding["profile_digest"]),
+        action_id=str(binding["action_id"]),
+        side=str(binding["side"]),
+        order_role=str(binding["order_role"]),
+    )
+    accepted_pairs: set[tuple[str, str]] = set()
+    statuses: set[str] = set()
+    for row in submit_report.get("placed_orders", []):
+        if not isinstance(row, Mapping):
+            continue
+        request = row.get("request")
+        response = row.get("response")
+        if not isinstance(request, Mapping) or not isinstance(response, Mapping):
+            continue
+        if not (
+            str(request.get("role") or "").strip().lower() == binding["role"]
+            and str(request.get("side") or "").upper().strip() == binding["side"]
+            and str(request.get("time_in_force") or "").upper().strip() == "GTX"
+            and str(
+                request.get("order_type") or request.get("type") or ""
+            ).upper().strip()
+            == "LIMIT"
+        ):
+            continue
+        status = str(response.get("status") or "").upper().strip()
+        order_id = str(response.get("orderId") or "").strip()
+        client_order_id = str(response.get("clientOrderId") or "").strip()
+        if (
+            status not in {"NEW", "PARTIALLY_FILLED", "FILLED"}
+            or not order_id
+            or not client_order_id
+        ):
+            continue
+        if not client_order_id.startswith(expected_client_prefix):
+            raise RuntimeError(
+                "ordinary recovery response client order id is outside its decision prefix"
+            )
+        accepted_pairs.add((order_id, client_order_id))
+        statuses.add(status)
+    if not accepted_pairs:
+        return None
+    ordered_pairs = sorted(accepted_pairs)
+    order_ids = [item[0] for item in ordered_pairs]
+    client_order_ids = [item[1] for item in ordered_pairs]
+    receipt_id = _inventory_recovery_receipt_id(
+        binding=binding,
+        order_ids=order_ids,
+        client_order_ids=client_order_ids,
+    )
+    loaded_state = read_json(state_path)
+    if loaded_state is None and state_path.exists():
+        raise RuntimeError("runner state is unreadable; refusing inventory receipt")
+    local_state = loaded_state or {}
+    raw_journal = local_state.get(INVENTORY_RECOVERY_RUNNER_RECEIPTS_KEY)
+    if raw_journal is None:
+        journal = {
+            "schema": INVENTORY_RECOVERY_RUNNER_RECEIPTS_SCHEMA,
+            "symbol": gate.symbol,
+            "next_observation_seq": 0,
+            "events": [],
+            "latest": {},
+        }
+    elif isinstance(raw_journal, Mapping):
+        journal = dict(raw_journal)
+        if not (
+            journal.get("schema") == INVENTORY_RECOVERY_RUNNER_RECEIPTS_SCHEMA
+            and journal.get("symbol") == gate.symbol
+            and type(journal.get("next_observation_seq")) is int
+            and isinstance(journal.get("events"), list)
+            and all(isinstance(item, Mapping) for item in journal["events"])
+            and isinstance(journal.get("latest"), Mapping)
+        ):
+            raise RuntimeError("inventory recovery receipt journal is corrupt")
+        journal["events"] = [dict(item) for item in journal["events"]]
+        journal["latest"] = dict(journal["latest"])
+    else:
+        raise RuntimeError("inventory recovery receipt journal is corrupt")
+    existing = next(
+        (
+            event
+            for event in journal["events"]
+            if event.get("receipt_id") == receipt_id
+        ),
+        None,
+    )
+    details = {
+        "accepted_order_ids": order_ids,
+        "accepted_client_order_ids": client_order_ids,
+        "accepted_statuses": sorted(statuses),
+        "accepted_order_types": ["LIMIT"],
+        "accepted_time_in_force": ["GTX"],
+        "allow_loss_effective": False,
+        "progress_stage": "gtx_order_accepted",
+    }
+    if existing is None:
+        receipt = {
+            "receipt_id": receipt_id,
+            "kind": "progress",
+            **binding,
+            "observed_at": observed_at.astimezone(timezone.utc).isoformat(),
+            "observation_seq": int(journal["next_observation_seq"]),
+            **details,
+        }
+        journal["next_observation_seq"] = int(journal["next_observation_seq"]) + 1
+        journal["events"].append(receipt)
+        journal["events"] = journal["events"][
+            -INVENTORY_RECOVERY_RUNNER_RECEIPTS_MAX_EVENTS:
+        ]
+        journal["latest"] = {"progress": receipt_id}
+        local_state[INVENTORY_RECOVERY_RUNNER_RECEIPTS_KEY] = journal
+        _write_json(state_path, local_state)
+    else:
+        expected = {"receipt_id": receipt_id, "kind": "progress", **binding, **details}
+        if any(existing.get(key) != value for key, value in expected.items()):
+            raise RuntimeError("inventory recovery receipt identity collision")
+        receipt = dict(existing)
+    return {
+        "action": "ordinary_recovery_progress_receipt",
+        "receipt_id": receipt["receipt_id"],
+        "recovery_action_count": 0,
+        **binding,
+    }
+
+
+def _record_inventory_recovery_progress(
+    args: Any,
+    *,
+    state_path: Path,
+    expected_gate: Mapping[str, Any] | None,
+    submit_report: Mapping[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Compatibility wrapper for the generalized ordinary receipt writer."""
+
+    observed_at = now or datetime.now(timezone.utc)
+    if _load_recovery_order_profile_gate(
+        args,
+        now=observed_at,
+    ).active_action is not ActionId.INVENTORY_RECOVER:
+        return None
+    receipt = _record_ordinary_recovery_progress(
+        args,
+        state_path=state_path,
+        expected_gate=expected_gate,
+        submit_report=submit_report,
+        now=observed_at,
+    )
+    if receipt is None or receipt.get("action_id") != ActionId.INVENTORY_RECOVER.value:
+        return None
+    return receipt
+
+
+def _recovery_config_applied_binding(
+    state: RecoveryState,
+) -> dict[str, Any] | None:
+    if not state.decision_id or state.issued_at is None:
+        return None
+    return {
+        "symbol": state.symbol,
+        "generation": state.generation,
+        "decision_id": str(state.decision_id),
+        "profile_digest": state.desired_profile.digest,
+    }
+
+
+def _recovery_config_applied_receipt_id(
+    *,
+    binding: Mapping[str, Any],
+    runner_instance_id: str,
+) -> str:
+    encoded = json.dumps(
+        {
+            "kind": "config_applied",
+            "binding": dict(binding),
+            "runner_instance_id": runner_instance_id,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "rca-" + hashlib.sha256(encoded).hexdigest()[:32]
+
+
+def _record_current_recovery_config_applied(
+    args: Any,
+    *,
+    state_path: Path,
+    now: datetime | None = None,
+    runner_instance_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Persist startup proof only after args match the live recovery target."""
+
+    if not bool(getattr(args, "apply", False)):
+        return None
+    control_path = str(getattr(args, "recovery_control_path", "") or "").strip()
+    expected_generation = getattr(args, "recovery_generation", None)
+    if not control_path and expected_generation is None:
+        return None
+    if not control_path:
+        raise RuntimeError("recovery config-applied generation fence is missing")
+    observed_at = now or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("recovery config-applied time must be timezone-aware")
+    symbol = str(getattr(args, "symbol", "") or "").upper().strip()
+    try:
+        state = JsonRecoveryStore(control_path).read(symbol)
+    except RecoveryStateUnavailableError as exc:
+        if expected_generation is None:
+            return None
+        raise RuntimeError(
+            "recovery config-applied registration is missing"
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(
+            "recovery config-applied dynamic store is unavailable"
+        ) from exc
+    if type(expected_generation) is not int or expected_generation < 0:
+        raise RuntimeError("recovery config-applied generation fence is missing")
+    _require_separate_temporary_loss_receipt_path(args, state_path)
+    binding = _recovery_config_applied_binding(state)
+    if binding is None:
+        return None
+    if state.symbol != symbol or state.generation != expected_generation:
+        raise RuntimeError("recovery config-applied generation mismatch")
+    if state.desired_runner_state != "running":
+        raise RuntimeError("recovery config-applied target is not running")
+    if not _recovery_runtime_profile_is_applied(args, state):
+        raise RuntimeError("recovery config-applied profile mismatch")
+    if (
+        observed_at < state.issued_at
+        or (
+            state.progress_deadline_at is not None
+            and observed_at >= state.progress_deadline_at
+        )
+        or (
+            state.hard_expires_at is not None
+            and observed_at >= state.hard_expires_at
+        )
+    ):
+        raise RuntimeError("recovery config-applied deadline reached")
+    instance_id = str(runner_instance_id or "").strip()
+    if not instance_id:
+        instance_id = (
+            f"pid-{os.getpid()}-"
+            f"{observed_at.astimezone(timezone.utc).isoformat()}"
+        )
+    if instance_id != str(runner_instance_id or instance_id):
+        raise ValueError("runner_instance_id must be canonical")
+    receipt_id = _recovery_config_applied_receipt_id(
+        binding=binding,
+        runner_instance_id=instance_id,
+    )
+    loaded_state = read_json(state_path)
+    if loaded_state is None and state_path.exists():
+        raise RuntimeError("runner state is unreadable; refusing config receipt")
+    local_state = loaded_state or {}
+    raw_journal = local_state.get(RECOVERY_CONFIG_APPLIED_RECEIPTS_KEY)
+    journal_rebuilt = False
+    if raw_journal is not None:
+        try:
+            load_recovery_config_applied_evidence(
+                state_path=state_path,
+                recovery_state=state,
+                captured_at=observed_at,
+            )
+        except RecoveryConfigAppliedReceiptJournalError:
+            # This journal is local proof, not control authority.  Once the
+            # live generation and complete runtime profile above have matched,
+            # discard only the corrupt proof slot so startup can issue a fresh
+            # fenced receipt without erasing unrelated runner state.
+            local_state.pop(RECOVERY_CONFIG_APPLIED_RECEIPTS_KEY, None)
+            raw_journal = None
+            journal_rebuilt = True
+    if raw_journal is None:
+        journal = {
+            "schema": RECOVERY_CONFIG_APPLIED_RECEIPTS_SCHEMA,
+            "symbol": state.symbol,
+            "next_observation_seq": 0,
+            "events": [],
+            "latest": {},
+        }
+    elif isinstance(raw_journal, Mapping):
+        journal = dict(raw_journal)
+        if not (
+            journal.get("schema") == RECOVERY_CONFIG_APPLIED_RECEIPTS_SCHEMA
+            and journal.get("symbol") == state.symbol
+            and type(journal.get("next_observation_seq")) is int
+            and journal.get("next_observation_seq") >= 0
+            and isinstance(journal.get("events"), list)
+            and all(isinstance(item, Mapping) for item in journal["events"])
+            and isinstance(journal.get("latest"), Mapping)
+        ):
+            raise RuntimeError("recovery config-applied journal is corrupt")
+        journal["events"] = [dict(item) for item in journal["events"]]
+        journal["latest"] = dict(journal["latest"])
+    else:
+        raise RuntimeError("recovery config-applied journal is corrupt")
+    existing = next(
+        (
+            event
+            for event in journal["events"]
+            if event.get("receipt_id") == receipt_id
+        ),
+        None,
+    )
+    details = {
+        "runner_instance_id": instance_id,
+        "config_applied": True,
+    }
+    if existing is None:
+        receipt = {
+            "receipt_id": receipt_id,
+            "kind": "config_applied",
+            **binding,
+            **details,
+            "observed_at": observed_at.astimezone(timezone.utc).isoformat(),
+            "observation_seq": int(journal["next_observation_seq"]),
+        }
+        journal["next_observation_seq"] = int(journal["next_observation_seq"]) + 1
+        journal["events"].append(receipt)
+        journal["events"] = journal["events"][
+            -RECOVERY_CONFIG_APPLIED_RECEIPTS_MAX_EVENTS:
+        ]
+        journal["latest"] = {"config_applied": receipt_id}
+        local_state[RECOVERY_CONFIG_APPLIED_RECEIPTS_KEY] = journal
+        _write_json(state_path, local_state)
+    else:
+        expected = {
+            "receipt_id": receipt_id,
+            "kind": "config_applied",
+            **binding,
+            **details,
+        }
+        if any(existing.get(key) != value for key, value in expected.items()):
+            raise RuntimeError("recovery config-applied receipt identity collision")
+        receipt = dict(existing)
+    return {
+        "action": "recovery_config_applied_receipt",
+        "receipt_id": receipt["receipt_id"],
+        "runner_instance_id": instance_id,
+        "journal_rebuilt": journal_rebuilt,
+        "recovery_action_count": 0,
+        **binding,
+    }
+
+
+def _read_temporary_loss_recovery_state(args: Any) -> RecoveryState | None:
+    control_path = str(getattr(args, "recovery_control_path", "") or "").strip()
+    symbol = str(getattr(args, "symbol", "") or "").upper().strip()
+    if not control_path or not symbol:
+        return None
+    try:
+        state = JsonRecoveryStore(control_path).read(symbol)
+    except Exception:
+        return None
+    return state
+
+
+def _require_separate_temporary_loss_receipt_path(
+    args: Any,
+    state_path: Path,
+) -> None:
+    control_path = str(getattr(args, "recovery_control_path", "") or "").strip()
+    if not control_path:
+        return
+    if state_path.expanduser().resolve() == Path(control_path).expanduser().resolve():
+        raise RuntimeError(
+            "temporary loss runner receipts cannot be written to recovery control"
+        )
+
+
+def _temporary_loss_known_order_ids(
+    *,
+    state_path: Path,
+    binding: Mapping[str, Any],
+) -> tuple[list[str], list[str]]:
+    state = read_json(state_path)
+    if state is None and state_path.exists():
+        raise RuntimeError("runner state is unreadable; refusing to replace it")
+    state = state or {}
+    journal = _load_temporary_loss_receipt_journal(
+        state,
+        symbol=str(binding["symbol"]),
+    )
+    accepted_pairs: set[tuple[str, str]] = set()
+    binding_keys = (
+        "symbol",
+        "generation",
+        "decision_id",
+        "profile_digest",
+        "action_lease_epoch",
+        "side",
+        "role",
+    )
+    for event in journal["events"]:
+        if event.get("kind") != "progress" or any(
+            event.get(key) != binding.get(key) for key in binding_keys
+        ):
+            continue
+        order_ids = [
+            str(item)
+            for item in event.get("accepted_order_ids", [])
+            if str(item)
+        ]
+        client_order_ids = [
+            str(item)
+            for item in event.get("accepted_client_order_ids", [])
+            if str(item)
+        ]
+        if len(order_ids) != len(client_order_ids):
+            raise RuntimeError("temporary loss receipt manifest pair is corrupt")
+        accepted_pairs.update(zip(order_ids, client_order_ids, strict=True))
+    ordered_pairs = sorted(accepted_pairs)
+    return (
+        [order_id for order_id, _client_order_id in ordered_pairs],
+        [client_order_id for _order_id, client_order_id in ordered_pairs],
+    )
+
+
+def _temporary_loss_terminal_owner_pending(
+    *,
+    state_path: Path,
+    symbol: str,
+) -> bool:
+    local_state = read_json(state_path)
+    if local_state is None and state_path.exists():
+        return True
+    local_state = local_state or {}
+    if isinstance(local_state.get(TERMINAL_DRAIN_STATE_KEY), Mapping):
+        return True
+    local_intent = local_state.get(TERMINAL_INTENT_STATE_KEY)
+    if isinstance(local_intent, Mapping) and local_intent.get("status") in (
+        TERMINAL_INTENT_RESUMABLE_STATUSES
+    ):
+        return True
+    _intent_path, terminal_intent = _read_resumable_terminal_intent(
+        state_path=state_path,
+        symbol=symbol,
+    )
+    return terminal_intent is not None
+
+
+def _maintain_temporary_loss_recovery_receipts(
+    args: Any,
+    *,
+    state_path: Path,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Write one fenced lease lifecycle receipt and tell the loop when to yield.
+
+    This adapter never signs a lease, mutates the coordinator control document,
+    touches process state, or executes cleanup.  SETTLING and expired leases
+    therefore consume the recovery slot for this cycle; the coordinator uses
+    the durable receipt on its next round.
+    """
+
+    observed_at = now or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        return None
+    _require_separate_temporary_loss_receipt_path(args, state_path)
+    state = _read_temporary_loss_recovery_state(args)
+    if state is None:
+        return None
+    expected_symbol = str(getattr(args, "symbol", "") or "").upper().strip()
+    expected_generation = getattr(args, "recovery_generation", None)
+    cleanup_binding = _temporary_loss_cleanup_binding(state)
+    if cleanup_binding is not None:
+        setattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)
+        if _temporary_loss_terminal_owner_pending(
+            state_path=state_path,
+            symbol=state.symbol,
+        ):
+            return None
+        return {
+            "action": "temporary_loss_cleanup_fence_wait",
+            "skip_normal_cycle": True,
+            "recovery_action_count": 1,
+            "allow_loss_effective": False,
+            "reason": (
+                "recovery_generation_mismatch"
+                if state.symbol != expected_symbol
+                or state.generation != expected_generation
+                else "temporary_loss_cleanup_pending"
+            ),
+            **cleanup_binding,
+        }
+    restoration_binding = _temporary_loss_restoration_binding(state)
+    if restoration_binding is not None:
+        setattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)
+        if (
+            state.symbol != expected_symbol
+            or state.generation != expected_generation
+        ):
+            return {
+                "action": "temporary_loss_generation_fence_wait",
+                "skip_normal_cycle": True,
+                "recovery_action_count": 1,
+                "allow_loss_effective": False,
+                "reason": "recovery_generation_mismatch",
+                **restoration_binding,
+            }
+        if _temporary_loss_terminal_owner_pending(
+            state_path=state_path,
+            symbol=state.symbol,
+        ):
+            return None
+        if not _recovery_runtime_profile_is_applied(args, state):
+            return {
+                "action": "temporary_loss_restoration_blocked",
+                "skip_normal_cycle": True,
+                "recovery_action_count": 1,
+                "allow_loss_effective": False,
+                "reason": "recovery_profile_not_applied",
+                **restoration_binding,
+            }
+        receipts = _persist_temporary_loss_runner_receipts(
+            state_path=state_path,
+            binding=restoration_binding,
+            observed_at=observed_at,
+            events=(
+                (
+                    "restoration_applied",
+                    {
+                        "allow_loss_effective": False,
+                        "config_applied": True,
+                    },
+                    None,
+                ),
+            ),
+        )
+        return {
+            "action": "temporary_loss_restoration_applied_receipt",
+            "receipt_id": receipts[0]["receipt_id"],
+            "skip_normal_cycle": False,
+            "recovery_action_count": 1,
+            "allow_loss_effective": False,
+            **restoration_binding,
+        }
+    if state.action_lease is None:
+        return None
+    binding = _temporary_loss_state_binding(state)
+    if binding is None:
+        return None
+    if state.symbol != expected_symbol or state.generation != expected_generation:
+        setattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)
+        return {
+            "action": "temporary_loss_generation_fence_wait",
+            "skip_normal_cycle": True,
+            "recovery_action_count": 1,
+            "allow_loss_effective": False,
+            "reason": "recovery_generation_mismatch",
+            **binding,
+        }
+    expired = observed_at >= state.action_lease.hard_expires_at
+    if expired:
+        setattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)
+        order_ids, client_order_ids = _temporary_loss_known_order_ids(
+            state_path=state_path,
+            binding=binding,
+        )
+        receipt_events: list[
+            tuple[str, Mapping[str, Any], Mapping[str, Any] | None]
+        ] = [
+            (
+                "expiry",
+                {
+                    "allow_loss_effective": False,
+                    "expired_at": state.action_lease.hard_expires_at.isoformat(),
+                    "reason": "temporary_loss_action_lease_hard_expired",
+                },
+                None,
+            )
+        ]
+        if state.phase is RecoveryPhase.ACTIVE:
+            receipt_events.append(
+                (
+                    "cleanup_needed",
+                    {
+                        "allow_loss_effective": False,
+                        "accepted_order_ids": order_ids,
+                        "accepted_client_order_ids": client_order_ids,
+                        "exchange_observation_required": True,
+                        "reason": "temporary_loss_lease_orders_must_reconcile",
+                    },
+                    None,
+                )
+            )
+        receipts = _persist_temporary_loss_runner_receipts(
+            state_path=state_path,
+            binding=binding,
+            observed_at=observed_at,
+            events=receipt_events,
+        )
+        return {
+            "action": "temporary_loss_expiry_cleanup_receipt",
+            "receipt_id": receipts[0]["receipt_id"],
+            "cleanup_receipt_id": (
+                receipts[1]["receipt_id"] if len(receipts) > 1 else None
+            ),
+            "skip_normal_cycle": True,
+            "recovery_action_count": 1,
+            "allow_loss_effective": False,
+            **binding,
+        }
+    if _temporary_loss_terminal_owner_pending(
+        state_path=state_path,
+        symbol=state.symbol,
+    ):
+        setattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)
+        return None
+    if state.phase is RecoveryPhase.SETTLING:
+        if not _recovery_runtime_profile_is_applied(args, state):
+            return {
+                "action": "temporary_loss_activation_blocked",
+                "skip_normal_cycle": True,
+                "recovery_action_count": 1,
+                "allow_loss_effective": False,
+                "reason": "recovery_profile_not_applied",
+                **binding,
+            }
+        receipts = _persist_temporary_loss_runner_receipts(
+            state_path=state_path,
+            binding=binding,
+            observed_at=observed_at,
+            events=(
+                (
+                    "activation",
+                    {
+                        "allow_loss_effective": False,
+                        "config_applied": True,
+                    },
+                    None,
+                ),
+            ),
+        )
+        return {
+            "action": "temporary_loss_activation_receipt",
+            "receipt_id": receipts[0]["receipt_id"],
+            "skip_normal_cycle": True,
+            "recovery_action_count": 1,
+            "allow_loss_effective": False,
+            **binding,
+        }
+    if not _recovery_runtime_profile_is_applied(args, state):
+        setattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)
+        return {
+            "action": "temporary_loss_profile_fence_wait",
+            "skip_normal_cycle": True,
+            "recovery_action_count": 1,
+            "allow_loss_effective": False,
+            "reason": "recovery_profile_not_applied",
+            **binding,
+        }
+    return None
+
+
+def _record_temporary_loss_recovery_progress(
+    args: Any,
+    *,
+    state_path: Path,
+    plan_report: Mapping[str, Any],
+    submit_report: Mapping[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    observed_at = now or datetime.now(timezone.utc)
+    _require_separate_temporary_loss_receipt_path(args, state_path)
+    authorization = _temporary_loss_runtime_authorization(args, now=observed_at)
+    expected = plan_report.get("temporary_loss_recovery_authorization")
+    if authorization is None or not authorization.matches(
+        expected if isinstance(expected, Mapping) else None
+    ):
+        return None
+    expected_client_prefix = temporary_loss_client_order_prefix_for_binding(
+        symbol=authorization.symbol,
+        source_decision_id=authorization.decision_id,
+        action_lease_epoch=authorization.action_lease_epoch,
+        side=authorization.side,
+        hard_expires_at=authorization.hard_expires_at,
+    )
+    accepted_pairs: set[tuple[str, str]] = set()
+    statuses: set[str] = set()
+    for row in submit_report.get("placed_orders", []):
+        if not isinstance(row, Mapping):
+            continue
+        request = row.get("request")
+        response = row.get("response")
+        if not isinstance(request, Mapping) or not isinstance(response, Mapping):
+            continue
+        if not (
+            str(request.get("role") or "").strip().lower() == authorization.role
+            and str(request.get("side") or "").upper().strip()
+            == authorization.side.value
+            and str(request.get("time_in_force") or "").upper().strip() == "GTX"
+        ):
+            continue
+        status = str(response.get("status") or "").upper().strip()
+        if status not in {"NEW", "PARTIALLY_FILLED", "FILLED"}:
+            continue
+        order_id = str(response.get("orderId") or "").strip()
+        client_order_id = str(response.get("clientOrderId") or "").strip()
+        if not order_id or not client_order_id:
+            continue
+        if not client_order_id.startswith(expected_client_prefix):
+            raise RuntimeError(
+                "temporary-loss response client order id is outside its decision prefix"
+            )
+        accepted_pairs.add((order_id, client_order_id))
+        statuses.add(status)
+    if not accepted_pairs:
+        return None
+    ordered_pairs = sorted(accepted_pairs)
+    binding = {
+        **authorization.as_dict(),
+        "order_role": OrderRole.REDUCE_ONLY.value,
+    }
+    identity = {
+        "accepted_order_ids": [order_id for order_id, _client_id in ordered_pairs],
+        "accepted_client_order_ids": [
+            client_id for _order_id, client_id in ordered_pairs
+        ],
+    }
+    receipts = _persist_temporary_loss_runner_receipts(
+        state_path=state_path,
+        binding=binding,
+        observed_at=observed_at,
+        events=(
+            (
+                "progress",
+                {
+                    **identity,
+                    "accepted_statuses": sorted(statuses),
+                    "allow_loss_effective": True,
+                    "progress_stage": "gtx_order_accepted",
+                },
+                identity,
+            ),
+        ),
+    )
+    return {
+        "action": "temporary_loss_progress_receipt",
+        "receipt_id": receipts[0]["receipt_id"],
+        "recovery_action_count": 0,
+        **binding,
+    }
+
+
+def _temporary_loss_runtime_authorization(
+    args: Any,
+    *,
+    now: datetime | None = None,
+) -> _TemporaryLossRuntimeAuthorization | None:
+    """Resolve one side's temporary loss permission from durable state.
+
+    Activation advances the coordinator generation and issues a fenced runner
+    restart.  The process generation plus the atomically persisted state/profile
+    pair must both match; missing, corrupt, expired, stale-process, cross-side,
+    or cross-role leases all fail closed.
+    """
+
+    if not bool(
+        getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)
+    ):
+        return None
+    observed_at = now or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        return None
+    control_path = str(getattr(args, "recovery_control_path", "") or "").strip()
+    expected_generation = getattr(args, "recovery_generation", None)
+    if (
+        not control_path
+        or type(expected_generation) is not int
+        or expected_generation < 0
+    ):
+        return None
+    try:
+        state = JsonRecoveryStore(control_path).read(
+            str(getattr(args, "symbol", "") or "").upper().strip()
+        )
+    except Exception:
+        return None
+    if (
+        state.generation != expected_generation
+        or _temporary_loss_recovery_binding(args, state) is None
+        or not _recovery_runtime_profile_is_applied(args, state)
+    ):
+        return None
+    try:
+        authorized = temporary_loss_authorized(state, now=observed_at)
+    except (TypeError, ValueError):
+        return None
+    if not authorized or state.action_lease is None:
+        return None
+    return _TemporaryLossRuntimeAuthorization(
+        symbol=state.symbol,
+        generation=state.generation,
+        profile_digest=state.desired_profile.digest,
+        decision_id=str(state.decision_id or ""),
+        action_lease_epoch=state.action_lease.epoch,
+        side=state.action_lease.side,
+        hard_expires_at=state.action_lease.hard_expires_at,
+    )
+
+
+def _temporary_loss_runtime_allow_roles(
+    args: Any,
+    *,
+    now: datetime | None = None,
+    expected_authorization: Mapping[str, Any] | None = None,
+    require_expected_authorization: bool = False,
+) -> frozenset[str]:
+    authorization = _temporary_loss_runtime_authorization(args, now=now)
+    if authorization is None:
+        return frozenset()
+    if require_expected_authorization and not authorization.matches(
+        expected_authorization
+    ):
+        return frozenset()
+    return frozenset({authorization.role})
+
+
+def _best_quote_submit_allow_loss_roles(
+    args: Any,
+    *,
+    now: datetime | None = None,
+    temporary_loss_roles: Iterable[str] | None = None,
+    expected_authorization: Mapping[str, Any] | None = None,
+    require_expected_authorization: bool = False,
+) -> set[str] | None:
     roles: set[str] = {
         "inventory_unlock_reduce_long",
         "inventory_unlock_reduce_short",
     }
-    if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)):
-        roles.update(
-            {
-                "best_quote_reduce_long",
-                "best_quote_reduce_short",
-            }
+    roles.update(
+        temporary_loss_roles
+        if temporary_loss_roles is not None
+        else _temporary_loss_runtime_allow_roles(
+            args,
+            now=now,
+            expected_authorization=expected_authorization,
+            require_expected_authorization=require_expected_authorization,
         )
+    )
     if bool(getattr(args, "best_quote_maker_volume_active_pair_reduce_enabled", False)):
         roles.update(
             {
@@ -12681,6 +19386,136 @@ def _best_quote_submit_allow_loss_roles(args: Any) -> set[str] | None:
             }
         )
     return roles or None
+
+
+def _guard_temporary_loss_order_before_submit(
+    *,
+    args: Any,
+    order: Mapping[str, Any],
+    plan_report: dict[str, Any],
+    strategy_mode: str,
+    live_bid_price: float,
+    live_ask_price: float,
+    tick_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    step_size: float | None,
+    now: datetime | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Re-check the typed lease at the last runner boundary before submit."""
+
+    candidate = dict(order)
+    role = str(candidate.get("role") or "").strip().lower()
+    if role not in {"best_quote_reduce_long", "best_quote_reduce_short"}:
+        return candidate, None
+    attempted_temporary_bypass = bool(
+        getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)
+    ) or str(candidate.get("reduce_only_no_loss_guard") or "").startswith(
+        "bypassed_allow_loss_role_"
+    )
+    if not attempted_temporary_bypass:
+        return candidate, None
+    raw_state_path = str(getattr(args, "state_path", "") or "").strip()
+    if raw_state_path and _temporary_loss_terminal_owner_pending(
+        state_path=Path(raw_state_path),
+        symbol=str(getattr(args, "symbol", "") or "").upper().strip(),
+    ):
+        setattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)
+        return None, {
+            "reason": "terminal_owner_preempts_temporary_loss",
+            "role": role,
+        }
+    if str(candidate.get("execution_type", "post_only")).strip().lower() == (
+        "aggressive"
+    ):
+        return None, {
+            "reason": "temporary_loss_requires_gtx",
+            "role": role,
+        }
+    # Hedge-mode exits use ``positionSide`` instead of Binance's reduceOnly
+    # flag.  Mark this private guard copy so the shared no-loss guard still
+    # classifies the order as inventory reducing.
+    original_force_reduce_only = candidate.get("force_reduce_only")
+    candidate["force_reduce_only"] = True
+    expected_authorization = plan_report.get("temporary_loss_recovery_authorization")
+    temporary_roles = _temporary_loss_runtime_allow_roles(
+        args,
+        now=now,
+        expected_authorization=(
+            expected_authorization
+            if isinstance(expected_authorization, Mapping)
+            else None
+        ),
+        require_expected_authorization=True,
+    )
+    guarded = apply_reduce_only_no_loss_guard_to_actions(
+        actions={
+            "place_orders": [candidate],
+            "place_count": 1,
+            "place_notional": _safe_float(candidate.get("notional")),
+        },
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+        tick_size=tick_size,
+        min_qty=min_qty,
+        min_notional=min_notional,
+        step_size=step_size,
+        enabled=True,
+        allow_loss_roles=_best_quote_submit_allow_loss_roles(
+            args,
+            now=now,
+            temporary_loss_roles=temporary_roles,
+        ),
+    )
+    kept = [
+        dict(item)
+        for item in guarded.get("place_orders", [])
+        if isinstance(item, dict)
+    ]
+    if not kept:
+        return None, {
+            "reason": "temporary_loss_lease_not_authorized",
+            "role": role,
+            "guard": guarded.get("reduce_only_no_loss_guard"),
+        }
+    guard_report = guarded.get("reduce_only_no_loss_guard") or {}
+    guard_price = (
+        guard_report.get("long_floor_price")
+        if role == "best_quote_reduce_long"
+        else guard_report.get("short_ceiling_price")
+    )
+    if role not in temporary_roles and _safe_float(guard_price) <= 0:
+        return None, {
+            "reason": "temporary_loss_cost_basis_unavailable",
+            "role": role,
+        }
+    authorization = _temporary_loss_runtime_authorization(args, now=now)
+    if authorization is None or not authorization.matches(
+        expected_authorization
+        if isinstance(expected_authorization, Mapping)
+        else None
+    ):
+        return None, {
+            "reason": "temporary_loss_lease_not_authorized",
+            "role": role,
+        }
+    guarded_order = kept[0]
+    guarded_order["_temporary_loss_client_order_prefix"] = (
+        temporary_loss_client_order_prefix_for_binding(
+            symbol=authorization.symbol,
+            source_decision_id=authorization.decision_id,
+            action_lease_epoch=authorization.action_lease_epoch,
+            side=authorization.side,
+            hard_expires_at=authorization.hard_expires_at,
+        )
+    )
+    if original_force_reduce_only is None:
+        guarded_order.pop("force_reduce_only", None)
+    else:
+        guarded_order["force_reduce_only"] = original_force_reduce_only
+    return guarded_order, None
 
 
 def _best_quote_take_profit_guard_cost_basis(
@@ -18891,6 +25726,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             )
 
     synthetic_ledger_snapshot: dict[str, Any] | None = None
+    temporary_loss_authorization: _TemporaryLossRuntimeAuthorization | None = None
     excess_inventory_gate = {
         "enabled": bool(getattr(args, "excess_inventory_reduce_only_enabled", False)),
         "active": False,
@@ -21235,12 +28071,22 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         best_quote_take_profit_guard_enabled = bool(
             getattr(effective_args, "best_quote_maker_volume_take_profit_guard_enabled", True)
         )
+        temporary_loss_authorization = _temporary_loss_runtime_authorization(
+            args,
+            now=plan_now,
+        )
+        temporary_loss_roles = frozenset(
+            {temporary_loss_authorization.role}
+            if temporary_loss_authorization is not None
+            else ()
+        )
         best_quote_long_guard_roles, best_quote_short_guard_roles = _best_quote_take_profit_guard_role_sets(
             hedge_best_quote=hedge_best_quote,
             enabled=best_quote_take_profit_guard_enabled,
             allow_loss_reduce_only=bool(
                 getattr(effective_args, "best_quote_maker_volume_allow_loss_reduce_only", False)
             ),
+            authorized_loss_roles=temporary_loss_roles,
         )
         # Under frozen isolation current_*_avg_price is the managed-only basis;
         # also feed the whole-position exchange basis so the no-loss guard clamps
@@ -23057,6 +29903,25 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             *plan["buy_orders"],
             *plan["sell_orders"],
         ]
+    recovery_order_profile_gate = _load_recovery_order_profile_gate(
+        args,
+        now=plan_now,
+    )
+    recovery_profile_gate = apply_recovery_profile_gate_to_plan(
+        plan=plan,
+        gate=recovery_order_profile_gate,
+    )
+    runtime_safety_signal_gate = (
+        _apply_registered_runtime_safety_signal_to_plan(
+            args=args,
+            plan=plan,
+            now=plan_now,
+        )
+    )
+    desired_orders = [
+        *plan["buy_orders"],
+        *plan["sell_orders"],
+    ]
     diff = diff_open_orders(existing_orders=open_orders_for_diff, desired_orders=desired_orders)
 
     state_now = _isoformat(_utc_now())
@@ -23091,8 +29956,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         state["sticky_exit_mode_key"] = sticky_exit_mode["key"]
     else:
         state.pop("sticky_exit_mode_key", None)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json(state_path, state)
 
     effective_loss_inventory_no_cross_small_entry_notional = max(
         _safe_float(getattr(effective_args, "loss_inventory_no_cross_small_entry_notional", 0.0)),
@@ -23140,6 +30004,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "entry_permission_gate": entry_permission_gate,
         "maker_volatility_inventory": maker_volatility_inventory,
         "best_quote_maker_volume": best_quote_maker_volume,
+        "temporary_loss_recovery_authorization": (
+            temporary_loss_authorization.as_dict()
+            if temporary_loss_authorization is not None
+            else None
+        ),
+        "recovery_profile_gate": recovery_profile_gate,
+        "runtime_safety_signal_gate": runtime_safety_signal_gate,
         "synthetic_trend_follow": synthetic_trend_follow,
         "synthetic_flow_sleeve": synthetic_flow_sleeve,
         "adverse_inventory_reduce": adverse_inventory_reduce,
@@ -23458,7 +30329,18 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
         enabled=True,
-        allow_loss_roles=_best_quote_submit_allow_loss_roles(args),
+        allow_loss_roles=_best_quote_submit_allow_loss_roles(
+            args,
+            expected_authorization=(
+                plan_report.get("temporary_loss_recovery_authorization")
+                if isinstance(
+                    plan_report.get("temporary_loss_recovery_authorization"),
+                    Mapping,
+                )
+                else None
+            ),
+            require_expected_authorization=True,
+        ),
     )
     validation["actions"] = isolate_frozen_pair_release_place_orders(validation["actions"])
     if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
@@ -23502,6 +30384,26 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                 or validation["actions"].get("place_count", 0) > 0
             )
 
+    validation["actions"], recovery_profile_execution = (
+        _apply_recovery_profile_gate_to_actions(
+            args=args,
+            actions=validation["actions"],
+            expected_gate=(
+                plan_report.get("recovery_profile_gate")
+                if isinstance(plan_report.get("recovery_profile_gate"), Mapping)
+                else None
+            ),
+            now=datetime.now(timezone.utc),
+        )
+    )
+    validation["actions"], runtime_safety_signal_execution = (
+        _apply_registered_runtime_safety_signal_to_actions(
+            args=args,
+            actions=validation["actions"],
+            now=datetime.now(timezone.utc),
+        )
+    )
+
     report = {
         "plan_json": str(args.plan_json),
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -23517,6 +30419,8 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         "canceled_orders": [],
         "placed_orders": [],
         "skipped_orders": [],
+        "recovery_profile_execution": recovery_profile_execution,
+        "runtime_safety_signal_execution": runtime_safety_signal_execution,
         "configuration": {
             "allow_symbol": args.symbol.upper().strip(),
             "strategy_mode": strategy_mode,
@@ -23970,7 +30874,18 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
         enabled=True,
-        allow_loss_roles=_best_quote_submit_allow_loss_roles(args),
+        allow_loss_roles=_best_quote_submit_allow_loss_roles(
+            args,
+            expected_authorization=(
+                plan_report.get("temporary_loss_recovery_authorization")
+                if isinstance(
+                    plan_report.get("temporary_loss_recovery_authorization"),
+                    Mapping,
+                )
+                else None
+            ),
+            require_expected_authorization=True,
+        ),
     )
     validation["actions"] = _apply_best_quote_directional_net_guard_to_actions(
         validation["actions"],
@@ -24020,6 +30935,64 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                 validation["actions"].get("cancel_count", 0) > 0
                 or validation["actions"].get("place_count", 0) > 0
             )
+    validation["actions"], recovery_profile_execution = (
+        _apply_recovery_profile_gate_to_actions(
+            args=args,
+            actions=validation["actions"],
+            expected_gate=(
+                plan_report.get("recovery_profile_gate")
+                if isinstance(plan_report.get("recovery_profile_gate"), Mapping)
+                else None
+            ),
+            now=datetime.now(timezone.utc),
+        )
+    )
+    report["recovery_profile_execution"] = recovery_profile_execution
+    validation["actions"], runtime_safety_signal_execution = (
+        _apply_registered_runtime_safety_signal_to_actions(
+            args=args,
+            actions=validation["actions"],
+            now=datetime.now(timezone.utc),
+        )
+    )
+    report["runtime_safety_signal_execution"] = (
+        runtime_safety_signal_execution
+    )
+    best_quote_metrics = plan_report.get("best_quote_maker_volume")
+    frozen_total_cap = (
+        best_quote_metrics.get("frozen_total_cap")
+        if isinstance(best_quote_metrics, dict)
+        and isinstance(best_quote_metrics.get("frozen_total_cap"), dict)
+        else {}
+    )
+    live_mid_price = (
+        (live_bid_price + live_ask_price) / 2.0
+        if live_bid_price > 0 and live_ask_price > 0
+        else 0.0
+    )
+    current_long_notional = max(current_long_qty * live_mid_price, 0.0)
+    current_short_notional = max(current_short_qty * live_mid_price, 0.0)
+    validation["actions"] = apply_projected_entry_exposure_cap_to_actions(
+        actions=validation["actions"],
+        strategy_mode=strategy_mode,
+        current_long_notional=max(
+            current_long_notional
+            - _safe_float(frozen_total_cap.get("frozen_long_notional")),
+            0.0,
+        ),
+        current_short_notional=max(
+            current_short_notional
+            - _safe_float(frozen_total_cap.get("frozen_short_notional")),
+            0.0,
+        ),
+        current_open_orders=current_strategy_open_orders,
+        max_long_notional=_safe_float(
+            plan_report.get("max_position_notional")
+        ),
+        max_short_notional=_safe_float(
+            plan_report.get("max_short_position_notional")
+        ),
+    )
     configured_place_budget = int(getattr(args, "execution_place_budget_per_cycle", 0) or 0)
     max_new_order_budget = int(getattr(args, "max_new_orders", 0) or 0)
     effective_place_budget = (
@@ -24139,6 +31112,105 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             current_book = market_fetcher(force_refresh=attempt > 0)
             current_bid = _safe_float(current_book.get("bid_price"))
             current_ask = _safe_float(current_book.get("ask_price"))
+            runtime_safety_order, runtime_safety_skip_reason = (
+                _guard_registered_runtime_safety_order_before_submit(
+                    args=args,
+                    order=order,
+                    now=datetime.now(timezone.utc),
+                )
+            )
+            if runtime_safety_order is None:
+                report["skipped_orders"].append(
+                    {
+                        "request": {
+                            "role": role,
+                            "side": side,
+                            "position_side": position_side,
+                            "qty": _safe_float(order.get("qty")),
+                            "desired_price": _safe_float(order.get("price")),
+                            "attempt": attempt + 1,
+                            "time_in_force": time_in_force,
+                        },
+                        "reason": runtime_safety_skip_reason
+                        or {
+                            "reason": (
+                                "runtime_safety_signal_blocks_risk_increase"
+                            )
+                        },
+                    }
+                )
+                last_exc = None
+                break
+            order = runtime_safety_order
+            recovery_guarded_order, recovery_profile_skip_reason = (
+                _guard_recovery_profile_order_before_submit(
+                    args=args,
+                    order=order,
+                    expected_gate=(
+                        plan_report.get("recovery_profile_gate")
+                        if isinstance(
+                            plan_report.get("recovery_profile_gate"), Mapping
+                        )
+                        else None
+                    ),
+                    now=datetime.now(timezone.utc),
+                )
+            )
+            if recovery_guarded_order is None:
+                report["skipped_orders"].append(
+                    {
+                        "request": {
+                            "role": role,
+                            "side": side,
+                            "position_side": position_side,
+                            "qty": _safe_float(order.get("qty")),
+                            "desired_price": _safe_float(order.get("price")),
+                            "attempt": attempt + 1,
+                            "order_type": "LIMIT",
+                            "time_in_force": time_in_force,
+                        },
+                        "reason": recovery_profile_skip_reason
+                        or {"reason": "recovery_profile_not_authorized"},
+                    }
+                )
+                last_exc = None
+                break
+            order = recovery_guarded_order
+            guarded_order, temporary_loss_skip_reason = (
+                _guard_temporary_loss_order_before_submit(
+                    args=args,
+                    order=order,
+                    plan_report=plan_report,
+                    strategy_mode=strategy_mode,
+                    live_bid_price=current_bid,
+                    live_ask_price=current_ask,
+                    tick_size=tick_size,
+                    min_qty=min_qty,
+                    min_notional=min_notional,
+                    step_size=symbol_info.get("step_size"),
+                    now=datetime.now(timezone.utc),
+                )
+            )
+            if guarded_order is None:
+                report["skipped_orders"].append(
+                    {
+                        "request": {
+                            "role": role,
+                            "side": side,
+                            "position_side": position_side,
+                            "qty": _safe_float(order.get("qty")),
+                            "desired_price": _safe_float(order.get("price")),
+                            "attempt": attempt + 1,
+                            "time_in_force": time_in_force,
+                        },
+                        "reason": temporary_loss_skip_reason or {
+                            "reason": "temporary_loss_lease_not_authorized"
+                        },
+                    }
+                )
+                last_exc = None
+                break
+            order = guarded_order
             prepared_order, skip_reason = prepare_post_only_order_request(
                 order=order,
                 side=side,
@@ -24242,6 +31314,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                             "submitted_price": _safe_float(prepared_order.get("submitted_price")),
                             "submitted_notional": _safe_float(prepared_order.get("submitted_notional")),
                             "attempt": attempt + 1,
+                            "order_type": "LIMIT",
                             "time_in_force": time_in_force,
                             "reduce_only": reduce_only,
                         },
@@ -24262,10 +31335,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                 )
                 last_exc = None
                 break
-            client_order_id = _build_client_order_id(
+            client_order_id = _build_recovery_aware_client_order_id(
                 symbol=symbol,
-                role=str(order.get("client_order_role") or role),
+                role=role,
                 index=index,
+                order=order,
             )
             if submitted_is_per_lot:
                 binding_state_path = Path(str(plan_report.get("state_path") or args.state_path))
@@ -25018,22 +32092,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--multi-timeframe-bias-scheduler-defensive-notional-scale", type=float, default=0.60)
     parser.add_argument("--multi-timeframe-bias-scheduler-defensive-step-scale", type=float, default=1.35)
     parser.add_argument("--multi-timeframe-bias-scheduler-reduce-max-order-scale", type=float, default=0.65)
-    parser.add_argument("--volatility-entry-pause-enabled", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--volatility-entry-pause-10s-abs-return-ratio", type=float, default=0.0)
-    parser.add_argument("--volatility-entry-pause-10s-amplitude-ratio", type=float, default=0.0)
-    parser.add_argument("--volatility-entry-pause-30s-abs-return-ratio", type=float, default=0.0)
-    parser.add_argument("--volatility-entry-pause-30s-amplitude-ratio", type=float, default=0.0)
-    parser.add_argument("--volatility-entry-pause-1m-abs-return-ratio", type=float, default=0.0)
-    parser.add_argument("--volatility-entry-pause-1m-amplitude-ratio", type=float, default=0.0)
-    parser.add_argument("--volatility-entry-pause-3m-abs-return-ratio", type=float, default=0.0)
-    parser.add_argument("--volatility-entry-pause-3m-amplitude-ratio", type=float, default=0.0)
-    parser.add_argument("--volatility-entry-pause-5m-abs-return-ratio", type=float, default=0.0)
-    parser.add_argument("--volatility-entry-pause-5m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--volatility-entry-pause-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--volatility-entry-pause-10s-abs-return-ratio", type=float, default=0.006)
+    parser.add_argument("--volatility-entry-pause-10s-amplitude-ratio", type=float, default=0.009)
+    parser.add_argument("--volatility-entry-pause-30s-abs-return-ratio", type=float, default=0.015)
+    parser.add_argument("--volatility-entry-pause-30s-amplitude-ratio", type=float, default=0.015)
+    parser.add_argument("--volatility-entry-pause-1m-abs-return-ratio", type=float, default=0.02)
+    parser.add_argument("--volatility-entry-pause-1m-amplitude-ratio", type=float, default=0.03)
+    parser.add_argument("--volatility-entry-pause-3m-abs-return-ratio", type=float, default=0.035)
+    parser.add_argument("--volatility-entry-pause-3m-amplitude-ratio", type=float, default=0.045)
+    parser.add_argument("--volatility-entry-pause-5m-abs-return-ratio", type=float, default=0.03)
+    parser.add_argument("--volatility-entry-pause-5m-amplitude-ratio", type=float, default=0.045)
     parser.add_argument("--volatility-entry-pause-recover-confirm-cycles", type=int, default=1)
     parser.add_argument("--volatility-entry-pause-min-observation-seconds", type=float, default=180.0)
     parser.add_argument("--volatility-entry-pause-inventory-recover-ratio", type=float, default=0.75)
     parser.add_argument("--volatility-entry-pause-tiny-inventory-ignore-notional", type=float, default=0.0)
-    parser.add_argument("--anti-chase-entry-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--anti-chase-entry-guard-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--anti-chase-entry-guard-1m-abs-return-ratio", type=float, default=0.0025)
     parser.add_argument("--anti-chase-entry-guard-1m-amplitude-ratio", type=float, default=0.0035)
     parser.add_argument("--anti-chase-entry-guard-3m-abs-return-ratio", type=float, default=0.006)
@@ -25169,12 +32243,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sleep-seconds", type=float, default=20.0)
     parser.add_argument("--startup-jitter-seconds", type=float, default=0.0)
     parser.add_argument("--cycle-jitter-seconds", type=float, default=0.0)
-    parser.add_argument("--iterations", type=int, default=0, help="0 means run forever")
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=0,
+        help="0 means lifecycle-controlled; >0 is only for unbounded diagnostic runs",
+    )
     parser.add_argument("--max-consecutive-errors", type=int, default=10)
     parser.add_argument("--state-path", type=str, default="output/night_small_semi_auto_state.json")
     parser.add_argument("--plan-json", type=str, default="output/night_loop_latest_plan.json")
     parser.add_argument("--submit-report-json", type=str, default="output/night_loop_latest_submit.json")
     parser.add_argument("--summary-jsonl", type=str, default="output/night_loop_events.jsonl")
+    parser.add_argument("--recovery-control-path", type=str, default=None)
+    parser.add_argument("--recovery-generation", type=int, default=None)
     parser.add_argument("--run-start-time", type=str, default=None)
     parser.add_argument("--run-end-time", type=str, default=None)
     parser.add_argument("--runtime-guard-stats-start-time", type=str, default=None)
@@ -25186,7 +32267,25 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-guard-loss-recovery-max-1m-amplitude-ratio", type=float, default=0.012)
     parser.add_argument("--runtime-guard-loss-recovery-max-3m-amplitude-ratio", type=float, default=0.025)
     parser.add_argument("--runtime-guard-stop-auto-flatten-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--terminal-drain-max-order-notional", type=float, default=0.0)
+    parser.add_argument("--terminal-drain-absolute-loss-budget", type=float, default=None)
+    parser.add_argument("--terminal-drain-loss-lease-seconds", type=float, default=300.0)
+    parser.add_argument("--terminal-drain-order-reprice-seconds", type=float, default=120.0)
+    parser.add_argument("--terminal-drain-flat-confirm-cycles", type=int, default=2)
+    parser.add_argument("--terminal-drain-max-wait-seconds", type=float, default=None)
+    parser.add_argument(
+        "--terminal-drain-exit-policy",
+        choices=("drain_clean", "drain_then_preserve", "stop_preserve"),
+        default=None,
+    )
+    parser.add_argument("--terminal-drain-stop-preserve-reason", type=str, default=None)
     parser.add_argument("--max-cumulative-notional", type=float, default=None)
+    parser.add_argument("--lifecycle-wear-stop-per-10k", type=float, default=None)
+    parser.add_argument(
+        "--lifecycle-wear-stop-min-gross-notional",
+        type=float,
+        default=None,
+    )
     parser.add_argument("--max-actual-net-notional", type=float, default=None)
     parser.add_argument("--max-synthetic-drift-notional", type=float, default=None)
     parser.add_argument("--max-unrealized-loss", type=float, default=None)
@@ -25524,6 +32623,40 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
         )
     if summary.get("audit_error"):
         print(f"  audit_error: {summary['audit_error']}")
+
+
+def _validate_terminal_run_contract(args: argparse.Namespace) -> None:
+    """Require every target/deadline run to declare a feasible exit contract."""
+    try:
+        contract = validate_run_contract(
+            run_start_time=getattr(args, "run_start_time", None),
+            runtime_guard_stats_start_time=getattr(
+                args, "runtime_guard_stats_start_time", None
+            ),
+            run_end_time=getattr(args, "run_end_time", None),
+            target_value=getattr(args, "max_cumulative_notional", None),
+            exit_policy=getattr(args, "terminal_drain_exit_policy", None),
+            loss_budget=getattr(args, "terminal_drain_absolute_loss_budget", None),
+            max_wait_seconds=getattr(args, "terminal_drain_max_wait_seconds", None),
+            preserve_reason=getattr(args, "terminal_drain_stop_preserve_reason", None),
+            wear_stop_per_10k=getattr(
+                args,
+                "lifecycle_wear_stop_per_10k",
+                None,
+            ),
+            wear_stop_min_gross_notional=getattr(
+                args,
+                "lifecycle_wear_stop_min_gross_notional",
+                None,
+            ),
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if contract.bounded and int(getattr(args, "iterations", 0) or 0) > 0:
+        raise SystemExit(
+            "bounded run cannot use --iterations; set --iterations 0 so the "
+            "target lifecycle records its terminal outcome"
+        )
 
 
 def main() -> None:
@@ -26138,6 +33271,10 @@ def main() -> None:
         raise SystemExit("--startup-jitter-seconds must be >= 0")
     if args.cycle_jitter_seconds < 0:
         raise SystemExit("--cycle-jitter-seconds must be >= 0")
+    try:
+        _validate_registered_runtime_safety_ttl(args)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if args.iterations < 0:
         raise SystemExit("--iterations must be >= 0")
     if args.max_consecutive_errors <= 0:
@@ -26166,12 +33303,39 @@ def main() -> None:
         raise SystemExit("--custom-grid-roll-upper-distance-ratio must be between 0 and 1")
     if args.custom_grid_roll_shift_levels <= 0:
         raise SystemExit("--custom-grid-roll-shift-levels must be > 0")
+    if args.terminal_drain_max_order_notional < 0:
+        raise SystemExit("--terminal-drain-max-order-notional must be >= 0")
+    if (
+        args.terminal_drain_absolute_loss_budget is not None
+        and args.terminal_drain_absolute_loss_budget < 0
+    ):
+        raise SystemExit("--terminal-drain-absolute-loss-budget must be >= 0")
+    if args.terminal_drain_loss_lease_seconds <= 0:
+        raise SystemExit("--terminal-drain-loss-lease-seconds must be > 0")
+    if args.terminal_drain_order_reprice_seconds <= 0:
+        raise SystemExit("--terminal-drain-order-reprice-seconds must be > 0")
+    if args.terminal_drain_flat_confirm_cycles < 2:
+        raise SystemExit("--terminal-drain-flat-confirm-cycles must be >= 2")
+    if args.terminal_drain_max_wait_seconds is not None and args.terminal_drain_max_wait_seconds <= 0:
+        raise SystemExit("--terminal-drain-max-wait-seconds must be > 0")
+    _validate_terminal_run_contract(args)
     normalize_runtime_guard_config(vars(args))
 
     plan_path = Path(args.plan_json)
     submit_report_path = Path(args.submit_report_json)
     summary_path = Path(args.summary_jsonl)
     audit_paths = build_audit_paths(summary_path)
+    startup_config_receipt = _record_current_recovery_config_applied(
+        args,
+        state_path=Path(args.state_path),
+        now=datetime.now(timezone.utc),
+    )
+    if startup_config_receipt is not None:
+        print(
+            "[recovery-config] applied "
+            f"generation={startup_config_receipt['generation']} "
+            f"receipt={startup_config_receipt['receipt_id']}"
+        )
     consecutive_errors = 0
     cycle = 0
     market_stream: FuturesMarketStream | None = None
@@ -26203,6 +33367,72 @@ def main() -> None:
             cycle += 1
             cycle_started_at = datetime.now(timezone.utc)
             try:
+                temporary_loss_maintenance = (
+                    _maintain_temporary_loss_recovery_receipts(
+                        args,
+                        state_path=Path(args.state_path),
+                        now=cycle_started_at,
+                    )
+                )
+                if (
+                    temporary_loss_maintenance is not None
+                    and temporary_loss_maintenance.get("skip_normal_cycle")
+                ):
+                    maintenance_summary = {
+                        "ts": cycle_started_at.isoformat(),
+                        "cycle": cycle,
+                        "symbol": args.symbol.upper().strip(),
+                        "runtime_status": "recovery_receipt_pending",
+                        "stop_triggered": False,
+                        "runner_exit_allowed": False,
+                        "stop_reason": None,
+                        "global_allow_loss": False,
+                        "recovery_action_count": 1,
+                        "temporary_loss_recovery": temporary_loss_maintenance,
+                        "pre_guard_trade_audit_appended": 0,
+                        "pre_guard_income_audit_appended": 0,
+                        "pre_guard_audit_error": None,
+                    }
+                    _append_jsonl(summary_path, maintenance_summary)
+                    _print_cycle_summary(maintenance_summary)
+                    consecutive_errors = 0
+                    if args.iterations and cycle >= args.iterations:
+                        break
+                    time.sleep(args.sleep_seconds)
+                    continue
+                recovery_profile_maintenance = _maintain_normal_recovery_profile_gate(
+                    args,
+                    state_path=Path(args.state_path),
+                    now=cycle_started_at,
+                )
+                if (
+                    recovery_profile_maintenance is not None
+                    and recovery_profile_maintenance.get("skip_normal_cycle")
+                ):
+                    maintenance_summary = {
+                        "ts": cycle_started_at.isoformat(),
+                        "cycle": cycle,
+                        "symbol": args.symbol.upper().strip(),
+                        "runtime_status": "recovery_profile_fence_wait",
+                        "stop_triggered": False,
+                        "runner_exit_allowed": False,
+                        "stop_reason": None,
+                        "global_allow_loss": False,
+                        "recovery_action_count": 1,
+                        "recovery_profile_maintenance": (
+                            recovery_profile_maintenance
+                        ),
+                        "pre_guard_trade_audit_appended": 0,
+                        "pre_guard_income_audit_appended": 0,
+                        "pre_guard_audit_error": None,
+                    }
+                    _append_jsonl(summary_path, maintenance_summary)
+                    _print_cycle_summary(maintenance_summary)
+                    consecutive_errors = 0
+                    if args.iterations and cycle >= args.iterations:
+                        break
+                    time.sleep(args.sleep_seconds)
+                    continue
                 pre_guard_audit_sync = {
                     "trade_appended": 0,
                     "income_appended": 0,
@@ -26235,7 +33465,10 @@ def main() -> None:
                     _append_jsonl(summary_path, runtime_guard_summary)
                     _print_cycle_summary(runtime_guard_summary)
                     consecutive_errors = 0
-                    if runtime_guard_summary.get("stop_triggered"):
+                    if runtime_guard_summary.get("stop_triggered") and runtime_guard_summary.get(
+                        "runner_exit_allowed",
+                        True,
+                    ):
                         break
                     if args.iterations and cycle >= args.iterations:
                         break
@@ -26256,6 +33489,42 @@ def main() -> None:
                 )
 
                 submit_report = execute_plan_report(args, plan_report)
+                temporary_loss_progress_receipt = (
+                    _record_temporary_loss_recovery_progress(
+                        args,
+                        state_path=Path(
+                            str(plan_report.get("state_path", args.state_path))
+                        ),
+                        plan_report=plan_report,
+                        submit_report=submit_report,
+                        now=datetime.now(timezone.utc),
+                    )
+                )
+                if temporary_loss_progress_receipt is not None:
+                    submit_report["temporary_loss_recovery_progress_receipt"] = (
+                        temporary_loss_progress_receipt
+                    )
+                ordinary_recovery_progress_receipt = (
+                    _record_ordinary_recovery_progress(
+                        args,
+                        state_path=Path(
+                            str(plan_report.get("state_path", args.state_path))
+                        ),
+                        expected_gate=(
+                            plan_report.get("recovery_profile_gate")
+                            if isinstance(
+                                plan_report.get("recovery_profile_gate"), Mapping
+                            )
+                            else None
+                        ),
+                        submit_report=submit_report,
+                        now=datetime.now(timezone.utc),
+                    )
+                )
+                if ordinary_recovery_progress_receipt is not None:
+                    submit_report["ordinary_recovery_progress_receipt"] = (
+                        ordinary_recovery_progress_receipt
+                    )
                 _write_json(submit_report_path, submit_report)
                 _append_jsonl(
                     audit_paths["submit_audit"],
@@ -26360,7 +33629,9 @@ def main() -> None:
                 runtime_guard_config = normalize_runtime_guard_config(vars(args))
                 runtime_cumulative_gross_notional, runtime_pnl_events, runtime_stats_start_time = _load_futures_runtime_guard_inputs(
                     summary_path,
-                    runtime_guard_stats_start_time=getattr(args, "runtime_guard_stats_start_time", None),
+                    runtime_guard_stats_start_time=(
+                        runtime_guard_config.runtime_guard_stats_start_time
+                    ),
                     symbol=args.symbol.upper().strip(),
                     now=cycle_started_at,
                     state_path=state_path,
@@ -26369,7 +33640,25 @@ def main() -> None:
                         if _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", "")))
                         else None
                     ),
+                    run_end_time=runtime_guard_config.run_end_time,
+                    max_cumulative_notional=(
+                        runtime_guard_config.max_cumulative_notional
+                    ),
+                    recv_window=int(getattr(args, "recv_window", 5000)),
+                    immutable_contract_window=bool(
+                        runtime_guard_config.run_end_time is not None
+                        or runtime_guard_config.max_cumulative_notional is not None
+                    ),
                 )
+                persisted_target_progress = _persisted_futures_target_progress(
+                    state=state,
+                    args=args,
+                    runtime_guard_config=runtime_guard_config,
+                )
+                if persisted_target_progress is not None:
+                    runtime_cumulative_gross_notional = (
+                        persisted_target_progress
+                    )
                 runtime_recovery = _runtime_guard_loss_recovery_state(state)
                 runtime_recovered_at = _parse_state_datetime(runtime_recovery.get("recovered_at"))
                 runtime_pnl_events_for_guard = _filter_pnl_events_after(runtime_pnl_events, runtime_recovered_at)
@@ -26966,6 +34255,11 @@ def main() -> None:
                         }
                 _write_json(state_path, state)
                 _append_jsonl(summary_path, summary)
+                _terminal_drain_ack_handoff_after_normal_event(
+                    args=args,
+                    state_path=state_path,
+                    acknowledged_at=cycle_started_at,
+                )
                 _print_cycle_summary(summary)
                 consecutive_errors = 0
             except KeyboardInterrupt:

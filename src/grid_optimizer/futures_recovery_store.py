@@ -35,7 +35,22 @@ from .recovery_control_ownership import (
 
 
 RECOVERY_STATE_KEY = "_futures_recovery_state"
+RECOVERY_STATE_MIRROR_KEY = "_futures_recovery_state_mirror"
 RECOVERY_STATE_SCHEMA_VERSION = 1
+_RECOVERY_STATE_SLOT_KEYS = (RECOVERY_STATE_KEY, RECOVERY_STATE_MIRROR_KEY)
+
+
+def recovery_coordinator_registered(control: Mapping[str, Any]) -> bool:
+    """Return whether the control document has crossed the coordinator fence.
+
+    Presence is the ownership boundary.  A malformed envelope must not silently
+    hand actuation back to a legacy writer; the coordinator/store path owns
+    validation and repair after registration.
+    """
+
+    return any(key in control for key in _RECOVERY_STATE_SLOT_KEYS)
+
+
 _PROTECTED_MANAGED_CONTROL_KEYS = frozenset(
     {
         "best_quote_maker_volume_allow_loss_reduce_only",
@@ -61,6 +76,9 @@ _COORDINATOR_OVERLAY_CONTROL_KEYS = frozenset(
         "recovery_safety_lease_hard_expires_at",
         "recovery_safety_observation_seq",
         "recovery_safety_observed_at",
+        "best_quote_maker_volume_same_side_entry_price_guard_report_only",
+        "near_market_entry_max_center_distance_steps",
+        "near_market_reentry_confirm_cycles",
     }
 )
 
@@ -388,7 +406,7 @@ def _profile_digest(profile: ManagedProfile) -> str:
 
 
 def _validate_profile(profile: ManagedProfile, *, path: str) -> None:
-    if RECOVERY_STATE_KEY in profile.fields:
+    if any(key in profile.fields for key in _RECOVERY_STATE_SLOT_KEYS):
         raise RecoveryStateCorruptError(
             f"{path}.fields cannot own the recovery state namespace"
         )
@@ -463,12 +481,16 @@ def _validate_state(state: RecoveryState) -> None:
             )
     if state.cleanup_obligation is not None:
         cleanup = state.cleanup_obligation
+        manifest = cleanup.managed_order_manifest
         if (
-            cleanup.action_lease_epoch < 0
-            or cleanup.action_lease_epoch > state.action_lease_epoch
+            manifest.symbol != state.symbol
+            or manifest.generation > state.generation
+            or manifest.issued_at > cleanup.created_at
+            or cleanup.next_retry_at < cleanup.created_at
+            or cleanup.needs_manifest_rebuild != (not manifest.orders)
         ):
             raise RecoveryStateCorruptError(
-                "state.cleanup_obligation has an invalid action lease epoch"
+                "state.cleanup_obligation has an invalid managed manifest"
             )
         if cleanup.attempt_count < 0:
             raise RecoveryStateCorruptError(
@@ -524,7 +546,15 @@ def _validate_state(state: RecoveryState) -> None:
     safety_lease = state.safety_lease
     cleanup = state.cleanup_obligation
 
-    action_lease_allowed = phase is RecoveryPhase.CLEANING or (
+    cleaning_needs_action_lease = bool(
+        phase is RecoveryPhase.CLEANING
+        and cleanup is not None
+        and (
+            cleanup.source_action_id is ActionId.TEMPORARY_LOSS_RELIEF
+            or state.cleanup_successor_action is ActionId.TEMPORARY_LOSS_RELIEF
+        )
+    )
+    action_lease_allowed = cleaning_needs_action_lease or (
         phase in {RecoveryPhase.SETTLING, RecoveryPhase.ACTIVE}
         and state.active_action is ActionId.TEMPORARY_LOSS_RELIEF
     )
@@ -533,7 +563,14 @@ def _validate_state(state: RecoveryState) -> None:
             f"state.{phase.value} has a forbidden action lease combination"
         )
     if (
-        phase in {RecoveryPhase.SETTLING, RecoveryPhase.ACTIVE}
+        (
+            phase in {RecoveryPhase.SETTLING, RecoveryPhase.ACTIVE}
+            or (
+                phase is RecoveryPhase.CLEANING
+                and state.cleanup_successor_action
+                is ActionId.TEMPORARY_LOSS_RELIEF
+            )
+        )
         and state.active_action is ActionId.TEMPORARY_LOSS_RELIEF
         and action_lease is not None
         and state.hard_expires_at != action_lease.hard_expires_at
@@ -542,7 +579,14 @@ def _validate_state(state: RecoveryState) -> None:
             "state.hard_expires_at must match state.action_lease.hard_expires_at"
         )
     if (
-        phase in {RecoveryPhase.SETTLING, RecoveryPhase.ACTIVE}
+        (
+            phase in {RecoveryPhase.SETTLING, RecoveryPhase.ACTIVE}
+            or (
+                phase is RecoveryPhase.CLEANING
+                and state.cleanup_successor_action
+                is ActionId.TEMPORARY_LOSS_RELIEF
+            )
+        )
         and state.active_action is ActionId.TEMPORARY_LOSS_RELIEF
         and action_lease is not None
         and state.issued_at != action_lease.started_at
@@ -609,15 +653,34 @@ def _validate_state(state: RecoveryState) -> None:
             f"state.{phase.value} has a forbidden cleanup combination"
         )
     if cleanup is not None:
-        if action_lease is None or not (
-            cleanup.source_action_id is action_lease.action_id
-            and cleanup.action_lease_epoch == action_lease.epoch
-        ):
+        manifest = cleanup.managed_order_manifest
+        source_loss_matches = bool(
+            cleanup.source_action_id is ActionId.TEMPORARY_LOSS_RELIEF
+            and action_lease is not None
+            and manifest.action_lease_epoch == action_lease.epoch
+            and manifest.side is action_lease.side
+            and manifest.order_role is action_lease.order_role
+            and manifest.hard_expires_at == action_lease.hard_expires_at
+        )
+        successor_loss_matches = bool(
+            state.cleanup_successor_action is ActionId.TEMPORARY_LOSS_RELIEF
+            and action_lease is not None
+            and state.active_action is action_lease.action_id
+            and state.side is action_lease.side
+            and state.order_role is action_lease.order_role
+        )
+        if cleanup.source_action_id is ActionId.TEMPORARY_LOSS_RELIEF:
+            lease_valid = source_loss_matches
+        elif state.cleanup_successor_action is ActionId.TEMPORARY_LOSS_RELIEF:
+            lease_valid = successor_loss_matches
+        else:
+            lease_valid = action_lease is None
+        if not lease_valid:
             raise RecoveryStateCorruptError(
-                "state cleaning obligation does not match its action lease"
+                "state cleaning obligation has an invalid loss lease binding"
             )
         successor = state.cleanup_successor_action
-        expected_action = action_lease.action_id if successor is None else successor
+        expected_action = cleanup.source_action_id if successor is None else successor
         if state.active_action is not expected_action:
             raise RecoveryStateCorruptError(
                 "state cleaning action does not match its cleanup successor"
@@ -704,7 +767,8 @@ def _validate_state(state: RecoveryState) -> None:
             == lease.order_role.value
             and desired.get("recovery_action_lease_hard_expires_at")
             == lease.hard_expires_at.isoformat()
-            and state.pending_effect_stage is EffectStage.NONE
+            and state.pending_effect_stage
+            in {EffectStage.NONE, EffectStage.RUNNER_RESTART}
         ):
             raise RecoveryStateCorruptError(
                 "state.settling temporary loss lease metadata is inconsistent"
@@ -732,7 +796,8 @@ def _validate_state(state: RecoveryState) -> None:
                 == lease.order_role.value
                 and desired.get("recovery_action_lease_hard_expires_at")
                 == lease.hard_expires_at.isoformat()
-                and state.pending_effect_stage is EffectStage.NONE
+                and state.pending_effect_stage
+                in {EffectStage.NONE, EffectStage.RUNNER_RESTART}
             ):
                 raise RecoveryStateCorruptError(
                     "active temporary loss lease must match action, side, role, "
@@ -749,7 +814,8 @@ def _validate_state(state: RecoveryState) -> None:
         if not (
             state.progress_deadline_at is not None
             and state.cooldown_until is None
-            and state.pending_effect_stage is EffectStage.NONE
+            and state.pending_effect_stage
+            in {EffectStage.NONE, EffectStage.RUNNER_RESTART}
             and state.desired_profile.digest == state.baseline_profile.digest
         ):
             raise RecoveryStateCorruptError(
@@ -811,6 +877,161 @@ def _decode_state(payload: Any) -> RecoveryState:
     return state
 
 
+def _decode_recovery_envelope(
+    envelope: Any,
+    *,
+    expected_symbol: str,
+) -> RecoveryState:
+    normalized_symbol = _normalize_symbol(expected_symbol)
+    if not isinstance(envelope, MappingABC):
+        raise RecoveryStateCorruptError(f"{RECOVERY_STATE_KEY} must be an object")
+    _require_fields(envelope, {"schema_version", "state"}, path=RECOVERY_STATE_KEY)
+    schema_version = envelope["schema_version"]
+    if (
+        type(schema_version) is not int
+        or schema_version != RECOVERY_STATE_SCHEMA_VERSION
+    ):
+        raise RecoveryStateCorruptError(
+            f"unsupported recovery state schema: {schema_version!r}"
+        )
+    state = _decode_state(envelope["state"])
+    if state.symbol != normalized_symbol:
+        raise RecoveryStateCorruptError(
+            f"recovery symbol mismatch: expected {normalized_symbol}, "
+            f"found {state.symbol}"
+        )
+    return state
+
+
+def _recovery_envelope(state: RecoveryState) -> dict[str, Any]:
+    return {
+        "schema_version": RECOVERY_STATE_SCHEMA_VERSION,
+        "state": _encode_state(state),
+    }
+
+
+def _decode_matching_recovery_slots(
+    document: Mapping[str, Any],
+    *,
+    expected_symbol: str,
+) -> RecoveryState:
+    """Require the two atomically-written slots to be valid and identical."""
+
+    states: dict[str, RecoveryState] = {}
+    failures: dict[str, str] = {}
+    for key in _RECOVERY_STATE_SLOT_KEYS:
+        if key not in document:
+            failures[key] = "missing"
+            continue
+        try:
+            states[key] = _decode_recovery_envelope(
+                document[key],
+                expected_symbol=expected_symbol,
+            )
+        except RecoveryStateCorruptError as exc:
+            failures[key] = str(exc)
+    if failures:
+        details = "; ".join(f"{key}={value}" for key, value in failures.items())
+        raise RecoveryStateCorruptError(
+            f"recovery state mirror repair required: {details}"
+        )
+    primary = states[RECOVERY_STATE_KEY]
+    mirror = states[RECOVERY_STATE_MIRROR_KEY]
+    if primary != mirror:
+        raise RecoveryStateCorruptError("recovery state slots diverge")
+    canonical = _recovery_envelope(primary)
+    for key in _RECOVERY_STATE_SLOT_KEYS:
+        raw = _json_copy(document[key], path=f"control.{key}")
+        if raw != canonical:
+            raise RecoveryStateCorruptError(
+                f"recovery state mirror repair required: {key} is not canonical"
+            )
+    return primary
+
+
+def _resolve_recovery_slots_for_repair(
+    document: Mapping[str, Any],
+    *,
+    expected_symbol: str,
+) -> tuple[RecoveryState, dict[str, Any], set[str]]:
+    """Select exactly one logical state without guessing between valid revisions."""
+
+    valid: dict[str, RecoveryState] = {}
+    failures: dict[str, str] = {}
+    for key in _RECOVERY_STATE_SLOT_KEYS:
+        if key not in document:
+            failures[key] = "missing"
+            continue
+        try:
+            state = _decode_recovery_envelope(
+                document[key],
+                expected_symbol=expected_symbol,
+            )
+            if (
+                _json_copy(document[key], path=f"control.{key}")
+                != _recovery_envelope(state)
+            ):
+                raise RecoveryStateCorruptError("slot is not canonical")
+            valid[key] = state
+        except RecoveryStateCorruptError as exc:
+            failures[key] = str(exc)
+    if not valid:
+        details = "; ".join(f"{key}={value}" for key, value in failures.items())
+        raise RecoveryStateCorruptError(
+            f"both recovery state slots are invalid: {details}"
+        )
+    states = tuple(valid.values())
+    if len(states) == 2 and states[0] != states[1]:
+        raise RecoveryStateCorruptError("recovery state slots diverge")
+    state = states[0]
+    canonical = _recovery_envelope(state)
+    changed = {
+        key
+        for key in _RECOVERY_STATE_SLOT_KEYS
+        if key not in valid
+    }
+    return state, canonical, changed
+
+
+def decode_recovery_desired_profile_fields(
+    envelope: Any,
+    *,
+    expected_symbol: str,
+) -> dict[str, Any]:
+    """Strictly decode an ownership envelope and return its desired flat fields."""
+
+    state = _decode_recovery_envelope(
+        envelope,
+        expected_symbol=expected_symbol,
+    )
+    desired = _json_copy(
+        state.desired_profile.fields,
+        path="state.desired_profile.fields",
+    )
+    if not isinstance(desired, dict):
+        raise RecoveryStateCorruptError(
+            "state.desired_profile.fields must be an object"
+        )
+    return desired
+
+
+def decode_recovery_state_slots(
+    document: Mapping[str, Any],
+    *,
+    expected_symbol: str,
+) -> RecoveryState:
+    """Validate both owner slots without treating repairable flat drift as state."""
+
+    if not recovery_coordinator_registered(document):
+        raise RecoveryStateUnavailableError(
+            f"unregistered recovery symbol: {_normalize_symbol(expected_symbol)}"
+        )
+    return _decode_matching_recovery_slots(
+        document,
+        expected_symbol=_normalize_symbol(expected_symbol),
+    )
+
+
 class JsonRecoveryStore:
     """A lock-protected, one-control-document implementation of recovery CAS."""
 
@@ -844,9 +1065,84 @@ class JsonRecoveryStore:
             self.control_path, timeout_seconds=self.lock_timeout_seconds
         ):
             document = self._read_document(allow_missing=True)
-            if RECOVERY_STATE_KEY in document:
+            if recovery_coordinator_registered(document):
                 existing = self._decode_document_state(document, normalized)
                 raise ValueError(f"symbol already registered: {existing.symbol}")
+            for source, value in (
+                (
+                    "control",
+                    document.get(
+                        "best_quote_maker_volume_reduce_freeze_enabled"
+                    ),
+                ),
+                (
+                    "baseline",
+                    baseline.get(
+                        "best_quote_maker_volume_reduce_freeze_enabled"
+                    ),
+                ),
+            ):
+                if value is not None and type(value) is not bool:
+                    raise ValueError(
+                        "cannot register recovery while frozen inventory "
+                        f"creation config is invalid in {source}"
+                    )
+                if value is True:
+                    raise ValueError(
+                        "cannot register recovery while frozen inventory "
+                        f"creation is enabled in {source}"
+                    )
+            state_suffix = "_loop_runner_control.json"
+            if self.control_path.name.endswith(state_suffix):
+                runner_state_path = self.control_path.with_name(
+                    self.control_path.name[: -len(state_suffix)]
+                    + "_loop_state.json"
+                )
+                try:
+                    runner_state_raw = runner_state_path.read_text(encoding="utf-8")
+                except FileNotFoundError:
+                    runner_state = {}
+                except OSError as exc:
+                    raise ValueError(
+                        "cannot register recovery while runner state is unreadable"
+                    ) from exc
+                else:
+                    try:
+                        runner_state = json.loads(runner_state_raw)
+                    except (UnicodeError, json.JSONDecodeError) as exc:
+                        raise ValueError(
+                            "cannot register recovery while runner state is unreadable"
+                        ) from exc
+                    if not isinstance(runner_state, MappingABC):
+                        raise ValueError(
+                            "cannot register recovery while runner state is unreadable"
+                        )
+                frozen = runner_state.get("best_quote_frozen_inventory")
+                if isinstance(frozen, MappingABC):
+                    quantities: list[float] = []
+                    for key in ("long_qty", "short_qty"):
+                        try:
+                            quantities.append(float(frozen.get(key) or 0.0))
+                        except (TypeError, ValueError):
+                            quantities.append(math.inf)
+                    for key in ("long_lots", "short_lots"):
+                        lots = frozen.get(key)
+                        if isinstance(lots, list):
+                            for lot in lots:
+                                if not isinstance(lot, MappingABC):
+                                    quantities.append(math.inf)
+                                    continue
+                                try:
+                                    quantities.append(float(lot.get("qty") or 0.0))
+                                except (TypeError, ValueError):
+                                    quantities.append(math.inf)
+                    if any(
+                        not math.isfinite(value) or value > 1e-12
+                        for value in quantities
+                    ):
+                        raise ValueError(
+                            "cannot register recovery while frozen inventory exists"
+                        )
             state = RecoveryState.initial(normalized, baseline, now=now)
             self._write_state(document, current=None, next_state=state)
             return state
@@ -859,6 +1155,70 @@ class JsonRecoveryStore:
             return self._decode_document_state(
                 self._read_document(allow_missing=False), normalized
             )
+
+    def reconcile_flat_profile(
+        self,
+        symbol: str,
+        *,
+        dry_run: bool = False,
+    ) -> tuple[RecoveryState, tuple[str, ...]]:
+        """Restore flat managed fields from the validated embedded owner.
+
+        This is a one-round local repair boundary for a registered symbol.  It
+        never changes the embedded recovery revision or any unrelated control
+        field; the next coordinator round performs any lifecycle transition.
+        """
+
+        normalized = _normalize_symbol(symbol)
+        with exclusive_control_lock(
+            self.control_path, timeout_seconds=self.lock_timeout_seconds
+        ):
+            document = self._read_document(allow_missing=False)
+            if not recovery_coordinator_registered(document):
+                raise RecoveryStateUnavailableError(
+                    f"unregistered recovery symbol: {normalized}"
+                )
+            state, canonical_envelope, slot_changes = (
+                _resolve_recovery_slots_for_repair(
+                    document,
+                    expected_symbol=normalized,
+                )
+            )
+            expected = _json_copy(
+                state.desired_profile.fields,
+                path="state.desired_profile.fields",
+            )
+            changed: set[str] = set(slot_changes)
+            for key, expected_value in expected.items():
+                try:
+                    actual_value = _json_copy(
+                        document[key], path=f"control.{key}"
+                    )
+                except (KeyError, RecoveryStateCorruptError):
+                    changed.add(key)
+                    continue
+                if actual_value != expected_value:
+                    changed.add(key)
+            unexpected = {
+                key
+                for key in document
+                if _is_managed_recovery_key(key) and key not in expected
+            }
+            changed.update(unexpected)
+            if not changed or dry_run:
+                return state, tuple(sorted(changed))
+
+            repaired = dict(document)
+            for key in unexpected:
+                repaired.pop(key, None)
+            repaired.update(expected)
+            for key in _RECOVERY_STATE_SLOT_KEYS:
+                repaired[key] = _json_copy(
+                    canonical_envelope,
+                    path=f"control.{key}",
+                )
+            write_control_json_atomically(self.control_path, repaired)
+            return state, tuple(sorted(changed))
 
     def compare_and_swap(
         self,
@@ -917,28 +1277,14 @@ class JsonRecoveryStore:
     def _decode_document_state(
         document: Mapping[str, Any], expected_symbol: str
     ) -> RecoveryState:
-        if RECOVERY_STATE_KEY not in document:
+        if not recovery_coordinator_registered(document):
             raise RecoveryStateUnavailableError(
                 f"unregistered recovery symbol: {expected_symbol}"
             )
-        envelope = document[RECOVERY_STATE_KEY]
-        if not isinstance(envelope, MappingABC):
-            raise RecoveryStateCorruptError(f"{RECOVERY_STATE_KEY} must be an object")
-        _require_fields(envelope, {"schema_version", "state"}, path=RECOVERY_STATE_KEY)
-        schema_version = envelope["schema_version"]
-        if (
-            type(schema_version) is not int
-            or schema_version != RECOVERY_STATE_SCHEMA_VERSION
-        ):
-            raise RecoveryStateCorruptError(
-                f"unsupported recovery state schema: {schema_version!r}"
-            )
-        state = _decode_state(envelope["state"])
-        if state.symbol != expected_symbol:
-            raise RecoveryStateCorruptError(
-                f"recovery symbol mismatch: expected {expected_symbol}, "
-                f"found {state.symbol}"
-            )
+        state = _decode_matching_recovery_slots(
+            document,
+            expected_symbol=expected_symbol,
+        )
         expected_flat = _json_copy(
             state.desired_profile.fields,
             path="state.desired_profile.fields",
@@ -984,8 +1330,27 @@ class JsonRecoveryStore:
         updated.update(
             _json_copy(next_state.desired_profile.fields, path="desired_profile.fields")
         )
-        updated[RECOVERY_STATE_KEY] = {
+        envelope = {
             "schema_version": RECOVERY_STATE_SCHEMA_VERSION,
             "state": encoded,
         }
+        updated[RECOVERY_STATE_KEY] = _json_copy(
+            envelope, path=RECOVERY_STATE_KEY
+        )
+        updated[RECOVERY_STATE_MIRROR_KEY] = _json_copy(
+            envelope, path=RECOVERY_STATE_MIRROR_KEY
+        )
         write_control_json_atomically(self.control_path, updated)
+
+
+def decode_recovery_control_state(
+    document: Mapping[str, Any],
+    *,
+    expected_symbol: str,
+) -> RecoveryState:
+    """Strictly validate one already-loaded recovery control document."""
+
+    return JsonRecoveryStore._decode_document_state(
+        document,
+        _normalize_symbol(expected_symbol),
+    )

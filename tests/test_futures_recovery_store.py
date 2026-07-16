@@ -14,14 +14,18 @@ from grid_optimizer.futures_recovery_coordinator import (
     ActionId,
     ActionLease,
     CleanupObligation,
+    EffectReceipt,
     EffectStage,
     FlowBlockerAssessment,
     FlowClock,
     FlowRoleKey,
     LedgerClass,
+    ManagedOrderIdentity,
+    ManagedOrderManifest,
     OrderRole,
     FuturesRecoveryDecisionEngine,
     RecoveryPhase,
+    RecoveryPolicy,
     RecoveryState,
     SafetyLease,
     Side,
@@ -29,10 +33,12 @@ from grid_optimizer.futures_recovery_coordinator import (
     materialize_profile,
 )
 from grid_optimizer.futures_recovery_store import (
+    RECOVERY_STATE_MIRROR_KEY,
     RECOVERY_STATE_KEY,
     JsonRecoveryStore,
     RecoveryStateCorruptError,
     RecoveryStateUnavailableError,
+    recovery_coordinator_registered,
 )
 
 
@@ -78,6 +84,16 @@ def _full_state() -> RecoveryState:
         },
         safety_lease=safety_lease,
     )
+    loss_profile = materialize_profile(
+        baseline=BASELINE,
+        action_id=ActionId.TEMPORARY_LOSS_RELIEF,
+        action_updates={
+            "recovery_order_side": Side.SELL.value,
+            "recovery_order_role": OrderRole.REDUCE_ONLY.value,
+        },
+        action_lease=action_lease,
+        action_lease_active=True,
+    )
     flow_key = FlowRoleKey(
         LedgerClass.NORMAL_BQ,
         Side.SELL,
@@ -103,11 +119,23 @@ def _full_state() -> RecoveryState:
         action_lease=action_lease,
         safety_lease=safety_lease,
         cleanup_obligation=CleanupObligation(
-            source_action_id=ActionId.TEMPORARY_LOSS_RELIEF,
-            source_decision_id="loss-decision-8",
-            action_lease_epoch=7,
-            open_order_ids=("order-2", "order-1"),
-            needs_manifest_rebuild=True,
+            managed_order_manifest=ManagedOrderManifest(
+                symbol="ARXUSDT",
+                generation=4,
+                decision_id="loss-decision-8",
+                profile_digest=loss_profile.digest,
+                action_id=ActionId.TEMPORARY_LOSS_RELIEF,
+                side=Side.SELL,
+                order_role=OrderRole.REDUCE_ONLY,
+                issued_at=action_lease.started_at,
+                orders=(
+                    ManagedOrderIdentity("1", "gx-arxu-tlr-source-1"),
+                    ManagedOrderIdentity("2", "gx-arxu-tlr-source-2"),
+                ),
+                action_lease_epoch=action_lease.epoch,
+                hard_expires_at=action_lease.hard_expires_at,
+            ),
+            needs_manifest_rebuild=False,
             created_at=NOW - timedelta(seconds=12),
             attempt_count=2,
             next_retry_at=NOW + timedelta(seconds=3),
@@ -310,6 +338,10 @@ def test_recovery_state_round_trips_every_field_and_deep_profile() -> None:
                         "schema_version": 1,
                         "state": encoded_state,
                     },
+                    RECOVERY_STATE_MIRROR_KEY: {
+                        "schema_version": 1,
+                        "state": encoded_state,
+                    },
                 }
             ),
             encoding="utf-8",
@@ -332,7 +364,11 @@ def test_recovery_state_round_trips_every_field_and_deep_profile() -> None:
         assert loaded.safety_lease is not None
         assert loaded.safety_lease.observation_seq == 41
         assert loaded.cleanup_obligation is not None
-        assert loaded.cleanup_obligation.open_order_ids == ("order-2", "order-1")
+        assert loaded.cleanup_obligation.open_order_ids == ("1", "2")
+        assert (
+            loaded.cleanup_obligation.managed_order_manifest.digest
+            == state.cleanup_obligation.managed_order_manifest.digest
+        )
         assert tuple(loaded.flow_clocks) == tuple(state.flow_clocks)
         assert loaded.temporary_loss_lease_uses == {
             "episode-a": 2,
@@ -344,6 +380,72 @@ def test_recovery_state_round_trips_every_field_and_deep_profile() -> None:
         assert loaded.effect_epoch == 13
         assert loaded.pending_effect_stage is EffectStage.MANAGED_GTX_CANCEL
         assert loaded.pending_effect_epoch == 13
+
+
+def test_rearmed_ordinary_retry_round_trip_preserves_episode_and_flow_clocks() -> None:
+    with TemporaryDirectory() as temp_dir:
+        control_path = Path(temp_dir) / "arxusdt_loop_runner_control.json"
+        store = JsonRecoveryStore(control_path)
+        state = store.register_symbol("ARXUSDT", BASELINE, now=NOW)
+        flow_key = FlowRoleKey(
+            LedgerClass.NORMAL_BQ,
+            Side.BUY,
+            OrderRole.ENTRY,
+        )
+        state = state.with_flow_clock(
+            flow_key,
+            quote_missing_since=NOW - timedelta(minutes=4),
+            submit_missing_since=NOW - timedelta(minutes=3),
+            fill_missing_since=NOW - timedelta(minutes=2),
+        ).with_temporary_loss_lease_use("ordinary-round-trip", count=2)
+        state = replace(
+            state.with_exhausted_attempt(
+                ActionId.MAKER_FLOW_RECOVER,
+                Side.BUY,
+                OrderRole.ENTRY,
+                now=NOW,
+            ).with_exhausted_attempt(
+                ActionId.BASELINE_TUNE,
+                Side.BUY,
+                OrderRole.ENTRY,
+                now=NOW,
+            ),
+            active_episode_fingerprint="ordinary-round-trip",
+        )
+        planned = FuturesRecoveryDecisionEngine(
+            policy=RecoveryPolicy(
+                exhausted_retry_backoff=timedelta(seconds=30)
+            )
+        ).plan_round(
+            snapshot=SymbolSnapshot(
+                symbol="ARXUSDT",
+                captured_at=NOW + timedelta(seconds=30),
+                assessment=FlowBlockerAssessment(
+                    missing_entry_sides=(Side.BUY,),
+                    episode_fingerprint="ordinary-round-trip",
+                ),
+            ),
+            state=state,
+            now=NOW + timedelta(seconds=30),
+            round_id="ordinary-round-trip-retry",
+        )
+        store.compare_and_swap(
+            "ARXUSDT",
+            expected_revision=0,
+            next_state=planned.next_state,
+        )
+
+        loaded = store.read("ARXUSDT")
+
+        assert loaded.active_action is ActionId.MAKER_FLOW_RECOVER
+        assert loaded.exhausted_attempts == ()
+        assert loaded.flow_clocks == state.flow_clocks
+        assert loaded.active_episode_fingerprint == "ordinary-round-trip"
+        assert loaded.temporary_loss_lease_uses == {"ordinary-round-trip": 2}
+        assert loaded.action_lease is None
+        assert loaded.desired_profile.fields[
+            "best_quote_maker_volume_allow_loss_reduce_only"
+        ] is False
 
 
 def test_register_uses_only_explicit_baseline_and_preserves_unmanaged_fields() -> None:
@@ -370,6 +472,7 @@ def test_register_uses_only_explicit_baseline_and_preserves_unmanaged_fields() -
         assert document["best_quote_maker_volume_allow_loss_reduce_only"] is False
         assert document["volatility_entry_pause_enabled"] is True
         assert document[RECOVERY_STATE_KEY]
+        assert document[RECOVERY_STATE_MIRROR_KEY] == document[RECOVERY_STATE_KEY]
         assert store.read("ARXUSDT") == registered
         with pytest.raises(ValueError, match="already registered"):
             JsonRecoveryStore(control_path).register_symbol(
@@ -378,6 +481,176 @@ def test_register_uses_only_explicit_baseline_and_preserves_unmanaged_fields() -
                 now=NOW + timedelta(days=1),
             )
         assert JsonRecoveryStore(control_path).read("ARXUSDT") == registered
+
+
+@pytest.mark.parametrize(
+    "corrupt_key",
+    (RECOVERY_STATE_KEY, RECOVERY_STATE_MIRROR_KEY),
+    ids=("primary_corrupt", "mirror_corrupt"),
+)
+def test_one_corrupt_recovery_slot_is_repaired_without_replaying_state(
+    corrupt_key: str,
+) -> None:
+    with TemporaryDirectory() as temp_dir:
+        control_path = Path(temp_dir) / "arxusdt_loop_runner_control.json"
+        store = JsonRecoveryStore(control_path)
+        registered = store.register_symbol("ARXUSDT", BASELINE, now=NOW)
+        active = replace(
+            _active_temporary_loss_state(),
+            document_revision=1,
+            baseline_profile=registered.baseline_profile,
+        )
+        store.compare_and_swap(
+            "ARXUSDT",
+            expected_revision=0,
+            next_state=active,
+        )
+        document = _read_document(control_path)
+        document["manual_unmanaged_switch"] = "keep-me"
+        document[corrupt_key] = {"schema_version": 1, "state": {"symbol": "ARXUSDT"}}
+        control_path.write_text(json.dumps(document), encoding="utf-8")
+
+        with pytest.raises(RecoveryStateCorruptError):
+            JsonRecoveryStore(control_path).read("ARXUSDT")
+
+        restarted_store = JsonRecoveryStore(control_path)
+        recovered, changed = restarted_store.reconcile_flat_profile("ARXUSDT")
+
+        repaired = _read_document(control_path)
+        assert changed == (corrupt_key,)
+        assert repaired[RECOVERY_STATE_KEY] == repaired[RECOVERY_STATE_MIRROR_KEY]
+        assert repaired["manual_unmanaged_switch"] == "keep-me"
+        assert recovered == active
+        assert restarted_store.read("ARXUSDT") == active
+        assert recovered.document_revision == 1
+        assert recovered.generation == active.generation
+        assert recovered.decision_id == active.decision_id
+        assert recovered.action_lease == active.action_lease
+        assert recovered.effect_epoch == active.effect_epoch
+
+
+def test_missing_primary_slot_keeps_registration_fence_and_repairs_from_mirror() -> None:
+    with TemporaryDirectory() as temp_dir:
+        control_path = Path(temp_dir) / "bchusdt_loop_runner_control.json"
+        store = JsonRecoveryStore(control_path)
+        registered = store.register_symbol("BCHUSDT", BASELINE, now=NOW)
+        document = _read_document(control_path)
+        del document[RECOVERY_STATE_KEY]
+        control_path.write_text(json.dumps(document), encoding="utf-8")
+
+        assert recovery_coordinator_registered(document) is True
+        with pytest.raises(RecoveryStateCorruptError):
+            JsonRecoveryStore(control_path).read("BCHUSDT")
+
+        recovered, changed = JsonRecoveryStore(control_path).reconcile_flat_profile(
+            "BCHUSDT"
+        )
+
+        repaired = _read_document(control_path)
+        assert recovered == registered
+        assert changed == (RECOVERY_STATE_KEY,)
+        assert repaired[RECOVERY_STATE_KEY] == repaired[RECOVERY_STATE_MIRROR_KEY]
+
+
+def test_mirror_namespace_cannot_be_owned_by_managed_profile() -> None:
+    with TemporaryDirectory() as temp_dir:
+        control_path = Path(temp_dir) / "arxusdt_loop_runner_control.json"
+        with pytest.raises(RecoveryStateCorruptError, match="state namespace"):
+            JsonRecoveryStore(control_path).register_symbol(
+                "ARXUSDT",
+                {**BASELINE, RECOVERY_STATE_MIRROR_KEY: {"unsafe": True}},
+                now=NOW,
+            )
+
+
+def test_two_corrupt_recovery_slots_remain_critical_and_unchanged() -> None:
+    with TemporaryDirectory() as temp_dir:
+        control_path = Path(temp_dir) / "arxusdt_loop_runner_control.json"
+        store = JsonRecoveryStore(control_path)
+        store.register_symbol("ARXUSDT", BASELINE, now=NOW)
+        document = _read_document(control_path)
+        document[RECOVERY_STATE_KEY] = {"schema_version": 1, "state": {}}
+        document[RECOVERY_STATE_MIRROR_KEY] = {"schema_version": 999, "state": {}}
+        control_path.write_text(json.dumps(document), encoding="utf-8")
+        before = control_path.read_bytes()
+
+        with pytest.raises(RecoveryStateCorruptError, match="both recovery state slots"):
+            JsonRecoveryStore(control_path).reconcile_flat_profile("ARXUSDT")
+
+        assert control_path.read_bytes() == before
+
+
+def test_two_valid_but_divergent_recovery_slots_fail_closed() -> None:
+    with TemporaryDirectory() as temp_dir:
+        control_path = Path(temp_dir) / "arxusdt_loop_runner_control.json"
+        store = JsonRecoveryStore(control_path)
+        registered = store.register_symbol("ARXUSDT", BASELINE, now=NOW)
+        divergent = replace(registered, generation=1)
+        document = _read_document(control_path)
+        document[RECOVERY_STATE_MIRROR_KEY] = {
+            "schema_version": 1,
+            "state": JsonRecoveryStore.encode_state(divergent),
+        }
+        control_path.write_text(json.dumps(document), encoding="utf-8")
+        before = control_path.read_bytes()
+
+        with pytest.raises(RecoveryStateCorruptError, match="recovery state slots diverge"):
+            JsonRecoveryStore(control_path).reconcile_flat_profile("ARXUSDT")
+
+        assert control_path.read_bytes() == before
+
+
+def test_register_refuses_symbol_with_existing_frozen_inventory() -> None:
+    with TemporaryDirectory() as temp_dir:
+        directory = Path(temp_dir)
+        control_path = directory / "bchusdt_loop_runner_control.json"
+        state_path = directory / "bchusdt_loop_state.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "best_quote_frozen_inventory": {
+                        "long_qty": 0.1,
+                        "short_qty": 0.0,
+                        "long_lots": [{"qty": 0.1, "price": 500.0}],
+                        "short_lots": [],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="frozen inventory"):
+            JsonRecoveryStore(control_path).register_symbol(
+                "BCHUSDT",
+                BASELINE,
+                now=NOW,
+            )
+
+        assert not control_path.exists()
+
+
+@pytest.mark.parametrize("enabled_in", ("control", "baseline"))
+def test_register_refuses_enabled_frozen_inventory_creation(enabled_in: str) -> None:
+    with TemporaryDirectory() as temp_dir:
+        directory = Path(temp_dir)
+        control_path = directory / "bchusdt_loop_runner_control.json"
+        control = {"symbol": "BCHUSDT"}
+        baseline = dict(BASELINE)
+        if enabled_in == "control":
+            control["best_quote_maker_volume_reduce_freeze_enabled"] = True
+        else:
+            baseline["best_quote_maker_volume_reduce_freeze_enabled"] = True
+        control_path.write_text(json.dumps(control), encoding="utf-8")
+        before = control_path.read_bytes()
+
+        with pytest.raises(ValueError, match="frozen inventory creation"):
+            JsonRecoveryStore(control_path).register_symbol(
+                "BCHUSDT",
+                baseline,
+                now=NOW,
+            )
+
+        assert control_path.read_bytes() == before
 
 
 def test_stale_recovery_metadata_is_removed_and_rejected_if_reintroduced() -> None:
@@ -472,6 +745,7 @@ def test_compare_and_swap_preserves_unmanaged_fields_and_increments_once() -> No
         document = _read_document(control_path)
         assert document["manual_unmanaged_switch"] == {"mode": "manual"}
         assert document["recovery_order_side"] == "BUY"
+        assert document[RECOVERY_STATE_MIRROR_KEY] == document[RECOVERY_STATE_KEY]
         assert store.read("ARXUSDT") == next_state
 
         with pytest.raises(RuntimeError, match="revision conflict"):
@@ -515,11 +789,17 @@ def test_safety_exit_state_round_trips_through_json_store() -> None:
             next_state=entered.next_state,
         )
         exited = engine.plan_round(
-            snapshot=SymbolSnapshot(
-                symbol="ARXUSDT",
-                captured_at=NOW + timedelta(seconds=1),
-                assessment=FlowBlockerAssessment(),
-            ),
+                snapshot=SymbolSnapshot(
+                    symbol="ARXUSDT",
+                    captured_at=NOW + timedelta(seconds=1),
+                    assessment=FlowBlockerAssessment(),
+                    effect_receipt=EffectReceipt(
+                        decision_id=entered.next_state.decision_id,
+                        stage=EffectStage.RUNNER_RESTART,
+                        effect_epoch=entered.effect_epoch,
+                        observed_at=NOW + timedelta(seconds=1),
+                    ),
+                ),
             state=store.read("ARXUSDT"),
             now=NOW + timedelta(seconds=1),
             round_id="store-safety-clear",

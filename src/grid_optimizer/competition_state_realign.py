@@ -43,6 +43,7 @@ from .data import (
     fetch_futures_position_risk_v3,
     fetch_futures_user_trades,
 )
+from .futures_recovery_store import recovery_coordinator_registered
 
 
 def _now_iso() -> str:
@@ -244,6 +245,19 @@ def main() -> None:
     k = os.environ["BINANCE_API_KEY"]
     s = os.environ["BINANCE_API_SECRET"]
     state_path = os.path.join(a.workdir, "output", f"{slug}_loop_state.json")
+    control_path = os.path.join(
+        a.workdir,
+        "output",
+        f"{slug}_loop_runner_control.json",
+    )
+    try:
+        with open(control_path, encoding="utf-8") as handle:
+            control = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        control = {}
+    if not isinstance(control, dict):
+        control = {}
+    coordinator_registered = recovery_coordinator_registered(control)
 
     lq, lavg, sq, savg = fetch_exchange_sides(sym, k, s)
     state = json.load(open(state_path))
@@ -253,11 +267,18 @@ def main() -> None:
         "ts": _now_iso(), "symbol": sym, "long_drift": round(ldrift, 1),
         "short_drift": round(sdrift, 1), "exch_long": lq, "exch_short": sq,
         "threshold": a.threshold_qty, "was_active": was_active,
+        "recovery_coordinator_registered": coordinator_registered,
     }
     if max(abs(ldrift), abs(sdrift)) <= a.threshold_qty or not a.enforce:
         status["action"] = (
             "none" if max(abs(ldrift), abs(sdrift)) <= a.threshold_qty else "DRY_RUN_would_realign"
         )
+        print(json.dumps(status))
+        return
+
+    if coordinator_registered:
+        status["action"] = "DEFERRED_TO_FUTURES_RECOVERY_COORDINATOR"
+        status["requested_action"] = "REALIGN_LEDGER"
         print(json.dumps(status))
         return
 

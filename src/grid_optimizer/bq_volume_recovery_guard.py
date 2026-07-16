@@ -1,17 +1,87 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from math import ceil
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from .futures_run_lifecycle import (
+    resolve_authoritative_run_contract,
+    run_contract_identity_from_config,
+    run_contract_snapshot_from_config,
+    validate_run_contract,
+)
+from .futures_terminal_ownership import (
+    TERMINAL_INTENT_ACTIVE_STATUSES as _TERMINAL_DRAIN_INTENT_ACTIVE_STATUSES,
+    TERMINAL_INTENT_COMPLETED_STATUSES as _TERMINAL_DRAIN_COMPLETED_STATUSES,
+    TerminalIntentValidationError,
+    terminal_drain_runtime_owner_is_integral,
+    validate_terminal_intent,
+)
+from .futures_recovery_coordinator import (
+    ActionId,
+    CleanupProof,
+    EffectReceipt,
+    EffectStage,
+    FlowBlockerAssessment,
+    FlowObservation,
+    FlowRoleKey,
+    LedgerClass,
+    ManagedOrderIdentity,
+    ManagedOrderManifest,
+    OrderRole,
+    RecoveryPhase,
+    RecoveryPolicy,
+    Side,
+    SymbolSnapshot,
+)
+from .futures_recovery_runtime_adapter import (
+    RegisteredSymbolRecoveryOrchestrator,
+    RecoveryAdmissionEvidenceError,
+    RecoveryConfigAppliedEvidence,
+    RecoveryConfigAppliedReceiptJournalError,
+    InventoryRecoveryReceiptJournalError,
+    TemporaryLossReceiptJournalError,
+    load_recovery_admission_evidence,
+    load_temporary_loss_runtime_evidence,
+    load_recovery_config_applied_evidence,
+    load_ordinary_recovery_runtime_evidence,
+    ordinary_recovery_fill_progress_receipts,
+    reconcile_managed_gtx_cleanup,
+    temporary_loss_fill_progress_receipts,
+)
+from .futures_recovery_runtime_signal import (
+    RUNTIME_SAFETY_SIGNAL_KEY,
+    RuntimeSafetySignal,
+    decode_runtime_safety_signal,
+    validate_runtime_safety_signal,
+)
+from .futures_volume_safety_observation import (
+    VolumeSafetyObservation,
+    decode_volume_safety_observation,
+    validate_volume_safety_observation,
+)
+from .futures_volatility_safety_observation import (
+    VolatilitySafetyObservation,
+    decode_volatility_safety_observation,
+    validate_volatility_safety_observation,
+)
+from .futures_recovery_shadow import flow_blockers_from_legacy
+from .futures_recovery_store import (
+    JsonRecoveryStore,
+    RECOVERY_STATE_KEY,
+    RECOVERY_STATE_MIRROR_KEY,
+    RecoveryStateStoreError,
+    recovery_coordinator_registered,
+)
 from .recovery_control_ownership import (
     exclusive_control_lock,
     mark_recovery_owned,
@@ -137,6 +207,249 @@ def _target_gate_done_marker(output_dir: Path, symbol: str, now: datetime) -> Pa
     return output_dir / f"{symbol.lower()}_target_gate_done_{now.strftime('%Y%m%d')}.flag"
 
 
+def _has_explicit_target_run_contract(output_dir: Path, symbol: str) -> bool:
+    """Return True only for a valid target run with its own immutable window."""
+
+    control = _read_json(_control_path(Path(output_dir), symbol))
+    try:
+        contract = validate_run_contract(
+            run_start_time=control.get("run_start_time"),
+            runtime_guard_stats_start_time=control.get(
+                "runtime_guard_stats_start_time"
+            ),
+            run_end_time=control.get("run_end_time"),
+            target_value=control.get("max_cumulative_notional"),
+            exit_policy=control.get("terminal_drain_exit_policy"),
+            loss_budget=control.get("terminal_drain_absolute_loss_budget"),
+            max_wait_seconds=control.get("terminal_drain_max_wait_seconds"),
+            preserve_reason=control.get("terminal_drain_stop_preserve_reason"),
+            wear_stop_per_10k=control.get("lifecycle_wear_stop_per_10k"),
+            wear_stop_min_gross_notional=control.get(
+                "lifecycle_wear_stop_min_gross_notional"
+            ),
+        )
+    except ValueError:
+        return False
+    return bool(
+        contract.target_value is not None
+        and contract.runtime_guard_stats_start_time is not None
+        and contract.run_end_time is not None
+    )
+
+
+def _terminal_delegation_blocked(
+    *,
+    symbol: str,
+    dry_run: bool,
+    reason: str,
+    error: str,
+) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "action": "terminal_drain_delegation_blocked",
+        "liveness_status": "blocked",
+        "severity": "critical",
+        "reason": reason,
+        "error": error,
+        "changed_keys": [],
+        "effect_count": 0,
+        "control_cas_count": 0,
+        "backup_path": None,
+        "restart_failed": None,
+        "dry_run": dry_run,
+    }
+
+
+def _terminal_record_contract(
+    record: Mapping[str, Any],
+    *,
+    symbol: str,
+    label: str,
+) -> tuple[dict[str, Any], str]:
+    snapshot = record.get("run_contract_snapshot")
+    if not isinstance(snapshot, dict):
+        raise ValueError(f"{label} run contract snapshot is missing")
+    canonical = run_contract_snapshot_from_config(snapshot)
+    if canonical != snapshot:
+        raise ValueError(f"{label} run contract snapshot is not canonical")
+    if canonical.get("symbol") != symbol:
+        raise ValueError(f"{label} run contract snapshot symbol mismatch")
+    contract_id = run_contract_identity_from_config(canonical)
+    if str(record.get("run_contract_id") or "").strip() != contract_id:
+        raise ValueError(f"{label} run contract id mismatch")
+    return canonical, contract_id
+
+
+def _terminal_drain_delegation(
+    *,
+    symbol: str,
+    output_dir: Path,
+    dry_run: bool,
+) -> dict[str, Any] | None:
+    """Return only a fully verified terminal owner, or a visible hard block."""
+    normalized_symbol = symbol.upper().strip()
+    output_dir = Path(output_dir)
+    slug = normalized_symbol.lower()
+    control_path = output_dir / f"{slug}_loop_runner_control.json"
+    intent_path = output_dir / f"{slug}_terminal_intent.json"
+    state_path = output_dir / f"{slug}_loop_state.json"
+    terminal_intent = _read_json(intent_path)
+    loop_state = _read_json(state_path)
+    terminal_owner = loop_state.get("futures_terminal_drain")
+    if not intent_path.exists() and terminal_owner is None:
+        return None
+
+    control = _read_json(control_path)
+    try:
+        _current_snapshot, current_contract_id = resolve_authoritative_run_contract(
+            control,
+            expected_symbol=normalized_symbol,
+        )
+    except (TypeError, ValueError) as exc:
+        return _terminal_delegation_blocked(
+            symbol=normalized_symbol,
+            dry_run=dry_run,
+            reason="terminal_current_run_contract_invalid",
+            error=str(exc),
+        )
+
+    active_intent: dict[str, Any] | None = None
+    completed_current_intent: dict[str, Any] | None = None
+    if intent_path.exists():
+        try:
+            validated_intent = validate_terminal_intent(
+                terminal_intent,
+                expected_symbol=normalized_symbol,
+            )
+            intent_contract_id = validated_intent.run_contract_id
+            if validated_intent.status in _TERMINAL_DRAIN_INTENT_ACTIVE_STATUSES:
+                active_intent = terminal_intent
+            elif intent_contract_id == current_contract_id:
+                completed_current_intent = terminal_intent
+        except (TerminalIntentValidationError, TypeError, ValueError) as exc:
+            return _terminal_delegation_blocked(
+                symbol=normalized_symbol,
+                dry_run=dry_run,
+                reason="terminal_intent_integrity_invalid",
+                error=str(exc),
+            )
+
+    active_owner: dict[str, Any] | None = None
+    completed_current_owner: dict[str, Any] | None = None
+    if terminal_owner is not None:
+        try:
+            if not isinstance(terminal_owner, dict):
+                raise ValueError("terminal runtime owner must be an object")
+            owner_status = str(terminal_owner.get("exit_status") or "")
+            if owner_status not in {
+                "exiting",
+                "exit_blocked",
+                "stopped_clean",
+                "stopped_preserved",
+            }:
+                raise ValueError("terminal runtime owner status is invalid")
+            _owner_snapshot, owner_contract_id = _terminal_record_contract(
+                terminal_owner,
+                symbol=normalized_symbol,
+                label="terminal runtime owner",
+            )
+            expected_decision_id = f"{normalized_symbol}|{owner_contract_id}"
+            if terminal_owner.get("decision_id") != expected_decision_id:
+                raise ValueError("terminal runtime owner decision mismatch")
+            if not terminal_drain_runtime_owner_is_integral(
+                terminal_owner,
+                symbol=normalized_symbol,
+                loop_state=loop_state,
+            ):
+                raise ValueError("terminal runtime owner integrity mismatch")
+            if owner_status in {"exiting", "exit_blocked"}:
+                active_owner = terminal_owner
+            elif owner_contract_id == current_contract_id:
+                completed_current_owner = terminal_owner
+        except (TypeError, ValueError) as exc:
+            return _terminal_delegation_blocked(
+                symbol=normalized_symbol,
+                dry_run=dry_run,
+                reason="terminal_runtime_owner_integrity_invalid",
+                error=str(exc),
+            )
+
+    if active_owner is not None:
+        owner_contract_id = str(active_owner["run_contract_id"])
+        delegated = {
+            "symbol": normalized_symbol,
+            "action": "delegated_to_terminal_drain_owner",
+            "changed_keys": [],
+            "backup_path": None,
+            "dry_run": dry_run,
+            "restart_failed": None,
+            "terminal_drain_decision_id": active_owner.get("decision_id"),
+            "terminal_drain_exit_status": active_owner.get("exit_status"),
+            "terminal_drain_run_contract_id": owner_contract_id,
+            "terminal_drain_contract_current": (
+                owner_contract_id == current_contract_id
+            ),
+            "terminal_recovery_reason": "trusted_lifecycle_terminal_handoff",
+        }
+        if active_intent is not None:
+            delegated["terminal_drain_intent_id"] = active_intent.get("intent_id")
+            delegated["terminal_drain_intent_status"] = active_intent.get("status")
+        return delegated
+
+    if active_intent is not None:
+        intent_contract_id = str(active_intent["run_contract_id"])
+        return {
+            "symbol": normalized_symbol,
+            "action": "delegated_to_terminal_drain_intent",
+            "changed_keys": [],
+            "backup_path": None,
+            "dry_run": dry_run,
+            "restart_failed": None,
+            "terminal_drain_intent_id": active_intent.get("intent_id"),
+            "terminal_drain_intent_status": active_intent.get("status"),
+            "terminal_drain_run_contract_id": intent_contract_id,
+            "terminal_drain_contract_current": (
+                intent_contract_id == current_contract_id
+            ),
+            "terminal_recovery_reason": "trusted_lifecycle_terminal_handoff",
+        }
+
+    if completed_current_intent is not None:
+        return {
+            "symbol": normalized_symbol,
+            "action": "delegated_to_terminal_drain_intent",
+            "changed_keys": [],
+            "backup_path": None,
+            "dry_run": dry_run,
+            "restart_failed": None,
+            "terminal_drain_intent_id": completed_current_intent.get("intent_id"),
+            "terminal_drain_intent_status": completed_current_intent.get("status"),
+            "terminal_drain_run_contract_id": current_contract_id,
+            "terminal_drain_contract_current": True,
+            "terminal_recovery_reason": "trusted_lifecycle_terminal_handoff",
+        }
+
+    if completed_current_owner is not None:
+        return {
+            "symbol": normalized_symbol,
+            "action": "delegated_to_terminal_drain_owner",
+            "changed_keys": [],
+            "backup_path": None,
+            "dry_run": dry_run,
+            "restart_failed": None,
+            "terminal_drain_decision_id": completed_current_owner.get(
+                "decision_id"
+            ),
+            "terminal_drain_exit_status": completed_current_owner.get(
+                "exit_status"
+            ),
+            "terminal_drain_run_contract_id": current_contract_id,
+            "terminal_drain_contract_current": True,
+            "terminal_recovery_reason": "trusted_lifecycle_terminal_handoff",
+        }
+    return None
+
+
 def _fetch_corrupt_state_exchange_snapshot(symbol: str) -> dict[str, Any]:
     from .data import fetch_futures_open_orders, fetch_futures_position_risk_v3
 
@@ -160,13 +473,20 @@ def _fetch_corrupt_state_exchange_snapshot(symbol: str) -> dict[str, Any]:
     }
 
 
-def _fetch_arx_strategy_order_snapshot(symbol: str) -> dict[str, Any]:
-    """Return the exchange truth for ARX runner-owned orders only."""
+def _registered_strategy_client_order_prefix(symbol: str) -> str:
+    normalized = str(symbol).upper().strip()
+    if not normalized:
+        raise ValueError("registered strategy symbol is required")
+    return f"gx-{normalized.lower().replace('usdt', 'u')}-"
+
+
+def _fetch_registered_strategy_order_snapshot(symbol: str) -> dict[str, Any]:
+    """Return exchange truth for one symbol's runner-owned orders only."""
     from .data import fetch_futures_open_orders
 
     api_key = os.environ["BINANCE_API_KEY"]
     api_secret = os.environ["BINANCE_API_SECRET"]
-    prefix = "gx-arxu"
+    prefix = _registered_strategy_client_order_prefix(symbol)
     orders = fetch_futures_open_orders(
         symbol, api_key, api_secret, use_cache=False
     )
@@ -178,7 +498,14 @@ def _fetch_arx_strategy_order_snapshot(symbol: str) -> dict[str, Any]:
     return {
         "strategy_open_order_count": len(strategy_orders),
         "strategy_order_ids": [str(order.get("orderId") or "") for order in strategy_orders],
+        "strategy_client_order_prefix": prefix,
     }
+
+
+def _fetch_arx_strategy_order_snapshot(symbol: str) -> dict[str, Any]:
+    """Compatibility wrapper retained for the unregistered ARX legacy path."""
+
+    return _fetch_registered_strategy_order_snapshot(symbol)
 
 
 def _planned_entry_order_count(plan: Mapping[str, Any]) -> int:
@@ -755,6 +1082,8 @@ def apply_daily_target_pace_floor(
     target_pace_fraction: float,
     target_pace_max_multiplier: float,
     target_completion_buffer_seconds: float = 0.0,
+    target_window_start: datetime | None = None,
+    target_window_end: datetime | None = None,
 ) -> float:
     static_floor = max(float(min_volume_notional), 0.0)
     target = max(float(daily_target_notional or 0.0), 0.0)
@@ -762,16 +1091,87 @@ def apply_daily_target_pace_floor(
         volume_summary["effective_min_volume_notional"] = static_floor
         return static_floor
 
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    day_end = day_start + timedelta(days=1)
+    use_run_contract_window = bool(
+        target_window_start is not None
+        and target_window_end is not None
+        and target_window_start.tzinfo is not None
+        and target_window_end.tzinfo is not None
+        and target_window_start < target_window_end
+    )
+    if use_run_contract_window:
+        window_start = target_window_start.astimezone(timezone.utc)
+        window_end = target_window_end.astimezone(timezone.utc)
+        window_source = "run_contract"
+    else:
+        window_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        window_end = window_start + timedelta(days=1)
+        window_source = "calendar_day"
     completion_buffer = max(float(target_completion_buffer_seconds), 0.0)
-    target_deadline = day_end - timedelta(seconds=completion_buffer)
-    effective_target_deadline = target_deadline if now < target_deadline else day_end
-    elapsed_seconds = max((now - day_start).total_seconds(), 1.0)
+    target_deadline = window_end - timedelta(seconds=completion_buffer)
+    if target_deadline <= window_start:
+        target_deadline = window_end
+    volume_summary.update(
+        {
+            "target_pace_window_source": window_source,
+            "target_window_start": window_start.isoformat(),
+            "target_window_end": window_end.isoformat(),
+            "target_deadline": target_deadline.isoformat(),
+        }
+    )
+    if now < window_start:
+        volume_summary.update(
+            {
+                "daily_target_notional": target,
+                "daily_gross_notional": 0.0,
+                "target_window_gross_notional": 0.0,
+                "remaining_target_notional": target,
+                "remaining_target_seconds": max(
+                    (target_deadline - window_start).total_seconds(), 0.0
+                ),
+                "effective_target_deadline": target_deadline.isoformat(),
+                "completion_buffer_expired": False,
+                "target_window_status": "waiting",
+                "required_hourly_notional": 0.0,
+                "target_pace_floor_notional": static_floor,
+                "effective_min_volume_notional": static_floor,
+            }
+        )
+        return static_floor
+    if now >= window_end:
+        elapsed_seconds = max((window_end - window_start).total_seconds(), 1.0)
+        window_summary = summarize_recent_volume(
+            rows=rows,
+            now=window_end,
+            window_seconds=elapsed_seconds,
+        )
+        window_gross = _safe_float(window_summary.get("gross_notional"))
+        volume_summary.update(
+            {
+                "daily_target_notional": target,
+                "daily_gross_notional": window_gross,
+                "target_window_gross_notional": window_gross,
+                "remaining_target_notional": max(target - window_gross, 0.0),
+                "remaining_target_seconds": 0.0,
+                "effective_target_deadline": window_end.isoformat(),
+                "completion_buffer_expired": True,
+                "target_window_status": "expired",
+                "required_hourly_notional": 0.0,
+                "target_pace_floor_notional": static_floor,
+                "effective_min_volume_notional": static_floor,
+            }
+        )
+        return static_floor
+
+    effective_target_deadline = target_deadline if now < target_deadline else window_end
+    elapsed_seconds = max((now - window_start).total_seconds(), 1.0)
     remaining_seconds = max((effective_target_deadline - now).total_seconds(), 1.0)
-    day_summary = summarize_recent_volume(rows=rows, now=now, window_seconds=elapsed_seconds)
-    day_gross = _safe_float(day_summary.get("gross_notional"))
-    remaining_target = max(target - day_gross, 0.0)
+    window_summary = summarize_recent_volume(
+        rows=rows,
+        now=now,
+        window_seconds=elapsed_seconds,
+    )
+    window_gross = _safe_float(window_summary.get("gross_notional"))
+    remaining_target = max(target - window_gross, 0.0)
     required_hourly = remaining_target * 3600.0 / remaining_seconds
     target_floor = required_hourly * max(float(window_seconds), 1.0) / 3600.0
     target_floor *= max(float(target_pace_fraction), 0.0)
@@ -782,13 +1182,14 @@ def apply_daily_target_pace_floor(
     volume_summary.update(
         {
             "daily_target_notional": target,
-            "daily_gross_notional": day_gross,
+            "daily_gross_notional": window_gross,
+            "target_window_gross_notional": window_gross,
             "remaining_target_notional": remaining_target,
             "remaining_target_seconds": remaining_seconds,
             "target_completion_buffer_seconds": completion_buffer,
-            "target_deadline": target_deadline.isoformat(),
             "effective_target_deadline": effective_target_deadline.isoformat(),
             "completion_buffer_expired": now >= target_deadline,
+            "target_window_status": "active",
             "required_hourly_notional": required_hourly,
             "target_pace_floor_notional": target_floor,
             "effective_min_volume_notional": effective_floor,
@@ -802,6 +1203,7 @@ def apply_target_pace_cycle_budget_floor(
     volume_summary: dict[str, Any],
     rows: list[dict[str, Any]],
     now: datetime,
+    target_window_start: datetime | None = None,
     control: dict[str, Any],
     assessment: dict[str, Any],
     static_floor_notional: float,
@@ -812,7 +1214,17 @@ def apply_target_pace_cycle_budget_floor(
     current_budget = max(_safe_float(control.get("best_quote_maker_volume_cycle_budget_notional")), 0.0)
     required_hourly = max(_safe_float(volume_summary.get("required_hourly_notional")), 0.0)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    trailing_seconds = min(max((now - day_start).total_seconds(), 1.0), 3600.0)
+    trailing_start = max(day_start, now - timedelta(hours=1))
+    if (
+        target_window_start is not None
+        and target_window_start.tzinfo is not None
+        and target_window_start <= now
+    ):
+        trailing_start = max(
+            trailing_start,
+            target_window_start.astimezone(timezone.utc),
+        )
+    trailing_seconds = max((now - trailing_start).total_seconds(), 1.0)
     trailing_summary = summarize_recent_volume(rows=rows, now=now, window_seconds=trailing_seconds)
     trailing_gross = max(_safe_float(trailing_summary.get("gross_notional")), 0.0)
     trailing_hourly = trailing_gross * 3600.0 / trailing_seconds
@@ -826,12 +1238,17 @@ def apply_target_pace_cycle_budget_floor(
     )
     short_wear_metrics: dict[str, float] = {}
     for label, seconds in (("5m", 300.0), ("15m", 900.0)):
-        short_summary = summarize_recent_volume(rows=rows, now=now, window_seconds=seconds)
+        effective_seconds = min(seconds, trailing_seconds)
+        short_summary = summarize_recent_volume(
+            rows=rows,
+            now=now,
+            window_seconds=effective_seconds,
+        )
         short_gross = max(_safe_float(short_summary.get("gross_notional")), 0.0)
         short_realized = summarize_recent_realized_pnl(
             rows=rows,
             now=now,
-            window_seconds=seconds,
+            window_seconds=effective_seconds,
         )
         short_wear_metrics[f"trailing_{label}_gross_notional"] = short_gross
         short_wear_metrics[f"trailing_{label}_realized_pnl"] = short_realized
@@ -844,6 +1261,7 @@ def apply_target_pace_cycle_budget_floor(
     volume_summary.update(
         {
             "trailing_60m_gross_notional": trailing_gross,
+            "trailing_window_seconds": trailing_seconds,
             "trailing_60m_hourly_notional": trailing_hourly,
             "trailing_60m_realized_pnl": trailing_realized_pnl,
             "trailing_60m_realized_wear_per_10k": trailing_realized_wear_per_10k,
@@ -975,6 +1393,23 @@ def _remember_recovery_updates(item: dict[str, Any], updates: dict[str, Any]) ->
         if key in _RECOVERY_CONTROL_KEYS:
             expected[key] = value
     item["guard_recovery_controls"] = expected
+
+
+def _recovery_original_controls_are_usable(item: Mapping[str, Any]) -> bool:
+    """Return whether the owned recovery has a readable restorable baseline."""
+
+    original = item.get("guard_original_controls")
+    if not isinstance(original, dict) or not original:
+        return False
+    known_originals = {
+        key: value for key, value in original.items() if key in _RECOVERY_CONTROL_KEYS
+    }
+    if not known_originals or any(
+        isinstance(value, (dict, list, tuple, set))
+        for value in known_originals.values()
+    ):
+        return False
+    return True
 
 
 def _restore_recovery_controls(
@@ -1699,6 +2134,10 @@ def _apply_control_update(
     dry_run: bool,
     restart_runner: RestartRunner,
 ) -> tuple[list[str], str | None]:
+    if recovery_coordinator_registered(control):
+        raise RuntimeError(
+            "registered recovery symbol rejects legacy control updates"
+        )
     if symbol.upper().strip() == "ARXUSDT":
         proposed = {**control, **updates}
         updates = {**updates, **arx_single_side_cap_updates(proposed)}
@@ -1710,6 +2149,10 @@ def _apply_control_update(
     # by a stale whole-document write, then keep the lock through restart.
     with exclusive_control_lock(control_path):
         current = _read_json(control_path) or dict(control)
+        if recovery_coordinator_registered(current):
+            raise RuntimeError(
+                "registered recovery symbol rejects legacy control updates"
+            )
         if symbol.upper().strip() == "ARXUSDT":
             proposed = {**current, **updates}
             updates = {**updates, **arx_single_side_cap_updates(proposed)}
@@ -2608,15 +3051,34 @@ def should_restart_arx_for_exchange_order_drift(
     lost two of those four runner-owned orders, the surviving half-book is a
     material throughput fault, not a healthy partial replacement window.
     """
-    expected_entries = max(int(expected_entry_order_count), 0)
-    return (
+    return bool(
         symbol.upper().strip() == "ARXUSDT"
-        and int(local_active_order_count) > 0
+        and should_restart_registered_for_exchange_order_drift(
+            local_active_order_count=local_active_order_count,
+            exchange_open_order_count=exchange_open_order_count,
+            expected_entry_order_count=expected_entry_order_count,
+        )
+    )
+
+
+def should_restart_registered_for_exchange_order_drift(
+    *,
+    local_active_order_count: int,
+    exchange_open_order_count: int,
+    expected_entry_order_count: int = 0,
+) -> bool:
+    """Detect material local/exchange drift for any registered symbol."""
+
+    expected_entries = max(int(expected_entry_order_count), 0)
+    exchange_count = int(exchange_open_order_count)
+    return (
+        int(local_active_order_count) > 0
+        and exchange_count >= 0
         and (
-            int(exchange_open_order_count) == 0
+            exchange_count == 0
             or (
                 expected_entries >= 4
-                and int(exchange_open_order_count) <= expected_entries - 2
+                and exchange_count <= expected_entries - 2
             )
         )
     )
@@ -2640,6 +3102,9 @@ def has_recent_arx_submit_activity(
         and _safe_float(event.get("event_time")) >= cutoff_ms
         for event in events
     )
+
+
+has_recent_registered_submit_activity = has_recent_arx_submit_activity
 
 
 def should_hold_arx_volume_priority_release(
@@ -3900,6 +4365,41 @@ def _configured_daily_target_notional(control: Mapping[str, Any]) -> float:
     return max(_safe_float(control.get("max_cumulative_notional")), 0.0)
 
 
+def _configured_target_pace_window(
+    control: Mapping[str, Any],
+) -> tuple[datetime | None, datetime | None]:
+    """Return the exact cumulative-volume window saved with the live run."""
+
+    start = _parse_time(control.get("runtime_guard_stats_start_time"))
+    end = _parse_time(control.get("run_end_time"))
+    if start is None or end is None or start >= end:
+        return None, None
+    return start, end
+
+
+def _target_trade_fetch_window_seconds(
+    *,
+    control: Mapping[str, Any],
+    now: datetime,
+    window_seconds: float,
+    has_cli_target: bool,
+) -> float:
+    """Keep exchange history aligned with the immutable target window."""
+
+    fetch_window_seconds = max(float(window_seconds), 1.0)
+    has_target = bool(has_cli_target) or _configured_daily_target_notional(control) > 0
+    if not has_target:
+        return fetch_window_seconds
+    target_start, target_end = _configured_target_pace_window(control)
+    if target_start is not None and target_end is not None:
+        return max(
+            fetch_window_seconds,
+            max((now - target_start).total_seconds(), 0.0),
+        )
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(fetch_window_seconds, (now - day_start).total_seconds())
+
+
 def check_symbol(
     *,
     symbol: str,
@@ -3940,7 +4440,49 @@ def check_symbol(
 ) -> dict[str, Any]:
     normalized_symbol = symbol.upper().strip()
     output_dir = Path(output_dir)
+    terminal_delegation = _terminal_drain_delegation(
+        symbol=normalized_symbol,
+        output_dir=output_dir,
+        dry_run=dry_run,
+    )
+    if (
+        terminal_delegation is not None
+        and terminal_delegation.get("action")
+        == "terminal_drain_delegation_blocked"
+    ):
+        _append_jsonl(
+            output_dir / "bq_volume_recovery_guard_events.jsonl",
+            {"ts": now.isoformat(), **terminal_delegation},
+        )
+        return terminal_delegation
     control_path = _control_path(output_dir, normalized_symbol)
+    if _registered_recovery_envelope_present(control_path):
+        registered = run_registered_recovery_symbol_round(
+            symbol=normalized_symbol,
+            output_dir=output_dir,
+            guard_state=state,
+            now=now,
+            window_seconds=window_seconds,
+            min_volume_notional=min_volume_notional,
+            near_cap_ratio=near_cap_ratio,
+            far_ticks=far_ticks,
+            plan_stale_seconds=plan_stale_seconds,
+            dry_run=dry_run,
+            runner_wrapper=runner_wrapper,
+            restart_runner=restart_runner,
+            terminal_delegation=terminal_delegation,
+        )
+        _append_jsonl(
+            output_dir / "bq_volume_recovery_guard_events.jsonl",
+            {"ts": now.isoformat(), **registered},
+        )
+        return registered
+    if terminal_delegation is not None:
+        _append_jsonl(
+            output_dir / "bq_volume_recovery_guard_events.jsonl",
+            {"ts": now.isoformat(), **terminal_delegation},
+        )
+        return terminal_delegation
     control = _read_json(control_path)
     plan = _read_json(_plan_path(output_dir, normalized_symbol))
     submit = _read_json(_submit_path(output_dir, normalized_symbol))
@@ -3957,6 +4499,7 @@ def check_symbol(
         if configured_daily_target > 0
         else daily_target_notional
     )
+    target_window_start, target_window_end = _configured_target_pace_window(control)
     effective_min_volume_notional = apply_daily_target_pace_floor(
         volume_summary=volume_summary,
         rows=rows,
@@ -3967,6 +4510,8 @@ def check_symbol(
         target_pace_fraction=target_pace_fraction,
         target_pace_max_multiplier=target_pace_max_multiplier,
         target_completion_buffer_seconds=target_completion_buffer_seconds,
+        target_window_start=target_window_start,
+        target_window_end=target_window_end,
     )
     assessment = assess_symbol(
         symbol=normalized_symbol,
@@ -4046,6 +4591,7 @@ def check_symbol(
         volume_summary=volume_summary,
         rows=rows,
         now=now,
+        target_window_start=target_window_start,
         control=control,
         assessment=assessment,
         static_floor_notional=cycle_budget_floor_notional,
@@ -4314,7 +4860,7 @@ def check_symbol(
         <= max(_safe_float(volume_summary.get("effective_min_volume_notional")), 0.0) * 0.5
     )
     recovery_original_controls = item.get("guard_original_controls")
-    recovery_has_original_controls = isinstance(recovery_original_controls, dict) and bool(recovery_original_controls)
+    recovery_has_original_controls = _recovery_original_controls_are_usable(item)
     recovery_expected_controls = item.get("guard_recovery_controls")
     recovery_expected_controls = (
         {
@@ -4931,6 +5477,7 @@ def check_symbol(
         control_updated_at is not None
         and control_updated_at <= now
         and item.get("last_verified_control_update_at") != control_updated_at.isoformat()
+        and item.get("last_terminal_control_update_at") != control_updated_at.isoformat()
     ):
         submit_generated_at = _parse_time(
             submit.get("submit_generated_at") or submit.get("generated_at")
@@ -4962,7 +5509,51 @@ def check_symbol(
             item["last_verified_control_update_at"] = control_updated_at.isoformat()
 
     try:
-        if stale_or_missing and not recovery_timeout_required:
+        if (
+            recovery_timed_out
+            and action_verification == "failed"
+            and not recovery_has_original_controls
+            and not bool(
+                control.get("best_quote_maker_volume_allow_loss_reduce_only")
+            )
+        ):
+            action = (
+                "dry_run_recovery_timeout_local_state_repair"
+                if dry_run
+                else "recovery_timeout_local_state_repair"
+            )
+            completed_at = now.isoformat()
+            item.update(
+                {
+                    "status": "cooldown",
+                    "cooldown_until": (
+                        now
+                        + timedelta(seconds=max(float(cooldown_seconds), 0.0))
+                    ).isoformat(),
+                    "last_recovery_action_at": completed_at,
+                    "last_recovery_action": action,
+                    "last_recovery_terminal_outcome": {
+                        "status": "terminated",
+                        "effect_stage": "local_state_repair",
+                        "reason": "original_controls_unavailable",
+                        "completed_at": completed_at,
+                    },
+                }
+            )
+            if control_updated_at is not None:
+                item["last_terminal_control_update_at"] = (
+                    control_updated_at.isoformat()
+                )
+            for key in (
+                "guard_original_controls",
+                "guard_recovery_controls",
+                "recovery_started_at",
+                "recovery_owned",
+                "action_verification_failures",
+                "last_action_verification",
+            ):
+                item.pop(key, None)
+        elif stale_or_missing and not recovery_timeout_required:
             action = "skip_stale_or_missing_inputs"
         elif (
             not bool(recovery_gate.get("ok"))
@@ -8777,6 +9368,1677 @@ def check_symbol(
     return result
 
 
+_REGISTERED_RUNTIME_EVIDENCE_KEY = "registered_recovery_runtime_evidence"
+_REGISTERED_RUNTIME_EVIDENCE_SCHEMA = "registered_recovery_runtime_v1"
+_REGISTERED_FLOW_OBSERVATION_KEY = "registered_recovery_flow_observation"
+_REGISTERED_FLOW_OBSERVATION_SCHEMA = "registered_recovery_flow_observation_v1"
+_REGISTERED_READINESS_OBSERVATION_KEY = (
+    "registered_recovery_readiness_observation"
+)
+_REGISTERED_READINESS_OBSERVATION_SCHEMA = (
+    "registered_recovery_readiness_observation_v1"
+)
+
+
+def _normal_entry_side(row: Mapping[str, Any]) -> Side | None:
+    client_order_id = str(
+        row.get("clientOrderId") or row.get("client_order_id") or ""
+    ).lower()
+    if any(marker in client_order_id for marker in ("-tlr-", "-frozen", "gtd-")):
+        return None
+    role = str(row.get("role") or "").strip().lower()
+    if role == "best_quote_entry_long":
+        return Side.BUY
+    if role == "best_quote_entry_short":
+        return Side.SELL
+    if "reduce" in role:
+        return None
+    side = str(row.get("side") or "").upper().strip()
+    position_side = str(
+        row.get("positionSide") or row.get("position_side") or ""
+    ).upper().strip()
+    if side == Side.BUY.value and position_side == "LONG":
+        return Side.BUY
+    if side == Side.SELL.value and position_side == "SHORT":
+        return Side.SELL
+    return None
+
+
+def _managed_order_manifest_from_runtime_evidence(
+    recovery_state: Any,
+    accepted_order_pairs: tuple[tuple[str, str], ...],
+) -> ManagedOrderManifest | None:
+    if not accepted_order_pairs:
+        return None
+    if (
+        recovery_state.decision_id is None
+        or recovery_state.issued_at is None
+        or recovery_state.side is None
+        or recovery_state.order_role is None
+    ):
+        raise ValueError("managed order evidence has no current action binding")
+    lease = recovery_state.action_lease
+    is_temporary_loss = (
+        recovery_state.active_action is ActionId.TEMPORARY_LOSS_RELIEF
+    )
+    if is_temporary_loss and lease is None:
+        raise ValueError("temporary-loss manifest has no action lease")
+    return ManagedOrderManifest(
+        symbol=recovery_state.symbol,
+        generation=recovery_state.generation,
+        decision_id=str(recovery_state.decision_id),
+        profile_digest=recovery_state.desired_profile.digest,
+        action_id=recovery_state.active_action,
+        side=recovery_state.side,
+        order_role=recovery_state.order_role,
+        issued_at=recovery_state.issued_at,
+        orders=tuple(
+            ManagedOrderIdentity(
+                order_id=order_id,
+                client_order_id=client_order_id,
+            )
+            for order_id, client_order_id in accepted_order_pairs
+        ),
+        action_lease_epoch=(lease.epoch if is_temporary_loss else None),
+        hard_expires_at=(lease.hard_expires_at if is_temporary_loss else None),
+    )
+
+
+def _accepted_limit_gtx_entry_sides(
+    submit: Mapping[str, Any],
+) -> set[Side]:
+    sides: set[Side] = set()
+    for row in submit.get("placed_orders", []):
+        if not isinstance(row, Mapping):
+            continue
+        request = row.get("request")
+        response = row.get("response")
+        if not isinstance(request, Mapping) or not isinstance(response, Mapping):
+            continue
+        side = _normal_entry_side(request)
+        order_type = str(
+            request.get("order_type") or request.get("type") or ""
+        ).upper().strip()
+        time_in_force = str(
+            request.get("time_in_force") or request.get("timeInForce") or ""
+        ).upper().strip()
+        status = str(response.get("status") or "").upper().strip()
+        if (
+            side is not None
+            and order_type == "LIMIT"
+            and time_in_force == "GTX"
+            and status in {"NEW", "PARTIALLY_FILLED", "FILLED"}
+            and str(response.get("orderId") or "").strip()
+            and str(response.get("clientOrderId") or "").strip()
+        ):
+            sides.add(side)
+    return sides
+
+
+def _normal_entry_flow_observations(
+    *,
+    recovery_state: Any,
+    plan: Mapping[str, Any],
+    submit: Mapping[str, Any],
+    trade_rows: Iterable[Mapping[str, Any]],
+    loop_state: Mapping[str, Any],
+    now: datetime,
+    far_ticks: int,
+) -> Mapping[FlowRoleKey, FlowObservation]:
+    bid, ask = _live_book(dict(plan), dict(submit))
+    tick = _tick_size(dict(plan), dict(recovery_state.desired_profile.fields))
+    planned_quote_sides: set[Side] = set()
+    for row in _planned_orders(dict(plan), dict(submit)):
+        side = _normal_entry_side(row)
+        if side is not None and _order_is_near_market(
+            row,
+            bid=bid,
+            ask=ask,
+            tick_size=tick,
+            far_ticks=far_ticks,
+        ):
+            planned_quote_sides.add(side)
+
+    submitted_sides = _accepted_limit_gtx_entry_sides(submit)
+    entry_order_sides: dict[str, Side] = {}
+    for placed in submit.get("placed_orders", []):
+        if not isinstance(placed, Mapping):
+            continue
+        request = placed.get("request")
+        response = placed.get("response")
+        if not isinstance(request, Mapping) or not isinstance(response, Mapping):
+            continue
+        side = _normal_entry_side(request)
+        order_id = str(response.get("orderId") or "").strip()
+        if side in submitted_sides and order_id:
+            entry_order_sides[order_id] = side
+    for raw in plan.get("kept_orders", []):
+        if not isinstance(raw, Mapping):
+            continue
+        row = dict(raw)
+        side = _normal_entry_side(row)
+        if (
+            side is not None
+            and str(row.get("type") or "").upper().strip() == "LIMIT"
+            and str(row.get("timeInForce") or "").upper().strip() == "GTX"
+            and _order_is_near_market(
+                row,
+                bid=bid,
+                ask=ask,
+                tick_size=tick,
+                far_ticks=far_ticks,
+            )
+        ):
+            submitted_sides.add(side)
+            order_id = str(row.get("orderId") or "").strip()
+            if order_id:
+                entry_order_sides[order_id] = side
+
+    raw_refs = loop_state.get("best_quote_volume_order_refs")
+    order_refs = raw_refs if isinstance(raw_refs, Mapping) else {}
+    for raw_order_id, raw_ref in order_refs.items():
+        if not isinstance(raw_ref, Mapping):
+            continue
+        role = str(raw_ref.get("role") or "").strip().lower()
+        book = str(raw_ref.get("book") or "").strip().lower()
+        if book not in {"", "normal", "normal_bq"}:
+            continue
+        if role == "best_quote_entry_long":
+            entry_order_sides[str(raw_order_id)] = Side.BUY
+        elif role == "best_quote_entry_short":
+            entry_order_sides[str(raw_order_id)] = Side.SELL
+
+    latest_fill_at: dict[Side, datetime] = {}
+    expected_prefix = _registered_strategy_client_order_prefix(
+        recovery_state.symbol
+    )
+    for raw in trade_rows:
+        if not isinstance(raw, Mapping):
+            continue
+        if str(raw.get("symbol") or "").upper().strip() not in {
+            "",
+            recovery_state.symbol,
+        }:
+            continue
+        client_order_id = str(
+            raw.get("clientOrderId") or raw.get("client_order_id") or ""
+        ).lower()
+        order_id = str(raw.get("orderId") or raw.get("order_id") or "").strip()
+        if client_order_id.startswith(expected_prefix):
+            side = _normal_entry_side(raw)
+        else:
+            side = entry_order_sides.get(order_id)
+        observed_at = _trade_time(dict(raw))
+        if (
+            side is None
+            or observed_at is None
+            or observed_at > now
+            or _safe_float(raw.get("qty")) <= 0
+        ):
+            continue
+        previous = latest_fill_at.get(side)
+        if previous is None or observed_at > previous:
+            latest_fill_at[side] = observed_at
+
+    normal_phase = bool(
+        recovery_state.phase
+        in {RecoveryPhase.STABLE, RecoveryPhase.COOLDOWN}
+        or (
+            recovery_state.phase is RecoveryPhase.RESTORING
+            and recovery_state.action_lease is None
+            and recovery_state.cleanup_obligation is None
+            and recovery_state.safety_lease is None
+            and recovery_state.desired_runner_state == "running"
+            and recovery_state.desired_profile.digest
+            == recovery_state.baseline_profile.digest
+        )
+    )
+    active_entry_side = (
+        recovery_state.side
+        if recovery_state.phase is RecoveryPhase.ACTIVE
+        and recovery_state.active_action
+        in {ActionId.MAKER_FLOW_RECOVER, ActionId.BASELINE_TUNE}
+        and recovery_state.order_role is OrderRole.ENTRY
+        else None
+    )
+    return {
+        FlowRoleKey(LedgerClass.NORMAL_BQ, side, OrderRole.ENTRY): FlowObservation(
+            obligation_active=bool(normal_phase or active_entry_side is side),
+            qualified_quote_present=side in planned_quote_sides,
+            submitted_gtx_present=side in submitted_sides,
+            latest_fill_at=latest_fill_at.get(side),
+        )
+        for side in (Side.BUY, Side.SELL)
+    }
+
+
+def _registered_readiness_sla_elapsed(
+    item: dict[str, Any],
+    *,
+    recovery_state: Any,
+    now: datetime,
+    error: str | None,
+) -> float:
+    symbol = recovery_state.symbol
+    raw = item.get(_REGISTERED_READINESS_OBSERVATION_KEY)
+    first_seen = None
+    if (
+        isinstance(raw, Mapping)
+        and raw.get("schema") == _REGISTERED_READINESS_OBSERVATION_SCHEMA
+        and raw.get("symbol") == symbol
+        and raw.get("generation") == recovery_state.generation
+        and raw.get("decision_id") == recovery_state.decision_id
+    ):
+        first_seen = _parse_time(raw.get("first_seen_at"))
+    if first_seen is None or first_seen > now:
+        first_seen = now
+    item[_REGISTERED_READINESS_OBSERVATION_KEY] = {
+        "schema": _REGISTERED_READINESS_OBSERVATION_SCHEMA,
+        "symbol": symbol,
+        "generation": recovery_state.generation,
+        "decision_id": recovery_state.decision_id,
+        "first_seen_at": first_seen.isoformat(),
+        "last_seen_at": now.isoformat(),
+        "last_error": str(error or "")[:240] or None,
+    }
+    return max((now - first_seen).total_seconds(), 0.0)
+
+
+def _blockers_with_runtime_safety_signal(
+    base: FlowBlockerAssessment,
+    signal: RuntimeSafetySignal,
+    *,
+    coordinator_observed_at: datetime,
+) -> FlowBlockerAssessment:
+    safety_reasons = list(base.safety_reasons)
+    runner_faults = list(base.runner_faults)
+    inventory_sides = list(base.inventory_reduce_sides)
+    for condition in signal.conditions:
+        if condition.action_id is ActionId.SAFETY_CONVERGE:
+            safety_reasons.append(condition.reason)
+        elif condition.action_id is ActionId.RUNNER_RECOVER:
+            runner_faults.append(f"runtime_safety:{condition.reason}")
+        elif (
+            condition.action_id is ActionId.INVENTORY_RECOVER
+            and condition.side is not None
+        ):
+            inventory_sides.append(condition.side)
+    has_signal_safety = any(
+        item.action_id is ActionId.SAFETY_CONVERGE
+        for item in signal.conditions
+    )
+    fingerprint = base.safety_evidence_fingerprint
+    observation_seq = base.safety_observation_seq
+    observed_at = base.safety_observed_at
+    if has_signal_safety:
+        combined_payload = {
+            "legacy_fingerprint": fingerprint,
+            "runtime_fingerprint": signal.fingerprint,
+            "coordinator_observed_at": coordinator_observed_at.isoformat(),
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                combined_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        observation_seq = max(
+            int(observation_seq or -1),
+            int(coordinator_observed_at.timestamp() * 1_000_000),
+        )
+        observed_at = max(
+            value
+            for value in (observed_at, coordinator_observed_at)
+            if value is not None
+        )
+    return replace(
+        base,
+        safety_reasons=tuple(dict.fromkeys(safety_reasons)),
+        safety_evidence_fingerprint=fingerprint,
+        safety_observation_seq=observation_seq,
+        safety_observed_at=observed_at,
+        runner_faults=tuple(dict.fromkeys(runner_faults)),
+        inventory_reduce_sides=tuple(
+            sorted(set(inventory_sides), key=lambda item: item.value)
+        ),
+    )
+
+
+def _runtime_signal_is_owned_predecessor(
+    signal: RuntimeSafetySignal,
+    recovery_state: Any,
+) -> bool:
+    requested_actions = {item.action_id for item in signal.conditions}
+    return bool(
+        signal.generation + 1 == recovery_state.generation
+        and recovery_state.phase
+        in {
+            RecoveryPhase.SETTLING,
+            RecoveryPhase.ACTIVE,
+            RecoveryPhase.CLEANING,
+        }
+        and recovery_state.active_action in requested_actions
+        and recovery_state.issued_at is not None
+        and signal.observed_at <= recovery_state.issued_at
+    )
+
+
+def _blockers_with_volume_safety_observation(
+    base: FlowBlockerAssessment,
+    observation: VolumeSafetyObservation,
+) -> FlowBlockerAssessment:
+    if not observation.active:
+        return base
+    combined_payload = {
+        "existing_fingerprint": base.safety_evidence_fingerprint,
+        "volume_fingerprint": observation.fingerprint,
+        "source": "web_volume_trigger",
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            combined_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return replace(
+        base,
+        safety_reasons=tuple(
+            dict.fromkeys((*base.safety_reasons, observation.reason))
+        ),
+        safety_evidence_fingerprint=fingerprint,
+        safety_observation_seq=max(
+            int(base.safety_observation_seq or -1),
+            observation.observation_seq,
+        ),
+        safety_observed_at=max(
+            value
+            for value in (base.safety_observed_at, observation.observed_at)
+            if value is not None
+        ),
+    )
+
+
+def _blockers_with_volatility_safety_observation(
+    base: FlowBlockerAssessment,
+    observation: VolatilitySafetyObservation,
+) -> FlowBlockerAssessment:
+    if not observation.active:
+        return base
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "existing_fingerprint": base.safety_evidence_fingerprint,
+                "volatility_fingerprint": observation.fingerprint,
+                "source": "web_volatility_trigger",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return replace(
+        base,
+        safety_reasons=tuple(
+            dict.fromkeys((*base.safety_reasons, observation.reason))
+        ),
+        safety_evidence_fingerprint=fingerprint,
+        safety_observation_seq=max(
+            int(base.safety_observation_seq or -1),
+            observation.observation_seq,
+        ),
+        safety_observed_at=max(
+            value
+            for value in (base.safety_observed_at, observation.observed_at)
+            if value is not None
+        ),
+    )
+
+
+def _registered_flow_episode_fingerprint(
+    *,
+    inventory_sides: tuple[Side, ...],
+    loss_sides: tuple[Side, ...],
+    missing_entry_sides: tuple[Side, ...],
+) -> str:
+    payload = {
+        "inventory": [side.value for side in inventory_sides],
+        "loss": [side.value for side in loss_sides],
+        "missing_entry": [side.value for side in missing_entry_sides],
+    }
+    return "rfo-" + hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _registered_blockers_with_ordinary_flow(
+    base: FlowBlockerAssessment,
+    *,
+    inventory_sides: tuple[Side, ...] = (),
+    loss_sides: tuple[Side, ...] = (),
+    missing_entry_sides: tuple[Side, ...] = (),
+    episode_fingerprint: str | None = None,
+    terminal_reason: str | None = None,
+    terminal_lifecycle_handoff: bool | None = None,
+) -> FlowBlockerAssessment:
+    return FlowBlockerAssessment(
+        terminal_reason=(
+            base.terminal_reason if terminal_reason is None else terminal_reason
+        ),
+        terminal_clean_flat_proof=base.terminal_clean_flat_proof,
+        terminal_lifecycle_handoff=(
+            base.terminal_lifecycle_handoff
+            if terminal_lifecycle_handoff is None
+            else terminal_lifecycle_handoff
+        ),
+        safety_reasons=base.safety_reasons,
+        safety_evidence_fingerprint=base.safety_evidence_fingerprint,
+        safety_observation_seq=base.safety_observation_seq,
+        safety_observed_at=base.safety_observed_at,
+        runner_faults=base.runner_faults,
+        unknown_order_ownership=base.unknown_order_ownership,
+        inventory_reduce_sides=inventory_sides,
+        loss_only_blocked_sides=loss_sides,
+        missing_entry_sides=missing_entry_sides,
+        episode_fingerprint=episode_fingerprint,
+    )
+
+
+def _store_registered_flow_observation(
+    item: dict[str, Any],
+    *,
+    state: Any,
+    blockers: FlowBlockerAssessment,
+    plan_observed_at: datetime,
+    submit_observed_at: datetime,
+) -> FlowBlockerAssessment:
+    inventory = tuple(sorted(set(blockers.inventory_reduce_sides), key=lambda side: side.value))
+    loss = tuple(sorted(set(blockers.loss_only_blocked_sides), key=lambda side: side.value))
+    missing = tuple(sorted(set(blockers.missing_entry_sides), key=lambda side: side.value))
+    if not (inventory or loss or missing):
+        item.pop(_REGISTERED_FLOW_OBSERVATION_KEY, None)
+        return _registered_blockers_with_ordinary_flow(blockers)
+    fingerprint = state.active_episode_fingerprint or _registered_flow_episode_fingerprint(
+        inventory_sides=inventory,
+        loss_sides=loss,
+        missing_entry_sides=missing,
+    )
+    item[_REGISTERED_FLOW_OBSERVATION_KEY] = {
+        "schema": _REGISTERED_FLOW_OBSERVATION_SCHEMA,
+        "symbol": state.symbol,
+        "episode_fingerprint": fingerprint,
+        "inventory_reduce_sides": [side.value for side in inventory],
+        "loss_only_blocked_sides": [side.value for side in loss],
+        "missing_entry_sides": [side.value for side in missing],
+        "plan_observed_at": plan_observed_at.isoformat(),
+        "submit_observed_at": submit_observed_at.isoformat(),
+    }
+    return _registered_blockers_with_ordinary_flow(
+        blockers,
+        inventory_sides=inventory,
+        loss_sides=loss,
+        missing_entry_sides=missing,
+        episode_fingerprint=fingerprint,
+    )
+
+
+def _carried_registered_flow_blockers(
+    item: Mapping[str, Any],
+    *,
+    state: Any,
+    base: FlowBlockerAssessment,
+) -> FlowBlockerAssessment | None:
+    if (
+        state.phase is RecoveryPhase.STABLE
+        or not state.active_episode_fingerprint
+    ):
+        return None
+    raw = item.get(_REGISTERED_FLOW_OBSERVATION_KEY)
+    if isinstance(raw, Mapping) and set(raw) == {
+        "schema",
+        "symbol",
+        "episode_fingerprint",
+        "inventory_reduce_sides",
+        "loss_only_blocked_sides",
+        "missing_entry_sides",
+        "plan_observed_at",
+        "submit_observed_at",
+    }:
+        fingerprint = raw.get("episode_fingerprint")
+        if (
+            raw.get("schema") == _REGISTERED_FLOW_OBSERVATION_SCHEMA
+            and raw.get("symbol") == state.symbol
+            and isinstance(fingerprint, str)
+            and fingerprint
+            and fingerprint == state.active_episode_fingerprint
+        ):
+            try:
+                inventory = tuple(
+                    Side(value) for value in raw["inventory_reduce_sides"]
+                )
+                loss = tuple(
+                    Side(value) for value in raw["loss_only_blocked_sides"]
+                )
+                missing = tuple(
+                    Side(value) for value in raw["missing_entry_sides"]
+                )
+            except (TypeError, ValueError):
+                pass
+            else:
+                if (
+                    list(raw["inventory_reduce_sides"])
+                    == sorted(set(raw["inventory_reduce_sides"]))
+                    and list(raw["loss_only_blocked_sides"])
+                    == sorted(set(raw["loss_only_blocked_sides"]))
+                    and list(raw["missing_entry_sides"])
+                    == sorted(set(raw["missing_entry_sides"]))
+                    and set(loss).issubset(set(inventory))
+                ):
+                    return _registered_blockers_with_ordinary_flow(
+                        base,
+                        inventory_sides=inventory,
+                        loss_sides=loss,
+                        missing_entry_sides=missing,
+                        episode_fingerprint=fingerprint,
+                    )
+    if state.side is None:
+        return None
+    if state.active_action is ActionId.TEMPORARY_LOSS_RELIEF:
+        return _registered_blockers_with_ordinary_flow(
+            base,
+            inventory_sides=(state.side,),
+            loss_sides=(state.side,),
+            episode_fingerprint=state.active_episode_fingerprint,
+        )
+    if state.active_action is ActionId.INVENTORY_RECOVER:
+        return _registered_blockers_with_ordinary_flow(
+            base,
+            inventory_sides=(state.side,),
+            episode_fingerprint=state.active_episode_fingerprint,
+        )
+    if state.active_action is ActionId.MAKER_FLOW_RECOVER:
+        return _registered_blockers_with_ordinary_flow(
+            base,
+            missing_entry_sides=(state.side,),
+            episode_fingerprint=state.active_episode_fingerprint,
+        )
+    if state.active_action is ActionId.BASELINE_TUNE:
+        if state.order_role is OrderRole.ENTRY:
+            return _registered_blockers_with_ordinary_flow(
+                base,
+                missing_entry_sides=(state.side,),
+                episode_fingerprint=state.active_episode_fingerprint,
+            )
+        if state.order_role is OrderRole.REDUCE_ONLY:
+            return _registered_blockers_with_ordinary_flow(
+                base,
+                inventory_sides=(state.side,),
+                episode_fingerprint=state.active_episode_fingerprint,
+            )
+    return None
+
+
+def _registered_recovery_envelope_present(control_path: Path) -> bool:
+    control = _read_json(control_path)
+    return recovery_coordinator_registered(control)
+
+
+def _registered_raw_allow_loss_is_unowned(
+    control: Mapping[str, Any],
+    recovery_state: Any,
+) -> bool:
+    if control.get("best_quote_maker_volume_allow_loss_reduce_only") is not True:
+        return False
+    lease = recovery_state.action_lease
+    desired = recovery_state.desired_profile.fields
+    return not bool(
+        recovery_state.phase is RecoveryPhase.ACTIVE
+        and recovery_state.active_action is ActionId.TEMPORARY_LOSS_RELIEF
+        and lease is not None
+        and recovery_state.side is lease.side
+        and recovery_state.action_lease_epoch == lease.epoch
+        and desired.get("best_quote_maker_volume_allow_loss_reduce_only") is True
+        and desired.get("recovery_action_lease_active") is True
+    )
+
+
+def _parse_registered_runtime_evidence(
+    item: Mapping[str, Any],
+    *,
+    recovery_state: Any,
+    now: datetime,
+) -> tuple[EffectReceipt | None, CleanupProof | None]:
+    raw = item.get(_REGISTERED_RUNTIME_EVIDENCE_KEY)
+    if not isinstance(raw, Mapping):
+        return None, None
+    if raw.get("schema") != _REGISTERED_RUNTIME_EVIDENCE_SCHEMA:
+        raise ValueError("registered runtime evidence schema is invalid")
+    if raw.get("symbol") != recovery_state.symbol:
+        raise ValueError("registered runtime evidence symbol mismatch")
+    if raw.get("decision_id") != recovery_state.decision_id:
+        return None, None
+    effect_receipt = None
+    effect = raw.get("effect_receipt")
+    if isinstance(effect, Mapping):
+        observed_at = _parse_time(effect.get("observed_at"))
+        try:
+            stage = EffectStage(str(effect.get("stage")))
+        except ValueError as exc:
+            raise ValueError("registered runtime effect stage is invalid") from exc
+        epoch = effect.get("effect_epoch")
+        if (
+            observed_at is None
+            or observed_at > now
+            or type(epoch) is not int
+            or epoch < 0
+        ):
+            raise ValueError("registered runtime effect receipt is invalid")
+        effect_receipt = EffectReceipt(
+            decision_id=str(recovery_state.decision_id),
+            stage=stage,
+            effect_epoch=epoch,
+            observed_at=observed_at,
+        )
+    cleanup_proof = None
+    proof = raw.get("cleanup_proof")
+    if isinstance(proof, Mapping):
+        observed_at = _parse_time(proof.get("observed_at"))
+        remaining = proof.get("remaining_order_ids")
+        watermark = proof.get("user_trades_watermark")
+        source_generation = proof.get("source_generation")
+        manifest_digest = proof.get("manifest_digest")
+        if (
+            observed_at is None
+            or observed_at > now
+            or not isinstance(remaining, list)
+            or any(not isinstance(value, str) for value in remaining)
+            or type(watermark) is not int
+            or watermark < 0
+            or type(source_generation) is not int
+            or source_generation < 0
+            or not isinstance(manifest_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest_digest)
+        ):
+            raise ValueError("registered runtime cleanup proof is invalid")
+        cleanup_proof = CleanupProof(
+            source_decision_id=str(proof.get("source_decision_id") or ""),
+            source_generation=source_generation,
+            manifest_digest=manifest_digest,
+            remaining_order_ids=tuple(remaining),
+            user_trades_watermark=watermark,
+            observed_at=observed_at,
+        )
+    return effect_receipt, cleanup_proof
+
+
+def _store_registered_runtime_evidence(
+    item: dict[str, Any],
+    *,
+    recovery_state: Any,
+    effect_receipt: EffectReceipt,
+    cleanup_proof: CleanupProof | None = None,
+) -> None:
+    item[_REGISTERED_RUNTIME_EVIDENCE_KEY] = {
+        "schema": _REGISTERED_RUNTIME_EVIDENCE_SCHEMA,
+        "symbol": recovery_state.symbol,
+        "decision_id": recovery_state.decision_id,
+        "generation": recovery_state.generation,
+        "profile_digest": recovery_state.desired_profile.digest,
+        "effect_receipt": {
+            "stage": effect_receipt.stage.value,
+            "effect_epoch": effect_receipt.effect_epoch,
+            "observed_at": effect_receipt.observed_at.isoformat(),
+        },
+        "cleanup_proof": (
+            {
+                "source_decision_id": cleanup_proof.source_decision_id,
+                "source_generation": cleanup_proof.source_generation,
+                "manifest_digest": cleanup_proof.manifest_digest,
+                "remaining_order_ids": list(cleanup_proof.remaining_order_ids),
+                "user_trades_watermark": cleanup_proof.user_trades_watermark,
+                "observed_at": cleanup_proof.observed_at.isoformat(),
+            }
+            if cleanup_proof is not None
+            else None
+        ),
+    }
+
+
+def run_registered_recovery_symbol_round(
+    *,
+    symbol: str,
+    output_dir: Path,
+    guard_state: dict[str, Any],
+    now: datetime,
+    window_seconds: float,
+    min_volume_notional: float,
+    near_cap_ratio: float,
+    far_ticks: int,
+    plan_stale_seconds: float,
+    dry_run: bool,
+    runner_wrapper: str,
+    runner_active_fetcher: Callable[[str], bool] | None = None,
+    restart_runner: RestartRunner | None = None,
+    stop_runner: RestartRunner | None = None,
+    exchange_order_snapshot_fetcher: CorruptStateExchangeFetcher | None = None,
+    fetch_open_orders: Callable[[str], list[dict[str, Any]]] | None = None,
+    cancel_order: Callable[[str, str], Mapping[str, Any]] | None = None,
+    fetch_user_trades_page: Callable[[str, int, int, int], list[dict[str, Any]]] | None = None,
+    terminal_delegation: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run the exclusive coordinator path for one explicitly registered symbol."""
+
+    normalized = symbol.upper().strip()
+    output_dir = Path(output_dir)
+    if (
+        terminal_delegation is not None
+        and terminal_delegation.get("action")
+        == "terminal_drain_delegation_blocked"
+    ):
+        return dict(terminal_delegation)
+    control_path = _control_path(output_dir, normalized)
+    control = _read_json(control_path)
+    store = JsonRecoveryStore(control_path)
+    try:
+        decoded, flat_drift = store.reconcile_flat_profile(
+            normalized,
+            dry_run=dry_run,
+        )
+    except (TypeError, ValueError, RecoveryStateStoreError) as exc:
+        return {
+            "symbol": normalized,
+            "action": "registered_recovery_blocked",
+            "liveness_status": "blocked",
+            "severity": "critical",
+            "reason": "registered_state_corrupt",
+            "error": str(exc),
+            "changed_keys": [],
+            "effect_count": 0,
+            "control_cas_count": 0,
+            "dry_run": dry_run,
+        }
+    if flat_drift:
+        mirror_repair = bool(
+            {RECOVERY_STATE_KEY, RECOVERY_STATE_MIRROR_KEY}.intersection(flat_drift)
+        )
+        return {
+            "symbol": normalized,
+            "action": (
+                (
+                    "dry_run_registered_recovery_state_mirror_repair"
+                    if mirror_repair
+                    else "dry_run_registered_flat_profile_repair"
+                )
+                if dry_run
+                else (
+                    "registered_recovery_state_mirror_repair"
+                    if mirror_repair
+                    else "registered_flat_profile_repair"
+                )
+            ),
+            "liveness_status": "recovering",
+            "reason": (
+                "recovery_state_slot_reconcile"
+                if mirror_repair
+                else "embedded_desired_profile_reconcile"
+            ),
+            "changed_keys": list(flat_drift),
+            "effect_stage": EffectStage.LOCAL_STATE_REPAIR.value,
+            "effect_count": 0 if dry_run else 1,
+            "external_effect_count": 0,
+            "control_cas_count": 0,
+            "dry_run": dry_run,
+        }
+    if _registered_raw_allow_loss_is_unowned(control, decoded):
+        return {
+            "symbol": normalized,
+            "action": "registered_recovery_blocked",
+            "liveness_status": "blocked",
+            "severity": "critical",
+            "reason": "raw_active_allow_loss_migration_required",
+            "changed_keys": [],
+            "effect_count": 0,
+            "control_cas_count": 0,
+            "dry_run": dry_run,
+        }
+    try:
+        recovery_state = store.read(normalized)
+    except RecoveryStateStoreError as exc:
+        return {
+            "symbol": normalized,
+            "action": "registered_recovery_blocked",
+            "liveness_status": "blocked",
+            "severity": "critical",
+            "reason": "registered_flat_profile_drift",
+            "error": str(exc),
+            "changed_keys": [],
+            "effect_count": 0,
+            "control_cas_count": 0,
+            "dry_run": dry_run,
+        }
+    if dry_run:
+        return {
+            "symbol": normalized,
+            "action": "dry_run_observe_registered_recovery",
+            "phase": recovery_state.phase.value,
+            "active_action": recovery_state.active_action.value,
+            "changed_keys": [],
+            "effect_count": 0,
+            "control_cas_count": 0,
+            "terminal_handoff_pending": terminal_delegation is not None,
+            "dry_run": True,
+        }
+    if (
+        terminal_delegation is not None
+        and recovery_state.phase is RecoveryPhase.STABLE
+    ):
+        return {
+            **dict(terminal_delegation),
+            "recovery_phase": recovery_state.phase.value,
+            "recovery_handoff_status": "ready",
+        }
+
+    runner_active = (runner_active_fetcher or (lambda value: _runner_is_active(value)))(
+        normalized
+    )
+    runtime_item = _symbol_state(guard_state, normalized)
+    plan = _read_json(_plan_path(output_dir, normalized))
+    submit = _read_json(_submit_path(output_dir, normalized))
+    rows = _iter_jsonl(_trade_path(output_dir, normalized))
+    volume_summary = summarize_recent_volume(
+        rows=rows,
+        now=now,
+        window_seconds=window_seconds,
+    )
+    legacy_assessment = assess_symbol(
+        symbol=normalized,
+        control=control,
+        plan=plan,
+        submit=submit,
+        volume_summary=volume_summary,
+        now=now,
+        min_volume_notional=min_volume_notional,
+        near_cap_ratio=near_cap_ratio,
+        far_ticks=far_ticks,
+        plan_stale_seconds=plan_stale_seconds,
+    )
+    # A registered symbol is suppressed only by the current structured
+    # terminal intent/owner gate, which main() evaluates before this round.
+    # A historical runtime stop event is audit evidence, not durable ownership:
+    # the runner may have restarted successfully and failed again afterwards.
+    known_stop_reason = ""
+    legacy_assessment["runner_inactive"] = not runner_active
+    preflight_results: list[dict[str, Any]] = []
+    exchange_observation_available = True
+    exchange_observation_error = None
+    exchange_drift_confirmation_count = 0
+    exchange_drift_status = None
+    local_active_count = _safe_int(
+        (submit.get("observed_strategy_open_order_state") or {}).get(
+            "active_order_count"
+        )
+    )
+    if runner_active and local_active_count > 0:
+        try:
+            exchange = (
+                exchange_order_snapshot_fetcher
+                or _fetch_registered_strategy_order_snapshot
+            )(normalized)
+            exchange_count = _safe_int(
+                exchange.get("strategy_open_order_count"), -1
+            )
+            drift_observed = should_restart_registered_for_exchange_order_drift(
+                local_active_order_count=local_active_count,
+                expected_entry_order_count=_planned_entry_order_count(plan),
+                exchange_open_order_count=exchange_count,
+            )
+            recent_submit = has_recent_registered_submit_activity(
+                submit=submit,
+                now=now,
+                max_age_seconds=60.0,
+            )
+            drift_key = "registered_exchange_order_drift_observation"
+            if drift_observed and not recent_submit:
+                fingerprint = (
+                    f"{local_active_count}:"
+                    f"{_planned_entry_order_count(plan)}:{exchange_count}"
+                )
+                prior = runtime_item.get(drift_key)
+                prior_count = (
+                    _safe_int(prior.get("confirmation_count"))
+                    if isinstance(prior, Mapping)
+                    and prior.get("fingerprint") == fingerprint
+                    else 0
+                )
+                exchange_drift_confirmation_count = prior_count + 1
+                runtime_item[drift_key] = {
+                    "fingerprint": fingerprint,
+                    "confirmation_count": exchange_drift_confirmation_count,
+                    "observed_at": now.isoformat(),
+                }
+                if exchange_drift_confirmation_count >= 2:
+                    preflight_results.append(
+                        {
+                            "action": (
+                                "restart_registered_partial_exchange_order_drift"
+                            )
+                        }
+                    )
+                    exchange_drift_status = "confirmed"
+                else:
+                    exchange_drift_status = "confirmation_pending"
+            elif drift_observed:
+                runtime_item.pop(drift_key, None)
+                exchange_drift_status = "recent_submit_observe_only"
+            else:
+                runtime_item.pop(drift_key, None)
+                exchange_drift_status = "clear"
+        except Exception as exc:
+            exchange_observation_available = False
+            exchange_observation_error = str(exc)[:240]
+            runtime_item.pop("registered_exchange_order_drift_observation", None)
+    # Legacy plan flags are not a typed safety observation. Registered symbols
+    # consume only a fresh, generation-bound Web observation with a fixed TTL.
+    legacy_assessment["volatility_entry_pause_active"] = False
+    safety_observation_status = "disabled"
+    volatility_safety_observation = None
+    volatility_safety_observation_error = None
+    if bool(control.get("volatility_trigger_enabled")):
+        safety_observation_status = "absent"
+        safety_status = _read_json(
+            output_dir / f"{normalized.lower()}_volatility_trigger_status.json"
+        )
+        raw_observation = safety_status.get("orchestrator_observation")
+        if raw_observation is not None:
+            if not isinstance(raw_observation, Mapping):
+                safety_observation_status = "invalid"
+                volatility_safety_observation_error = (
+                    "volatility safety observation is not an object"
+                )
+            else:
+                try:
+                    decoded_observation = decode_volatility_safety_observation(
+                        raw_observation
+                    )
+                    owned_predecessor = bool(
+                        decoded_observation.active
+                        and decoded_observation.generation + 1
+                        == recovery_state.generation
+                        and recovery_state.phase
+                        in {
+                            RecoveryPhase.SETTLING,
+                            RecoveryPhase.ACTIVE,
+                            RecoveryPhase.CLEANING,
+                        }
+                        and recovery_state.active_action
+                        is ActionId.SAFETY_CONVERGE
+                        and decoded_observation.reason in recovery_state.reasons
+                        and recovery_state.issued_at is not None
+                        and decoded_observation.observed_at
+                        <= recovery_state.issued_at
+                    )
+                    if (
+                        decoded_observation.generation < recovery_state.generation
+                        and not owned_predecessor
+                    ):
+                        safety_observation_status = "obsolete"
+                    else:
+                        _run_snapshot, run_contract_id = (
+                            resolve_authoritative_run_contract(
+                                control,
+                                expected_symbol=normalized,
+                            )
+                        )
+                        volatility_safety_observation = (
+                            validate_volatility_safety_observation(
+                                raw_observation,
+                                expected_symbol=normalized,
+                                expected_run_contract_id=run_contract_id,
+                                expected_generation=(
+                                    decoded_observation.generation
+                                    if owned_predecessor
+                                    else recovery_state.generation
+                                ),
+                                now=now,
+                            )
+                        )
+                except (TypeError, ValueError) as exc:
+                    safety_observation_status = "invalid"
+                    volatility_safety_observation_error = str(exc)
+                else:
+                    if safety_observation_status != "obsolete":
+                        if volatility_safety_observation is None:
+                            safety_observation_status = "stale"
+                        elif volatility_safety_observation.active:
+                            safety_observation_status = "fresh_active"
+                        else:
+                            safety_observation_status = "fresh_clear"
+    volume_safety_observation = None
+    volume_safety_observation_status = "disabled"
+    volume_safety_observation_error = None
+    if (
+        bool(control.get("volume_trigger_enabled"))
+        and _safe_float(control.get("volume_trigger_stop_threshold")) > 0
+    ):
+        volume_safety_observation_status = "absent"
+        volume_status = _read_json(
+            output_dir / f"{normalized.lower()}_volume_trigger_status.json"
+        )
+        raw_volume_observation = volume_status.get("orchestrator_observation")
+        if raw_volume_observation is not None:
+            if not isinstance(raw_volume_observation, Mapping):
+                volume_safety_observation_status = "invalid"
+                volume_safety_observation_error = (
+                    "volume safety observation is not an object"
+                )
+            else:
+                try:
+                    decoded_volume_observation = (
+                        decode_volume_safety_observation(raw_volume_observation)
+                    )
+                    owned_predecessor = bool(
+                        decoded_volume_observation.active
+                        and decoded_volume_observation.generation + 1
+                        == recovery_state.generation
+                        and recovery_state.phase
+                        in {
+                            RecoveryPhase.SETTLING,
+                            RecoveryPhase.ACTIVE,
+                            RecoveryPhase.CLEANING,
+                        }
+                        and recovery_state.active_action
+                        is ActionId.SAFETY_CONVERGE
+                        and decoded_volume_observation.reason
+                        in recovery_state.reasons
+                        and recovery_state.issued_at is not None
+                        and decoded_volume_observation.observed_at
+                        <= recovery_state.issued_at
+                    )
+                    if (
+                        decoded_volume_observation.generation
+                        < recovery_state.generation
+                        and not owned_predecessor
+                    ):
+                        volume_safety_observation_status = "obsolete"
+                    else:
+                        _run_snapshot, run_contract_id = (
+                            resolve_authoritative_run_contract(
+                                control,
+                                expected_symbol=normalized,
+                            )
+                        )
+                        volume_safety_observation = (
+                            validate_volume_safety_observation(
+                                raw_volume_observation,
+                                expected_symbol=normalized,
+                                expected_run_contract_id=run_contract_id,
+                                expected_generation=(
+                                    decoded_volume_observation.generation
+                                    if owned_predecessor
+                                    else recovery_state.generation
+                                ),
+                                now=now,
+                            )
+                        )
+                except (TypeError, ValueError) as exc:
+                    volume_safety_observation_status = "invalid"
+                    volume_safety_observation_error = str(exc)
+                else:
+                    if volume_safety_observation_status != "obsolete":
+                        if volume_safety_observation is None:
+                            volume_safety_observation_status = "stale"
+                        elif volume_safety_observation.active:
+                            volume_safety_observation_status = "fresh_active"
+                        else:
+                            volume_safety_observation_status = "fresh_clear"
+    loop_state_path = output_dir / f"{normalized.lower()}_loop_state.json"
+    loop_state = _read_json(loop_state_path)
+    runtime_safety_signal = None
+    runtime_safety_signal_status = "absent"
+    runtime_safety_signal_error = None
+    raw_runtime_safety_signal = loop_state.get(RUNTIME_SAFETY_SIGNAL_KEY)
+    if raw_runtime_safety_signal is not None:
+        if not isinstance(raw_runtime_safety_signal, Mapping):
+            runtime_safety_signal_status = "invalid"
+            runtime_safety_signal_error = "runtime safety signal is not an object"
+        else:
+            try:
+                decoded_runtime_safety_signal = decode_runtime_safety_signal(
+                    raw_runtime_safety_signal
+                )
+                if (
+                    decoded_runtime_safety_signal.generation
+                    < recovery_state.generation
+                ):
+                    if _runtime_signal_is_owned_predecessor(
+                        decoded_runtime_safety_signal,
+                        recovery_state,
+                    ):
+                        runtime_safety_signal = validate_runtime_safety_signal(
+                            raw_runtime_safety_signal,
+                            expected_symbol=normalized,
+                            expected_run_contract_id=(
+                                run_contract_identity_from_config(control)
+                            ),
+                            expected_generation=(
+                                decoded_runtime_safety_signal.generation
+                            ),
+                            expected_decision_id=(
+                                decoded_runtime_safety_signal.decision_id
+                            ),
+                            now=now,
+                        )
+                        runtime_safety_signal_status = (
+                            "fresh_predecessor"
+                            if runtime_safety_signal is not None
+                            else "stale"
+                        )
+                    else:
+                        runtime_safety_signal_status = "obsolete"
+                else:
+                    runtime_safety_signal = validate_runtime_safety_signal(
+                        raw_runtime_safety_signal,
+                        expected_symbol=normalized,
+                        expected_run_contract_id=run_contract_identity_from_config(
+                            control
+                        ),
+                        expected_generation=recovery_state.generation,
+                        expected_decision_id=recovery_state.decision_id,
+                        now=now,
+                    )
+            except (TypeError, ValueError) as exc:
+                runtime_safety_signal_status = "invalid"
+                runtime_safety_signal_error = str(exc)
+            else:
+                if runtime_safety_signal_status not in {
+                    "obsolete",
+                    "fresh_predecessor",
+                    "stale",
+                }:
+                    runtime_safety_signal_status = (
+                        "fresh" if runtime_safety_signal is not None else "stale"
+                    )
+    flow_observation_status = "unavailable"
+    flow_observation_error: str | None = None
+    admission_evidence = None
+    try:
+        admission_evidence = load_recovery_admission_evidence(
+            plan=plan,
+            submit=submit,
+            recovery_state=recovery_state,
+            captured_at=now,
+            max_age_seconds=plan_stale_seconds,
+        )
+        legacy_assessment["loss_blocked_reduce_fallback_sides"] = [
+            side.value for side in admission_evidence.loss_only_blocked_sides
+        ]
+        runtime_item.pop(_REGISTERED_READINESS_OBSERVATION_KEY, None)
+        flow_observation_status = "fresh"
+    except (RecoveryAdmissionEvidenceError, ValueError) as exc:
+        flow_observation_error = str(exc)
+
+    mapped_blockers = flow_blockers_from_legacy(
+        assessment=legacy_assessment,
+        preflight_results=preflight_results,
+    )
+    if volatility_safety_observation is not None:
+        mapped_blockers = _blockers_with_volatility_safety_observation(
+            mapped_blockers,
+            volatility_safety_observation,
+        )
+    if volume_safety_observation is not None:
+        mapped_blockers = _blockers_with_volume_safety_observation(
+            mapped_blockers,
+            volume_safety_observation,
+        )
+    if runtime_safety_signal is not None:
+        mapped_blockers = _blockers_with_runtime_safety_signal(
+            mapped_blockers,
+            runtime_safety_signal,
+            coordinator_observed_at=now,
+        )
+    elif runtime_safety_signal_status == "invalid":
+        mapped_blockers = replace(
+            mapped_blockers,
+            runner_faults=tuple(
+                dict.fromkeys(
+                    (
+                        *mapped_blockers.runner_faults,
+                        "runtime_safety_signal_invalid",
+                    )
+                )
+            ),
+        )
+    priority_blockers = _registered_blockers_with_ordinary_flow(
+        mapped_blockers,
+        terminal_reason=(
+            str(
+                terminal_delegation.get("terminal_recovery_reason")
+                or "trusted_lifecycle_terminal_handoff"
+            )
+            if terminal_delegation is not None
+            else None
+        ),
+        terminal_lifecycle_handoff=(
+            True if terminal_delegation is not None else None
+        ),
+    )
+    fresh_blockers = _registered_blockers_with_ordinary_flow(
+        priority_blockers,
+        inventory_sides=mapped_blockers.inventory_reduce_sides,
+        loss_sides=mapped_blockers.loss_only_blocked_sides,
+        # Legacy one-frame missing-entry flags are observations only.  The
+        # coordinator's per-side quote/submit/fill SLA is the sole admission
+        # path for MAKER_FLOW_RECOVER.
+        missing_entry_sides=(),
+        episode_fingerprint=mapped_blockers.episode_fingerprint,
+    )
+    if admission_evidence is not None:
+        blockers = _store_registered_flow_observation(
+            runtime_item,
+            state=recovery_state,
+            blockers=fresh_blockers,
+            plan_observed_at=admission_evidence.plan_observed_at,
+            submit_observed_at=admission_evidence.submit_observed_at,
+        )
+    else:
+        carried = _carried_registered_flow_blockers(
+            runtime_item,
+            state=recovery_state,
+            base=priority_blockers,
+        )
+        if carried is not None:
+            blockers = carried
+            flow_observation_status = "carried_observation_unavailable"
+        else:
+            blockers = priority_blockers
+            higher_priority_available = bool(
+                blockers.terminal_lifecycle_handoff
+                or blockers.runner_faults
+                or blockers.safety_reasons
+                or blockers.unknown_order_ownership
+                or recovery_state.active_action
+                in {
+                    ActionId.RUNNER_RECOVER,
+                    ActionId.SAFETY_CONVERGE,
+                }
+                or (
+                    recovery_state.phase
+                    in {RecoveryPhase.RESTORING, RecoveryPhase.COOLDOWN}
+                    and recovery_state.active_episode_fingerprint is None
+                )
+            )
+            if (
+                not higher_priority_available
+                and recovery_state.phase is RecoveryPhase.STABLE
+            ):
+                readiness_elapsed = _registered_readiness_sla_elapsed(
+                    runtime_item,
+                    recovery_state=recovery_state,
+                    now=now,
+                    error=flow_observation_error,
+                )
+                # Report freshness and recovery grace are separate clocks.
+                # A small plan-stale setting must never collapse liveness
+                # diagnosis into an immediate restart loop.
+                readiness_sla = (
+                    RecoveryPolicy().action_progress_timeout.total_seconds()
+                )
+                if readiness_elapsed < readiness_sla:
+                    return {
+                        "symbol": normalized,
+                        "action": "registered_recovery_observe_only",
+                        "liveness_status": "recovering",
+                        "reason": "recovery_readiness_sla_pending",
+                        "readiness_elapsed_seconds": readiness_elapsed,
+                        "readiness_sla_seconds": readiness_sla,
+                        "flow_observation_status": flow_observation_status,
+                        "flow_observation_error": flow_observation_error,
+                        "exchange_drift_status": exchange_drift_status,
+                        "exchange_drift_confirmation_count": (
+                            exchange_drift_confirmation_count
+                        ),
+                        "changed_keys": [],
+                        "effect_count": 0,
+                        "control_cas_count": 0,
+                        "dry_run": False,
+                    }
+                blockers = replace(
+                    blockers,
+                    runner_faults=tuple(
+                        dict.fromkeys(
+                            (
+                                *blockers.runner_faults,
+                                "recovery_admission_observation_unavailable",
+                            )
+                        )
+                    ),
+                )
+                flow_observation_status = "readiness_sla_exceeded"
+
+    effect_receipt = None
+    cleanup_proof = None
+    try:
+        effect_receipt, cleanup_proof = _parse_registered_runtime_evidence(
+            runtime_item,
+            recovery_state=recovery_state,
+            now=now,
+        )
+    except ValueError as exc:
+        runtime_item.pop(_REGISTERED_RUNTIME_EVIDENCE_KEY, None)
+        flow_observation_error = ";".join(
+            value
+            for value in (
+                flow_observation_error,
+                f"registered_effect_evidence_quarantined:{exc}",
+            )
+            if value
+        )
+
+    config_applied_evidence = RecoveryConfigAppliedEvidence(
+        applied_generation=None,
+        applied_profile_digest=None,
+        receipt_id=None,
+        runner_instance_id=None,
+        observed_at=None,
+        latest_observation_seq=-1,
+    )
+    try:
+        config_applied_evidence = load_recovery_config_applied_evidence(
+            state_path=loop_state_path,
+            recovery_state=recovery_state,
+            captured_at=now,
+        )
+    except (OSError, ValueError, RecoveryConfigAppliedReceiptJournalError) as exc:
+        flow_observation_error = ";".join(
+            value
+            for value in (
+                flow_observation_error,
+                f"config_evidence_quarantined:{type(exc).__name__}:{exc}",
+            )
+            if value
+        )
+
+    runtime_evidence = None
+    ordinary_evidence = None
+    temporary_loss_fill_receipts = ()
+    ordinary_fill_receipts = ()
+    if (
+        recovery_state.active_action is ActionId.TEMPORARY_LOSS_RELIEF
+        and recovery_state.phase
+        in {
+            RecoveryPhase.SETTLING,
+            RecoveryPhase.ACTIVE,
+        }
+    ):
+        try:
+            runtime_evidence = load_temporary_loss_runtime_evidence(
+                state_path=loop_state_path,
+                recovery_state=recovery_state,
+                captured_at=now,
+            )
+            if recovery_state.phase is RecoveryPhase.ACTIVE:
+                temporary_loss_fill_receipts = (
+                    temporary_loss_fill_progress_receipts(
+                        recovery_state=recovery_state,
+                        runtime_evidence=runtime_evidence,
+                        trade_rows=rows,
+                        captured_at=now,
+                    )
+                )
+        except (OSError, ValueError, TemporaryLossReceiptJournalError) as exc:
+            runtime_evidence = None
+            temporary_loss_fill_receipts = ()
+            flow_observation_error = ";".join(
+                value
+                for value in (
+                    flow_observation_error,
+                    f"temporary_loss_evidence_quarantined:{type(exc).__name__}:{exc}",
+                )
+                if value
+            )
+    if (
+        recovery_state.phase is RecoveryPhase.ACTIVE
+        and recovery_state.active_action
+        in {
+            ActionId.INVENTORY_RECOVER,
+            ActionId.MAKER_FLOW_RECOVER,
+            ActionId.BASELINE_TUNE,
+        }
+    ):
+        try:
+            ordinary_evidence = load_ordinary_recovery_runtime_evidence(
+                state_path=loop_state_path,
+                recovery_state=recovery_state,
+                captured_at=now,
+            )
+            ordinary_fill_receipts = ordinary_recovery_fill_progress_receipts(
+                recovery_state=recovery_state,
+                runtime_evidence=ordinary_evidence,
+                trade_rows=rows,
+                captured_at=now,
+            )
+        except (OSError, ValueError, InventoryRecoveryReceiptJournalError) as exc:
+            ordinary_evidence = None
+            ordinary_fill_receipts = ()
+            flow_observation_error = ";".join(
+                value
+                for value in (
+                    flow_observation_error,
+                    f"ordinary_evidence_quarantined:{type(exc).__name__}:{exc}",
+                )
+                if value
+            )
+
+    managed_order_manifest = _managed_order_manifest_from_runtime_evidence(
+        recovery_state,
+        (
+            runtime_evidence.accepted_order_pairs
+            if runtime_evidence is not None
+            else (
+                ordinary_evidence.accepted_order_pairs
+                if ordinary_evidence is not None
+                else ()
+            )
+        ),
+    )
+
+    flow_observations = (
+        _normal_entry_flow_observations(
+            recovery_state=recovery_state,
+            plan=plan,
+            submit=submit,
+            trade_rows=rows,
+            loop_state=loop_state,
+            now=now,
+            far_ticks=far_ticks,
+        )
+        if admission_evidence is not None
+        else {}
+    )
+    snapshot = SymbolSnapshot(
+        symbol=normalized,
+        captured_at=now,
+        assessment=blockers,
+        activation_receipt=(
+            runtime_evidence.activation_receipt
+            if runtime_evidence is not None
+            else None
+        ),
+        progress_receipts=(
+            temporary_loss_fill_receipts + ordinary_fill_receipts
+        ),
+        managed_order_manifest=managed_order_manifest,
+        exchange_observation_available=exchange_observation_available,
+        effect_receipt=effect_receipt,
+        cleanup_proof=cleanup_proof,
+        applied_generation=(
+            config_applied_evidence.applied_generation
+        ),
+        applied_profile_digest=(
+            config_applied_evidence.applied_profile_digest
+        ),
+        flow_observations=flow_observations,
+    )
+
+    restart = restart_runner or (
+        lambda value: _default_restart_runner(value, runner_wrapper=runner_wrapper)
+    )
+    stop = stop_runner or (
+        lambda value: _default_stop_runner(value, runner_wrapper=runner_wrapper)
+    )
+
+    def execute_effect(effect_symbol: str, command: Any) -> None:
+        current = store.read(effect_symbol)
+        if command.stage in {
+            EffectStage.RUNNER_RESTART,
+            EffectStage.RUNNER_STOP,
+        }:
+            actuator = (
+                restart
+                if command.stage is EffectStage.RUNNER_RESTART
+                else stop
+            )
+            actuator(effect_symbol)
+            receipt = EffectReceipt(
+                decision_id=command.decision_id,
+                stage=command.stage,
+                effect_epoch=command.effect_epoch,
+                observed_at=now,
+            )
+            _store_registered_runtime_evidence(
+                runtime_item,
+                recovery_state=current,
+                effect_receipt=receipt,
+            )
+            return
+        if command.stage not in {
+            EffectStage.MANAGED_GTX_CANCEL,
+            EffectStage.LOCAL_STATE_REPAIR,
+        }:
+            raise RuntimeError(
+                f"registered recovery effect is unsupported: {command.stage.value}"
+            )
+        nonlocal fetch_open_orders, cancel_order, fetch_user_trades_page
+        if (
+            fetch_open_orders is None
+            or cancel_order is None
+            or fetch_user_trades_page is None
+        ):
+            from .data import (
+                delete_futures_order,
+                fetch_futures_open_orders,
+                fetch_futures_user_trades,
+            )
+
+            api_key = os.environ["BINANCE_API_KEY"]
+            api_secret = os.environ["BINANCE_API_SECRET"]
+            fetch_open_orders = lambda value: fetch_futures_open_orders(
+                value, api_key, api_secret, use_cache=False
+            )
+            cancel_order = lambda value, order_id: delete_futures_order(
+                symbol=value,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_id=int(order_id),
+            )
+            fetch_user_trades_page = (
+                lambda value, start_ms, end_ms, limit: fetch_futures_user_trades(
+                    symbol=value,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    start_time_ms=start_ms,
+                    end_time_ms=end_ms,
+                    limit=limit,
+                    use_cache=False,
+                )
+            )
+        cleanup = reconcile_managed_gtx_cleanup(
+            recovery_state=current,
+            observed_at=now,
+            fetch_open_orders=fetch_open_orders,
+            cancel_order=cancel_order,
+            fetch_user_trades_page=fetch_user_trades_page,
+        )
+        if cleanup.effect_receipt is None or cleanup.cleanup_proof is None:
+            raise RuntimeError(
+                cleanup.blocked_reason or "managed GTX cleanup proof unavailable"
+            )
+        _store_registered_runtime_evidence(
+            runtime_item,
+            recovery_state=current,
+            effect_receipt=cleanup.effect_receipt,
+            cleanup_proof=cleanup.cleanup_proof,
+        )
+
+    outcome = RegisteredSymbolRecoveryOrchestrator(
+        store=store,
+        effect_executor=execute_effect,
+    ).reconcile(
+        snapshot=snapshot,
+        now=now,
+        round_id=f"bq-registered:{normalized}:{now.isoformat()}",
+    )
+    planned = outcome.plan
+    return {
+        "symbol": normalized,
+        "action": f"coordinator_{planned.action_id.value}_{planned.mode.value}",
+        "phase": planned.next_state.phase.value,
+        "active_action": planned.next_state.active_action.value,
+        "side": planned.next_state.side.value if planned.next_state.side else None,
+        "order_role": (
+            planned.next_state.order_role.value
+            if planned.next_state.order_role
+            else None
+        ),
+        "decision_id": planned.next_state.decision_id,
+        "generation": planned.next_state.generation,
+        "liveness_status": planned.liveness_status,
+        "changed_keys": sorted(
+            key
+            for key, value in planned.desired_profile.fields.items()
+            if control.get(key) != value
+        ),
+        "effect_stage": planned.effect_stage.value,
+        "effect_error": planned.effect_error,
+        "effect_count": outcome.effect_count,
+        "control_cas_count": outcome.control_cas_count,
+        "snapshot_count": outcome.snapshot_provider_calls,
+        "exchange_observation_available": exchange_observation_available,
+        "exchange_observation_error": exchange_observation_error,
+        "exchange_drift_status": exchange_drift_status,
+        "exchange_drift_confirmation_count": exchange_drift_confirmation_count,
+        "runner_active": runner_active,
+        "known_stop_reason": known_stop_reason or None,
+        "safety_observation_status": safety_observation_status,
+        "volatility_safety_observation_error": (
+            volatility_safety_observation_error
+        ),
+        "volume_safety_observation_status": volume_safety_observation_status,
+        "volume_safety_observation_error": volume_safety_observation_error,
+        "runtime_safety_signal_status": runtime_safety_signal_status,
+        "runtime_safety_signal_error": runtime_safety_signal_error,
+        "flow_observation_status": flow_observation_status,
+        "flow_observation_error": flow_observation_error,
+        "ordinary_typed_receipt_interface": (
+            "strict_plan_submit_manifest_and_user_trades_fill"
+        ),
+        "dry_run": False,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Recover stalled best-quote maker-volume saved runners.")
     parser.add_argument("--app-dir", default="/home/ubuntu/wangge")
@@ -8839,29 +11101,69 @@ def main(argv: list[str] | None = None) -> int:
     results = []
     exit_code = 0
     for symbol in _normalize_symbols(args.symbols):
+        terminal_delegation = _terminal_drain_delegation(
+            symbol=symbol,
+            output_dir=output_dir,
+            dry_run=args.dry_run,
+        )
+        if (
+            terminal_delegation is not None
+            and terminal_delegation.get("action")
+            == "terminal_drain_delegation_blocked"
+        ):
+            _append_jsonl(
+                output_dir / "bq_volume_recovery_guard_events.jsonl",
+                {"ts": now.isoformat(), **terminal_delegation},
+            )
+            results.append(terminal_delegation)
+            exit_code = 1
+            continue
+        control_path = _control_path(output_dir, symbol)
+        if _registered_recovery_envelope_present(control_path):
+            registered_result = run_registered_recovery_symbol_round(
+                symbol=symbol,
+                output_dir=output_dir,
+                guard_state=state,
+                now=now,
+                window_seconds=args.window_seconds,
+                min_volume_notional=args.min_volume_notional,
+                near_cap_ratio=args.near_cap_ratio,
+                far_ticks=args.far_ticks,
+                plan_stale_seconds=args.plan_stale_seconds,
+                dry_run=args.dry_run,
+                runner_wrapper=args.runner_wrapper,
+                terminal_delegation=terminal_delegation,
+            )
+            _append_jsonl(
+                output_dir / "bq_volume_recovery_guard_events.jsonl",
+                {"ts": now.isoformat(), **registered_result},
+            )
+            results.append(registered_result)
+            if (
+                registered_result.get("action") == "registered_recovery_blocked"
+                or registered_result.get("effect_error")
+            ):
+                exit_code = 1
+            continue
+        if terminal_delegation is not None:
+            _append_jsonl(
+                output_dir / "bq_volume_recovery_guard_events.jsonl",
+                {"ts": now.isoformat(), **terminal_delegation},
+            )
+            results.append(terminal_delegation)
+            continue
         target_done_marker = _target_gate_done_marker(output_dir, symbol, now)
-        if target_done_marker.exists():
-            runner_active = _runner_is_active(symbol)
-            stop_failed: str | None = None
-            if runner_active and args.dry_run:
-                action = "dry_run_stop_runner_target_gate_done"
-            elif runner_active:
-                try:
-                    _default_stop_runner(symbol, runner_wrapper=args.runner_wrapper)
-                    action = "stop_runner_target_gate_done"
-                except subprocess.CalledProcessError as exc:
-                    action = "stop_runner_target_gate_done_failed"
-                    stop_failed = str(exc)
-                    exit_code = 1
-            else:
-                action = "skip_target_gate_done_terminal"
+        if target_done_marker.exists() and not _has_explicit_target_run_contract(
+            output_dir,
+            symbol,
+        ):
             result = {
                 "symbol": symbol,
-                "action": action,
+                "action": "observe_target_gate_done_terminal",
                 "changed_keys": [],
                 "backup_path": None,
                 "dry_run": args.dry_run,
-                "restart_failed": stop_failed,
+                "restart_failed": None,
                 "target_gate_done_marker": str(target_done_marker),
             }
             _append_jsonl(
@@ -9008,11 +11310,13 @@ def main(argv: list[str] | None = None) -> int:
             results.append(result)
             continue
         try:
-            fetch_window_seconds = args.window_seconds
             control_for_target = _read_json(_control_path(output_dir, symbol))
-            if symbol in daily_targets or _configured_daily_target_notional(control_for_target) > 0:
-                day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                fetch_window_seconds = max(fetch_window_seconds, (now - day_start).total_seconds())
+            fetch_window_seconds = _target_trade_fetch_window_seconds(
+                control=control_for_target,
+                now=now,
+                window_seconds=args.window_seconds,
+                has_cli_target=symbol in daily_targets,
+            )
             trade_rows = _fetch_exchange_user_trades(
                 symbol=symbol,
                 now=now,

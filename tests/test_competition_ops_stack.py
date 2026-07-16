@@ -7,11 +7,13 @@ patch that replaces the server ``/tmp/apply_cfg.py`` shell-out.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import grid_optimizer.competition_health_monitor as hm
 import grid_optimizer.competition_state_realign as ra
 import grid_optimizer.competition_target_gate as tg
+from grid_optimizer.futures_run_lifecycle import bind_run_contract_owner
 from grid_optimizer.recovery_control_ownership import is_recovery_managed
 
 
@@ -181,6 +183,84 @@ def test_recovery_managed_symbols_make_external_controllers_read_only() -> None:
     assert is_recovery_managed("OUSDT", {}) is True
     assert is_recovery_managed("REUSDT", {}) is False
     assert is_recovery_managed("REUSDT", {"recovery_control_owner": "bq_volume_recovery_guard"}) is True
+    assert is_recovery_managed(
+        "BCHUSDT",
+        {"_futures_recovery_state": {"schema_version": 1}},
+    ) is True
+    assert is_recovery_managed(
+        "BCHUSDT",
+        {"_futures_recovery_state": None},
+    ) is True
+    assert is_recovery_managed(
+        "BCHUSDT",
+        {"_futures_recovery_state_mirror": {"schema_version": 1}},
+    ) is True
+
+
+def test_registered_bch_health_monitor_observes_without_control_or_restart(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    control_path = output_dir / "bchusdt_loop_runner_control.json"
+    original = {
+        "symbol": "BCHUSDT",
+        "best_quote_maker_volume_quote_offset_ticks": 0,
+        "_futures_recovery_state": None,
+    }
+    control_path.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "hm",
+            "--symbol",
+            "BCHUSDT",
+            "--service",
+            "grid-loop@BCHUSDT.service",
+            "--workdir",
+            str(tmp_path),
+            "--first",
+            "3000",
+            "--enforce",
+        ],
+    )
+    monkeypatch.setattr(hm, "is_active", lambda _service: True)
+    monkeypatch.setattr(hm, "journal", lambda _service, _minutes: "mid=500 placed=0")
+    monkeypatch.setattr(
+        hm,
+        "daily_recent_wear",
+        lambda *_args, **_kwargs: (5000.0, 1.8, 500.0, 5.0),
+    )
+    monkeypatch.setattr(
+        hm,
+        "get_offset",
+        lambda _cfg: ("best_quote_maker_volume_quote_offset_ticks", 0),
+    )
+    forbidden: list[str] = []
+    monkeypatch.setattr(
+        hm,
+        "restart",
+        lambda *_args, **_kwargs: forbidden.append("restart") or {"ok": True},
+    )
+    monkeypatch.setattr(
+        hm,
+        "apply_offset",
+        lambda *_args, **_kwargs: forbidden.append("apply_offset"),
+    )
+    monkeypatch.setattr(
+        hm,
+        "deadlock_unstick",
+        lambda *_args, **_kwargs: forbidden.append("deadlock_unstick") or {},
+    )
+
+    hm.main()
+
+    assert forbidden == []
+    record = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert record["action"] == "observe_only_recovery_managed_symbol"
+    assert json.loads(control_path.read_text(encoding="utf-8")) == original
 
 
 def test_placed_sum_parses_journal_lines() -> None:
@@ -211,18 +291,62 @@ def _run_gate_main(monkeypatch, argv: list[str]) -> None:
     tg.main()
 
 
-def _control(workdir: Path, slug: str, max_cum: float) -> None:
+def _target_window_stats(vol: float, wear: float) -> dict[str, object]:
+    return {
+        "gross_notional": vol,
+        "realized_pnl": -(wear * vol / 10_000.0),
+        "wear_per_10k": wear,
+        "trade_count": 1 if vol > 0 else 0,
+        "window_start": "2026-07-16T00:00:00+00:00",
+        "window_end": "2026-07-17T00:00:00+00:00",
+        "query_end": "2026-07-16T01:00:00+00:00",
+    }
+
+
+def _owned_contract(control: dict[str, object]) -> dict[str, object]:
+    owned, _ = bind_run_contract_owner(
+        control,
+        activated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+    return owned
+
+
+def _control(
+    workdir: Path,
+    slug: str,
+    max_cum: float,
+    *,
+    wear_stop: float | None = None,
+    wear_first: float | None = None,
+) -> dict[str, object]:
     (workdir / "output").mkdir(parents=True, exist_ok=True)
+    control = _owned_contract({
+        "symbol": slug.upper(),
+        "strategy_profile": "test_profile",
+        "strategy_mode": "hedge_best_quote_maker_volume_v1",
+        "per_order_notional": 20.0,
+        "run_start_time": "2026-07-16T00:00:00+00:00",
+        "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+        "run_end_time": "2026-07-17T00:00:00+00:00",
+        "max_cumulative_notional": max_cum,
+        "terminal_drain_exit_policy": "drain_then_preserve",
+        "terminal_drain_absolute_loss_budget": 5.0,
+        "terminal_drain_max_wait_seconds": 900.0,
+        "terminal_drain_stop_preserve_reason": None,
+        "lifecycle_wear_stop_per_10k": wear_stop,
+        "lifecycle_wear_stop_min_gross_notional": wear_first,
+    })
     (workdir / "output" / f"{slug}_loop_runner_control.json").write_text(
-        json.dumps({"max_cumulative_notional": max_cum}), encoding="utf-8")
+        json.dumps(control), encoding="utf-8")
+    return control
 
 
 def test_gate_zero_target_never_stops_even_with_huge_volume(tmp_path: Path, monkeypatch, capsys) -> None:
-    # No control JSON -> target stays 0. A 0 target with huge day volume must NOT stop+flatten.
+    # No control JSON -> target stays 0. Huge volume must not submit a target intent.
     (tmp_path / "output").mkdir(parents=True)
     calls: list = []
     monkeypatch.setattr(tg, "subprocess", type("S", (), {"run": staticmethod(_fake_subprocess(calls))}))
-    monkeypatch.setattr(tg, "daily_vol_wear", lambda *a, **k: (10_000_000.0, 0.0))
+    monkeypatch.setattr(tg, "daily_vol_wear", lambda *a, **k: _target_window_stats(10_000_000.0, 0.0))
     monkeypatch.setattr(tg, "cancel_frozen_tp", lambda *a, **k: 0)   # pre-cleanup must not hit network
     _run_gate_main(monkeypatch, ["--symbol", "ARXUSDT", "--service", "grid-loop@ARXUSDT.service",
                                  "--workdir", str(tmp_path), "--enforce"])
@@ -237,7 +361,7 @@ def test_gate_dry_run_does_not_cancel_frozen_tp(tmp_path: Path, monkeypatch, cap
     _control(tmp_path, "arxusdt", 100_000)
     calls: list = []
     monkeypatch.setattr(tg, "subprocess", type("S", (), {"run": staticmethod(_fake_subprocess(calls))}))
-    monkeypatch.setattr(tg, "daily_vol_wear", lambda *a, **k: (0.0, 0.0))
+    monkeypatch.setattr(tg, "daily_vol_wear", lambda *a, **k: _target_window_stats(0.0, 0.0))
     canceled = {"n": 0}
     monkeypatch.setattr(tg, "cancel_frozen_tp", lambda *a, **k: canceled.__setitem__("n", 1))
     _run_gate_main(monkeypatch, ["--symbol", "ARXUSDT", "--service", "grid-loop@ARXUSDT.service",
@@ -245,24 +369,450 @@ def test_gate_dry_run_does_not_cancel_frozen_tp(tmp_path: Path, monkeypatch, cap
     assert canceled["n"] == 0
 
 
-def test_gate_aborts_when_stop_not_confirmed_inactive(tmp_path: Path, monkeypatch, capsys) -> None:
-    # Target hit + --enforce, but the service never goes inactive: abort BEFORE cancelling or
-    # flattening anything.
-    _control(tmp_path, "arxusdt", 100_000)
+def test_gate_rejects_bounded_control_without_owner_before_exchange_query(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True)
+    raw = {
+        key: value
+        for key, value in _owned_contract(
+            {
+                "symbol": "ARXUSDT",
+                "strategy_profile": "test_profile",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "per_order_notional": 20.0,
+                "run_start_time": "2026-07-16T00:00:00+00:00",
+                "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+                "run_end_time": "2026-07-17T00:00:00+00:00",
+                "max_cumulative_notional": 100_000.0,
+                "terminal_drain_exit_policy": "drain_then_preserve",
+                "terminal_drain_absolute_loss_budget": 5.0,
+                "terminal_drain_max_wait_seconds": 900.0,
+            }
+        ).items()
+        if key != "futures_run_contract_owner"
+    }
+    (output_dir / "arxusdt_loop_runner_control.json").write_text(
+        json.dumps(raw), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        tg,
+        "daily_vol_wear",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("owner must be checked before exchange query")
+        ),
+    )
+
+    _run_gate_main(
+        monkeypatch,
+        [
+            "--symbol",
+            "ARXUSDT",
+            "--service",
+            "grid-loop@ARXUSDT.service",
+            "--workdir",
+            str(tmp_path),
+            "--enforce",
+        ],
+    )
+
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["action"] == "LIFECYCLE_INTENT_REJECTED"
+    assert out["config_error"] == "invalid_run_contract_owner"
+    assert "owner is missing" in out["error"]
+
+
+def test_gate_enforce_submits_terminal_intent_without_runtime_or_exchange_actions(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    # The external gate is only an observer/intent producer.  The loop runner is
+    # the sole owner of entry blocking, cancellation and terminal drain orders.
+    control = _control(tmp_path, "arxusdt", 100_000)
     calls: list = []
     monkeypatch.setattr(tg, "subprocess", type("S", (), {"run": staticmethod(_fake_subprocess(calls))}))
-    monkeypatch.setattr(tg, "daily_vol_wear", lambda *a, **k: (200_000.0, 0.0))
+    monkeypatch.setattr(tg, "daily_vol_wear", lambda *a, **k: _target_window_stats(200_000.0, 0.0))
     monkeypatch.setattr(tg, "confirm_stopped", lambda *a, **k: False)
-    monkeypatch.setattr(tg, "cancel_frozen_tp", lambda *a, **k: 0)   # isolate the flatten path
     touched: list = []
+    monkeypatch.setattr(tg, "cancel_frozen_tp", lambda *a, **k: touched.append("cancel_tp"))
     monkeypatch.setattr(tg, "fetch_futures_open_orders", lambda *a, **k: touched.append("cancel") or [])
     monkeypatch.setattr(tg, "fetch_futures_position_risk_v3", lambda *a, **k: touched.append("pos") or [])
     monkeypatch.setattr(tg, "post_futures_market_order", lambda *a, **k: touched.append("flatten"))
+    monkeypatch.setattr(tg, "post_futures_order", lambda *a, **k: touched.append("limit"))
+    monkeypatch.setattr(tg, "delete_futures_order", lambda *a, **k: touched.append("delete"))
+    monkeypatch.setattr(
+        tg,
+        "load_live_runner_contract",
+        lambda **kwargs: tg.run_contract_identity_from_config(control),
+    )
     _run_gate_main(monkeypatch, ["--symbol", "ARXUSDT", "--service", "grid-loop@ARXUSDT.service",
                                  "--workdir", str(tmp_path), "--enforce"])
     out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert out["action"] == "ABORTED_STOP_FAILED"
-    assert touched == []                                 # no cancel / no position read / no flatten
+    assert out["action"] == "LIFECYCLE_INTENT_SUBMITTED"
+    assert touched == []
+    assert not any("stop" in c for c in calls)
+
+    intent_path = tmp_path / "output" / "arxusdt_terminal_intent.json"
+    intent = json.loads(intent_path.read_text(encoding="utf-8"))
+    intent_id = intent.pop("intent_id")
+    assert intent_id.startswith("ARXUSDT-competition_target_gate-target_reached-")
+    assert intent == {
+        "schema": "futures_lifecycle_intent_v2",
+        "symbol": "ARXUSDT",
+        "source": "competition_target_gate",
+        "action": "lifecycle_drain",
+        "status": "pending",
+        "requested_at": out["ts"],
+        "trigger_reason": "target_reached",
+        "exit_policy": "use_immutable_run_contract",
+        "run_contract_id": tg.run_contract_identity_from_config(control),
+        "run_contract_snapshot": tg.run_contract_snapshot_from_config(control),
+        "observed": {
+            "gross_notional": 200000.0,
+            "realized_pnl": 0.0,
+            "wear_per_10k": 0.0,
+            "trade_count": 1,
+            "target": 100000.0,
+            "first": None,
+            "wear_stop": None,
+            "window_start": "2026-07-16T00:00:00+00:00",
+            "window_end": "2026-07-17T00:00:00+00:00",
+            "query_end": "2026-07-16T01:00:00+00:00",
+        },
+    }
+
+
+def test_gate_terminal_intent_retry_preserves_first_pending_contract(tmp_path: Path) -> None:
+    observed = {
+        "gross_notional": 100000.0,
+        "wear_per_10k": 0.8,
+        "target": 100000.0,
+        "first": 75000.0,
+        "wear_stop": 2.0,
+    }
+    first_contract = _owned_contract({
+        "symbol": "ARXUSDT",
+        "strategy_profile": "test_profile",
+        "run_start_time": "2026-07-16T00:00:00+00:00",
+        "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+        "run_end_time": "2026-07-17T00:00:00+00:00",
+        "max_cumulative_notional": 100000.0,
+        "terminal_drain_exit_policy": "drain_then_preserve",
+        "terminal_drain_absolute_loss_budget": 5.0,
+        "terminal_drain_max_wait_seconds": 900.0,
+    })
+    first, created = tg.submit_lifecycle_intent(
+        workdir=str(tmp_path),
+        symbol="ARXUSDT",
+        trigger_reason="target_reached",
+        requested_at="2026-07-16T01:00:00+00:00",
+        observed=observed,
+        run_contract_config=first_contract,
+    )
+    assert created is True
+
+    retry_observed = {**observed, "gross_notional": 110000.0}
+    retry, created = tg.submit_lifecycle_intent(
+        workdir=str(tmp_path),
+        symbol="ARXUSDT",
+        trigger_reason="target_reached",
+        requested_at="2026-07-16T01:01:00+00:00",
+        observed=retry_observed,
+        run_contract_config=first_contract,
+    )
+
+    assert created is False
+    assert retry == first
+    assert retry["requested_at"] == "2026-07-16T01:00:00+00:00"
+    assert retry["observed"] == observed
+    assert list((tmp_path / "output").glob("*.tmp")) == []
+
+
+def test_gate_cli_wear_thresholds_cannot_enable_wear_exit(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _control(tmp_path, "arxusdt", 100_000)
+    monkeypatch.setattr(
+        tg,
+        "daily_vol_wear",
+        lambda *a, **k: _target_window_stats(80_000.0, 3.0),
+    )
+
+    _run_gate_main(
+        monkeypatch,
+        [
+            "--symbol",
+            "ARXUSDT",
+            "--service",
+            "grid-loop@ARXUSDT.service",
+            "--workdir",
+            str(tmp_path),
+            "--first",
+            "1",
+            "--wear-stop",
+            "0.1",
+            "--enforce",
+        ],
+    )
+
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["hit_target"] is False
+    assert out["hit_wear"] is False
+    assert not (tmp_path / "output" / "arxusdt_terminal_intent.json").exists()
+
+
+def test_gate_wear_exit_uses_only_immutable_snapshot_thresholds(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    control = _control(
+        tmp_path,
+        "arxusdt",
+        100_000,
+        wear_stop=2.0,
+        wear_first=75_000.0,
+    )
+    monkeypatch.setattr(
+        tg,
+        "daily_vol_wear",
+        lambda *a, **k: _target_window_stats(80_000.0, 3.0),
+    )
+    monkeypatch.setattr(
+        tg,
+        "load_live_runner_contract",
+        lambda **kwargs: tg.run_contract_identity_from_config(control),
+    )
+
+    _run_gate_main(
+        monkeypatch,
+        [
+            "--symbol",
+            "ARXUSDT",
+            "--service",
+            "grid-loop@ARXUSDT.service",
+            "--workdir",
+            str(tmp_path),
+            "--first",
+            "999999999",
+            "--wear-stop",
+            "999",
+            "--enforce",
+        ],
+    )
+
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["trigger"] == "wear"
+    intent = json.loads(
+        (tmp_path / "output" / "arxusdt_terminal_intent.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert intent["observed"]["first"] == 75_000.0
+    assert intent["observed"]["wear_stop"] == 2.0
+
+
+def test_gate_archives_orphan_completed_intent_before_new_run(tmp_path: Path) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True)
+    intent_path = output_dir / "arxusdt_terminal_intent.json"
+    intent_path.write_text(
+        json.dumps(
+            {
+                "schema": "futures_lifecycle_intent_v2",
+                "intent_id": "ARXUSDT-old-completed",
+                "symbol": "ARXUSDT",
+                "source": "competition_target_gate",
+                "action": "lifecycle_drain",
+                "trigger_reason": "target_reached",
+                "requested_at": "2026-07-15T01:00:00+00:00",
+                "status": "stopped_preserved",
+                "run_contract_id": "run-contract-old",
+                "observed": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    replacement, created = tg.submit_lifecycle_intent(
+        workdir=str(tmp_path),
+        symbol="ARXUSDT",
+        trigger_reason="target_reached",
+        requested_at="2026-07-16T01:00:00+00:00",
+        observed={
+            "gross_notional": 100000.0,
+            "wear_per_10k": 0.5,
+            "target": 100000.0,
+            "first": 75000.0,
+            "wear_stop": 2.0,
+        },
+        run_contract_config=_owned_contract({
+            "symbol": "ARXUSDT",
+            "strategy_profile": "new_profile",
+            "run_start_time": "2026-07-16T00:00:00+00:00",
+            "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+            "run_end_time": "2026-07-17T00:00:00+00:00",
+            "max_cumulative_notional": 100000.0,
+            "terminal_drain_exit_policy": "drain_then_preserve",
+            "terminal_drain_absolute_loss_budget": 5.0,
+            "terminal_drain_max_wait_seconds": 900.0,
+        }),
+    )
+
+    assert created is True
+    assert replacement["run_contract_id"] == tg.run_contract_identity_from_config(
+        replacement["run_contract_snapshot"]
+    )
+    archived = list((output_dir / "terminal_intent_history").glob("*.json"))
+    assert len(archived) == 1
+    assert json.loads(archived[0].read_text(encoding="utf-8"))["intent_id"] == "ARXUSDT-old-completed"
+
+
+def test_gate_rejects_wear_trigger_without_bounded_exit_contract(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True)
+    (output_dir / "arxusdt_loop_runner_control.json").write_text(
+        json.dumps(
+            {
+                "symbol": "ARXUSDT",
+                "strategy_profile": "test_profile",
+                "max_cumulative_notional": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        tg,
+        "daily_vol_wear",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("invalid contract must be rejected before exchange query")
+        ),
+    )
+
+    _run_gate_main(
+        monkeypatch,
+        [
+            "--symbol",
+            "ARXUSDT",
+            "--service",
+            "grid-loop@ARXUSDT.service",
+            "--workdir",
+            str(tmp_path),
+            "--enforce",
+        ],
+    )
+
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["action"] == "LIFECYCLE_INTENT_REJECTED"
+    assert out["config_error"] == "invalid_run_contract"
+    assert not (output_dir / "arxusdt_terminal_intent.json").exists()
+
+
+def test_gate_rejects_disk_target_that_differs_from_live_run_contract(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    control = _control(tmp_path, "arxusdt", 100_000)
+    live_control = dict(control)
+    live_control["max_cumulative_notional"] = 200_000.0
+    monkeypatch.setattr(tg, "daily_vol_wear", lambda *a, **k: _target_window_stats(100_000.0, 0.0))
+    monkeypatch.setattr(
+        tg,
+        "load_live_runner_contract",
+        lambda **kwargs: tg.run_contract_identity_from_config(live_control),
+    )
+
+    _run_gate_main(
+        monkeypatch,
+        [
+            "--symbol",
+            "ARXUSDT",
+            "--service",
+            "grid-loop@ARXUSDT.service",
+            "--workdir",
+            str(tmp_path),
+            "--enforce",
+        ],
+    )
+
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["action"] == "LIFECYCLE_INTENT_REJECTED"
+    assert out["config_error"] == "live_run_contract_mismatch"
+    assert not (tmp_path / "output" / "arxusdt_terminal_intent.json").exists()
+
+
+def test_live_runner_command_reconstructs_same_immutable_contract(tmp_path: Path, monkeypatch) -> None:
+    control = _control(tmp_path, "arxusdt", 100_000)
+    pid_path = tmp_path / "output" / "arxusdt_loop_runner.pid"
+    pid_path.write_text("321", encoding="utf-8")
+    command = (
+        "python -u -m grid_optimizer.loop_runner "
+        "--symbol ARXUSDT --strategy-profile test_profile "
+        "--strategy-mode hedge_best_quote_maker_volume_v1 "
+        "--per-order-notional 20 "
+        "--run-start-time 2026-07-16T00:00:00+00:00 "
+        "--runtime-guard-stats-start-time 2026-07-16T00:00:00+00:00 "
+        "--run-end-time 2026-07-17T00:00:00+00:00 "
+        "--max-cumulative-notional 100000 "
+        "--terminal-drain-exit-policy drain_then_preserve "
+        "--terminal-drain-absolute-loss-budget 5 "
+        "--terminal-drain-max-wait-seconds 900"
+    )
+    monkeypatch.setattr(
+        tg.subprocess,
+        "run",
+        lambda *args, **kwargs: _FakeProc(returncode=0, stdout=command),
+    )
+
+    live_contract_id = tg.load_live_runner_contract(
+        workdir=str(tmp_path),
+        slug="arxusdt",
+    )
+
+    assert live_contract_id == tg.run_contract_identity_from_config(control)
+
+
+def test_live_runner_command_reconstructs_immutable_wear_thresholds(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    control = _control(
+        tmp_path,
+        "arxusdt",
+        100_000,
+        wear_stop=2.0,
+        wear_first=75_000.0,
+    )
+    (tmp_path / "output" / "arxusdt_loop_runner.pid").write_text(
+        "321",
+        encoding="utf-8",
+    )
+    command = (
+        "python -u -m grid_optimizer.loop_runner "
+        "--symbol ARXUSDT --strategy-profile test_profile "
+        "--strategy-mode hedge_best_quote_maker_volume_v1 "
+        "--per-order-notional 20 "
+        "--run-start-time 2026-07-16T00:00:00+00:00 "
+        "--runtime-guard-stats-start-time 2026-07-16T00:00:00+00:00 "
+        "--run-end-time 2026-07-17T00:00:00+00:00 "
+        "--max-cumulative-notional 100000 "
+        "--lifecycle-wear-stop-per-10k 2 "
+        "--lifecycle-wear-stop-min-gross-notional 75000 "
+        "--terminal-drain-exit-policy drain_then_preserve "
+        "--terminal-drain-absolute-loss-budget 5 "
+        "--terminal-drain-max-wait-seconds 900"
+    )
+    monkeypatch.setattr(
+        tg.subprocess,
+        "run",
+        lambda *args, **kwargs: _FakeProc(returncode=0, stdout=command),
+    )
+
+    live_contract_id = tg.load_live_runner_contract(
+        workdir=str(tmp_path),
+        slug="arxusdt",
+    )
+
+    assert live_contract_id == tg.run_contract_identity_from_config(control)
 
 
 def test_gate_frozen_tp_qty_clamped_to_kept_short_and_step(tmp_path: Path, monkeypatch) -> None:
@@ -280,12 +830,12 @@ def test_gate_frozen_tp_qty_clamped_to_kept_short_and_step(tmp_path: Path, monke
 
 def test_evaluate_triggers_zero_target_is_never_a_hit() -> None:
     # target <= 0 -> target_ok False and hit_target forced False regardless of volume.
-    assert tg.evaluate_triggers(1e9, 0.0, 0.0, 75000, 2.0) == (False, False, False)
-    assert tg.evaluate_triggers(1e9, 0.0, -5.0, 75000, 2.0) == (False, False, False)
+    assert tg.evaluate_triggers(1e9, 0.0, 0.0, None, None) == (False, False, False)
+    assert tg.evaluate_triggers(1e9, 0.0, -5.0, None, None) == (False, False, False)
     # positive target: hit only once volume reaches it.
     assert tg.evaluate_triggers(90_000, 0.0, 100_000, 75000, 2.0) == (True, False, False)
     assert tg.evaluate_triggers(100_000, 0.0, 100_000, 75000, 2.0) == (True, True, False)
-    # wear stop is independent of the target and only arms past `first`.
+    # Wear stop is independent of the target, but only when explicitly bound.
     assert tg.evaluate_triggers(80_000, 3.0, 0.0, 75000, 2.0) == (False, False, True)
     assert tg.evaluate_triggers(50_000, 9.0, 0.0, 75000, 2.0) == (False, False, False)
 
@@ -317,6 +867,73 @@ def test_realign_never_starts_an_already_inactive_runner() -> None:
     assert ra.should_start_after_realign(was_active=False, allow_start_when_stopped=False) is False
     assert ra.should_start_after_realign(was_active=True, allow_start_when_stopped=False) is True
     assert ra.should_start_after_realign(was_active=False, allow_start_when_stopped=True) is True
+
+
+def test_registered_recovery_realign_reports_drift_without_actuating(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True)
+    state_path = output_dir / "arxusdt_loop_state.json"
+    original_state = {
+        "best_quote_volume_ledger": {
+            "long_lots": [{"qty": 500.0}],
+            "short_lots": [],
+        }
+    }
+    state_path.write_text(json.dumps(original_state), encoding="utf-8")
+    (output_dir / "arxusdt_loop_runner_control.json").write_text(
+        json.dumps({"symbol": "ARXUSDT", "_futures_recovery_state": {"schema_version": 1}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BINANCE_API_KEY", "k")
+    monkeypatch.setenv("BINANCE_API_SECRET", "s")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "realign",
+            "--symbol",
+            "ARXUSDT",
+            "--service",
+            "svc",
+            "--workdir",
+            str(tmp_path),
+            "--threshold-qty",
+            "10",
+            "--enforce",
+        ],
+    )
+    monkeypatch.setattr(
+        ra,
+        "fetch_exchange_sides",
+        lambda *args, **kwargs: (0.0, 0.0, 0.0, 0.0),
+    )
+    monkeypatch.setattr(ra, "is_active", lambda _service: True)
+    side_effects: list[str] = []
+    monkeypatch.setattr(
+        ra.subprocess,
+        "run",
+        lambda *args, **kwargs: side_effects.append("systemctl") or _FakeProc(),
+    )
+    monkeypatch.setattr(
+        ra,
+        "fetch_futures_open_orders",
+        lambda *args, **kwargs: side_effects.append("open_orders") or [],
+    )
+    monkeypatch.setattr(
+        ra,
+        "delete_futures_order",
+        lambda *args, **kwargs: side_effects.append("cancel"),
+    )
+
+    ra.main()
+
+    status = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert status["action"] == "DEFERRED_TO_FUTURES_RECOVERY_COORDINATOR"
+    assert status["requested_action"] == "REALIGN_LEDGER"
+    assert status["recovery_coordinator_registered"] is True
+    assert side_effects == []
+    assert json.loads(state_path.read_text(encoding="utf-8")) == original_state
 
 
 def test_compute_drift_counts_ledger_plus_frozen_vs_exchange() -> None:

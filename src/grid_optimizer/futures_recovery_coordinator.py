@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
@@ -22,6 +23,7 @@ JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "Jso
 
 
 class ActionId(str, Enum):
+    TERMINAL_HANDOFF = "terminal_handoff"
     TERMINAL_STOP = "terminal_stop"
     SAFETY_CONVERGE = "safety_converge"
     RUNNER_RECOVER = "runner_recover"
@@ -35,6 +37,7 @@ class ActionId(str, Enum):
 
 
 ACTION_PRIORITY = (
+    ActionId.TERMINAL_HANDOFF,
     ActionId.TERMINAL_STOP,
     ActionId.SAFETY_CONVERGE,
     ActionId.RUNNER_RECOVER,
@@ -93,6 +96,17 @@ class LedgerClass(str, Enum):
     UNKNOWN = "unknown"
 
 
+_MANAGED_ORDER_ACTIONS = frozenset(
+    {
+        ActionId.INVENTORY_RECOVER,
+        ActionId.TEMPORARY_LOSS_RELIEF,
+        ActionId.MAKER_FLOW_RECOVER,
+        ActionId.BASELINE_TUNE,
+    }
+)
+_CLIENT_ORDER_ID_RE = re.compile(r"^[.A-Z:/a-z0-9_-]{1,36}$")
+
+
 @dataclass(frozen=True)
 class ExecutionPolicy:
     order_type: str = "LIMIT"
@@ -105,6 +119,134 @@ class ManagedProfile:
     fields: Mapping[str, Any]
     digest: str
     execution_policy: ExecutionPolicy = field(default_factory=ExecutionPolicy)
+
+
+@dataclass(frozen=True, order=True)
+class ManagedOrderIdentity:
+    """One exact exchange identity owned by a recovery decision."""
+
+    order_id: str
+    client_order_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.order_id, str)
+            or not self.order_id.isdigit()
+            or int(self.order_id) <= 0
+        ):
+            raise ValueError("managed order id must be a positive decimal string")
+        if (
+            not isinstance(self.client_order_id, str)
+            or not _CLIENT_ORDER_ID_RE.fullmatch(self.client_order_id)
+        ):
+            raise ValueError("managed client order id is invalid")
+
+
+@dataclass(frozen=True)
+class ManagedOrderManifest:
+    """Immutable submit ownership carried through cleanup and preemption."""
+
+    symbol: str
+    generation: int
+    decision_id: str
+    profile_digest: str
+    action_id: ActionId
+    side: Side
+    order_role: OrderRole
+    issued_at: datetime
+    orders: tuple[ManagedOrderIdentity, ...] = ()
+    action_lease_epoch: int | None = None
+    hard_expires_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.symbol, str)
+            or not self.symbol
+            or self.symbol != self.symbol.upper().strip()
+        ):
+            raise ValueError("managed order manifest symbol is invalid")
+        if type(self.generation) is not int or self.generation < 0:
+            raise ValueError("managed order manifest generation is invalid")
+        if (
+            not isinstance(self.decision_id, str)
+            or not self.decision_id
+            or self.decision_id != self.decision_id.strip()
+        ):
+            raise ValueError("managed order manifest decision is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.profile_digest):
+            raise ValueError("managed order manifest profile digest is invalid")
+        if not isinstance(self.action_id, ActionId) or (
+            self.action_id not in _MANAGED_ORDER_ACTIONS
+        ):
+            raise ValueError("action does not own a managed order manifest")
+        if not isinstance(self.side, Side) or not isinstance(
+            self.order_role, OrderRole
+        ):
+            raise ValueError("managed order manifest side or role is invalid")
+        if self.action_id is ActionId.INVENTORY_RECOVER and (
+            self.order_role is not OrderRole.REDUCE_ONLY
+        ):
+            raise ValueError("inventory recovery manifest must be reduce-only")
+        if self.action_id is ActionId.MAKER_FLOW_RECOVER and (
+            self.order_role is not OrderRole.ENTRY
+        ):
+            raise ValueError("maker recovery manifest must be entry")
+        if self.action_id is ActionId.TEMPORARY_LOSS_RELIEF:
+            if (
+                self.order_role is not OrderRole.REDUCE_ONLY
+                or type(self.action_lease_epoch) is not int
+                or self.action_lease_epoch < 0
+                or self.hard_expires_at is None
+            ):
+                raise ValueError("temporary-loss manifest lease binding is invalid")
+        elif self.action_lease_epoch is not None or self.hard_expires_at is not None:
+            raise ValueError("ordinary manifest cannot carry a loss lease")
+        for value, field_name in (
+            (self.issued_at, "issued_at"),
+            (self.hard_expires_at, "hard_expires_at"),
+        ):
+            if value is not None and (
+                value.tzinfo is None or value.utcoffset() is None
+            ):
+                raise ValueError(
+                    f"managed order manifest {field_name} must be timezone-aware"
+                )
+        if self.hard_expires_at is not None and self.hard_expires_at <= self.issued_at:
+            raise ValueError("managed order manifest hard expiry is invalid")
+        if self.orders != tuple(sorted(set(self.orders))):
+            raise ValueError("managed order manifest identities are not canonical")
+        if len({item.order_id for item in self.orders}) != len(self.orders):
+            raise ValueError("managed order manifest has duplicate order ids")
+        if len({item.client_order_id for item in self.orders}) != len(self.orders):
+            raise ValueError("managed order manifest has duplicate client order ids")
+
+    @property
+    def digest(self) -> str:
+        return _canonical_digest(
+            {
+                "symbol": self.symbol,
+                "generation": self.generation,
+                "decision_id": self.decision_id,
+                "profile_digest": self.profile_digest,
+                "action_id": self.action_id.value,
+                "side": self.side.value,
+                "order_role": self.order_role.value,
+                "issued_at": self.issued_at.isoformat(),
+                "orders": [
+                    {
+                        "order_id": item.order_id,
+                        "client_order_id": item.client_order_id,
+                    }
+                    for item in self.orders
+                ],
+                "action_lease_epoch": self.action_lease_epoch,
+                "hard_expires_at": (
+                    self.hard_expires_at.isoformat()
+                    if self.hard_expires_at is not None
+                    else None
+                ),
+            }
+        )
 
 
 def _canonical_digest(payload: Mapping[str, JsonValue]) -> str:
@@ -226,6 +368,28 @@ class FlowClock:
 
 
 @dataclass(frozen=True)
+class FlowObservation:
+    """One immutable side/role liveness observation for this round.
+
+    Exchange acceptance proves quote/submit coverage only.  A fill advances
+    independently through its authoritative ``userTrades`` timestamp, so a
+    repeatedly accepted or replaced GTX order cannot erase a no-fill clock.
+    """
+
+    obligation_active: bool
+    qualified_quote_present: bool
+    submitted_gtx_present: bool
+    latest_fill_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.latest_fill_at is not None and (
+            self.latest_fill_at.tzinfo is None
+            or self.latest_fill_at.utcoffset() is None
+        ):
+            raise ValueError("latest_fill_at must be timezone-aware")
+
+
+@dataclass(frozen=True)
 class ActionAttempt:
     action_id: ActionId
     side: Side
@@ -256,23 +420,73 @@ class SafetyLease:
 
 @dataclass(frozen=True)
 class CleanupObligation:
-    source_action_id: ActionId
-    source_decision_id: str
-    action_lease_epoch: int
-    open_order_ids: tuple[str, ...]
+    managed_order_manifest: ManagedOrderManifest
     needs_manifest_rebuild: bool
     created_at: datetime
     attempt_count: int
     next_retry_at: datetime
 
+    def __post_init__(self) -> None:
+        if type(self.needs_manifest_rebuild) is not bool or (
+            self.needs_manifest_rebuild != (not self.managed_order_manifest.orders)
+        ):
+            raise ValueError("cleanup rebuild flag must match manifest completeness")
+        if type(self.attempt_count) is not int or self.attempt_count < 0:
+            raise ValueError("cleanup attempt count is invalid")
+        for value in (self.created_at, self.next_retry_at):
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError("cleanup timestamps must be timezone-aware")
+        if self.next_retry_at < self.created_at:
+            raise ValueError("cleanup retry precedes obligation creation")
+
+    @property
+    def source_action_id(self) -> ActionId:
+        return self.managed_order_manifest.action_id
+
+    @property
+    def source_decision_id(self) -> str:
+        return self.managed_order_manifest.decision_id
+
+    @property
+    def open_order_ids(self) -> tuple[str, ...]:
+        return tuple(item.order_id for item in self.managed_order_manifest.orders)
+
+    @property
+    def action_lease_epoch(self) -> int | None:
+        """Source loss-lease epoch; ordinary managed orders have no lease."""
+
+        return self.managed_order_manifest.action_lease_epoch
+
 
 @dataclass(frozen=True)
 class CleanupProof:
     source_decision_id: str
-    action_lease_epoch: int
+    source_generation: int
+    manifest_digest: str
     remaining_order_ids: tuple[str, ...]
     user_trades_watermark: int
     observed_at: datetime
+
+    def __post_init__(self) -> None:
+        if not self.source_decision_id or (
+            self.source_decision_id != self.source_decision_id.strip()
+        ):
+            raise ValueError("cleanup proof decision is invalid")
+        if type(self.source_generation) is not int or self.source_generation < 0:
+            raise ValueError("cleanup proof generation is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.manifest_digest):
+            raise ValueError("cleanup proof manifest digest is invalid")
+        if self.remaining_order_ids != tuple(
+            sorted(set(self.remaining_order_ids), key=int)
+        ) or any(not item.isdigit() or int(item) <= 0 for item in self.remaining_order_ids):
+            raise ValueError("cleanup proof remaining order ids are invalid")
+        if (
+            type(self.user_trades_watermark) is not int
+            or self.user_trades_watermark < 0
+        ):
+            raise ValueError("cleanup proof trade watermark is invalid")
+        if self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
+            raise ValueError("cleanup proof time must be timezone-aware")
 
 
 @dataclass(frozen=True)
@@ -312,6 +526,8 @@ class ProgressReceipt:
 @dataclass(frozen=True)
 class FlowBlockerAssessment:
     terminal_reason: str | None = None
+    terminal_clean_flat_proof: bool = False
+    terminal_lifecycle_handoff: bool = False
     safety_reasons: tuple[str, ...] = ()
     safety_evidence_fingerprint: str | None = None
     safety_observation_seq: int | None = None
@@ -335,9 +551,12 @@ class SymbolSnapshot:
     assessment: FlowBlockerAssessment
     applied_generation: int | None = None
     applied_profile_digest: str | None = None
+    flow_observations: Mapping[FlowRoleKey, FlowObservation] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
     progress_receipts: tuple[ProgressReceipt, ...] = ()
     cleanup_proof: CleanupProof | None = None
-    action_lease_open_order_ids: tuple[str, ...] = ()
+    managed_order_manifest: ManagedOrderManifest | None = None
     exchange_observation_available: bool = True
     effect_receipt: EffectReceipt | None = None
     activation_receipt: ActivationReceipt | None = None
@@ -351,12 +570,14 @@ class RecoveryPolicy:
     cooldown: timedelta = timedelta(minutes=1)
     restore_timeout: timedelta = timedelta(minutes=2)
     cleanup_retry_interval: timedelta = timedelta(seconds=15)
+    exhausted_retry_backoff: timedelta = timedelta(minutes=5)
     max_temporary_loss_leases_per_episode: int = 2
     max_safety_observation_age: timedelta = timedelta(seconds=30)
     terminal_reason_allowlist: frozenset[str] = frozenset(
         {
             "competition_target_confirmed",
             "trusted_competition_window_end",
+            "trusted_lifecycle_terminal_handoff",
             "unrecoverable_managed_document_corruption",
         }
     )
@@ -370,12 +591,15 @@ class RecoveryPolicy:
             "cooldown",
             "restore_timeout",
             "cleanup_retry_interval",
+            "exhausted_retry_backoff",
             "max_safety_observation_age",
         ):
             if getattr(self, name).total_seconds() < 0:
                 raise ValueError(f"{name} must be non-negative")
         if self.action_hard_ttl < self.action_progress_timeout:
             raise ValueError("action_hard_ttl must cover action_progress_timeout")
+        if self.exhausted_retry_backoff.total_seconds() <= 0:
+            raise ValueError("exhausted_retry_backoff must be positive")
         if self.max_temporary_loss_leases_per_episode < 1:
             raise ValueError("max_temporary_loss_leases_per_episode must be positive")
         if self.round_history_size < 1:
@@ -629,6 +853,84 @@ def _stable_sides(sides: tuple[Side, ...]) -> tuple[Side, ...]:
     return tuple(sorted(set(sides), key=lambda side: side.value))
 
 
+def _flow_clocks_for_action(
+    clocks: Mapping[FlowRoleKey, FlowClock],
+    *,
+    action_id: ActionId,
+    side: Side | None,
+    order_role: OrderRole | None,
+) -> Mapping[FlowRoleKey, FlowClock]:
+    preserve_entry_side = (
+        side
+        if (
+            action_id in {ActionId.MAKER_FLOW_RECOVER, ActionId.BASELINE_TUNE}
+            and order_role is OrderRole.ENTRY
+        )
+        else None
+    )
+    normalized = {
+        key: (
+            clock
+            if not (
+                key.ledger_class is LedgerClass.NORMAL_BQ
+                and key.order_role is OrderRole.ENTRY
+                and key.side is not preserve_entry_side
+            )
+            else FlowClock()
+        )
+        for key, clock in clocks.items()
+    }
+    return MappingProxyType(normalized)
+
+
+def _managed_order_manifest_for_state(
+    state: RecoveryState,
+    observed: ManagedOrderManifest | None,
+) -> ManagedOrderManifest:
+    """Return a complete source binding, even when the submit journal is empty."""
+
+    if (
+        state.active_action not in _MANAGED_ORDER_ACTIONS
+        or state.decision_id is None
+        or state.issued_at is None
+        or state.side is None
+        or state.order_role is None
+    ):
+        raise ValueError("state does not own a managed recovery order scope")
+    lease = state.action_lease
+    if state.active_action is ActionId.TEMPORARY_LOSS_RELIEF:
+        if lease is None or lease.action_id is not state.active_action:
+            raise ValueError("temporary-loss cleanup has no source lease")
+        lease_epoch = lease.epoch
+        hard_expires_at = lease.hard_expires_at
+    else:
+        lease_epoch = None
+        hard_expires_at = None
+    expected = ManagedOrderManifest(
+        symbol=state.symbol,
+        generation=state.generation,
+        decision_id=state.decision_id,
+        profile_digest=state.desired_profile.digest,
+        action_id=state.active_action,
+        side=state.side,
+        order_role=state.order_role,
+        issued_at=state.issued_at,
+        orders=observed.orders if observed is not None else (),
+        action_lease_epoch=lease_epoch,
+        hard_expires_at=hard_expires_at,
+    )
+    if observed is not None and observed != expected:
+        raise ValueError("managed order manifest does not match current decision")
+    return expected
+
+
+def _state_requires_managed_order_cleanup(state: RecoveryState) -> bool:
+    return bool(
+        state.active_action in _MANAGED_ORDER_ACTIONS
+        and state.phase in {RecoveryPhase.SETTLING, RecoveryPhase.ACTIVE}
+    )
+
+
 def _directional_fairness_key(
     action_id: ActionId,
     order_role: OrderRole,
@@ -670,17 +972,21 @@ def _directional_candidate(
     side: Side,
     role: OrderRole,
     reason: str,
+    *,
+    updates: Mapping[str, JsonValue] | None = None,
 ) -> _Candidate:
+    profile_updates: dict[str, JsonValue] = {
+        "recovery_order_side": side.value,
+        "recovery_order_role": role.value,
+        "recovery_order_ledger_class": LedgerClass.NORMAL_BQ.value,
+    }
+    profile_updates.update(dict(updates or {}))
     return _Candidate(
         action_id=action_id,
         side=side,
         order_role=role,
         reasons=(reason,),
-        updates={
-            "recovery_order_side": side.value,
-            "recovery_order_role": role.value,
-            "recovery_order_ledger_class": LedgerClass.NORMAL_BQ.value,
-        },
+        updates=profile_updates,
     )
 
 
@@ -689,8 +995,43 @@ def _evaluate_terminal(
     _state: RecoveryState,
     policy: RecoveryPolicy,
 ) -> _ActionEvaluation:
+    if assessment.terminal_lifecycle_handoff:
+        return _ActionEvaluation()
     if not assessment.terminal_reason:
         return _ActionEvaluation()
+    if assessment.terminal_reason not in policy.terminal_reason_allowlist:
+        return _ActionEvaluation(
+            blocked_reasons=(
+                f"unregistered_terminal_reason:{assessment.terminal_reason}",
+            )
+        )
+    if not assessment.terminal_clean_flat_proof:
+        return _ActionEvaluation(
+            blocked_reasons=("terminal_clean_flat_proof_required",)
+        )
+    return _ActionEvaluation(
+        candidates=(
+            _Candidate(
+                ActionId.TERMINAL_STOP,
+                reasons=(assessment.terminal_reason,),
+                effect_stage=EffectStage.RUNNER_STOP,
+                runner_state="stopped",
+            ),
+        )
+    )
+
+
+def _evaluate_terminal_handoff(
+    assessment: FlowBlockerAssessment,
+    _state: RecoveryState,
+    policy: RecoveryPolicy,
+) -> _ActionEvaluation:
+    if not assessment.terminal_lifecycle_handoff:
+        return _ActionEvaluation()
+    if not assessment.terminal_reason:
+        return _ActionEvaluation(
+            blocked_reasons=("terminal_handoff_reason_required",)
+        )
     if assessment.terminal_reason not in policy.terminal_reason_allowlist:
         return _ActionEvaluation(
             blocked_reasons=(
@@ -700,10 +1041,9 @@ def _evaluate_terminal(
     return _ActionEvaluation(
         candidates=(
             _Candidate(
-                ActionId.TERMINAL_STOP,
+                ActionId.TERMINAL_HANDOFF,
                 reasons=(assessment.terminal_reason,),
-                effect_stage=EffectStage.RUNNER_STOP,
-                runner_state="stopped",
+                runner_state="running",
             ),
         )
     )
@@ -857,6 +1197,9 @@ def _evaluate_maker_flow(
                 side,
                 OrderRole.ENTRY,
                 "missing_entry_role",
+                updates={
+                    "best_quote_maker_volume_same_side_entry_price_guard_report_only": True,
+                },
             )
             for side in _stable_sides(assessment.missing_entry_sides)
         )
@@ -882,19 +1225,71 @@ def _evaluate_baseline_rebase(
 
 def _evaluate_baseline_tune(
     assessment: FlowBlockerAssessment,
-    _state: RecoveryState,
-    _policy: RecoveryPolicy,
+    state: RecoveryState,
+    policy: RecoveryPolicy,
 ) -> _ActionEvaluation:
-    return _ActionEvaluation(
-        candidates=tuple(
+    candidates = [
+        _directional_candidate(
+            ActionId.BASELINE_TUNE,
+            side,
+            OrderRole.ENTRY,
+            "registered_baseline_capacity_insufficient",
+            updates={
+                "near_market_entry_max_center_distance_steps": 999.0,
+                "near_market_reentry_confirm_cycles": 1,
+            },
+        )
+        for side in _stable_sides(assessment.baseline_tune_sides)
+    ]
+    candidates.extend(
+        _directional_candidate(
+            ActionId.BASELINE_TUNE,
+            side,
+            OrderRole.ENTRY,
+            "maker_flow_recovery_exhausted_baseline_tune",
+            updates={
+                "near_market_entry_max_center_distance_steps": 999.0,
+                "near_market_reentry_confirm_cycles": 1,
+            },
+        )
+        for side in _stable_sides(assessment.missing_entry_sides)
+        if state.attempt_exhausted(
+            ActionId.MAKER_FLOW_RECOVER,
+            side,
+            OrderRole.ENTRY,
+        )
+    )
+    episode_fingerprint = _episode_fingerprint(assessment)
+    loss_budget_exhausted = (
+        state.temporary_loss_lease_uses.get(episode_fingerprint, 0)
+        >= policy.max_temporary_loss_leases_per_episode
+    )
+    for side in _stable_sides(assessment.inventory_reduce_sides):
+        if not state.attempt_exhausted(
+            ActionId.INVENTORY_RECOVER,
+            side,
+            OrderRole.REDUCE_ONLY,
+        ):
+            continue
+        loss_only = side in assessment.loss_only_blocked_sides
+        if loss_only and not loss_budget_exhausted:
+            # TEMPORARY_LOSS_RELIEF remains the unique next action while its
+            # typed per-episode budget is still available.
+            continue
+        candidates.append(
             _directional_candidate(
                 ActionId.BASELINE_TUNE,
                 side,
-                OrderRole.ENTRY,
-                "registered_baseline_capacity_insufficient",
+                OrderRole.REDUCE_ONLY,
+                (
+                    "temporary_loss_budget_exhausted_baseline_tune"
+                    if loss_only
+                    else "inventory_recovery_exhausted_baseline_tune"
+                ),
             )
-            for side in _stable_sides(assessment.baseline_tune_sides)
         )
+    return _ActionEvaluation(
+        candidates=tuple(candidates)
     )
 
 
@@ -907,6 +1302,7 @@ def _evaluate_noop(
 
 
 ACTION_DEFINITIONS = (
+    ActionDefinition(ActionId.TERMINAL_HANDOFF, _evaluate_terminal_handoff),
     ActionDefinition(ActionId.TERMINAL_STOP, _evaluate_terminal),
     ActionDefinition(ActionId.SAFETY_CONVERGE, _evaluate_safety),
     ActionDefinition(ActionId.RUNNER_RECOVER, _evaluate_runner),
@@ -934,13 +1330,20 @@ class FuturesRecoveryDecisionEngine:
         now: datetime,
         round_id: str,
     ) -> RoundPlan:
-        plan = self._plan_round(
+        flow_state, flow_assessment = self._apply_flow_observations(
             snapshot=snapshot,
             state=state,
             now=now,
+        )
+        if flow_assessment is not snapshot.assessment:
+            snapshot = replace(snapshot, assessment=flow_assessment)
+        plan = self._plan_round(
+            snapshot=snapshot,
+            state=flow_state,
+            now=now,
             round_id=round_id,
         )
-        history = tuple(dict.fromkeys((*state.recent_round_ids, round_id)))[
+        history = tuple(dict.fromkeys((*flow_state.recent_round_ids, round_id)))[
             -self.policy.round_history_size :
         ]
         next_state = replace(
@@ -948,6 +1351,108 @@ class FuturesRecoveryDecisionEngine:
             recent_round_ids=history,
         )
         return replace(plan, next_state=next_state)
+
+    def _apply_flow_observations(
+        self,
+        *,
+        snapshot: SymbolSnapshot,
+        state: RecoveryState,
+        now: datetime,
+    ) -> tuple[RecoveryState, FlowBlockerAssessment]:
+        if not snapshot.flow_observations:
+            return state, snapshot.assessment
+        clocks = dict(state.flow_clocks)
+        expired_entry_sides: set[Side] = set()
+        timeout = self.policy.action_progress_timeout
+        for key, observation in snapshot.flow_observations.items():
+            if not isinstance(key, FlowRoleKey) or not isinstance(
+                observation, FlowObservation
+            ):
+                raise ValueError("flow observations must be typed")
+            if observation.latest_fill_at is not None and (
+                observation.latest_fill_at > snapshot.captured_at
+                or observation.latest_fill_at > now
+            ):
+                raise ValueError("flow fill observation is from the future")
+            current = clocks.get(key, FlowClock())
+            current = FlowClock(
+                quote_missing_since=(
+                    now
+                    if current.quote_missing_since is not None
+                    and current.quote_missing_since > now
+                    else current.quote_missing_since
+                ),
+                submit_missing_since=(
+                    now
+                    if current.submit_missing_since is not None
+                    and current.submit_missing_since > now
+                    else current.submit_missing_since
+                ),
+                fill_missing_since=(
+                    now
+                    if current.fill_missing_since is not None
+                    and current.fill_missing_since > now
+                    else current.fill_missing_since
+                ),
+            )
+            if observation.obligation_active:
+                quote_missing_since = (
+                    None
+                    if observation.qualified_quote_present
+                    else (current.quote_missing_since or now)
+                )
+                submit_missing_since = (
+                    None
+                    if observation.submitted_gtx_present
+                    else (current.submit_missing_since or now)
+                )
+                fill_missing_since = current.fill_missing_since
+                if fill_missing_since is None:
+                    # A newly armed obligation starts at this observation.
+                    # Historical audit rows must not create inherited debt.
+                    fill_missing_since = now
+                elif (
+                    observation.latest_fill_at is not None
+                    and observation.latest_fill_at > fill_missing_since
+                ):
+                    fill_missing_since = observation.latest_fill_at
+                current = FlowClock(
+                    quote_missing_since=quote_missing_since,
+                    submit_missing_since=submit_missing_since,
+                    fill_missing_since=fill_missing_since,
+                )
+                clocks[key] = current
+                if (
+                    key.ledger_class is LedgerClass.NORMAL_BQ
+                    and key.order_role is OrderRole.ENTRY
+                    and any(
+                        since is not None and now - since >= timeout
+                        for since in (
+                            current.quote_missing_since,
+                            current.submit_missing_since,
+                            current.fill_missing_since,
+                        )
+                    )
+                ):
+                    expired_entry_sides.add(key.side)
+            else:
+                # A paused/disabled obligation has no liveness debt.  Reset
+                # every stage so time spent under a safety pause or another
+                # recovery action cannot trigger immediately on reactivation.
+                clocks[key] = FlowClock()
+        next_state = replace(state, flow_clocks=MappingProxyType(clocks))
+        if not expired_entry_sides:
+            return next_state, snapshot.assessment
+        missing = _stable_sides(
+            (
+                *snapshot.assessment.missing_entry_sides,
+                *tuple(expired_entry_sides),
+            )
+        )
+        return next_state, replace(
+            snapshot.assessment,
+            missing_entry_sides=missing,
+        )
 
     def _plan_round(
         self,
@@ -988,6 +1493,18 @@ class FuturesRecoveryDecisionEngine:
         if state.phase is RecoveryPhase.STOP_PENDING:
             return self._plan_stop_pending(snapshot, state, round_id)
         if state.phase is RecoveryPhase.STOPPED:
+            terminal_handoff = _evaluate_terminal_handoff(
+                snapshot.assessment,
+                state,
+                self.policy,
+            )
+            if terminal_handoff.candidates:
+                selected = terminal_handoff.candidates[0]
+                return self._finish_terminal_handoff(
+                    state=state,
+                    round_id=round_id,
+                    reasons=selected.reasons,
+                )
             return self._hold(state, round_id, liveness_status="terminal")
         if state.phase is RecoveryPhase.ACTIVE:
             return self._plan_active(snapshot, state, now, round_id)
@@ -1032,12 +1549,8 @@ class FuturesRecoveryDecisionEngine:
             )
         )
         if (
-            (
-                state.action_lease is not None
-                and state.action_lease.activated_at is not None
-            )
+            _state_requires_managed_order_cleanup(state)
             or state.cleanup_obligation is not None
-            or bool(snapshot.action_lease_open_order_ids)
         ):
             return self._enter_candidate_through_cleanup(
                 snapshot=snapshot,
@@ -1046,6 +1559,13 @@ class FuturesRecoveryDecisionEngine:
                 suppressed=suppressed,
                 now=now,
                 round_id=round_id,
+            )
+        if selected.action_id is ActionId.TERMINAL_HANDOFF:
+            return self._finish_terminal_handoff(
+                state=state,
+                round_id=round_id,
+                reasons=selected.reasons,
+                suppressed=suppressed,
             )
         return self._enter_candidate(
             snapshot=snapshot,
@@ -1063,6 +1583,7 @@ class FuturesRecoveryDecisionEngine:
         now: datetime,
         round_id: str,
     ) -> RoundPlan:
+        state = self._rearm_ordinary_attempts_after_backoff(state, now=now)
         candidates = self._candidates(snapshot.assessment, state)
         selected = self._select_candidate(candidates, state)
         suppressed = tuple(
@@ -1106,6 +1627,14 @@ class FuturesRecoveryDecisionEngine:
                 next_state=next_state,
             )
 
+        if selected.action_id is ActionId.TERMINAL_HANDOFF:
+            return self._finish_terminal_handoff(
+                state=state,
+                round_id=round_id,
+                reasons=selected.reasons,
+                suppressed=suppressed,
+            )
+
         return self._enter_candidate(
             snapshot=snapshot,
             state=state,
@@ -1114,6 +1643,31 @@ class FuturesRecoveryDecisionEngine:
             now=now,
             round_id=round_id,
         )
+
+    def _rearm_ordinary_attempts_after_backoff(
+        self,
+        state: RecoveryState,
+        *,
+        now: datetime,
+    ) -> RecoveryState:
+        """Open a new bounded ordinary retry epoch without erasing the episode."""
+
+        ordinary_actions = {
+            ActionId.INVENTORY_RECOVER,
+            ActionId.MAKER_FLOW_RECOVER,
+            ActionId.BASELINE_TUNE,
+        }
+        retained = tuple(
+            attempt
+            for attempt in state.exhausted_attempts
+            if (
+                attempt.action_id not in ordinary_actions
+                or attempt.exhausted_at + self.policy.exhausted_retry_backoff > now
+            )
+        )
+        if retained == state.exhausted_attempts:
+            return state
+        return replace(state, exhausted_attempts=retained)
 
     def _enter_candidate(
         self,
@@ -1161,9 +1715,15 @@ class FuturesRecoveryDecisionEngine:
             action_lease_active=False,
             safety_lease=safety_lease,
         )
+        selected_effect = selected.effect_stage
+        if (
+            selected.action_id is not ActionId.TERMINAL_STOP
+            and selected_effect is EffectStage.NONE
+        ):
+            selected_effect = EffectStage.RUNNER_RESTART
         effect_epoch = state.effect_epoch
         pending_effect_epoch = None
-        if selected.effect_stage is not EffectStage.NONE:
+        if selected_effect is not EffectStage.NONE:
             effect_epoch += 1
             pending_effect_epoch = effect_epoch
         next_state = replace(
@@ -1196,12 +1756,18 @@ class FuturesRecoveryDecisionEngine:
             action_lease_epoch=action_epoch,
             safety_lease_epoch=safety_epoch,
             temporary_loss_lease_uses=MappingProxyType(temporary_loss_uses),
+            flow_clocks=_flow_clocks_for_action(
+                state.flow_clocks,
+                action_id=selected.action_id,
+                side=selected.side,
+                order_role=selected.order_role,
+            ),
             active_episode_fingerprint=episode_fingerprint,
             cleanup_successor_action=None,
             post_cleanup_effect_stage=EffectStage.NONE,
             terminal_stop_confirmed=False,
             effect_epoch=effect_epoch,
-            pending_effect_stage=selected.effect_stage,
+            pending_effect_stage=selected_effect,
             pending_effect_epoch=pending_effect_epoch,
             last_round_id=round_id,
             exhausted_attempts=self._exhausted_after_selection(
@@ -1224,7 +1790,7 @@ class FuturesRecoveryDecisionEngine:
             suppressed_actions=suppressed,
             desired_profile=profile,
             desired_runner_state=selected.runner_state,
-            effect_stage=selected.effect_stage,
+            effect_stage=selected_effect,
             effect_epoch=pending_effect_epoch,
             liveness_status=(
                 "terminal"
@@ -1276,29 +1842,16 @@ class FuturesRecoveryDecisionEngine:
         now: datetime,
         round_id: str,
     ) -> RoundPlan:
-        """Preempt without losing an activated lease cleanup obligation."""
+        """Preempt only after preserving the source decision's exact manifest."""
 
-        if selected.action_id is ActionId.TEMPORARY_LOSS_RELIEF:
-            raise ValueError("a loss lease cannot preempt through another lease")
         obligation = state.cleanup_obligation
         cleanup_effect = EffectStage.NONE
         if obligation is None:
-            lease = state.action_lease
-            if (
-                lease is None
-                or state.decision_id is None
-                or (
-                    lease.activated_at is None
-                    and not snapshot.action_lease_open_order_ids
-                )
-            ):
-                raise ValueError(
-                    "cleanup preemption requires an activated action lease"
-                )
-            open_order_ids = tuple(dict.fromkeys(snapshot.action_lease_open_order_ids))
-            needs_manifest_rebuild = (
-                not open_order_ids or not snapshot.exchange_observation_available
+            source_manifest = _managed_order_manifest_for_state(
+                state,
+                snapshot.managed_order_manifest,
             )
+            needs_manifest_rebuild = not source_manifest.orders
             cleanup_effect = (
                 EffectStage.LOCAL_STATE_REPAIR
                 if needs_manifest_rebuild
@@ -1306,10 +1859,7 @@ class FuturesRecoveryDecisionEngine:
             )
             cleanup_starts_now = selected.action_id is not ActionId.TERMINAL_STOP
             obligation = CleanupObligation(
-                source_action_id=lease.action_id,
-                source_decision_id=state.decision_id,
-                action_lease_epoch=lease.epoch,
-                open_order_ids=open_order_ids,
+                managed_order_manifest=source_manifest,
                 needs_manifest_rebuild=needs_manifest_rebuild,
                 created_at=now,
                 attempt_count=1 if cleanup_starts_now else 0,
@@ -1319,10 +1869,39 @@ class FuturesRecoveryDecisionEngine:
                     else now
                 ),
             )
+        elif selected.action_id is ActionId.TERMINAL_HANDOFF:
+            cleanup_effect = (
+                EffectStage.LOCAL_STATE_REPAIR
+                if obligation.needs_manifest_rebuild
+                else EffectStage.MANAGED_GTX_CANCEL
+            )
+            obligation = replace(
+                obligation,
+                attempt_count=obligation.attempt_count + 1,
+                next_retry_at=now + self.policy.cleanup_retry_interval,
+            )
 
         safety_lease = None
         safety_epoch = state.safety_lease_epoch
+        action_lease = (
+            state.action_lease
+            if obligation.source_action_id is ActionId.TEMPORARY_LOSS_RELIEF
+            else None
+        )
+        action_epoch = state.action_lease_epoch
         hard_expires_at = now + self.policy.action_hard_ttl
+        if selected.action_id is ActionId.TEMPORARY_LOSS_RELIEF:
+            if selected.side is None or selected.order_role is not OrderRole.REDUCE_ONLY:
+                raise ValueError("temporary loss relief requires a reduce-only side")
+            action_epoch += 1
+            action_lease = ActionLease(
+                epoch=action_epoch,
+                action_id=selected.action_id,
+                side=selected.side,
+                order_role=selected.order_role,
+                started_at=now,
+                hard_expires_at=hard_expires_at,
+            )
         if selected.action_id is ActionId.SAFETY_CONVERGE:
             safety_epoch += 1
             hard_expires_at = now + self.policy.safety_hard_ttl
@@ -1336,6 +1915,12 @@ class FuturesRecoveryDecisionEngine:
             baseline=state.baseline_profile.fields,
             action_id=selected.action_id,
             action_updates=selected.updates,
+            action_lease=(
+                action_lease
+                if selected.action_id is ActionId.TEMPORARY_LOSS_RELIEF
+                else None
+            ),
+            action_lease_active=False,
             safety_lease=safety_lease,
         )
         if selected.action_id is ActionId.TERMINAL_STOP:
@@ -1349,7 +1934,15 @@ class FuturesRecoveryDecisionEngine:
             pending_effect = (
                 effect if effect is not EffectStage.NONE else state.pending_effect_stage
             )
-            post_cleanup_effect = selected.effect_stage
+            post_cleanup_effect = (
+                EffectStage.NONE
+                if selected.action_id is ActionId.TERMINAL_HANDOFF
+                else (
+                    selected.effect_stage
+                    if selected.effect_stage is not EffectStage.NONE
+                    else EffectStage.RUNNER_RESTART
+                )
+            )
             if effect is not EffectStage.NONE:
                 effect_epoch = state.effect_epoch + 1
                 pending_effect_epoch = effect_epoch
@@ -1372,8 +1965,16 @@ class FuturesRecoveryDecisionEngine:
             progress_deadline_at=now + self.policy.action_progress_timeout,
             hard_expires_at=hard_expires_at,
             cooldown_until=None,
+            action_lease=action_lease,
             safety_lease=safety_lease,
             cleanup_obligation=obligation,
+            flow_clocks=_flow_clocks_for_action(
+                state.flow_clocks,
+                action_id=selected.action_id,
+                side=selected.side,
+                order_role=selected.order_role,
+            ),
+            action_lease_epoch=action_epoch,
             safety_lease_epoch=safety_epoch,
             active_episode_fingerprint=_episode_fingerprint(snapshot.assessment),
             cleanup_successor_action=selected.action_id,
@@ -1466,6 +2067,7 @@ class FuturesRecoveryDecisionEngine:
             )
             uses = dict(state.temporary_loss_lease_uses)
             uses[episode_fingerprint] = uses.get(episode_fingerprint, 0) + 1
+            effect_epoch = state.effect_epoch + 1
             next_state = replace(
                 state,
                 document_revision=state.document_revision + 1,
@@ -1474,17 +2076,27 @@ class FuturesRecoveryDecisionEngine:
                 phase=RecoveryPhase.ACTIVE,
                 action_lease=activated_lease,
                 temporary_loss_lease_uses=MappingProxyType(uses),
-                pending_effect_stage=EffectStage.NONE,
-                pending_effect_epoch=None,
+                effect_epoch=effect_epoch,
+                pending_effect_stage=EffectStage.RUNNER_RESTART,
+                pending_effect_epoch=effect_epoch,
                 last_round_id=round_id,
             )
             return self._round_plan(
                 next_state,
                 round_id,
                 mode=ActionMode.ADVANCE,
-                effect_stage=EffectStage.NONE,
+                effect_stage=EffectStage.RUNNER_RESTART,
                 liveness_status="recovering",
             )
+        if state.pending_effect_stage is not EffectStage.NONE:
+            if self._effect_receipt_matches(snapshot, state):
+                state = replace(
+                    state,
+                    pending_effect_stage=EffectStage.NONE,
+                    pending_effect_epoch=None,
+                )
+            elif state.progress_deadline_at is None or now < state.progress_deadline_at:
+                return self._retry_pending_effect(state, round_id)
         return self._hold(state, round_id, liveness_status="recovering")
 
     def _plan_active(
@@ -1506,7 +2118,27 @@ class FuturesRecoveryDecisionEngine:
             )
         )
         if state.pending_effect_stage is not EffectStage.NONE:
-            if expired:
+            effect_confirmed = bool(
+                self._effect_receipt_matches(snapshot, state)
+                or self._has_current_progress(snapshot, state)
+            )
+            if not effect_confirmed:
+                if (
+                    state.active_action is ActionId.SAFETY_CONVERGE
+                    and self._active_safety_evidence_is_current(snapshot, state)
+                ):
+                    # Losing a lifecycle receipt cannot turn a still-current
+                    # hard safety condition into permission to restore the
+                    # trading baseline.  Re-run the same fenced effect epoch;
+                    # after its progress deadline the state is visibly blocked,
+                    # but the safety profile and decision remain unchanged.
+                    return self._retry_pending_effect(
+                        state,
+                        round_id,
+                        liveness_status="blocked" if expired else "recovering",
+                    )
+                if not expired:
+                    return self._retry_pending_effect(state, round_id)
                 return self._exit_active(
                     snapshot,
                     state,
@@ -1514,8 +2146,6 @@ class FuturesRecoveryDecisionEngine:
                     round_id,
                     reason="effect_receipt_deadline",
                 )
-            if not self._effect_receipt_matches(snapshot, state):
-                return self._retry_pending_effect(state, round_id)
             state = replace(
                 state,
                 pending_effect_stage=EffectStage.NONE,
@@ -1568,6 +2198,12 @@ class FuturesRecoveryDecisionEngine:
             terminal_stop_confirmed=True,
             pending_effect_stage=EffectStage.NONE,
             pending_effect_epoch=None,
+            flow_clocks=_flow_clocks_for_action(
+                state.flow_clocks,
+                action_id=ActionId.TERMINAL_STOP,
+                side=None,
+                order_role=None,
+            ),
             last_round_id=round_id,
         )
         return self._round_plan(
@@ -1582,6 +2218,8 @@ class FuturesRecoveryDecisionEngine:
         self,
         state: RecoveryState,
         round_id: str,
+        *,
+        liveness_status: str = "recovering",
     ) -> RoundPlan:
         if (
             state.pending_effect_stage is EffectStage.NONE
@@ -1598,7 +2236,7 @@ class FuturesRecoveryDecisionEngine:
             round_id,
             mode=ActionMode.ADVANCE,
             effect_stage=state.pending_effect_stage,
-            liveness_status="recovering",
+            liveness_status=liveness_status,
         )
 
     @staticmethod
@@ -1659,6 +2297,7 @@ class FuturesRecoveryDecisionEngine:
             action_updates=state.desired_profile.fields,
             safety_lease=renewed,
         )
+        next_effect_epoch = state.effect_epoch + 1
         next_state = replace(
             state,
             document_revision=state.document_revision + 1,
@@ -1669,13 +2308,16 @@ class FuturesRecoveryDecisionEngine:
             safety_lease_epoch=next_epoch,
             hard_expires_at=renewed.hard_expires_at,
             progress_deadline_at=now + self.policy.action_progress_timeout,
+            effect_epoch=next_effect_epoch,
+            pending_effect_stage=EffectStage.RUNNER_RESTART,
+            pending_effect_epoch=next_effect_epoch,
             last_round_id=round_id,
         )
         return self._round_plan(
             next_state,
             round_id,
             mode=ActionMode.ADVANCE,
-            effect_stage=EffectStage.NONE,
+            effect_stage=EffectStage.RUNNER_RESTART,
             liveness_status="recovering",
         )
 
@@ -1697,6 +2339,37 @@ class FuturesRecoveryDecisionEngine:
             <= self.policy.max_safety_observation_age
         )
 
+    def _active_safety_evidence_is_current(
+        self,
+        snapshot: SymbolSnapshot,
+        state: RecoveryState,
+    ) -> bool:
+        lease = state.safety_lease
+        assessment = snapshot.assessment
+        observed_at = assessment.safety_observed_at
+        observation_seq = assessment.safety_observation_seq
+        fingerprint = assessment.safety_evidence_fingerprint
+        if not (
+            assessment.safety_reasons
+            and lease is not None
+            and fingerprint
+            and observation_seq is not None
+            and observed_at is not None
+            and observed_at <= snapshot.captured_at
+            and snapshot.captured_at - observed_at
+            <= self.policy.max_safety_observation_age
+        ):
+            return False
+        same_evidence = bool(
+            fingerprint == lease.evidence_fingerprint
+            and observation_seq == lease.observation_seq
+            and observed_at == lease.observed_at
+        )
+        return same_evidence or self._safety_evidence_is_fresh_successor(
+            snapshot,
+            lease,
+        )
+
     def _exit_active(
         self,
         snapshot: SymbolSnapshot,
@@ -1710,27 +2383,44 @@ class FuturesRecoveryDecisionEngine:
             baseline=state.baseline_profile.fields,
             action_id=ActionId.NOOP,
         )
-        open_order_ids = (
-            tuple(dict.fromkeys(snapshot.action_lease_open_order_ids))
-            if state.action_lease is not None
-            else ()
-        )
+        if (
+            state.active_action is ActionId.RUNNER_RECOVER
+            and state.action_lease is None
+            and state.pending_effect_stage is EffectStage.NONE
+            and state.desired_profile.digest == profile.digest
+        ):
+            next_state = replace(
+                state,
+                document_revision=state.document_revision + 1,
+                desired_profile=profile,
+                phase=RecoveryPhase.COOLDOWN,
+                reasons=tuple(dict.fromkeys((*state.reasons, reason))),
+                issued_at=None,
+                progress_deadline_at=None,
+                hard_expires_at=None,
+                cooldown_until=now + self.policy.cooldown,
+                pending_effect_stage=EffectStage.NONE,
+                pending_effect_epoch=None,
+                last_round_id=round_id,
+            )
+            return self._round_plan(
+                next_state,
+                round_id,
+                mode=ActionMode.EXIT,
+                effect_stage=EffectStage.NONE,
+                liveness_status="recovering",
+            )
         cleanup = None
         phase = RecoveryPhase.RESTORING
         effect = EffectStage.NONE
-        if state.action_lease is not None and (
-            state.action_lease.activated_at is not None or open_order_ids
-        ):
-            if state.decision_id is None:
-                raise ValueError("leased action has no decision_id")
-            needs_manifest_rebuild = (
-                not open_order_ids or not snapshot.exchange_observation_available
+        if _state_requires_managed_order_cleanup(state):
+            source_manifest = _managed_order_manifest_for_state(
+                state,
+                snapshot.managed_order_manifest,
             )
+            needs_manifest_rebuild = not source_manifest.orders
             cleanup = CleanupObligation(
-                source_action_id=state.active_action,
-                source_decision_id=state.decision_id,
-                action_lease_epoch=state.action_lease.epoch,
-                open_order_ids=open_order_ids,
+                managed_order_manifest=source_manifest,
                 needs_manifest_rebuild=needs_manifest_rebuild,
                 created_at=now,
                 attempt_count=1,
@@ -1742,6 +2432,8 @@ class FuturesRecoveryDecisionEngine:
                 if needs_manifest_rebuild
                 else EffectStage.MANAGED_GTX_CANCEL
             )
+        else:
+            effect = EffectStage.RUNNER_RESTART
         effect_epoch = state.effect_epoch
         pending_effect_epoch = None
         if effect is not EffectStage.NONE:
@@ -1754,7 +2446,12 @@ class FuturesRecoveryDecisionEngine:
             desired_profile=profile,
             desired_runner_state="running",
             phase=phase,
-            action_lease=(state.action_lease if cleanup is not None else None),
+            action_lease=(
+                state.action_lease
+                if cleanup is not None
+                and cleanup.source_action_id is ActionId.TEMPORARY_LOSS_RELIEF
+                else None
+            ),
             safety_lease=(
                 state.safety_lease
                 if state.active_action is ActionId.SAFETY_CONVERGE
@@ -1830,7 +2527,12 @@ class FuturesRecoveryDecisionEngine:
         ):
             successor = state.cleanup_successor_action
             successor_expired = bool(
-                successor not in {None, ActionId.TERMINAL_STOP}
+                successor
+                not in {
+                    None,
+                    ActionId.TERMINAL_HANDOFF,
+                    ActionId.TERMINAL_STOP,
+                }
                 and (
                     (
                         state.progress_deadline_at is not None
@@ -1883,6 +2585,7 @@ class FuturesRecoveryDecisionEngine:
                         safety_lease=safety_lease,
                     )
                     generation += 1
+                    effect = EffectStage.RUNNER_RESTART
                     hard_expires_at = safety_lease.hard_expires_at
                     progress_deadline_at = now + self.policy.action_progress_timeout
                     liveness_status = "recovering"
@@ -1891,7 +2594,7 @@ class FuturesRecoveryDecisionEngine:
                     liveness_status = "blocked"
             elif successor_expired:
                 phase = RecoveryPhase.RESTORING
-                effect = EffectStage.NONE
+                effect = EffectStage.RUNNER_RESTART
                 progress_deadline_at = now + self.policy.restore_timeout
                 liveness_status = "recovering"
                 desired_profile = materialize_profile(
@@ -1906,7 +2609,7 @@ class FuturesRecoveryDecisionEngine:
                 )
             elif successor is None:
                 phase = RecoveryPhase.RESTORING
-                effect = EffectStage.NONE
+                effect = EffectStage.RUNNER_RESTART
                 progress_deadline_at = now + self.policy.restore_timeout
                 liveness_status = "recovering"
             elif successor is ActionId.TERMINAL_STOP:
@@ -1916,6 +2619,18 @@ class FuturesRecoveryDecisionEngine:
                 effect = EffectStage.NONE
                 progress_deadline_at = None
                 liveness_status = "terminal"
+            elif successor is ActionId.TERMINAL_HANDOFF:
+                return self._finish_terminal_handoff(
+                    state=state,
+                    round_id=round_id,
+                )
+            elif successor is ActionId.TEMPORARY_LOSS_RELIEF:
+                if state.action_lease is None:
+                    raise ValueError("temporary-loss cleanup successor has no lease")
+                phase = RecoveryPhase.SETTLING
+                effect = state.post_cleanup_effect_stage
+                progress_deadline_at = state.progress_deadline_at
+                liveness_status = "recovering"
             else:
                 phase = RecoveryPhase.ACTIVE
                 effect = state.post_cleanup_effect_stage
@@ -1933,7 +2648,11 @@ class FuturesRecoveryDecisionEngine:
                 desired_profile=desired_profile,
                 desired_runner_state=desired_runner_state,
                 phase=phase,
-                action_lease=None,
+                action_lease=(
+                    state.action_lease
+                    if phase is RecoveryPhase.SETTLING
+                    else None
+                ),
                 safety_lease=safety_lease,
                 safety_lease_epoch=safety_lease_epoch,
                 cleanup_obligation=None,
@@ -2013,6 +2732,79 @@ class FuturesRecoveryDecisionEngine:
             ),
         )
 
+    def _finish_terminal_handoff(
+        self,
+        *,
+        state: RecoveryState,
+        round_id: str,
+        reasons: tuple[str, ...] | None = None,
+        suppressed: tuple[ActionId, ...] = (),
+    ) -> RoundPlan:
+        """Release recovery ownership to an existing lifecycle drain owner.
+
+        The lifecycle owner remains solely responsible for terminal draining.
+        Recovery only closes its typed loss lease, restores the immutable
+        baseline, and returns to a rollover-safe STABLE state.
+        """
+
+        profile = materialize_profile(
+            baseline=state.baseline_profile.fields,
+            action_id=ActionId.NOOP,
+        )
+        next_state = replace(
+            state,
+            document_revision=state.document_revision + 1,
+            generation=(
+                state.generation + 1
+                if state.desired_profile.digest != profile.digest
+                else state.generation
+            ),
+            desired_profile=profile,
+            desired_runner_state="running",
+            phase=RecoveryPhase.STABLE,
+            active_action=ActionId.NOOP,
+            decision_id=None,
+            side=None,
+            order_role=None,
+            reasons=(),
+            issued_at=None,
+            progress_deadline_at=None,
+            hard_expires_at=None,
+            cooldown_until=None,
+            action_lease=None,
+            safety_lease=None,
+            cleanup_obligation=None,
+            active_episode_fingerprint=None,
+            cleanup_successor_action=None,
+            post_cleanup_effect_stage=EffectStage.NONE,
+            terminal_stop_confirmed=False,
+            pending_effect_stage=EffectStage.NONE,
+            pending_effect_epoch=None,
+            flow_clocks=_flow_clocks_for_action(
+                state.flow_clocks,
+                action_id=ActionId.TERMINAL_HANDOFF,
+                side=None,
+                order_role=None,
+            ),
+            last_round_id=round_id,
+        )
+        return RoundPlan(
+            symbol=state.symbol,
+            round_id=round_id,
+            action_id=ActionId.TERMINAL_HANDOFF,
+            mode=ActionMode.EXIT,
+            side=None,
+            order_role=None,
+            reasons=reasons if reasons is not None else state.reasons,
+            suppressed_actions=suppressed,
+            desired_profile=profile,
+            desired_runner_state="running",
+            effect_stage=EffectStage.NONE,
+            effect_epoch=None,
+            liveness_status="terminal_handoff",
+            next_state=next_state,
+        )
+
     @staticmethod
     def _cleanup_proof_valid(
         proof: CleanupProof | None,
@@ -2023,7 +2815,9 @@ class FuturesRecoveryDecisionEngine:
         return bool(
             proof is not None
             and proof.source_decision_id == obligation.source_decision_id
-            and proof.action_lease_epoch == obligation.action_lease_epoch
+            and proof.source_generation
+            == obligation.managed_order_manifest.generation
+            and proof.manifest_digest == obligation.managed_order_manifest.digest
             and not proof.remaining_order_ids
             and proof.user_trades_watermark >= 0
             and proof.observed_at >= obligation.created_at
@@ -2061,6 +2855,15 @@ class FuturesRecoveryDecisionEngine:
                 effect_stage=EffectStage.NONE,
                 liveness_status="recovering",
             )
+        if state.pending_effect_stage is not EffectStage.NONE:
+            if self._effect_receipt_matches(snapshot, state):
+                state = replace(
+                    state,
+                    pending_effect_stage=EffectStage.NONE,
+                    pending_effect_epoch=None,
+                )
+            elif state.progress_deadline_at is None or now < state.progress_deadline_at:
+                return self._retry_pending_effect(state, round_id)
         if state.progress_deadline_at is None or now < state.progress_deadline_at:
             return self._hold(state, round_id, liveness_status="recovering")
 
@@ -2286,7 +3089,20 @@ class FuturesRecoveryDecisionEngine:
                     continue
                 candidates.append(candidate)
         if not candidates and exhausted_candidates:
-            candidates.extend(exhausted_candidates)
+            # Bounded ordinary recovery actions never silently restart their
+            # exhausted tuple. Inventory and maker-flow advance to their
+            # BASELINE_TUNE successor; an exhausted BASELINE_TUNE remains
+            # visibly blocked until the episode changes or clears.
+            candidates.extend(
+                candidate
+                for candidate in exhausted_candidates
+                if candidate.action_id
+                not in {
+                    ActionId.INVENTORY_RECOVER,
+                    ActionId.MAKER_FLOW_RECOVER,
+                    ActionId.BASELINE_TUNE,
+                }
+            )
         candidates.append(
             _Candidate(ActionId.NOOP, reasons=tuple(dict.fromkeys(noop_reasons)))
         )
@@ -2361,6 +3177,7 @@ class FuturesRecoveryDecisionEngine:
             for attempt in state.exhausted_attempts
             if not (
                 attempt.action_id is selected.action_id
+                and attempt.side is selected.side
                 and attempt.order_role is selected.order_role
             )
         )

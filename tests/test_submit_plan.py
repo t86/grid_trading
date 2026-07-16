@@ -9,6 +9,7 @@ from grid_optimizer.submit_plan import (
     apply_hard_loss_rescue_entry_guard_to_actions,
     apply_loss_inventory_no_cross_entry_guard_to_actions,
     apply_loss_reduce_reentry_guard_to_actions,
+    apply_projected_entry_exposure_cap_to_actions,
     apply_reduce_only_no_loss_guard_to_actions,
     build_execution_actions,
     cap_reduce_only_place_orders_to_position,
@@ -25,6 +26,100 @@ from grid_optimizer.submit_plan import (
 
 
 class SubmitPlanTests(unittest.TestCase):
+    def test_projected_entry_cap_rejects_order_that_crosses_cap_from_below(self) -> None:
+        guarded = apply_projected_entry_exposure_cap_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "BUY",
+                        "position_side": "LONG",
+                        "price": 1.0,
+                        "qty": 20.0,
+                        "notional": 20.0,
+                        "role": "best_quote_entry_long",
+                    },
+                    {
+                        "side": "SELL",
+                        "position_side": "LONG",
+                        "price": 1.0,
+                        "qty": 40.0,
+                        "notional": 40.0,
+                        "role": "best_quote_reduce_long",
+                        "force_reduce_only": True,
+                    },
+                ],
+                "cancel_orders": [],
+            },
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            current_long_notional=990.0,
+            current_short_notional=0.0,
+            current_open_orders=[],
+            max_long_notional=1_000.0,
+            max_short_notional=1_000.0,
+        )
+
+        self.assertEqual(
+            [order["role"] for order in guarded["place_orders"]],
+            ["best_quote_reduce_long"],
+        )
+        self.assertEqual(
+            guarded["projected_entry_exposure_cap"]["dropped_order_count"],
+            1,
+        )
+
+    def test_projected_entry_cap_reserves_live_entries_and_accepted_places(self) -> None:
+        guarded = apply_projected_entry_exposure_cap_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "BUY",
+                        "position_side": "LONG",
+                        "price": 1.0,
+                        "qty": 40.0,
+                        "notional": 40.0,
+                        "role": "best_quote_entry_long",
+                    },
+                    {
+                        "side": "BUY",
+                        "position_side": "LONG",
+                        "price": 1.0,
+                        "qty": 1.0,
+                        "notional": 1.0,
+                        "role": "best_quote_entry_long",
+                    },
+                ],
+                "cancel_orders": [],
+            },
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            current_long_notional=900.0,
+            current_short_notional=0.0,
+            current_open_orders=[
+                {
+                    "side": "BUY",
+                    "positionSide": "LONG",
+                    "price": "1",
+                    "origQty": "60",
+                },
+            ],
+            max_long_notional=1_000.0,
+            max_short_notional=1_000.0,
+        )
+
+        self.assertEqual(
+            [order["notional"] for order in guarded["place_orders"]],
+            [40.0],
+        )
+        self.assertEqual(
+            guarded["projected_entry_exposure_cap"][
+                "reserved_long_entry_notional"
+            ],
+            100.0,
+        )
+        self.assertEqual(
+            guarded["projected_entry_exposure_cap"]["dropped_order_count"],
+            1,
+        )
+
     def test_filter_strategy_open_orders_excludes_manual_orders(self) -> None:
         result = filter_strategy_open_orders(
             [

@@ -11,8 +11,36 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from zoneinfo import ZoneInfo
 
+from grid_optimizer.futures_run_lifecycle import (
+    RUN_CONTRACT_OWNER_KEY,
+    bind_run_contract_owner,
+    validate_run_contract,
+)
+from grid_optimizer.futures_recovery_coordinator import (
+    ActionId,
+    ActionMode,
+    EffectStage,
+    FlowBlockerAssessment,
+    FuturesRecoveryDecisionEngine,
+    RecoveryPhase,
+    RecoveryState,
+    SymbolSnapshot,
+)
+from grid_optimizer.futures_recovery_store import (
+    RECOVERY_STATE_MIRROR_KEY,
+    RECOVERY_STATE_KEY,
+    RECOVERY_STATE_SCHEMA_VERSION,
+    JsonRecoveryStore,
+    RecoveryStateCorruptError,
+    decode_recovery_control_state,
+    decode_recovery_desired_profile_fields,
+    recovery_coordinator_registered,
+)
+from grid_optimizer.recovery_control_ownership import exclusive_control_lock
+
 
 BEIJING = ZoneInfo("Asia/Shanghai")
+REGISTERED_RECOVERY_DEFERRED_EXIT_CODE = 3
 
 # These fields define the durable competition baseline.  The runtime profile is
 # their sole value source; the saved runner control may only contain temporary
@@ -32,6 +60,10 @@ PROFILE_BASELINE_KEYS = (
     "max_short_position_notional",
     "max_total_notional",
     "max_actual_net_notional",
+    "terminal_drain_exit_policy",
+    "terminal_drain_absolute_loss_budget",
+    "terminal_drain_max_wait_seconds",
+    "terminal_drain_stop_preserve_reason",
     "execution_place_budget_per_cycle",
     "max_new_orders",
     "best_quote_maker_volume_allow_loss_reduce_only",
@@ -90,6 +122,119 @@ TARGET_NOTIONAL_KEYS = (
     "best_quote_maker_volume_target_remaining_notional",
     "max_cumulative_notional",
 )
+
+REGISTERED_RECOVERY_LIFECYCLE_KEYS = frozenset(
+    {
+        "run_start_time",
+        "runtime_guard_stats_start_time",
+        "run_end_time",
+        *TARGET_NOTIONAL_KEYS,
+        RUN_CONTRACT_OWNER_KEY,
+        "terminal_drain_max_order_notional",
+        "competition_window_auto_rolled_at",
+        "competition_control_profile_rebased_at",
+    }
+)
+
+
+def registered_recovery_roll_status(
+    control: dict[str, object],
+    *,
+    symbol: str,
+) -> dict[str, object] | None:
+    """Return why a coordinator-owned control cannot safely roll lifecycle."""
+
+    if not recovery_coordinator_registered(control):
+        return None
+    normalized_symbol = str(symbol or control.get("symbol") or "").upper().strip()
+    try:
+        state = decode_recovery_control_state(
+            control,
+            expected_symbol=normalized_symbol,
+        )
+    except (ValueError, RecoveryStateCorruptError) as exc:
+        return {
+            "changed": False,
+            "status": "deferred",
+            "reason": "registered_recovery_state_invalid",
+            "symbol": normalized_symbol,
+            "phase": None,
+            "stable_rebase_eligible": False,
+            "atomic_rebase_required": True,
+            "error": str(exc),
+        }
+
+    stable_rebase_eligible = bool(
+        state.phase is RecoveryPhase.STABLE
+        and state.action_lease is None
+        and state.safety_lease is None
+        and state.cleanup_obligation is None
+        and state.pending_effect_stage is EffectStage.NONE
+        and state.pending_effect_epoch is None
+    )
+    if not stable_rebase_eligible:
+        return {
+            "changed": False,
+            "status": "deferred",
+            "reason": "registered_recovery_state_not_safe_to_rebase",
+            "symbol": state.symbol,
+            "phase": state.phase.value,
+            "stable_rebase_eligible": False,
+            "atomic_rebase_required": True,
+            "recovery_generation": state.generation,
+            "recovery_document_revision": state.document_revision,
+        }
+    managed_lifecycle_fields = sorted(
+        set(state.desired_profile.fields).intersection(
+            REGISTERED_RECOVERY_LIFECYCLE_KEYS
+        )
+    )
+    if managed_lifecycle_fields:
+        return {
+            "changed": False,
+            "status": "deferred",
+            "reason": "registered_recovery_manages_lifecycle_fields",
+            "symbol": state.symbol,
+            "phase": state.phase.value,
+            "stable_rebase_eligible": True,
+            "atomic_rebase_required": True,
+            "managed_lifecycle_fields": managed_lifecycle_fields,
+            "recovery_generation": state.generation,
+            "recovery_document_revision": state.document_revision,
+        }
+    return None
+
+
+def plan_registered_roll_restart(
+    state: RecoveryState,
+    *,
+    now: datetime,
+    round_id: str,
+) -> RecoveryState:
+    """Purely stage the coordinator-owned restart for one new run contract."""
+
+    plan = FuturesRecoveryDecisionEngine().plan_round(
+        snapshot=SymbolSnapshot(
+            symbol=state.symbol,
+            captured_at=now,
+            assessment=FlowBlockerAssessment(
+                baseline_rebase_requested=True,
+            ),
+        ),
+        state=state,
+        now=now,
+        round_id=round_id,
+    )
+    if not (
+        plan.action_id is ActionId.BASELINE_REBASE
+        and plan.mode is ActionMode.ENTER
+        and plan.effect_stage is EffectStage.RUNNER_RESTART
+        and plan.next_state.pending_effect_stage is EffectStage.RUNNER_RESTART
+        and plan.next_state.document_revision == state.document_revision + 1
+        and plan.next_state.generation == state.generation + 1
+    ):
+        raise RuntimeError("registered roll did not stage one baseline rebase")
+    return plan.next_state
 
 
 def current_trade_window(now: datetime, reset_hour: int) -> tuple[datetime, datetime]:
@@ -170,6 +315,37 @@ def apply_target_notional(control: dict[str, object], *, target_notional: float 
     return changed
 
 
+def validate_rolled_control_contract(control: dict[str, object]) -> None:
+    """Reject a new competition window that has no bounded exit contract."""
+
+    validate_run_contract(
+        run_start_time=control.get("run_start_time"),
+        runtime_guard_stats_start_time=control.get("runtime_guard_stats_start_time"),
+        run_end_time=control.get("run_end_time"),
+        target_value=control.get("max_cumulative_notional"),
+        exit_policy=control.get("terminal_drain_exit_policy"),
+        loss_budget=control.get("terminal_drain_absolute_loss_budget"),
+        max_wait_seconds=control.get("terminal_drain_max_wait_seconds"),
+        preserve_reason=control.get("terminal_drain_stop_preserve_reason"),
+    )
+
+
+def bind_rolled_run_contract_owner(
+    control: dict[str, object],
+    *,
+    now: datetime,
+    handoff_reason: str | None,
+) -> tuple[dict[str, object], bool]:
+    """Freeze a rolled bounded run, requiring an explicit replacement reason."""
+
+    validate_rolled_control_contract(control)
+    return bind_run_contract_owner(
+        control,
+        activated_at=now,
+        handoff_reason=handoff_reason,
+    )
+
+
 def reset_runtime_guard_baseline(
     control: dict[str, object],
     state: dict[str, object] | None,
@@ -228,6 +404,10 @@ def main() -> None:
     parser.add_argument("--target-notional", type=float)
     parser.add_argument("--loop-state-path", type=Path)
     parser.add_argument("--reset-runtime-guard-baseline", action="store_true")
+    parser.add_argument(
+        "--run-contract-handoff-reason",
+        help="required when replacing an already-owned bounded run contract",
+    )
     parser.add_argument("--reset-hour", type=int, default=8)
     args = parser.parse_args()
     if not 0 <= args.reset_hour <= 23:
@@ -236,46 +416,160 @@ def main() -> None:
         raise SystemExit("--target-notional must be positive")
 
     control_path = args.control_path
-    control, recovered_from = load_usable_control(control_path)
-    runtime_profile: dict[str, object] | None = None
-    if args.runtime_profile is not None:
-        runtime_profile = json.loads(args.runtime_profile.read_text(encoding="utf-8"))
-        if not isinstance(runtime_profile, dict):
-            raise SystemExit("runtime profile must be a JSON object")
     now = datetime.now(BEIJING)
-    updated = roll_control_window(
-        control,
-        now=now,
-        reset_hour=args.reset_hour,
-        runtime_profile=runtime_profile,
-        force_profile_rebase=args.force_profile_rebase,
-    )
-    target_changed = apply_target_notional(updated, target_notional=args.target_notional)
-    loop_state: dict[str, object] | None = None
-    if args.loop_state_path is not None and args.loop_state_path.exists():
-        raw_state = json.loads(args.loop_state_path.read_text(encoding="utf-8"))
-        if isinstance(raw_state, dict):
-            loop_state = raw_state
-    guard_baseline_changed = False
-    loss_recovery_cleared = False
-    if args.reset_runtime_guard_baseline:
-        guard_baseline_changed, loss_recovery_cleared = reset_runtime_guard_baseline(
-            updated,
-            loop_state,
-            now=now,
+    registered_recovery_state = None
+    registered_recovery_next_state = None
+    managed_profile_changes_deferred: list[str] = []
+    with exclusive_control_lock(control_path):
+        try:
+            raw_current = json.loads(control_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raw_current = None
+        raw_registered = bool(
+            isinstance(raw_current, dict)
+            and recovery_coordinator_registered(raw_current)
         )
-    changed = (
-        updated != control
-        or recovered_from is not None
-        or target_changed
-        or guard_baseline_changed
-    )
-    if changed:
-        write_json_atomically(control_path, updated)
+        if isinstance(raw_current, dict):
+            deferred = registered_recovery_roll_status(
+                raw_current,
+                symbol=str(args.symbol),
+            )
+            if deferred is not None:
+                print(json.dumps(deferred, ensure_ascii=False))
+                raise SystemExit(REGISTERED_RECOVERY_DEFERRED_EXIT_CODE)
+
+        if raw_registered:
+            control = raw_current
+            recovered_from = None
+        else:
+            control, recovered_from = load_usable_control(control_path)
+            deferred = registered_recovery_roll_status(
+                control,
+                symbol=str(args.symbol),
+            )
+            if deferred is not None:
+                print(json.dumps(deferred, ensure_ascii=False))
+                raise SystemExit(REGISTERED_RECOVERY_DEFERRED_EXIT_CODE)
+        if recovery_coordinator_registered(control):
+            registered_recovery_state = decode_recovery_control_state(
+                control,
+                expected_symbol=str(args.symbol),
+            )
+        managed_desired_fields = (
+            {
+                key: control[key]
+                for key in registered_recovery_state.desired_profile.fields
+            }
+            if registered_recovery_state is not None
+            else {}
+        )
+
+        runtime_profile: dict[str, object] | None = None
+        if args.runtime_profile is not None:
+            runtime_profile = json.loads(
+                args.runtime_profile.read_text(encoding="utf-8")
+            )
+            if not isinstance(runtime_profile, dict):
+                raise SystemExit("runtime profile must be a JSON object")
+        updated = roll_control_window(
+            control,
+            now=now,
+            reset_hour=args.reset_hour,
+            runtime_profile=runtime_profile,
+            force_profile_rebase=args.force_profile_rebase,
+        )
+        target_changed = apply_target_notional(
+            updated,
+            target_notional=args.target_notional,
+        )
+        # A registered STABLE roll owns only the run lifecycle.  Runtime-profile
+        # values may be observed, but the coordinator's desired strategy fields
+        # remain value-for-value authoritative and its envelope is never rebuilt.
+        for key, desired_value in managed_desired_fields.items():
+            if key not in updated or updated[key] != desired_value:
+                managed_profile_changes_deferred.append(key)
+                updated[key] = desired_value
+        managed_profile_changes_deferred.sort()
+        try:
+            validate_rolled_control_contract(updated)
+        except ValueError as exc:
+            raise SystemExit(f"invalid rolled run contract: {exc}") from exc
+        loop_state: dict[str, object] | None = None
+        if (
+            registered_recovery_state is None
+            and args.loop_state_path is not None
+            and args.loop_state_path.exists()
+        ):
+            raw_state = json.loads(args.loop_state_path.read_text(encoding="utf-8"))
+            if isinstance(raw_state, dict):
+                loop_state = raw_state
+        guard_baseline_changed = False
+        loss_recovery_cleared = False
+        if args.reset_runtime_guard_baseline:
+            guard_baseline_changed, loss_recovery_cleared = reset_runtime_guard_baseline(
+                updated,
+                loop_state,
+                now=now,
+            )
+        try:
+            updated, run_contract_owner_changed = bind_rolled_run_contract_owner(
+                updated,
+                now=now,
+                handoff_reason=args.run_contract_handoff_reason,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"invalid rolled run contract owner: {exc}") from exc
+        if registered_recovery_state is not None and run_contract_owner_changed:
+            owner = updated.get(RUN_CONTRACT_OWNER_KEY)
+            if not isinstance(owner, dict) or not owner.get("run_contract_id"):
+                raise RuntimeError("registered roll has no new run contract owner")
+            registered_recovery_next_state = plan_registered_roll_restart(
+                registered_recovery_state,
+                now=now,
+                round_id=(
+                    f"competition-roll:{registered_recovery_state.symbol}:"
+                    f"{owner['run_contract_id']}:{now.isoformat()}"
+                ),
+            )
+            recovery_envelope = {
+                "schema_version": RECOVERY_STATE_SCHEMA_VERSION,
+                "state": JsonRecoveryStore.encode_state(
+                    registered_recovery_next_state
+                ),
+            }
+            next_desired_fields = decode_recovery_desired_profile_fields(
+                recovery_envelope,
+                expected_symbol=registered_recovery_state.symbol,
+            )
+            for key in registered_recovery_state.desired_profile.fields:
+                updated.pop(key, None)
+            updated.update(next_desired_fields)
+            updated[RECOVERY_STATE_KEY] = recovery_envelope
+            updated[RECOVERY_STATE_MIRROR_KEY] = recovery_envelope
+            validated_next_state = decode_recovery_control_state(
+                updated,
+                expected_symbol=registered_recovery_state.symbol,
+            )
+            if validated_next_state != registered_recovery_next_state:
+                raise RuntimeError("registered roll recovery state changed before write")
+        changed = (
+            updated != control
+            or recovered_from is not None
+            or target_changed
+            or guard_baseline_changed
+            or run_contract_owner_changed
+        )
+        if changed:
+            write_json_atomically(control_path, updated)
     if loss_recovery_cleared and args.loop_state_path is not None and loop_state is not None:
         write_json_atomically(args.loop_state_path, loop_state)
     state_changed = False
-    if changed and args.guard_state_path is not None and args.guard_state_path.exists():
+    if (
+        registered_recovery_state is None
+        and changed
+        and args.guard_state_path is not None
+        and args.guard_state_path.exists()
+    ):
         state = json.loads(args.guard_state_path.read_text(encoding="utf-8"))
         if isinstance(state, dict):
             state_changed = clear_recovery_overlay(state, symbol=str(args.symbol).upper())
@@ -285,16 +579,51 @@ def main() -> None:
         json.dumps(
             {
                 "changed": changed,
+                "status": "applied",
                 "run_start_time": updated.get("run_start_time"),
                 "run_end_time": updated.get("run_end_time"),
                 "runtime_guard_stats_start_time": updated.get("runtime_guard_stats_start_time"),
-                "profile_rebased": bool(runtime_profile) and changed,
+                "profile_rebased": bool(runtime_profile)
+                and changed
+                and not managed_profile_changes_deferred,
+                "profile_rebase_partial": bool(runtime_profile)
+                and changed
+                and bool(managed_profile_changes_deferred),
                 "recovery_overlay_cleared": state_changed,
                 "target_notional": args.target_notional,
                 "target_changed": target_changed,
                 "runtime_guard_baseline_reset": guard_baseline_changed,
                 "runtime_guard_loss_recovery_cleared": loss_recovery_cleared,
                 "control_recovered_from": recovered_from,
+                "registered_recovery_contract_roll": (
+                    registered_recovery_state is not None
+                ),
+                "recovery_restart_scheduled": (
+                    registered_recovery_next_state is not None
+                ),
+                "recovery_managed_profile_preserved": (
+                    registered_recovery_state is not None
+                ),
+                "recovery_phase": (
+                    (
+                        registered_recovery_next_state
+                        or registered_recovery_state
+                    ).phase.value
+                    if registered_recovery_state is not None
+                    else None
+                ),
+                "recovery_effect_stage": (
+                    registered_recovery_next_state.pending_effect_stage.value
+                    if registered_recovery_next_state is not None
+                    else None
+                ),
+                "managed_profile_changes_deferred": managed_profile_changes_deferred,
+                "run_contract_owner_changed": run_contract_owner_changed,
+                "run_contract_id": (
+                    updated.get(RUN_CONTRACT_OWNER_KEY, {}).get("run_contract_id")
+                    if isinstance(updated.get(RUN_CONTRACT_OWNER_KEY), dict)
+                    else None
+                ),
             },
             ensure_ascii=False,
         )

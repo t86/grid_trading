@@ -34,6 +34,7 @@ PAUSE_BASELINES="${PAUSE_BASELINES:-}"
 LOSS_REDUCE_QUOTE_OFFSET_EXTRA_TICKS="${LOSS_REDUCE_QUOTE_OFFSET_EXTRA_TICKS:-ARXUSDT=1,OUSDT=1}"
 REQUIRE_SOFT_PRESSURE_FOR_ALLOW_LOSS_SYMBOLS="${REQUIRE_SOFT_PRESSURE_FOR_ALLOW_LOSS_SYMBOLS:-ARXUSDT}"
 ON_UNIT_ACTIVE_SEC="${ON_UNIT_ACTIVE_SEC:-1min}"
+TIMEOUT_START_SEC="${TIMEOUT_START_SEC:-45s}"
 
 if ! command -v sudo >/dev/null 2>&1; then
   echo "sudo is required for systemd installation." >&2
@@ -83,6 +84,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=${TIMEOUT_START_SEC}
 User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 WorkingDirectory=${APP_DIR}

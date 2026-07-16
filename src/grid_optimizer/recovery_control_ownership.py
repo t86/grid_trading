@@ -1,10 +1,10 @@
-"""Ownership boundary for the recovery-managed futures runners.
+"""Ownership boundary for recovery-coordinated futures runners.
 
-The recovery guard is the sole control writer for the initial managed rollout
-(ARXUSDT/OUSDT).  Other monitors may still observe these symbols, but must not
-patch their control JSON, restart their runner, or execute legacy repair code.
-An explicit owner marker lets the same contract be extended without expanding
-the default rollout set.
+Any control document containing the coordinator state envelope is explicitly
+registered, regardless of symbol or envelope validity.  Legacy monitors may
+observe it, but must not patch control, restart the runner, or execute repair
+code.  Presence is the ownership fence; envelope validation belongs solely to
+the coordinator/store path and must never fall back to a legacy actuator.
 """
 from __future__ import annotations
 
@@ -20,11 +20,17 @@ from typing import Any, Iterator
 
 RECOVERY_CONTROL_OWNER = "bq_volume_recovery_guard"
 DEFAULT_RECOVERY_MANAGED_SYMBOLS = frozenset({"ARXUSDT", "OUSDT"})
+_RECOVERY_STATE_KEY = "_futures_recovery_state"
+_RECOVERY_STATE_MIRROR_KEY = "_futures_recovery_state_mirror"
 
 
 def is_recovery_managed(symbol: str, control: dict[str, Any] | None = None) -> bool:
     """Whether only the recovery guard may actuate this symbol."""
     if str(symbol).upper().strip() in DEFAULT_RECOVERY_MANAGED_SYMBOLS:
+        return True
+    if isinstance(control, dict) and (
+        _RECOVERY_STATE_KEY in control or _RECOVERY_STATE_MIRROR_KEY in control
+    ):
         return True
     return bool(control) and str(control.get("recovery_control_owner") or "") == RECOVERY_CONTROL_OWNER
 

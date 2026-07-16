@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from grid_optimizer.futures_recovery_store import recovery_coordinator_registered
+
 
 @dataclass(frozen=True)
 class GuardTier:
@@ -223,6 +225,24 @@ def run_guard(args: argparse.Namespace) -> int:
         gross_notional = _as_float(event.get("cumulative_gross_notional"))
         cost_per_10k = (rolling_loss * 10000.0 / gross_notional) if gross_notional > 0 else 0.0
         tier = _select_tier(cost_per_10k)
+        if recovery_coordinator_registered(control):
+            row = {
+                "ts": now,
+                "symbol": symbol,
+                "status": "deferred",
+                "reason": "futures_recovery_coordinator_registered",
+                "requested_tier": tier.name,
+                "rolling_hourly_loss": rolling_loss,
+                "cumulative_gross_notional": gross_notional,
+                "cost_per_10k": cost_per_10k,
+                "changes": [],
+                "restart": False,
+                "dry_run": args.dry_run,
+                "recovery_coordinator_registered": True,
+            }
+            print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            _append_audit(audit_path, row)
+            continue
         baseline = _baseline_for(symbol, control, state)
         updated, changes = _apply_tier(control, baseline, tier)
         previous_tier = str(state.get("last_tiers", {}).get(symbol) or "")

@@ -8,27 +8,24 @@ byte-identical apart from the symbol and file paths). Run it as::
     python -m grid_optimizer.competition_target_gate --symbol ARXUSDT \
         --service grid-loop@ARXUSDT.service --workdir /home/ubuntu/wangge --enforce
 
-Behaviour (unchanged from the battle-tested server version):
+Automatic behaviour:
 
-1. Read the real day volume / wear from exchange ``userTrades``
-   (``-realized_pnl / gross_notional * 1e4`` = wear per 10k).
-2. Stop + flatten the runner when the day volume hits the target
-   (``max_cumulative_notional`` from the live control JSON) OR when volume is
-   past ``--first`` and wear is above ``--wear-stop``.
-3. Flatten ONLY the managed (non-frozen) position; frozen long/short inventory
-   is kept so a stopped runner never realizes the frozen legs at a loss.
-   A managed side is market-closed only when it is NOT underwater at the mark
-   (vs its active-ledger weighted cost). An underwater side is kept and a
-   breakeven+``--active-tp-ratio`` reduce LIMIT rests instead (``TGTTP*``
-   clientOrderId, cancelled once the runner is active again), so a trend-day
-   target stop can never realize the active book's unrealized loss.
-4. Rest a BUY take-profit LIMIT on the kept frozen shorts, priced so the whole
-   frozen book closes at >= ``--tp-ratio`` average profit and no individual lot
-   is underwater at the fill (``min_entry`` guard). The runner cancels this
-   ``FROZENTP*`` order on its next active cycle.
+1. Validate one immutable run contract before reading exchange state.
+2. Read volume / wear from exchange ``userTrades`` only for that contract's
+   half-open window (``-realized_pnl / gross_notional * 1e4`` = wear per 10k).
+3. When the run-window volume hits ``max_cumulative_notional``, or the wear
+   limit is breached, atomically persist a symbol-scoped ``lifecycle_drain``
+   intent bound to the same contract digest.
+4. Never stop/restart the runner, cancel exchange orders or submit close orders.
+   The loop runner is the sole owner that consumes the intent and executes its
+   maker-only terminal-drain state machine.
 
-A per-symbol ``<symbol>_target_gate_done_YYYYMMDD.flag`` under ``output/``
-prevents repeating the stop/flatten within the same UTC day.
+``--place-tp-now`` remains an explicit manual maintenance command.  It is not
+part of the automatic target/wear enforcement path.
+
+Legacy ``<symbol>_target_gate_done_YYYYMMDD.flag`` files are still observed for
+backward compatibility.  New automatic runs use the idempotent terminal-intent
+file instead and do not create a done marker.
 """
 from __future__ import annotations
 
@@ -36,6 +33,7 @@ import argparse
 import json
 import math
 import os
+import shlex
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -50,10 +48,23 @@ from .data import (
     post_futures_market_order,
     post_futures_order,
 )
-from .monitor import summarize_user_trades
+from .futures_run_lifecycle import (
+    resolve_authoritative_run_contract,
+    run_contract_identity_from_config,
+    run_contract_snapshot_from_config,
+    validate_run_contract,
+)
+from .futures_terminal_ownership import terminal_intent_id
+from .futures_trade_window import fetch_exact_futures_trade_window
+from .recovery_control_ownership import exclusive_control_lock
 
 FROZEN_TP_PREFIX = "FROZENTP"
 ACTIVE_TP_PREFIX = "TGTTP"
+LIFECYCLE_INTENT_SCHEMA = "futures_lifecycle_intent_v2"
+LIFECYCLE_INTENT_SOURCE = "competition_target_gate"
+LIFECYCLE_INTENT_COMPLETED_STATUSES = frozenset(
+    {"completed", "stopped_clean", "stopped_preserved"}
+)
 
 
 def _now() -> datetime:
@@ -67,28 +78,111 @@ def _truncate_step(qty: float, step: float) -> float:
     return math.floor(qty / step) * step
 
 
-def daily_vol_wear(sym: str, k: str, s: str) -> tuple[float, float]:
-    """Return (day gross notional, day wear per 10k) from exchange userTrades."""
-    now = _now()
-    start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-    cur = int(start.timestamp() * 1000)
-    trades: list[dict[str, Any]] = []
-    seen: set[Any] = set()
-    pages = 0
-    while pages < 80:
-        pages += 1
-        batch = fetch_futures_user_trades(symbol=sym, api_key=k, api_secret=s, start_time_ms=cur, limit=1000)
-        new = [t for t in batch if t.get("id") not in seen]
-        for t in new:
-            seen.add(t.get("id"))
-        trades += new
-        if len(batch) < 1000 or not new:
-            break
-        cur = max(int(t.get("time", 0)) for t in batch)
-    su = summarize_user_trades(trades)
-    v = su["gross_notional"]
-    r = su["realized_pnl"]
-    return v, ((-r / v * 1e4) if v > 0 else 0.0)
+def daily_vol_wear(
+    sym: str,
+    k: str,
+    s: str,
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    now: datetime | None = None,
+) -> dict[str, float | int | str]:
+    """Return deduplicated exchange truth for one immutable run window."""
+
+    if window_start.tzinfo is None or window_start.utcoffset() is None:
+        raise ValueError("window_start must include timezone information")
+    if window_end.tzinfo is None or window_end.utcoffset() is None:
+        raise ValueError("window_end must include timezone information")
+    start = window_start.astimezone(timezone.utc)
+    end = window_end.astimezone(timezone.utc)
+    if start >= end:
+        raise ValueError("window_start must be earlier than window_end")
+    observed_at = (now or _now()).astimezone(timezone.utc)
+    query_end = min(observed_at, end)
+    start_ms = int(start.timestamp() * 1000)
+    end_exclusive_ms = int(query_end.timestamp() * 1000)
+    if end_exclusive_ms <= start_ms:
+        return {
+            "gross_notional": 0.0,
+            "realized_pnl": 0.0,
+            "wear_per_10k": 0.0,
+            "trade_count": 0,
+            "window_start": start.isoformat(),
+            "window_end": end.isoformat(),
+            "query_end": query_end.isoformat(),
+        }
+
+    trades = fetch_exact_futures_trade_window(
+        fetch_page=lambda range_start_ms, range_end_inclusive_ms, limit: (
+            fetch_futures_user_trades(
+                symbol=sym,
+                api_key=k,
+                api_secret=s,
+                start_time_ms=range_start_ms,
+                end_time_ms=range_end_inclusive_ms,
+                limit=limit,
+                use_cache=False,
+            )
+        ),
+        start_time_ms=start_ms,
+        end_time_exclusive_ms=end_exclusive_ms,
+        page_limit=1000,
+        max_requests=80,
+    )
+    gross = 0.0
+    realized_pnl = 0.0
+    for trade in trades:
+        try:
+            if "quoteQty" in trade:
+                quote_notional = float(trade["quoteQty"])
+            elif "quote_qty" in trade:
+                quote_notional = float(trade["quote_qty"])
+            else:
+                quote_notional = 0.0
+            if abs(quote_notional) <= 0.0:
+                price_raw = trade.get("price")
+                quantity_raw = (
+                    trade.get("qty")
+                    if "qty" in trade
+                    else trade.get("quantity")
+                )
+                if (
+                    price_raw is None
+                    or price_raw == ""
+                    or quantity_raw is None
+                    or quantity_raw == ""
+                ):
+                    raise ValueError("exchange trade notional is missing")
+                price = float(price_raw)
+                quantity = float(quantity_raw)
+                if price <= 0.0 or abs(quantity) <= 0.0:
+                    raise ValueError("exchange trade notional is missing")
+                quote_notional = price * quantity
+            if "realizedPnl" in trade:
+                trade_realized = float(trade["realizedPnl"])
+            elif "realized_pnl" in trade:
+                trade_realized = float(trade["realized_pnl"])
+            else:
+                raise ValueError("exchange trade realizedPnl is required")
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, ValueError) and str(exc).startswith("exchange trade"):
+                raise
+            raise ValueError("exchange trade numeric field is invalid") from exc
+        if not math.isfinite(quote_notional) or not math.isfinite(trade_realized):
+            raise ValueError("exchange trade numeric field must be finite")
+        if abs(quote_notional) <= 0.0:
+            raise ValueError("exchange trade notional must be positive")
+        gross += abs(quote_notional)
+        realized_pnl += trade_realized
+    return {
+        "gross_notional": gross,
+        "realized_pnl": realized_pnl,
+        "wear_per_10k": (-realized_pnl / gross * 1e4) if gross > 0 else 0.0,
+        "trade_count": len(trades),
+        "window_start": start.isoformat(),
+        "window_end": end.isoformat(),
+        "query_end": query_end.isoformat(),
+    }
 
 
 def _frozen_short_lots(workdir: str, slug: str) -> list[tuple[float, float]]:
@@ -248,18 +342,232 @@ def _read_frozen_from_plan(workdir: str, slug: str, plan_json: str) -> tuple[flo
 
 
 def evaluate_triggers(
-    vol: float, wear: float, target: float, first: float, wear_stop: float
+    vol: float,
+    wear: float,
+    target: float,
+    first: float | None,
+    wear_stop: float | None,
 ) -> tuple[bool, bool, bool]:
     """Return (target_ok, hit_target, hit_wear).
 
     ``target_ok`` is False for a missing/zero/negative target; in that case
-    ``hit_target`` is forced False so a 0 target can never stop+flatten on a
-    vol>=0 read. The wear stop still fires independently once vol is past ``first``.
+    ``hit_target`` is forced False so a 0 target can never submit a drain intent
+    on a vol>=0 read.  Wear is disabled unless both immutable thresholds exist.
     """
     target_ok = target > 0
     hit_target = target_ok and vol >= target
-    hit_wear = vol >= first and wear > wear_stop
+    hit_wear = (
+        first is not None
+        and wear_stop is not None
+        and vol >= first
+        and wear > wear_stop
+    )
     return target_ok, hit_target, hit_wear
+
+
+def _terminal_intent_path(workdir: str, slug: str) -> Path:
+    return Path(workdir) / "output" / f"{slug}_terminal_intent.json"
+
+
+def _intent_id(*, symbol: str, trigger_reason: str, run_contract_id: str) -> str:
+    """Build a retry-stable identity for one immutable run contract."""
+    return terminal_intent_id(
+        symbol=symbol,
+        source=LIFECYCLE_INTENT_SOURCE,
+        trigger_reason=trigger_reason,
+        run_contract_id=run_contract_id,
+    )
+
+
+_RUN_CONTRACT_ARG_FIELDS = {
+    "--symbol": "symbol",
+    "--strategy-profile": "strategy_profile",
+    "--strategy-mode": "strategy_mode",
+    "--per-order-notional": "per_order_notional",
+    "--run-start-time": "run_start_time",
+    "--run-end-time": "run_end_time",
+    "--runtime-guard-stats-start-time": "runtime_guard_stats_start_time",
+    "--max-cumulative-notional": "max_cumulative_notional",
+    "--lifecycle-wear-stop-per-10k": "lifecycle_wear_stop_per_10k",
+    "--lifecycle-wear-stop-min-gross-notional": (
+        "lifecycle_wear_stop_min_gross_notional"
+    ),
+    "--terminal-drain-exit-policy": "terminal_drain_exit_policy",
+    "--terminal-drain-absolute-loss-budget": "terminal_drain_absolute_loss_budget",
+    "--terminal-drain-max-wait-seconds": "terminal_drain_max_wait_seconds",
+    "--terminal-drain-stop-preserve-reason": "terminal_drain_stop_preserve_reason",
+    "--terminal-drain-max-order-notional": "terminal_drain_max_order_notional",
+    "--terminal-drain-loss-lease-seconds": "terminal_drain_loss_lease_seconds",
+    "--terminal-drain-order-reprice-seconds": "terminal_drain_order_reprice_seconds",
+    "--terminal-drain-flat-confirm-cycles": "terminal_drain_flat_confirm_cycles",
+}
+
+
+def _run_contract_config_from_command(args_text: str) -> dict[str, Any]:
+    tokens = shlex.split(str(args_text or ""))
+    if "grid_optimizer.loop_runner" not in tokens:
+        raise ValueError("live process is not grid_optimizer.loop_runner")
+    config: dict[str, Any] = {}
+    index = 0
+    while index < len(tokens):
+        field = _RUN_CONTRACT_ARG_FIELDS.get(tokens[index])
+        if field is None or index + 1 >= len(tokens):
+            index += 1
+            continue
+        config[field] = tokens[index + 1]
+        index += 2
+    return config
+
+
+def load_live_runner_contract(*, workdir: str, slug: str) -> str:
+    """Read the contract from the actual loop process, never from saved control."""
+
+    output_dir = Path(workdir) / "output"
+    pid_candidates = [
+        output_dir / f"{slug}_loop_runner.pid",
+        output_dir / "night_loop_runner.pid",
+    ]
+    pid = 0
+    for pid_path in pid_candidates:
+        try:
+            pid = int(pid_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        if pid > 0:
+            break
+    if pid <= 0:
+        raise ValueError("live runner pid is unavailable")
+    proc = subprocess.run(
+        ["ps", "-ww", "-p", str(pid), "-o", "args="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0 or not str(proc.stdout or "").strip():
+        raise ValueError("live runner command is unavailable")
+    config = _run_contract_config_from_command(str(proc.stdout).strip().splitlines()[-1])
+    return run_contract_identity_from_config(config)
+
+
+def _parse_intent_timestamp(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _completed_intent_belongs_to_older_run(
+    existing: dict[str, Any],
+    *,
+    run_contract_id: str,
+    run_start_time: str | None,
+) -> bool:
+    if existing.get("status") not in LIFECYCLE_INTENT_COMPLETED_STATUSES:
+        return False
+    existing_contract_id = str(existing.get("run_contract_id") or "").strip()
+    if existing_contract_id:
+        return existing_contract_id != run_contract_id
+    requested_at = _parse_intent_timestamp(existing.get("requested_at"))
+    current_start = _parse_intent_timestamp(run_start_time)
+    return bool(requested_at and current_start and requested_at < current_start)
+
+
+def _archive_completed_intent(path: Path, existing: dict[str, Any]) -> None:
+    history_dir = path.parent / "terminal_intent_history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    intent_id = str(existing.get("intent_id") or "unknown")
+    safe_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in intent_id)
+    archive_path = history_dir / f"{safe_id or 'unknown'}.json"
+    os.replace(path, archive_path)
+
+
+def submit_lifecycle_intent(
+    *,
+    workdir: str,
+    symbol: str,
+    trigger_reason: str,
+    requested_at: str,
+    observed: dict[str, Any],
+    run_contract_config: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Atomically persist an idempotent terminal-drain intent.
+
+    Returns ``(intent, created)``.  An existing valid intent is never overwritten:
+    its owner/consumer must finish and archive it before another run contract can
+    claim the symbol.
+    """
+    slug = symbol.lower()
+    path = _terminal_intent_path(workdir, slug)
+    run_contract_snapshot, run_contract_id = resolve_authoritative_run_contract(
+        run_contract_config,
+        expected_symbol=symbol,
+    )
+    if run_contract_snapshot.get("symbol") != symbol:
+        raise ValueError("lifecycle intent symbol does not match run contract")
+    run_start_time = str(run_contract_snapshot.get("run_start_time") or "") or None
+
+    def load_existing() -> dict[str, Any]:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(existing, dict):
+            raise ValueError(f"invalid lifecycle intent payload: {path}")
+        if (
+            existing.get("schema") != LIFECYCLE_INTENT_SCHEMA
+            or existing.get("symbol") != symbol
+            or existing.get("action") != "lifecycle_drain"
+        ):
+            raise ValueError(f"conflicting lifecycle intent: {path}")
+        return existing
+
+    intent: dict[str, Any] = {
+        "schema": LIFECYCLE_INTENT_SCHEMA,
+        "intent_id": _intent_id(
+            symbol=symbol,
+            trigger_reason=trigger_reason,
+            run_contract_id=run_contract_id,
+        ),
+        "symbol": symbol,
+        "source": LIFECYCLE_INTENT_SOURCE,
+        "action": "lifecycle_drain",
+        "trigger_reason": trigger_reason,
+        "requested_at": requested_at,
+        "status": "pending",
+        "exit_policy": "use_immutable_run_contract",
+        "run_contract_id": run_contract_id,
+        "run_contract_snapshot": run_contract_snapshot,
+        "observed": observed,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with exclusive_control_lock(path):
+        if path.exists():
+            existing = load_existing()
+            if _completed_intent_belongs_to_older_run(
+                existing,
+                run_contract_id=run_contract_id,
+                run_start_time=run_start_time,
+            ):
+                _archive_completed_intent(path, existing)
+            else:
+                return existing, False
+
+        temp_path = path.with_name(
+            f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        try:
+            with temp_path.open("x", encoding="utf-8") as handle:
+                json.dump(intent, handle, sort_keys=True, separators=(",", ":"))
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(temp_path, path)
+        finally:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+    return intent, True
 
 
 def confirm_stopped(service: str, retries: int = 6, delay: float = 1.0) -> bool:
@@ -283,10 +591,24 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--symbol", required=True)
     ap.add_argument("--service", required=True)
     ap.add_argument("--workdir", required=True)
-    ap.add_argument("--target", type=float, default=0.0,
-                    help="Fallback target; overridden by the live control max_cumulative_notional.")
-    ap.add_argument("--wear-stop", type=float, default=2.0)
-    ap.add_argument("--first", type=float, default=75000.0)
+    ap.add_argument(
+        "--target",
+        type=float,
+        default=0.0,
+        help="Deprecated report-only input; enforcement always uses the live immutable run contract.",
+    )
+    ap.add_argument(
+        "--wear-stop",
+        type=float,
+        default=None,
+        help="Deprecated report-only input; immutable runner control is authoritative.",
+    )
+    ap.add_argument(
+        "--first",
+        type=float,
+        default=None,
+        help="Deprecated report-only input; immutable runner control is authoritative.",
+    )
     ap.add_argument("--qty-step", type=float, default=1.0,
                     help="Symbol lot step; the frozen-short TP qty is truncated to it.")
     ap.add_argument("--plan-json", default=None,
@@ -305,25 +627,25 @@ def main() -> None:
     a = build_parser().parse_args()
     sym = a.symbol.upper()
     slug = sym.lower()
-    plan_json = a.plan_json or f"output/{slug}_loop_latest_plan.json"
     k = os.environ["BINANCE_API_KEY"]
     s = os.environ["BINANCE_API_SECRET"]
 
-    # Target tracks the runner max_cumulative_notional (daily_reset updates it each day),
-    # so today/tomorrow target changes flow from the config without editing this cron.
-    # config_ok distinguishes "read the config and target is 0/negative" from "could not read
-    # the config at all" -- either way we must NOT treat a 0 target as an instant stop trigger.
+    # The saved control is the only source of the immutable target window and
+    # exit contract.  CLI target fallback is intentionally not an enforcement
+    # authority because it cannot identify which run owns the observed volume.
     config_ok = False
+    cfg: dict[str, Any] = {}
     try:
-        cfg = json.load(open(os.path.join(a.workdir, "output", f"{slug}_loop_runner_control.json")))
+        loaded_cfg = json.load(open(os.path.join(a.workdir, "output", f"{slug}_loop_runner_control.json")))
+        if not isinstance(loaded_cfg, dict):
+            raise ValueError("runner control must be a JSON object")
+        cfg = loaded_cfg
         config_ok = True
-        ct = float(cfg.get("max_cumulative_notional") or 0)
-        if ct > 0:
-            a.target = ct
     except Exception:
         config_ok = False
 
-    ts = _now().isoformat()
+    now = _now()
+    ts = now.isoformat()
 
     # Manual: rest the frozen-short TP for an already-stopped runner, then exit.
     if a.place_tp_now:
@@ -334,116 +656,242 @@ def main() -> None:
         print(json.dumps({"ts": ts, "place_tp_now": info}))
         return
 
-    # Once the runner is back up it manages frozen itself -> clean up any stale resting TP.
-    # dry-run must have NO exchange side effects, so only cancel under --enforce.
-    alive = subprocess.run(
-        ["systemctl", "is-active", a.service], capture_output=True, text=True
-    ).stdout.strip() == "active"
-    if a.enforce and alive:
-        try:
-            c = cancel_frozen_tp(sym, k, s)
-            if c:
-                print(json.dumps({"ts": ts, "frozen_tp_canceled": c}))
-        except Exception:
-            pass
-
-    done_marker = os.path.join(
-        a.workdir, "output", f"{slug}_target_gate_done_{_now().strftime('%Y%m%d')}.flag"
-    )
-    if os.path.exists(done_marker):
-        print(json.dumps({"ts": ts, "skip": "already_done_today"}))
+    if not config_ok:
+        print(
+            json.dumps(
+                {
+                    "ts": ts,
+                    "target": 0.0,
+                    "hit_target": False,
+                    "hit_wear": False,
+                    "enforce": a.enforce,
+                    "action": "LIFECYCLE_INTENT_REJECTED",
+                    "config_error": "missing_config",
+                }
+            )
+        )
         return
 
-    # A missing/zero target must never fire the gate: a 0 target with vol>=0 would stop+flatten
-    # on every run. Require a positive target (report config_error otherwise); wear-stop still
-    # works independently once volume is past --first.
-    vol, wear = daily_vol_wear(sym, k, s)
-    target_ok, hit_target, hit_wear = evaluate_triggers(vol, wear, a.target, a.first, a.wear_stop)
+    try:
+        run_contract = validate_run_contract(
+            run_start_time=cfg.get("run_start_time"),
+            runtime_guard_stats_start_time=cfg.get(
+                "runtime_guard_stats_start_time"
+            ),
+            run_end_time=cfg.get("run_end_time"),
+            target_value=cfg.get("max_cumulative_notional"),
+            exit_policy=cfg.get("terminal_drain_exit_policy"),
+            loss_budget=cfg.get("terminal_drain_absolute_loss_budget"),
+            max_wait_seconds=cfg.get("terminal_drain_max_wait_seconds"),
+            preserve_reason=cfg.get("terminal_drain_stop_preserve_reason"),
+            wear_stop_per_10k=cfg.get("lifecycle_wear_stop_per_10k"),
+            wear_stop_min_gross_notional=cfg.get(
+                "lifecycle_wear_stop_min_gross_notional"
+            ),
+        )
+        if (
+            run_contract.runtime_guard_stats_start_time is None
+            or run_contract.run_end_time is None
+        ):
+            raise ValueError(
+                "target/wear gate requires runtime_guard_stats_start_time and run_end_time"
+            )
+    except ValueError as exc:
+        print(
+            json.dumps(
+                {
+                    "ts": ts,
+                    "target": a.target,
+                    "hit_target": False,
+                    "hit_wear": False,
+                    "enforce": a.enforce,
+                    "action": "LIFECYCLE_INTENT_REJECTED",
+                    "config_error": "invalid_run_contract",
+                    "error": str(exc),
+                }
+            )
+        )
+        return
+
+    try:
+        authoritative_snapshot, control_contract_id = (
+            resolve_authoritative_run_contract(
+                cfg,
+                expected_symbol=sym,
+            )
+        )
+    except ValueError as exc:
+        print(
+            json.dumps(
+                {
+                    "ts": ts,
+                    "target": a.target,
+                    "hit_target": False,
+                    "hit_wear": False,
+                    "enforce": a.enforce,
+                    "action": "LIFECYCLE_INTENT_REJECTED",
+                    "config_error": "invalid_run_contract_owner",
+                    "error": str(exc),
+                }
+            )
+        )
+        return
+
+    # Rebuild all enforcement terms from the owner's canonical snapshot. CLI
+    # wear inputs remain accepted only so old scripts do not fail to parse.
+    run_contract = validate_run_contract(
+        run_start_time=authoritative_snapshot.get("run_start_time"),
+        runtime_guard_stats_start_time=authoritative_snapshot.get(
+            "runtime_guard_stats_start_time"
+        ),
+        run_end_time=authoritative_snapshot.get("run_end_time"),
+        target_value=authoritative_snapshot.get("max_cumulative_notional"),
+        exit_policy=authoritative_snapshot.get("terminal_drain_exit_policy"),
+        loss_budget=authoritative_snapshot.get(
+            "terminal_drain_absolute_loss_budget"
+        ),
+        max_wait_seconds=authoritative_snapshot.get(
+            "terminal_drain_max_wait_seconds"
+        ),
+        preserve_reason=authoritative_snapshot.get(
+            "terminal_drain_stop_preserve_reason"
+        ),
+        wear_stop_per_10k=authoritative_snapshot.get(
+            "lifecycle_wear_stop_per_10k"
+        ),
+        wear_stop_min_gross_notional=authoritative_snapshot.get(
+            "lifecycle_wear_stop_min_gross_notional"
+        ),
+    )
+    a.target = float(run_contract.target_value or 0.0)
+    wear_stop = run_contract.wear_stop_per_10k
+    wear_first = run_contract.wear_stop_min_gross_notional
+
+    try:
+        window_stats = daily_vol_wear(
+            sym,
+            k,
+            s,
+            window_start=run_contract.runtime_guard_stats_start_time,
+            window_end=run_contract.run_end_time,
+            now=now,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        print(
+            json.dumps(
+                {
+                    "ts": ts,
+                    "target": a.target,
+                    "hit_target": False,
+                    "hit_wear": False,
+                    "enforce": a.enforce,
+                    "action": "LIFECYCLE_INTENT_REJECTED",
+                    "config_error": "trade_query_incomplete",
+                    "run_contract_id": control_contract_id,
+                    "error": str(exc),
+                }
+            )
+        )
+        return
+
+    vol = float(window_stats["gross_notional"])
+    wear = float(window_stats["wear_per_10k"])
+    target_ok, hit_target, hit_wear = evaluate_triggers(
+        vol,
+        wear,
+        a.target,
+        wear_first,
+        wear_stop,
+    )
     status: dict[str, Any] = {
         "ts": ts, "vol": round(vol, 0), "wear": round(wear, 2), "target": a.target,
         "hit_target": hit_target, "hit_wear": hit_wear, "enforce": a.enforce,
+        "run_contract_id": control_contract_id,
+        "window_start": window_stats["window_start"],
+        "window_end": window_stats["window_end"],
+        "query_end": window_stats["query_end"],
+        "trade_count": int(window_stats["trade_count"]),
+        "realized_pnl": float(window_stats["realized_pnl"]),
+        "remaining_target": max(float(a.target) - vol, 0.0),
     }
-    if not target_ok:
+    if not target_ok and wear_stop is None:
         status["config_error"] = "missing_config" if not config_ok else "non_positive_target"
     if not (hit_target or hit_wear):
         print(json.dumps(status))
         return
     status["trigger"] = "target" if hit_target else "wear"
     if not a.enforce:
-        status["action"] = "DRY_RUN_would_stop_flatten"
+        status["action"] = "DRY_RUN_would_submit_lifecycle_intent"
         print(json.dumps(status))
         return
 
-    # 1. stop runner -- and CONFIRM it is inactive before touching orders/positions. If the stop
-    #    fails or the service is still active, abort without cancelling or flattening anything.
-    stop_rc = subprocess.run(["sudo", "-n", "systemctl", "stop", a.service], capture_output=True).returncode
-    if not confirm_stopped(a.service):
-        status["action"] = "ABORTED_STOP_FAILED"
-        status["stop_rc"] = stop_rc
+    try:
+        live_contract_id = load_live_runner_contract(workdir=a.workdir, slug=slug)
+    except (OSError, TypeError, ValueError) as exc:
+        status.update(
+            {
+                "action": "LIFECYCLE_INTENT_REJECTED",
+                "config_error": "live_run_contract_unavailable",
+                "error": str(exc),
+            }
+        )
         print(json.dumps(status))
         return
-    status["stop_rc"] = stop_rc
-    # 2. read frozen inventory to keep; only flatten managed/non-frozen position.
-    frozen_long, frozen_short = _read_frozen_from_plan(a.workdir, slug, plan_json)
-    # 3. cancel open orders
-    oo = fetch_futures_open_orders(sym, k, s)
-    for o in oo:
-        try:
-            delete_futures_order(symbol=sym, order_id=int(o.get("orderId")), api_key=k, api_secret=s)
-        except Exception:
-            pass
-    # 4. handle managed only; preserve frozen long/short inventory. A side in profit at the
-    #    mark is market-closed (old behaviour); an underwater side keeps its position and
-    #    rests a breakeven+active_tp_ratio reduce LIMIT so the stop never realizes its loss.
-    pos = fetch_futures_position_risk_v3(symbol=sym, api_key=k, api_secret=s, contract_type="usdm")
-    rows = {x.get("positionSide"): x for x in pos}
-    lo = float((rows.get("LONG") or {}).get("positionAmt", 0) or 0)
-    sh = -float((rows.get("SHORT") or {}).get("positionAmt", 0) or 0)  # sh = short size positive
-    mark = 0.0
-    for ps in ("LONG", "SHORT"):
-        m = float((rows.get(ps) or {}).get("markPrice", 0) or 0)
-        if m > 0:
-            mark = m
-            break
-    long_wavg, short_wavg = _active_wavg(a.workdir, slug)
-    close_long = int(max(lo - frozen_long, 0))
-    close_short = int(max(sh - frozen_short, 0))
-    acted: list[str] = []
-    long_action = resolve_flatten_action("LONG", close_long, mark, long_wavg)
-    if long_action == "market":
-        post_futures_market_order(symbol=sym, side="SELL", quantity=close_long, api_key=k, api_secret=s,
-                                  position_side="LONG", new_client_order_id="tgtflatL")
-        acted.append(f"closeLONG{close_long}")
-    elif long_action == "rest_tp":
-        r = place_active_tp(sym, k, s, slug, "LONG", close_long, long_wavg,
-                            a.active_tp_ratio, a.tick, a.qty_step)
-        acted.append(f"restLONGTP{close_long}@{r.get('price')}" if r.get("placed")
-                     else f"restLONGTP_failed:{r.get('reason')}")
-        status["active_tp_long"] = r
-    short_action = resolve_flatten_action("SHORT", close_short, mark, short_wavg)
-    if short_action == "market":
-        post_futures_market_order(symbol=sym, side="BUY", quantity=close_short, api_key=k, api_secret=s,
-                                  position_side="SHORT", new_client_order_id="tgtflatS")
-        acted.append(f"closeSHORT{close_short}")
-    elif short_action == "rest_tp":
-        r = place_active_tp(sym, k, s, slug, "SHORT", close_short, short_wavg,
-                            a.active_tp_ratio, a.tick, a.qty_step)
-        acted.append(f"restSHORTTP{close_short}@{r.get('price')}" if r.get("placed")
-                     else f"restSHORTTP_failed:{r.get('reason')}")
-        status["active_tp_short"] = r
-    # 5. rest a take-profit LIMIT on the kept frozen shorts (fills automatically if price reaches
-    #    the tp-ratio line while the runner is stopped; the runner cancels it on its next active cycle).
-    tp = (
-        place_frozen_short_tp(sym, k, s, a.workdir, slug, a.tp_ratio, a.tick, a.qty_step,
-                              max_qty=frozen_short)
-        if frozen_short > 0 else {"placed": False, "reason": "no_frozen_short"}
+    if live_contract_id != control_contract_id:
+        status.update(
+            {
+                "action": "LIFECYCLE_INTENT_REJECTED",
+                "config_error": "live_run_contract_mismatch",
+                "control_run_contract_id": control_contract_id,
+                "live_run_contract_id": live_contract_id,
+            }
+        )
+        print(json.dumps(status))
+        return
+
+    observed = {
+        "gross_notional": float(vol),
+        "realized_pnl": float(window_stats["realized_pnl"]),
+        "wear_per_10k": float(wear),
+        "trade_count": int(window_stats["trade_count"]),
+        "target": float(a.target),
+        "first": wear_first,
+        "wear_stop": wear_stop,
+        "window_start": str(window_stats["window_start"]),
+        "window_end": str(window_stats["window_end"]),
+        "query_end": str(window_stats["query_end"]),
+    }
+    trigger_reason = "target_reached" if hit_target else "wear_limit_breached"
+    try:
+        intent, created = submit_lifecycle_intent(
+            workdir=a.workdir,
+            symbol=sym,
+            trigger_reason=trigger_reason,
+            requested_at=ts,
+            observed=observed,
+            run_contract_config={
+                **cfg,
+                # The resolver above is the authority.  Reattach its exact
+                # snapshot fields before the idempotent submitter revalidates.
+                **authoritative_snapshot,
+            },
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        status["action"] = "LIFECYCLE_INTENT_SUBMISSION_FAILED"
+        status["error"] = str(exc)
+        print(json.dumps(status))
+        return
+    status.update(
+        {
+            "action": (
+                "LIFECYCLE_INTENT_SUBMITTED"
+                if created
+                else "LIFECYCLE_INTENT_ALREADY_PENDING"
+            ),
+            "intent_id": intent["intent_id"],
+            "intent_path": str(_terminal_intent_path(a.workdir, slug)),
+        }
     )
-    Path(done_marker).write_text(ts, encoding="utf-8")
-    status.update({
-        "action": "STOPPED_FLATTENED_MANAGED_ONLY",
-        "frozen_long_kept": frozen_long, "frozen_short_kept": frozen_short,
-        "closed": acted, "canceled_orders": len(oo), "frozen_tp": tp,
-    })
     print(json.dumps(status))
 
 

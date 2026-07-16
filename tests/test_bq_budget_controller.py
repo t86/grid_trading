@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -33,6 +35,63 @@ class BqBudgetControllerTests(unittest.TestCase):
 
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"cycle": 2})
             self.assertEqual(len(set(replaced_sources)), 2)
+
+    def test_registered_bch_presence_fence_is_observe_only_before_any_actuator(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            workdir = Path(tmpdir)
+            output_dir = workdir / "output"
+            output_dir.mkdir()
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            original = {
+                "symbol": "BCHUSDT",
+                "best_quote_maker_volume_cycle_budget_notional": 80.0,
+                "_futures_recovery_state": None,
+            }
+            control_path.write_text(json.dumps(original), encoding="utf-8")
+            stdout = StringIO()
+            with (
+                patch.dict(
+                    budget_controller.os.environ,
+                    {"BINANCE_API_KEY": "k", "BINANCE_API_SECRET": "s"},
+                ),
+                patch.object(
+                    budget_controller,
+                    "_fetch_day_trades",
+                    side_effect=AssertionError("registered BCH fetched actuator inputs"),
+                ),
+                patch.object(
+                    budget_controller,
+                    "_write_control_json",
+                    side_effect=AssertionError("registered BCH control was written"),
+                ),
+                patch.object(
+                    budget_controller.subprocess,
+                    "run",
+                    side_effect=AssertionError("registered BCH runner was restarted"),
+                ),
+                redirect_stdout(stdout),
+            ):
+                result = budget_controller.main(
+                    [
+                        "--symbol",
+                        "BCHUSDT",
+                        "--workdir",
+                        str(workdir),
+                        "--runner-wrapper",
+                        "/unused",
+                        "--enforce",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                json.loads(stdout.getvalue())["action"],
+                "observe_only_recovery_managed_symbol",
+            )
+            self.assertEqual(
+                json.loads(control_path.read_text(encoding="utf-8")),
+                original,
+            )
 
     def test_defaults_all_tiers_to_current_runner_cycle(self) -> None:
         budgets, source = resolve_budget_tiers(

@@ -123,6 +123,28 @@ from .data import (
     read_latest_cached_close,
 )
 from .dry_run import _round_order_price, _round_order_qty
+from .futures_run_lifecycle import (
+    RUN_CONTRACT_OWNER_KEY,
+    resolve_authoritative_run_contract,
+    validate_run_contract,
+    validate_run_contract_owner,
+)
+from .futures_recovery_store import (
+    RECOVERY_STATE_KEY,
+    RECOVERY_STATE_MIRROR_KEY,
+    RecoveryStateStoreError,
+    _is_managed_recovery_key,
+    decode_recovery_control_state,
+    decode_recovery_desired_profile_fields,
+    decode_recovery_state_slots,
+    recovery_coordinator_registered,
+)
+from .futures_volume_safety_observation import (
+    build_volume_safety_observation,
+)
+from .futures_volatility_safety_observation import (
+    build_volatility_safety_observation,
+)
 from .monitor import (
     RUNNER_CONTROL_PATH,
     RUNNER_LOG_PATH,
@@ -142,6 +164,7 @@ from .maker_flatten_runner import (
     is_flatten_order,
     load_live_flatten_snapshot,
 )
+from .competition_target_gate import daily_vol_wear
 from .notifications import alert_source_label, send_alert_email
 from .optimize import min_step_ratio_for_cost, objective_value, optimize_grid_count
 from .runtime_guards import (
@@ -157,7 +180,10 @@ from .running_status import (
     _read_jsonl_tail as _read_running_status_jsonl_tail,
     normalize_running_status_server_payload,
 )
-from .recovery_control_ownership import exclusive_control_lock, write_control_json_atomically
+from .recovery_control_ownership import (
+    exclusive_control_lock,
+    write_control_json_atomically,
+)
 from .short_volume_candidates import build_short_volume_candidate_report
 from .spot_competition_tuner import (
     build_spot_competition_backtest,
@@ -4389,6 +4415,16 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "runtime_guard_loss_recovery_enabled": True,
     "rolling_hourly_loss_limit": None,
     "max_cumulative_notional": None,
+    "lifecycle_wear_stop_per_10k": None,
+    "lifecycle_wear_stop_min_gross_notional": None,
+    "terminal_drain_exit_policy": None,
+    "terminal_drain_absolute_loss_budget": None,
+    "terminal_drain_max_wait_seconds": None,
+    "terminal_drain_stop_preserve_reason": None,
+    "terminal_drain_max_order_notional": 0.0,
+    "terminal_drain_loss_lease_seconds": 300.0,
+    "terminal_drain_order_reprice_seconds": 120.0,
+    "terminal_drain_flat_confirm_cycles": 2,
     "max_actual_net_notional": None,
     "max_synthetic_drift_notional": None,
     "max_unrealized_loss": None,
@@ -5477,7 +5513,9 @@ def _load_last_runner_control_config(symbol: str) -> tuple[dict[str, Any], str]:
         raise ValueError(f"{normalized_symbol} 暂无最近运行策略配置，请先保存参数或成功启动一次策略")
 
     candidate.setdefault("symbol", normalized_symbol)
-    normalized = _normalize_runner_control_payload(candidate)
+    # A saved run is a complete historical contract.  Never fill missing run
+    # terms from a different process that happens to be active now.
+    normalized = _normalize_runner_control_payload(candidate, inherit_existing=False)
     normalized = _normalize_runner_runtime_paths(normalized, normalized_symbol)
     return _autotune_runner_symbol_config(normalized), source
 
@@ -5519,7 +5557,76 @@ def _save_runner_control_config(config: dict[str, Any], *, symbol: str | None = 
     normalized_symbol = str(symbol or config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
     control_path = _runner_control_path(normalized_symbol)
     with exclusive_control_lock(control_path):
-        write_control_json_atomically(control_path, config)
+        loaded_existing = _read_json_dict(control_path)
+        existing = loaded_existing if isinstance(loaded_existing, dict) else {}
+        candidate = dict(config)
+        existing_owner = existing.get(RUN_CONTRACT_OWNER_KEY)
+        if recovery_coordinator_registered(existing):
+            raise ValueError(
+                "registered futures recovery control changes are deferred to "
+                "the recovery coordinator"
+            )
+
+        if existing_owner is not None:
+            existing_snapshot, existing_contract_id = (
+                resolve_authoritative_run_contract(
+                    existing,
+                    expected_symbol=normalized_symbol,
+                )
+            )
+            candidate_owner = candidate.get(RUN_CONTRACT_OWNER_KEY)
+            if candidate_owner is None:
+                candidate[RUN_CONTRACT_OWNER_KEY] = existing_owner
+            if "terminal_drain_max_order_notional" not in candidate:
+                candidate["terminal_drain_max_order_notional"] = existing_snapshot[
+                    "terminal_drain_max_order_notional"
+                ]
+            try:
+                _candidate_snapshot, candidate_contract_id = (
+                    resolve_authoritative_run_contract(
+                        candidate,
+                        expected_symbol=normalized_symbol,
+                    )
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "active bounded run contract changed; explicit run contract "
+                    f"handoff is required: {exc}"
+                ) from exc
+            candidate_owner = candidate[RUN_CONTRACT_OWNER_KEY]
+            if candidate_contract_id == existing_contract_id:
+                if candidate_owner != existing_owner:
+                    raise ValueError(
+                        "active bounded run owner cannot be replaced without an "
+                        "explicit run contract handoff"
+                    )
+                candidate["terminal_drain_max_order_notional"] = existing_snapshot[
+                    "terminal_drain_max_order_notional"
+                ]
+            else:
+                validate_run_contract_owner(
+                    candidate_owner,
+                    expected_symbol=normalized_symbol,
+                )
+                if (
+                    candidate_owner.get("handoff_from_contract_id")
+                    != existing_contract_id
+                    or candidate_owner.get("generation")
+                    != int(existing_owner.get("generation", 0)) + 1
+                ):
+                    raise ValueError(
+                        "replacement run owner is not an explicit handoff from the "
+                        "active contract"
+                    )
+        elif candidate.get(RUN_CONTRACT_OWNER_KEY) is not None:
+            resolve_authoritative_run_contract(
+                candidate,
+                expected_symbol=normalized_symbol,
+            )
+
+        write_control_json_atomically(control_path, candidate)
+        config.clear()
+        config.update(candidate)
 
 
 def _is_spot_runner_control_path(path: Path) -> bool:
@@ -5548,7 +5655,9 @@ def _iter_saved_runner_control_configs() -> list[dict[str, Any]]:
         if not symbol or symbol in seen_symbols:
             continue
         try:
-            configs.append(_normalize_runner_control_payload(stored))
+            configs.append(
+                _normalize_runner_control_payload(stored, inherit_existing=False)
+            )
         except Exception:
             continue
         seen_symbols.add(symbol)
@@ -7481,6 +7590,10 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     )
 
 
+def _volume_trigger_status_path(symbol: str) -> Path:
+    return Path(f"output/{_symbol_output_slug(symbol)}_volume_trigger_status.json")
+
+
 def _volatility_trigger_status_path(symbol: str) -> Path:
     return Path(f"output/{_symbol_output_slug(symbol)}_volatility_trigger_status.json")
 
@@ -7522,8 +7635,13 @@ def _update_volume_trigger_status(symbol: str, payload: dict[str, Any]) -> None:
     normalized_symbol = str(symbol or "").upper().strip()
     if not normalized_symbol:
         return
+    normalized_payload = dict(payload)
+    _write_json_dict(
+        _volume_trigger_status_path(normalized_symbol),
+        normalized_payload,
+    )
     with VOLUME_TRIGGER_STATUS_LOCK:
-        VOLUME_TRIGGER_STATUS_CACHE[normalized_symbol] = dict(payload)
+        VOLUME_TRIGGER_STATUS_CACHE[normalized_symbol] = normalized_payload
 
 
 def _runner_volume_trigger_status(symbol: str) -> dict[str, Any] | None:
@@ -7531,8 +7649,15 @@ def _runner_volume_trigger_status(symbol: str) -> dict[str, Any] | None:
     if not normalized_symbol:
         return None
     with VOLUME_TRIGGER_STATUS_LOCK:
-        status = VOLUME_TRIGGER_STATUS_CACHE.get(normalized_symbol)
-        return dict(status) if isinstance(status, dict) else None
+        cached = VOLUME_TRIGGER_STATUS_CACHE.get(normalized_symbol)
+        if isinstance(cached, dict):
+            return dict(cached)
+    payload = _read_json_dict(_volume_trigger_status_path(normalized_symbol))
+    if isinstance(payload, dict):
+        with VOLUME_TRIGGER_STATUS_LOCK:
+            VOLUME_TRIGGER_STATUS_CACHE[normalized_symbol] = dict(payload)
+        return dict(payload)
+    return None
 
 
 def _update_volatility_trigger_status(symbol: str, payload: dict[str, Any]) -> None:
@@ -8067,7 +8192,8 @@ def _reconcile_runner_volume_trigger(config: dict[str, Any]) -> None:
     if not symbol or not normalized_config.get("volume_trigger_enabled"):
         return
 
-    checked_at = datetime.now(timezone.utc).isoformat()
+    checked_at_dt = datetime.now(timezone.utc)
+    checked_at = checked_at_dt.isoformat()
     window_key = _normalize_volume_trigger_window(normalized_config.get("volume_trigger_window"))
     window_minutes = VOLUME_TRIGGER_WINDOW_MINUTES[window_key]
     quote_volume = fetch_futures_quote_volume_sum(symbol, window_minutes=window_minutes)
@@ -8093,6 +8219,59 @@ def _reconcile_runner_volume_trigger(config: dict[str, Any]) -> None:
         "reason": decision.get("reason"),
         "last_error": None,
     }
+    if recovery_coordinator_registered(config) or recovery_coordinator_registered(
+        normalized_config
+    ):
+        status["recovery_coordinator_registered"] = True
+        status["legacy_decision"] = dict(decision)
+        status["orchestrator_observation"] = None
+        status["requested_action"] = None
+        status["actuation_deferred"] = False
+        status["action"] = None
+        stop_threshold = normalized_config.get("volume_trigger_stop_threshold")
+        try:
+            recovery_state = decode_recovery_control_state(
+                config,
+                expected_symbol=symbol,
+            )
+            _run_snapshot, run_contract_id = resolve_authoritative_run_contract(
+                config,
+                expected_symbol=symbol,
+            )
+            observation = (
+                build_volume_safety_observation(
+                    symbol=symbol,
+                    run_contract_id=run_contract_id,
+                    generation=recovery_state.generation,
+                    observed_at=checked_at_dt,
+                    window=window_key,
+                    window_minutes=window_minutes,
+                    current_quote_volume=quote_volume,
+                    stop_threshold=float(stop_threshold),
+                )
+                if stop_threshold is not None
+                else None
+            )
+        except (RecoveryStateStoreError, TypeError, ValueError) as exc:
+            observation = None
+            status["orchestrator_observation_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+        if observation is not None:
+            status["orchestrator_observation"] = observation.as_dict()
+            status["orchestrator_signal"] = {
+                "action": "entry_pause" if observation.active else None,
+                "reason": observation.reason,
+                "active": observation.active,
+            }
+            status["requested_action"] = (
+                "entry_pause" if observation.active else None
+            )
+            status["actuation_deferred"] = observation.active
+        if status["requested_action"] is not None:
+            status["reason"] = "deferred_to_futures_recovery_coordinator"
+        _update_volume_trigger_status(symbol, status)
+        return
     try:
         if decision.get("action") == "start":
             volatility_gate = _volatility_trigger_start_allowed(normalized_config)
@@ -8140,15 +8319,34 @@ def _run_volume_trigger_loop(stop_event: threading.Event) -> None:
                 _reconcile_runner_volume_trigger(config)
             except Exception as exc:  # pragma: no cover
                 symbol = str(config.get("symbol", "")).upper().strip()
+                error_status: dict[str, Any] = {
+                    "checked_at": datetime.now(timezone.utc).isoformat(),
+                    "symbol": symbol,
+                    "action": None,
+                    "reason": "error",
+                    "last_error": f"{type(exc).__name__}: {exc}",
+                }
+                if recovery_coordinator_registered(config):
+                    previous = _runner_volume_trigger_status(symbol) or {}
+                    previous_observation = previous.get(
+                        "orchestrator_observation"
+                    )
+                    if isinstance(previous_observation, dict):
+                        error_status.update(
+                            {
+                                "recovery_coordinator_registered": True,
+                                "orchestrator_observation": dict(
+                                    previous_observation
+                                ),
+                                "requested_action": previous.get(
+                                    "requested_action"
+                                ),
+                                "actuation_deferred": False,
+                            }
+                        )
                 _update_volume_trigger_status(
                     symbol,
-                    {
-                        "checked_at": datetime.now(timezone.utc).isoformat(),
-                        "symbol": symbol,
-                        "action": None,
-                        "reason": "error",
-                        "last_error": f"{type(exc).__name__}: {exc}",
-                    },
+                    error_status,
                 )
         stop_event.wait(VOLUME_TRIGGER_POLL_SECONDS)
 
@@ -8256,6 +8454,57 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
         "full_flatten_target_reached": bool(previous_status.get("full_flatten_target_reached", False)),
         "escalation_reason": previous_status.get("escalation_reason"),
     }
+    if not spot_runner and (
+        recovery_coordinator_registered(config)
+        or recovery_coordinator_registered(normalized_config)
+    ):
+        requested_action = decision.get("action")
+        status["recovery_coordinator_registered"] = True
+        status["orchestrator_signal"] = {
+            **decision,
+            "stop_cancel_open_orders": bool(
+                effective_config.get("volatility_trigger_stop_cancel_open_orders", True)
+            ),
+            "stop_close_all_positions": bool(
+                effective_config.get("volatility_trigger_stop_close_all_positions", True)
+            ),
+            "reduce_target_notional": reduce_target_notional,
+        }
+        status["requested_action"] = requested_action
+        status["actuation_deferred"] = requested_action is not None
+        status["action"] = None
+        try:
+            recovery_state = decode_recovery_control_state(
+                config,
+                expected_symbol=symbol,
+            )
+            _run_snapshot, run_contract_id = resolve_authoritative_run_contract(
+                config,
+                expected_symbol=symbol,
+            )
+            observation = build_volatility_safety_observation(
+                symbol=symbol,
+                run_contract_id=run_contract_id,
+                generation=recovery_state.generation,
+                observed_at=checked_at_dt,
+                window=window_key,
+                window_minutes=window_minutes,
+                current_amplitude_ratio=current_amplitude_ratio,
+                current_return_ratio=current_return_ratio,
+                amplitude_threshold=signal_profile.get("amplitude_threshold"),
+                abs_return_threshold=signal_profile.get("abs_return_threshold"),
+            )
+        except (RecoveryStateStoreError, TypeError, ValueError) as exc:
+            status["orchestrator_observation"] = None
+            status["orchestrator_observation_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+        else:
+            status["orchestrator_observation"] = observation.as_dict()
+        if requested_action is not None:
+            status["reason"] = "deferred_to_futures_recovery_coordinator"
+        _update_volatility_trigger_status(symbol, status)
+        return
     try:
         if decision.get("action") == "start":
             volume_gate = {"allowed": True, "reason": "disabled"}
@@ -9319,6 +9568,35 @@ def _runner_preset_map(symbol: str | None = None) -> dict[str, dict[str, Any]]:
     return merged
 
 
+def _declares_positive_run_target(config: dict[str, Any] | None) -> bool:
+    value = (config or {}).get("max_cumulative_notional")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(parsed) and parsed > 0
+
+
+def _reject_declared_run_target_clear(
+    declared_config: dict[str, Any],
+    overrides: dict[str, Any] | None,
+    *,
+    source_label: str,
+) -> None:
+    """Prevent a named target strategy from becoming silently unbounded."""
+
+    if not _declares_positive_run_target(declared_config) or not overrides:
+        return
+    if "max_cumulative_notional" not in overrides:
+        return
+    override = overrides.get("max_cumulative_notional")
+    if override is None or (isinstance(override, str) and not override.strip()):
+        raise ValueError(
+            f"{source_label} 声明了成交额目标，不能用空值清除；"
+            "如需无目标运行，必须改用明确的无目标策略配置。"
+        )
+
+
 def _runner_preset_payload(profile: str, base_config: dict[str, Any] | None = None) -> dict[str, Any]:
     normalized = str(profile or "").strip()
     requested_symbol = str((base_config or {}).get("symbol", "")).upper().strip()
@@ -9328,8 +9606,14 @@ def _runner_preset_payload(profile: str, base_config: dict[str, Any] | None = No
     if preset is None:
         raise ValueError(f"Unknown strategy_profile: {profile}")
     preset_symbol = str(preset.get("symbol", "")).upper().strip()
+    preset_config = dict(preset.get("config", {}))
+    _reject_declared_run_target_clear(
+        preset_config,
+        base_config,
+        source_label=str(preset.get("label") or normalized),
+    )
     config = dict(RUNNER_DEFAULT_CONFIG)
-    config.update(preset.get("config", {}))
+    config.update(preset_config)
     if base_config:
         config.update(base_config)
     resolved_symbol = str(config.get("symbol", "")).upper().strip()
@@ -9375,12 +9659,16 @@ def _runner_preset_summaries(symbol: str | None = None) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for key, item in _runner_preset_map(symbol).items():
         config = item.get("config", {})
+        requires_run_contract = _declares_positive_run_target(config)
         summaries.append(
             {
                 "key": key,
                 "label": item.get("label", key),
                 "description": item.get("description", ""),
                 "startable": bool(item.get("startable", True)),
+                "requires_run_contract": requires_run_contract,
+                "direct_startable": bool(item.get("startable", True))
+                and not requires_run_contract,
                 "kind": item.get("kind", "one_way"),
                 "custom": bool(item.get("custom", False)),
                 "symbol": item.get("symbol"),
@@ -9762,9 +10050,18 @@ def _delete_custom_grid_runner_preset(preset_key: str, symbol: str | None = None
     }
 
 
-def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _normalize_runner_control_payload(
+    payload: dict[str, Any],
+    *,
+    inherit_existing: bool = True,
+) -> dict[str, Any]:
     requested_symbol = str((payload or {}).get("symbol", "")).upper().strip()
-    config = _load_runner_control_config(requested_symbol or None)
+    if inherit_existing:
+        config = _load_runner_control_config(requested_symbol or None)
+    else:
+        config = dict(RUNNER_DEFAULT_CONFIG)
+        if requested_symbol:
+            config["symbol"] = requested_symbol
     if not payload:
         return config
 
@@ -10044,6 +10341,13 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "rolling_hourly_loss_per_10k_limit",
         "rolling_hourly_loss_per_10k_min_notional",
         "max_cumulative_notional",
+        "lifecycle_wear_stop_per_10k",
+        "lifecycle_wear_stop_min_gross_notional",
+        "terminal_drain_absolute_loss_budget",
+        "terminal_drain_max_wait_seconds",
+        "terminal_drain_max_order_notional",
+        "terminal_drain_loss_lease_seconds",
+        "terminal_drain_order_reprice_seconds",
         "max_actual_net_notional",
         "max_synthetic_drift_notional",
         "max_unrealized_loss",
@@ -10179,6 +10483,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "leverage",
         "maker_retries",
         "max_new_orders",
+        "terminal_drain_flat_confirm_cycles",
         "near_market_reentry_confirm_cycles",
         "auto_regime_confirm_cycles",
         "elastic_max_entry_orders_ping_pong_fast",
@@ -10318,6 +10623,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "summary_jsonl",
         "run_start_time",
         "run_end_time",
+        "terminal_drain_exit_policy",
+        "terminal_drain_stop_preserve_reason",
         "runtime_guard_stats_start_time",
         "volume_trigger_window",
         "volatility_trigger_window",
@@ -10326,6 +10633,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
     }
     json_fields = {
         "volatility_trigger_fast_windows",
+        RUN_CONTRACT_OWNER_KEY,
+        "_futures_recovery_state",
+        "_futures_recovery_state_mirror",
     }
     noneable_fields = {
         "center_price",
@@ -10465,11 +10775,17 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "rolling_hourly_loss_per_10k_limit",
         "rolling_hourly_loss_per_10k_min_notional",
         "max_cumulative_notional",
+        "lifecycle_wear_stop_per_10k",
+        "lifecycle_wear_stop_min_gross_notional",
+        "terminal_drain_absolute_loss_budget",
+        "terminal_drain_max_wait_seconds",
         "max_actual_net_notional",
         "max_synthetic_drift_notional",
         "max_unrealized_loss",
         "run_start_time",
         "run_end_time",
+        "terminal_drain_exit_policy",
+        "terminal_drain_stop_preserve_reason",
         "runtime_guard_stats_start_time",
         "volume_trigger_start_threshold",
         "volume_trigger_stop_threshold",
@@ -10520,6 +10836,69 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
     return _normalize_runner_volatility_trigger_config(_normalize_runner_volume_trigger_config(config))
 
 
+def _preserve_active_runner_ownership(
+    resolved: dict[str, Any],
+    *,
+    inherited: dict[str, Any],
+    raw_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Carry durable owners through preset expansion unless explicitly replaced."""
+
+    owner = inherited.get(RUN_CONTRACT_OWNER_KEY)
+    if owner is not None and RUN_CONTRACT_OWNER_KEY not in raw_payload:
+        resolved[RUN_CONTRACT_OWNER_KEY] = owner
+        snapshot = validate_run_contract_owner(
+            owner,
+            expected_symbol=str(resolved.get("symbol") or ""),
+        )
+        if "terminal_drain_max_order_notional" not in raw_payload:
+            resolved["terminal_drain_max_order_notional"] = snapshot[
+                "terminal_drain_max_order_notional"
+            ]
+
+    recovery_desired_keys: set[str] = set()
+    if recovery_coordinator_registered(inherited):
+        decode_recovery_state_slots(
+            inherited,
+            expected_symbol=str(resolved.get("symbol") or ""),
+        )
+        recovery_envelope = inherited[RECOVERY_STATE_KEY]
+        recovery_desired_fields = decode_recovery_desired_profile_fields(
+            recovery_envelope,
+            expected_symbol=str(resolved.get("symbol") or ""),
+        )
+        recovery_desired_keys = set(recovery_desired_fields)
+        if (
+            RECOVERY_STATE_KEY in raw_payload
+            and raw_payload[RECOVERY_STATE_KEY] != recovery_envelope
+        ):
+            raise ValueError(
+                "active futures recovery envelope must be changed through the recovery store"
+            )
+        for key in (RECOVERY_STATE_KEY, RECOVERY_STATE_MIRROR_KEY):
+            inherited_slot = inherited[key]
+            if key in raw_payload and raw_payload[key] != inherited_slot:
+                raise ValueError(
+                    "active futures recovery envelope must be changed through "
+                    "the recovery store"
+                )
+            resolved[key] = inherited_slot
+        for key, value in recovery_desired_fields.items():
+            if key in raw_payload and raw_payload[key] != value:
+                raise ValueError(
+                    f"recovery-managed control {key} must be changed through the recovery store"
+                )
+            resolved[key] = value
+    for key, value in inherited.items():
+        if (
+            key not in recovery_desired_keys
+            and _is_managed_recovery_key(str(key))
+            and key not in raw_payload
+        ):
+            resolved[key] = value
+    return resolved
+
+
 def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
     raw_payload = dict(payload)
     config = _normalize_runner_control_payload(payload)
@@ -10534,13 +10913,25 @@ def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
         runtime_payload = _read_json_dict(runtime_config_path)
         if not runtime_payload:
             raise ValueError(f"Unknown strategy_profile: {profile}")
+        _reject_declared_run_target_clear(
+            runtime_payload,
+            raw_payload,
+            source_label=profile,
+        )
         runtime_payload.update(raw_payload)
-        resolved = _normalize_runner_control_payload(runtime_payload)
+        resolved = _normalize_runner_control_payload(
+            runtime_payload,
+            inherit_existing=False,
+        )
         runtime_paths = _default_runtime_paths_for_symbol(str(resolved.get("symbol", "")))
         for key, value in runtime_paths.items():
             if not str(payload.get(key, "")).strip():
                 resolved[key] = value
-        return _autotune_runner_symbol_config(resolved)
+        return _preserve_active_runner_ownership(
+            _autotune_runner_symbol_config(resolved),
+            inherited=config,
+            raw_payload=raw_payload,
+        )
     if not preset.get("startable", True):
         raise ValueError(f"{preset.get('label', profile)} 当前是模板预设，页面已展示参数，但还不能直接启动。")
     preset_symbol = str(preset.get("symbol", "")).upper().strip()
@@ -10549,12 +10940,19 @@ def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"{preset.get('label', profile)} requires symbol={preset_symbol}")
     raw_payload.setdefault("symbol", config.get("symbol"))
     raw_payload.setdefault("strategy_profile", profile)
-    resolved = _normalize_runner_control_payload(_runner_preset_payload(profile, raw_payload))
+    resolved = _normalize_runner_control_payload(
+        _runner_preset_payload(profile, raw_payload),
+        inherit_existing=False,
+    )
     runtime_paths = _default_runtime_paths_for_symbol(str(resolved.get("symbol", "")))
     for key, value in runtime_paths.items():
         if not str(payload.get(key, "")).strip():
             resolved[key] = value
-    return _autotune_runner_symbol_config(resolved)
+    return _preserve_active_runner_ownership(
+        _autotune_runner_symbol_config(resolved),
+        inherited=config,
+        raw_payload=raw_payload,
+    )
 
 
 def _runtime_guard_input_summary(
@@ -10563,12 +10961,16 @@ def _runtime_guard_input_summary(
     runtime_guard_stats_start_time: Any = None,
     symbol: str | None = None,
     now: datetime | None = None,
+    runtime_guard_stats_end_time: Any = None,
+    immutable_window: bool = False,
 ) -> tuple[float, list[dict[str, Any]], datetime | None]:
     return summarize_futures_runtime_guard_inputs(
         summary_path,
         runtime_guard_stats_start_time=runtime_guard_stats_start_time,
         symbol=symbol,
         now=now,
+        runtime_guard_stats_end_time=runtime_guard_stats_end_time,
+        immutable_window=immutable_window,
     )
 
 
@@ -10597,10 +10999,51 @@ def _preflight_runner_runtime_guards(config: dict[str, Any]) -> None:
     symbol = str(config.get("symbol", "")).upper().strip()
     cumulative_gross_notional, pnl_events, stats_start_time = _runtime_guard_input_summary(
         summary_path,
-        runtime_guard_stats_start_time=config.get("runtime_guard_stats_start_time"),
+        runtime_guard_stats_start_time=(
+            runtime_guard_config.runtime_guard_stats_start_time
+        ),
         symbol=symbol,
         now=current,
+        runtime_guard_stats_end_time=runtime_guard_config.run_end_time,
+        immutable_window=bool(
+            runtime_guard_config.run_end_time is not None
+            or runtime_guard_config.max_cumulative_notional is not None
+        ),
     )
+    if runtime_guard_config.max_cumulative_notional is not None:
+        if (
+            runtime_guard_config.runtime_guard_stats_start_time is None
+            or runtime_guard_config.run_end_time is None
+        ):
+            raise ValueError(
+                "target run requires immutable stats start and run end"
+            )
+        credentials = load_binance_api_credentials()
+        if credentials is None:
+            raise ValueError(
+                "target progress exchange truth unavailable: missing credentials"
+            )
+        api_key, api_secret = credentials
+        try:
+            target_progress = daily_vol_wear(
+                symbol,
+                api_key,
+                api_secret,
+                window_start=(
+                    runtime_guard_config.runtime_guard_stats_start_time
+                ),
+                window_end=runtime_guard_config.run_end_time,
+                now=current,
+            )
+        except Exception as exc:
+            raise ValueError(
+                "target progress exchange truth unavailable: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        cumulative_gross_notional = float(
+            target_progress.get("gross_notional") or 0.0
+        )
+        stats_start_time = runtime_guard_config.runtime_guard_stats_start_time
     runtime_guard_result = evaluate_runtime_guards(
         config=runtime_guard_config,
         now=current,
@@ -10662,8 +11105,9 @@ def _preflight_runner_runtime_guards(config: dict[str, Any]) -> None:
     raise ValueError(
         "启动前风控预检已拦截："
         + "；".join(detail_lines)
-        + "。注意：reset_state 只重置本地状态，不会清空 runtime guard 审计计数。"
-        + f"如需重新启动，请调高阈值，或清理 {audit_paths['trade_audit']} / {audit_paths['income_audit']} 后再启动。"
+        + "。注意：reset_state 只重置本地状态，不会改变交易所成交真相。"
+        + "如需开始新一轮，请创建新的 stats_start/end 与运行契约；"
+        + f"审计文件只可归档，不应删除（{audit_paths['trade_audit']} / {audit_paths['income_audit']}）。"
     )
 
 
@@ -10949,9 +11393,89 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         )
 
 
+def _validate_runner_run_contract(config: dict[str, Any]) -> None:
+    try:
+        validate_run_contract(
+            run_start_time=config.get("run_start_time"),
+            runtime_guard_stats_start_time=config.get(
+                "runtime_guard_stats_start_time"
+            ),
+            run_end_time=config.get("run_end_time"),
+            target_value=config.get("max_cumulative_notional"),
+            exit_policy=config.get("terminal_drain_exit_policy"),
+            loss_budget=config.get("terminal_drain_absolute_loss_budget"),
+            max_wait_seconds=config.get("terminal_drain_max_wait_seconds"),
+            preserve_reason=config.get("terminal_drain_stop_preserve_reason"),
+            wear_stop_per_10k=config.get("lifecycle_wear_stop_per_10k"),
+            wear_stop_min_gross_notional=config.get(
+                "lifecycle_wear_stop_min_gross_notional"
+            ),
+        )
+    except ValueError as exc:
+        symbol = str(config.get("symbol", "")).upper().strip() or "UNKNOWN"
+        raise ValueError(f"{symbol} 运行终止契约无效：{exc}") from exc
+
+
+def _defer_registered_runner_web_action(
+    *,
+    symbol: str,
+    requested_action: str,
+    candidate: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Fence every Web mutation once the recovery ownership key exists."""
+
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return None
+    existing = _read_json_dict(_runner_control_path(normalized_symbol))
+    if not (
+        recovery_coordinator_registered(candidate or {})
+        or (
+            isinstance(existing, dict)
+            and recovery_coordinator_registered(existing)
+        )
+    ):
+        return None
+    result: dict[str, Any] = {
+        "symbol": normalized_symbol,
+        "recovery_coordinator_registered": True,
+        "actuation_deferred": True,
+        "deferred": True,
+        "reason": "deferred_to_futures_recovery_coordinator",
+        "requested_action": requested_action,
+    }
+    if requested_action == "start_or_restart":
+        result.update(
+            {
+                "started": False,
+                "already_running": False,
+                "restarted": False,
+            }
+        )
+    elif requested_action == "change_control":
+        result["saved"] = False
+    return result
+
+
 def _save_runner_config_without_start(payload: dict[str, Any]) -> dict[str, Any]:
+    requested_symbol = str(payload.get("symbol") or "").upper().strip()
+    deferred = _defer_registered_runner_web_action(
+        symbol=requested_symbol,
+        requested_action="change_control",
+        candidate=payload,
+    )
+    if deferred is not None:
+        return deferred
     config = _resolve_runner_start_config(payload)
+    _validate_runner_run_contract(config)
     symbol = str(config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
+    deferred = _defer_registered_runner_web_action(
+        symbol=symbol,
+        requested_action="change_control",
+        candidate=config,
+    )
+    if deferred is not None:
+        return deferred
     _save_runner_control_config(config, symbol=symbol)
     _clear_volatility_trigger_status(symbol, reason="saved_without_start")
     return {
@@ -10973,6 +11497,43 @@ def _start_runner_from_last_config(symbol: str) -> dict[str, Any]:
         "symbol": normalized_symbol,
         "config": config,
         "config_source": config_source,
+    }
+
+
+def _runner_recovery_ownership_conflict(
+    symbol: Any,
+    *,
+    operation: str,
+) -> dict[str, Any] | None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        raise ValueError("symbol is required")
+    control_path = _runner_control_path(normalized_symbol)
+    control = _read_json_dict(control_path)
+    if control is None and control_path.exists():
+        return {
+            "ok": False,
+            "error": (
+                f"runner control for {normalized_symbol} is unreadable; "
+                f"{operation} is blocked"
+            ),
+            "reason": "runner_control_unreadable",
+            "symbol": normalized_symbol,
+            "operation": operation,
+        }
+    if not isinstance(control, dict) or not recovery_coordinator_registered(
+        control
+    ):
+        return None
+    return {
+        "ok": False,
+        "error": (
+            f"recovery coordinator owns {normalized_symbol}; "
+            f"{operation} must be requested through the coordinator"
+        ),
+        "reason": "recovery_coordinator_owns_symbol",
+        "symbol": normalized_symbol,
+        "operation": operation,
     }
 
 
@@ -12353,6 +12914,41 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--run-start-time", str(config["run_start_time"])])
     if config.get("run_end_time") is not None:
         command.extend(["--run-end-time", str(config["run_end_time"])])
+    if config.get("terminal_drain_exit_policy") is not None:
+        command.extend(["--terminal-drain-exit-policy", str(config["terminal_drain_exit_policy"])])
+    if config.get("terminal_drain_absolute_loss_budget") is not None:
+        command.extend(
+            [
+                "--terminal-drain-absolute-loss-budget",
+                str(config["terminal_drain_absolute_loss_budget"]),
+            ]
+        )
+    if config.get("terminal_drain_max_wait_seconds") is not None:
+        command.extend(
+            [
+                "--terminal-drain-max-wait-seconds",
+                str(config["terminal_drain_max_wait_seconds"]),
+            ]
+        )
+    if config.get("terminal_drain_stop_preserve_reason") is not None:
+        command.extend(
+            [
+                "--terminal-drain-stop-preserve-reason",
+                str(config["terminal_drain_stop_preserve_reason"]),
+            ]
+        )
+    command.extend(
+        [
+            "--terminal-drain-max-order-notional",
+            str(config.get("terminal_drain_max_order_notional", 0.0)),
+            "--terminal-drain-loss-lease-seconds",
+            str(config.get("terminal_drain_loss_lease_seconds", 300.0)),
+            "--terminal-drain-order-reprice-seconds",
+            str(config.get("terminal_drain_order_reprice_seconds", 120.0)),
+            "--terminal-drain-flat-confirm-cycles",
+            str(int(config.get("terminal_drain_flat_confirm_cycles", 2) or 2)),
+        ]
+    )
     if config.get("runtime_guard_stats_start_time") is not None:
         command.extend(["--runtime-guard-stats-start-time", str(config["runtime_guard_stats_start_time"])])
     command.append(
@@ -12379,6 +12975,20 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         ])
     if config.get("max_cumulative_notional") is not None:
         command.extend(["--max-cumulative-notional", str(config["max_cumulative_notional"])])
+    if config.get("lifecycle_wear_stop_per_10k") is not None:
+        command.extend(
+            [
+                "--lifecycle-wear-stop-per-10k",
+                str(config["lifecycle_wear_stop_per_10k"]),
+            ]
+        )
+    if config.get("lifecycle_wear_stop_min_gross_notional") is not None:
+        command.extend(
+            [
+                "--lifecycle-wear-stop-min-gross-notional",
+                str(config["lifecycle_wear_stop_min_gross_notional"]),
+            ]
+        )
     if config.get("max_actual_net_notional") is not None:
         command.extend(["--max-actual-net-notional", str(config["max_actual_net_notional"])])
     if config.get("max_synthetic_drift_notional") is not None:
@@ -12435,6 +13045,18 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--inventory-tier-per-order-notional", str(config["inventory_tier_per_order_notional"])])
     if config.get("inventory_tier_base_position_notional") is not None:
         command.extend(["--inventory-tier-base-position-notional", str(config["inventory_tier_base_position_notional"])])
+    command.extend(
+        [
+            "--recovery-control-path",
+            str(_runner_control_path(str(config.get("symbol") or ""))),
+        ]
+    )
+    if recovery_coordinator_registered(config):
+        recovery_state = decode_recovery_control_state(
+            config,
+            expected_symbol=str(config.get("symbol") or ""),
+        )
+        command.extend(["--recovery-generation", str(recovery_state.generation)])
     command.append("--cancel-stale" if config.get("cancel_stale", True) else "--no-cancel-stale")
     command.append("--apply" if config.get("apply", True) else "--no-apply")
     if config.get("reset_state", True):
@@ -12476,11 +13098,21 @@ def _launchctl_loaded(label: str) -> bool:
 
 def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
     symbol = str(config.get("symbol", RUNNER_DEFAULT_CONFIG.get("symbol", "NIGHTUSDT"))).upper().strip() or "NIGHTUSDT"
+    deferred = _defer_registered_runner_web_action(
+        symbol=symbol,
+        requested_action="start_or_restart",
+        candidate=config,
+    )
+    if deferred is not None:
+        return deferred
+    _validate_runner_run_contract(config)
     _validate_runner_required_risk_guards(config)
     _runner_start_safety_preflight(config, spot=False)
+    # The target/deadline preflight is read-only and must finish before stopping
+    # an existing terminal drain or touching any runner process/order state.
+    _preflight_runner_runtime_guards(config)
     _stop_flatten_process(symbol, cancel_orders=True)
     runner = _read_runner_process_for_symbol(symbol)
-    _preflight_runner_runtime_guards(config)
     restarted = False
     if runner.get("is_running"):
         current_config = dict(runner.get("config") or {})
@@ -12685,11 +13317,21 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "max_total_notional",
             "run_start_time",
             "run_end_time",
+            "terminal_drain_exit_policy",
+            "terminal_drain_absolute_loss_budget",
+            "terminal_drain_max_wait_seconds",
+            "terminal_drain_stop_preserve_reason",
+            "terminal_drain_max_order_notional",
+            "terminal_drain_loss_lease_seconds",
+            "terminal_drain_order_reprice_seconds",
+            "terminal_drain_flat_confirm_cycles",
             "runtime_guard_stats_start_time",
             "runtime_guard_stop_auto_flatten_enabled",
             "runtime_guard_loss_recovery_enabled",
             "rolling_hourly_loss_limit",
             "max_cumulative_notional",
+            "lifecycle_wear_stop_per_10k",
+            "lifecycle_wear_stop_min_gross_notional",
             "max_actual_net_notional",
             "max_synthetic_drift_notional",
             "max_unrealized_loss",
@@ -23037,6 +23679,26 @@ MONITOR_PAGE = """<!doctype html>
         </label>
       </div>
       <div class="toolbar runtime-guard-toolbar">
+        <label>运行结束策略
+          <select id="monitor_terminal_drain_exit_policy">
+            <option value="">请选择明确退出策略</option>
+            <option value="drain_then_preserve">先 GTX 排空，超时保留残仓</option>
+            <option value="stop_preserve">停止并保留残仓</option>
+            <option value="drain_clean">持续 GTX 排空（仅无目标/截止）</option>
+          </select>
+        </label>
+        <label>结束排空损耗预算（USDT）
+          <input id="monitor_terminal_drain_absolute_loss_budget" type="number" min="0" step="0.01" />
+        </label>
+        <label>排空最长等待（秒）
+          <input id="monitor_terminal_drain_max_wait_seconds" type="number" min="0" step="1" />
+        </label>
+        <label>保留残仓原因
+          <input id="monitor_terminal_drain_stop_preserve_reason" type="text" placeholder="stop_preserve 时必填" />
+        </label>
+      </div>
+      <div class="meta">运行结束契约：有成交额目标或截止时间时必须明确退出策略和损耗边界；目标未达成也会按明确路径退出，并记录实际结果。</div>
+      <div class="toolbar runtime-guard-toolbar">
         <label class="inline-check" title="启用后，web 服务会按市场成交额自动启动或停止这套策略">
           <span class="check-row">
             <input id="monitor_volume_trigger_enabled" type="checkbox" />
@@ -23996,6 +24658,10 @@ MONITOR_PAGE = """<!doctype html>
     const monitorRuntimeGuardStatsStartTimeEl = document.getElementById("monitor_runtime_guard_stats_start_time");
     const monitorRollingHourlyLossLimitEl = document.getElementById("monitor_rolling_hourly_loss_limit");
     const monitorMaxCumulativeNotionalEl = document.getElementById("monitor_max_cumulative_notional");
+    const monitorTerminalDrainExitPolicyEl = document.getElementById("monitor_terminal_drain_exit_policy");
+    const monitorTerminalDrainAbsoluteLossBudgetEl = document.getElementById("monitor_terminal_drain_absolute_loss_budget");
+    const monitorTerminalDrainMaxWaitSecondsEl = document.getElementById("monitor_terminal_drain_max_wait_seconds");
+    const monitorTerminalDrainStopPreserveReasonEl = document.getElementById("monitor_terminal_drain_stop_preserve_reason");
     const monitorVolumeTriggerEnabledEl = document.getElementById("monitor_volume_trigger_enabled");
     const monitorVolumeTriggerWindowEl = document.getElementById("monitor_volume_trigger_window");
     const monitorVolumeTriggerStartThresholdEl = document.getElementById("monitor_volume_trigger_start_threshold");
@@ -26562,10 +27228,14 @@ MONITOR_PAGE = """<!doctype html>
       max_total_notional: "单轮新增挂单总名义上限。",
       sleep_seconds: "循环轮询周期。越小越跟价，但撤改单更频繁。",
       run_start_time: "允许开始交易的时间。未到时间前会停止交易、撤策略单并进入清仓逻辑。",
-      run_end_time: "允许结束交易的时间。超过时间后会停止交易、撤策略单并进入清仓逻辑。",
-      runtime_guard_stats_start_time: "风控统计起点。累计成交额和滚动亏损只会统计这个时间之后的审计数据；留空时比赛币会尽量跟随当前赛段起点。",
+      run_end_time: "运行截止时间。到点后停止新增交易并进入运行结束契约，分别记录目标结果和最终退出结果。",
+      runtime_guard_stats_start_time: "本次运行不可变的风控统计起点。设置累计成交额目标时必填；成交额、目标节奏和滚动亏损都只使用该起点之后的数据，不会按自然日补默认值。",
       rolling_hourly_loss_limit: "最近 60 分钟滚动亏损阈值。达到后会自动停机、撤单并清仓。",
-      max_cumulative_notional: "累计成交额阈值。达到后会自动停机、撤单并清仓。",
+      max_cumulative_notional: "本次运行窗口内的累计成交额目标。达到后进入运行结束契约；设置目标时必须同时设置统计起点、截止时间和明确退出策略。",
+      terminal_drain_exit_policy: "运行结束策略。有限运行只允许先用 GTX maker-only 排空、超时保留残仓，或停止并保留残仓。",
+      terminal_drain_absolute_loss_budget: "本次结束排空可消耗的绝对损耗预算，必须显式、有限，运行中不会被其他配置改写。",
+      terminal_drain_max_wait_seconds: "GTX 排空的最长等待时间；drain_then_preserve 到时仍未清空会撤本策略委托、保存残仓快照后结束。",
+      terminal_drain_stop_preserve_reason: "选择 stop_preserve 时必填的保留原因；退出前仍会阻止入场并清理本策略委托。",
       max_actual_net_notional: "实际净敞口绝对值阈值。达到后会自动停机、撤单并清仓。",
       max_synthetic_drift_notional: "synthetic 虚拟净仓和实际净仓偏差折算成名义金额后的阈值。达到后会自动停机、撤单并清仓。",
       max_unrealized_loss: "当前持仓按交易所 mark 价格计算的浮亏阈值。达到后会自动停机、撤单并清仓。",
@@ -27085,6 +27755,14 @@ MONITOR_PAGE = """<!doctype html>
         runtime_guard_stats_start_time: fromLocalInputValue(monitorRuntimeGuardStatsStartTimeEl.value),
         rolling_hourly_loss_limit: monitorRollingHourlyLossLimitEl.value ? Number(monitorRollingHourlyLossLimitEl.value) : null,
         max_cumulative_notional: monitorMaxCumulativeNotionalEl.value ? Number(monitorMaxCumulativeNotionalEl.value) : null,
+        terminal_drain_exit_policy: monitorTerminalDrainExitPolicyEl.value || null,
+        terminal_drain_absolute_loss_budget: monitorTerminalDrainAbsoluteLossBudgetEl.value
+          ? Number(monitorTerminalDrainAbsoluteLossBudgetEl.value)
+          : null,
+        terminal_drain_max_wait_seconds: monitorTerminalDrainMaxWaitSecondsEl.value
+          ? Number(monitorTerminalDrainMaxWaitSecondsEl.value)
+          : null,
+        terminal_drain_stop_preserve_reason: monitorTerminalDrainStopPreserveReasonEl.value.trim() || null,
         volume_trigger_enabled: Boolean(monitorVolumeTriggerEnabledEl && monitorVolumeTriggerEnabledEl.checked),
         volume_trigger_window: monitorVolumeTriggerWindowEl ? String(monitorVolumeTriggerWindowEl.value || "1h") : "1h",
         volume_trigger_start_threshold: monitorVolumeTriggerStartThresholdEl && monitorVolumeTriggerStartThresholdEl.value
@@ -27129,6 +27807,10 @@ MONITOR_PAGE = """<!doctype html>
       monitorRuntimeGuardStatsStartTimeEl.value = toLocalInputValue(source.runtime_guard_stats_start_time);
       monitorRollingHourlyLossLimitEl.value = source.rolling_hourly_loss_limit ?? "";
       monitorMaxCumulativeNotionalEl.value = source.max_cumulative_notional ?? "";
+      monitorTerminalDrainExitPolicyEl.value = source.terminal_drain_exit_policy || "";
+      monitorTerminalDrainAbsoluteLossBudgetEl.value = source.terminal_drain_absolute_loss_budget ?? "";
+      monitorTerminalDrainMaxWaitSecondsEl.value = source.terminal_drain_max_wait_seconds ?? "";
+      monitorTerminalDrainStopPreserveReasonEl.value = source.terminal_drain_stop_preserve_reason || "";
       monitorVolumeTriggerEnabledEl.checked = Boolean(source.volume_trigger_enabled);
       monitorVolumeTriggerWindowEl.value = source.volume_trigger_window || "1h";
       monitorVolumeTriggerStartThresholdEl.value = source.volume_trigger_start_threshold ?? "";
@@ -27816,7 +28498,7 @@ MONITOR_PAGE = """<!doctype html>
         lines.push(`run_start_time=${fmtTs(config.run_start_time)} 之前不会继续交易；如果当前已有仓位或挂单，会先撤策略单并转入清仓。`);
       }
       if (config.run_end_time) {
-        lines.push(`run_end_time=${fmtTs(config.run_end_time)} 之后会自动停止交易、撤策略单并转入清仓。`);
+        lines.push(`run_end_time=${fmtTs(config.run_end_time)} 到达后会停止新增交易并进入运行结束契约。`);
       }
       if (config.runtime_guard_stats_start_time) {
         lines.push(`runtime_guard_stats_start_time=${fmtTs(config.runtime_guard_stats_start_time)} 之后的审计数据才会参与累计成交额和滚动亏损统计。`);
@@ -27825,7 +28507,19 @@ MONITOR_PAGE = """<!doctype html>
         lines.push(`最近 60 分钟滚动亏损达到 ${fmtGuideNotional(config.rolling_hourly_loss_limit)} 时，会直接停机并执行撤单清仓。`);
       }
       if (asGuideNumber(config.max_cumulative_notional) > 0) {
-        lines.push(`累计成交额达到 ${fmtGuideNotional(config.max_cumulative_notional)} 时，会直接停机并执行撤单清仓。`);
+        lines.push(`累计成交额达到 ${fmtGuideNotional(config.max_cumulative_notional)} 时，会记录 TARGET_REACHED 并进入运行结束契约。`);
+      }
+      if (config.run_end_time || asGuideNumber(config.max_cumulative_notional) > 0) {
+        lines.push("运行结束契约会分别记录目标结果和退出结果；目标未达成也会按明确路径退出，不会静默停机或永久锁定。");
+        if (config.terminal_drain_exit_policy === "drain_then_preserve") {
+          lines.push(
+            `结束时只使用 GTX maker-only 排空，绝对损耗预算 ${fmtGuideNotional(config.terminal_drain_absolute_loss_budget)}，最长等待 ${fmtGuideNumber(config.terminal_drain_max_wait_seconds, 0)} 秒；超时后清理本策略委托、保存残仓快照并以 STOPPED_PRESERVED 结束。`
+          );
+        } else if (config.terminal_drain_exit_policy === "stop_preserve") {
+          lines.push(`结束时先阻止入场并清理本策略委托，再以“${String(config.terminal_drain_stop_preserve_reason || "未填写原因")}”保存残仓快照并结束。`);
+        } else {
+          lines.push("当前缺少明确的运行结束策略，保存或启动时会在产生进程、订单副作用前拒绝该有限运行配置。");
+        }
       }
       if (asGuideNumber(config.max_actual_net_notional) > 0) {
         lines.push(`实际净敞口绝对值达到 ${fmtGuideNotional(config.max_actual_net_notional)} 时，会直接停机并执行撤单清仓。`);
@@ -28150,6 +28844,12 @@ MONITOR_PAGE = """<!doctype html>
       };
     }
 
+    function presetRequiresRunContract(preset) {
+      if (!preset) return false;
+      if (preset.requires_run_contract) return true;
+      return Number((((preset || {}).config || {}).max_cumulative_notional) || 0) > 0;
+    }
+
     function buildRunnerPayloadFromEditor(selectedSymbol, selectedPreset = null) {
       let payload = mergeRunnerConfigFromForm(readRunnerEditorConfigFromTextarea());
       const payloadSymbol = String(payload.symbol || "").trim().toUpperCase();
@@ -28197,7 +28897,11 @@ MONITOR_PAGE = """<!doctype html>
       const currentText = currentPreset ? currentPreset.label : currentProfile;
       const selectedText = selectedPreset ? selectedPreset.label : selectedProfile;
       const selectedDesc = selectedPreset ? selectedPreset.description : "未选择策略预设";
-      const startableText = selectedPreset && !selectedPreset.startable ? " · 当前只展示模板，不能直接启动" : "";
+      const startableText = selectedPreset && !selectedPreset.startable
+        ? " · 当前只展示模板，不能直接启动"
+        : (presetRequiresRunContract(selectedPreset)
+          ? " · 需先载入预设，填写本次统计起止与退出契约，再应用启动"
+          : "");
       const customText = selectedPreset && selectedPreset.custom ? " · 可载入/更新/删除" : "";
       strategyPresetMetaEl.textContent =
         `当前运行: ${currentText} · 已选择: ${selectedText} · ${selectedDesc}${startableText}${customText}`;
@@ -28915,7 +29619,9 @@ MONITOR_PAGE = """<!doctype html>
           </div>
         `;
       }).join("");
-      startStrategyBtn.disabled = strategyActionPending || Boolean(selectedPreset && !selectedPreset.startable);
+      startStrategyBtn.disabled = strategyActionPending || Boolean(
+        selectedPreset && (!selectedPreset.startable || presetRequiresRunContract(selectedPreset))
+      );
       startStrategyBtn.textContent = runner.is_running ? "重启策略" : "启动策略";
       stopStrategyBtn.disabled = strategyActionPending || !Boolean(runner.is_running);
       if (quickStartLastBtn) quickStartLastBtn.disabled = strategyActionPending;
@@ -29544,6 +30250,10 @@ MONITOR_PAGE = """<!doctype html>
           strategyActionMetaEl.textContent = `${effectivePreset.label} 当前是模板预设，页面已展示参数，但还不能直接启动。`;
           return;
         }
+        if (presetRequiresRunContract(effectivePreset)) {
+          strategyActionMetaEl.textContent = `${effectivePreset.label} 包含成交额目标；请先载入预设，填写本次统计起止与退出契约，再点击“应用并启动”。`;
+          return;
+        }
       }
       strategyActionPending = true;
       strategyActionMetaEl.textContent = action === "start" ? "正在按当前选中预设启动策略..." : "正在停止策略...";
@@ -29661,6 +30371,10 @@ MONITOR_PAGE = """<!doctype html>
       monitorRunEndTimeEl,
       monitorRollingHourlyLossLimitEl,
       monitorMaxCumulativeNotionalEl,
+      monitorTerminalDrainExitPolicyEl,
+      monitorTerminalDrainAbsoluteLossBudgetEl,
+      monitorTerminalDrainMaxWaitSecondsEl,
+      monitorTerminalDrainStopPreserveReasonEl,
       monitorVolumeTriggerEnabledEl,
       monitorVolumeTriggerWindowEl,
       monitorVolumeTriggerStartThresholdEl,
@@ -37664,16 +38378,22 @@ def _build_status_runtime_snapshot(
 def _running_status_stats_start_time(symbol: str, runner: dict[str, Any]) -> datetime | None:
     runner_config = runner.get("config") if isinstance(runner.get("config"), dict) else {}
     try:
-        board = resolve_active_competition_board(symbol, "futures", now=datetime.now(timezone.utc))
-        board_start_time = _parse_utc_datetime((board or {}).get("activity_start_at"))
-        if board_start_time is not None:
-            return board_start_time
+        configured_start = resolve_runtime_guard_stats_start_time(
+            runtime_guard_stats_start_time=runner_config.get(
+                "runtime_guard_stats_start_time"
+            ),
+        )
+        if configured_start is not None:
+            return configured_start
     except Exception:
         pass
     try:
-        return resolve_runtime_guard_stats_start_time(
-            runtime_guard_stats_start_time=runner_config.get("runtime_guard_stats_start_time"),
+        board = resolve_active_competition_board(
+            symbol,
+            "futures",
+            now=datetime.now(timezone.utc),
         )
+        return _parse_utc_datetime((board or {}).get("activity_start_at"))
     except Exception:
         return None
 
@@ -39161,6 +39881,19 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send_json({"ok": False, "error": "JSON body must be object"}, status=400)
                     return
             try:
+                protected_operation = {
+                    "/api/runner/stop": "stop",
+                    "/api/runner/quick_flatten": "quick_flatten",
+                    "/api/runner/frozen_inventory": "frozen_inventory",
+                }.get(path)
+                if protected_operation is not None:
+                    conflict = _runner_recovery_ownership_conflict(
+                        payload.get("symbol"),
+                        operation=protected_operation,
+                    )
+                    if conflict is not None:
+                        self._send_json(conflict, status=409)
+                        return
                 if path.endswith("/quick_start_last"):
                     result = _start_runner_from_last_config(payload.get("symbol"))
                 elif path.endswith("/quick_flatten"):

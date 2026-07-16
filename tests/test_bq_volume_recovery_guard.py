@@ -5,6 +5,7 @@ import os
 import subprocess
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
@@ -23,6 +24,55 @@ from grid_optimizer.bq_volume_recovery_guard import (
     recover_inactive_runner,
     summarize_recent_volume,
 )
+from grid_optimizer.futures_run_lifecycle import (
+    bind_run_contract_owner,
+    run_contract_identity_from_config,
+    run_contract_snapshot_from_config,
+)
+from grid_optimizer.futures_terminal_ownership import terminal_intent_id
+from grid_optimizer.futures_terminal_drain import (
+    DrainStage,
+    TerminalDrainState,
+    terminal_drain_state_to_dict,
+)
+from grid_optimizer.loop_runner import (
+    _terminal_drain_exit_contract_from_snapshot,
+    _terminal_drain_owner_integrity_digest,
+    _terminal_drain_runtime_integrity_digest,
+)
+from grid_optimizer.futures_recovery_store import (
+    RECOVERY_STATE_KEY,
+    RECOVERY_STATE_MIRROR_KEY,
+    JsonRecoveryStore,
+)
+from grid_optimizer.futures_recovery_coordinator import (
+    ActionId,
+    CleanupProof,
+    EffectReceipt,
+    EffectStage,
+    ActivationReceipt,
+    FlowBlockerAssessment,
+    FlowRoleKey,
+    FuturesRecoveryDecisionEngine,
+    LedgerClass,
+    OrderRole,
+    ProgressReceipt,
+    RecoveryPhase,
+    RecoveryState,
+    Side,
+    SymbolSnapshot,
+)
+from grid_optimizer.futures_recovery_runtime_adapter import (
+    InventoryRecoveryReceiptJournalError,
+    OrdinaryRecoveryRuntimeEvidence,
+    RecoveryAdmissionEvidence,
+    RecoveryConfigAppliedReceiptJournalError,
+    RecoveryConfigAppliedEvidence,
+    TemporaryLossReceiptJournalError,
+    TemporaryLossRuntimeEvidence,
+    _expected_recovery_profile_gate,
+    temporary_loss_client_order_prefix,
+)
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -36,7 +86,3453 @@ def _append_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
     )
 
 
+def _terminal_test_control(
+    *,
+    symbol: str = "BCHUSDT",
+    strategy_profile: str = "test_profile",
+) -> dict[str, object]:
+    control: dict[str, object] = {
+        "symbol": symbol,
+        "strategy_profile": strategy_profile,
+        "strategy_mode": "hedge_best_quote_maker_volume_v1",
+        "per_order_notional": 20.0,
+        "run_start_time": "2026-07-16T00:00:00+00:00",
+        "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+        "run_end_time": "2026-07-17T00:00:00+00:00",
+        "max_cumulative_notional": 20_000.0,
+        "terminal_drain_exit_policy": "drain_then_preserve",
+        "terminal_drain_absolute_loss_budget": 2.0,
+        "terminal_drain_max_wait_seconds": 600.0,
+    }
+    owned, _ = bind_run_contract_owner(
+        control,
+        activated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+    return owned
+
+
+def _terminal_test_runtime_owner(
+    control: dict[str, object],
+    *,
+    exit_status: str,
+) -> dict[str, object]:
+    snapshot = run_contract_snapshot_from_config(control)
+    contract_id = run_contract_identity_from_config(snapshot)
+    symbol = str(snapshot["symbol"])
+    decision_id = f"{symbol}|{contract_id}"
+    drain_state = TerminalDrainState.initial(symbol, decision_id=decision_id)
+    if exit_status == "stopped_clean":
+        drain_state = replace(drain_state, stage=DrainStage.STOPPED_CLEAN)
+    elif exit_status == "stopped_preserved":
+        drain_state = replace(drain_state, stage=DrainStage.STOPPED_PRESERVED)
+    started_at = datetime(2026, 7, 16, tzinfo=timezone.utc).isoformat()
+    owner: dict[str, object] = {
+        "schema": "futures_terminal_drain_runtime_v1",
+        "decision_id": decision_id,
+        "run_contract_id": contract_id,
+        "run_contract_snapshot": snapshot,
+        "started_at": started_at,
+        "exit_status": exit_status,
+        "exit_contract": _terminal_drain_exit_contract_from_snapshot(
+            snapshot,
+            captured_at=started_at,
+        ),
+        "initial_frozen_long_qty": 0.0,
+        "initial_frozen_short_qty": 0.0,
+        "drain_state": terminal_drain_state_to_dict(drain_state),
+        "intents": [],
+        "active_intent_ids": [],
+    }
+    owner["owner_integrity_digest"] = _terminal_drain_owner_integrity_digest(owner)
+    owner["runtime_integrity_digest"] = _terminal_drain_runtime_integrity_digest(
+        owner
+    )
+    return owner
+
+
+def _terminal_test_intent(
+    control: dict[str, object],
+    *,
+    status: str = "pending",
+) -> dict[str, object]:
+    snapshot = run_contract_snapshot_from_config(control)
+    contract_id = run_contract_identity_from_config(snapshot)
+    source = "competition_target_gate"
+    trigger_reason = "target_reached"
+    requested_at = "2026-07-16T01:00:00+00:00"
+    target = float(snapshot["max_cumulative_notional"])
+    return {
+        "schema": "futures_lifecycle_intent_v2",
+        "intent_id": terminal_intent_id(
+            symbol=str(snapshot["symbol"]),
+            source=source,
+            trigger_reason=trigger_reason,
+            run_contract_id=contract_id,
+        ),
+        "symbol": snapshot["symbol"],
+        "source": source,
+        "action": "lifecycle_drain",
+        "trigger_reason": trigger_reason,
+        "requested_at": requested_at,
+        "status": status,
+        "exit_policy": "use_immutable_run_contract",
+        "run_contract_id": contract_id,
+        "run_contract_snapshot": snapshot,
+        "observed": {
+            "gross_notional": target + 1.0,
+            "target": target,
+            "realized_pnl": 0.0,
+            "wear_per_10k": 0.0,
+            "trade_count": 1,
+            "window_start": snapshot["runtime_guard_stats_start_time"],
+            "window_end": snapshot["run_end_time"],
+            "query_end": requested_at,
+        },
+    }
+
+
+def _write_registered_normal_reports(
+    *,
+    output_dir: Path,
+    state,
+    generated_at: datetime,
+    current_long_notional: float = 0.0,
+    current_short_notional: float = 0.0,
+    loss_sides: tuple[Side, ...] = (),
+) -> None:
+    gate = {
+        "managed": True,
+        "ready": True,
+        "reason": None,
+        "symbol": state.symbol,
+        "generation": state.generation,
+        "decision_id": state.decision_id,
+        "profile_digest": state.desired_profile.digest,
+        "active_action": "noop",
+        "side": None,
+        "order_role": None,
+        "ledger_class": None,
+        "allowed_orders": [],
+        "allowed_roles": [],
+        "progress_deadline_at": None,
+        "hard_expires_at": None,
+    }
+    dropped = []
+    if Side.SELL in loss_sides:
+        dropped.append(
+            {
+                "role": "best_quote_reduce_long",
+                "side": "SELL",
+                "reduce_only_no_loss_drop_reason": (
+                    "long_reduce_below_no_loss_floor"
+                ),
+            }
+        )
+    if Side.BUY in loss_sides:
+        dropped.append(
+            {
+                "role": "best_quote_reduce_short",
+                "side": "BUY",
+                "reduce_only_no_loss_drop_reason": (
+                    "short_reduce_above_no_loss_ceiling"
+                ),
+            }
+        )
+    _write_json(
+        output_dir / f"{state.symbol.lower()}_loop_latest_plan.json",
+        {
+            "generated_at": (generated_at - timedelta(seconds=1)).isoformat(),
+            "current_long_notional": current_long_notional,
+            "current_short_notional": current_short_notional,
+            "effective_max_position_notional": 100.0,
+            "effective_max_short_position_notional": 100.0,
+            "buy_orders": [],
+            "sell_orders": [],
+            "recovery_profile_gate": {
+                **gate,
+                "dropped_order_count": 0,
+                "dropped_orders": [],
+            },
+        },
+    )
+    _write_json(
+        output_dir / f"{state.symbol.lower()}_loop_latest_submit.json",
+        {
+            "generated_at": generated_at.isoformat(),
+            "submit_generated_at": generated_at.isoformat(),
+            "observed_strategy_open_order_state": {"active_order_count": 0},
+            "recovery_profile_execution": {
+                "managed": True,
+                "authorized": True,
+                "reason": None,
+                "current_gate": gate,
+                "dropped_place_count": 0,
+                "dropped_cancel_count": 0,
+                "dropped_orders": [],
+            },
+            "validation": {
+                "actions": {
+                    "place_orders": [],
+                    "reduce_only_no_loss_guard": {
+                        "enabled": True,
+                        "dropped_order_count": len(dropped),
+                        "dropped_orders": dropped,
+                    },
+                }
+            },
+        },
+    )
+
+
 class BqVolumeRecoveryGuardTests(unittest.TestCase):
+    def test_active_entry_baseline_tune_carries_blocker_without_reports(
+        self,
+    ) -> None:
+        side = Side.BUY
+        episode = "baseline-tune-stale-admission"
+        initial = replace(
+            RecoveryState.initial(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            ).with_exhausted_attempt(
+                ActionId.MAKER_FLOW_RECOVER,
+                side,
+                OrderRole.ENTRY,
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            ),
+            active_episode_fingerprint=episode,
+        )
+        active = FuturesRecoveryDecisionEngine().plan_round(
+            snapshot=SymbolSnapshot(
+                symbol="BCHUSDT",
+                captured_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+                assessment=FlowBlockerAssessment(
+                    missing_entry_sides=(side,),
+                    episode_fingerprint=episode,
+                ),
+            ),
+            state=initial,
+            now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            round_id="baseline-tune-stale-enter",
+        ).next_state
+        self.assertEqual(active.active_action, ActionId.BASELINE_TUNE)
+
+        carried = bq_volume_recovery_guard._carried_registered_flow_blockers(
+            {},
+            state=active,
+            base=FlowBlockerAssessment(),
+        )
+
+        self.assertIsNotNone(carried)
+        assert carried is not None
+        self.assertEqual(carried.missing_entry_sides, (Side.BUY,))
+
+    def test_registered_normal_entry_fill_clock_is_side_scoped(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            now = datetime(2026, 7, 16, 2, 0, tzinfo=timezone.utc)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            store = JsonRecoveryStore(control_path)
+            state = store.register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=now - timedelta(minutes=10),
+            )
+
+            def write_reports(current_state, observed_at: datetime) -> None:
+                gate = _expected_recovery_profile_gate(current_state)
+                _write_json(
+                    output_dir / "bchusdt_loop_latest_plan.json",
+                    {
+                        "generated_at": (observed_at - timedelta(seconds=1)).isoformat(),
+                        "bid_price": 500.0,
+                        "ask_price": 500.1,
+                        "tick_size": 0.1,
+                        "symbol_info": {"tick_size": 0.1},
+                        "current_long_notional": 0.0,
+                        "current_short_notional": 0.0,
+                        "effective_max_position_notional": 100.0,
+                        "effective_max_short_position_notional": 100.0,
+                        "buy_orders": [
+                            {
+                                "side": "BUY",
+                                "position_side": "LONG",
+                                "price": 500.0,
+                                "qty": 0.02,
+                                "role": "best_quote_entry_long",
+                            }
+                        ],
+                        "sell_orders": [
+                            {
+                                "side": "SELL",
+                                "position_side": "SHORT",
+                                "price": 500.1,
+                                "qty": 0.02,
+                                "role": "best_quote_entry_short",
+                            }
+                        ],
+                        "kept_orders": [
+                            {
+                                "symbol": "BCHUSDT",
+                                "orderId": 101,
+                                "clientOrderId": "gx-bchu-bestquot-0-00000001",
+                                "side": "BUY",
+                                "positionSide": "LONG",
+                                "type": "LIMIT",
+                                "timeInForce": "GTX",
+                                "price": 500.0,
+                                "origQty": 0.02,
+                            },
+                            {
+                                "symbol": "BCHUSDT",
+                                "orderId": 102,
+                                "clientOrderId": "gx-bchu-bestquot-1-00000001",
+                                "side": "SELL",
+                                "positionSide": "SHORT",
+                                "type": "LIMIT",
+                                "timeInForce": "GTX",
+                                "price": 500.1,
+                                "origQty": 0.02,
+                            },
+                        ],
+                        "recovery_profile_gate": {
+                            **gate,
+                            "dropped_order_count": 0,
+                            "dropped_orders": [],
+                        },
+                    },
+                )
+                _write_json(
+                    output_dir / "bchusdt_loop_latest_submit.json",
+                    {
+                        "generated_at": observed_at.isoformat(),
+                        "submit_generated_at": observed_at.isoformat(),
+                        "observed_strategy_open_order_state": {
+                            "active_order_count": 2
+                        },
+                        "recovery_profile_execution": {
+                            "managed": True,
+                            "authorized": True,
+                            "reason": None,
+                            "current_gate": gate,
+                            "dropped_place_count": 0,
+                            "dropped_cancel_count": 0,
+                            "dropped_orders": [],
+                        },
+                        "validation": {
+                            "actions": {
+                                "place_orders": [],
+                                "reduce_only_no_loss_guard": {
+                                    "dropped_orders": []
+                                },
+                            }
+                        },
+                    },
+                )
+
+            write_reports(state, now)
+            guard_state: dict[str, object] = {}
+            first = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=125,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=1,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=lambda _symbol: (_ for _ in ()).throw(
+                    AssertionError("fill clock armed a restart too early")
+                ),
+                exchange_order_snapshot_fetcher=lambda _symbol: {
+                    "strategy_open_order_count": 2,
+                    "strategy_order_ids": ["101", "102"],
+                },
+            )
+            self.assertEqual(first["action"], "coordinator_noop_hold")
+
+            later = now + timedelta(seconds=121)
+            current = store.read("BCHUSDT")
+            write_reports(current, later)
+            _append_jsonl(
+                output_dir / "bchusdt_loop_trade_audit.jsonl",
+                [
+                    {
+                        "id": 9001,
+                        "orderId": 101,
+                        "symbol": "BCHUSDT",
+                        "side": "BUY",
+                        "positionSide": "LONG",
+                        "time": int(later.timestamp() * 1000),
+                        "price": 500.0,
+                        "qty": 0.02,
+                    }
+                ],
+            )
+            restarts: list[str] = []
+            second = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=later,
+                window_seconds=180,
+                min_volume_notional=125,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=1,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+                exchange_order_snapshot_fetcher=lambda _symbol: {
+                    "strategy_open_order_count": 2,
+                    "strategy_order_ids": ["101", "102"],
+                },
+            )
+            self.assertEqual(
+                second["action"], "coordinator_maker_flow_recover_enter"
+            )
+            self.assertEqual(second["side"], "SELL")
+            self.assertEqual(second["effect_count"], 1)
+            self.assertEqual(restarts, ["BCHUSDT"])
+
+    def test_registered_stale_readiness_escalates_only_after_persisted_sla(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            now = datetime(2026, 7, 16, 3, 0, tzinfo=timezone.utc)
+            JsonRecoveryStore(
+                output_dir / "bchusdt_loop_runner_control.json"
+            ).register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=now - timedelta(minutes=10),
+            )
+            guard_state: dict[str, object] = {}
+            restarts: list[str] = []
+
+            first = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=125,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+            )
+            self.assertEqual(first["action"], "registered_recovery_observe_only")
+            self.assertEqual(first["reason"], "recovery_readiness_sla_pending")
+            self.assertEqual(first["effect_count"], 0)
+
+            still_waiting = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now + timedelta(seconds=2),
+                window_seconds=180,
+                min_volume_notional=125,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=1,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+            )
+            self.assertEqual(
+                still_waiting["reason"], "recovery_readiness_sla_pending"
+            )
+            self.assertEqual(restarts, [])
+
+            second = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now + timedelta(seconds=121),
+                window_seconds=180,
+                min_volume_notional=125,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=1,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+            )
+            self.assertEqual(second["action"], "coordinator_runner_recover_enter")
+            self.assertEqual(second["effect_count"], 1)
+            self.assertEqual(restarts, ["BCHUSDT"])
+
+    def test_registered_readiness_is_generation_bound_and_fresh_reports_clear_it(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            now = datetime(2026, 7, 16, 3, 10, tzinfo=timezone.utc)
+            store = JsonRecoveryStore(
+                output_dir / "bchusdt_loop_runner_control.json"
+            )
+            state = store.register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=now - timedelta(minutes=10),
+            )
+            item: dict[str, object] = {
+                "registered_recovery_readiness_observation": {
+                    "schema": "registered_recovery_readiness_observation_v1",
+                    "symbol": "BCHUSDT",
+                    "generation": state.generation - 1,
+                    "decision_id": "old-decision",
+                    "first_seen_at": (now - timedelta(hours=1)).isoformat(),
+                    "last_seen_at": (now - timedelta(hours=1)).isoformat(),
+                    "last_error": "old",
+                }
+            }
+            elapsed = bq_volume_recovery_guard._registered_readiness_sla_elapsed(
+                item,
+                recovery_state=state,
+                now=now,
+                error="current",
+            )
+            self.assertEqual(elapsed, 0.0)
+            observation = item["registered_recovery_readiness_observation"]
+            assert isinstance(observation, dict)
+            self.assertEqual(observation["generation"], state.generation)
+            guard_state = {"symbols": {"BCHUSDT": item}}
+            _write_registered_normal_reports(
+                output_dir=output_dir,
+                state=state,
+                generated_at=now + timedelta(seconds=1),
+            )
+
+            result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now + timedelta(seconds=2),
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=lambda _symbol: (_ for _ in ()).throw(
+                    AssertionError("fresh readiness restarted runner")
+                ),
+            )
+
+            self.assertEqual(result["flow_observation_status"], "fresh")
+            self.assertNotIn(
+                "registered_recovery_readiness_observation",
+                item,
+            )
+
+    def test_registered_round_repairs_one_recovery_slot_and_executes_no_external_effect(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            now = datetime(2026, 7, 16, tzinfo=timezone.utc)
+            registered = JsonRecoveryStore(control_path).register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=now,
+            )
+            control = json.loads(control_path.read_text(encoding="utf-8"))
+            del control[RECOVERY_STATE_KEY]
+            control_path.write_text(json.dumps(control), encoding="utf-8")
+            external_effects: list[tuple[str, str]] = []
+
+            result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state={},
+                now=now + timedelta(seconds=1),
+                window_seconds=60.0,
+                min_volume_notional=1.0,
+                near_cap_ratio=0.8,
+                far_ticks=2,
+                plan_stale_seconds=30.0,
+                dry_run=False,
+                runner_wrapper="unused",
+                runner_active_fetcher=lambda symbol: external_effects.append(
+                    ("active", symbol)
+                )
+                or False,
+                restart_runner=lambda symbol: external_effects.append(
+                    ("restart", symbol)
+                ),
+                stop_runner=lambda symbol: external_effects.append(("stop", symbol)),
+                exchange_order_snapshot_fetcher=lambda symbol: external_effects.append(
+                    ("exchange", symbol)
+                )
+                or {},
+                fetch_open_orders=lambda symbol: external_effects.append(
+                    ("orders", symbol)
+                )
+                or [],
+                cancel_order=lambda symbol, order_id: external_effects.append(
+                    ("cancel", f"{symbol}:{order_id}")
+                )
+                or {},
+            )
+
+            self.assertEqual(
+                result["action"], "registered_recovery_state_mirror_repair"
+            )
+            self.assertEqual(result["effect_stage"], EffectStage.LOCAL_STATE_REPAIR.value)
+            self.assertEqual(result["changed_keys"], [RECOVERY_STATE_KEY])
+            self.assertEqual(result["external_effect_count"], 0)
+            self.assertEqual(external_effects, [])
+            repaired = json.loads(control_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                repaired[RECOVERY_STATE_KEY], repaired[RECOVERY_STATE_MIRROR_KEY]
+            )
+            self.assertEqual(JsonRecoveryStore(control_path).read("BCHUSDT"), registered)
+
+    def test_registered_round_never_guesses_between_divergent_valid_slots(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            now = datetime(2026, 7, 16, tzinfo=timezone.utc)
+            registered = JsonRecoveryStore(control_path).register_symbol(
+                "BCHUSDT",
+                {"volatility_entry_pause_enabled": True},
+                now=now,
+            )
+            control = json.loads(control_path.read_text(encoding="utf-8"))
+            control[RECOVERY_STATE_MIRROR_KEY] = {
+                "schema_version": 1,
+                "state": JsonRecoveryStore.encode_state(
+                    replace(registered, generation=registered.generation + 1)
+                ),
+            }
+            control_path.write_text(json.dumps(control), encoding="utf-8")
+            before = control_path.read_bytes()
+            external_effects: list[str] = []
+
+            result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state={},
+                now=now + timedelta(seconds=1),
+                window_seconds=60.0,
+                min_volume_notional=1.0,
+                near_cap_ratio=0.8,
+                far_ticks=2,
+                plan_stale_seconds=30.0,
+                dry_run=False,
+                runner_wrapper="unused",
+                restart_runner=external_effects.append,
+                stop_runner=external_effects.append,
+            )
+
+            self.assertEqual(result["action"], "registered_recovery_blocked")
+            self.assertEqual(result["reason"], "registered_state_corrupt")
+            self.assertEqual(result["severity"], "critical")
+            self.assertEqual(result["effect_count"], 0)
+            self.assertEqual(external_effects, [])
+            self.assertEqual(control_path.read_bytes(), before)
+
+    def test_registered_guard_requires_exact_maker_fill_after_gtx_acceptance(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            now = datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            store = JsonRecoveryStore(control_path)
+            initial = store.register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                    "best_quote_maker_volume_same_side_entry_price_guard_report_only": False,
+                    "near_market_entry_max_center_distance_steps": 1.5,
+                    "near_market_reentry_confirm_cycles": 3,
+                },
+                now=now - timedelta(seconds=5),
+            )
+            flow_key = FlowRoleKey(
+                LedgerClass.NORMAL_BQ,
+                Side.BUY,
+                OrderRole.ENTRY,
+            )
+            initial = initial.with_flow_clock(
+                flow_key,
+                quote_missing_since=now - timedelta(minutes=5),
+                submit_missing_since=now - timedelta(minutes=5),
+                fill_missing_since=now - timedelta(minutes=5),
+            )
+            blockers = FlowBlockerAssessment(
+                missing_entry_sides=(Side.BUY,),
+                episode_fingerprint="guard-maker-progress",
+            )
+            active = FuturesRecoveryDecisionEngine().plan_round(
+                snapshot=SymbolSnapshot(
+                    symbol="BCHUSDT",
+                    captured_at=now - timedelta(seconds=4),
+                    assessment=blockers,
+                ),
+                state=initial,
+                now=now - timedelta(seconds=4),
+                round_id="guard-maker-enter",
+            ).next_state
+            store.compare_and_swap(
+                "BCHUSDT", expected_revision=0, next_state=active
+            )
+            restarts: list[str] = []
+            guard_state: dict[str, object] = {}
+            evidence = OrdinaryRecoveryRuntimeEvidence(
+                progress_receipts=(),
+                accepted_order_ids=("811",),
+                accepted_client_order_ids=("ordinary-811",),
+                accepted_order_pairs=(("811", "ordinary-811"),),
+                latest_observation_seq=0,
+            )
+
+            with (
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "load_recovery_admission_evidence",
+                    return_value=RecoveryAdmissionEvidence(
+                        plan_observed_at=now - timedelta(seconds=2),
+                        submit_observed_at=now - timedelta(seconds=1),
+                    ),
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "flow_blockers_from_legacy",
+                    return_value=blockers,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "load_recovery_config_applied_evidence",
+                    return_value=RecoveryConfigAppliedEvidence(),
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "load_ordinary_recovery_runtime_evidence",
+                    return_value=evidence,
+                ) as ordinary_loader,
+            ):
+                accepted_only = (
+                    bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                        symbol="BCHUSDT",
+                        output_dir=output_dir,
+                        guard_state=guard_state,
+                        now=now - timedelta(seconds=2),
+                        window_seconds=60,
+                        min_volume_notional=10,
+                        near_cap_ratio=0.95,
+                        far_ticks=8,
+                        plan_stale_seconds=300,
+                        dry_run=False,
+                        runner_wrapper="/unused",
+                        runner_active_fetcher=lambda _symbol: True,
+                        restart_runner=restarts.append,
+                    )
+                )
+                self.assertEqual(accepted_only["phase"], "active")
+                self.assertEqual(
+                    accepted_only["active_action"], "maker_flow_recover"
+                )
+                _append_jsonl(
+                    output_dir / "bchusdt_loop_trade_audit.jsonl",
+                    [
+                        {
+                            "id": 9001,
+                            "orderId": 811,
+                            "clientOrderId": "ordinary-811",
+                            "symbol": "BCHUSDT",
+                            "side": "BUY",
+                            "positionSide": "LONG",
+                            "time": int(
+                                (now - timedelta(seconds=1)).timestamp() * 1000
+                            ),
+                            "qty": "0.02",
+                        }
+                    ],
+                )
+                result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                    symbol="BCHUSDT",
+                    output_dir=output_dir,
+                    guard_state=guard_state,
+                    now=now,
+                    window_seconds=60,
+                    min_volume_notional=10,
+                    near_cap_ratio=0.95,
+                    far_ticks=8,
+                    plan_stale_seconds=300,
+                    dry_run=False,
+                    runner_wrapper="/unused",
+                    runner_active_fetcher=lambda _symbol: True,
+                    restart_runner=restarts.append,
+                    fetch_open_orders=lambda _symbol: [],
+                    cancel_order=lambda _symbol, _order_id: (_ for _ in ()).throw(
+                        AssertionError("filled ordinary order was canceled")
+                    ),
+                    fetch_user_trades_page=(
+                        lambda _symbol, start_ms, _end_ms, _limit: [
+                            {
+                                "id": 9001,
+                                "orderId": 811,
+                                "time": start_ms + 1,
+                            }
+                        ]
+                    ),
+                )
+
+            self.assertEqual(ordinary_loader.call_count, 2)
+            self.assertEqual(result["action"], "coordinator_maker_flow_recover_exit")
+            self.assertEqual(result["phase"], "cleaning")
+            self.assertEqual(
+                result["ordinary_typed_receipt_interface"],
+                "strict_plan_submit_manifest_and_user_trades_fill",
+            )
+            self.assertEqual(restarts, ["BCHUSDT"])
+
+    def test_corrupt_ordinary_journal_does_not_erase_effect_receipt(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            now = datetime(2026, 7, 16, 0, 2, tzinfo=timezone.utc)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            store = JsonRecoveryStore(control_path)
+            flow_key = FlowRoleKey(
+                LedgerClass.NORMAL_BQ,
+                Side.BUY,
+                OrderRole.ENTRY,
+            )
+            initial = store.register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=now - timedelta(minutes=1),
+            ).with_flow_clock(
+                flow_key,
+                quote_missing_since=now - timedelta(minutes=5),
+                submit_missing_since=now - timedelta(minutes=5),
+                fill_missing_since=now - timedelta(minutes=5),
+            )
+            blockers = FlowBlockerAssessment(
+                missing_entry_sides=(Side.BUY,),
+                episode_fingerprint="corrupt-ordinary-journal",
+            )
+            active = FuturesRecoveryDecisionEngine().plan_round(
+                snapshot=SymbolSnapshot(
+                    symbol="BCHUSDT",
+                    captured_at=now - timedelta(seconds=4),
+                    assessment=blockers,
+                ),
+                state=initial,
+                now=now - timedelta(seconds=4),
+                round_id="corrupt-ordinary-enter",
+            ).next_state
+            store.compare_and_swap(
+                "BCHUSDT", expected_revision=0, next_state=active
+            )
+            assert active.pending_effect_epoch is not None
+            guard_state: dict[str, object] = {}
+            runtime_item = bq_volume_recovery_guard._symbol_state(
+                guard_state,
+                "BCHUSDT",
+            )
+            runtime_item["registered_recovery_runtime_evidence"] = {
+                "schema": "registered_recovery_runtime_v1",
+                "symbol": "BCHUSDT",
+                "decision_id": active.decision_id,
+                "generation": active.generation,
+                "profile_digest": active.desired_profile.digest,
+                "effect_receipt": {
+                    "stage": "runner_restart",
+                    "effect_epoch": active.pending_effect_epoch,
+                    "observed_at": (now - timedelta(seconds=1)).isoformat(),
+                },
+                "cleanup_proof": None,
+            }
+            restarts: list[str] = []
+
+            with (
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "load_recovery_admission_evidence",
+                    return_value=RecoveryAdmissionEvidence(
+                        plan_observed_at=now - timedelta(seconds=2),
+                        submit_observed_at=now - timedelta(seconds=1),
+                    ),
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "flow_blockers_from_legacy",
+                    return_value=blockers,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "load_recovery_config_applied_evidence",
+                    return_value=RecoveryConfigAppliedEvidence(),
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "load_ordinary_recovery_runtime_evidence",
+                    side_effect=InventoryRecoveryReceiptJournalError(
+                        "corrupt ordinary journal"
+                    ),
+                ),
+            ):
+                result = (
+                    bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                        symbol="BCHUSDT",
+                        output_dir=output_dir,
+                        guard_state=guard_state,
+                        now=now,
+                        window_seconds=60,
+                        min_volume_notional=10,
+                        near_cap_ratio=0.95,
+                        far_ticks=8,
+                        plan_stale_seconds=300,
+                        dry_run=False,
+                        runner_wrapper="/unused",
+                        runner_active_fetcher=lambda _symbol: True,
+                        restart_runner=restarts.append,
+                    )
+                )
+
+            self.assertEqual(result["effect_count"], 0)
+            self.assertEqual(result["phase"], "active")
+            self.assertEqual(restarts, [])
+            self.assertIn(
+                "registered_recovery_runtime_evidence",
+                runtime_item,
+            )
+
+    def test_main_registered_symbol_bypasses_every_legacy_actuator(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "arxusdt_loop_runner_control.json"
+            JsonRecoveryStore(control_path).register_symbol(
+                "ARXUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            registered_result = {
+                "symbol": "ARXUSDT",
+                "action": "coordinator_noop_hold",
+                "effect_count": 0,
+                "control_cas_count": 1,
+            }
+            stdout = StringIO()
+            with (
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "_terminal_drain_delegation",
+                    return_value=None,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "run_registered_recovery_symbol_round",
+                    return_value=registered_result,
+                ) as registered,
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_corrupt_loop_state",
+                    side_effect=AssertionError("legacy corrupt-state actuator called"),
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_inactive_runner",
+                    side_effect=AssertionError("legacy inactive actuator called"),
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_arx_effective_control_drift",
+                    side_effect=AssertionError("legacy control-drift actuator called"),
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_arx_runner_error_loop",
+                    side_effect=AssertionError("legacy runner-error actuator called"),
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_arx_exchange_order_drift",
+                    side_effect=AssertionError("legacy order-drift actuator called"),
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "check_symbol",
+                    side_effect=AssertionError("legacy check_symbol called"),
+                ),
+                redirect_stdout(stdout),
+            ):
+                exit_code = bq_volume_recovery_guard.main(
+                    [
+                        "--output-dir",
+                        str(output_dir),
+                        "--state-path",
+                        str(output_dir / "guard_state.json"),
+                        "--symbols",
+                        "ARXUSDT",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            registered.assert_called_once()
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["results"], [registered_result])
+
+    def test_main_registered_terminal_owner_handoffs_to_coordinator_before_delegation(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            JsonRecoveryStore(control_path).register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            terminal = {
+                "symbol": "BCHUSDT",
+                "action": "delegated_to_terminal_drain_owner",
+                "terminal_drain_decision_id": "BCHUSDT|run-1",
+                "terminal_drain_exit_status": "exiting",
+            }
+            registered_result = {
+                "symbol": "BCHUSDT",
+                "action": "coordinator_terminal_handoff_enter",
+                "phase": "cleaning",
+                "effect_count": 1,
+                "control_cas_count": 1,
+            }
+            stdout = StringIO()
+            with (
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "_terminal_drain_delegation",
+                    return_value=terminal,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "run_registered_recovery_symbol_round",
+                    return_value=registered_result,
+                ) as registered,
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "check_symbol",
+                    side_effect=AssertionError("registered terminal fell into legacy path"),
+                ),
+                redirect_stdout(stdout),
+            ):
+                exit_code = bq_volume_recovery_guard.main(
+                    [
+                        "--output-dir",
+                        str(output_dir),
+                        "--state-path",
+                        str(output_dir / "guard_state.json"),
+                        "--symbols",
+                        "BCHUSDT",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            registered.assert_called_once()
+            self.assertEqual(
+                registered.call_args.kwargs["terminal_delegation"], terminal
+            )
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["results"], [registered_result])
+
+    def test_main_registered_blocked_is_critical_nonzero_without_fallback(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            JsonRecoveryStore(
+                output_dir / "arxusdt_loop_runner_control.json"
+            ).register_symbol(
+                "ARXUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            blocked = {
+                "symbol": "ARXUSDT",
+                "action": "registered_recovery_blocked",
+                "reason": "runtime_evidence_invalid",
+                "liveness_status": "blocked",
+                "severity": "critical",
+                "effect_count": 0,
+                "control_cas_count": 0,
+            }
+            stdout = StringIO()
+            with (
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "_terminal_drain_delegation",
+                    return_value=None,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "run_registered_recovery_symbol_round",
+                    return_value=blocked,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_corrupt_loop_state",
+                    side_effect=AssertionError("registered symbol fell back"),
+                ),
+                redirect_stdout(stdout),
+            ):
+                exit_code = bq_volume_recovery_guard.main(
+                    [
+                        "--output-dir",
+                        str(output_dir),
+                        "--state-path",
+                        str(output_dir / "guard_state.json"),
+                        "--symbols",
+                        "ARXUSDT",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            payload = json.loads(stdout.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["results"], [blocked])
+            guard_state = json.loads(
+                (output_dir / "guard_state.json").read_text(encoding="utf-8")
+            )
+            self.assertIsInstance(guard_state, dict)
+
+    def test_registered_raw_active_allow_loss_is_repaired_false_in_one_round(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "arxusdt_loop_runner_control.json"
+            store = JsonRecoveryStore(control_path)
+            registered = store.register_symbol(
+                "ARXUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            control = json.loads(control_path.read_text(encoding="utf-8"))
+            control["best_quote_maker_volume_allow_loss_reduce_only"] = True
+            _write_json(control_path, control)
+            restarts: list[str] = []
+
+            result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="ARXUSDT",
+                output_dir=output_dir,
+                guard_state={},
+                now=datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc),
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: (_ for _ in ()).throw(
+                    AssertionError("runner observation should not occur")
+                ),
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(result["action"], "registered_flat_profile_repair")
+            self.assertEqual(result["reason"], "embedded_desired_profile_reconcile")
+            self.assertEqual(
+                result["changed_keys"],
+                ["best_quote_maker_volume_allow_loss_reduce_only"],
+            )
+            self.assertEqual(result["control_cas_count"], 0)
+            self.assertEqual(result["effect_count"], 1)
+            self.assertEqual(result["liveness_status"], "recovering")
+            self.assertEqual(restarts, [])
+            repaired = json.loads(control_path.read_text(encoding="utf-8"))
+            self.assertIs(
+                repaired["best_quote_maker_volume_allow_loss_reduce_only"],
+                False,
+            )
+            self.assertEqual(store.read("ARXUSDT"), registered)
+
+    def test_registered_flat_managed_drift_repairs_only_embedded_profile(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            store = JsonRecoveryStore(control_path)
+            registered = store.register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                    "max_new_orders": 8,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            control = json.loads(control_path.read_text(encoding="utf-8"))
+            control["max_new_orders"] = 0
+            control["unrelated_operator_note"] = "preserve"
+            _write_json(control_path, control)
+
+            result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state={},
+                now=datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc),
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: (_ for _ in ()).throw(
+                    AssertionError("flat repair must consume the only action")
+                ),
+            )
+
+            self.assertEqual(result["action"], "registered_flat_profile_repair")
+            self.assertEqual(result["changed_keys"], ["max_new_orders"])
+            repaired = json.loads(control_path.read_text(encoding="utf-8"))
+            self.assertEqual(repaired["max_new_orders"], 8)
+            self.assertEqual(repaired["unrelated_operator_note"], "preserve")
+            self.assertEqual(store.read("BCHUSDT"), registered)
+
+    def test_registered_inactive_runner_uses_one_coordinator_cas_and_one_effect(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "arxusdt_loop_runner_control.json"
+            JsonRecoveryStore(control_path).register_symbol(
+                "ARXUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            guard_state: dict[str, object] = {}
+            restarts: list[str] = []
+
+            result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="ARXUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc),
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: False,
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(result["action"], "coordinator_runner_recover_enter")
+            self.assertEqual(result["snapshot_count"], 1)
+            self.assertEqual(result["control_cas_count"], 1)
+            self.assertEqual(result["effect_count"], 1)
+            self.assertEqual(result["effect_stage"], "runner_restart")
+            self.assertEqual(restarts, ["ARXUSDT"])
+            persisted = JsonRecoveryStore(control_path).read("ARXUSDT")
+            self.assertEqual(persisted.phase.value, "active")
+            self.assertEqual(persisted.active_action.value, "runner_recover")
+            item = guard_state["symbols"]["ARXUSDT"]
+            self.assertEqual(
+                item["registered_recovery_runtime_evidence"]["effect_receipt"][
+                    "stage"
+                ],
+                "runner_restart",
+            )
+            cleared = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="ARXUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=datetime(2026, 7, 16, 0, 1, 1, tzinfo=timezone.utc),
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+            )
+            self.assertEqual(cleared.get("phase"), "cooldown", cleared)
+            self.assertEqual(cleared["effect_count"], 0)
+            self.assertEqual(cleared["control_cas_count"], 1)
+            self.assertEqual(restarts, ["ARXUSDT"])
+
+    def test_registered_terminal_stop_executes_one_stop_effect_with_receipt(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            now = datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            state = JsonRecoveryStore(control_path).register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=now - timedelta(minutes=1),
+            )
+            _write_registered_normal_reports(
+                output_dir=output_dir,
+                state=state,
+                generated_at=now,
+            )
+            stops: list[str] = []
+            guard_state: dict[str, object] = {}
+            with patch.object(
+                bq_volume_recovery_guard,
+                "flow_blockers_from_legacy",
+                return_value=FlowBlockerAssessment(
+                    terminal_reason="competition_target_confirmed",
+                    terminal_clean_flat_proof=True,
+                ),
+            ):
+                result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                    symbol="BCHUSDT",
+                    output_dir=output_dir,
+                    guard_state=guard_state,
+                    now=now,
+                    window_seconds=60,
+                    min_volume_notional=10,
+                    near_cap_ratio=0.95,
+                    far_ticks=8,
+                    plan_stale_seconds=300,
+                    dry_run=False,
+                    runner_wrapper="/unused",
+                    runner_active_fetcher=lambda _symbol: True,
+                    restart_runner=lambda _symbol: (_ for _ in ()).throw(
+                        AssertionError("terminal stop used restart effect")
+                    ),
+                    stop_runner=stops.append,
+                )
+
+            self.assertEqual(result["action"], "coordinator_terminal_stop_enter")
+            self.assertEqual(result["effect_stage"], "runner_stop")
+            self.assertEqual(result["effect_count"], 1)
+            self.assertEqual(result["control_cas_count"], 1)
+            self.assertEqual(stops, ["BCHUSDT"])
+            receipt = guard_state["symbols"]["BCHUSDT"][
+                "registered_recovery_runtime_evidence"
+            ]["effect_receipt"]
+            self.assertEqual(receipt["stage"], "runner_stop")
+            persisted = JsonRecoveryStore(control_path).read("BCHUSDT")
+            self.assertEqual(persisted.phase.value, "stop_pending")
+            self.assertEqual(persisted.active_action.value, "terminal_stop")
+
+            terminal = {
+                "symbol": "BCHUSDT",
+                "action": "delegated_to_terminal_drain_intent",
+                "terminal_drain_intent_id": "BCHUSDT-terminal-after-stop",
+                "terminal_drain_intent_status": "pending",
+                "terminal_recovery_reason": "trusted_lifecycle_terminal_handoff",
+            }
+            confirmed = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now + timedelta(seconds=1),
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: False,
+                restart_runner=lambda _symbol: (_ for _ in ()).throw(
+                    AssertionError("terminal handoff restarted runner")
+                ),
+                stop_runner=stops.append,
+                terminal_delegation=terminal,
+            )
+            self.assertEqual(confirmed["action"], "coordinator_terminal_stop_advance")
+            self.assertEqual(confirmed["phase"], "stopped")
+            self.assertEqual(confirmed["effect_count"], 0)
+            self.assertEqual(stops, ["BCHUSDT"])
+
+            released = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now + timedelta(seconds=2),
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: False,
+                restart_runner=lambda _symbol: (_ for _ in ()).throw(
+                    AssertionError("terminal handoff restarted runner")
+                ),
+                stop_runner=stops.append,
+                terminal_delegation=terminal,
+            )
+            self.assertEqual(
+                released["action"],
+                "coordinator_terminal_handoff_exit",
+            )
+            self.assertEqual(released["phase"], "stable")
+            self.assertEqual(released["effect_count"], 0)
+            self.assertEqual(stops, ["BCHUSDT"])
+
+            delegated = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now + timedelta(seconds=3),
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                terminal_delegation=terminal,
+            )
+            self.assertEqual(
+                delegated["action"],
+                "delegated_to_terminal_drain_intent",
+            )
+            self.assertEqual(delegated["recovery_phase"], "stable")
+            self.assertEqual(delegated["recovery_handoff_status"], "ready")
+
+    def test_registered_inactive_runner_ignores_unowned_historical_stop_event(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            now = datetime(2026, 7, 16, 0, 10, tzinfo=timezone.utc)
+            control_path = output_dir / "arxusdt_loop_runner_control.json"
+            JsonRecoveryStore(control_path).register_symbol(
+                "ARXUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=now - timedelta(minutes=10),
+            )
+            _append_jsonl(
+                output_dir / "arxusdt_loop_events.jsonl",
+                [
+                    {
+                        "ts": (now - timedelta(minutes=9)).isoformat(),
+                        "runtime_status": "stopped",
+                        "stop_reason": "max_actual_net_notional_hit",
+                    },
+                    {
+                        "ts": (now - timedelta(minutes=5)).isoformat(),
+                        "runtime_status": "running",
+                        "cycle": 1,
+                    },
+                ],
+            )
+            restarts: list[str] = []
+
+            result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="ARXUSDT",
+                output_dir=output_dir,
+                guard_state={},
+                now=now,
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: False,
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(result["action"], "coordinator_runner_recover_enter")
+            self.assertEqual(result["effect_count"], 1)
+            self.assertIsNone(result["known_stop_reason"])
+            self.assertEqual(restarts, ["ARXUSDT"])
+
+    def test_registered_restoring_uses_only_real_generic_config_applied_proof(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "arxusdt_loop_runner_control.json"
+            store = JsonRecoveryStore(control_path)
+            initial = store.register_symbol(
+                "ARXUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            engine = FuturesRecoveryDecisionEngine()
+            entered = engine.plan_round(
+                snapshot=SymbolSnapshot(
+                    symbol="ARXUSDT",
+                    captured_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+                    assessment=FlowBlockerAssessment(
+                        missing_entry_sides=(Side.BUY,)
+                    ),
+                ),
+                state=initial,
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+                round_id="registered-maker-enter",
+            )
+            store.compare_and_swap(
+                "ARXUSDT", expected_revision=0, next_state=entered.next_state
+            )
+            cleaning = engine.plan_round(
+                snapshot=SymbolSnapshot(
+                    symbol="ARXUSDT",
+                    captured_at=datetime(
+                        2026, 7, 16, 0, 0, 1, tzinfo=timezone.utc
+                    ),
+                    assessment=FlowBlockerAssessment(),
+                    effect_receipt=EffectReceipt(
+                        decision_id=entered.next_state.decision_id,
+                        stage=EffectStage.RUNNER_RESTART,
+                        effect_epoch=entered.effect_epoch,
+                        observed_at=datetime(
+                            2026, 7, 16, 0, 0, 1, tzinfo=timezone.utc
+                        ),
+                    ),
+                ),
+                state=entered.next_state,
+                now=datetime(2026, 7, 16, 0, 0, 1, tzinfo=timezone.utc),
+                round_id="registered-maker-exit",
+            ).next_state
+            store.compare_and_swap(
+                "ARXUSDT", expected_revision=1, next_state=cleaning
+            )
+            self.assertEqual(cleaning.phase, RecoveryPhase.CLEANING)
+            obligation = cleaning.cleanup_obligation
+            assert obligation is not None
+            cleanup_at = datetime(
+                2026, 7, 16, 0, 0, 2, tzinfo=timezone.utc
+            )
+            restoring = engine.plan_round(
+                snapshot=SymbolSnapshot(
+                    symbol="ARXUSDT",
+                    captured_at=cleanup_at,
+                    assessment=FlowBlockerAssessment(),
+                    cleanup_proof=CleanupProof(
+                        source_decision_id=obligation.source_decision_id,
+                        source_generation=(
+                            obligation.managed_order_manifest.generation
+                        ),
+                        manifest_digest=(
+                            obligation.managed_order_manifest.digest
+                        ),
+                        remaining_order_ids=(),
+                        user_trades_watermark=0,
+                        observed_at=cleanup_at,
+                    ),
+                ),
+                state=cleaning,
+                now=cleanup_at,
+                round_id="registered-maker-cleaned",
+            ).next_state
+            store.compare_and_swap(
+                "ARXUSDT", expected_revision=2, next_state=restoring
+            )
+            applied = RecoveryConfigAppliedEvidence(
+                applied_generation=restoring.generation,
+                applied_profile_digest=restoring.desired_profile.digest,
+                receipt_id="rca-real-runner-proof",
+                runner_instance_id="runner-instance-1",
+                observed_at=datetime(
+                    2026, 7, 16, 0, 0, 3, tzinfo=timezone.utc
+                ),
+                latest_observation_seq=3,
+            )
+
+            with (
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "load_recovery_config_applied_evidence",
+                    return_value=applied,
+                ) as generic_applied,
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "load_temporary_loss_runtime_evidence",
+                    side_effect=AssertionError(
+                        "RESTORING consumed temporary-loss applied fallback"
+                    ),
+                ),
+            ):
+                result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                    symbol="ARXUSDT",
+                    output_dir=output_dir,
+                    guard_state={},
+                    now=datetime(2026, 7, 16, 0, 0, 3, tzinfo=timezone.utc),
+                    window_seconds=60,
+                    min_volume_notional=10,
+                    near_cap_ratio=0.95,
+                    far_ticks=8,
+                    plan_stale_seconds=300,
+                    dry_run=False,
+                    runner_wrapper="/unused",
+                    runner_active_fetcher=lambda _symbol: True,
+                    restart_runner=lambda _symbol: (_ for _ in ()).throw(
+                        AssertionError("applied restore restarted again")
+                    ),
+                )
+
+            generic_applied.assert_called_once()
+            self.assertEqual(result["phase"], "cooldown")
+            self.assertEqual(result["effect_count"], 0)
+            self.assertEqual(result["control_cas_count"], 1)
+
+    def test_registered_fresh_fenced_reports_admit_ordinary_inventory_first(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            now = datetime(2026, 7, 16, 0, 2, tzinfo=timezone.utc)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            store = JsonRecoveryStore(control_path)
+            state = store.register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                    "best_quote_maker_volume_max_long_notional": 100.0,
+                    "best_quote_maker_volume_max_short_notional": 100.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.8,
+                },
+                now=now - timedelta(seconds=5),
+            )
+            _write_registered_normal_reports(
+                output_dir=output_dir,
+                state=state,
+                generated_at=now - timedelta(seconds=1),
+                current_long_notional=95.0,
+                loss_sides=(Side.SELL,),
+            )
+            restarts: list[str] = []
+
+            guard_state = {
+                "symbols": {
+                    "BCHUSDT": {
+                        "registered_recovery_flow_observation": {
+                            "schema": "registered_recovery_flow_observation_v1",
+                            "symbol": "BCHUSDT",
+                            "episode_fingerprint": "old-completed-episode",
+                            "inventory_reduce_sides": ["SELL"],
+                            "loss_only_blocked_sides": ["SELL"],
+                            "missing_entry_sides": [],
+                            "plan_observed_at": (
+                                now - timedelta(minutes=2)
+                            ).isoformat(),
+                            "submit_observed_at": (
+                                now - timedelta(minutes=2)
+                            ).isoformat(),
+                        }
+                    }
+                }
+            }
+            result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(result["action"], "coordinator_inventory_recover_enter")
+            self.assertEqual(result["side"], "SELL")
+            self.assertEqual(result["flow_observation_status"], "fresh")
+            self.assertEqual(result["effect_count"], 1)
+            self.assertEqual(restarts, ["BCHUSDT"])
+
+    def test_registered_missing_entry_waits_for_flow_sla_before_one_maker_side(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            now = datetime(2026, 7, 16, 0, 2, tzinfo=timezone.utc)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            store = JsonRecoveryStore(control_path)
+            state = store.register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                    "best_quote_maker_volume_max_long_notional": 100.0,
+                    "best_quote_maker_volume_max_short_notional": 100.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.8,
+                },
+                now=now - timedelta(seconds=5),
+            )
+            _write_registered_normal_reports(
+                output_dir=output_dir,
+                state=state,
+                generated_at=now - timedelta(seconds=1),
+            )
+            plan_path = output_dir / "bchusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["sell_orders"] = [
+                {
+                    "side": "SELL",
+                    "price": 500.0,
+                    "qty": 0.01,
+                    "role": "best_quote_entry_short",
+                }
+            ]
+            _write_json(plan_path, plan)
+            restarts: list[str] = []
+
+            guard_state: dict[str, object] = {}
+            first = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(first["action"], "coordinator_noop_hold")
+            self.assertEqual(restarts, [])
+
+            later = now + timedelta(seconds=121)
+            current = store.read("BCHUSDT")
+            _write_registered_normal_reports(
+                output_dir=output_dir,
+                state=current,
+                generated_at=later - timedelta(seconds=1),
+            )
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["sell_orders"] = [
+                {
+                    "side": "SELL",
+                    "price": 500.0,
+                    "qty": 0.01,
+                    "role": "best_quote_entry_short",
+                }
+            ]
+            _write_json(plan_path, plan)
+            second = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=later,
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(
+                second["action"], "coordinator_maker_flow_recover_enter"
+            )
+            self.assertEqual(second["side"], "BUY")
+            self.assertEqual(second["order_role"], "entry")
+            self.assertEqual(restarts, ["BCHUSDT"])
+
+    def test_registered_unavailable_reports_carry_current_episode_through_restore_and_cooldown(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            now = datetime(2026, 7, 16, 0, 4, tzinfo=timezone.utc)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            store = JsonRecoveryStore(control_path)
+            initial = store.register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                    "best_quote_maker_volume_max_long_notional": 100.0,
+                    "best_quote_maker_volume_max_short_notional": 100.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.8,
+                },
+                now=now - timedelta(seconds=5),
+            )
+            _write_registered_normal_reports(
+                output_dir=output_dir,
+                state=initial,
+                generated_at=now - timedelta(seconds=1),
+                current_long_notional=95.0,
+                loss_sides=(Side.SELL,),
+            )
+            guard_state: dict[str, object] = {}
+            restarts: list[str] = []
+            entered = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+            )
+            self.assertEqual(entered["active_action"], "inventory_recover")
+            active = store.read("BCHUSDT")
+            self.assertIsNotNone(active.progress_deadline_at)
+
+            deadline = active.progress_deadline_at
+            timed_out = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=deadline,
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+                fetch_open_orders=lambda _symbol: [],
+                cancel_order=lambda _symbol, _order_id: (_ for _ in ()).throw(
+                    AssertionError("empty manifest canceled an order")
+                ),
+                fetch_user_trades_page=lambda *_args: [],
+            )
+            self.assertEqual(timed_out["phase"], "cleaning")
+            self.assertEqual(
+                timed_out["flow_observation_status"],
+                "carried_observation_unavailable",
+            )
+            cleaned = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=deadline + timedelta(seconds=1),
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+                fetch_open_orders=lambda _symbol: [],
+                cancel_order=lambda _symbol, _order_id: (_ for _ in ()).throw(
+                    AssertionError("empty manifest canceled an order")
+                ),
+                fetch_user_trades_page=lambda *_args: [],
+            )
+            self.assertEqual(cleaned["phase"], "restoring")
+            restoring = store.read("BCHUSDT")
+            self.assertTrue(
+                restoring.attempt_exhausted(
+                    ActionId.INVENTORY_RECOVER,
+                    Side.SELL,
+                    OrderRole.REDUCE_ONLY,
+                )
+            )
+            applied = RecoveryConfigAppliedEvidence(
+                applied_generation=restoring.generation,
+                applied_profile_digest=restoring.desired_profile.digest,
+                receipt_id="rca-carried-restore",
+                runner_instance_id="runner-carried-restore",
+                observed_at=deadline + timedelta(seconds=2),
+                latest_observation_seq=1,
+            )
+            with patch.object(
+                bq_volume_recovery_guard,
+                "load_recovery_config_applied_evidence",
+                return_value=applied,
+            ):
+                restored = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                    symbol="BCHUSDT",
+                    output_dir=output_dir,
+                    guard_state=guard_state,
+                    now=deadline + timedelta(seconds=2),
+                    window_seconds=60,
+                    min_volume_notional=10,
+                    near_cap_ratio=0.95,
+                    far_ticks=8,
+                    plan_stale_seconds=300,
+                    dry_run=False,
+                    runner_wrapper="/unused",
+                    runner_active_fetcher=lambda _symbol: True,
+                    restart_runner=restarts.append,
+                )
+            self.assertEqual(restored["phase"], "cooldown")
+            self.assertEqual(
+                restored["flow_observation_status"],
+                "carried_observation_unavailable",
+            )
+            cooldown = store.read("BCHUSDT")
+            self.assertIsNotNone(cooldown.cooldown_until)
+
+            finished = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=cooldown.cooldown_until,
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+            )
+            self.assertEqual(finished["phase"], "stable")
+            stable = store.read("BCHUSDT")
+            self.assertTrue(
+                stable.attempt_exhausted(
+                    ActionId.INVENTORY_RECOVER,
+                    Side.SELL,
+                    OrderRole.REDUCE_ONLY,
+                )
+            )
+            self.assertEqual(restarts, ["BCHUSDT", "BCHUSDT"])
+
+    def test_registered_stale_admission_is_visible_and_cannot_guess_an_action(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            now = datetime(2026, 7, 16, 0, 2, tzinfo=timezone.utc)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            store = JsonRecoveryStore(control_path)
+            state = store.register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                    "best_quote_maker_volume_max_long_notional": 100.0,
+                    "best_quote_maker_volume_max_short_notional": 100.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.8,
+                },
+                now=now - timedelta(minutes=2),
+            )
+            _write_registered_normal_reports(
+                output_dir=output_dir,
+                state=state,
+                generated_at=now - timedelta(seconds=31),
+                current_long_notional=95.0,
+                loss_sides=(Side.SELL,),
+            )
+            guard_state = {
+                "symbols": {
+                    "BCHUSDT": {
+                        "registered_recovery_flow_observation": {
+                            "schema": "registered_recovery_flow_observation_v1",
+                            "symbol": "BCHUSDT",
+                            "episode_fingerprint": "old-completed-episode",
+                            "inventory_reduce_sides": ["SELL"],
+                            "loss_only_blocked_sides": ["SELL"],
+                            "missing_entry_sides": [],
+                            "plan_observed_at": (
+                                now - timedelta(minutes=2)
+                            ).isoformat(),
+                            "submit_observed_at": (
+                                now - timedelta(minutes=2)
+                            ).isoformat(),
+                        }
+                    }
+                }
+            }
+            result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=lambda _symbol: (_ for _ in ()).throw(
+                    AssertionError("stale observation guessed a recovery effect")
+                ),
+            )
+
+            self.assertEqual(result["action"], "registered_recovery_observe_only")
+            self.assertEqual(result["reason"], "recovery_readiness_sla_pending")
+            self.assertEqual(result["readiness_elapsed_seconds"], 0.0)
+            self.assertEqual(result["control_cas_count"], 0)
+            self.assertEqual(store.read("BCHUSDT").document_revision, 0)
+
+    def test_registered_corrupt_runner_receipt_is_quarantined_not_permanently_blocked(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            now = datetime(2026, 7, 16, 0, 2, tzinfo=timezone.utc)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            store = JsonRecoveryStore(control_path)
+            state = store.register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=now - timedelta(minutes=1),
+            )
+            _write_registered_normal_reports(
+                output_dir=output_dir,
+                state=state,
+                generated_at=now,
+            )
+            restarts: list[str] = []
+            with patch.object(
+                bq_volume_recovery_guard,
+                "load_recovery_config_applied_evidence",
+                side_effect=RecoveryConfigAppliedReceiptJournalError(
+                    "corrupt config-applied journal"
+                ),
+            ):
+                result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                    symbol="BCHUSDT",
+                    output_dir=output_dir,
+                    guard_state={},
+                    now=now,
+                    window_seconds=60,
+                    min_volume_notional=10,
+                    near_cap_ratio=0.95,
+                    far_ticks=8,
+                    plan_stale_seconds=300,
+                    dry_run=False,
+                    runner_wrapper="/unused",
+                    runner_active_fetcher=lambda _symbol: True,
+                    restart_runner=restarts.append,
+                )
+
+            self.assertEqual(
+                result["action"],
+                "coordinator_noop_hold",
+            )
+            self.assertEqual(result["control_cas_count"], 1)
+            self.assertEqual(result["effect_count"], 0)
+            self.assertEqual(restarts, [])
+            self.assertIn(
+                "RecoveryConfigAppliedReceiptJournalError",
+                result["flow_observation_error"],
+            )
+            persisted = store.read("BCHUSDT")
+            self.assertEqual(persisted.active_action, ActionId.NOOP)
+
+    def test_registered_progress_uses_full_manifest_before_cleanup_needed_event(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            now = datetime(2026, 7, 16, 0, 3, tzinfo=timezone.utc)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            store = JsonRecoveryStore(control_path)
+            initial = store.register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=now,
+            ).with_exhausted_attempt(
+                ActionId.INVENTORY_RECOVER,
+                Side.SELL,
+                OrderRole.REDUCE_ONLY,
+                now=now,
+            )
+            blockers = FlowBlockerAssessment(
+                inventory_reduce_sides=(Side.SELL,),
+                loss_only_blocked_sides=(Side.SELL,),
+                episode_fingerprint="bch-progress-manifest",
+            )
+            engine = FuturesRecoveryDecisionEngine()
+            settling = engine.plan_round(
+                snapshot=SymbolSnapshot(
+                    symbol="BCHUSDT",
+                    captured_at=now,
+                    assessment=blockers,
+                ),
+                state=initial,
+                now=now,
+                round_id="manifest-loss-enter",
+            ).next_state
+            store.compare_and_swap(
+                "BCHUSDT", expected_revision=0, next_state=settling
+            )
+            assert settling.action_lease is not None
+            activated_at = now + timedelta(seconds=1)
+            active = engine.plan_round(
+                snapshot=SymbolSnapshot(
+                    symbol="BCHUSDT",
+                    captured_at=activated_at,
+                    assessment=blockers,
+                    activation_receipt=ActivationReceipt(
+                        decision_id=str(settling.decision_id),
+                        generation=settling.generation,
+                        profile_digest=settling.desired_profile.digest,
+                        action_lease_epoch=settling.action_lease.epoch,
+                        observed_at=activated_at,
+                    ),
+                ),
+                state=settling,
+                now=activated_at,
+                round_id="manifest-loss-activate",
+            ).next_state
+            store.compare_and_swap(
+                "BCHUSDT", expected_revision=1, next_state=active
+            )
+            progress_at = activated_at + timedelta(seconds=1)
+            evidence = TemporaryLossRuntimeEvidence(
+                progress_receipts=(),
+                accepted_order_ids=("701",),
+                accepted_client_order_ids=("typed-loss-701",),
+                accepted_order_pairs=(("701", "typed-loss-701"),),
+                cleanup_requested=False,
+                latest_observation_seq=1,
+            )
+            _append_jsonl(
+                output_dir / "bchusdt_loop_trade_audit.jsonl",
+                [
+                    {
+                        "id": 1701,
+                        "orderId": 701,
+                        "clientOrderId": "typed-loss-701",
+                        "symbol": "BCHUSDT",
+                        "side": "SELL",
+                        "positionSide": "LONG",
+                        "time": int(progress_at.timestamp() * 1000),
+                        "qty": "0.02",
+                    }
+                ],
+            )
+
+            with patch.object(
+                bq_volume_recovery_guard,
+                "load_temporary_loss_runtime_evidence",
+                return_value=evidence,
+            ):
+                result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                    symbol="BCHUSDT",
+                    output_dir=output_dir,
+                    guard_state={},
+                    now=progress_at,
+                    window_seconds=60,
+                    min_volume_notional=10,
+                    near_cap_ratio=0.95,
+                    far_ticks=8,
+                    plan_stale_seconds=300,
+                    dry_run=False,
+                    runner_wrapper="/unused",
+                    runner_active_fetcher=lambda _symbol: True,
+                    restart_runner=lambda _symbol: (_ for _ in ()).throw(
+                        AssertionError("progress cleanup restarted runner")
+                    ),
+                    fetch_open_orders=lambda _symbol: [],
+                    cancel_order=lambda _symbol, _order_id: (_ for _ in ()).throw(
+                        AssertionError("FILLED order was canceled")
+                    ),
+                    fetch_user_trades_page=(
+                        lambda _symbol, start_ms, _end_ms, _limit: [
+                            {"id": 1701, "orderId": 701, "time": start_ms + 1}
+                        ]
+                    ),
+                )
+
+            self.assertEqual(result["phase"], "cleaning")
+            self.assertEqual(result["effect_stage"], "managed_gtx_cancel")
+            cleaning = store.read("BCHUSDT")
+            self.assertIsNotNone(cleaning.cleanup_obligation)
+            self.assertEqual(cleaning.cleanup_obligation.open_order_ids, ("701",))
+            self.assertFalse(cleaning.cleanup_obligation.needs_manifest_rebuild)
+
+    def test_registered_terminal_handoff_cleans_manifest_then_reaches_stable(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            now = datetime(2026, 7, 16, 0, 6, tzinfo=timezone.utc)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            store = JsonRecoveryStore(control_path)
+            initial = store.register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=now,
+            ).with_exhausted_attempt(
+                ActionId.INVENTORY_RECOVER,
+                Side.SELL,
+                OrderRole.REDUCE_ONLY,
+                now=now,
+            )
+            blockers = FlowBlockerAssessment(
+                inventory_reduce_sides=(Side.SELL,),
+                loss_only_blocked_sides=(Side.SELL,),
+                episode_fingerprint="terminal-manifest",
+            )
+            engine = FuturesRecoveryDecisionEngine()
+            settling = engine.plan_round(
+                snapshot=SymbolSnapshot(
+                    symbol="BCHUSDT",
+                    captured_at=now,
+                    assessment=blockers,
+                ),
+                state=initial,
+                now=now,
+                round_id="terminal-manifest-enter",
+            ).next_state
+            store.compare_and_swap(
+                "BCHUSDT", expected_revision=0, next_state=settling
+            )
+            assert settling.action_lease is not None
+            activated_at = now + timedelta(seconds=1)
+            active = engine.plan_round(
+                snapshot=SymbolSnapshot(
+                    symbol="BCHUSDT",
+                    captured_at=activated_at,
+                    assessment=blockers,
+                    activation_receipt=ActivationReceipt(
+                        decision_id=str(settling.decision_id),
+                        generation=settling.generation,
+                        profile_digest=settling.desired_profile.digest,
+                        action_lease_epoch=settling.action_lease.epoch,
+                        observed_at=activated_at,
+                    ),
+                ),
+                state=settling,
+                now=activated_at,
+                round_id="terminal-manifest-activate",
+            ).next_state
+            store.compare_and_swap(
+                "BCHUSDT", expected_revision=1, next_state=active
+            )
+            client_order_id = (
+                f"{temporary_loss_client_order_prefix(active)}a1b2c3"
+            )
+            evidence = TemporaryLossRuntimeEvidence(
+                accepted_order_ids=("701",),
+                accepted_client_order_ids=(client_order_id,),
+                accepted_order_pairs=(("701", client_order_id),),
+                latest_observation_seq=1,
+            )
+            terminal = {
+                "symbol": "BCHUSDT",
+                "action": "delegated_to_terminal_drain_owner",
+                "terminal_drain_decision_id": "BCHUSDT|run-1",
+                "terminal_drain_exit_status": "exiting",
+                "terminal_recovery_reason": "trusted_lifecycle_terminal_handoff",
+            }
+            open_snapshots = iter(
+                [
+                    [
+                        {
+                            "symbol": "BCHUSDT",
+                            "orderId": 701,
+                            "clientOrderId": client_order_id,
+                            "type": "LIMIT",
+                            "timeInForce": "GTX",
+                            "side": "SELL",
+                            "positionSide": "LONG",
+                        }
+                    ],
+                    [],
+                ]
+            )
+            guard_state: dict[str, object] = {}
+            with patch.object(
+                bq_volume_recovery_guard,
+                "load_temporary_loss_runtime_evidence",
+                return_value=evidence,
+            ):
+                cleaning_result = (
+                    bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                        symbol="BCHUSDT",
+                        output_dir=output_dir,
+                        guard_state=guard_state,
+                        now=activated_at + timedelta(seconds=1),
+                        window_seconds=60,
+                        min_volume_notional=10,
+                        near_cap_ratio=0.95,
+                        far_ticks=8,
+                        plan_stale_seconds=300,
+                        dry_run=False,
+                        runner_wrapper="/unused",
+                        runner_active_fetcher=lambda _symbol: True,
+                        restart_runner=lambda _symbol: (_ for _ in ()).throw(
+                            AssertionError("terminal handoff restarted runner")
+                        ),
+                        fetch_open_orders=lambda _symbol: next(open_snapshots),
+                        cancel_order=lambda symbol, order_id: {
+                            "symbol": symbol,
+                            "orderId": int(order_id),
+                            "status": "CANCELED",
+                        },
+                        fetch_user_trades_page=lambda *_args: [],
+                        terminal_delegation=terminal,
+                    )
+                )
+
+            cleaning = store.read("BCHUSDT")
+            self.assertEqual(cleaning_result["phase"], "cleaning", cleaning_result)
+            self.assertEqual(cleaning_result["effect_stage"], "managed_gtx_cancel")
+            self.assertFalse(
+                cleaning.desired_profile.fields[
+                    "best_quote_maker_volume_allow_loss_reduce_only"
+                ]
+            )
+            self.assertIsNotNone(cleaning.cleanup_obligation)
+            self.assertEqual(
+                cleaning.cleanup_obligation.source_decision_id,
+                active.decision_id,
+            )
+
+            stable_result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=activated_at + timedelta(seconds=2),
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=lambda _symbol: (_ for _ in ()).throw(
+                    AssertionError("terminal handoff restarted runner")
+                ),
+                terminal_delegation=terminal,
+            )
+            stable = store.read("BCHUSDT")
+            self.assertEqual(stable_result["action"], "coordinator_terminal_handoff_exit")
+            self.assertEqual(stable.phase.value, "stable")
+            self.assertEqual(stable.active_action, ActionId.NOOP)
+            self.assertIsNone(stable.action_lease)
+            self.assertIsNone(stable.cleanup_obligation)
+            self.assertEqual(
+                stable.desired_profile.digest, stable.baseline_profile.digest
+            )
+
+    def test_registered_terminal_handoff_repairs_missing_manifest_by_lease_prefix(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            now = datetime(2026, 7, 16, 0, 7, tzinfo=timezone.utc)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            store = JsonRecoveryStore(control_path)
+            initial = store.register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=now,
+            ).with_exhausted_attempt(
+                ActionId.INVENTORY_RECOVER,
+                Side.SELL,
+                OrderRole.REDUCE_ONLY,
+                now=now,
+            )
+            blockers = FlowBlockerAssessment(
+                inventory_reduce_sides=(Side.SELL,),
+                loss_only_blocked_sides=(Side.SELL,),
+                episode_fingerprint="terminal-rebuild",
+            )
+            engine = FuturesRecoveryDecisionEngine()
+            settling = engine.plan_round(
+                snapshot=SymbolSnapshot(
+                    symbol="BCHUSDT", captured_at=now, assessment=blockers
+                ),
+                state=initial,
+                now=now,
+                round_id="terminal-rebuild-enter",
+            ).next_state
+            store.compare_and_swap(
+                "BCHUSDT", expected_revision=0, next_state=settling
+            )
+            assert settling.action_lease is not None
+            activated_at = now + timedelta(seconds=1)
+            active = engine.plan_round(
+                snapshot=SymbolSnapshot(
+                    symbol="BCHUSDT",
+                    captured_at=activated_at,
+                    assessment=blockers,
+                    activation_receipt=ActivationReceipt(
+                        decision_id=str(settling.decision_id),
+                        generation=settling.generation,
+                        profile_digest=settling.desired_profile.digest,
+                        action_lease_epoch=settling.action_lease.epoch,
+                        observed_at=activated_at,
+                    ),
+                ),
+                state=settling,
+                now=activated_at,
+                round_id="terminal-rebuild-activate",
+            ).next_state
+            store.compare_and_swap(
+                "BCHUSDT", expected_revision=1, next_state=active
+            )
+            terminal = {
+                "symbol": "BCHUSDT",
+                "action": "delegated_to_terminal_drain_intent",
+                "terminal_drain_intent_id": "intent-1",
+                "terminal_drain_intent_status": "accepted",
+                "terminal_recovery_reason": "trusted_lifecycle_terminal_handoff",
+            }
+            guard_state: dict[str, object] = {}
+            open_call_count = 0
+
+            def fetch_open_orders(_symbol: str) -> list[dict[str, object]]:
+                nonlocal open_call_count
+                open_call_count += 1
+                cleaning_state = store.read("BCHUSDT")
+                prefix = temporary_loss_client_order_prefix(cleaning_state)
+                return [
+                    {
+                        "symbol": "BCHUSDT",
+                        "orderId": 702,
+                        "clientOrderId": f"{prefix}1",
+                        "type": "LIMIT",
+                        "timeInForce": "GTX",
+                        "side": "SELL",
+                        "positionSide": "LONG",
+                    }
+                ]
+
+            with patch.object(
+                bq_volume_recovery_guard,
+                "load_temporary_loss_runtime_evidence",
+                side_effect=TemporaryLossReceiptJournalError("missing manifest"),
+            ):
+                result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                    symbol="BCHUSDT",
+                    output_dir=output_dir,
+                    guard_state=guard_state,
+                    now=activated_at + timedelta(seconds=1),
+                    window_seconds=60,
+                    min_volume_notional=10,
+                    near_cap_ratio=0.95,
+                    far_ticks=8,
+                    plan_stale_seconds=300,
+                    dry_run=False,
+                    runner_wrapper="/unused",
+                    runner_active_fetcher=lambda _symbol: True,
+                    restart_runner=lambda _symbol: (_ for _ in ()).throw(
+                        AssertionError("terminal handoff restarted runner")
+                    ),
+                    fetch_open_orders=fetch_open_orders,
+                    cancel_order=lambda symbol, order_id: {
+                        "symbol": symbol,
+                        "orderId": int(order_id),
+                        "status": "CANCELED",
+                    },
+                    fetch_user_trades_page=lambda *_args: [],
+                    terminal_delegation=terminal,
+                )
+
+            cleaning = store.read("BCHUSDT")
+            self.assertEqual(result["phase"], "cleaning", result)
+            self.assertEqual(result["effect_stage"], "local_state_repair")
+            self.assertIn("owned_gtx_orders_still_open", result["effect_error"])
+            self.assertFalse(
+                cleaning.desired_profile.fields[
+                    "best_quote_maker_volume_allow_loss_reduce_only"
+                ]
+            )
+            self.assertTrue(cleaning.cleanup_obligation.needs_manifest_rebuild)
+            self.assertEqual(open_call_count, 2)
+
+    def test_direct_check_symbol_registered_path_never_enters_legacy_decision_tree(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "arxusdt_loop_runner_control.json"
+            JsonRecoveryStore(control_path).register_symbol(
+                "ARXUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            expected = {
+                "symbol": "ARXUSDT",
+                "action": "coordinator_noop_hold",
+                "control_cas_count": 1,
+                "effect_count": 0,
+            }
+            with (
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "run_registered_recovery_symbol_round",
+                    return_value=expected,
+                ) as registered,
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "assess_symbol",
+                    side_effect=AssertionError("legacy assessment called"),
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "_apply_control_update",
+                    side_effect=AssertionError("legacy control writer called"),
+                ),
+            ):
+                result = check_symbol(
+                    symbol="ARXUSDT",
+                    output_dir=output_dir,
+                    state={},
+                    now=datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc),
+                    window_seconds=60,
+                    min_volume_notional=10,
+                    trigger_seconds=120,
+                )
+
+            self.assertEqual(result, expected)
+            registered.assert_called_once()
+
+    def test_registered_control_rejects_direct_legacy_writer(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "arxusdt_loop_runner_control.json"
+            JsonRecoveryStore(control_path).register_symbol(
+                "ARXUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            control = json.loads(control_path.read_text(encoding="utf-8"))
+            before = control_path.read_bytes()
+            restarts: list[str] = []
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "registered recovery symbol rejects legacy control updates",
+            ):
+                _apply_control_update(
+                    symbol="ARXUSDT",
+                    control_path=control_path,
+                    control=control,
+                    updates={
+                        "best_quote_maker_volume_allow_loss_reduce_only": True
+                    },
+                    now=datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc),
+                    dry_run=False,
+                    restart_runner=restarts.append,
+                )
+
+            self.assertEqual(control_path.read_bytes(), before)
+            self.assertEqual(restarts, [])
+
+    def test_registered_exchange_order_drift_requires_two_quiet_observations(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "arxusdt_loop_runner_control.json"
+            JsonRecoveryStore(control_path).register_symbol(
+                "ARXUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            now = datetime(2026, 7, 16, 1, 0, tzinfo=timezone.utc)
+            _write_json(
+                output_dir / "arxusdt_loop_latest_plan.json",
+                {
+                    "generated_at": (now - timedelta(seconds=120)).isoformat(),
+                    "bid_price": 1.0,
+                    "ask_price": 1.001,
+                    "tick_size": 0.001,
+                    "buy_orders": [
+                        {"side": "BUY", "price": 1.0, "qty": 10, "role": "entry"},
+                        {"side": "BUY", "price": 0.999, "qty": 10, "role": "entry"},
+                    ],
+                    "sell_orders": [
+                        {"side": "SELL", "price": 1.001, "qty": 10, "role": "entry"},
+                        {"side": "SELL", "price": 1.002, "qty": 10, "role": "entry"},
+                    ],
+                },
+            )
+            _write_json(
+                output_dir / "arxusdt_loop_latest_submit.json",
+                {
+                    "submit_generated_at": (now - timedelta(seconds=120)).isoformat(),
+                    "executed": False,
+                    "placed_orders": [],
+                    "observed_strategy_open_order_state": {"active_order_count": 4},
+                },
+            )
+            guard_state: dict[str, object] = {}
+            restarts: list[str] = []
+            exchange_snapshot = lambda _symbol: {
+                "strategy_open_order_count": 0,
+                "strategy_order_ids": [],
+            }
+
+            first = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="ARXUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+                exchange_order_snapshot_fetcher=exchange_snapshot,
+            )
+            second = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="ARXUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now + timedelta(seconds=1),
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+                exchange_order_snapshot_fetcher=exchange_snapshot,
+            )
+
+            self.assertEqual(first["exchange_drift_status"], "confirmation_pending")
+            self.assertEqual(first["effect_count"], 0)
+            self.assertEqual(restarts, ["ARXUSDT"])
+            self.assertEqual(second["exchange_drift_status"], "confirmed")
+            self.assertEqual(second["action"], "coordinator_runner_recover_enter")
+            self.assertEqual(second["effect_count"], 1)
+
+    def test_registered_bch_exchange_order_drift_uses_symbol_scoped_order_prefix(self) -> None:
+        self.assertEqual(
+            bq_volume_recovery_guard._registered_strategy_client_order_prefix(
+                "BCHUSDT"
+            ),
+            "gx-bchu-",
+        )
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            JsonRecoveryStore(control_path).register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            now = datetime(2026, 7, 16, 1, 0, tzinfo=timezone.utc)
+            _write_json(
+                output_dir / "bchusdt_loop_latest_plan.json",
+                {
+                    "generated_at": (now - timedelta(seconds=120)).isoformat(),
+                    "bid_price": 500.0,
+                    "ask_price": 500.1,
+                    "tick_size": 0.1,
+                    "buy_orders": [
+                        {"side": "BUY", "price": 500.0, "qty": 0.02, "role": "entry"},
+                        {"side": "BUY", "price": 499.9, "qty": 0.02, "role": "entry"},
+                    ],
+                    "sell_orders": [
+                        {"side": "SELL", "price": 500.1, "qty": 0.02, "role": "entry"},
+                        {"side": "SELL", "price": 500.2, "qty": 0.02, "role": "entry"},
+                    ],
+                },
+            )
+            _write_json(
+                output_dir / "bchusdt_loop_latest_submit.json",
+                {
+                    "submit_generated_at": (now - timedelta(seconds=120)).isoformat(),
+                    "executed": False,
+                    "placed_orders": [],
+                    "observed_strategy_open_order_state": {"active_order_count": 4},
+                },
+            )
+            guard_state: dict[str, object] = {}
+            restarts: list[str] = []
+            fetched_symbols: list[str] = []
+
+            def exchange_snapshot(symbol: str) -> dict[str, object]:
+                fetched_symbols.append(symbol)
+                return {
+                    "strategy_open_order_count": 0,
+                    "strategy_order_ids": [],
+                    "strategy_client_order_prefix": "gx-bchu-",
+                }
+
+            first = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+                exchange_order_snapshot_fetcher=exchange_snapshot,
+            )
+            second = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=now + timedelta(seconds=1),
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: True,
+                restart_runner=restarts.append,
+                exchange_order_snapshot_fetcher=exchange_snapshot,
+            )
+
+            self.assertEqual(first["exchange_drift_status"], "confirmation_pending")
+            self.assertEqual(second["exchange_drift_status"], "confirmed")
+            self.assertEqual(second["action"], "coordinator_runner_recover_enter")
+            self.assertEqual(fetched_symbols, ["BCHUSDT", "BCHUSDT"])
+            self.assertEqual(restarts, ["BCHUSDT"])
+
+    def test_registered_missing_web_volatility_observation_does_not_create_safety(self) -> None:
+        for minute in (0, 1):
+            with TemporaryDirectory() as tmpdir:
+                output_dir = Path(tmpdir)
+                control_path = output_dir / "arxusdt_loop_runner_control.json"
+                JsonRecoveryStore(control_path).register_symbol(
+                    "ARXUSDT",
+                    {
+                        "best_quote_maker_volume_allow_loss_reduce_only": False,
+                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                        "hard_loss_forced_reduce_enabled": False,
+                        "volatility_entry_pause_enabled": True,
+                        "volatility_trigger_enabled": True,
+                    },
+                    now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+                )
+                result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                    symbol="ARXUSDT",
+                    output_dir=output_dir,
+                    guard_state={},
+                    now=datetime(
+                        2026, 7, 16, 1, minute, tzinfo=timezone.utc
+                    ),
+                    window_seconds=60,
+                    min_volume_notional=10,
+                    near_cap_ratio=0.95,
+                    far_ticks=8,
+                    plan_stale_seconds=300,
+                    dry_run=False,
+                    runner_wrapper="/unused",
+                    runner_active_fetcher=lambda _symbol: True,
+                    restart_runner=lambda _symbol: None,
+                )
+                persisted = JsonRecoveryStore(control_path).read("ARXUSDT")
+                self.assertNotEqual(
+                    result["action"], "coordinator_safety_converge_enter"
+                )
+                self.assertIsNone(persisted.safety_lease)
+                self.assertIs(persisted.phase, RecoveryPhase.STABLE)
+
+    def _assert_main_terminal_gate_skips_all_prechecks(
+        self,
+        *,
+        output_dir: Path,
+        expected_action: str,
+    ) -> dict[str, object]:
+        stdout = StringIO()
+        with (
+            patch.object(
+                bq_volume_recovery_guard,
+                "recover_corrupt_loop_state",
+                return_value=None,
+            ) as corrupt,
+            patch.object(
+                bq_volume_recovery_guard,
+                "_runner_is_active",
+                return_value=True,
+            ) as runner_active,
+            patch.object(
+                bq_volume_recovery_guard,
+                "recover_inactive_runner",
+            ) as inactive,
+            patch.object(
+                bq_volume_recovery_guard,
+                "recover_arx_effective_control_drift",
+                return_value=None,
+            ) as effective_drift,
+            patch.object(
+                bq_volume_recovery_guard,
+                "recover_arx_runner_error_loop",
+                return_value=None,
+            ) as runner_error,
+            patch.object(
+                bq_volume_recovery_guard,
+                "_fetch_exchange_user_trades",
+                return_value=[],
+            ) as exchange_trades,
+            patch.object(
+                bq_volume_recovery_guard,
+                "recover_arx_exchange_order_drift",
+                return_value=None,
+            ) as exchange_drift,
+            patch.object(
+                bq_volume_recovery_guard,
+                "check_symbol",
+                return_value={"symbol": "BCHUSDT", "action": "unexpected_check"},
+            ) as symbol_check,
+            redirect_stdout(stdout),
+        ):
+            exit_code = bq_volume_recovery_guard.main(
+                [
+                    "--output-dir",
+                    str(output_dir),
+                    "--state-path",
+                    str(output_dir / "guard_state.json"),
+                    "--symbols",
+                    "BCHUSDT",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        for precheck in (
+            corrupt,
+            runner_active,
+            inactive,
+            effective_drift,
+            runner_error,
+            exchange_trades,
+            exchange_drift,
+            symbol_check,
+        ):
+            precheck.assert_not_called()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["results"][0]["action"], expected_action)
+        return payload["results"][0]
+
+    def test_terminal_delegation_accepts_integral_active_intent_from_old_contract(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            current_control = _terminal_test_control(strategy_profile="new_profile")
+            old_control = _terminal_test_control(strategy_profile="old_profile")
+            old_snapshot = run_contract_snapshot_from_config(old_control)
+            old_contract_id = run_contract_identity_from_config(old_snapshot)
+            _write_json(
+                output_dir / "bchusdt_loop_runner_control.json",
+                current_control,
+            )
+            _write_json(
+                output_dir / "bchusdt_terminal_intent.json",
+                _terminal_test_intent(old_control, status="executing"),
+            )
+
+            delegated = bq_volume_recovery_guard._terminal_drain_delegation(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                dry_run=False,
+            )
+
+        self.assertEqual(delegated["action"], "delegated_to_terminal_drain_intent")
+        self.assertFalse(delegated["terminal_drain_contract_current"])
+        self.assertEqual(delegated["terminal_drain_run_contract_id"], old_contract_id)
+
+    def test_terminal_delegation_returns_visible_block_on_tampered_intent(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control = _terminal_test_control()
+            snapshot = run_contract_snapshot_from_config(control)
+            contract_id = run_contract_identity_from_config(snapshot)
+            snapshot["terminal_drain_absolute_loss_budget"] = 200.0
+            _write_json(output_dir / "bchusdt_loop_runner_control.json", control)
+            _write_json(
+                output_dir / "bchusdt_terminal_intent.json",
+                {
+                    "schema": "futures_lifecycle_intent_v2",
+                    "intent_id": "BCHUSDT-tampered",
+                    "symbol": "BCHUSDT",
+                    "source": "competition_target_gate",
+                    "action": "lifecycle_drain",
+                    "status": "pending",
+                    "run_contract_id": contract_id,
+                    "run_contract_snapshot": snapshot,
+                },
+            )
+
+            blocked = bq_volume_recovery_guard._terminal_drain_delegation(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                dry_run=False,
+            )
+
+        self.assertEqual(blocked["action"], "terminal_drain_delegation_blocked")
+        self.assertEqual(blocked["liveness_status"], "blocked")
+        self.assertEqual(blocked["severity"], "critical")
+        self.assertEqual(blocked["reason"], "terminal_intent_integrity_invalid")
+
+    def test_terminal_delegation_rejects_invalid_intent_envelope_fields(self) -> None:
+        mutations = {
+            "schema": lambda intent: intent.update(schema="wrong"),
+            "status": lambda intent: intent.update(status="unknown"),
+            "intent_id": lambda intent: intent.update(intent_id=""),
+            "action": lambda intent: intent.update(action="legacy_stop"),
+            "symbol": lambda intent: intent.update(symbol="ARXUSDT"),
+        }
+        for field, mutate in mutations.items():
+            with self.subTest(field=field), TemporaryDirectory() as tmpdir:
+                output_dir = Path(tmpdir)
+                control = _terminal_test_control()
+                snapshot = run_contract_snapshot_from_config(control)
+                intent = {
+                    "schema": "futures_lifecycle_intent_v2",
+                    "intent_id": "BCHUSDT-valid",
+                    "symbol": "BCHUSDT",
+                    "action": "lifecycle_drain",
+                    "status": "pending",
+                    "run_contract_id": run_contract_identity_from_config(snapshot),
+                    "run_contract_snapshot": snapshot,
+                }
+                mutate(intent)
+                _write_json(
+                    output_dir / "bchusdt_loop_runner_control.json",
+                    control,
+                )
+                _write_json(
+                    output_dir / "bchusdt_terminal_intent.json",
+                    intent,
+                )
+
+                blocked = bq_volume_recovery_guard._terminal_drain_delegation(
+                    symbol="BCHUSDT",
+                    output_dir=output_dir,
+                    dry_run=False,
+                )
+
+            self.assertEqual(
+                blocked["reason"],
+                "terminal_intent_integrity_invalid",
+            )
+
+    def test_terminal_delegation_rejects_invalid_proof_without_side_effects(
+        self,
+    ) -> None:
+        for proof_case in (
+            "missing_observed",
+            "fake_target",
+            "fake_deadline",
+            "fake_wear",
+        ):
+            with self.subTest(proof_case=proof_case), TemporaryDirectory() as tmpdir:
+                output_dir = Path(tmpdir)
+                control = _terminal_test_control()
+                intent = _terminal_test_intent(control)
+                observed = intent.get("observed")
+                if proof_case == "missing_observed":
+                    intent.pop("observed")
+                elif proof_case == "fake_target":
+                    observed["gross_notional"] = 19_999.0
+                elif proof_case == "fake_deadline":
+                    intent["trigger_reason"] = "target_unmet_deadline"
+                    intent["requested_at"] = "2026-07-17T00:00:01+00:00"
+                    observed.update(
+                        gross_notional=19_999.0,
+                        query_end="2026-07-17T00:00:00+00:00",
+                        runtime_guard_primary_reason="max_actual_net_notional_hit",
+                        runtime_guard_matched_reasons=["after_end_window"],
+                    )
+                else:
+                    intent["trigger_reason"] = "wear_limit_breached"
+                    observed.update(
+                        gross_notional=80_000.0,
+                        realized_pnl=-8.0,
+                        wear_per_10k=1.0,
+                        first=75_000.0,
+                        wear_stop=2.0,
+                    )
+                if proof_case in {"fake_deadline", "fake_wear"}:
+                    intent["intent_id"] = terminal_intent_id(
+                        symbol="BCHUSDT",
+                        source="competition_target_gate",
+                        trigger_reason=str(intent["trigger_reason"]),
+                        run_contract_id=str(intent["run_contract_id"]),
+                    )
+                control_path = output_dir / "bchusdt_loop_runner_control.json"
+                intent_path = output_dir / "bchusdt_terminal_intent.json"
+                _write_json(control_path, control)
+                _write_json(intent_path, intent)
+                before = {
+                    control_path: control_path.read_bytes(),
+                    intent_path: intent_path.read_bytes(),
+                }
+
+                blocked = bq_volume_recovery_guard._terminal_drain_delegation(
+                    symbol="BCHUSDT",
+                    output_dir=output_dir,
+                    dry_run=False,
+                )
+
+                self.assertEqual(
+                    blocked["reason"],
+                    "terminal_intent_integrity_invalid",
+                )
+                for path, payload in before.items():
+                    self.assertEqual(path.read_bytes(), payload)
+
+    def test_terminal_delegation_returns_visible_block_on_tampered_runtime_owner(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control = _terminal_test_control()
+            owner = _terminal_test_runtime_owner(control, exit_status="exiting")
+            owner["runtime_integrity_digest"] = "tampered"
+            _write_json(output_dir / "bchusdt_loop_runner_control.json", control)
+            _write_json(
+                output_dir / "bchusdt_loop_state.json",
+                {"futures_terminal_drain": owner},
+            )
+
+            blocked = bq_volume_recovery_guard._terminal_drain_delegation(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                dry_run=False,
+            )
+
+        self.assertEqual(blocked["action"], "terminal_drain_delegation_blocked")
+        self.assertEqual(blocked["reason"], "terminal_runtime_owner_integrity_invalid")
+
+    def test_terminal_delegation_rejects_runtime_owner_decision_and_status(self) -> None:
+        for field in ("decision_id", "exit_status"):
+            with self.subTest(field=field), TemporaryDirectory() as tmpdir:
+                output_dir = Path(tmpdir)
+                control = _terminal_test_control()
+                owner = _terminal_test_runtime_owner(control, exit_status="exiting")
+                if field == "decision_id":
+                    owner[field] = "BCHUSDT|wrong"
+                else:
+                    owner[field] = "unknown"
+                owner["runtime_integrity_digest"] = (
+                    _terminal_drain_runtime_integrity_digest(owner)
+                )
+                _write_json(
+                    output_dir / "bchusdt_loop_runner_control.json",
+                    control,
+                )
+                _write_json(
+                    output_dir / "bchusdt_loop_state.json",
+                    {"futures_terminal_drain": owner},
+                )
+
+                blocked = bq_volume_recovery_guard._terminal_drain_delegation(
+                    symbol="BCHUSDT",
+                    output_dir=output_dir,
+                    dry_run=False,
+                )
+
+            self.assertEqual(
+                blocked["reason"],
+                "terminal_runtime_owner_integrity_invalid",
+            )
+
+    def test_main_does_not_handoff_corrupt_terminal_artifact_to_coordinator(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control = {
+                **_terminal_test_control(),
+                "_futures_recovery_state": None,
+            }
+            snapshot = run_contract_snapshot_from_config(control)
+            contract_id = run_contract_identity_from_config(snapshot)
+            snapshot["terminal_drain_absolute_loss_budget"] = 200.0
+            _write_json(output_dir / "bchusdt_loop_runner_control.json", control)
+            _write_json(
+                output_dir / "bchusdt_terminal_intent.json",
+                {
+                    "schema": "futures_lifecycle_intent_v2",
+                    "intent_id": "BCHUSDT-tampered-registered",
+                    "symbol": "BCHUSDT",
+                    "action": "lifecycle_drain",
+                    "status": "pending",
+                    "run_contract_id": contract_id,
+                    "run_contract_snapshot": snapshot,
+                },
+            )
+            stdout = StringIO()
+            with (
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "run_registered_recovery_symbol_round",
+                    side_effect=AssertionError("corrupt terminal artifact was delegated"),
+                ) as registered,
+                redirect_stdout(stdout),
+            ):
+                exit_code = bq_volume_recovery_guard.main(
+                    [
+                        "--output-dir",
+                        str(output_dir),
+                        "--state-path",
+                        str(output_dir / "guard_state.json"),
+                        "--symbols",
+                        "BCHUSDT",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 1)
+        registered.assert_not_called()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(
+            payload["results"][0]["action"],
+            "terminal_drain_delegation_blocked",
+        )
+
+    def test_main_pending_or_accepted_intent_gate_precedes_every_precheck(self) -> None:
+        for status in ("pending", "accepted"):
+            with self.subTest(status=status), TemporaryDirectory() as tmpdir:
+                output_dir = Path(tmpdir)
+                control = _terminal_test_control()
+                snapshot = run_contract_snapshot_from_config(control)
+                contract_id = run_contract_identity_from_config(snapshot)
+                _write_json(
+                    output_dir / "bchusdt_loop_runner_control.json",
+                    control,
+                )
+                _write_json(
+                    output_dir / "bchusdt_terminal_intent.json",
+                    _terminal_test_intent(control, status=status),
+                )
+
+                result = self._assert_main_terminal_gate_skips_all_prechecks(
+                    output_dir=output_dir,
+                    expected_action="delegated_to_terminal_drain_intent",
+                )
+
+                self.assertEqual(result["terminal_drain_intent_status"], status)
+
+    def test_main_loop_terminal_owner_gate_precedes_every_precheck(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control = _terminal_test_control()
+            owner = _terminal_test_runtime_owner(control, exit_status="exiting")
+            _write_json(
+                output_dir / "bchusdt_loop_runner_control.json",
+                control,
+            )
+            _write_json(
+                output_dir / "bchusdt_loop_state.json",
+                {"futures_terminal_drain": owner},
+            )
+
+            result = self._assert_main_terminal_gate_skips_all_prechecks(
+                output_dir=output_dir,
+                expected_action="delegated_to_terminal_drain_owner",
+            )
+
+        self.assertEqual(result["terminal_drain_decision_id"], owner["decision_id"])
+
+    def test_completed_intent_from_previous_run_does_not_permanently_own_symbol(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            current_control = _terminal_test_control(strategy_profile="new_profile")
+            old_control = _terminal_test_control(strategy_profile="old_profile")
+            old_snapshot = run_contract_snapshot_from_config(old_control)
+            old_contract_id = run_contract_identity_from_config(old_snapshot)
+            _write_json(output_dir / "bchusdt_loop_runner_control.json", current_control)
+            _write_json(
+                output_dir / "bchusdt_terminal_intent.json",
+                _terminal_test_intent(old_control, status="stopped_preserved"),
+            )
+
+            delegated = bq_volume_recovery_guard._terminal_drain_delegation(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                dry_run=False,
+            )
+
+        self.assertIsNone(delegated)
+        self.assertNotEqual(
+            old_contract_id,
+            run_contract_identity_from_config(current_control),
+        )
+
+    def test_completed_intent_with_invalid_current_contract_fails_closed(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            _write_json(
+                output_dir / "bchusdt_loop_runner_control.json",
+                {
+                    "symbol": "BCHUSDT",
+                    "run_start_time": "2026-07-16T00:00:00+00:00",
+                    "max_cumulative_notional": 20_000.0,
+                },
+            )
+            _write_json(
+                output_dir / "bchusdt_terminal_intent.json",
+                {
+                    "schema": "futures_lifecycle_intent_v2",
+                    "intent_id": "BCHUSDT-old-completed-invalid-current",
+                    "symbol": "BCHUSDT",
+                    "source": "competition_target_gate",
+                    "action": "lifecycle_drain",
+                    "status": "stopped_preserved",
+                    "requested_at": "2026-07-15T01:00:00+00:00",
+                    "run_contract_id": "old-run-contract",
+                },
+            )
+
+            delegated = bq_volume_recovery_guard._terminal_drain_delegation(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                dry_run=False,
+            )
+
+        self.assertEqual(delegated["action"], "terminal_drain_delegation_blocked")
+        self.assertEqual(delegated["reason"], "terminal_current_run_contract_invalid")
+
+    def test_completed_intent_for_current_run_still_blocks_revival(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            current_control = _terminal_test_control()
+            current_snapshot = run_contract_snapshot_from_config(current_control)
+            current_contract_id = run_contract_identity_from_config(current_snapshot)
+            _write_json(output_dir / "bchusdt_loop_runner_control.json", current_control)
+            _write_json(
+                output_dir / "bchusdt_terminal_intent.json",
+                _terminal_test_intent(current_control, status="stopped_clean"),
+            )
+
+            delegated = bq_volume_recovery_guard._terminal_drain_delegation(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                dry_run=False,
+            )
+
+        self.assertIsNotNone(delegated)
+        self.assertEqual(delegated["action"], "delegated_to_terminal_drain_intent")
+
+    def test_completed_loop_owner_from_previous_run_does_not_permanently_own_symbol(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            current_control = _terminal_test_control(strategy_profile="new_profile")
+            old_control = _terminal_test_control(strategy_profile="old_profile")
+            old_owner = _terminal_test_runtime_owner(
+                old_control,
+                exit_status="stopped_preserved",
+            )
+            _write_json(output_dir / "bchusdt_loop_runner_control.json", current_control)
+            _write_json(
+                output_dir / "bchusdt_loop_state.json",
+                {"futures_terminal_drain": old_owner},
+            )
+
+            delegated = bq_volume_recovery_guard._terminal_drain_delegation(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                dry_run=False,
+            )
+
+        self.assertIsNone(delegated)
+
+    def test_pending_terminal_intent_blocks_guard_before_runner_claims_owner(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control = _terminal_test_control()
+            snapshot = run_contract_snapshot_from_config(control)
+            contract_id = run_contract_identity_from_config(snapshot)
+            _write_json(
+                output_dir / "bchusdt_loop_runner_control.json",
+                control,
+            )
+            intent = _terminal_test_intent(control)
+            _write_json(
+                output_dir / "bchusdt_terminal_intent.json",
+                intent,
+            )
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                state={},
+                now=datetime(2026, 7, 16, 1, 0, tzinfo=timezone.utc),
+                window_seconds=180.0,
+                min_volume_notional=10.0,
+                trigger_seconds=180.0,
+                restart_runner=lambda symbol: restarts.append(symbol),
+            )
+
+        self.assertEqual(result["action"], "delegated_to_terminal_drain_intent")
+        self.assertEqual(
+            result["terminal_drain_intent_id"],
+            intent["intent_id"],
+        )
+        self.assertEqual(restarts, [])
+
+    def test_terminal_drain_owner_blocks_guard_control_and_restart_actions(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control = _terminal_test_control()
+            owner = _terminal_test_runtime_owner(control, exit_status="exiting")
+            _write_json(
+                output_dir / "bchusdt_loop_runner_control.json",
+                control,
+            )
+            _write_json(
+                output_dir / "bchusdt_loop_state.json",
+                {"futures_terminal_drain": owner},
+            )
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="BCHUSDT",
+                output_dir=output_dir,
+                state={},
+                now=datetime(2026, 7, 15, 10, 10, tzinfo=timezone.utc),
+                window_seconds=180.0,
+                min_volume_notional=10.0,
+                trigger_seconds=180.0,
+                restart_runner=lambda symbol: restarts.append(symbol),
+            )
+
+        self.assertEqual(result["action"], "delegated_to_terminal_drain_owner")
+        self.assertEqual(result["terminal_drain_exit_status"], "exiting")
+        self.assertEqual(restarts, [])
+
     def test_control_target_overrides_legacy_guard_target(self) -> None:
         self.assertEqual(
             bq_volume_recovery_guard._configured_daily_target_notional(
@@ -2055,7 +5551,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             },
         )
 
-    def test_main_never_restarts_symbol_after_target_gate_done(self) -> None:
+    def test_main_only_observes_target_gate_done_when_runner_is_inactive(self) -> None:
         now = datetime.now(timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -2080,10 +5576,10 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 )
 
             self.assertEqual(exit_code, 0)
-            runner_active.assert_called_once_with("ARXUSDT")
+            runner_active.assert_not_called()
             fetch_trades.assert_not_called()
             payload = json.loads(stdout.getvalue())
-            self.assertEqual(payload["results"][0]["action"], "skip_target_gate_done_terminal")
+            self.assertEqual(payload["results"][0]["action"], "observe_target_gate_done_terminal")
             self.assertEqual(payload["results"][0]["target_gate_done_marker"], str(marker.resolve()))
 
     def test_main_defers_long_exchange_cooldown_without_failing_guard(self) -> None:
@@ -2122,7 +5618,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             state = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertIn("exchange_trade_fetch_deferred_until", state["symbols"]["REUSDT"])
 
-    def test_main_stops_active_runner_after_target_gate_done(self) -> None:
+    def test_main_only_observes_target_gate_done_even_when_runner_is_active(self) -> None:
         now = datetime.now(timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -2149,9 +5645,99 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 )
 
             self.assertEqual(exit_code, 0)
-            stop_runner.assert_called_once_with("OUSDT", runner_wrapper="/usr/local/bin/test-wrapper")
+            stop_runner.assert_not_called()
             payload = json.loads(stdout.getvalue())
-            self.assertEqual(payload["results"][0]["action"], "stop_runner_target_gate_done")
+            self.assertEqual(payload["results"][0]["action"], "observe_target_gate_done_terminal")
+
+    def test_main_ignores_legacy_done_marker_for_new_explicit_target_contract(self) -> None:
+        now = datetime.now(timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            marker = output_dir / f"bchusdt_target_gate_done_{now.strftime('%Y%m%d')}.flag"
+            marker.write_text((now - timedelta(hours=1)).isoformat(), encoding="utf-8")
+            _write_json(
+                output_dir / "bchusdt_loop_runner_control.json",
+                {
+                    "symbol": "BCHUSDT",
+                    "strategy_profile": "bchusdt_altcoins_probe_v1",
+                    "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                    "per_order_notional": 22.0,
+                    "run_start_time": (now - timedelta(minutes=5)).isoformat(),
+                    "runtime_guard_stats_start_time": (
+                        now - timedelta(minutes=5)
+                    ).isoformat(),
+                    "run_end_time": (now + timedelta(hours=1)).isoformat(),
+                    "max_cumulative_notional": 20_000.0,
+                    "terminal_drain_exit_policy": "stop_preserve",
+                    "terminal_drain_absolute_loss_budget": 0.0,
+                    "terminal_drain_stop_preserve_reason": "probe_window_complete",
+                },
+            )
+            stdout = StringIO()
+            expected = {
+                "symbol": "BCHUSDT",
+                "action": "hold_healthy_volume",
+                "changed_keys": [],
+                "backup_path": None,
+                "dry_run": True,
+                "restart_failed": None,
+            }
+
+            with (
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_corrupt_loop_state",
+                    return_value=None,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "_runner_is_active",
+                    return_value=True,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_arx_effective_control_drift",
+                    return_value=None,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_arx_runner_error_loop",
+                    return_value=None,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "_fetch_exchange_user_trades",
+                    return_value=[],
+                ) as fetch_trades,
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_arx_exchange_order_drift",
+                    return_value=None,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "check_symbol",
+                    return_value=expected,
+                ) as check_symbol,
+                redirect_stdout(stdout),
+            ):
+                exit_code = bq_volume_recovery_guard.main(
+                    [
+                        "--output-dir",
+                        str(output_dir),
+                        "--state-path",
+                        str(output_dir / "guard_state.json"),
+                        "--symbols",
+                        "BCHUSDT",
+                        "--dry-run",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            fetch_trades.assert_called_once()
+            check_symbol.assert_called_once()
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["results"][0]["action"], "hold_healthy_volume")
 
     def test_restores_persistent_corrupt_state_from_recent_valid_backup(self) -> None:
         now = datetime(2026, 7, 11, 11, 20, tzinfo=timezone.utc)
@@ -8044,6 +11630,119 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 state["symbols"]["REUSDT"]["status"], {"normal", "cooldown"}
             )
             self.assertEqual(restarts, ["REUSDT"])
+
+    def test_timed_out_failed_verification_repairs_local_state_when_baseline_is_unusable(self) -> None:
+        now = datetime(2026, 7, 16, 2, 0, tzinfo=timezone.utc)
+        control_updated_at = now - timedelta(minutes=4)
+        unusable_baselines = {
+            "missing": None,
+            "damaged_type": "not-a-control-map",
+            "damaged_unknown_key": {"unknown_control": 48.0},
+            "damaged_nested_value": {
+                "best_quote_maker_volume_cycle_budget_notional": {"value": 48.0}
+            },
+        }
+
+        for case, baseline in unusable_baselines.items():
+            with self.subTest(case=case), TemporaryDirectory() as tmpdir:
+                output_dir = Path(tmpdir)
+                self._write_common_files(
+                    output_dir,
+                    now=now,
+                    control={
+                        "best_quote_maker_volume_allow_loss_reduce_only": False,
+                        "best_quote_maker_volume_cycle_budget_notional": 60.0,
+                        "recovery_control_updated_at": control_updated_at.isoformat(),
+                    },
+                    long_notional=800.0,
+                    short_notional=700.0,
+                    open_order_count=1,
+                    active_order_count=0,
+                    orders_near_market=True,
+                )
+                item: dict[str, object] = {
+                    "status": "recovery_active",
+                    "recovery_owned": True,
+                    "recovery_started_at": (now - timedelta(minutes=6)).isoformat(),
+                    "action_verification_failures": 1,
+                    "guard_recovery_controls": {
+                        "best_quote_maker_volume_cycle_budget_notional": 60.0,
+                    },
+                }
+                if baseline is not None:
+                    item["guard_original_controls"] = baseline
+                state: dict[str, object] = {"symbols": {"REUSDT": item}}
+                restarts: list[str] = []
+
+                result = check_symbol(
+                    symbol="REUSDT",
+                    output_dir=output_dir,
+                    state=state,
+                    now=now,
+                    window_seconds=60,
+                    min_volume_notional=1,
+                    trigger_seconds=120,
+                    max_recovery_seconds=300,
+                    cooldown_seconds=600,
+                    restart_runner=restarts.append,
+                )
+
+                control = json.loads(
+                    (output_dir / "reusdt_loop_runner_control.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                repaired = state["symbols"]["REUSDT"]
+
+                self.assertEqual(
+                    result["action"], "recovery_timeout_local_state_repair"
+                )
+                self.assertEqual(result["changed_keys"], [])
+                self.assertEqual(
+                    control["best_quote_maker_volume_cycle_budget_notional"], 60.0
+                )
+                self.assertFalse(
+                    control["best_quote_maker_volume_allow_loss_reduce_only"]
+                )
+                self.assertEqual(repaired["status"], "cooldown")
+                self.assertNotIn("recovery_started_at", repaired)
+                self.assertNotIn("recovery_owned", repaired)
+                self.assertNotIn("guard_original_controls", repaired)
+                self.assertNotIn("guard_recovery_controls", repaired)
+                self.assertEqual(
+                    repaired["last_terminal_control_update_at"],
+                    control_updated_at.isoformat(),
+                )
+                self.assertEqual(
+                    repaired["last_recovery_terminal_outcome"],
+                    {
+                        "status": "terminated",
+                        "effect_stage": "local_state_repair",
+                        "reason": "original_controls_unavailable",
+                        "completed_at": now.isoformat(),
+                    },
+                )
+                self.assertEqual(restarts, [])
+
+                follow_up = check_symbol(
+                    symbol="REUSDT",
+                    output_dir=output_dir,
+                    state=state,
+                    now=now + timedelta(seconds=1),
+                    window_seconds=60,
+                    min_volume_notional=1,
+                    trigger_seconds=120,
+                    max_recovery_seconds=300,
+                    cooldown_seconds=600,
+                    restart_runner=restarts.append,
+                )
+
+                self.assertEqual(follow_up["action"], "cooldown")
+                self.assertNotEqual(
+                    follow_up["action"],
+                    "recovery_action_verification_failed_hold",
+                )
+                self.assertEqual(restarts, [])
 
     def test_recovered_volume_clears_recovery_instead_of_reapplying_drifted_control(self) -> None:
         now = datetime(2026, 6, 26, 8, 35, tzinfo=timezone.utc)
