@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -50,8 +51,8 @@ def _parse_positive_float(value: Any, field_name: str) -> float | None:
     if value in {"", None}:
         return None
     parsed = float(value)
-    if parsed <= 0:
-        raise ValueError(f"{field_name} must be > 0")
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(f"{field_name} must be a finite number > 0")
     return parsed
 
 

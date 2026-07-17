@@ -9,6 +9,7 @@ from grid_optimizer.submit_plan import (
     apply_hard_loss_rescue_entry_guard_to_actions,
     apply_loss_inventory_no_cross_entry_guard_to_actions,
     apply_loss_reduce_reentry_guard_to_actions,
+    apply_actual_net_exposure_decision_to_actions,
     apply_projected_entry_exposure_cap_to_actions,
     apply_reduce_only_no_loss_guard_to_actions,
     build_execution_actions,
@@ -26,6 +27,364 @@ from grid_optimizer.submit_plan import (
 
 
 class SubmitPlanTests(unittest.TestCase):
+    def test_actual_net_decision_cancels_partially_filled_risk_order_before_placing(self) -> None:
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "SELL",
+                        "position_side": "LONG",
+                        "price": 200.0,
+                        "qty": 0.1,
+                        "notional": 20.0,
+                        "role": "best_quote_reduce_long",
+                        "time_in_force": "GTX",
+                    }
+                ],
+                "cancel_orders": [{"orderId": 999, "side": "SELL"}],
+            },
+            current_actual_net_qty=0.575,
+            valuation_price=200.0,
+            current_open_orders=[
+                {
+                    "orderId": 123,
+                    "side": "BUY",
+                    "positionSide": "SHORT",
+                    "price": "200",
+                    "origQty": "0.10",
+                    "executedQty": "0.04",
+                },
+                {
+                    "orderId": 456,
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "price": "200",
+                    "origQty": "0.05",
+                    "executedQty": "0",
+                },
+            ],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "cancel_risk_increasing",
+        )
+        self.assertEqual(
+            [order["orderId"] for order in guarded["cancel_orders"]],
+            [123],
+        )
+        self.assertEqual(guarded["place_orders"], [])
+
+    def test_actual_net_decision_does_not_recreate_cancel_rejected_by_managed_owner(self) -> None:
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={
+                "place_orders": [],
+                "cancel_orders": [],
+                "recovery_profile_gate": {
+                    "managed": True,
+                    "authorized": False,
+                },
+            },
+            current_actual_net_qty=0.575,
+            valuation_price=200.0,
+            current_open_orders=[
+                {
+                    "orderId": 7,
+                    "clientOrderId": "gx-bchu-frozen-7",
+                    "side": "BUY",
+                    "positionSide": "SHORT",
+                    "price": "200",
+                    "origQty": "0.10",
+                    "executedQty": "0",
+                }
+            ],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "hold",
+        )
+        self.assertEqual(guarded["cancel_orders"], [])
+
+    def test_actual_net_decision_rejects_entry_role_that_can_be_bumped_after_gate(self) -> None:
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "SELL",
+                        "position_side": "SHORT",
+                        "price": 200.0,
+                        "qty": 0.001,
+                        "notional": 0.2,
+                        "role": "grid_entry",
+                        "time_in_force": "GTX",
+                    }
+                ],
+                "cancel_orders": [],
+            },
+            current_actual_net_qty=0.61,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "hold",
+        )
+        self.assertEqual(guarded["place_orders"], [])
+
+    def test_actual_net_decision_keeps_one_gtx_order_in_reducing_direction(self) -> None:
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "BUY",
+                        "position_side": "SHORT",
+                        "price": 200.0,
+                        "qty": 0.1,
+                        "notional": 20.0,
+                        "role": "best_quote_reduce_short",
+                        "time_in_force": "GTX",
+                        "reduce_only_no_loss_guard": "bypassed_allow_loss_role",
+                    },
+                    {
+                        "side": "SELL",
+                        "position_side": "LONG",
+                        "price": 200.0,
+                        "qty": 0.1,
+                        "notional": 20.0,
+                        "role": "best_quote_reduce_long",
+                        "time_in_force": "GTX",
+                        "reduce_only_no_loss_guard": "passed",
+                    },
+                    {
+                        "side": "SELL",
+                        "position_side": "SHORT",
+                        "price": 200.0,
+                        "qty": 0.1,
+                        "notional": 20.0,
+                        "role": "best_quote_entry_short",
+                        "time_in_force": "GTX",
+                    },
+                ],
+                "cancel_orders": [{"orderId": 999, "side": "SELL"}],
+            },
+            current_actual_net_qty=0.64,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "place_net_decrease",
+        )
+        self.assertEqual(guarded["cancel_orders"], [])
+        self.assertEqual(len(guarded["place_orders"]), 1)
+        self.assertEqual(
+            (guarded["place_orders"][0]["side"], guarded["place_orders"][0]["role"]),
+            ("SELL", "best_quote_reduce_long"),
+        )
+
+    def test_actual_net_decision_cancels_stale_reducing_order_before_replacement(self) -> None:
+        old_reduce = {
+            "orderId": 88,
+            "clientOrderId": "gx-bchu-bestquot-88",
+            "side": "SELL",
+            "positionSide": "LONG",
+            "price": "210",
+            "origQty": "0.05",
+            "executedQty": "0",
+        }
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "SELL",
+                        "position_side": "LONG",
+                        "price": 200.0,
+                        "qty": 0.05,
+                        "notional": 10.0,
+                        "role": "best_quote_reduce_long",
+                        "time_in_force": "GTX",
+                    }
+                ],
+                "cancel_orders": [old_reduce],
+            },
+            current_actual_net_qty=0.64,
+            valuation_price=200.0,
+            current_open_orders=[old_reduce],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "cancel_net_decrease_refresh",
+        )
+        self.assertEqual(
+            [order["orderId"] for order in guarded["cancel_orders"]],
+            [88],
+        )
+        self.assertEqual(guarded["place_orders"], [])
+
+    def test_actual_net_decision_uses_safe_opposite_entry_when_reduce_is_unavailable(self) -> None:
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "BUY",
+                        "position_side": "LONG",
+                        "price": 200.0,
+                        "qty": 0.11,
+                        "notional": 22.0,
+                        "role": "best_quote_entry_long",
+                        "time_in_force": "GTX",
+                    },
+                    {
+                        "side": "SELL",
+                        "position_side": "SHORT",
+                        "price": 200.0,
+                        "qty": 0.075,
+                        "notional": 15.0,
+                        "role": "best_quote_entry_short",
+                        "time_in_force": "GTX",
+                    },
+                ],
+                "cancel_orders": [],
+            },
+            current_actual_net_qty=0.55,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "place_net_decrease",
+        )
+        self.assertEqual(
+            [order["role"] for order in guarded["place_orders"]],
+            ["best_quote_entry_short"],
+        )
+
+    def test_actual_net_decision_holds_when_pause_removed_all_reducing_candidates(self) -> None:
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "BUY",
+                        "position_side": "LONG",
+                        "price": 200.0,
+                        "qty": 0.11,
+                        "notional": 22.0,
+                        "role": "best_quote_entry_long",
+                        "time_in_force": "GTX",
+                    }
+                ],
+                "cancel_orders": [],
+            },
+            current_actual_net_qty=0.55,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "hold",
+        )
+        self.assertEqual(guarded["place_orders"], [])
+
+    def test_actual_net_decision_fails_closed_for_non_finite_cap(self) -> None:
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "BUY",
+                        "position_side": "LONG",
+                        "price": 200.0,
+                        "qty": 1.0,
+                        "notional": 200.0,
+                        "role": "best_quote_entry_long",
+                        "time_in_force": "GTX",
+                    }
+                ],
+                "cancel_orders": [],
+            },
+            current_actual_net_qty=0.6,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=float("nan"),
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "hold",
+        )
+        self.assertEqual(guarded["place_orders"], [])
+
+    def test_actual_net_decision_counts_unknown_order_but_does_not_cancel_it(self) -> None:
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={"place_orders": [], "cancel_orders": []},
+            current_actual_net_qty=0.575,
+            valuation_price=200.0,
+            current_open_orders=[
+                {
+                    "orderId": 991,
+                    "clientOrderId": "manual-order",
+                    "side": "BUY",
+                    "price": "200",
+                    "origQty": "0.10",
+                    "executedQty": "0",
+                }
+            ],
+            owned_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "hold",
+        )
+        self.assertEqual(guarded["cancel_orders"], [])
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["reason"],
+            "risk_cancel_not_authorized",
+        )
+
+    def test_actual_net_decision_values_order_qty_at_live_mark_not_limit_price(self) -> None:
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "BUY",
+                        "position_side": "LONG",
+                        "price": 190.0,
+                        "qty": 0.025,
+                        "notional": 4.75,
+                        "role": "best_quote_entry_long",
+                        "time_in_force": "GTX",
+                    }
+                ],
+                "cancel_orders": [],
+            },
+            current_actual_net_qty=0.576,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        # At the common live mark of 200 this BUY projects to 120.2, even
+        # though its resting limit price would make the mixed-price sum 119.95.
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "hold",
+        )
+        self.assertEqual(guarded["place_orders"], [])
+
     def test_projected_entry_cap_rejects_order_that_crosses_cap_from_below(self) -> None:
         guarded = apply_projected_entry_exposure_cap_to_actions(
             actions={

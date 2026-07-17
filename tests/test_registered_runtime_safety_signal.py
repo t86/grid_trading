@@ -5,6 +5,7 @@ import json
 import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -19,6 +20,7 @@ from grid_optimizer.loop_runner import (
     _apply_registered_runtime_safety_signal_to_plan,
     _apply_registered_runtime_safety_signal_to_actions,
     _guard_registered_runtime_safety_order_before_submit,
+    _guard_cancel_order_before_submit,
     _maybe_handle_runtime_guard,
     _protective_entry_stop,
     _replace_registered_runtime_safety_source,
@@ -26,6 +28,7 @@ from grid_optimizer.loop_runner import (
     _validate_registered_runtime_safety_ttl,
 )
 from grid_optimizer.runtime_guards import RuntimeGuardResult
+from grid_optimizer.submit_plan import apply_actual_net_exposure_decision_to_actions
 
 
 NOW = datetime(2026, 7, 16, 1, tzinfo=timezone.utc)
@@ -275,9 +278,14 @@ def test_registered_runtime_signal_action_gate_allows_only_normal_gtx_reduce() -
                         "side": "BUY",
                         "execution_type": "aggressive",
                     },
+                    {
+                        "role": "best_quote_reduce_short",
+                        "side": "SELL",
+                        "execution_type": "post_only",
+                    },
                 ],
                 "cancel_count": 1,
-                "place_count": 3,
+                "place_count": 4,
             },
             now=NOW + timedelta(seconds=1),
         )
@@ -293,6 +301,303 @@ def test_registered_runtime_signal_action_gate_allows_only_normal_gtx_reduce() -
         }
     ]
     assert actions["place_count"] == 1
+
+
+def test_cancel_submit_guard_rejects_managed_generation_change() -> None:
+    stale_gate = SimpleNamespace(
+        managed=True,
+        ready=False,
+        reason="recovery_generation_mismatch",
+        active_action=ActionId.INVENTORY_RECOVER,
+        matches=lambda _expected: False,
+    )
+    with (
+        patch(
+            "grid_optimizer.loop_runner._load_recovery_order_profile_gate",
+            return_value=stale_gate,
+        ),
+        patch(
+            "grid_optimizer.loop_runner._registered_runtime_safety_signal_gate",
+            return_value=(None, {"active": False, "reason": None}),
+        ),
+    ):
+        guarded, reason = _guard_cancel_order_before_submit(
+            args=argparse.Namespace(),
+            order={"orderId": 7, "side": "BUY"},
+            expected_gate={"managed": True, "generation": 1},
+            now=NOW,
+        )
+
+    assert guarded is None
+    assert reason["reason"] == "recovery_cancel_not_authorized"
+    assert reason["gate_reason"] == "recovery_generation_mismatch"
+
+
+def test_cancel_submit_guard_rechecks_directional_runtime_signal() -> None:
+    unmanaged_gate = SimpleNamespace(managed=False)
+    signal = SimpleNamespace(
+        conditions=(SimpleNamespace(side=SimpleNamespace(value="SELL")),),
+    )
+    with (
+        patch(
+            "grid_optimizer.loop_runner._load_recovery_order_profile_gate",
+            return_value=unmanaged_gate,
+        ),
+        patch(
+            "grid_optimizer.loop_runner._registered_runtime_safety_signal_gate",
+            return_value=(
+                signal,
+                {"active": True, "reason": "runtime_safety_signal_active"},
+            ),
+        ),
+    ):
+        blocked, blocked_reason = _guard_cancel_order_before_submit(
+            args=argparse.Namespace(),
+            order={"orderId": 8, "side": "SELL"},
+            expected_gate=None,
+            now=NOW,
+        )
+        allowed, allowed_reason = _guard_cancel_order_before_submit(
+            args=argparse.Namespace(),
+            order={"orderId": 9, "side": "BUY"},
+            expected_gate=None,
+            now=NOW,
+        )
+        refresh, refresh_reason = _guard_cancel_order_before_submit(
+            args=argparse.Namespace(),
+            order={"orderId": 10, "side": "SELL"},
+            expected_gate=None,
+            actual_net_decision={"action": "cancel_net_decrease_refresh"},
+            now=NOW,
+        )
+
+    assert blocked is None
+    assert blocked_reason["reason"] == "runtime_safety_signal_blocks_cancel"
+    assert allowed == {"orderId": 9, "side": "BUY"}
+    assert allowed_reason is None
+    assert refresh == {"orderId": 10, "side": "SELL"}
+    assert refresh_reason is None
+
+
+def test_position_cap_signal_preserves_owned_reduce_refresh_for_final_arbiter() -> None:
+    with TemporaryDirectory() as tmpdir:
+        args, registered = _registered_args(tmpdir)
+        Path(args.state_path).write_text(
+            json.dumps(
+                {
+                    RUNTIME_SAFETY_SIGNAL_KEY: {
+                        "schema": "futures_recovery_runtime_safety_signal_v1",
+                        "symbol": "BCHUSDT",
+                        "run_contract_id": run_contract_identity_from_config(vars(args)),
+                        "generation": registered.generation,
+                        "decision_id": registered.decision_id,
+                        "observed_at": NOW.isoformat(),
+                        "hard_expires_at": (NOW + timedelta(seconds=120)).isoformat(),
+                        "conditions": [
+                            {
+                                "source": "runtime_guard",
+                                "action_id": "inventory_recover",
+                                "reason": "max_actual_net_notional_hit",
+                                "side": "SELL",
+                                "observed_at": NOW.isoformat(),
+                                "hard_expires_at": (NOW + timedelta(seconds=120)).isoformat(),
+                                "details_digest": "sha256:" + "7" * 64,
+                            }
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        old_reduce = {
+            "orderId": 88,
+            "clientOrderId": "gx-bchu-bestquot-88",
+            "side": "SELL",
+            "positionSide": "LONG",
+            "price": "210",
+            "origQty": "0.05",
+            "executedQty": "0",
+        }
+        candidates, _report = _apply_registered_runtime_safety_signal_to_actions(
+            args=args,
+            actions={
+                "cancel_orders": [old_reduce],
+                "place_orders": [
+                    {
+                        "side": "SELL",
+                        "position_side": "LONG",
+                        "price": 200.0,
+                        "qty": 0.05,
+                        "notional": 10.0,
+                        "role": "best_quote_reduce_long",
+                        "time_in_force": "GTX",
+                    }
+                ],
+                "cancel_count": 1,
+                "place_count": 1,
+                "recovery_profile_gate": {
+                    "managed": True,
+                    "authorized": True,
+                },
+            },
+            now=NOW + timedelta(seconds=1),
+        )
+        decision = apply_actual_net_exposure_decision_to_actions(
+            actions=candidates,
+            current_actual_net_qty=0.64,
+            valuation_price=200.0,
+            current_open_orders=[old_reduce],
+            owned_open_orders=[old_reduce],
+            max_actual_net_notional=120.0,
+        )
+
+    assert decision["actual_net_exposure_decision"]["action"] == (
+        "cancel_net_decrease_refresh"
+    )
+    assert [row["orderId"] for row in decision["cancel_orders"]] == [88]
+    assert decision["place_orders"] == []
+
+
+def test_position_cap_signal_preserves_owned_cancel_candidates_for_final_decision() -> None:
+    with TemporaryDirectory() as tmpdir:
+        args, registered = _registered_args(tmpdir)
+        Path(args.state_path).write_text(
+            json.dumps(
+                {
+                    RUNTIME_SAFETY_SIGNAL_KEY: {
+                        "schema": "futures_recovery_runtime_safety_signal_v1",
+                        "symbol": "BCHUSDT",
+                        "run_contract_id": run_contract_identity_from_config(vars(args)),
+                        "generation": registered.generation,
+                        "decision_id": registered.decision_id,
+                        "observed_at": NOW.isoformat(),
+                        "hard_expires_at": (NOW + timedelta(seconds=120)).isoformat(),
+                        "conditions": [
+                            {
+                                "source": "runtime_guard",
+                                "action_id": "inventory_recover",
+                                "reason": "max_actual_net_notional_hit",
+                                "side": "SELL",
+                                "observed_at": NOW.isoformat(),
+                                "hard_expires_at": (NOW + timedelta(seconds=120)).isoformat(),
+                                "details_digest": "sha256:" + "2" * 64,
+                            }
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        actions, report = _apply_registered_runtime_safety_signal_to_actions(
+            args=args,
+            actions={
+                "cancel_orders": [
+                    {"orderId": 1, "side": "BUY", "role": "best_quote_entry_long"},
+                    {"orderId": 2, "side": "SELL", "role": "best_quote_reduce_long"},
+                ],
+                "place_orders": [
+                    {
+                        "role": "best_quote_reduce_long",
+                        "side": "SELL",
+                        "execution_type": "post_only",
+                        "time_in_force": "GTX",
+                    },
+                    {
+                        "role": "best_quote_reduce_short",
+                        "side": "BUY",
+                        "execution_type": "post_only",
+                        "time_in_force": "GTX",
+                    },
+                ],
+                "cancel_count": 2,
+                "place_count": 2,
+            },
+            now=NOW + timedelta(seconds=1),
+        )
+
+        assert report["active"] is True
+        assert report["allowed_reduce_side"] == "SELL"
+        # The runtime signal is a candidate fence.  The final actual-net
+        # arbiter chooses risk BUY cancellation versus stale SELL refresh.
+        assert [row["orderId"] for row in actions["cancel_orders"]] == [1, 2]
+        assert actions["place_orders"] == []
+        guarded, reason = _guard_registered_runtime_safety_order_before_submit(
+            args=args,
+            order={
+                "role": "best_quote_reduce_short",
+                "side": "BUY",
+                "execution_type": "post_only",
+                "time_in_force": "GTX",
+            },
+            now=NOW + timedelta(seconds=1),
+        )
+        assert guarded is None
+        assert reason["reason"] == "runtime_safety_signal_blocks_risk_increase"
+
+
+def test_position_cap_signal_keeps_only_owned_reduce_role() -> None:
+    with TemporaryDirectory() as tmpdir:
+        args, registered = _registered_args(tmpdir)
+        Path(args.state_path).write_text(
+            json.dumps(
+                {
+                    RUNTIME_SAFETY_SIGNAL_KEY: {
+                        "schema": "futures_recovery_runtime_safety_signal_v1",
+                        "symbol": "BCHUSDT",
+                        "run_contract_id": run_contract_identity_from_config(vars(args)),
+                        "generation": registered.generation,
+                        "decision_id": registered.decision_id,
+                        "observed_at": NOW.isoformat(),
+                        "hard_expires_at": (NOW + timedelta(seconds=120)).isoformat(),
+                        "conditions": [
+                            {
+                                "source": "runtime_guard",
+                                "action_id": "inventory_recover",
+                                "reason": "max_actual_net_notional_hit",
+                                "side": "SELL",
+                                "observed_at": NOW.isoformat(),
+                                "hard_expires_at": (NOW + timedelta(seconds=120)).isoformat(),
+                                "details_digest": "sha256:" + "6" * 64,
+                            }
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        actions, _report = _apply_registered_runtime_safety_signal_to_actions(
+            args=args,
+            actions={
+                "cancel_orders": [],
+                "place_orders": [
+                    {
+                        "role": "best_quote_reduce_long",
+                        "side": "SELL",
+                        "execution_type": "post_only",
+                        "time_in_force": "GTX",
+                    },
+                    {
+                        "role": "best_quote_entry_short",
+                        "side": "SELL",
+                        "execution_type": "post_only",
+                        "time_in_force": "GTX",
+                    },
+                    {
+                        "role": "best_quote_reduce_short",
+                        "side": "BUY",
+                        "execution_type": "post_only",
+                        "time_in_force": "GTX",
+                    },
+                ],
+                "cancel_count": 0,
+                "place_count": 3,
+            },
+            now=NOW + timedelta(seconds=1),
+        )
+
+    assert [row["role"] for row in actions["place_orders"]] == [
+        "best_quote_reduce_long",
+    ]
 
 
 def test_expired_signal_has_absolute_deadline_and_releases_local_entry_gate() -> None:
@@ -393,10 +698,15 @@ def test_tampered_signal_above_global_max_ttl_is_rejected_fail_closed() -> None:
                         "role": "best_quote_entry_long",
                         "side": "BUY",
                         "execution_type": "post_only",
+                    },
+                    {
+                        "role": "best_quote_reduce_short",
+                        "side": "BUY",
+                        "execution_type": "post_only",
                     }
                 ],
                 "cancel_count": 0,
-                "place_count": 1,
+                "place_count": 2,
             },
             now=NOW + timedelta(seconds=1),
         )

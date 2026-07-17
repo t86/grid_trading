@@ -116,6 +116,7 @@ from .submit_plan import (
     apply_hard_loss_rescue_entry_guard_to_actions,
     apply_loss_inventory_no_cross_entry_guard_to_actions,
     apply_loss_reduce_reentry_guard_to_actions,
+    apply_actual_net_exposure_decision_to_actions,
     apply_projected_entry_exposure_cap_to_actions,
     apply_reduce_only_no_loss_guard_to_actions,
     cap_reduce_only_place_orders_to_position,
@@ -12445,6 +12446,56 @@ def _runtime_guard_live_exposure(
     return net_notional, unrealized_pnl
 
 
+def _runtime_guard_plan_actual_net_notional(
+    plan_report: Mapping[str, Any],
+) -> Any:
+    """Return account LONG-SHORT net for the runtime position cap.
+
+    ``strategy_actual_net_notional`` deliberately excludes frozen inventory and
+    remains valid for strategy PnL recovery.  It is not a position-cap metric.
+    New plans persist an explicit exchange value; old hedge BQ plans can be
+    reconstructed from their pre-isolation reduce-freeze snapshot.
+    """
+
+    explicit = plan_report.get("exchange_actual_net_notional")
+    if explicit is not None:
+        return explicit
+    exchange_qty = plan_report.get("exchange_actual_net_qty")
+    mid_price = _safe_float(plan_report.get("mid_price"))
+    if exchange_qty is not None and mid_price > 0:
+        return _safe_float(exchange_qty) * mid_price
+    exchange_long_qty = plan_report.get("exchange_long_qty")
+    exchange_short_qty = plan_report.get("exchange_short_qty")
+    if (
+        exchange_long_qty is not None
+        and exchange_short_qty is not None
+        and mid_price > 0
+    ):
+        return (
+            _safe_float(exchange_long_qty) - _safe_float(exchange_short_qty)
+        ) * mid_price
+    best_quote = plan_report.get("best_quote_maker_volume")
+    reduce_freeze = (
+        best_quote.get("reduce_freeze")
+        if isinstance(best_quote, Mapping)
+        else None
+    )
+    if (
+        isinstance(reduce_freeze, Mapping)
+        and "actual_long_qty" in reduce_freeze
+        and "actual_short_qty" in reduce_freeze
+        and mid_price > 0
+    ):
+        return (
+            _safe_float(reduce_freeze.get("actual_long_qty"))
+            - _safe_float(reduce_freeze.get("actual_short_qty"))
+        ) * mid_price
+    legacy = plan_report.get("strategy_actual_net_notional")
+    if legacy is None:
+        legacy = plan_report.get("actual_net_notional")
+    return legacy
+
+
 def _runtime_guard_exposure_inputs(
     latest_plan_report: dict[str, Any],
     *,
@@ -12458,8 +12509,9 @@ def _runtime_guard_exposure_inputs(
       semantics, no live call. There is no stale snapshot to latch on, and
       plan-less guard evaluations must not require network access.
     - FRESH plan (``generated_at`` within ``RUNTIME_GUARD_PLAN_MAX_AGE_SECONDS``):
-      plan values are used and live positionRisk is NOT consulted at all — normal
-      cycles keep the ledger-scoped ``strategy_actual_net_notional`` semantics.
+      plan values are used and live positionRisk is NOT consulted at all.  The
+      actual-net cap uses account LONG-SHORT including frozen inventory, while
+      unrealized-loss recovery keeps its ledger-scoped strategy PnL semantics.
     - STALE plan or a non-empty snapshot missing/unparseable ``generated_at`` (a
       guard-stopped runner no longer writes plans): re-read account-level exposure
       from live positionRisk, which unlatches a stop whose pre-stop snapshot no
@@ -12467,9 +12519,7 @@ def _runtime_guard_exposure_inputs(
     - Live fetch failure: keep the stale plan values (fail-closed — a stale stop may
       hold longer than necessary, but exposure is never blind-released).
     """
-    net = latest_plan_report.get("strategy_actual_net_notional")
-    if net is None:
-        net = latest_plan_report.get("actual_net_notional")
+    net = _runtime_guard_plan_actual_net_notional(latest_plan_report)
     upnl = latest_plan_report.get("strategy_unrealized_pnl")
     if upnl is None:
         upnl = latest_plan_report.get("unrealized_pnl")
@@ -17786,18 +17836,52 @@ def _registered_runtime_safety_signal_gate(
     return signal, report
 
 
-def _runtime_safety_normal_gtx_reduce(order: Mapping[str, Any]) -> bool:
+def _runtime_safety_allowed_reduce_sides(signal: Any) -> frozenset[str]:
+    if signal is None:
+        return frozenset()
+    directional = {
+        condition.side.value
+        for condition in getattr(signal, "conditions", ())
+        if getattr(condition, "side", None) is not None
+    }
+    if not directional:
+        return frozenset({"BUY", "SELL"})
+    if len(directional) == 1:
+        return frozenset(directional)
+    return frozenset()
+
+
+def _runtime_safety_normal_gtx_reduce(
+    order: Mapping[str, Any],
+    *,
+    signal: Any = None,
+) -> bool:
     role = str(order.get("role") or "").strip().lower()
     side = str(order.get("side") or "").strip().upper()
-    if (role, side) not in {
-        ("best_quote_reduce_long", "SELL"),
-        ("best_quote_reduce_short", "BUY"),
-    }:
+    allowed_sides = _runtime_safety_allowed_reduce_sides(signal)
+    if side not in allowed_sides:
+        return False
+    directional = len(allowed_sides) == 1
+    allowed_role_sides = (
+        {
+            "SELL": {("best_quote_reduce_long", "SELL")},
+            "BUY": {("best_quote_reduce_short", "BUY")},
+        }[side]
+        if directional
+        else {
+            ("best_quote_reduce_long", "SELL"),
+            ("best_quote_reduce_short", "BUY"),
+        }
+    )
+    if (role, side) not in allowed_role_sides:
         return False
     if str(order.get("execution_type", "post_only")).strip().lower() == "aggressive":
         return False
     time_in_force = str(order.get("time_in_force") or "GTX").strip().upper()
-    return time_in_force == "GTX"
+    return (
+        time_in_force == "GTX"
+        and side in allowed_sides
+    )
 
 
 def _apply_registered_runtime_safety_signal_to_plan(
@@ -17806,8 +17890,12 @@ def _apply_registered_runtime_safety_signal_to_plan(
     plan: dict[str, Any],
     now: datetime,
 ) -> dict[str, Any]:
-    _signal, report = _registered_runtime_safety_signal_gate(args, now=now)
+    signal, report = _registered_runtime_safety_signal_gate(args, now=now)
     dropped: list[dict[str, Any]] = []
+    allowed_sides = _runtime_safety_allowed_reduce_sides(signal)
+    report["allowed_reduce_side"] = (
+        next(iter(allowed_sides)) if len(allowed_sides) == 1 else None
+    )
     if report["active"]:
         for key in ("bootstrap_orders", "buy_orders", "sell_orders"):
             kept = []
@@ -17815,7 +17903,7 @@ def _apply_registered_runtime_safety_signal_to_plan(
                 if not isinstance(raw, Mapping):
                     continue
                 order = dict(raw)
-                if _runtime_safety_normal_gtx_reduce(order):
+                if _runtime_safety_normal_gtx_reduce(order, signal=signal):
                     kept.append(order)
                 else:
                     dropped.append(
@@ -17838,7 +17926,7 @@ def _apply_registered_runtime_safety_signal_to_actions(
     now: datetime,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     result = dict(actions)
-    _signal, report = _registered_runtime_safety_signal_gate(args, now=now)
+    signal, report = _registered_runtime_safety_signal_gate(args, now=now)
     places = [
         dict(item)
         for item in actions.get("place_orders", [])
@@ -17851,16 +17939,36 @@ def _apply_registered_runtime_safety_signal_to_actions(
     ]
     dropped_places: list[dict[str, Any]] = []
     dropped_cancels: list[dict[str, Any]] = []
+    allowed_sides = _runtime_safety_allowed_reduce_sides(signal)
+    allowed_reduce_side = (
+        next(iter(allowed_sides)) if len(allowed_sides) == 1 else None
+    )
+    report["allowed_reduce_side"] = allowed_reduce_side
     if report["active"]:
         kept_places = []
         for order in places:
-            if _runtime_safety_normal_gtx_reduce(order):
+            if _runtime_safety_normal_gtx_reduce(order, signal=signal):
                 kept_places.append(order)
             else:
                 dropped_places.append(order)
         places = kept_places
-        dropped_cancels = cancels
-        cancels = []
+        if allowed_reduce_side is None:
+            dropped_cancels = cancels
+            cancels = []
+        else:
+            kept_cancels = [
+                order
+                for order in cancels
+                if str(order.get("side") or "").upper().strip()
+                in {"BUY", "SELL"}
+            ]
+            dropped_cancels = [
+                order for order in cancels if order not in kept_cancels
+            ]
+            cancels = kept_cancels
+            if cancels:
+                dropped_places.extend(places)
+                places = []
     result["place_orders"] = places
     result["place_count"] = len(places)
     result["place_notional"] = sum(
@@ -17889,14 +17997,73 @@ def _guard_registered_runtime_safety_order_before_submit(
     order: Mapping[str, Any],
     now: datetime,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    _signal, report = _registered_runtime_safety_signal_gate(args, now=now)
-    if not report["active"] or _runtime_safety_normal_gtx_reduce(order):
+    signal, report = _registered_runtime_safety_signal_gate(args, now=now)
+    if not report["active"] or _runtime_safety_normal_gtx_reduce(
+        order,
+        signal=signal,
+    ):
         return dict(order), None
     return None, {
         "reason": "runtime_safety_signal_blocks_risk_increase",
         "signal_reason": report.get("reason"),
         "role": str(order.get("role") or ""),
         "side": str(order.get("side") or "").upper().strip(),
+    }
+
+
+def _guard_cancel_order_before_submit(
+    *,
+    args: Any,
+    order: Mapping[str, Any],
+    expected_gate: Mapping[str, Any] | None,
+    actual_net_decision: Mapping[str, Any] | None = None,
+    now: datetime,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    gate = _load_recovery_order_profile_gate(args, now=now)
+    expected_managed = bool(
+        isinstance(expected_gate, Mapping) and expected_gate.get("managed")
+    )
+    if expected_managed:
+        authorized = bool(gate.managed and gate.matches(expected_gate))
+    else:
+        authorized = not gate.managed
+    if not authorized:
+        active_action = getattr(gate, "active_action", ActionId.NOOP)
+        return None, {
+            "reason": "recovery_cancel_not_authorized",
+            "active_action": getattr(active_action, "value", str(active_action)),
+            "gate_reason": getattr(gate, "reason", None),
+            "order_id": order.get("orderId"),
+            "client_order_id": order.get("clientOrderId"),
+        }
+
+    signal, report = _registered_runtime_safety_signal_gate(args, now=now)
+    if not report.get("active"):
+        return dict(order), None
+    allowed_reduce_sides = _runtime_safety_allowed_reduce_sides(signal)
+    allowed_cancel_side = None
+    if len(allowed_reduce_sides) == 1:
+        reduce_side = next(iter(allowed_reduce_sides))
+        decision_action = (
+            str(actual_net_decision.get("action") or "")
+            if isinstance(actual_net_decision, Mapping)
+            else ""
+        )
+        allowed_cancel_side = (
+            reduce_side
+            if decision_action == "cancel_net_decrease_refresh"
+            else "BUY" if reduce_side == "SELL" else "SELL"
+        )
+    side = str(order.get("side") or "").upper().strip()
+    if side == allowed_cancel_side:
+        return dict(order), None
+    return None, {
+        "reason": "runtime_safety_signal_blocks_cancel",
+        "signal_reason": report.get("reason"),
+        "side": side,
+        "allowed_cancel_side": allowed_cancel_side,
+        "order_id": order.get("orderId"),
+        "client_order_id": order.get("clientOrderId"),
     }
 
 
@@ -25178,6 +25345,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     else:
         current_long_qty = max(_position_qty(long_position, position_side="LONG" if uses_exchange_hedge_positions else None), 0.0)
         current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0) if uses_exchange_hedge_positions else 0.0
+    exchange_long_qty = current_long_qty
+    exchange_short_qty = current_short_qty
+    exchange_actual_net_qty = (
+        exchange_long_qty - exchange_short_qty
+        if uses_exchange_hedge_positions
+        else actual_net_qty
+    )
+    exchange_actual_net_notional = exchange_actual_net_qty * max(mid_price, 0.0)
     current_long_notional = current_long_qty * max(mid_price, 0.0)
     current_short_notional = current_short_qty * max(mid_price, 0.0)
     if uses_exchange_hedge_positions:
@@ -30055,6 +30230,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "current_short_avg_price": current_short_avg_price,
         "actual_net_qty": actual_net_qty,
         "actual_net_notional": actual_net_qty * max(mid_price, 0.0),
+        "exchange_long_qty": exchange_long_qty,
+        "exchange_short_qty": exchange_short_qty,
+        "exchange_actual_net_qty": exchange_actual_net_qty,
+        "exchange_actual_net_notional": exchange_actual_net_notional,
         "strategy_actual_net_qty": strategy_actual_net_qty,
         "strategy_actual_net_notional": strategy_actual_net_notional,
         "unrealized_pnl": unrealized_pnl,
@@ -30239,6 +30418,78 @@ def _mark_submit_report_blocked(report: dict[str, Any], *, reason: str = "valida
     return report
 
 
+def _actual_net_safety_cancel_requested(actions: Mapping[str, Any]) -> bool:
+    decision = actions.get("actual_net_exposure_decision")
+    return bool(
+        isinstance(decision, Mapping)
+        and decision.get("action")
+        in {"cancel_risk_increasing", "cancel_net_decrease_refresh"}
+    )
+
+
+def _execution_cancel_actions_enabled(
+    args: argparse.Namespace,
+    actions: Mapping[str, Any],
+) -> bool:
+    return bool(
+        actions.get("cancel_count", 0) > 0
+        and (
+            bool(getattr(args, "cancel_stale", False))
+            or _actual_net_safety_cancel_requested(actions)
+        )
+    )
+
+
+def _authorize_actual_net_safety_cancel_validation(
+    validation: Mapping[str, Any],
+) -> dict[str, Any]:
+    result = dict(validation)
+    actions = result.get("actions")
+    if not (
+        isinstance(actions, Mapping)
+        and _actual_net_safety_cancel_requested(actions)
+    ):
+        return result
+    stale_cancel_error = (
+        "plan contains stale orders; rerun with --cancel-stale or regenerate the plan"
+    )
+    result["errors"] = [
+        item for item in list(result.get("errors") or [])
+        if item != stale_cancel_error
+    ]
+    result["ok"] = not result["errors"]
+    return result
+
+
+def _actual_net_exposure_open_orders(
+    *,
+    args: argparse.Namespace,
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    snapshot_open_orders: Iterable[Any],
+) -> list[dict[str, Any]]:
+    cap = _safe_float(getattr(args, "max_actual_net_notional", None))
+    if not math.isfinite(cap):
+        raise ValueError("max_actual_net_notional must be finite")
+    if cap <= 0:
+        return [
+            dict(item) for item in snapshot_open_orders
+            if isinstance(item, Mapping)
+        ]
+    return [
+        dict(item)
+        for item in fetch_futures_open_orders(
+            symbol,
+            api_key,
+            api_secret,
+            recv_window=int(getattr(args, "recv_window", 5000)),
+            use_cache=False,
+        )
+        if isinstance(item, Mapping)
+    ]
+
+
 def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -> dict[str, Any]:
     strategy_mode = str(plan_report.get("strategy_mode") or getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
     effective_max_total_notional = _safe_float(plan_report.get("effective_max_total_notional"))
@@ -30417,6 +30668,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         },
         "executed": False,
         "canceled_orders": [],
+        "skipped_cancels": [],
         "placed_orders": [],
         "skipped_orders": [],
         "recovery_profile_execution": recovery_profile_execution,
@@ -30993,6 +31245,40 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             plan_report.get("max_short_position_notional")
         ),
     )
+    actual_net_exposure_open_orders = _actual_net_exposure_open_orders(
+        args=args,
+        symbol=symbol,
+        api_key=api_key,
+        api_secret=api_secret,
+        snapshot_open_orders=current_open_orders,
+    )
+    validation["actions"] = apply_actual_net_exposure_decision_to_actions(
+        actions=validation["actions"],
+        current_actual_net_qty=current_actual_net_qty,
+        valuation_price=live_mid_price,
+        current_open_orders=actual_net_exposure_open_orders,
+        owned_open_orders=_filter_futures_strategy_orders(
+            actual_net_exposure_open_orders,
+            symbol,
+        ),
+        max_actual_net_notional=_safe_float(
+            getattr(args, "max_actual_net_notional", None)
+        ),
+    )
+    validation = _authorize_actual_net_safety_cancel_validation(validation)
+    report["actual_net_exposure_decision"] = validation["actions"].get(
+        "actual_net_exposure_decision"
+    )
+    if (
+        validation["actions"].get("cancel_count", 0) > 0
+        or validation["actions"].get("place_count", 0) > 0
+    ):
+        validation["errors"] = [
+            item
+            for item in validation["errors"]
+            if "plan contains no actions to execute" not in item
+        ]
+        validation["ok"] = not validation["errors"]
     configured_place_budget = int(getattr(args, "execution_place_budget_per_cycle", 0) or 0)
     max_new_order_budget = int(getattr(args, "max_new_orders", 0) or 0)
     effective_place_budget = (
@@ -31049,8 +31335,41 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         recv_window=args.recv_window,
     )
 
-    if args.cancel_stale:
+    if _execution_cancel_actions_enabled(args, validation["actions"]):
         for stale_order in validation["actions"]["cancel_orders"]:
+            guarded_cancel, cancel_skip_reason = _guard_cancel_order_before_submit(
+                args=args,
+                order=stale_order,
+                expected_gate=(
+                    plan_report.get("recovery_profile_gate")
+                    if isinstance(
+                        plan_report.get("recovery_profile_gate"), Mapping
+                    )
+                    else None
+                ),
+                actual_net_decision=(
+                    validation["actions"].get("actual_net_exposure_decision")
+                    if isinstance(validation["actions"], Mapping)
+                    else None
+                ),
+                now=datetime.now(timezone.utc),
+            )
+            if guarded_cancel is None:
+                report["skipped_cancels"].append(
+                    {
+                        "request": {
+                            "orderId": stale_order.get("orderId"),
+                            "clientOrderId": stale_order.get("clientOrderId"),
+                            "side": str(stale_order.get("side") or "")
+                            .upper()
+                            .strip(),
+                        },
+                        "reason": cancel_skip_reason
+                        or {"reason": "cancel_not_authorized"},
+                    }
+                )
+                continue
+            stale_order = guarded_cancel
             try:
                 cancel_response = delete_futures_order(
                     symbol=symbol,
@@ -33673,9 +33992,7 @@ def main() -> None:
                     cumulative_gross_notional=runtime_cumulative_gross_notional,
                     pnl_events=runtime_pnl_events_for_guard,
                     actual_net_notional=_safe_float(
-                        plan_report.get("strategy_actual_net_notional")
-                        if plan_report.get("strategy_actual_net_notional") is not None
-                        else plan_report.get("actual_net_notional")
+                        _runtime_guard_plan_actual_net_notional(plan_report)
                     ),
                     synthetic_drift_notional=_synthetic_drift_notional(
                         _safe_float(plan_report.get("mid_price")),

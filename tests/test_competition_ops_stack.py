@@ -1172,6 +1172,149 @@ def test_guard_exposure_inputs_fresh_plan_never_touches_live(monkeypatch) -> Non
     assert calls == []                                   # fresh plan: live NOT consulted
 
 
+def test_guard_exposure_inputs_fresh_hedge_plan_includes_frozen_exchange_net() -> None:
+    import grid_optimizer.loop_runner as lr
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 7, 17, 0, 0, 0, tzinfo=timezone.utc)
+    price = 190.96
+    fresh_plan = {
+        "generated_at": now.isoformat(),
+        "strategy_mode": "hedge_best_quote_maker_volume_v1",
+        "mid_price": price,
+        # Both legacy candidates are deliberately wrong for hedge mode: one is
+        # only the LONG row and one excludes the frozen LONG reservoir.
+        "actual_net_notional": 0.748 * price,
+        "strategy_actual_net_notional": (0.465 - 0.073) * price,
+        "best_quote_maker_volume": {
+            "reduce_freeze": {
+                "actual_long_qty": 0.748,
+                "actual_short_qty": 0.073,
+                "frozen_long_qty": 0.283,
+                "frozen_short_qty": 0.0,
+            }
+        },
+    }
+
+    net, _upnl, source = lr._runtime_guard_exposure_inputs(
+        fresh_plan,
+        now=now,
+        symbol="BCHUSDT",
+        live_exposure_fetcher=lambda _symbol: (_ for _ in ()).throw(
+            AssertionError("fresh plan must not fetch live exposure")
+        ),
+    )
+
+    assert source == "plan"
+    assert abs(net - ((0.748 - 0.073) * price)) < 1e-9
+    guard = lr.evaluate_runtime_guards(
+        config=lr.normalize_runtime_guard_config(
+            {"max_actual_net_notional": 120.0}
+        ),
+        now=now,
+        cumulative_gross_notional=0.0,
+        pnl_events=[],
+        actual_net_notional=net,
+    )
+    assert guard.primary_reason == "max_actual_net_notional_hit"
+
+
+def test_actual_net_safety_cancel_executes_when_stale_cancel_is_disabled() -> None:
+    import grid_optimizer.loop_runner as lr
+    from argparse import Namespace
+
+    actions = {
+        "cancel_count": 1,
+        "cancel_orders": [{"orderId": 7, "side": "BUY"}],
+        "actual_net_exposure_decision": {
+            "action": "cancel_risk_increasing",
+        },
+    }
+
+    assert lr._execution_cancel_actions_enabled(
+        Namespace(cancel_stale=False),
+        actions,
+    )
+    assert not lr._execution_cancel_actions_enabled(
+        Namespace(cancel_stale=False),
+        {
+            "cancel_count": 1,
+            "cancel_orders": [{"orderId": 8, "side": "BUY"}],
+            "actual_net_exposure_decision": {"action": "normal"},
+        },
+    )
+    refresh_actions = {
+        **actions,
+        "actual_net_exposure_decision": {
+            "action": "cancel_net_decrease_refresh",
+        },
+    }
+    assert lr._execution_cancel_actions_enabled(
+        Namespace(cancel_stale=False),
+        refresh_actions,
+    )
+
+
+def test_actual_net_safety_cancel_only_overrides_stale_cancel_validation_error() -> None:
+    import grid_optimizer.loop_runner as lr
+
+    stale_error = (
+        "plan contains stale orders; rerun with --cancel-stale or regenerate the plan"
+    )
+    validation = {
+        "ok": False,
+        "errors": [stale_error],
+        "actions": {
+            "cancel_count": 1,
+            "cancel_orders": [{"orderId": 7, "side": "BUY"}],
+            "actual_net_exposure_decision": {
+                "action": "cancel_risk_increasing",
+            },
+        },
+    }
+
+    updated = lr._authorize_actual_net_safety_cancel_validation(validation)
+
+    assert updated["ok"] is True
+    assert updated["errors"] == []
+
+    validation["errors"] = [stale_error, "unrelated validation failure"]
+    validation["ok"] = False
+    updated = lr._authorize_actual_net_safety_cancel_validation(validation)
+    assert updated["ok"] is False
+    assert updated["errors"] == ["unrelated validation failure"]
+
+
+def test_actual_net_cap_uses_fresh_full_exchange_order_snapshot(monkeypatch) -> None:
+    import grid_optimizer.loop_runner as lr
+    from argparse import Namespace
+
+    manual_order = {
+        "orderId": 991,
+        "clientOrderId": "manual-order",
+        "symbol": "BCHUSDT",
+        "side": "BUY",
+    }
+    calls = []
+
+    def fetch(symbol, api_key, api_secret, *, recv_window, use_cache):
+        calls.append((symbol, api_key, api_secret, recv_window, use_cache))
+        return [manual_order]
+
+    monkeypatch.setattr(lr, "fetch_futures_open_orders", fetch)
+
+    rows = lr._actual_net_exposure_open_orders(
+        args=Namespace(max_actual_net_notional=120.0, recv_window=5000),
+        symbol="BCHUSDT",
+        api_key="key",
+        api_secret="secret",
+        snapshot_open_orders=[{"orderId": 1, "clientOrderId": "gx-bchu-1"}],
+    )
+
+    assert rows == [manual_order]
+    assert calls == [("BCHUSDT", "key", "secret", 5000, False)]
+
+
 def test_guard_exposure_inputs_stale_or_missing_ts_uses_live(monkeypatch) -> None:
     import grid_optimizer.loop_runner as lr
     from datetime import datetime, timedelta, timezone

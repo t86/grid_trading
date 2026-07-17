@@ -143,6 +143,16 @@ flowchart LR
 
 运行器本地安全信号按 `max(120s, sleep + jitter + 60s 协调轮询 + 30s 余量)` 固化绝对 TTL，并设置 15 分钟全局上限；超限的已注册运行配置在启动前拒绝，未注册旧运行器不受此新门禁影响。信号过期、条件新鲜清除或 coordinator 接管各自有严格的 generation/decision 规则，本地清除观测不能直接改写 coordinator 的安全状态。
 
+真实净敞口上限统一使用交易所账户级 `LONG - SHORT`，冻结仓只从普通策略盈亏/恢复账本隔离，不能从 `max_actual_net_notional` 隔离。Hedge 模式下 `BUY/LONG entry` 与 `BUY/SHORT reduce` 都增加真实净敞口，`SELL/LONG reduce` 与 `SELL/SHORT entry` 都减少真实净敞口；任何角色名、`allow_loss` 或局部 guard 都不得改变这个方向语义。所有 entry pause、inventory unlock、亏损许可、恢复 profile 和普通仓位上限处理完后，提交器执行一次最终净敞口裁决，且不允许相反方向委托互相抵扣：若交易所现有委托的最坏单边成交会越界，本轮唯一动作是撤销精确归属的增险方向委托；确认撤单后的下一轮，才可从已经通过上游门禁的候选中保留最多一个 `LIMIT + GTX` 降险委托；无安全候选时明确 `HOLD`，不得重新生成被波动暂停删除的 entry，也不得自行开启亏损权限。
+
+该最终裁决只收窄候选，不取得冻结账本或临时亏损租约的所有权。`TEMPORARY_LOSS_RELIEF` 仍必须绑定当前代际、决策、方向、订单角色和绝对 TTL，到期或回执完成后自动回收；`volatility_entry_pause` 默认开启；任何恢复订单继续保持 maker-only。运行时 position-cap 信号必须携带有符号方向：净多只允许 SELL 降险，并把已授权的风险 BUY 撤单与旧 SELL 降险单刷新撤单都交给最终裁决二选一，净空完全对称；有待撤订单时不得在同轮下新单。
+
+受协调器管理的 symbol 只能从当前 recovery profile 已授权的撤单候选中执行净敞口撤单；代际或所有权门禁已拒绝的撤单不得根据交易所快照被最终裁决重新生成。未注册兼容路径允许 hard-cap 裁决撤销本运行器精确归属的增险订单，这类安全撤单以及“撤旧的降险单、下一轮换成近价 GTX”的刷新撤单不受普通 `cancel_stale` 维护开关抑制。若已有降险单同时出现在本轮已授权撤单候选中，本轮只能撤旧单，不能把撤单删除后永久 `HOLD`，也不能同轮挂替代单。
+
+启用真实净敞口上限时，提交前必须强制读取该 symbol 的完整、非缓存交易所开放委托用于最坏单边投影，不能只依赖可能仅含策略前缀订单的 user-data-stream 本地缓存。未知或人工委托参与风险投影，但不因此取得撤单权限；若未知增险委托使上限不可证明，本轮明确 `HOLD` 并报告 `risk_cancel_not_authorized`。所有上限、估值价和当前净数量都必须是有限数，`NaN`、正负无穷或无效配置在启动配置层直接拒绝，提交层再次失败关闭。
+
+撤单与下单使用相同的提交前 fence。每笔交易所 delete 之前必须重新读取当前 recovery generation、decision、profile 和运行时安全信号；managed 撤单只有仍匹配计划快照才可执行，方向性 position-cap 信号下只允许撤增险方向。换代、租约到期、信号变为无方向或所有权后来被接管时，旧撤单记录为 `skipped_cancels`，不得执行。
+
 注册前若现有冻结库存摘要或 lot 为正数/无效，或 control/baseline 仍启用 `best_quote_maker_volume_reduce_freeze_enabled` 冻结创建能力，所有权切换直接拒绝；这只是阻止不完整的 `FROZEN_LEDGER_REPAIR` 接管，不代表冻结修复已实现。扁平受管字段漂移、遗留原始 `allow_loss=true` 和损坏的普通回执 journal 分别进入单独的本地修复轮次，下一轮再恢复决策，不能依赖人工清理布尔状态。
 
 改造基线 `main` 已包含的普通 BQ 入场受阻时定向 reduce-only、双侧 entry 受阻时恢复减仓单、ARX 低速时恢复双边近价 maker/临时容量、partial maker book drift 和“近期 submit 只抑制重启但不抑制独立流量恢复”等修复，已作为表征门禁映射到注册 symbol 的 `FlowBlockerAssessment`/标准动作和运行器回执。未注册 symbol 仍保留旧路径；冻结账本专用修复和生产迁移夹具未验证前，不得删除这些兼容路径或将已注册 symbol 当作已可生产启用。

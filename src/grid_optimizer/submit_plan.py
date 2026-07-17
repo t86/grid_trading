@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 import traceback
 from datetime import datetime, timezone
@@ -1249,6 +1250,288 @@ def _order_notional(order: dict[str, Any]) -> float:
         _safe_float(
             order.get("origQty", order.get("qty", order.get("quantity")))
         )
+    )
+
+
+def _is_gtx_candidate(order: dict[str, Any]) -> bool:
+    if not _order_prefers_post_only(order):
+        return False
+    return str(
+        order.get("time_in_force", order.get("timeInForce", "GTX")) or "GTX"
+    ).upper().strip() == "GTX"
+
+
+def apply_actual_net_exposure_decision_to_actions(
+    *,
+    actions: dict[str, Any],
+    current_actual_net_qty: float,
+    valuation_price: float,
+    current_open_orders: Iterable[Any],
+    max_actual_net_notional: float,
+    owned_open_orders: Iterable[Any] | None = None,
+) -> dict[str, Any]:
+    """Make the final, single action decision for actual net exposure.
+
+    BUY always increases exchange LONG-SHORT net and SELL always decreases it,
+    including hedge-mode SHORT reductions.  Opposite-side orders therefore may
+    not offset each other in the projection.  If live orders can cross the cap,
+    this round only cancels the exact risk direction.  Otherwise a breached or
+    newly projected cap keeps at most one GTX order that reduces absolute net.
+    All earlier pause, ownership and loss gates remain authoritative candidates;
+    this function never synthesizes an order or opens loss permission.
+    """
+
+    def finite_number(value: Any) -> float | None:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) else None
+
+    parsed_cap = finite_number(max_actual_net_notional)
+    parsed_mark = finite_number(valuation_price)
+    parsed_current_qty = finite_number(current_actual_net_qty)
+    invalid_fields = [
+        name
+        for name, value in (
+            ("max_actual_net_notional", parsed_cap),
+            ("valuation_price", parsed_mark),
+            ("current_actual_net_qty", parsed_current_qty),
+        )
+        if value is None
+    ]
+    cap = max(parsed_cap or 0.0, 0.0)
+    mark_price = max(parsed_mark or 0.0, 0.0)
+    current_qty = parsed_current_qty or 0.0
+    current = current_qty * mark_price
+    place_orders = [
+        dict(item)
+        for item in actions.get("place_orders", [])
+        if isinstance(item, dict)
+    ]
+    cancel_orders = [
+        dict(item)
+        for item in actions.get("cancel_orders", [])
+        if isinstance(item, dict)
+    ]
+    current_open_order_rows = list(current_open_orders)
+    open_orders = [
+        dict(item) for item in current_open_order_rows if isinstance(item, dict)
+    ]
+    owned_orders = [
+        dict(item)
+        for item in (
+            current_open_order_rows
+            if owned_open_orders is None
+            else owned_open_orders
+        )
+        if isinstance(item, dict)
+    ]
+    recovery_profile_gate = actions.get("recovery_profile_gate")
+    managed_recovery = bool(
+        isinstance(recovery_profile_gate, dict)
+        and recovery_profile_gate.get("managed")
+    )
+
+    def finish(
+        action: str,
+        *,
+        places: list[dict[str, Any]] | None = None,
+        cancels: list[dict[str, Any]] | None = None,
+        enabled: bool = True,
+        **details: Any,
+    ) -> dict[str, Any]:
+        kept_places = place_orders if places is None else places
+        kept_cancels = cancel_orders if cancels is None else cancels
+        result = dict(actions)
+        result.update(
+            {
+                "place_orders": kept_places,
+                "place_count": len(kept_places),
+                "place_notional": sum(_order_notional(row) for row in kept_places),
+                "cancel_orders": kept_cancels,
+                "cancel_count": len(kept_cancels),
+                "actual_net_exposure_decision": {
+                    "enabled": enabled,
+                    "action": action,
+                    "current_actual_net_notional": current,
+                    "max_actual_net_notional": cap if enabled else None,
+                    **details,
+                },
+            }
+        )
+        return result
+
+    if invalid_fields:
+        return finish(
+            "hold",
+            places=[],
+            cancels=[],
+            reason="actual_net_input_non_finite",
+            invalid_fields=invalid_fields,
+        )
+    if cap <= 0:
+        return finish("normal", enabled=False)
+    if mark_price <= 0:
+        return finish(
+            "hold",
+            places=[],
+            cancels=[],
+            reason="actual_net_valuation_unavailable",
+        )
+
+    def marked_notional(order: dict[str, Any]) -> float:
+        qty = float(_order_remaining_qty(order))
+        if qty > 0:
+            return qty * mark_price
+        # An unquantified order cannot be proven inside a hard cap.
+        return cap + abs(current) + 1.0
+
+    open_by_side = {"BUY": [], "SELL": []}
+    open_notional = {"BUY": 0.0, "SELL": 0.0}
+    for order in open_orders:
+        side = str(order.get("side") or "").upper().strip()
+        if side not in open_by_side:
+            continue
+        open_by_side[side].append(order)
+        open_notional[side] += marked_notional(order)
+
+    projected_open_buy = current + open_notional["BUY"]
+    projected_open_sell = current - open_notional["SELL"]
+    risk_open_sides: list[str] = []
+    if open_notional["BUY"] > 0 and projected_open_buy > cap + 1e-9:
+        risk_open_sides.append("BUY")
+    if open_notional["SELL"] > 0 and projected_open_sell < -cap - 1e-9:
+        risk_open_sides.append("SELL")
+
+    if risk_open_sides:
+        if managed_recovery:
+            # A managed owner may have rejected cancellation because the
+            # generation/profile fence is stale.  The final exposure arbiter
+            # only narrows those already-authorized candidates; it never
+            # recreates a mutation from the exchange snapshot.
+            risk_cancels = [
+                order
+                for order in cancel_orders
+                if str(order.get("side") or "").upper().strip()
+                in risk_open_sides
+            ]
+        else:
+            risk_cancels = [
+                order
+                for side in risk_open_sides
+                for order in open_by_side[side]
+                if any(
+                    _order_matches_cancel(order, owned_order)
+                    for owned_order in owned_orders
+                )
+            ]
+        if not risk_cancels:
+            return finish(
+                "hold",
+                places=[],
+                cancels=[],
+                reason="risk_cancel_not_authorized",
+                risk_open_sides=risk_open_sides,
+            )
+        return finish(
+            "cancel_risk_increasing",
+            places=[],
+            cancels=risk_cancels,
+            risk_open_sides=risk_open_sides,
+        )
+
+    candidate_notional = {"BUY": 0.0, "SELL": 0.0}
+    for order in place_orders:
+        side = str(order.get("side") or "").upper().strip()
+        if side in candidate_notional:
+            candidate_notional[side] += marked_notional(order)
+    projected_buy = projected_open_buy + candidate_notional["BUY"]
+    projected_sell = projected_open_sell - candidate_notional["SELL"]
+    triggered_reasons: list[str] = []
+    if abs(current) > cap + 1e-9:
+        triggered_reasons.append("current_actual_net_over_cap")
+    if projected_buy > cap + 1e-9:
+        triggered_reasons.append("projected_buy_over_cap")
+    if projected_sell < -cap - 1e-9:
+        triggered_reasons.append("projected_sell_over_cap")
+    if not triggered_reasons:
+        return finish(
+            "normal",
+            projected_buy_notional=projected_buy,
+            projected_sell_notional=projected_sell,
+        )
+
+    reducing_side = "SELL" if current > 1e-12 else "BUY" if current < -1e-12 else None
+    existing_reducing_count = (
+        len(open_by_side[reducing_side]) if reducing_side is not None else 0
+    )
+    reducing_refresh_cancels = (
+        [
+            cancel
+            for cancel in cancel_orders
+            if any(
+                _order_matches_cancel(open_order, cancel)
+                for open_order in open_by_side[reducing_side]
+            )
+        ]
+        if reducing_side is not None
+        else []
+    )
+    if reducing_refresh_cancels:
+        return finish(
+            "cancel_net_decrease_refresh",
+            places=[],
+            cancels=reducing_refresh_cancels,
+            reducing_side=reducing_side,
+            triggered_reasons=triggered_reasons,
+        )
+    selected: dict[str, Any] | None = None
+    if reducing_side is not None and existing_reducing_count == 0:
+        eligible: list[tuple[int, int, dict[str, Any]]] = []
+        for index, order in enumerate(place_orders):
+            if str(order.get("side") or "").upper().strip() != reducing_side:
+                continue
+            notional = marked_notional(order)
+            if (
+                notional <= 0
+                or notional > abs(current) + 1e-9
+                or not _is_gtx_candidate(order)
+            ):
+                continue
+            role = str(order.get("role") or "").lower().strip()
+            no_loss_state = str(
+                order.get("reduce_only_no_loss_guard") or ""
+            ).lower()
+            if "reduce" in role and "bypassed" not in no_loss_state:
+                priority = 0
+            elif (role, reducing_side) in {
+                ("best_quote_entry_short", "SELL"),
+                ("best_quote_entry_long", "BUY"),
+            }:
+                priority = 1
+            elif "reduce" in role:
+                priority = 2
+            else:
+                continue
+            eligible.append((priority, index, order))
+        if eligible:
+            selected = min(eligible, key=lambda item: (item[0], item[1]))[2]
+
+    action = (
+        "hold_existing_net_decrease"
+        if existing_reducing_count > 0
+        else "place_net_decrease"
+        if selected is not None
+        else "hold"
+    )
+    return finish(
+        action,
+        places=[selected] if selected is not None else [],
+        cancels=[],
+        reducing_side=reducing_side,
+        triggered_reasons=triggered_reasons,
+        selected_role=str(selected.get("role") or "") if selected else None,
     )
 
 

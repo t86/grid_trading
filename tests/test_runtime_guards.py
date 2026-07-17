@@ -41,6 +41,13 @@ class RuntimeGuardsTests(unittest.TestCase):
                 }
             )
 
+    def test_normalize_runtime_guard_config_rejects_non_finite_limits(self) -> None:
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                normalize_runtime_guard_config(
+                    {"max_actual_net_notional": value}
+                )
+
     def test_beijing_08_daily_stats_start_resolves_to_current_window(self) -> None:
         resolved = resolve_runtime_guard_stats_start_time(
             runtime_guard_stats_start_time="beijing_08_daily",
