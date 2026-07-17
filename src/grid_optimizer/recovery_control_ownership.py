@@ -67,7 +67,13 @@ def exclusive_control_lock(control_path: Path, *, timeout_seconds: float = 15.0)
     lock_path = control_path.with_suffix(control_path.suffix + ".actuator.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + max(float(timeout_seconds), 0.0)
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
+    lock_fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT, 0o666)
+    try:
+        lock_file = os.fdopen(lock_fd, "r", encoding="utf-8")
+    except BaseException:
+        os.close(lock_fd)
+        raise
+    with lock_file:
         while True:
             try:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

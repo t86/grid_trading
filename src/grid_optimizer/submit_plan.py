@@ -8,7 +8,7 @@ import traceback
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .data import (
     delete_futures_order,
@@ -1261,6 +1261,100 @@ def _is_gtx_candidate(order: dict[str, Any]) -> bool:
     ).upper().strip() == "GTX"
 
 
+def is_frozen_inventory_order(order: Mapping[str, Any]) -> bool:
+    """Return whether an order belongs to the independent frozen ledger."""
+
+    role = str(order.get("role") or "").lower().strip()
+    book = str(order.get("book") or order.get("ledger_class") or "").lower().strip()
+    explicitly_frozen = bool(
+        book == "frozen_bq"
+        or role.startswith("frozen_inventory_")
+        or order.get("manual_frozen_inventory_reduce")
+        or order.get("manual_frozen_inventory_limit")
+        or order.get("frozen_inventory_pair_release")
+        or order.get("frozen_inventory_per_lot_release")
+    )
+    if not explicitly_frozen:
+        return False
+    # Exchange/open-order rows are untrusted observations.  A role-looking or
+    # legacy client ID must not remove them from ordinary risk projection unless
+    # the runner bound the row to a durable frozen order ref.  Directive
+    # authorization is deliberately separate: an expired or damaged directive
+    # can block a frozen mutation, but it cannot transfer ownership back to the
+    # ordinary ledger.
+    exchange_identity = bool(
+        str(order.get("orderId") or order.get("order_id") or "").strip()
+        or str(
+            order.get("clientOrderId")
+            or order.get("client_order_id")
+            or order.get("origClientOrderId")
+            or ""
+        ).strip()
+    )
+    return bool(
+        explicitly_frozen
+        and (
+            not exchange_identity
+            or _truthy(order.get("frozen_inventory_authorization_validated"))
+            or _truthy(order.get("frozen_inventory_ownership_validated"))
+        )
+    )
+
+
+def _frozen_order_is_gtx_maker(order: Mapping[str, Any]) -> bool:
+    return bool(
+        str(order.get("execution_type") or "").lower().strip()
+        in {"maker", "post_only"}
+        and str(order.get("time_in_force") or order.get("timeInForce") or "")
+        .upper()
+        .strip()
+        == "GTX"
+        and _truthy(order.get("post_only"))
+    )
+
+
+def _valid_frozen_pair_group(orders: list[dict[str, Any]]) -> bool:
+    if not orders:
+        return True
+    if not all(_frozen_order_is_gtx_maker(order) for order in orders):
+        return False
+    request_ids = {
+        str(order.get("frozen_inventory_request_id") or "").strip()
+        for order in orders
+    }
+    if len(request_ids) != 1 or "" in request_ids:
+        return False
+    roles = [str(order.get("role") or "").lower().strip() for order in orders]
+    if len(orders) == 1:
+        expected_repair = (
+            "LONG"
+            if roles[0] == "frozen_inventory_pair_release_long"
+            else "SHORT"
+            if roles[0] == "frozen_inventory_pair_release_short"
+            else ""
+        )
+        return bool(
+            expected_repair
+            and str(orders[0].get("frozen_inventory_pair_repair_side") or "")
+            .upper()
+            .strip()
+            == expected_repair
+        )
+    if len(orders) != 2 or set(roles) != {
+        "frozen_inventory_pair_release_long",
+        "frozen_inventory_pair_release_short",
+    }:
+        return False
+    if any(order.get("frozen_inventory_pair_repair_side") for order in orders):
+        return False
+    quantities = [_safe_float(order.get("qty", order.get("quantity"))) for order in orders]
+    return bool(
+        quantities[0] > 0
+        and quantities[1] > 0
+        and math.isclose(quantities[0], quantities[1], rel_tol=1e-12, abs_tol=1e-12)
+    )
+
+
 def apply_actual_net_exposure_decision_to_actions(
     *,
     actions: dict[str, Any],
@@ -1270,15 +1364,18 @@ def apply_actual_net_exposure_decision_to_actions(
     max_actual_net_notional: float,
     owned_open_orders: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
-    """Make the final, single action decision for actual net exposure.
+    """Make the final, single action decision for ordinary net exposure.
 
-    BUY always increases exchange LONG-SHORT net and SELL always decreases it,
-    including hedge-mode SHORT reductions.  Opposite-side orders therefore may
-    not offset each other in the projection.  If live orders can cross the cap,
-    this round only cancels the exact risk direction.  Otherwise a breached or
-    newly projected cap keeps at most one GTX order that reduces absolute net.
-    All earlier pause, ownership and loss gates remain authoritative candidates;
-    this function never synthesizes an order or opens loss permission.
+    The caller supplies normal inventory after subtracting the independent
+    frozen ledger.  Frozen positions and frozen orders never participate in
+    this cap.  For ordinary inventory BUY increases LONG-SHORT net and SELL
+    decreases it, including hedge-mode SHORT reductions.  Opposite-side orders
+    therefore may not offset each other in the projection.  If live ordinary
+    orders can cross the cap, this round only cancels the exact risk direction.
+    Otherwise a breached or newly projected cap keeps at most one GTX order
+    that reduces absolute ordinary net.  All earlier pause, ownership and loss
+    gates remain authoritative candidates; this function never synthesizes an
+    order or opens loss permission.
     """
 
     def finite_number(value: Any) -> float | None:
@@ -1304,19 +1401,27 @@ def apply_actual_net_exposure_decision_to_actions(
     mark_price = max(parsed_mark or 0.0, 0.0)
     current_qty = parsed_current_qty or 0.0
     current = current_qty * mark_price
-    place_orders = [
+    all_place_orders = [
         dict(item)
         for item in actions.get("place_orders", [])
         if isinstance(item, dict)
     ]
-    cancel_orders = [
+    all_cancel_orders = [
         dict(item)
         for item in actions.get("cancel_orders", [])
         if isinstance(item, dict)
     ]
+    place_orders = [
+        item for item in all_place_orders if not is_frozen_inventory_order(item)
+    ]
+    cancel_orders = [
+        item for item in all_cancel_orders if not is_frozen_inventory_order(item)
+    ]
     current_open_order_rows = list(current_open_orders)
     open_orders = [
-        dict(item) for item in current_open_order_rows if isinstance(item, dict)
+        dict(item)
+        for item in current_open_order_rows
+        if isinstance(item, dict) and not is_frozen_inventory_order(item)
     ]
     owned_orders = [
         dict(item)
@@ -1325,7 +1430,7 @@ def apply_actual_net_exposure_decision_to_actions(
             if owned_open_orders is None
             else owned_open_orders
         )
-        if isinstance(item, dict)
+        if isinstance(item, dict) and not is_frozen_inventory_order(item)
     ]
     recovery_profile_gate = actions.get("recovery_profile_gate")
     managed_recovery = bool(
@@ -1354,7 +1459,9 @@ def apply_actual_net_exposure_decision_to_actions(
                 "actual_net_exposure_decision": {
                     "enabled": enabled,
                     "action": action,
+                    "inventory_scope": "ordinary_excluding_frozen",
                     "current_actual_net_notional": current,
+                    "current_ordinary_net_notional": current,
                     "max_actual_net_notional": cap if enabled else None,
                     **details,
                 },
@@ -1535,6 +1642,276 @@ def apply_actual_net_exposure_decision_to_actions(
     )
 
 
+def coordinate_symbol_execution_action(
+    *,
+    actions: dict[str, Any],
+    current_actual_net_qty: float,
+    valuation_price: float,
+    current_open_orders: Iterable[Any],
+    max_actual_net_notional: float,
+    owned_open_orders: Iterable[Any] | None = None,
+) -> dict[str, Any]:
+    """Select one logical mutation lane for this symbol and cycle.
+
+    The ordinary cap arbiter never owns frozen orders.  This outer coordinator
+    first evaluates ordinary safety using only ordinary candidates.  A real
+    ordinary cap action or fail-closed HOLD wins over frozen work; otherwise an
+    authorized frozen mutation group is one logical action and ordinary work is
+    deferred to the next cycle.  A two-leg frozen pair remains one logical
+    action even though it consumes two exchange requests.
+    """
+
+    all_places = [
+        dict(item)
+        for item in actions.get("place_orders", [])
+        if isinstance(item, dict)
+    ]
+    all_cancels = [
+        dict(item)
+        for item in actions.get("cancel_orders", [])
+        if isinstance(item, dict)
+    ]
+    frozen_place_candidates = [
+        item for item in all_places if is_frozen_inventory_order(item)
+    ]
+    frozen_cancel_candidates = [
+        item for item in all_cancels if is_frozen_inventory_order(item)
+    ]
+    authorized_frozen_places = [
+        item
+        for item in frozen_place_candidates
+        if str(item.get("frozen_inventory_request_id") or "").strip()
+        and _truthy(item.get("frozen_inventory_authorization_validated"))
+        and _frozen_order_is_gtx_maker(item)
+    ]
+    authorized_frozen_cancels = [
+        item
+        for item in frozen_cancel_candidates
+        if str(item.get("frozen_inventory_request_id") or "").strip()
+        and _truthy(item.get("frozen_inventory_authorization_validated"))
+    ]
+    unauthorized_frozen_place_count = (
+        len(frozen_place_candidates) - len(authorized_frozen_places)
+    )
+    unauthorized_frozen_cancel_count = (
+        len(frozen_cancel_candidates) - len(authorized_frozen_cancels)
+    )
+    frozen_request_ids = list(
+        dict.fromkeys(
+            str(item.get("frozen_inventory_request_id") or "").strip()
+            for item in [*authorized_frozen_cancels, *authorized_frozen_places]
+        )
+    )
+    invalid_pair_request_ids = {
+        request_id
+        for request_id in frozen_request_ids
+        if not _valid_frozen_pair_group(
+            [
+                item
+                for item in authorized_frozen_places
+                if str(item.get("frozen_inventory_request_id") or "").strip()
+                == request_id
+                and str(item.get("role") or "").lower().strip().startswith(
+                    "frozen_inventory_pair_release_"
+                )
+            ]
+        )
+    }
+    if invalid_pair_request_ids:
+        authorized_frozen_places = [
+            item
+            for item in authorized_frozen_places
+            if str(item.get("frozen_inventory_request_id") or "").strip()
+            not in invalid_pair_request_ids
+        ]
+        authorized_frozen_cancels = [
+            item
+            for item in authorized_frozen_cancels
+            if str(item.get("frozen_inventory_request_id") or "").strip()
+            not in invalid_pair_request_ids
+        ]
+        unauthorized_frozen_place_count += sum(
+            1
+            for item in frozen_place_candidates
+            if str(item.get("frozen_inventory_request_id") or "").strip()
+            in invalid_pair_request_ids
+        )
+        unauthorized_frozen_cancel_count += sum(
+            1
+            for item in frozen_cancel_candidates
+            if str(item.get("frozen_inventory_request_id") or "").strip()
+            in invalid_pair_request_ids
+        )
+        frozen_request_ids = [
+            request_id
+            for request_id in frozen_request_ids
+            if request_id not in invalid_pair_request_ids
+        ]
+
+    def _request_sort_key(request_id: str) -> tuple[bool, str, str, str]:
+        rows = [
+            item
+            for item in [*authorized_frozen_cancels, *authorized_frozen_places]
+            if str(item.get("frozen_inventory_request_id") or "").strip()
+            == request_id
+        ]
+        last_selected = min(
+            (
+                str(item.get("frozen_inventory_last_selected_at") or "").strip()
+                for item in rows
+                if str(item.get("frozen_inventory_last_selected_at") or "").strip()
+            ),
+            default="",
+        )
+        requested_at = min(
+            (
+                str(item.get("frozen_inventory_requested_at") or "").strip()
+                for item in rows
+                if str(item.get("frozen_inventory_requested_at") or "").strip()
+            ),
+            default="",
+        )
+        return bool(last_selected), last_selected or requested_at, requested_at, request_id
+
+    frozen_request_ids.sort(key=_request_sort_key)
+    pair_repair_request_ids = [
+        request_id
+        for request_id in frozen_request_ids
+        if any(
+            str(item.get("frozen_inventory_pair_repair_side") or "").strip()
+            for item in authorized_frozen_places
+            if str(item.get("frozen_inventory_request_id") or "").strip()
+            == request_id
+        )
+    ]
+    selected_frozen_request_id = (
+        pair_repair_request_ids[0]
+        if pair_repair_request_ids
+        else frozen_request_ids[0]
+        if frozen_request_ids
+        else ""
+    )
+    frozen_places = [
+        item
+        for item in authorized_frozen_places
+        if str(item.get("frozen_inventory_request_id") or "").strip()
+        == selected_frozen_request_id
+    ]
+    frozen_cancels = [
+        item
+        for item in authorized_frozen_cancels
+        if str(item.get("frozen_inventory_request_id") or "").strip()
+        == selected_frozen_request_id
+    ]
+    deferred_frozen_places = [
+        item for item in authorized_frozen_places if item not in frozen_places
+    ]
+    deferred_frozen_cancels = [
+        item for item in authorized_frozen_cancels if item not in frozen_cancels
+    ]
+    ordinary_places = [item for item in all_places if not is_frozen_inventory_order(item)]
+    ordinary_cancels = [item for item in all_cancels if not is_frozen_inventory_order(item)]
+
+    ordinary_actions = dict(actions)
+    ordinary_actions.update(
+        {
+            "place_orders": ordinary_places,
+            "place_count": len(ordinary_places),
+            "place_notional": sum(_order_notional(row) for row in ordinary_places),
+            "cancel_orders": ordinary_cancels,
+            "cancel_count": len(ordinary_cancels),
+        }
+    )
+    ordinary_result = apply_actual_net_exposure_decision_to_actions(
+        actions=ordinary_actions,
+        current_actual_net_qty=current_actual_net_qty,
+        valuation_price=valuation_price,
+        current_open_orders=current_open_orders,
+        max_actual_net_notional=max_actual_net_notional,
+        owned_open_orders=owned_open_orders,
+    )
+    ordinary_decision = dict(
+        ordinary_result.get("actual_net_exposure_decision") or {}
+    )
+    ordinary_action = str(ordinary_decision.get("action") or "hold")
+    ordinary_safety_wins = ordinary_action != "normal"
+    recovery_gate = actions.get("recovery_profile_gate")
+    current_gate = (
+        recovery_gate.get("current_gate")
+        if isinstance(recovery_gate, Mapping)
+        else None
+    )
+    active_recovery_action = str(
+        (current_gate or {}).get("active_action") or "noop"
+    ).lower().strip()
+    ordinary_recovery_wins = bool(
+        isinstance(recovery_gate, Mapping)
+        and recovery_gate.get("managed")
+        and recovery_gate.get("authorized")
+        and active_recovery_action not in {"", "noop"}
+    )
+    pair_repair_wins = bool(pair_repair_request_ids)
+
+    if not authorized_frozen_places and not authorized_frozen_cancels:
+        ordinary_decision.update(
+            {
+                "selected_lane": "ordinary",
+                "dropped_unauthorized_frozen_place_count": unauthorized_frozen_place_count,
+                "dropped_unauthorized_frozen_cancel_count": unauthorized_frozen_cancel_count,
+            }
+        )
+        ordinary_result["actual_net_exposure_decision"] = ordinary_decision
+        return ordinary_result
+
+    if (ordinary_safety_wins or ordinary_recovery_wins) and not pair_repair_wins:
+        ordinary_decision.update(
+            {
+                "selected_lane": "ordinary",
+                "ordinary_recovery_action": active_recovery_action,
+                "deferred_frozen_place_count": len(authorized_frozen_places),
+                "deferred_frozen_cancel_count": len(authorized_frozen_cancels),
+                "deferred_frozen_request_count": len(frozen_request_ids),
+                "dropped_unauthorized_frozen_place_count": unauthorized_frozen_place_count,
+                "dropped_unauthorized_frozen_cancel_count": unauthorized_frozen_cancel_count,
+            }
+        )
+        ordinary_result["actual_net_exposure_decision"] = ordinary_decision
+        return ordinary_result
+
+    result = dict(actions)
+    result.update(
+        {
+            "place_orders": frozen_places,
+            "place_count": len(frozen_places),
+            "place_notional": sum(_order_notional(row) for row in frozen_places),
+            "cancel_orders": frozen_cancels,
+            "cancel_count": len(frozen_cancels),
+            "actual_net_exposure_decision": {
+                "enabled": False,
+                "action": "frozen_inventory_action",
+                "selected_lane": "frozen",
+                "inventory_scope": "frozen_ledger",
+                "ordinary_candidate_action": ordinary_action,
+                "selected_frozen_request_id": selected_frozen_request_id,
+                "current_ordinary_net_notional": ordinary_decision.get(
+                    "current_ordinary_net_notional"
+                ),
+                "max_actual_net_notional": ordinary_decision.get(
+                    "max_actual_net_notional"
+                ),
+                "deferred_ordinary_place_count": len(ordinary_places),
+                "deferred_ordinary_cancel_count": len(ordinary_cancels),
+                "deferred_frozen_request_count": max(len(frozen_request_ids) - 1, 0),
+                "deferred_frozen_place_count": len(deferred_frozen_places),
+                "deferred_frozen_cancel_count": len(deferred_frozen_cancels),
+                "dropped_unauthorized_frozen_place_count": unauthorized_frozen_place_count,
+                "dropped_unauthorized_frozen_cancel_count": unauthorized_frozen_cancel_count,
+            },
+        }
+    )
+    return result
+
+
 def apply_projected_entry_exposure_cap_to_actions(
     *,
     actions: dict[str, Any],
@@ -1573,6 +1950,8 @@ def apply_projected_entry_exposure_cap_to_actions(
     for raw_order in current_open_orders:
         if not isinstance(raw_order, dict):
             continue
+        if is_frozen_inventory_order(raw_order):
+            continue
         side = entry_side(raw_order)
         if side is not None:
             reserved[side] += _order_notional(raw_order)
@@ -1583,6 +1962,9 @@ def apply_projected_entry_exposure_cap_to_actions(
         if not isinstance(raw_order, dict):
             continue
         order = dict(raw_order)
+        if is_frozen_inventory_order(order):
+            kept_orders.append(order)
+            continue
         side = entry_side(order)
         notional = _order_notional(order)
         cap = caps[side] if side is not None else 0.0

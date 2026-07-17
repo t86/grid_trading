@@ -10,6 +10,7 @@ from grid_optimizer.submit_plan import (
     apply_loss_inventory_no_cross_entry_guard_to_actions,
     apply_loss_reduce_reentry_guard_to_actions,
     apply_actual_net_exposure_decision_to_actions,
+    coordinate_symbol_execution_action,
     apply_projected_entry_exposure_cap_to_actions,
     apply_reduce_only_no_loss_guard_to_actions,
     build_execution_actions,
@@ -23,10 +24,14 @@ from grid_optimizer.submit_plan import (
     suppress_same_side_nearby_place_orders,
     suppress_place_orders_with_existing_submitted_buckets,
     validate_plan_report,
+    is_frozen_inventory_order,
 )
 
 
 class SubmitPlanTests(unittest.TestCase):
+    def test_frozen_classifier_recognizes_canonical_book_without_role(self) -> None:
+        self.assertTrue(is_frozen_inventory_order({"book": "frozen_bq"}))
+
     def test_actual_net_decision_cancels_partially_filled_risk_order_before_placing(self) -> None:
         guarded = apply_actual_net_exposure_decision_to_actions(
             actions={
@@ -91,7 +96,7 @@ class SubmitPlanTests(unittest.TestCase):
             current_open_orders=[
                 {
                     "orderId": 7,
-                    "clientOrderId": "gx-bchu-frozen-7",
+                    "clientOrderId": "gx-bchu-bestquot-7",
                     "side": "BUY",
                     "positionSide": "SHORT",
                     "price": "200",
@@ -385,6 +390,519 @@ class SubmitPlanTests(unittest.TestCase):
         )
         self.assertEqual(guarded["place_orders"], [])
 
+    def test_actual_net_decision_treats_unbound_frozen_prefix_as_ordinary_risk(self) -> None:
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "BUY",
+                        "position_side": "LONG",
+                        "price": 200.0,
+                        "qty": 0.05,
+                        "notional": 10.0,
+                        "role": "best_quote_entry_long",
+                        "time_in_force": "GTX",
+                    }
+                ],
+                "cancel_orders": [],
+            },
+            current_actual_net_qty=0.5,
+            valuation_price=200.0,
+            current_open_orders=[
+                {
+                    "orderId": 71,
+                    "clientOrderId": "gx-bchu-frozenin-1-12345678",
+                    "side": "BUY",
+                    "positionSide": "SHORT",
+                    "price": "200",
+                    "origQty": "0.20",
+                    "executedQty": "0",
+                }
+            ],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "cancel_risk_increasing",
+        )
+        self.assertEqual(guarded["place_orders"], [])
+
+    def test_actual_net_decision_leaves_frozen_action_outside_ordinary_cap(self) -> None:
+        frozen_orders = [
+            {
+                "side": "SELL",
+                "position_side": "LONG",
+                "price": 200.0,
+                "qty": 0.10,
+                "notional": 20.0,
+                "role": "frozen_inventory_pair_release_long",
+                "time_in_force": "GTX",
+                "execution_type": "maker",
+                "post_only": True,
+                "frozen_inventory_pair_release": True,
+                "frozen_inventory_request_id": "pair-test-1",
+                "frozen_inventory_authorization_validated": True,
+            },
+            {
+                "side": "BUY",
+                "position_side": "SHORT",
+                "price": 200.0,
+                "qty": 0.10,
+                "notional": 20.0,
+                "role": "frozen_inventory_pair_release_short",
+                "time_in_force": "GTX",
+                "execution_type": "maker",
+                "post_only": True,
+                "frozen_inventory_pair_release": True,
+                "frozen_inventory_request_id": "pair-test-1",
+                "frozen_inventory_authorization_validated": True,
+            },
+        ]
+        guarded = coordinate_symbol_execution_action(
+            actions={"place_orders": frozen_orders, "cancel_orders": []},
+            current_actual_net_qty=0.5,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "frozen_inventory_action",
+        )
+        self.assertEqual(guarded["place_orders"], frozen_orders)
+
+    def test_actual_net_decision_never_selects_frozen_manual_reduce_as_ordinary_recovery(self) -> None:
+        frozen_reduce = {
+            "side": "SELL",
+            "position_side": "LONG",
+            "price": 200.0,
+            "qty": 0.10,
+            "notional": 20.0,
+            "role": "frozen_inventory_manual_reduce_long",
+            "time_in_force": "GTX",
+            "execution_type": "maker",
+            "post_only": True,
+            "manual_frozen_inventory_reduce": True,
+            "frozen_inventory_request_id": "manual-test-1",
+            "frozen_inventory_authorization_validated": True,
+        }
+        guarded = coordinate_symbol_execution_action(
+            actions={"place_orders": [frozen_reduce], "cancel_orders": []},
+            current_actual_net_qty=0.5,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "frozen_inventory_action",
+        )
+        self.assertNotEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "place_net_decrease",
+        )
+
+    def test_symbol_coordinator_prioritizes_ordinary_hard_cap_over_frozen_action(self) -> None:
+        ordinary_reduce = {
+            "side": "SELL",
+            "position_side": "LONG",
+            "price": 200.0,
+            "qty": 0.10,
+            "notional": 20.0,
+            "role": "best_quote_reduce_long",
+            "time_in_force": "GTX",
+        }
+        frozen_reduce = {
+            "book": "frozen_bq",
+            "side": "SELL",
+            "position_side": "LONG",
+            "price": 200.0,
+            "qty": 0.10,
+            "notional": 20.0,
+            "role": "frozen_inventory_manual_reduce_long",
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "post_only": True,
+            "frozen_inventory_request_id": "frozen-priority-1",
+            "frozen_inventory_authorization_validated": True,
+        }
+
+        guarded = coordinate_symbol_execution_action(
+            actions={"place_orders": [frozen_reduce, ordinary_reduce], "cancel_orders": []},
+            current_actual_net_qty=0.70,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "place_net_decrease",
+        )
+        self.assertEqual(guarded["place_orders"], [ordinary_reduce])
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["deferred_frozen_place_count"],
+            1,
+        )
+
+    def test_symbol_coordinator_treats_frozen_pair_as_one_logical_cycle_action(self) -> None:
+        frozen_pair = [
+            {
+                "book": "frozen_bq",
+                "side": "SELL",
+                "role": "frozen_inventory_pair_release_long",
+                "qty": 0.1,
+                "execution_type": "maker",
+                "time_in_force": "GTX",
+                "post_only": True,
+                "frozen_inventory_request_id": "frozen-pair-1",
+                "frozen_inventory_authorization_validated": True,
+            },
+            {
+                "book": "frozen_bq",
+                "side": "BUY",
+                "role": "frozen_inventory_pair_release_short",
+                "qty": 0.1,
+                "execution_type": "maker",
+                "time_in_force": "GTX",
+                "post_only": True,
+                "frozen_inventory_request_id": "frozen-pair-1",
+                "frozen_inventory_authorization_validated": True,
+            },
+        ]
+        ordinary_entry = {
+            "side": "BUY",
+            "position_side": "LONG",
+            "role": "best_quote_entry_long",
+            "price": 200.0,
+            "qty": 0.1,
+            "notional": 20.0,
+            "time_in_force": "GTX",
+        }
+
+        guarded = coordinate_symbol_execution_action(
+            actions={
+                "place_orders": [ordinary_entry, *frozen_pair],
+                "cancel_orders": [],
+            },
+            current_actual_net_qty=0.0,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "frozen_inventory_action",
+        )
+        self.assertEqual(guarded["place_orders"], frozen_pair)
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["deferred_ordinary_place_count"],
+            1,
+        )
+
+    def test_symbol_coordinator_selects_only_one_frozen_request_group(self) -> None:
+        first_request = {
+            "book": "frozen_bq",
+            "side": "SELL",
+            "role": "frozen_inventory_manual_reduce_long",
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "post_only": True,
+            "frozen_inventory_request_id": "frozen-request-1",
+            "frozen_inventory_authorization_validated": True,
+        }
+        second_request = {
+            "book": "frozen_bq",
+            "side": "BUY",
+            "role": "frozen_inventory_manual_reduce_short",
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "post_only": True,
+            "frozen_inventory_request_id": "frozen-request-2",
+            "frozen_inventory_authorization_validated": True,
+        }
+
+        guarded = coordinate_symbol_execution_action(
+            actions={
+                "place_orders": [first_request, second_request],
+                "cancel_orders": [],
+            },
+            current_actual_net_qty=0.0,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        decision = guarded["actual_net_exposure_decision"]
+        self.assertEqual(guarded["place_orders"], [first_request])
+        self.assertEqual(decision["selected_frozen_request_id"], "frozen-request-1")
+        self.assertEqual(decision["deferred_frozen_request_count"], 1)
+        self.assertEqual(decision["deferred_frozen_place_count"], 1)
+
+    def test_unauthorized_frozen_candidate_cannot_block_ordinary_brushing(self) -> None:
+        ordinary_entry = {
+            "side": "BUY",
+            "position_side": "LONG",
+            "role": "best_quote_entry_long",
+            "price": 200.0,
+            "qty": 0.1,
+            "notional": 20.0,
+            "time_in_force": "GTX",
+        }
+        unauthorized_frozen = {
+            "book": "frozen_bq",
+            "side": "SELL",
+            "role": "frozen_inventory_manual_reduce_long",
+        }
+
+        guarded = coordinate_symbol_execution_action(
+            actions={
+                "place_orders": [unauthorized_frozen, ordinary_entry],
+                "cancel_orders": [],
+            },
+            current_actual_net_qty=0.0,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "normal",
+        )
+        self.assertEqual(guarded["place_orders"], [ordinary_entry])
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"][
+                "dropped_unauthorized_frozen_place_count"
+            ],
+            1,
+        )
+
+    def test_frozen_ioc_candidate_cannot_bypass_gtx_maker_contract(self) -> None:
+        ordinary_entry = {
+            "side": "BUY",
+            "position_side": "LONG",
+            "role": "best_quote_entry_long",
+            "price": 200.0,
+            "qty": 0.1,
+            "notional": 20.0,
+            "time_in_force": "GTX",
+        }
+        unsafe_frozen = {
+            "book": "frozen_bq",
+            "side": "SELL",
+            "role": "frozen_inventory_manual_reduce_long",
+            "qty": 0.1,
+            "execution_type": "aggressive",
+            "time_in_force": "IOC",
+            "post_only": False,
+            "frozen_inventory_request_id": "unsafe-frozen-1",
+            "frozen_inventory_authorization_validated": True,
+        }
+
+        guarded = coordinate_symbol_execution_action(
+            actions={"place_orders": [unsafe_frozen, ordinary_entry], "cancel_orders": []},
+            current_actual_net_qty=0.0,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(guarded["place_orders"], [ordinary_entry])
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"][
+                "dropped_unauthorized_frozen_place_count"
+            ],
+            1,
+        )
+
+    def test_single_initial_pair_leg_without_explicit_repair_is_deferred(self) -> None:
+        unsafe_leg = {
+            "book": "frozen_bq",
+            "side": "BUY",
+            "role": "frozen_inventory_pair_release_short",
+            "qty": 0.1,
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "post_only": True,
+            "frozen_inventory_request_id": "pair-missing-leg",
+            "frozen_inventory_authorization_validated": True,
+        }
+
+        guarded = coordinate_symbol_execution_action(
+            actions={"place_orders": [unsafe_leg], "cancel_orders": []},
+            current_actual_net_qty=0.0,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(guarded["place_orders"], [])
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"][
+                "dropped_unauthorized_frozen_place_count"
+            ],
+            1,
+        )
+
+    def test_active_temporary_loss_recovery_wins_over_regular_frozen_request(self) -> None:
+        ordinary_reduce = {
+            "side": "SELL",
+            "position_side": "LONG",
+            "role": "best_quote_reduce_long",
+            "price": 200.0,
+            "qty": 0.1,
+            "notional": 20.0,
+            "time_in_force": "GTX",
+        }
+        frozen_reduce = {
+            "book": "frozen_bq",
+            "side": "SELL",
+            "role": "frozen_inventory_manual_reduce_long",
+            "qty": 0.1,
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "post_only": True,
+            "frozen_inventory_request_id": "frozen-during-tlr",
+            "frozen_inventory_authorization_validated": True,
+        }
+        actions = {
+            "place_orders": [frozen_reduce, ordinary_reduce],
+            "cancel_orders": [],
+            "recovery_profile_gate": {
+                "managed": True,
+                "authorized": True,
+                "current_gate": {"active_action": "temporary_loss_relief"},
+            },
+        }
+
+        guarded = coordinate_symbol_execution_action(
+            actions=actions,
+            current_actual_net_qty=0.1,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(guarded["place_orders"], [ordinary_reduce])
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["ordinary_recovery_action"],
+            "temporary_loss_relief",
+        )
+
+    def test_explicit_pair_repair_wins_one_cycle_over_ordinary_hard_cap(self) -> None:
+        ordinary_reduce = {
+            "side": "SELL",
+            "position_side": "LONG",
+            "role": "best_quote_reduce_long",
+            "price": 200.0,
+            "qty": 0.1,
+            "notional": 20.0,
+            "time_in_force": "GTX",
+        }
+        pair_repair = {
+            "book": "frozen_bq",
+            "side": "BUY",
+            "role": "frozen_inventory_pair_release_short",
+            "qty": 0.1,
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "post_only": True,
+            "frozen_inventory_request_id": "pair-repair-priority",
+            "frozen_inventory_pair_repair_side": "SHORT",
+            "frozen_inventory_authorization_validated": True,
+        }
+
+        guarded = coordinate_symbol_execution_action(
+            actions={"place_orders": [ordinary_reduce, pair_repair], "cancel_orders": []},
+            current_actual_net_qty=0.7,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(guarded["place_orders"], [pair_repair])
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["selected_lane"],
+            "frozen",
+        )
+
+    def test_frozen_request_selection_rotates_by_durable_last_selected_time(self) -> None:
+        def request(
+            request_id: str,
+            side: str,
+            *,
+            requested_at: str,
+            last_selected_at: str = "",
+        ) -> dict[str, object]:
+            return {
+                "book": "frozen_bq",
+                "side": side,
+                "role": (
+                    "frozen_inventory_manual_reduce_long"
+                    if side == "SELL"
+                    else "frozen_inventory_manual_reduce_short"
+                ),
+                "qty": 0.1,
+                "execution_type": "maker",
+                "time_in_force": "GTX",
+                "post_only": True,
+                "frozen_inventory_request_id": request_id,
+                "frozen_inventory_authorization_validated": True,
+                "frozen_inventory_requested_at": requested_at,
+                "frozen_inventory_last_selected_at": last_selected_at,
+            }
+
+        rounds = [
+            [
+                request("first", "SELL", requested_at="2026-07-17T00:00:00+00:00"),
+                request("second", "BUY", requested_at="2026-07-17T00:00:01+00:00"),
+            ],
+            [
+                request(
+                    "first",
+                    "SELL",
+                    requested_at="2026-07-17T00:00:00+00:00",
+                    last_selected_at="2026-07-17T00:00:02+00:00",
+                ),
+                request("second", "BUY", requested_at="2026-07-17T00:00:01+00:00"),
+            ],
+            [
+                request(
+                    "first",
+                    "SELL",
+                    requested_at="2026-07-17T00:00:00+00:00",
+                    last_selected_at="2026-07-17T00:00:02+00:00",
+                ),
+                request(
+                    "second",
+                    "BUY",
+                    requested_at="2026-07-17T00:00:01+00:00",
+                    last_selected_at="2026-07-17T00:00:03+00:00",
+                ),
+            ],
+        ]
+        selected: list[str] = []
+        for orders in rounds:
+            guarded = coordinate_symbol_execution_action(
+                actions={"place_orders": orders, "cancel_orders": []},
+                current_actual_net_qty=0.0,
+                valuation_price=200.0,
+                current_open_orders=[],
+                max_actual_net_notional=120.0,
+            )
+            selected.append(
+                guarded["actual_net_exposure_decision"][
+                    "selected_frozen_request_id"
+                ]
+            )
+
+        self.assertEqual(selected, ["first", "second", "first"])
+
     def test_projected_entry_cap_rejects_order_that_crosses_cap_from_below(self) -> None:
         guarded = apply_projected_entry_exposure_cap_to_actions(
             actions={
@@ -424,6 +942,56 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(
             guarded["projected_entry_exposure_cap"]["dropped_order_count"],
             1,
+        )
+
+    def test_projected_entry_cap_ignores_frozen_open_and_candidate_orders(self) -> None:
+        ordinary_entry = {
+            "side": "SELL",
+            "position_side": "SHORT",
+            "price": 200.0,
+            "qty": 0.20,
+            "notional": 40.0,
+            "role": "best_quote_entry_short",
+        }
+        frozen_adjust = {
+            "book": "frozen_bq",
+            "side": "SELL",
+            "position_side": "SHORT",
+            "price": 200.0,
+            "qty": 0.30,
+            "notional": 60.0,
+            "role": "frozen_inventory_hedge_adjust_short",
+            "frozen_inventory_request_id": "frozen-adjust-1",
+            "frozen_inventory_authorization_validated": True,
+        }
+        guarded = apply_projected_entry_exposure_cap_to_actions(
+            actions={
+                "place_orders": [ordinary_entry, frozen_adjust],
+                "cancel_orders": [],
+            },
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            current_long_notional=0.0,
+            current_short_notional=50.0,
+            current_open_orders=[
+                {
+                    **frozen_adjust,
+                    "orderId": 71,
+                    "frozen_inventory_request_id": "frozen-adjust-open-1",
+                    "frozen_inventory_authorization_validated": True,
+                }
+            ],
+            max_long_notional=100.0,
+            max_short_notional=100.0,
+        )
+
+        self.assertEqual(guarded["place_orders"], [ordinary_entry, frozen_adjust])
+        self.assertEqual(
+            guarded["projected_entry_exposure_cap"]["reserved_short_entry_notional"],
+            40.0,
+        )
+        self.assertEqual(
+            guarded["projected_entry_exposure_cap"]["dropped_order_count"],
+            0,
         )
 
     def test_projected_entry_cap_reserves_live_entries_and_accepted_places(self) -> None:

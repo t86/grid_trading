@@ -10,6 +10,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 import grid_optimizer.competition_health_monitor as hm
 import grid_optimizer.competition_state_realign as ra
 import grid_optimizer.competition_target_gate as tg
@@ -936,7 +938,73 @@ def test_registered_recovery_realign_reports_drift_without_actuating(
     assert json.loads(state_path.read_text(encoding="utf-8")) == original_state
 
 
-def test_compute_drift_counts_ledger_plus_frozen_vs_exchange() -> None:
+def test_realign_rechecks_coordinator_ownership_before_stopping_or_mutating(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True)
+    state_path = output_dir / "arxusdt_loop_state.json"
+    original_state = {
+        "best_quote_volume_ledger": {
+            "long_lots": [{"qty": 500.0}],
+            "short_lots": [],
+        }
+    }
+    state_path.write_text(json.dumps(original_state), encoding="utf-8")
+    (output_dir / "arxusdt_loop_runner_control.json").write_text(
+        json.dumps({"symbol": "ARXUSDT"}), encoding="utf-8"
+    )
+    monkeypatch.setenv("BINANCE_API_KEY", "k")
+    monkeypatch.setenv("BINANCE_API_SECRET", "s")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "realign",
+            "--symbol",
+            "ARXUSDT",
+            "--service",
+            "svc",
+            "--workdir",
+            str(tmp_path),
+            "--threshold-qty",
+            "10",
+            "--enforce",
+        ],
+    )
+    ownership_checks = iter((False, True))
+    monkeypatch.setattr(
+        ra,
+        "recovery_coordinator_registered",
+        lambda _control: next(ownership_checks),
+    )
+    monkeypatch.setattr(
+        ra,
+        "fetch_exchange_sides",
+        lambda *args, **kwargs: (0.0, 0.0, 0.0, 0.0),
+    )
+    monkeypatch.setattr(ra, "is_active", lambda _service: True)
+    side_effects: list[str] = []
+    monkeypatch.setattr(
+        ra.subprocess,
+        "run",
+        lambda *args, **kwargs: side_effects.append("systemctl") or _FakeProc(),
+    )
+    monkeypatch.setattr(
+        ra,
+        "fetch_futures_open_orders",
+        lambda *args, **kwargs: side_effects.append("open_orders") or [],
+    )
+
+    ra.main()
+
+    status = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert status["action"] == "DEFERRED_TO_FUTURES_RECOVERY_COORDINATOR"
+    assert status["recovery_coordinator_registered"] is True
+    assert side_effects == []
+    assert json.loads(state_path.read_text(encoding="utf-8")) == original_state
+
+
+def test_compute_drift_compares_only_ordinary_inventory() -> None:
     state = {
         "best_quote_volume_ledger": {
             "long_lots": [{"qty": 5000}, {"qty": 838}],
@@ -944,11 +1012,24 @@ def test_compute_drift_counts_ledger_plus_frozen_vs_exchange() -> None:
         },
         "best_quote_frozen_inventory": {"long_lots": [], "short_lots": [{"qty": 291}]},
     }
-    ldrift, sdrift = ra.compute_drift(state, long_qty=0.0, short_qty=0.0)
+    ldrift, sdrift = ra.compute_drift(state, long_qty=0.0, short_qty=291.0)
     assert ldrift == 5838.0                       # ledger thinks long, exchange flat
-    assert sdrift == 3000.0                       # 2709 ledger + 291 frozen
+    assert sdrift == 2709.0                       # frozen 291 is outside ordinary drift
     ldrift2, sdrift2 = ra.compute_drift(state, long_qty=5838.0, short_qty=3000.0)
     assert ldrift2 == 0.0 and sdrift2 == 0.0
+
+
+def test_compute_drift_fails_closed_when_frozen_exceeds_exchange() -> None:
+    state = {
+        "best_quote_volume_ledger": {"long_lots": [], "short_lots": []},
+        "best_quote_frozen_inventory": {
+            "long_lots": [],
+            "short_lots": [{"qty": 291}],
+        },
+    }
+
+    with pytest.raises(ValueError, match="frozen inventory exceeds exchange position"):
+        ra.compute_drift(state, long_qty=0.0, short_qty=0.0)
 
 
 def test_realign_ledger_preserves_frozen_and_writes_active_remainder() -> None:
@@ -1114,7 +1195,7 @@ def test_guard_plan_freshness_thresholds() -> None:
     assert lr._runtime_guard_plan_report_is_fresh({"generated_at": "garbage"}, now=now) is False
 
 
-def test_guard_live_exposure_is_account_level_and_fail_closed() -> None:
+def test_guard_live_exposure_excludes_frozen_inventory_and_is_fail_closed() -> None:
     import grid_optimizer.loop_runner as lr
 
     creds = lambda: ("k", "s")  # noqa: E731
@@ -1129,17 +1210,25 @@ def test_guard_live_exposure_is_account_level_and_fail_closed() -> None:
     assert net == 0.0
     assert upnl == -6.0
 
-    # ACCOUNT-level scope: a frozen short reservoir (OUSDT ~720) is included, so the
-    # reading is conservative; the symbol's max_actual_net_notional (1500) must be
-    # sized above reservoir + headroom -- the documented operating convention.
+    # Frozen inventory is a separate ledger.  The ordinary position guard sees
+    # only 2 LONG - 3 non-frozen SHORT, not the 720 frozen SHORT reservoir.
     reservoir = [
         {"positionAmt": "2", "markPrice": "1.0", "unRealizedProfit": "0"},
         {"positionAmt": "-723", "markPrice": "1.0", "unRealizedProfit": "12.0"},
     ]
     net, _ = lr._runtime_guard_live_exposure(
-        "OUSDT", fetch_position_risk=lambda **kw: reservoir, load_credentials=creds)
-    assert net == -721.0
-    assert abs(net) < 1500.0                             # reservoir alone must not trip the O guard
+        "OUSDT",
+        frozen_short_qty=720.0,
+        fetch_position_risk=lambda **kw: reservoir,
+        load_credentials=creds,
+    )
+    assert net == -1.0
+    assert lr._runtime_guard_live_exposure(
+        "OUSDT",
+        frozen_short_qty=800.0,
+        fetch_position_risk=lambda **kw: reservoir,
+        load_credentials=creds,
+    ) is None
 
     # Fail-closed: fetch failure or missing credentials -> None (caller keeps stale values).
     def boom(**kw):
@@ -1172,7 +1261,7 @@ def test_guard_exposure_inputs_fresh_plan_never_touches_live(monkeypatch) -> Non
     assert calls == []                                   # fresh plan: live NOT consulted
 
 
-def test_guard_exposure_inputs_fresh_hedge_plan_includes_frozen_exchange_net() -> None:
+def test_guard_exposure_inputs_fresh_hedge_plan_excludes_frozen_inventory() -> None:
     import grid_optimizer.loop_runner as lr
     from datetime import datetime, timezone
 
@@ -1182,10 +1271,10 @@ def test_guard_exposure_inputs_fresh_hedge_plan_includes_frozen_exchange_net() -
         "generated_at": now.isoformat(),
         "strategy_mode": "hedge_best_quote_maker_volume_v1",
         "mid_price": price,
-        # Both legacy candidates are deliberately wrong for hedge mode: one is
-        # only the LONG row and one excludes the frozen LONG reservoir.
+        # The ordinary strategy net excludes the frozen LONG reservoir.
         "actual_net_notional": 0.748 * price,
         "strategy_actual_net_notional": (0.465 - 0.073) * price,
+        "exchange_actual_net_notional": (0.748 - 0.073) * price,
         "best_quote_maker_volume": {
             "reduce_freeze": {
                 "actual_long_qty": 0.748,
@@ -1206,7 +1295,7 @@ def test_guard_exposure_inputs_fresh_hedge_plan_includes_frozen_exchange_net() -
     )
 
     assert source == "plan"
-    assert abs(net - ((0.748 - 0.073) * price)) < 1e-9
+    assert abs(net - ((0.465 - 0.073) * price)) < 1e-9
     guard = lr.evaluate_runtime_guards(
         config=lr.normalize_runtime_guard_config(
             {"max_actual_net_notional": 120.0}
@@ -1216,7 +1305,92 @@ def test_guard_exposure_inputs_fresh_hedge_plan_includes_frozen_exchange_net() -
         pnl_events=[],
         actual_net_notional=net,
     )
-    assert guard.primary_reason == "max_actual_net_notional_hit"
+    assert guard.primary_reason is None
+    assert guard.tradable is True
+
+
+def test_ordinary_position_qtys_subtract_frozen_ledger_from_exchange_sides() -> None:
+    import grid_optimizer.loop_runner as lr
+
+    ordinary_long, ordinary_short = lr._ordinary_position_qtys(
+        exchange_long_qty=0.748,
+        exchange_short_qty=0.073,
+        frozen_long_qty=0.283,
+        frozen_short_qty=0.0,
+    )
+
+    assert abs(ordinary_long - 0.465) < 1e-12
+    assert abs(ordinary_short - 0.073) < 1e-12
+
+
+def test_ordinary_position_qtys_can_have_opposite_sign_from_exchange_total() -> None:
+    import grid_optimizer.loop_runner as lr
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    ordinary_long, ordinary_short = lr._ordinary_position_qtys(
+        exchange_long_qty=10.0,
+        exchange_short_qty=5.0,
+        frozen_long_qty=9.0,
+        frozen_short_qty=0.0,
+    )
+
+    assert ordinary_long - ordinary_short == -4.0
+    conditions = lr._runtime_guard_safety_conditions(
+        runtime_guard_result=SimpleNamespace(
+            matched_reasons=["max_actual_net_notional_hit"],
+            actual_net_notional_abs=4.0,
+        ),
+        actual_net_notional=ordinary_long - ordinary_short,
+        observed_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+        ttl=timedelta(seconds=120),
+    )
+    assert conditions[0].side.value == "BUY"
+
+
+def test_ordinary_position_qtys_reject_frozen_ledger_above_exchange_side() -> None:
+    import grid_optimizer.loop_runner as lr
+
+    with pytest.raises(ValueError, match="frozen inventory exceeds exchange position"):
+        lr._ordinary_position_qtys(
+            exchange_long_qty=1.0,
+            exchange_short_qty=2.0,
+            frozen_long_qty=1.1,
+            frozen_short_qty=0.0,
+        )
+
+
+@pytest.mark.parametrize("invalid", ["bad", float("nan"), float("inf"), -1.0])
+def test_ordinary_position_qtys_rejects_invalid_or_negative_boundary_values(
+    invalid,
+) -> None:
+    import grid_optimizer.loop_runner as lr
+
+    with pytest.raises(ValueError, match="inventory boundary"):
+        lr._ordinary_position_qtys(
+            exchange_long_qty=invalid,
+            exchange_short_qty=0.0,
+            frozen_long_qty=0.0,
+            frozen_short_qty=0.0,
+        )
+
+
+def test_runtime_guard_prefers_exchange_minus_frozen_over_strategy_ledger() -> None:
+    import grid_optimizer.loop_runner as lr
+
+    actual = lr._runtime_guard_plan_actual_net_notional(
+        {
+            "mid_price": 222.78,
+            "exchange_long_qty": 0.650,
+            "exchange_short_qty": 0.073,
+            "frozen_long_qty": 0.283,
+            "frozen_short_qty": 0.0,
+            "ordinary_actual_net_notional": 999.0,
+            "strategy_actual_net_notional": 888.0,
+        }
+    )
+
+    assert actual == pytest.approx(((0.650 - 0.283) - 0.073) * 222.78)
 
 
 def test_actual_net_safety_cancel_executes_when_stale_cancel_is_disabled() -> None:
@@ -1346,6 +1520,28 @@ def test_guard_exposure_inputs_stale_or_missing_ts_uses_live(monkeypatch) -> Non
     assert calls == []
 
 
+def test_guard_exposure_inputs_stale_frozen_scope_keeps_strategy_upnl() -> None:
+    import grid_optimizer.loop_runner as lr
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 7, 5, 0, 0, 0, tzinfo=timezone.utc)
+    stale_plan = {
+        "generated_at": (now - timedelta(seconds=400)).isoformat(),
+        "strategy_actual_net_notional": -1.0,
+        "strategy_unrealized_pnl": -2.0,
+        "frozen_short_qty": 720.0,
+    }
+
+    net, upnl, source = lr._runtime_guard_exposure_inputs(
+        stale_plan,
+        now=now,
+        symbol="OUSDT",
+        live_exposure_fetcher=lambda _symbol: (-1.0, -999.0),
+    )
+
+    assert (net, upnl, source) == (-1.0, -2.0, "live_position_risk")
+
+
 def test_guard_exposure_inputs_fail_closed_keeps_stale_values() -> None:
     import grid_optimizer.loop_runner as lr
     from datetime import datetime, timedelta, timezone
@@ -1364,13 +1560,31 @@ def test_guard_exposure_inputs_fail_closed_keeps_stale_values() -> None:
 
 def test_realign_main_cancels_managed_only_and_archives_plan(tmp_path: Path, monkeypatch, capsys) -> None:
     # End-to-end enforce path with an ACTIVE runner: stop -> cancel MANAGED (gx-) only
-    # -> realign ledger -> archive stale plan -> start. FROZENTP / manual / external
-    # orders must survive.
+    # -> realign ledger -> archive stale plan -> start. Durable frozen orders,
+    # FROZENTP / manual / external orders must survive; an unbound gx- prefix
+    # remains ordinary and cannot spoof frozen ownership.
     (tmp_path / "output").mkdir(parents=True)
     state_file = tmp_path / "output" / "arxusdt_loop_state.json"
     state_file.write_text(json.dumps({
         "best_quote_volume_ledger": {"long_lots": [{"qty": 5268}], "short_lots": [{"qty": 2314}]},
         "best_quote_frozen_inventory": {},
+        "best_quote_volume_order_refs": {
+            "2": {
+                "book": "frozen_bq",
+                "role": "frozen_inventory_manual_reduce_long",
+                "client_order_id": "gx-arxu-frozen-owned-2",
+            },
+        },
+        "best_quote_frozen_inventory_pair_release": {
+            "submission_manifest": {
+                "legs": {
+                    "short": {
+                        "order_id": "6",
+                        "client_order_id": "gx-arxu-frozen-pair-6",
+                    },
+                },
+            },
+        },
     }), encoding="utf-8")
     plan_file = tmp_path / "output" / "arxusdt_loop_latest_plan.json"
     plan_file.write_text(json.dumps({"strategy_actual_net_notional": 812}), encoding="utf-8")
@@ -1392,9 +1606,12 @@ def test_realign_main_cancels_managed_only_and_archives_plan(tmp_path: Path, mon
     monkeypatch.setattr(ra.time, "sleep", lambda *_: None)
     open_orders = [
         {"orderId": 1, "clientOrderId": "gx-arxu-bestquot-1-08624"},
-        {"orderId": 2, "clientOrderId": "FROZENTParxusdt202607050113"},
+        {"orderId": 2, "clientOrderId": "gx-arxu-frozen-owned-2"},
         {"orderId": 3, "clientOrderId": "mfarxusd_closelon_s_1"},
         {"orderId": 4, "clientOrderId": "usrreduceL2607050"},
+        {"orderId": 5, "clientOrderId": "gx-arxu-frozen-prefix-spoof"},
+        {"orderId": 6, "clientOrderId": "gx-arxu-frozen-pair-6"},
+        {"orderId": 7, "clientOrderId": "FROZENTParxusdt202607050113"},
     ]
     monkeypatch.setattr(ra, "fetch_futures_open_orders", lambda *a, **k: open_orders)
     canceled: list = []
@@ -1403,10 +1620,11 @@ def test_realign_main_cancels_managed_only_and_archives_plan(tmp_path: Path, mon
 
     ra.main()
 
-    assert canceled == [1]                                    # ONLY the managed gx- order
+    assert canceled == [1, 5]                                 # ordinary gx- + prefix spoof
     out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert out["action"] == "REALIGNED_AND_RESTARTED"
-    assert out["canceled_managed_orders"] == 1
+    assert out["canceled_managed_orders"] == 2
+    assert out["kept_frozen_orders"] == 2                     # durable ref + pair manifest
     assert out["kept_unmanaged_orders"] == 3                  # FROZENTP + mf + usr preserved
     assert not plan_file.exists()                             # stale plan archived before start
     assert any("stop" in c for c in sysctl) and any("start" in c for c in sysctl)

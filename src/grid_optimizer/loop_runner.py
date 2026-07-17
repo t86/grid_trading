@@ -25,6 +25,7 @@ from .audit import (
     count_jsonl_lines,
     collect_new_rows,
     epoch_ms,
+    exclusive_json_state_lock,
     fetch_time_paged,
     income_row_key,
     income_row_time_ms,
@@ -116,11 +117,12 @@ from .submit_plan import (
     apply_hard_loss_rescue_entry_guard_to_actions,
     apply_loss_inventory_no_cross_entry_guard_to_actions,
     apply_loss_reduce_reentry_guard_to_actions,
-    apply_actual_net_exposure_decision_to_actions,
+    coordinate_symbol_execution_action,
     apply_projected_entry_exposure_cap_to_actions,
     apply_reduce_only_no_loss_guard_to_actions,
     cap_reduce_only_place_orders_to_position,
     estimate_mid_drift_steps,
+    is_frozen_inventory_order,
     preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
     sort_cancel_orders_farthest_from_market_first,
@@ -142,6 +144,11 @@ from .futures_terminal_drain import (
     settle_loss_lease,
     terminal_drain_state_from_dict,
     terminal_drain_state_to_dict,
+)
+from .futures_inventory_boundary import (
+    is_durable_frozen_order_record,
+    ordinary_position_qtys as _ordinary_position_qtys,
+    strict_frozen_side_qtys,
 )
 from .futures_recovery_coordinator import (
     ActionId,
@@ -3165,6 +3172,24 @@ def _best_quote_volume_ledger_snapshot(
         "last_trade_keys_at_time": list((ledger or {}).get("last_trade_keys_at_time") or []),
         "last_transfer_at": str((ledger or {}).get("last_transfer_at") or ""),
         "transfer_shortfall_qty": _safe_float((ledger or {}).get("transfer_shortfall_qty")),
+        "position_reconcile_deferred_reason": str(
+            (ledger or {}).get("position_reconcile_deferred_reason") or ""
+        ),
+        "position_reconcile_pending_count": int(
+            (ledger or {}).get("position_reconcile_pending_count") or 0
+        ),
+        "position_reconcile_target_long_qty": _safe_float(
+            (ledger or {}).get("position_reconcile_target_long_qty")
+        ),
+        "position_reconcile_target_short_qty": _safe_float(
+            (ledger or {}).get("position_reconcile_target_short_qty")
+        ),
+        "position_reconcile_ledger_long_qty": _safe_float(
+            (ledger or {}).get("position_reconcile_ledger_long_qty")
+        ),
+        "position_reconcile_ledger_short_qty": _safe_float(
+            (ledger or {}).get("position_reconcile_ledger_short_qty")
+        ),
     }
 
 
@@ -3726,12 +3751,721 @@ def _refresh_best_quote_frozen_inventory_quantities(frozen: dict[str, Any]) -> d
     return frozen
 
 
+_FROZEN_PAIR_TERMINAL_LEG_STATUSES = {
+    "filled",
+    "canceled",
+    "cancelled",
+    "expired",
+    "rejected",
+    "not_found",
+}
+
+
+def _frozen_pair_manifest_has_unresolved_legs(
+    manifest: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(manifest, Mapping):
+        return False
+    legs = manifest.get("legs")
+    if not isinstance(legs, Mapping) or not legs:
+        return True
+    if any(not isinstance(raw_leg, Mapping) for raw_leg in legs.values()):
+        return True
+    return any(
+        str(
+            (raw_leg or {}).get("status")
+            or (raw_leg or {}).get("submit_state")
+            or "prepared"
+        )
+        .lower()
+        .strip()
+        not in _FROZEN_PAIR_TERMINAL_LEG_STATUSES
+        for raw_leg in legs.values()
+    )
+
+
+def _frozen_pair_manifest_reconcile_errors(
+    manifest: Mapping[str, Any],
+    *,
+    request_id: str,
+) -> list[str]:
+    errors: list[str] = []
+    for field in ("version", "submission_seq"):
+        raw_value = manifest.get(field)
+        if isinstance(raw_value, bool):
+            errors.append(f"manifest {field} is invalid")
+            continue
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            errors.append(f"manifest {field} is invalid")
+            continue
+        if value < 1 or str(raw_value).strip() != str(value):
+            errors.append(f"manifest {field} is invalid")
+    if not request_id or str(manifest.get("request_id") or "").strip() != request_id:
+        errors.append("manifest request id is invalid")
+    legs = manifest.get("legs")
+    if not isinstance(legs, Mapping) or not legs:
+        errors.append("manifest legs are missing or invalid")
+        return errors
+    for leg_key, raw_leg in legs.items():
+        if leg_key not in {"long", "short"} or not isinstance(raw_leg, Mapping):
+            errors.append(f"manifest leg {leg_key} is invalid")
+            continue
+        client_order_id = str(raw_leg.get("client_order_id") or "").strip()
+        if not client_order_id:
+            errors.append(f"manifest leg {leg_key} client id is missing")
+        raw_updated_at = str(
+            raw_leg.get("updated_at") or raw_leg.get("prepared_at") or ""
+        ).strip()
+        try:
+            parsed_at = datetime.fromisoformat(
+                raw_updated_at.replace("Z", "+00:00")
+            )
+            if parsed_at.tzinfo is None:
+                raise ValueError("timezone is missing")
+        except (TypeError, ValueError):
+            errors.append(f"manifest leg {leg_key} timestamp is invalid")
+    return errors
+
+
+def _frozen_pair_client_order_id(
+    *,
+    symbol: str,
+    request_id: str,
+    submission_seq: int,
+    leg: str,
+) -> str:
+    normalized_leg = str(leg or "").lower().strip()
+    if normalized_leg not in {"long", "short"}:
+        raise ValueError("frozen pair manifest leg must be long or short")
+    if not str(request_id or "").strip() or int(submission_seq) < 1:
+        raise ValueError("frozen pair manifest identity is invalid")
+    compact_symbol = str(symbol or "").lower().replace("usdt", "u")[:12]
+    if not compact_symbol:
+        raise ValueError("frozen pair manifest symbol is missing")
+    digest = hashlib.sha256(
+        f"{symbol.upper()}:{request_id}:{int(submission_seq)}".encode("utf-8")
+    ).hexdigest()[:8]
+    lane = "frpl" if normalized_leg == "long" else "frps"
+    return f"gx-{compact_symbol}-{lane}-{int(submission_seq)}-{digest}"[:36]
+
+
+def _prepare_frozen_pair_submission_manifest(
+    *,
+    state: dict[str, Any],
+    symbol: str,
+    orders: Iterable[Mapping[str, Any]],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Persist the complete pair identity before either exchange POST."""
+
+    directive = state.get("best_quote_frozen_inventory_pair_release")
+    if not isinstance(directive, dict):
+        raise ValueError("frozen pair directive is missing")
+    request_id = str(directive.get("request_id") or "").strip()
+    if not request_id:
+        raise ValueError("frozen pair request id is missing")
+    existing = directive.get("submission_manifest")
+    if (
+        isinstance(existing, Mapping)
+        and str(existing.get("request_id") or "").strip() == request_id
+        and _frozen_pair_manifest_has_unresolved_legs(existing)
+    ):
+        return copy.deepcopy(dict(existing))
+
+    rows = [dict(row) for row in orders if isinstance(row, Mapping)]
+    roles = {str(row.get("role") or "").lower().strip() for row in rows}
+    repair_side = str(directive.get("repair_side") or "").lower().strip()
+    expected_roles = {
+        "frozen_inventory_pair_release_long",
+        "frozen_inventory_pair_release_short",
+    }
+    if repair_side:
+        if repair_side not in {"long", "short"} or len(rows) != 1:
+            raise ValueError("frozen pair repair manifest shape is invalid")
+        expected_repair_role = f"frozen_inventory_pair_release_{repair_side}"
+        if roles != {expected_repair_role}:
+            raise ValueError("frozen pair repair role does not match directive")
+    elif len(rows) != 2 or roles != expected_roles:
+        raise ValueError("frozen pair initial manifest requires both legs")
+
+    quantities: list[float] = []
+    by_leg: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        role = str(row.get("role") or "").lower().strip()
+        leg = "long" if role.endswith("_long") else "short"
+        if (
+            str(row.get("frozen_inventory_request_id") or "").strip()
+            != request_id
+            or not bool(row.get("force_reduce_only"))
+            or str(row.get("execution_type") or "").lower().strip()
+            not in {"maker", "post_only"}
+            or str(row.get("time_in_force") or "").upper().strip() != "GTX"
+            or not bool(row.get("post_only"))
+        ):
+            raise ValueError("frozen pair manifest order is not authorized GTX maker")
+        qty = float(row.get("qty"))
+        price = float(row.get("price"))
+        if (
+            isinstance(row.get("qty"), bool)
+            or isinstance(row.get("price"), bool)
+            or not math.isfinite(qty)
+            or qty <= 0
+            or not math.isfinite(price)
+            or price <= 0
+        ):
+            raise ValueError("frozen pair manifest quantity and price must be finite")
+        quantities.append(qty)
+        by_leg[leg] = dict(row)
+    if not repair_side and not math.isclose(
+        quantities[0], quantities[1], rel_tol=1e-12, abs_tol=1e-12
+    ):
+        raise ValueError("frozen pair initial legs must have equal quantity")
+
+    previous_seq = max(
+        int(directive.get("submission_seq") or 0),
+        int((existing or {}).get("submission_seq") or 0)
+        if isinstance(existing, Mapping)
+        else 0,
+    )
+    submission_seq = previous_seq + 1
+    prepared_at = (now or _utc_now()).astimezone(timezone.utc).isoformat()
+    legs: dict[str, dict[str, Any]] = {}
+    refs = state.get("best_quote_volume_order_refs")
+    refs = dict(refs) if isinstance(refs, Mapping) else {}
+    for leg, row in by_leg.items():
+        client_order_id = _frozen_pair_client_order_id(
+            symbol=symbol,
+            request_id=request_id,
+            submission_seq=submission_seq,
+            leg=leg,
+        )
+        role = str(row.get("role") or "").lower().strip()
+        leg_record = {
+            "role": role,
+            "side": str(row.get("side") or "").upper().strip(),
+            "position_side": str(
+                row.get("position_side") or row.get("positionSide") or "BOTH"
+            ).upper().strip(),
+            "qty": float(row.get("qty")),
+            "price": float(row.get("price")),
+            "client_order_id": client_order_id,
+            "status": "prepared",
+            "submit_state": "prepared",
+            "order_id": "",
+            "executed_qty": 0.0,
+            "prepared_at": prepared_at,
+            "updated_at": prepared_at,
+        }
+        legs[leg] = leg_record
+        refs[f"pending:{client_order_id}"] = {
+            "book": "frozen_bq",
+            "role": role,
+            "side": leg_record["side"],
+            "position_side": leg_record["position_side"],
+            "client_order_id": client_order_id,
+            "frozen_inventory_request_id": request_id,
+            "frozen_pair_manifest_pending": True,
+            "updated_at": prepared_at,
+        }
+    manifest = {
+        "version": 1,
+        "request_id": request_id,
+        "submission_seq": submission_seq,
+        "kind": "repair" if repair_side else "initial",
+        "phase": "prepared",
+        "prepared_at": prepared_at,
+        "updated_at": prepared_at,
+        "legs": legs,
+    }
+    directive.update(
+        {
+            "submission_seq": submission_seq,
+            "submission_manifest": manifest,
+            "awaiting_fill_confirmation": True,
+            "submitted": True,
+            "updated_at": prepared_at,
+        }
+    )
+    state["best_quote_frozen_inventory_pair_release"] = directive
+    state["best_quote_volume_order_refs"] = refs
+    return copy.deepcopy(manifest)
+
+
+def _record_frozen_pair_leg_transition(
+    *,
+    state: dict[str, Any],
+    request_id: str,
+    role: str,
+    status: str,
+    response: Mapping[str, Any] | None = None,
+    error: str | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    directive = state.get("best_quote_frozen_inventory_pair_release")
+    if not isinstance(directive, dict) or str(directive.get("request_id") or "").strip() != str(
+        request_id or ""
+    ).strip():
+        return {"recorded": False, "reason": "request_mismatch"}
+    manifest = directive.get("submission_manifest")
+    if not isinstance(manifest, dict):
+        return {"recorded": False, "reason": "manifest_missing"}
+    normalized_role = str(role or "").lower().strip()
+    leg = "long" if normalized_role.endswith("_long") else "short" if normalized_role.endswith("_short") else ""
+    legs = manifest.get("legs")
+    leg_record = dict((legs or {}).get(leg) or {}) if isinstance(legs, Mapping) else {}
+    if not leg or str(leg_record.get("role") or "").lower().strip() != normalized_role:
+        return {"recorded": False, "reason": "role_mismatch"}
+    checked_at = (now or _utc_now()).astimezone(timezone.utc).isoformat()
+    normalized_status = str(status or "").lower().strip()
+    if normalized_status not in {
+        "submitting",
+        "accepted",
+        "unknown",
+        "open",
+        "partial",
+        *_FROZEN_PAIR_TERMINAL_LEG_STATUSES,
+    }:
+        return {"recorded": False, "reason": "invalid_status"}
+    raw_response = response if isinstance(response, Mapping) else {}
+    client_order_id = str(
+        raw_response.get("clientOrderId") or leg_record.get("client_order_id") or ""
+    ).strip()
+    if client_order_id != str(leg_record.get("client_order_id") or "").strip():
+        return {"recorded": False, "reason": "client_order_id_mismatch"}
+    order_id = str(raw_response.get("orderId") or leg_record.get("order_id") or "").strip()
+    leg_record.update(
+        {
+            "status": normalized_status,
+            "submit_state": normalized_status,
+            "order_id": order_id,
+            "executed_qty": max(
+                _safe_float(
+                    raw_response.get(
+                        "executedQty", leg_record.get("executed_qty")
+                    )
+                ),
+                0.0,
+            ),
+            "updated_at": checked_at,
+        }
+    )
+    if normalized_status == "submitting":
+        leg_record["submitted_at"] = checked_at
+    if error:
+        leg_record["last_error"] = str(error)
+    elif normalized_status not in {"unknown", "rejected"}:
+        leg_record.pop("last_error", None)
+    legs = dict(legs) if isinstance(legs, Mapping) else {}
+    legs[leg] = leg_record
+    manifest["legs"] = legs
+    manifest["phase"] = (
+        "terminal"
+        if not _frozen_pair_manifest_has_unresolved_legs(manifest)
+        else "submitting"
+        if normalized_status == "submitting"
+        else "awaiting_reconcile"
+    )
+    manifest["updated_at"] = checked_at
+    directive["submission_manifest"] = manifest
+    directive["awaiting_fill_confirmation"] = _frozen_pair_manifest_has_unresolved_legs(
+        manifest
+    )
+    directive["updated_at"] = checked_at
+    state["best_quote_frozen_inventory_pair_release"] = directive
+
+    refs = state.get("best_quote_volume_order_refs")
+    refs = dict(refs) if isinstance(refs, Mapping) else {}
+    ref = dict(refs.get(f"pending:{client_order_id}") or {})
+    ref.update(
+        {
+            "book": "frozen_bq",
+            "role": normalized_role,
+            "side": str(leg_record.get("side") or "").upper().strip(),
+            "position_side": str(
+                leg_record.get("position_side") or "BOTH"
+            ).upper().strip(),
+            "client_order_id": client_order_id,
+            "frozen_inventory_request_id": str(request_id),
+            "frozen_pair_manifest_pending": normalized_status
+            not in _FROZEN_PAIR_TERMINAL_LEG_STATUSES,
+            "updated_at": checked_at,
+        }
+    )
+    refs[f"pending:{client_order_id}"] = ref
+    if order_id:
+        refs[order_id] = dict(ref)
+    state["best_quote_volume_order_refs"] = refs
+    return {
+        "recorded": True,
+        "request_id": str(request_id),
+        "role": normalized_role,
+        "status": normalized_status,
+        "order_id": order_id,
+        "client_order_id": client_order_id,
+    }
+
+
+def _account_frozen_pair_manifest_execution(
+    *,
+    state: dict[str, Any],
+    request_id: str,
+    role: str,
+    executed_qty: float,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Apply an exchange cumulative executedQty exactly once per manifest leg."""
+
+    directive = state.get("best_quote_frozen_inventory_pair_release")
+    if not isinstance(directive, dict) or str(
+        directive.get("request_id") or ""
+    ).strip() != str(request_id or "").strip():
+        return {"accounted": False, "reason": "request_mismatch", "delta_qty": 0.0}
+    manifest = directive.get("submission_manifest")
+    legs = manifest.get("legs") if isinstance(manifest, dict) else None
+    normalized_role = str(role or "").lower().strip()
+    leg_key = (
+        "long"
+        if normalized_role.endswith("_long")
+        else "short"
+        if normalized_role.endswith("_short")
+        else ""
+    )
+    leg = dict((legs or {}).get(leg_key) or {}) if isinstance(legs, Mapping) else {}
+    if not leg_key or str(leg.get("role") or "").lower().strip() != normalized_role:
+        return {"accounted": False, "reason": "role_mismatch", "delta_qty": 0.0}
+    safe_executed_qty = max(_safe_float(executed_qty), 0.0)
+    order_id = str(leg.get("order_id") or "").strip()
+    client_order_id = str(leg.get("client_order_id") or "").strip()
+    accounting_key = (
+        f"order:{order_id}"
+        if order_id
+        else f"client:{client_order_id}"
+        if client_order_id
+        else ""
+    )
+    accounted_order_fills = dict(directive.get("accounted_order_fills") or {})
+    accounting_record = dict(accounted_order_fills.get(accounting_key) or {})
+    previous_accounted_qty = max(
+        _safe_float(leg.get("accounted_fill_qty")),
+        _safe_float(accounting_record.get("accounted_fill_qty")),
+        0.0,
+    )
+    delta_qty = max(safe_executed_qty - previous_accounted_qty, 0.0)
+    requested_qty = max(_safe_float(directive.get("requested_qty")), 0.0)
+    if requested_qty > 0:
+        delta_qty = min(delta_qty, max(requested_qty - previous_accounted_qty, 0.0))
+    checked_at = (now or _utc_now()).astimezone(timezone.utc).isoformat()
+    leg["exchange_executed_qty"] = max(
+        safe_executed_qty,
+        max(_safe_float(leg.get("exchange_executed_qty")), 0.0),
+    )
+    if delta_qty > 1e-12:
+        leg["accounted_fill_qty"] = previous_accounted_qty + delta_qty
+        side_field = "filled_long_qty" if leg_key == "long" else "filled_short_qty"
+        side_total = max(_safe_float(directive.get(side_field)), 0.0) + delta_qty
+        directive[side_field] = min(side_total, requested_qty) if requested_qty > 0 else side_total
+    if accounting_key:
+        accounting_record.update(
+            {
+                "request_id": str(request_id),
+                "role": normalized_role,
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "accounted_fill_qty": max(
+                    previous_accounted_qty + delta_qty,
+                    _safe_float(accounting_record.get("accounted_fill_qty")),
+                ),
+                "exchange_executed_qty": max(
+                    safe_executed_qty,
+                    _safe_float(accounting_record.get("exchange_executed_qty")),
+                ),
+                "updated_at": checked_at,
+            }
+        )
+        accounted_order_fills[accounting_key] = accounting_record
+        if len(accounted_order_fills) > 2000:
+            accounted_order_fills = dict(
+                list(accounted_order_fills.items())[-2000:]
+            )
+        directive["accounted_order_fills"] = accounted_order_fills
+    leg["updated_at"] = checked_at
+    legs = dict(legs) if isinstance(legs, Mapping) else {}
+    legs[leg_key] = leg
+    manifest["legs"] = legs
+    manifest["updated_at"] = checked_at
+    directive["submission_manifest"] = manifest
+    directive["updated_at"] = checked_at
+    state["best_quote_frozen_inventory_pair_release"] = directive
+    return {
+        "accounted": True,
+        "reason": "accounted" if delta_qty > 1e-12 else "no_new_execution",
+        "delta_qty": delta_qty,
+        "accounted_fill_qty": max(_safe_float(leg.get("accounted_fill_qty")), 0.0),
+    }
+
+
+def _frozen_pair_exchange_status(raw_status: Any) -> str:
+    normalized = str(raw_status or "").upper().strip()
+    return {
+        "NEW": "open",
+        "PARTIALLY_FILLED": "partial",
+        "FILLED": "filled",
+        "CANCELED": "canceled",
+        "CANCELLED": "canceled",
+        "EXPIRED": "expired",
+        "EXPIRED_IN_MATCH": "expired",
+        "REJECTED": "rejected",
+    }.get(normalized, "accepted" if not normalized else "unknown")
+
+
+def reconcile_best_quote_frozen_pair_release(
+    *,
+    state: dict[str, Any],
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    current_open_orders: Iterable[Mapping[str, Any]] | None,
+    observed_trade_rows: list[dict[str, Any]] | None,
+    recv_window: int,
+    now: datetime | None = None,
+    missing_order_grace_seconds: float = 2.0,
+    not_found_quiet_window_seconds: float = 10.0,
+) -> dict[str, Any]:
+    """Reconcile a crash-safe frozen pair manifest without creating new orders."""
+
+    checked_at = (now or _utc_now()).astimezone(timezone.utc)
+    directive = state.get("best_quote_frozen_inventory_pair_release")
+    manifest = (
+        directive.get("submission_manifest")
+        if isinstance(directive, Mapping)
+        else None
+    )
+    report: dict[str, Any] = {
+        "enabled": isinstance(manifest, Mapping),
+        "request_id": str((directive or {}).get("request_id") or "")
+        if isinstance(directive, Mapping)
+        else "",
+        "open_leg_count": 0,
+        "queried_leg_count": 0,
+        "not_found_proof_count": 0,
+        "terminal_leg_count": 0,
+        "errors": [],
+    }
+    if not isinstance(manifest, Mapping):
+        report["fill_sync"] = sync_best_quote_frozen_pair_release(
+            state=state,
+            observed_trade_rows=observed_trade_rows,
+        )
+        return report
+    request_id = report["request_id"]
+    validation_errors = _frozen_pair_manifest_reconcile_errors(
+        manifest,
+        request_id=request_id,
+    )
+    if current_open_orders is None:
+        validation_errors.append("fresh open-order observation is missing")
+    if validation_errors:
+        report["blocked"] = True
+        report["errors"].extend(validation_errors)
+        if isinstance(directive, dict):
+            directive["awaiting_fill_confirmation"] = True
+            directive["last_reconcile_error"] = "; ".join(validation_errors)
+            directive["updated_at"] = checked_at.isoformat()
+            state["best_quote_frozen_inventory_pair_release"] = directive
+        return report
+    open_order_rows = [
+        dict(row)
+        for row in list(current_open_orders or [])
+        if isinstance(row, Mapping)
+    ]
+    open_by_client_id = {
+        str(row.get("clientOrderId") or row.get("client_order_id") or "").strip(): dict(row)
+        for row in open_order_rows
+        if str(row.get("clientOrderId") or row.get("client_order_id") or "").strip()
+    }
+    open_by_order_id = {
+        str(row.get("orderId") or row.get("order_id") or "").strip(): dict(row)
+        for row in open_order_rows
+        if str(row.get("orderId") or row.get("order_id") or "").strip()
+    }
+
+    for leg_key, raw_leg in list((manifest.get("legs") or {}).items()):
+        if not isinstance(raw_leg, Mapping):
+            report["errors"].append(f"{leg_key}: malformed manifest leg")
+            continue
+        leg = dict(raw_leg)
+        role = str(leg.get("role") or f"frozen_inventory_pair_release_{leg_key}").lower().strip()
+        client_order_id = str(leg.get("client_order_id") or "").strip()
+        order_id = str(leg.get("order_id") or "").strip()
+        status = str(leg.get("status") or leg.get("submit_state") or "prepared").lower().strip()
+        if status in _FROZEN_PAIR_TERMINAL_LEG_STATUSES:
+            report["terminal_leg_count"] += 1
+            continue
+        found = open_by_client_id.get(client_order_id) or open_by_order_id.get(order_id)
+        if found is not None:
+            found = dict(found)
+            found.setdefault("clientOrderId", client_order_id)
+            transition_status = _frozen_pair_exchange_status(found.get("status"))
+            _record_frozen_pair_leg_transition(
+                state=state,
+                request_id=request_id,
+                role=role,
+                status=transition_status,
+                response=found,
+                now=checked_at,
+            )
+            _account_frozen_pair_manifest_execution(
+                state=state,
+                request_id=request_id,
+                role=role,
+                executed_qty=_safe_float(found.get("executedQty")),
+                now=checked_at,
+            )
+            report["open_leg_count"] += 1
+            continue
+
+        manifest_version = int(manifest.get("version") or 0)
+        raw_updated_at = str(leg.get("updated_at") or leg.get("prepared_at") or "").strip()
+        try:
+            leg_updated_at = datetime.fromisoformat(raw_updated_at.replace("Z", "+00:00"))
+            if leg_updated_at.tzinfo is None:
+                leg_updated_at = leg_updated_at.replace(tzinfo=timezone.utc)
+            leg_age_seconds = max(
+                (checked_at - leg_updated_at.astimezone(timezone.utc)).total_seconds(),
+                0.0,
+            )
+        except ValueError:
+            report["blocked"] = True
+            report["errors"].append(
+                f"{leg_key}: manifest timestamp is invalid"
+            )
+            continue
+        if manifest_version < 1 or leg_age_seconds < max(missing_order_grace_seconds, 0.0):
+            continue
+        try:
+            found = fetch_futures_order(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_id=int(order_id) if order_id.isdigit() else None,
+                orig_client_order_id=None if order_id.isdigit() else client_order_id,
+                recv_window=recv_window,
+            )
+            report["queried_leg_count"] += 1
+        except RuntimeError as exc:
+            message = str(exc)
+            if "-2013" in message or "order does not exist" in message.lower():
+                current_directive = state.get("best_quote_frozen_inventory_pair_release")
+                current_manifest = (
+                    current_directive.get("submission_manifest")
+                    if isinstance(current_directive, dict)
+                    else None
+                )
+                current_legs = current_manifest.get("legs") if isinstance(current_manifest, dict) else None
+                current_leg = dict((current_legs or {}).get(leg_key) or {})
+                proofs = [
+                    dict(item)
+                    for item in list(current_leg.get("not_found_proofs") or [])
+                    if isinstance(item, Mapping)
+                    and str(item.get("open_orders_observed_at") or "").strip()
+                ]
+                previous_proof_at = (
+                    _parse_state_datetime(
+                        proofs[-1].get("open_orders_observed_at")
+                    )
+                    if proofs
+                    else None
+                )
+                quiet_window_elapsed = (
+                    previous_proof_at is None
+                    or (
+                        checked_at - previous_proof_at.astimezone(timezone.utc)
+                    ).total_seconds()
+                    >= max(float(not_found_quiet_window_seconds), 0.0)
+                )
+                if quiet_window_elapsed:
+                    proofs.append(
+                        {
+                            "client_order_id": client_order_id,
+                            "order_id": order_id,
+                            "client_id_absent_from_open_orders": (
+                                client_order_id not in open_by_client_id
+                            ),
+                            "order_id_absent_from_open_orders": (
+                                not order_id or order_id not in open_by_order_id
+                            ),
+                            "open_orders_observed_at": checked_at.isoformat(),
+                            "order_query_observed_at": checked_at.isoformat(),
+                        }
+                    )
+                current_leg["not_found_proofs"] = proofs[-2:]
+                current_leg["last_error"] = message
+                current_legs = dict(current_legs) if isinstance(current_legs, Mapping) else {}
+                current_legs[leg_key] = current_leg
+                current_manifest["legs"] = current_legs
+                current_directive["submission_manifest"] = current_manifest
+                state["best_quote_frozen_inventory_pair_release"] = current_directive
+                if quiet_window_elapsed:
+                    report["not_found_proof_count"] += 1
+                if len(proofs) >= 2 and quiet_window_elapsed:
+                    _record_frozen_pair_leg_transition(
+                        state=state,
+                        request_id=request_id,
+                        role=role,
+                        status="not_found",
+                        error=message,
+                        now=checked_at,
+                    )
+                    report["terminal_leg_count"] += 1
+            else:
+                _record_frozen_pair_leg_transition(
+                    state=state,
+                    request_id=request_id,
+                    role=role,
+                    status="unknown",
+                    error=message,
+                    now=checked_at,
+                )
+                report["errors"].append(f"{client_order_id}: {message}")
+            continue
+        found = dict(found)
+        found.setdefault("clientOrderId", client_order_id)
+        transition_status = _frozen_pair_exchange_status(found.get("status"))
+        _record_frozen_pair_leg_transition(
+            state=state,
+            request_id=request_id,
+            role=role,
+            status=transition_status,
+            response=found,
+            now=checked_at,
+        )
+        _account_frozen_pair_manifest_execution(
+            state=state,
+            request_id=request_id,
+            role=role,
+            executed_qty=_safe_float(found.get("executedQty")),
+            now=checked_at,
+        )
+        if transition_status in _FROZEN_PAIR_TERMINAL_LEG_STATUSES:
+            report["terminal_leg_count"] += 1
+
+    report["fill_sync"] = sync_best_quote_frozen_pair_release(
+        state=state,
+        observed_trade_rows=observed_trade_rows,
+    )
+    return report
+
+
 def sync_best_quote_frozen_pair_release(
     *,
     state: dict[str, Any],
     observed_trade_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    directive = dict(state.get("best_quote_frozen_inventory_pair_release") or {})
+    directive = copy.deepcopy(
+        dict(state.get("best_quote_frozen_inventory_pair_release") or {})
+    )
     request_id = str(directive.get("request_id") or "").strip()
     report = {
         "enabled": bool(request_id),
@@ -3759,6 +4493,22 @@ def sync_best_quote_frozen_pair_release(
     historical_fill_key_set = set(applied_fill_keys)
     seen_legacy_fill_keys: set[str] = set()
     seen_legacy_without_exchange_id: set[str] = set()
+    manifest = directive.get("submission_manifest")
+    manifest_legs = (
+        dict(manifest.get("legs") or {}) if isinstance(manifest, dict) else {}
+    )
+    manifest_leg_by_order_id = {
+        str(leg.get("order_id") or "").strip(): leg_key
+        for leg_key, leg in manifest_legs.items()
+        if isinstance(leg, Mapping) and str(leg.get("order_id") or "").strip()
+    }
+    manifest_leg_by_client_id = {
+        str(leg.get("client_order_id") or "").strip(): leg_key
+        for leg_key, leg in manifest_legs.items()
+        if isinstance(leg, Mapping)
+        and str(leg.get("client_order_id") or "").strip()
+    }
+    accounted_order_fills = dict(directive.get("accounted_order_fills") or {})
     long_delta = 0.0
     short_delta = 0.0
     for row in [dict(item) for item in list(observed_trade_rows or []) if isinstance(item, dict)]:
@@ -3793,6 +4543,78 @@ def sync_best_quote_frozen_pair_release(
         qty = max(_safe_float(row.get("qty")), 0.0)
         if qty <= 1e-12:
             continue
+        client_order_id = str(
+            row.get("clientOrderId")
+            or row.get("client_order_id")
+            or ref.get("client_order_id")
+            or ""
+        ).strip()
+        manifest_leg_key = manifest_leg_by_order_id.get(
+            order_id
+        ) or manifest_leg_by_client_id.get(client_order_id)
+        order_accounting_key = f"order:{order_id}" if order_id else ""
+        client_accounting_key = (
+            f"client:{client_order_id}" if client_order_id else ""
+        )
+        accounting_key = (
+            order_accounting_key
+            if order_accounting_key in accounted_order_fills
+            else client_accounting_key
+            if client_accounting_key in accounted_order_fills
+            else order_accounting_key or client_accounting_key
+        )
+        accounting_record = dict(
+            accounted_order_fills.get(accounting_key) or {}
+        )
+        if manifest_leg_key or accounting_record:
+            manifest_leg = (
+                dict(manifest_legs.get(manifest_leg_key) or {})
+                if manifest_leg_key
+                else {}
+            )
+            observed_keys = [
+                str(item)
+                for item in list(
+                    accounting_record.get("observed_trade_fill_keys")
+                    or manifest_leg.get("observed_trade_fill_keys")
+                    or []
+                )
+                if str(item).strip()
+            ]
+            observed_qty = max(
+                _safe_float(accounting_record.get("observed_trade_qty")),
+                _safe_float(manifest_leg.get("observed_trade_qty")),
+                0.0,
+            ) + qty
+            accounted_qty = max(
+                _safe_float(accounting_record.get("accounted_fill_qty")),
+                _safe_float(manifest_leg.get("accounted_fill_qty")),
+                0.0,
+            )
+            qty = max(observed_qty - accounted_qty, 0.0)
+            manifest_leg["observed_trade_qty"] = observed_qty
+            if fill_key:
+                observed_keys.append(fill_key)
+            manifest_leg["observed_trade_fill_keys"] = observed_keys[-10000:]
+            if qty > 1e-12:
+                manifest_leg["accounted_fill_qty"] = accounted_qty + qty
+            manifest_leg["updated_at"] = _utc_now().isoformat()
+            if manifest_leg_key:
+                manifest_legs[manifest_leg_key] = manifest_leg
+            if accounting_key:
+                accounting_record.update(
+                    {
+                        "request_id": request_id,
+                        "role": role,
+                        "order_id": order_id,
+                        "client_order_id": client_order_id,
+                        "observed_trade_qty": observed_qty,
+                        "observed_trade_fill_keys": observed_keys[-10000:],
+                        "accounted_fill_qty": accounted_qty + qty,
+                        "updated_at": _utc_now().isoformat(),
+                    }
+                )
+                accounted_order_fills[accounting_key] = accounting_record
         if role == "frozen_inventory_pair_release_long":
             long_delta += qty
         elif role == "frozen_inventory_pair_release_short":
@@ -3809,6 +4631,9 @@ def sync_best_quote_frozen_pair_release(
     filled_long_qty = report["filled_long_qty"] + long_delta
     filled_short_qty = report["filled_short_qty"] + short_delta
     requested_qty = max(_safe_float(directive.get("requested_qty")), 0.0)
+    if requested_qty > 0:
+        filled_long_qty = min(filled_long_qty, requested_qty)
+        filled_short_qty = min(filled_short_qty, requested_qty)
     paired_total = min(filled_long_qty, filled_short_qty)
     if requested_qty > 0:
         paired_total = min(paired_total, requested_qty)
@@ -3857,15 +4682,37 @@ def sync_best_quote_frozen_pair_release(
             "new_paired_release_qty": new_paired,
         }
     )
-    if filled_long_qty > filled_short_qty + 1e-12:
-        report["repair_side"] = "short"
-    elif filled_short_qty > filled_long_qty + 1e-12:
-        report["repair_side"] = "long"
+    if isinstance(manifest, dict):
+        manifest["legs"] = manifest_legs
+        directive["submission_manifest"] = manifest
+    if accounted_order_fills:
+        if len(accounted_order_fills) > 2000:
+            accounted_order_fills = dict(
+                list(accounted_order_fills.items())[-2000:]
+            )
+        directive["accounted_order_fills"] = accounted_order_fills
+    manifest_unresolved = _frozen_pair_manifest_has_unresolved_legs(
+        manifest if isinstance(manifest, Mapping) else None
+    )
+    if not manifest_unresolved:
+        if filled_long_qty > filled_short_qty + 1e-12:
+            report["repair_side"] = "short"
+        elif filled_short_qty > filled_long_qty + 1e-12:
+            report["repair_side"] = "long"
     completed = requested_qty > 0 and paired_total + 1e-12 >= requested_qty
     report["completed"] = completed
     if completed:
         state.pop("best_quote_frozen_inventory_pair_release", None)
     else:
+        if isinstance(manifest, dict):
+            manifest["phase"] = (
+                str(manifest.get("phase") or "awaiting_reconcile")
+                if manifest_unresolved
+                else "repair_required"
+                if report["repair_side"]
+                else "terminal"
+            )
+            manifest["updated_at"] = _utc_now().isoformat()
         directive.update(
             {
                 "requested": True,
@@ -3873,11 +4720,13 @@ def sync_best_quote_frozen_pair_release(
                 "filled_short_qty": filled_short_qty,
                 "paired_released_qty": paired_total,
                 "repair_side": report["repair_side"],
-                "awaiting_fill_confirmation": False,
+                "awaiting_fill_confirmation": manifest_unresolved,
                 "applied_trade_fill_keys": applied_fill_keys[-10000:],
                 "updated_at": _utc_now().isoformat(),
             }
         )
+        if isinstance(manifest, dict):
+            directive["submission_manifest"] = manifest
         state["best_quote_frozen_inventory_pair_release"] = directive
     return report
 
@@ -4420,6 +5269,21 @@ def _best_quote_reduce_freeze_report(
         0.0,
     )
 
+    def _raw_frozen_qty(side: str) -> float:
+        raw_lots = ledger.get(f"{side}_lots")
+        lot_qty = sum(
+            max(_safe_float(item.get("qty")), 0.0)
+            for item in (raw_lots if isinstance(raw_lots, list) else [])
+            if isinstance(item, Mapping)
+        )
+        return max(lot_qty, max(_safe_float(ledger.get(f"{side}_qty")), 0.0))
+
+    if (
+        _raw_frozen_qty("long") > effective_position_long_qty + 1e-12
+        or _raw_frozen_qty("short") > effective_position_short_qty + 1e-12
+    ):
+        raise ValueError("frozen inventory exceeds exchange position")
+
     def _normalized_lots(side: str, current_qty: float, fallback_entry: float) -> list[dict[str, Any]]:
         raw_lots = ledger.get(f"{side}_lots")
         source_lots = list(raw_lots) if isinstance(raw_lots, list) else []
@@ -4526,7 +5390,44 @@ def _best_quote_reduce_freeze_report(
         else 0.0
     )
     managed_source = "exchange_minus_frozen_inventory"
-    if isinstance(bq_ledger_report, dict) and bool(bq_ledger_report.get("initialized")):
+    ledger_cost_basis_rejection_reason = ""
+    ledger_cost_basis_usable = False
+    if isinstance(bq_ledger_report, dict):
+        ledger_long_qty = max(_safe_float(bq_ledger_report.get("long_qty")), 0.0)
+        ledger_short_qty = max(_safe_float(bq_ledger_report.get("short_qty")), 0.0)
+        ledger_cost_basis_usable = bool(
+            bq_ledger_report.get("initialized")
+            and bq_ledger_report.get("sync_ok", True)
+            and not str(
+                bq_ledger_report.get("position_reconcile_deferred_reason") or ""
+            ).strip()
+            and math.isclose(
+                ledger_long_qty,
+                managed_long_qty,
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            )
+            and math.isclose(
+                ledger_short_qty,
+                managed_short_qty,
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            )
+        )
+        if not ledger_cost_basis_usable:
+            if not bool(bq_ledger_report.get("initialized")):
+                ledger_cost_basis_rejection_reason = "ledger_not_initialized"
+            elif not bool(bq_ledger_report.get("sync_ok", True)):
+                ledger_cost_basis_rejection_reason = "ledger_sync_not_ok"
+            elif str(
+                bq_ledger_report.get("position_reconcile_deferred_reason") or ""
+            ).strip():
+                ledger_cost_basis_rejection_reason = str(
+                    bq_ledger_report.get("position_reconcile_deferred_reason")
+                ).strip()
+            else:
+                ledger_cost_basis_rejection_reason = "ledger_qty_not_canonical_ordinary"
+    if ledger_cost_basis_usable:
         managed_source = "best_quote_volume_ledger"
         managed_long_qty = max(_safe_float(bq_ledger_report.get("long_qty")), 0.0)
         managed_short_qty = max(_safe_float(bq_ledger_report.get("short_qty")), 0.0)
@@ -4574,6 +5475,8 @@ def _best_quote_reduce_freeze_report(
         "managed_short_unrealized_pnl": managed_short_unrealized,
         "managed_unrealized_pnl": managed_unrealized,
         "managed_source": managed_source,
+        "ledger_cost_basis_usable": ledger_cost_basis_usable,
+        "ledger_cost_basis_rejection_reason": ledger_cost_basis_rejection_reason,
         "volume_ledger": dict(bq_ledger_report or {}),
         "position_long_qty": effective_position_long_qty,
         "position_short_qty": effective_position_short_qty,
@@ -4933,14 +5836,54 @@ def _apply_best_quote_reduce_freeze(
     actual_short_loss_ratio = short_loss_ratio
     frozen_long_qty = _safe_float(report.get("frozen_long_qty"))
     frozen_short_qty = _safe_float(report.get("frozen_short_qty"))
-    if isinstance(bq_ledger_report, dict) and bool(bq_ledger_report.get("initialized")):
+    ledger_cost_basis_usable = bool(
+        isinstance(bq_ledger_report, dict)
+        and report.get("ledger_cost_basis_usable")
+    )
+    ledger_transfer_allowed = bool(
+        not isinstance(bq_ledger_report, dict) or ledger_cost_basis_usable
+    )
+    report["ledger_transfer_allowed"] = ledger_transfer_allowed
+    report["ledger_transfer_blocked_reason"] = (
+        None
+        if ledger_transfer_allowed
+        else str(
+            report.get("ledger_cost_basis_rejection_reason")
+            or "ledger_cost_basis_rejected"
+        )
+    )
+    if ledger_cost_basis_usable:
         managed_long_qty = max(_safe_float(bq_ledger_report.get("long_qty")), 0.0)
         managed_short_qty = max(_safe_float(bq_ledger_report.get("short_qty")), 0.0)
         current_long_avg_price = max(_safe_float(bq_ledger_report.get("long_avg_price")), 0.0)
         current_short_avg_price = max(_safe_float(bq_ledger_report.get("short_avg_price")), 0.0)
     else:
-        managed_long_qty = max(_safe_float(current_long_qty) - frozen_long_qty, 0.0)
-        managed_short_qty = max(_safe_float(current_short_qty) - frozen_short_qty, 0.0)
+        managed_long_qty = max(
+            _safe_float(
+                report.get(
+                    "managed_long_qty",
+                    max(_safe_float(current_long_qty) - frozen_long_qty, 0.0),
+                )
+            ),
+            0.0,
+        )
+        managed_short_qty = max(
+            _safe_float(
+                report.get(
+                    "managed_short_qty",
+                    max(_safe_float(current_short_qty) - frozen_short_qty, 0.0),
+                )
+            ),
+            0.0,
+        )
+        current_long_avg_price = max(
+            _safe_float(report.get("managed_long_avg_price", current_long_avg_price)),
+            0.0,
+        )
+        current_short_avg_price = max(
+            _safe_float(report.get("managed_short_avg_price", current_short_avg_price)),
+            0.0,
+        )
     managed_long_notional = managed_long_qty * _safe_float(mid_price)
     managed_short_notional = managed_short_qty * _safe_float(mid_price)
     long_loss_ratio = 0.0
@@ -4988,7 +5931,7 @@ def _apply_best_quote_reduce_freeze(
         return long_freeze_threshold if str(side).upper() == "LONG" else short_freeze_threshold
 
     def _managed_lot_candidates(side: str, side_threshold: float) -> tuple[list[dict[str, Any]], float, float, float]:
-        if not isinstance(bq_ledger_report, dict) or not bool(bq_ledger_report.get("initialized")):
+        if not ledger_cost_basis_usable:
             return [], 0.0, 0.0, 0.0
         ledger = dict(state.get("best_quote_volume_ledger") or {})
         side_key = "long_lots" if str(side).upper() == "LONG" else "short_lots"
@@ -5146,7 +6089,7 @@ def _apply_best_quote_reduce_freeze(
         "SHORT",
         short_freeze_threshold,
     )
-    use_lot_candidates = isinstance(bq_ledger_report, dict) and bool(bq_ledger_report.get("initialized"))
+    use_lot_candidates = ledger_cost_basis_usable
     freeze_pair_gate_report = {
         "enabled": True,
         "long": {
@@ -5206,6 +6149,13 @@ def _apply_best_quote_reduce_freeze(
     short_confirm_qty = short_candidate_qty if use_lot_candidates else managed_short_qty
     short_confirm_notional = short_candidate_notional if use_lot_candidates else managed_short_notional
     short_confirm_loss_ratio = short_candidate_loss_ratio if use_lot_candidates else short_loss_ratio
+    if not ledger_transfer_allowed:
+        long_confirm_qty = 0.0
+        long_confirm_notional = 0.0
+        long_confirm_loss_ratio = 0.0
+        short_confirm_qty = 0.0
+        short_confirm_notional = 0.0
+        short_confirm_loss_ratio = 0.0
     long_quality_bucket_notional = _quality_bucket_notional(long_candidate_lots)
     short_quality_bucket_notional = _quality_bucket_notional(short_candidate_lots)
     quality_report["long"]["bucket_notional"] = long_quality_bucket_notional
@@ -5391,6 +6341,25 @@ def _frozen_inventory_directive_authorized(
         return False, "missing_authorization"
     if bool(directive.get("consumed")):
         return False, "authorization_consumed"
+    for field in (
+        "requested_qty",
+        "filled_long_qty",
+        "filled_short_qty",
+        "paired_released_qty",
+        "submitted_qty",
+        "price",
+    ):
+        if field not in directive:
+            continue
+        raw_value = directive.get(field)
+        if isinstance(raw_value, bool):
+            return False, f"authorization_invalid_{field}"
+        try:
+            numeric_value = float(raw_value)
+        except (TypeError, ValueError):
+            return False, f"authorization_invalid_{field}"
+        if not math.isfinite(numeric_value) or numeric_value < 0.0:
+            return False, f"authorization_invalid_{field}"
     expires_at = _parse_state_datetime(directive.get("expires_at"))
     if expires_at is None:
         return False, "authorization_missing_expiry"
@@ -5713,6 +6682,11 @@ def apply_best_quote_frozen_inventory_manual_reduce(
         frozen_qty = max(_safe_float(ledger.get(f"{side_key}_qty")), 0.0)
         if not requested:
             return None
+        if bool(side_directive.get("submitted")):
+            reduce_report["blocked_reasons"].append(
+                f"{side_key}_awaiting_order_reconcile"
+            )
+            return None
         if not _authorized(side_directive, side_key=side_key):
             return None
         requested_qty = max(_safe_float(side_directive.get("requested_qty")), 0.0)
@@ -5733,10 +6707,7 @@ def apply_best_quote_frozen_inventory_manual_reduce(
                 and selected_lot_allocations
             )
         )
-        safe_tick = max(_safe_float(tick_size), 0.0)
-        raw_price = (ask_price if is_long else bid_price) if per_lot_release else (bid_price if is_long else ask_price)
-        if safe_tick > 0 and not per_lot_release:
-            raw_price = raw_price - safe_tick if is_long else raw_price + safe_tick
+        raw_price = ask_price if is_long else bid_price
         price = _round_order_price(max(_safe_float(raw_price), 0.0), tick_size, side)
         if price <= 0:
             reduce_report["blocked_reasons"].append(f"{side_key}_missing_price")
@@ -5817,11 +6788,12 @@ def apply_best_quote_frozen_inventory_manual_reduce(
             "role": f"frozen_inventory_manual_reduce_{side_key}",
             "position_side": ("LONG" if is_long else "SHORT") if hedge_mode else "BOTH",
             "force_reduce_only": True,
-            "execution_type": "maker" if per_lot_release else "aggressive",
-            "time_in_force": "GTX" if per_lot_release else "IOC",
-            "post_only": per_lot_release,
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "post_only": True,
             "manual_frozen_inventory_reduce": True,
             "frozen_inventory_request_id": str(side_directive.get("request_id") or "").strip(),
+            "frozen_inventory_authorization_validated": True,
         }
         if per_lot_release:
             order.update(
@@ -5839,15 +6811,11 @@ def apply_best_quote_frozen_inventory_manual_reduce(
         plan["sell_orders"] = [long_order, *list(plan.get("sell_orders") or [])]
         reduce_report["placed_long"] = True
         reduce_report["orders"].append(dict(long_order))
-        if not bool(long_order.get("frozen_inventory_per_lot_release")):
-            directive.pop("long", None)
     short_order = _build_order(side_key="short")
     if short_order is not None:
         plan["buy_orders"] = [short_order, *list(plan.get("buy_orders") or [])]
         reduce_report["placed_short"] = True
         reduce_report["orders"].append(dict(short_order))
-        if not bool(short_order.get("frozen_inventory_per_lot_release")):
-            directive.pop("short", None)
 
     if directive:
         state["best_quote_frozen_inventory_manual_reduce"] = directive
@@ -5871,6 +6839,7 @@ def apply_best_quote_frozen_inventory_manual_limit(
 ) -> dict[str, Any]:
     directive = dict(state.get("best_quote_frozen_inventory_manual_limit") or {})
     ledger = dict(state.get("best_quote_frozen_inventory") or {})
+    recovery_blocked_reasons: list[str] = []
     for side_key in ("long", "short"):
         if side_key in directive:
             continue
@@ -5879,13 +6848,22 @@ def apply_best_quote_frozen_inventory_manual_limit(
         if isolated_qty > 1e-12 and price > 0:
             request_id = str(ledger.get(f"{side_key}_manual_limit_request_id") or "").strip()
             if not request_id:
-                request_id = f"recovered-{side_key}-{int(time.time() * 1000)}"
-                ledger[f"{side_key}_manual_limit_request_id"] = request_id
+                recovery_blocked_reasons.append(
+                    f"{side_key}_recovered_request_missing"
+                )
+                continue
+            frozen_qty = max(_safe_float(ledger.get(f"{side_key}_qty")), 0.0)
+            if isolated_qty > frozen_qty + 1e-12:
+                recovery_blocked_reasons.append(
+                    f"{side_key}_recovered_ledger_isolation_exceeds_frozen_qty"
+                )
+                continue
             directive[side_key] = {
                 "requested": True,
                 "requested_qty": isolated_qty,
                 "price": price,
                 "request_id": request_id,
+                "expires_at": "1970-01-01T00:00:00+00:00",
                 "source": "recovered_manual_limit_isolation",
                 "recovered_from_isolated_qty": True,
             }
@@ -5894,7 +6872,7 @@ def apply_best_quote_frozen_inventory_manual_limit(
         "placed_long": False,
         "placed_short": False,
         "orders": [],
-        "blocked_reasons": [],
+        "blocked_reasons": list(recovery_blocked_reasons),
         "recovered_from_isolated_qty": any(
             bool((directive.get(side_key) or {}).get("recovered_from_isolated_qty"))
             for side_key in ("long", "short")
@@ -5905,13 +6883,21 @@ def apply_best_quote_frozen_inventory_manual_limit(
 
     def _authorized(side_directive: dict[str, Any], *, side_key: str) -> bool:
         ok, reason = _frozen_inventory_directive_authorized(side_directive)
-        if not ok and not bool(side_directive.get("recovered_from_isolated_qty")):
+        recovered = bool(side_directive.get("recovered_from_isolated_qty"))
+        if ok:
+            return True
+        if recovered and reason == "authorization_expired":
+            return True
+        if recovered:
+            limit_report["blocked_reasons"].append(f"{side_key}_{reason}")
+            return False
+        if not ok:
             directive.pop(side_key, None)
             ledger[f"{side_key}_manual_limit_isolated_qty"] = 0.0
             ledger.pop(f"{side_key}_manual_limit_price", None)
             ledger.pop(f"{side_key}_manual_limit_request_id", None)
             limit_report["blocked_reasons"].append(f"{side_key}_{reason}")
-        return ok or bool(side_directive.get("recovered_from_isolated_qty"))
+        return False
 
     def _build_order(*, side_key: str) -> dict[str, Any] | None:
         side_directive = dict(directive.get(side_key) or {})
@@ -5922,6 +6908,41 @@ def apply_best_quote_frozen_inventory_manual_limit(
         is_long = side_key == "long"
         frozen_qty = max(_safe_float(ledger.get(f"{side_key}_qty")), 0.0)
         isolated_key = f"{side_key}_manual_limit_isolated_qty"
+        isolated_qty = max(_safe_float(ledger.get(isolated_key)), 0.0)
+        request_id = str(side_directive.get("request_id") or "").strip()
+        if (
+            bool(side_directive.get("recovered_from_isolated_qty"))
+            and (
+                not request_id
+                or str(
+                    ledger.get(f"{side_key}_manual_limit_request_id") or ""
+                ).strip()
+                != request_id
+                or isolated_qty <= 1e-12
+                or isolated_qty > frozen_qty + 1e-12
+            )
+        ):
+            limit_report["blocked_reasons"].append(
+                f"{side_key}_recovered_ledger_request_invalid"
+            )
+            return None
+        role = f"frozen_inventory_manual_limit_{side_key}"
+        refs = state.get("best_quote_volume_order_refs")
+        if any(
+            isinstance(raw_ref, Mapping)
+            and str(raw_ref.get("role") or "").lower().strip() == role
+            and str(
+                raw_ref.get("frozen_inventory_request_id") or ""
+            ).strip()
+            == request_id
+            for raw_ref in (
+                refs.values() if isinstance(refs, Mapping) else ()
+            )
+        ):
+            limit_report["blocked_reasons"].append(
+                f"{side_key}_existing_order_ref_requires_reconcile"
+            )
+            return None
         requested_qty = max(_safe_float(side_directive.get("requested_qty")), 0.0)
         order_qty = min(requested_qty, frozen_qty)
         if order_qty <= 1e-12:
@@ -5946,7 +6967,6 @@ def apply_best_quote_frozen_inventory_manual_limit(
             return None
         ledger[isolated_key] = min(max(_safe_float(ledger.get(isolated_key)), qty), frozen_qty)
         ledger[f"{side_key}_manual_limit_price"] = price
-        request_id = str(side_directive.get("request_id") or "").strip()
         if request_id:
             ledger[f"{side_key}_manual_limit_request_id"] = request_id
         return {
@@ -5959,8 +6979,10 @@ def apply_best_quote_frozen_inventory_manual_limit(
             "force_reduce_only": True,
             "execution_type": "maker",
             "time_in_force": "GTX",
+            "post_only": True,
             "manual_frozen_inventory_limit": True,
             "frozen_inventory_request_id": str(side_directive.get("request_id") or "").strip(),
+            "frozen_inventory_authorization_validated": True,
         }
 
     long_order = _build_order(side_key="long")
@@ -6043,7 +7065,7 @@ def apply_best_quote_frozen_inventory_pair_release(
     min_side_notional: float,
     min_profit_ratio: float,
     max_slippage_ticks: int,
-    execution_type: str = "aggressive",
+    execution_type: str = "maker",
     allow_loss: bool = False,
     requested_qty: float | None = None,
     request_id: str | None = None,
@@ -6076,6 +7098,25 @@ def apply_best_quote_frozen_inventory_pair_release(
     if not enabled:
         release_report["blocked_reasons"].append("disabled")
         return release_report
+    for field, raw_value in (
+        ("requested_qty", requested_qty),
+        ("filled_long_qty", filled_long_qty),
+        ("filled_short_qty", filled_short_qty),
+        ("paired_released_qty", paired_released_qty),
+    ):
+        if raw_value is None and field == "requested_qty":
+            continue
+        if isinstance(raw_value, bool):
+            release_report["blocked_reasons"].append(f"invalid_{field}")
+            return release_report
+        try:
+            numeric_value = float(raw_value)
+        except (TypeError, ValueError):
+            release_report["blocked_reasons"].append(f"invalid_{field}")
+            return release_report
+        if not math.isfinite(numeric_value) or numeric_value < 0.0:
+            release_report["blocked_reasons"].append(f"invalid_{field}")
+            return release_report
     safe_request_id = str(request_id or "").strip()
     if not safe_request_id:
         release_report["blocked_reasons"].append("missing_authorization")
@@ -6140,9 +7181,7 @@ def apply_best_quote_frozen_inventory_pair_release(
         release_report["blocked_reasons"].append("below_min_qty")
         return release_report
 
-    release_execution_type = str(execution_type or "aggressive").strip().lower()
-    if release_execution_type not in {"aggressive", "maker"}:
-        release_execution_type = "aggressive"
+    release_execution_type = "maker"
     slippage = max(int(max_slippage_ticks), 0) * max(_safe_float(tick_size), 0.0)
     if release_execution_type == "maker":
         sell_price = _round_order_price(max(safe_ask + slippage, 0.0), tick_size, "SELL")
@@ -6210,6 +7249,7 @@ def apply_best_quote_frozen_inventory_pair_release(
         "post_only": release_execution_type == "maker",
         "frozen_inventory_pair_release": True,
         "frozen_inventory_request_id": safe_request_id,
+        "frozen_inventory_authorization_validated": True,
     }
     buy_order = {
         "side": "BUY",
@@ -6224,7 +7264,12 @@ def apply_best_quote_frozen_inventory_pair_release(
         "post_only": release_execution_type == "maker",
         "frozen_inventory_pair_release": True,
         "frozen_inventory_request_id": safe_request_id,
+        "frozen_inventory_authorization_validated": True,
     }
+    if repair_side:
+        repair_marker = repair_side.upper()
+        sell_order["frozen_inventory_pair_repair_side"] = repair_marker
+        buy_order["frozen_inventory_pair_repair_side"] = repair_marker
     placed_orders: list[dict[str, Any]] = []
     if repair_side in {"", "long"}:
         plan["sell_orders"] = [sell_order, *list(plan.get("sell_orders") or [])]
@@ -8639,6 +9684,20 @@ def update_best_quote_volume_order_refs(
     strategy_mode: str,
     submit_report: dict[str, Any],
 ) -> None:
+    with exclusive_json_state_lock(state_path):
+        _update_best_quote_volume_order_refs_unlocked(
+            state_path=state_path,
+            strategy_mode=strategy_mode,
+            submit_report=submit_report,
+        )
+
+
+def _update_best_quote_volume_order_refs_unlocked(
+    *,
+    state_path: Path,
+    strategy_mode: str,
+    submit_report: dict[str, Any],
+) -> None:
     if not _is_best_quote_maker_volume_mode(strategy_mode) or not state_path.exists():
         return
     try:
@@ -8661,9 +9720,12 @@ def update_best_quote_volume_order_refs(
     manual_reduce_directive = state.get("best_quote_frozen_inventory_manual_reduce")
     manual_reduce_directive = dict(manual_reduce_directive) if isinstance(manual_reduce_directive, Mapping) else {}
     manual_reduce_updated = False
+    manual_reduce_updated_sides: set[str] = set()
     manual_limit_directive = state.get("best_quote_frozen_inventory_manual_limit")
     manual_limit_directive = dict(manual_limit_directive) if isinstance(manual_limit_directive, Mapping) else {}
     manual_limit_updated = False
+    manual_limit_updated_sides: set[str] = set()
+    touched_order_ref_ids: set[str] = set()
     now_iso = _isoformat(_utc_now())
 
     for item in submit_report.get("placed_orders", []):
@@ -8710,13 +9772,13 @@ def update_best_quote_volume_order_refs(
                 side_directive["submitted_at"] = now_iso
                 manual_limit_directive[side_key] = side_directive
                 manual_limit_updated = True
+                manual_limit_updated_sides.add(side_key)
         if role_lower in {"frozen_inventory_manual_reduce_long", "frozen_inventory_manual_reduce_short"}:
             side_key = "long" if role_lower.endswith("_long") else "short"
             side_directive = dict(manual_reduce_directive.get(side_key) or {})
             directive_request_id = str(side_directive.get("request_id") or "").strip()
             if (
-                bool(request.get("frozen_inventory_per_lot_release"))
-                and side_directive
+                side_directive
                 and frozen_request_id
                 and frozen_request_id == directive_request_id
             ):
@@ -8730,14 +9792,19 @@ def update_best_quote_volume_order_refs(
                     0.0,
                 )
                 side_directive["submitted_at"] = now_iso
-                if selected_lot_allocations:
+                if (
+                    bool(request.get("frozen_inventory_per_lot_release"))
+                    and selected_lot_allocations
+                ):
                     side_directive["selected_lot_allocations"] = selected_lot_allocations
                     side_directive["requested_qty"] = sum(
                         max(_safe_float(item.get("qty")), 0.0) for item in selected_lot_allocations
                     )
                 manual_reduce_directive[side_key] = side_directive
                 manual_reduce_updated = True
-        refs[str(order_id)] = {
+                manual_reduce_updated_sides.add(side_key)
+        order_ref_id = str(order_id)
+        refs[order_ref_id] = {
             "book": _best_quote_order_book_from_role(request.get("role")),
             "role": role,
             "side": str(request.get("side", "")).upper().strip(),
@@ -8752,6 +9819,7 @@ def update_best_quote_volume_order_refs(
             "selected_lot_allocations": selected_lot_allocations,
             "updated_at": _isoformat(_utc_now()),
         }
+        touched_order_ref_ids.add(order_ref_id)
 
     if len(refs) > 10000:
         refs = dict(list(refs.items())[-10000:])
@@ -8780,8 +9848,88 @@ def update_best_quote_volume_order_refs(
             }
         )
         state["best_quote_frozen_inventory_pair_release"] = directive
+    # Merge only the fields owned by this order-ref update into the freshest
+    # state snapshot.  A pair leg receipt can land after the first read (for
+    # example immediately after POST); writing the stale whole document here
+    # must never roll that receipt or its manifest back.
+    latest_state = read_json(state_path)
+    if isinstance(latest_state, dict):
+        latest_refs = latest_state.get("best_quote_volume_order_refs")
+        latest_refs = dict(latest_refs) if isinstance(latest_refs, Mapping) else {}
+        for order_ref_id in touched_order_ref_ids:
+            latest_refs[order_ref_id] = dict(refs[order_ref_id])
+        if len(latest_refs) > 10000:
+            latest_refs = dict(list(latest_refs.items())[-10000:])
+        latest_state["best_quote_volume_order_refs"] = latest_refs
+
+        if manual_reduce_updated_sides:
+            latest_manual_reduce = latest_state.get(
+                "best_quote_frozen_inventory_manual_reduce"
+            )
+            latest_manual_reduce = (
+                dict(latest_manual_reduce)
+                if isinstance(latest_manual_reduce, Mapping)
+                else {}
+            )
+            for side_key in manual_reduce_updated_sides:
+                latest_manual_reduce[side_key] = dict(
+                    manual_reduce_directive[side_key]
+                )
+            latest_state["best_quote_frozen_inventory_manual_reduce"] = (
+                latest_manual_reduce
+            )
+
+        if manual_limit_updated_sides:
+            latest_manual_limit = latest_state.get(
+                "best_quote_frozen_inventory_manual_limit"
+            )
+            latest_manual_limit = (
+                dict(latest_manual_limit)
+                if isinstance(latest_manual_limit, Mapping)
+                else {}
+            )
+            for side_key in manual_limit_updated_sides:
+                latest_manual_limit[side_key] = dict(
+                    manual_limit_directive[side_key]
+                )
+            latest_state["best_quote_frozen_inventory_manual_limit"] = (
+                latest_manual_limit
+            )
+
+        if pair_release_submitted_orders:
+            source_directive = state.get(
+                "best_quote_frozen_inventory_pair_release"
+            )
+            latest_directive = latest_state.get(
+                "best_quote_frozen_inventory_pair_release"
+            )
+            source_directive = (
+                source_directive if isinstance(source_directive, Mapping) else {}
+            )
+            latest_directive = (
+                dict(latest_directive)
+                if isinstance(latest_directive, Mapping)
+                else {}
+            )
+            for key in (
+                "last_submitted_at",
+                "last_submitted_orders",
+                "last_submitted_release_qty",
+            ):
+                if key in source_directive:
+                    latest_directive[key] = copy.deepcopy(source_directive[key])
+            if not latest_directive.get("request_id"):
+                latest_directive["request_id"] = str(
+                    source_directive.get("request_id") or pair_release_request_id
+                )
+            latest_directive.setdefault("requested", True)
+            latest_directive.setdefault("awaiting_fill_confirmation", True)
+            latest_state["best_quote_frozen_inventory_pair_release"] = (
+                latest_directive
+            )
+        state = latest_state
     try:
-        state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_json(state_path, state)
     except OSError:
         return
 
@@ -9435,8 +10583,15 @@ def _is_futures_strategy_order(order: dict[str, Any], symbol: str) -> bool:
 
 
 def _is_frozen_inventory_manual_limit_open_order(order: dict[str, Any]) -> bool:
-    client_order_id = str(order.get("clientOrderId", "") or "").lower()
-    return client_order_id.startswith("gx-") and "-frozenin-" in client_order_id
+    return bool(
+        order.get("frozen_inventory_authorization_validated")
+        and is_frozen_inventory_order(order)
+        and _order_role(order)
+        in {
+            "frozen_inventory_manual_limit_long",
+            "frozen_inventory_manual_limit_short",
+        }
+    )
 
 
 def _preserve_frozen_inventory_manual_limit_open_orders(
@@ -9479,11 +10634,18 @@ def _preserve_frozen_inventory_manual_limit_open_orders(
                 "price": price,
                 "qty": qty,
                 "notional": price * qty,
+                "book": BQ_BOOK_FROZEN,
                 "role": f"frozen_inventory_manual_limit_{side_key}",
                 "position_side": position_side,
                 "force_reduce_only": True,
                 "execution_type": "maker",
+                "time_in_force": "GTX",
+                "post_only": True,
                 "manual_frozen_inventory_limit": True,
+                "frozen_inventory_request_id": str(
+                    order.get("frozen_inventory_request_id") or ""
+                ).strip(),
+                "frozen_inventory_authorization_validated": True,
             }
         )
     return preserved
@@ -9497,11 +10659,27 @@ def _filter_futures_strategy_orders(open_orders: Iterable[Any], symbol: str) -> 
     ]
 
 
-def _filter_futures_normal_strategy_orders(open_orders: Iterable[Any], symbol: str) -> list[dict[str, Any]]:
+def _filter_futures_normal_strategy_orders(
+    open_orders: Iterable[Any],
+    symbol: str,
+    *,
+    args: Any | None = None,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    strategy_orders = _filter_futures_strategy_orders(open_orders, symbol)
+    classified_orders = (
+        _classify_current_frozen_inventory_open_orders(
+            args=args,
+            orders=strategy_orders,
+            now=now,
+        )
+        if args is not None
+        else strategy_orders
+    )
     return [
         order
-        for order in _filter_futures_strategy_orders(open_orders, symbol)
-        if "-frozen" not in str(order.get("clientOrderId", "") or "").lower()
+        for order in classified_orders
+        if not is_frozen_inventory_order(order)
     ]
 
 
@@ -9551,7 +10729,14 @@ def _maybe_recover_hedge_bq_position_mismatch(
         report["action"] = "position_realign_recovery_failed"
         report["recovery_error"] = f"{recovery_exc.__class__.__name__}: {recovery_exc}"
         return report
-    normal_orders = _filter_futures_normal_strategy_orders(open_orders, symbol)
+    classified_orders = _classify_current_frozen_inventory_open_orders(
+        args=args,
+        orders=_filter_futures_strategy_orders(open_orders, symbol),
+        now=datetime.now(timezone.utc),
+    )
+    normal_orders = [
+        order for order in classified_orders if not is_frozen_inventory_order(order)
+    ]
     normal_order_ids = {
         int(order["orderId"])
         for order in normal_orders
@@ -9559,7 +10744,7 @@ def _maybe_recover_hedge_bq_position_mismatch(
     }
     report["preserved_frozen_order_ids"] = [
         int(order["orderId"])
-        for order in _filter_futures_strategy_orders(open_orders, symbol)
+        for order in classified_orders
         if str(order.get("orderId", "")).strip()
         and int(order["orderId"]) not in normal_order_ids
     ]
@@ -10134,9 +11319,97 @@ def apply_execution_request_budget_to_actions(
         cancel_limit = min(cancel_limit, safe_max_mutations)
         place_limit = min(place_limit, max(safe_max_mutations - cancel_limit, 0))
     kept_cancel_orders = cancel_orders[:cancel_limit]
-    kept_place_orders = place_orders[:place_limit]
     deferred_cancel_orders = cancel_orders[cancel_limit:]
-    deferred_place_orders = place_orders[place_limit:]
+    deferred_atomic_place_groups: list[dict[str, Any]] = []
+    pair_orders = [
+        order for order in place_orders if _is_frozen_inventory_pair_release_order(order)
+    ]
+    pair_request_ids = {
+        str(order.get("frozen_inventory_request_id") or "").strip()
+        for order in pair_orders
+        if str(order.get("frozen_inventory_request_id") or "").strip()
+    }
+    pair_roles = {
+        str(order.get("role") or "").lower().strip()
+        for order in pair_orders
+    }
+    pair_qtys = [
+        max(_safe_float(order.get("qty", order.get("quantity"))), 0.0)
+        for order in pair_orders
+    ]
+    single_repair_valid = bool(
+        len(pair_orders) == 1
+        and str(pair_orders[0].get("frozen_inventory_pair_repair_side") or "")
+        .upper()
+        .strip()
+        == (
+            "LONG"
+            if str(pair_orders[0].get("role") or "").lower().strip()
+            == "frozen_inventory_pair_release_long"
+            else "SHORT"
+            if str(pair_orders[0].get("role") or "").lower().strip()
+            == "frozen_inventory_pair_release_short"
+            else ""
+        )
+    )
+    initial_pair_valid = bool(
+        len(pair_orders) == 2
+        and len(pair_request_ids) == 1
+        and pair_roles
+        == {
+            "frozen_inventory_pair_release_long",
+            "frozen_inventory_pair_release_short",
+        }
+        and all(qty > 0 for qty in pair_qtys)
+        and math.isclose(pair_qtys[0], pair_qtys[1], rel_tol=1e-12, abs_tol=1e-12)
+        and not any(
+            order.get("frozen_inventory_pair_repair_side")
+            for order in pair_orders
+        )
+    )
+    pair_structure_invalid = bool(
+        pair_orders and not (single_repair_valid or initial_pair_valid)
+    )
+    atomic_pair = initial_pair_valid
+    if pair_structure_invalid:
+        kept_place_orders = [
+            order
+            for order in place_orders
+            if not _is_frozen_inventory_pair_release_order(order)
+        ][:place_limit]
+        deferred_place_orders = [
+            order for order in place_orders if order not in kept_place_orders
+        ]
+        deferred_atomic_place_groups.append(
+            {
+                "ledger_class": "frozen_bq",
+                "action": "frozen_inventory_pair_release",
+                "request_id": next(iter(pair_request_ids), ""),
+                "required_place_budget": 2,
+                "available_place_budget": place_limit,
+                "reason": "invalid_pair_shape_without_explicit_repair",
+            }
+        )
+    elif atomic_pair and place_limit < len(pair_orders):
+        kept_place_orders = [
+            order for order in place_orders if not _is_frozen_inventory_pair_release_order(order)
+        ][:place_limit]
+        deferred_place_orders = [
+            order for order in place_orders if order not in kept_place_orders
+        ]
+        deferred_atomic_place_groups.append(
+            {
+                "ledger_class": "frozen_bq",
+                "action": "frozen_inventory_pair_release",
+                "request_id": next(iter(pair_request_ids), ""),
+                "required_place_budget": len(pair_orders),
+                "available_place_budget": place_limit,
+                "reason": "insufficient_place_budget",
+            }
+        )
+    else:
+        kept_place_orders = place_orders[:place_limit]
+        deferred_place_orders = place_orders[place_limit:]
     actions["cancel_orders"] = kept_cancel_orders
     actions["place_orders"] = kept_place_orders
     actions["cancel_count"] = len(kept_cancel_orders)
@@ -10155,6 +11428,7 @@ def apply_execution_request_budget_to_actions(
         "deferred_place_count": len(deferred_place_orders),
         "deferred_cancel_orders": deferred_cancel_orders,
         "deferred_place_orders": deferred_place_orders,
+        "deferred_atomic_place_groups": deferred_atomic_place_groups,
     }
     return updated
 
@@ -10815,16 +12089,26 @@ def _cancel_futures_strategy_orders(
     api_key: str,
     api_secret: str,
     recv_window: int,
+    state: Mapping[str, Any] | None = None,
 ) -> int:
     strategy_prefix = _strategy_client_order_prefix(symbol)
     flatten_prefix = flatten_client_order_prefix(symbol)
     open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window)
+    classified_orders = _classify_current_frozen_inventory_open_orders(
+        args=None,
+        orders=open_orders,
+        state=state,
+    )
     count = 0
-    for order in open_orders:
+    for order in classified_orders:
         if not isinstance(order, dict):
             continue
         client_order_id = str(order.get("clientOrderId", "") or "")
-        if not client_order_id.startswith(strategy_prefix) or is_flatten_order(order, flatten_prefix):
+        if (
+            not client_order_id.startswith(strategy_prefix)
+            or is_flatten_order(order, flatten_prefix)
+            or is_frozen_inventory_order(order)
+        ):
             continue
         try:
             delete_futures_order(
@@ -10862,10 +12146,18 @@ def _cancel_futures_strategy_entry_orders(
     strategy_prefix = _strategy_client_order_prefix(symbol)
     flatten_prefix = flatten_client_order_prefix(symbol)
     open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window, use_cache=False)
+    classified_orders = _classify_current_frozen_inventory_open_orders(
+        args=None,
+        orders=open_orders,
+        state=state,
+    )
+    normal_open_orders = [
+        order for order in classified_orders if not is_frozen_inventory_order(order)
+    ]
     decorated_orders = (
-        _decorate_synthetic_open_orders(state=state, open_orders=list(open_orders))
+        _decorate_synthetic_open_orders(state=state, open_orders=normal_open_orders)
         if isinstance(state, dict) and _is_synthetic_neutral_mode(strategy_mode)
-        else list(open_orders)
+        else normal_open_orders
     )
     by_client_order_id = {
         str(item.get("clientOrderId", "") or ""): item
@@ -10873,7 +12165,7 @@ def _cancel_futures_strategy_entry_orders(
         if isinstance(item, dict)
     }
     count = 0
-    for order in open_orders:
+    for order in normal_open_orders:
         if not isinstance(order, dict):
             continue
         client_order_id = str(order.get("clientOrderId", "") or "")
@@ -11414,15 +12706,11 @@ def _runtime_guard_loss_recovery_blocks_submit(args: argparse.Namespace, *, now:
 
 
 def _is_frozen_inventory_manual_order(order: Mapping[str, Any] | dict[str, Any]) -> bool:
-    role = str((order or {}).get("role") or "").strip()
-    return (
-        role.startswith("frozen_inventory_manual_reduce_")
-        or role.startswith("frozen_inventory_manual_limit_")
-        or role.startswith("frozen_inventory_pair_release_")
-        or bool((order or {}).get("manual_frozen_inventory_reduce"))
-        or bool((order or {}).get("manual_frozen_inventory_limit"))
-        or bool((order or {}).get("frozen_inventory_pair_release"))
-    )
+    return is_frozen_inventory_order(order or {})
+
+
+def _looks_like_frozen_inventory_order(order: Mapping[str, Any]) -> bool:
+    return is_durable_frozen_order_record(order)
 
 
 def _is_frozen_inventory_per_lot_order(order: Mapping[str, Any] | dict[str, Any]) -> bool:
@@ -11807,7 +13095,495 @@ def _enforce_frozen_per_lot_single_active_lane(
 def _is_authorized_frozen_inventory_order(order: Mapping[str, Any] | dict[str, Any]) -> bool:
     if not _is_frozen_inventory_manual_order(order):
         return True
-    return bool(str((order or {}).get("frozen_inventory_request_id") or "").strip())
+    return bool((order or {}).get("frozen_inventory_authorization_validated"))
+
+
+def _frozen_inventory_gtx_maker_order(order: Mapping[str, Any]) -> bool:
+    return bool(
+        str(order.get("execution_type") or "").lower().strip()
+        in {"maker", "post_only"}
+        and str(order.get("time_in_force") or order.get("timeInForce") or "")
+        .upper()
+        .strip()
+        == "GTX"
+        and bool(order.get("post_only"))
+    )
+
+
+def _current_frozen_inventory_order_authorization(
+    *,
+    args: Any | None,
+    order: Mapping[str, Any],
+    now: datetime | None = None,
+    operation: str = "place",
+    state: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Bind one frozen mutation to the current durable directive and ledger.
+
+    Client IDs, roles and request IDs supplied by a plan or the exchange are
+    observations, not authority.  Every plan/action/send fence calls this
+    helper again so expiry, cancellation and fill progress cannot be bypassed
+    by a stale plan.
+    """
+
+    checked_at = (now or _utc_now()).astimezone(timezone.utc)
+    durable_state = state
+    if durable_state is None:
+        state_path = Path(str(getattr(args, "state_path", "") or ""))
+        durable_state = read_json(state_path) if state_path else None
+    if not isinstance(durable_state, Mapping):
+        return None, {"reason": "frozen_inventory_state_unavailable"}
+
+    candidate = dict(order)
+    order_id = str(candidate.get("orderId") or candidate.get("order_id") or "").strip()
+    client_order_id = str(
+        candidate.get("clientOrderId")
+        or candidate.get("client_order_id")
+        or candidate.get("origClientOrderId")
+        or ""
+    ).strip()
+    refs = durable_state.get("best_quote_volume_order_refs")
+    refs = refs if isinstance(refs, Mapping) else {}
+    ref: Mapping[str, Any] = {}
+    if order_id and isinstance(refs.get(order_id), Mapping):
+        ref = refs[order_id]
+    elif client_order_id:
+        ref = next(
+            (
+                raw_ref
+                for raw_ref in refs.values()
+                if isinstance(raw_ref, Mapping)
+                and str(raw_ref.get("client_order_id") or "").strip()
+                == client_order_id
+            ),
+            {},
+        )
+    has_exchange_identity = bool(order_id or client_order_id)
+    if has_exchange_identity and not ref:
+        return None, {"reason": "frozen_inventory_order_ref_missing"}
+
+    role = str(candidate.get("role") or ref.get("role") or "").lower().strip()
+    ref_role = str(ref.get("role") or "").lower().strip()
+    if ref_role and role and ref_role != role:
+        return None, {"reason": "frozen_inventory_order_ref_role_mismatch"}
+    request_id = str(
+        candidate.get("frozen_inventory_request_id")
+        or ref.get("frozen_inventory_request_id")
+        or ""
+    ).strip()
+    ref_request_id = str(ref.get("frozen_inventory_request_id") or "").strip()
+    if ref_request_id and request_id != ref_request_id:
+        return None, {"reason": "frozen_inventory_order_ref_request_mismatch"}
+    if not request_id:
+        return None, {"reason": "frozen_inventory_request_missing"}
+
+    role_specs = {
+        "frozen_inventory_manual_reduce_long": ("manual_reduce", "long", "SELL"),
+        "frozen_inventory_manual_reduce_short": ("manual_reduce", "short", "BUY"),
+        "frozen_inventory_manual_limit_long": ("manual_limit", "long", "SELL"),
+        "frozen_inventory_manual_limit_short": ("manual_limit", "short", "BUY"),
+        "frozen_inventory_pair_release_long": ("pair_release", "long", "SELL"),
+        "frozen_inventory_pair_release_short": ("pair_release", "short", "BUY"),
+    }
+    spec = role_specs.get(role)
+    if spec is None:
+        return None, {"reason": "frozen_inventory_role_unsupported", "role": role}
+    directive_kind, side_key, expected_side = spec
+    side = str(candidate.get("side") or ref.get("side") or "").upper().strip()
+    if side != expected_side:
+        return None, {"reason": "frozen_inventory_side_mismatch", "role": role}
+    position_side = str(
+        candidate.get("position_side")
+        or candidate.get("positionSide")
+        or ref.get("position_side")
+        or "BOTH"
+    ).upper().strip()
+    expected_position_side = "LONG" if side_key == "long" else "SHORT"
+    if position_side not in {expected_position_side, "BOTH"}:
+        return None, {"reason": "frozen_inventory_position_side_mismatch", "role": role}
+    if operation == "place" and not bool(candidate.get("force_reduce_only")):
+        return None, {"reason": "frozen_inventory_reduce_only_missing", "role": role}
+    if operation == "place" and not _frozen_inventory_gtx_maker_order(candidate):
+        return None, {"reason": "frozen_inventory_gtx_maker_required", "role": role}
+
+    ledger = durable_state.get("best_quote_frozen_inventory")
+    try:
+        frozen_long_qty, frozen_short_qty = strict_frozen_side_qtys(ledger)
+    except ValueError as exc:
+        return None, {
+            "reason": "frozen_inventory_ledger_invalid",
+            "error": str(exc),
+        }
+    frozen_qty = frozen_long_qty if side_key == "long" else frozen_short_qty
+    quantity = max(
+        _safe_float(
+            candidate.get(
+                "origQty",
+                candidate.get("qty", candidate.get("quantity")),
+            )
+        )
+        - _safe_float(candidate.get("executedQty")),
+        0.0,
+    )
+    if quantity <= 1e-12 or (
+        operation == "place" and quantity > frozen_qty + 1e-12
+    ):
+        return None, {
+            "reason": "frozen_inventory_quantity_outside_ledger",
+            "quantity": quantity,
+            "frozen_qty": frozen_qty,
+        }
+
+    if directive_kind == "manual_reduce":
+        container = durable_state.get("best_quote_frozen_inventory_manual_reduce")
+        directive = (
+            (container or {}).get(side_key)
+            if isinstance(container, Mapping)
+            else None
+        )
+    elif directive_kind == "manual_limit":
+        container = durable_state.get("best_quote_frozen_inventory_manual_limit")
+        directive = (
+            (container or {}).get(side_key)
+            if isinstance(container, Mapping)
+            else None
+        )
+    else:
+        directive = durable_state.get("best_quote_frozen_inventory_pair_release")
+    if not isinstance(directive, Mapping):
+        return None, {"reason": "frozen_inventory_directive_missing", "role": role}
+    directive_request_id = str(directive.get("request_id") or "").strip()
+    if directive_request_id != request_id:
+        return None, {"reason": "frozen_inventory_directive_request_mismatch", "role": role}
+
+    submission_manifest = (
+        directive.get("submission_manifest")
+        if directive_kind == "pair_release"
+        else None
+    )
+    cleanup_owned_order = bool(
+        operation == "cancel"
+        and has_exchange_identity
+        and ref
+        and (
+            bool(directive.get("requested"))
+            or bool(directive.get("submitted"))
+            or _frozen_pair_manifest_has_unresolved_legs(
+                submission_manifest
+                if isinstance(submission_manifest, Mapping)
+                else None
+            )
+        )
+    )
+
+    recovered_manual_limit = bool(
+        directive_kind == "manual_limit"
+        and directive.get("recovered_from_isolated_qty")
+        and str((ledger or {}).get(f"{side_key}_manual_limit_request_id") or "").strip()
+        == request_id
+        and _safe_float((ledger or {}).get(f"{side_key}_manual_limit_isolated_qty"))
+        > 1e-12
+    )
+    if not recovered_manual_limit and not cleanup_owned_order:
+        directive_ok, directive_reason = _frozen_inventory_directive_authorized(
+            directive,
+            now=checked_at,
+        )
+        if not directive_ok:
+            return None, {"reason": directive_reason, "role": role}
+    if operation == "place" and not bool(directive.get("requested")):
+        return None, {"reason": "frozen_inventory_directive_not_requested", "role": role}
+    if (
+        operation == "place"
+        and directive_kind in {"manual_reduce", "manual_limit"}
+        and bool(directive.get("submitted"))
+    ):
+        return None, {"reason": "frozen_inventory_directive_already_submitted", "role": role}
+    if operation == "cancel" and not cleanup_owned_order and not (
+        bool(directive.get("requested")) or bool(directive.get("submitted"))
+    ):
+        return None, {"reason": "frozen_inventory_cancel_not_owned", "role": role}
+
+    requested_qty = max(_safe_float(directive.get("requested_qty")), 0.0)
+    remaining_qty = requested_qty
+    repair_side = ""
+    if directive_kind == "pair_release":
+        filled_long = max(_safe_float(directive.get("filled_long_qty")), 0.0)
+        filled_short = max(_safe_float(directive.get("filled_short_qty")), 0.0)
+        if filled_long > filled_short + 1e-12:
+            repair_side = "short"
+            remaining_qty = filled_long - filled_short
+        elif filled_short > filled_long + 1e-12:
+            repair_side = "long"
+            remaining_qty = filled_short - filled_long
+        else:
+            remaining_qty = max(
+                requested_qty
+                - max(_safe_float(directive.get("paired_released_qty")), 0.0),
+                0.0,
+            )
+        declared_repair = str(
+            directive.get("repair_side") or directive.get("last_repair_side") or ""
+        ).lower().strip()
+        if repair_side:
+            order_repair = str(
+                candidate.get("frozen_inventory_pair_repair_side") or ""
+            ).lower().strip()
+            if declared_repair != repair_side or order_repair != repair_side:
+                return None, {"reason": "frozen_inventory_pair_repair_mismatch", "role": role}
+        elif candidate.get("frozen_inventory_pair_repair_side"):
+            return None, {"reason": "frozen_inventory_pair_repair_not_required", "role": role}
+        elif operation == "place" and bool(
+            directive.get("awaiting_fill_confirmation")
+        ):
+            manifest_legs = (
+                submission_manifest.get("legs")
+                if isinstance(submission_manifest, Mapping)
+                else None
+            )
+            manifest_leg = (
+                (manifest_legs or {}).get(side_key)
+                if isinstance(manifest_legs, Mapping)
+                else None
+            )
+            manifest_status = str(
+                (manifest_leg or {}).get("status")
+                or (manifest_leg or {}).get("submit_state")
+                or ""
+            ).lower().strip()
+            manifest_prepared_leg = bool(
+                isinstance(manifest_leg, Mapping)
+                and str(manifest_leg.get("role") or "").lower().strip() == role
+                and manifest_status == "prepared"
+                and math.isclose(
+                    quantity,
+                    max(_safe_float(manifest_leg.get("qty")), 0.0),
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            )
+            if not manifest_prepared_leg:
+                return None, {"reason": "frozen_inventory_pair_awaiting_reconcile", "role": role}
+    if operation == "place" and remaining_qty > 0 and quantity > remaining_qty + 1e-12:
+        return None, {
+            "reason": "frozen_inventory_quantity_exceeds_directive",
+            "quantity": quantity,
+            "remaining_qty": remaining_qty,
+        }
+
+    authorized = dict(candidate)
+    authorized.update(
+        {
+            "book": BQ_BOOK_FROZEN,
+            "role": role,
+            "side": side,
+            "position_side": position_side,
+            "frozen_inventory_request_id": request_id,
+            "frozen_inventory_authorization_validated": True,
+            "frozen_inventory_authorized_at": checked_at.isoformat(),
+            "frozen_inventory_requested_at": str(
+                directive.get("requested_at") or ""
+            ).strip(),
+            "frozen_inventory_last_selected_at": str(
+                directive.get("last_selected_at") or ""
+            ).strip(),
+        }
+    )
+    return authorized, {"reason": "authorized", "role": role}
+
+
+def _authorize_current_frozen_inventory_actions(
+    *,
+    args: Any,
+    actions: Mapping[str, Any],
+    now: datetime | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    result = dict(actions)
+    dropped: list[dict[str, Any]] = []
+
+    def _authorize_rows(key: str, *, operation: str) -> list[dict[str, Any]]:
+        kept: list[dict[str, Any]] = []
+        for raw in actions.get(key, []):
+            if not isinstance(raw, Mapping):
+                continue
+            order = dict(raw)
+            if not _looks_like_frozen_inventory_order(order):
+                kept.append(order)
+                continue
+            authorized, reason = _current_frozen_inventory_order_authorization(
+                args=args,
+                order=order,
+                now=now,
+                operation=operation,
+            )
+            if authorized is None:
+                dropped.append(
+                    {
+                        "operation": operation,
+                        "role": str(order.get("role") or ""),
+                        "side": str(order.get("side") or "").upper().strip(),
+                        **reason,
+                    }
+                )
+            else:
+                kept.append(authorized)
+        return kept
+
+    places = _authorize_rows("place_orders", operation="place")
+    cancels = _authorize_rows("cancel_orders", operation="cancel")
+    result.update(
+        {
+            "place_orders": places,
+            "place_count": len(places),
+            "place_notional": sum(
+                _safe_float(row.get("notional"))
+                or _safe_float(row.get("price")) * _safe_float(row.get("qty"))
+                for row in places
+            ),
+            "cancel_orders": cancels,
+            "cancel_count": len(cancels),
+            "frozen_inventory_authorization": {
+                "dropped_count": len(dropped),
+                "dropped_orders": dropped,
+            },
+        }
+    )
+    return result, result["frozen_inventory_authorization"]
+
+
+def _classify_current_frozen_inventory_open_orders(
+    *,
+    args: Any | None,
+    orders: Iterable[Any],
+    now: datetime | None = None,
+    state: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    durable_state = state
+    if durable_state is None:
+        state_path = Path(str(getattr(args, "state_path", "") or ""))
+        durable_state = read_json(state_path) if state_path else None
+    refs = (
+        durable_state.get("best_quote_volume_order_refs")
+        if isinstance(durable_state, Mapping)
+        else None
+    )
+    refs = refs if isinstance(refs, Mapping) else {}
+    durable_refs_by_client_order_id = {
+        str(ref.get("client_order_id") or "").strip(): ref
+        for ref in refs.values()
+        if isinstance(ref, Mapping)
+        and str(ref.get("client_order_id") or "").strip()
+    }
+    classified: list[dict[str, Any]] = []
+    for raw in orders:
+        if not isinstance(raw, Mapping):
+            continue
+        order = dict(raw)
+        order_id = str(order.get("orderId") or order.get("order_id") or "").strip()
+        client_order_id = str(
+            order.get("clientOrderId")
+            or order.get("client_order_id")
+            or ""
+        ).strip()
+        matched_ref = (
+            refs.get(order_id)
+            if order_id and isinstance(refs.get(order_id), Mapping)
+            else durable_refs_by_client_order_id.get(client_order_id)
+            if client_order_id
+            else None
+        )
+        has_durable_ref = isinstance(matched_ref, Mapping)
+        if not _looks_like_frozen_inventory_order(order) and not has_durable_ref:
+            classified.append(order)
+            continue
+        authorized, _reason = _current_frozen_inventory_order_authorization(
+            args=args,
+            order=order,
+            now=now,
+            operation="cancel",
+            state=durable_state,
+        )
+        if authorized is not None:
+            authorized["frozen_inventory_ownership_validated"] = True
+            classified.append(authorized)
+            continue
+        if has_durable_ref and _looks_like_frozen_inventory_order(matched_ref):
+            # Ownership and mutation authority are different facts.  A durable
+            # frozen ref must keep the exchange row out of every ordinary lane
+            # even when its directive is missing, corrupt or expired.  The
+            # missing authorization flag still prevents frozen cancellation or
+            # placement until the directive is repaired.
+            owned = dict(order)
+            for key in (
+                "book",
+                "ledger_class",
+                "role",
+                "position_side",
+                "frozen_inventory_request_id",
+                "source",
+                "frozen_inventory_per_lot_release",
+                "selected_lot_allocations",
+            ):
+                if key in matched_ref:
+                    owned[key] = copy.deepcopy(matched_ref[key])
+            owned["frozen_inventory_ownership_validated"] = True
+            owned["frozen_inventory_authorization_validated"] = False
+            classified.append(owned)
+            continue
+        # Prefix-like or otherwise unbound observations stay ordinary.  They
+        # receive neither frozen ownership nor frozen mutation authority.
+        classified.append(order)
+    return classified
+
+
+def _record_frozen_inventory_request_selection(
+    *,
+    args: Any,
+    request_id: str,
+    now: datetime | None = None,
+) -> bool:
+    safe_request_id = str(request_id or "").strip()
+    if not safe_request_id:
+        return False
+    state_path = Path(str(getattr(args, "state_path", "") or ""))
+    state = read_json(state_path) if state_path else None
+    if not isinstance(state, dict):
+        return False
+    selected_at = (now or _utc_now()).astimezone(timezone.utc).isoformat()
+    changed = False
+    for container_key in (
+        "best_quote_frozen_inventory_manual_reduce",
+        "best_quote_frozen_inventory_manual_limit",
+    ):
+        container = state.get(container_key)
+        if not isinstance(container, Mapping):
+            continue
+        updated_container = dict(container)
+        for side_key in ("long", "short"):
+            directive = updated_container.get(side_key)
+            if not isinstance(directive, Mapping):
+                continue
+            if str(directive.get("request_id") or "").strip() != safe_request_id:
+                continue
+            updated = dict(directive)
+            updated["last_selected_at"] = selected_at
+            updated["selection_count"] = int(updated.get("selection_count") or 0) + 1
+            updated_container[side_key] = updated
+            state[container_key] = updated_container
+            changed = True
+    pair = state.get("best_quote_frozen_inventory_pair_release")
+    if (
+        isinstance(pair, Mapping)
+        and str(pair.get("request_id") or "").strip() == safe_request_id
+    ):
+        updated_pair = dict(pair)
+        updated_pair["last_selected_at"] = selected_at
+        updated_pair["selection_count"] = int(updated_pair.get("selection_count") or 0) + 1
+        state["best_quote_frozen_inventory_pair_release"] = updated_pair
+        changed = True
+    if changed:
+        _write_json(state_path, state)
+    return changed
 
 
 def _is_frozen_inventory_pair_release_order(order: Mapping[str, Any] | dict[str, Any]) -> bool:
@@ -11943,7 +13719,11 @@ def _runtime_guard_has_allowed_frozen_inventory_places(actions: Mapping[str, Any
     if _safe_float((actions or {}).get("place_count")) <= 0:
         return False
     place_orders = [dict(item) for item in list((actions or {}).get("place_orders") or []) if isinstance(item, dict)]
-    return bool(place_orders) and all(_is_frozen_inventory_manual_order(item) for item in place_orders)
+    return bool(place_orders) and all(
+        _is_frozen_inventory_manual_order(item)
+        and _is_authorized_frozen_inventory_order(item)
+        for item in place_orders
+    )
 
 
 def _is_directional_net_guard_reduce_only_order(order: Mapping[str, Any] | dict[str, Any]) -> bool:
@@ -12016,9 +13796,7 @@ def _has_best_quote_frozen_inventory_position(state: Mapping[str, Any] | dict[st
 
 def _best_quote_frozen_inventory_qtys(state: Mapping[str, Any] | dict[str, Any]) -> tuple[float, float]:
     ledger = state.get("best_quote_frozen_inventory") if isinstance(state, Mapping) else None
-    if not isinstance(ledger, Mapping):
-        return 0.0, 0.0
-    return max(_safe_float(ledger.get("long_qty")), 0.0), max(_safe_float(ledger.get("short_qty")), 0.0)
+    return strict_frozen_side_qtys(ledger)
 
 
 def _suppress_place_orders_during_runtime_guard_loss_cooldown(
@@ -12057,7 +13835,10 @@ def _suppress_place_orders_during_runtime_guard_loss_cooldown(
     dropped: list[dict[str, Any]] = []
     for item in place_orders:
         if (
-            _is_frozen_inventory_manual_order(item)
+            (
+                _is_frozen_inventory_manual_order(item)
+                and _is_authorized_frozen_inventory_order(item)
+            )
             or _is_directional_net_guard_reduce_only_order(item)
         ):
             allowed.append(dict(item))
@@ -12400,31 +14181,22 @@ def _runtime_guard_plan_report_is_fresh(
 def _runtime_guard_live_exposure(
     symbol: str,
     *,
+    frozen_long_qty: float = 0.0,
+    frozen_short_qty: float = 0.0,
     fetch_position_risk: Any = None,
     load_credentials: Any = None,
 ) -> tuple[float, float] | None:
-    """Live (net_notional, unrealized_pnl) from exchange positionRisk.
+    """Live ordinary (net_notional, exchange unrealized_pnl) from positionRisk.
 
     Used instead of a stale latest-plan snapshot. Returns None on any failure so
     the caller keeps the stale values — fail-closed: a stale stop may hold longer
     than necessary, but exposure is never blind-released on missing data.
 
-    Scope: this is deliberately the ACCOUNT-level net for the symbol, which
-    includes frozen inventory (e.g. the OUSDT frozen short reservoir), and can
-    read wider than the plan's ledger-scoped ``strategy_actual_net_notional`` it
-    substitutes for. Two reasons:
-
-    - The fallback exists precisely because the plan/state are untrustworthy at
-      this moment: external fills (a manual flatten or reduce) are what
-      desynchronize them (2026-07-04/05 ARX incidents). Deriving a "managed only"
-      figure from the state ledger minus frozen would re-trust the very data the
-      fallback is escaping — the pre-realign ledger still said 5268/2314 while
-      the exchange held a flat 1400/1400 hedge, so a ledger-based fallback would
-      have kept the guard latched on a flat account.
-    - Including frozen only errs conservative: the guard can fire earlier, never
-      blind-release. Symbols that hold a frozen reservoir must size
-      ``max_actual_net_notional`` above reservoir + trading headroom — already
-      the operating convention (OUSDT: guard 1500 vs ~720 reservoir).
+    ``max_actual_net_notional`` is an ordinary-position limit.  The caller passes
+    the latest durable frozen quantities, which are subtracted side by side at
+    the exchange mark.  Exchange unrealized PnL is returned for non-frozen
+    symbols only; the caller retains ledger-scoped strategy PnL whenever frozen
+    inventory exists because positionRisk cannot apportion PnL by ledger.
     """
     fetcher = fetch_position_risk or fetch_futures_position_risk_v3
     loader = load_credentials or load_binance_api_credentials
@@ -12436,34 +14208,112 @@ def _runtime_guard_live_exposure(
         positions = fetcher(api_key=api_key, api_secret=api_secret, symbol=symbol)
     except Exception:
         return None
-    net_notional = 0.0
+    ordinary_net_notional = 0.0
     unrealized_pnl = 0.0
+    remaining_frozen_long = max(_safe_float(frozen_long_qty), 0.0)
+    remaining_frozen_short = max(_safe_float(frozen_short_qty), 0.0)
     for position in positions or []:
         amount = _safe_float(position.get("positionAmt"))
         mark_price = _safe_float(position.get("markPrice"))
-        net_notional += amount * mark_price
+        if amount > 0:
+            frozen_qty = min(amount, remaining_frozen_long)
+            remaining_frozen_long -= frozen_qty
+            ordinary_net_notional += (amount - frozen_qty) * mark_price
+        elif amount < 0:
+            side_qty = abs(amount)
+            frozen_qty = min(side_qty, remaining_frozen_short)
+            remaining_frozen_short -= frozen_qty
+            ordinary_net_notional -= (side_qty - frozen_qty) * mark_price
         unrealized_pnl += _safe_float(position.get("unRealizedProfit"))
-    return net_notional, unrealized_pnl
+    if remaining_frozen_long > 1e-12 or remaining_frozen_short > 1e-12:
+        return None
+    return ordinary_net_notional, unrealized_pnl
+
+
+def _plan_frozen_inventory_qtys(
+    plan_report: Mapping[str, Any],
+) -> tuple[float, float]:
+    frozen_long = plan_report.get("frozen_long_qty")
+    frozen_short = plan_report.get("frozen_short_qty")
+    frozen_long_notional = plan_report.get("frozen_long_notional")
+    frozen_short_notional = plan_report.get("frozen_short_notional")
+    best_quote = plan_report.get("best_quote_maker_volume")
+    reduce_freeze = (
+        best_quote.get("reduce_freeze")
+        if isinstance(best_quote, Mapping)
+        else None
+    )
+    if frozen_long is None and isinstance(reduce_freeze, Mapping):
+        frozen_long = reduce_freeze.get("frozen_long_qty")
+    if frozen_short is None and isinstance(reduce_freeze, Mapping):
+        frozen_short = reduce_freeze.get("frozen_short_qty")
+    if frozen_long_notional is None and isinstance(reduce_freeze, Mapping):
+        frozen_long_notional = reduce_freeze.get("frozen_long_notional")
+    if frozen_short_notional is None and isinstance(reduce_freeze, Mapping):
+        frozen_short_notional = reduce_freeze.get("frozen_short_notional")
+    mid_price = max(_safe_float(plan_report.get("mid_price")), 0.0)
+    if frozen_long is None and mid_price > 0 and frozen_long_notional is not None:
+        frozen_long = _safe_float(frozen_long_notional) / mid_price
+    if frozen_short is None and mid_price > 0 and frozen_short_notional is not None:
+        frozen_short = _safe_float(frozen_short_notional) / mid_price
+    return (
+        max(_safe_float(frozen_long), 0.0),
+        max(_safe_float(frozen_short), 0.0),
+    )
+
+
+def _plan_frozen_inventory_total_notional(plan_report: Mapping[str, Any]) -> float:
+    """Best available frozen total used only to validate side allocation."""
+
+    candidates = [plan_report.get("frozen_total_notional")]
+    best_quote = plan_report.get("best_quote_maker_volume")
+    reduce_freeze = (
+        best_quote.get("reduce_freeze")
+        if isinstance(best_quote, Mapping)
+        else None
+    )
+    if isinstance(reduce_freeze, Mapping):
+        candidates.append(reduce_freeze.get("frozen_total_notional"))
+        frozen_total_cap = reduce_freeze.get("frozen_total_cap")
+        if isinstance(frozen_total_cap, Mapping):
+            candidates.append(frozen_total_cap.get("frozen_total_notional"))
+    return max((max(_safe_float(value), 0.0) for value in candidates), default=0.0)
+
+
+RUNTIME_GUARD_FROZEN_SPLIT_FAIL_CLOSED_NOTIONAL = 1e300
 
 
 def _runtime_guard_plan_actual_net_notional(
     plan_report: Mapping[str, Any],
 ) -> Any:
-    """Return account LONG-SHORT net for the runtime position cap.
+    """Return ordinary LONG-SHORT net for the runtime position cap.
 
-    ``strategy_actual_net_notional`` deliberately excludes frozen inventory and
-    remains valid for strategy PnL recovery.  It is not a position-cap metric.
-    New plans persist an explicit exchange value; old hedge BQ plans can be
-    reconstructed from their pre-isolation reduce-freeze snapshot.
+    Frozen inventory has its own ledger and caps.  ``max_actual_net_notional``
+    therefore derives ordinary exposure from exchange sides minus the frozen
+    ledger whenever that authoritative split is available.  Strategy ledger
+    values are compatibility fallbacks only.
     """
-
-    explicit = plan_report.get("exchange_actual_net_notional")
-    if explicit is not None:
-        return explicit
-    exchange_qty = plan_report.get("exchange_actual_net_qty")
     mid_price = _safe_float(plan_report.get("mid_price"))
-    if exchange_qty is not None and mid_price > 0:
-        return _safe_float(exchange_qty) * mid_price
+    frozen_long_qty, frozen_short_qty = _plan_frozen_inventory_qtys(plan_report)
+    frozen_total_notional = _plan_frozen_inventory_total_notional(plan_report)
+    allocated_frozen_notional = (
+        frozen_long_qty + frozen_short_qty
+    ) * max(mid_price, 0.0)
+    frozen_side_breakdown_missing = (
+        frozen_total_notional > allocated_frozen_notional + 1e-9
+    )
+    if frozen_side_breakdown_missing:
+        explicit = plan_report.get("ordinary_actual_net_notional")
+        if explicit is not None:
+            return explicit
+        strategy = plan_report.get("strategy_actual_net_notional")
+        if strategy is not None:
+            return strategy
+        # Returning zero would silently release an active max-net stop.  An
+        # unallocated frozen total cannot be subtracted directionally, so hold
+        # the ordinary cap closed until a side split or explicit ordinary value
+        # is persisted.
+        return RUNTIME_GUARD_FROZEN_SPLIT_FAIL_CLOSED_NOTIONAL
     exchange_long_qty = plan_report.get("exchange_long_qty")
     exchange_short_qty = plan_report.get("exchange_short_qty")
     if (
@@ -12471,9 +14321,13 @@ def _runtime_guard_plan_actual_net_notional(
         and exchange_short_qty is not None
         and mid_price > 0
     ):
-        return (
-            _safe_float(exchange_long_qty) - _safe_float(exchange_short_qty)
-        ) * mid_price
+        ordinary_long_qty, ordinary_short_qty = _ordinary_position_qtys(
+            exchange_long_qty=_safe_float(exchange_long_qty),
+            exchange_short_qty=_safe_float(exchange_short_qty),
+            frozen_long_qty=frozen_long_qty,
+            frozen_short_qty=frozen_short_qty,
+        )
+        return (ordinary_long_qty - ordinary_short_qty) * mid_price
     best_quote = plan_report.get("best_quote_maker_volume")
     reduce_freeze = (
         best_quote.get("reduce_freeze")
@@ -12486,14 +14340,25 @@ def _runtime_guard_plan_actual_net_notional(
         and "actual_short_qty" in reduce_freeze
         and mid_price > 0
     ):
-        return (
-            _safe_float(reduce_freeze.get("actual_long_qty"))
-            - _safe_float(reduce_freeze.get("actual_short_qty"))
+        ordinary_long_qty, ordinary_short_qty = _ordinary_position_qtys(
+            exchange_long_qty=_safe_float(reduce_freeze.get("actual_long_qty")),
+            exchange_short_qty=_safe_float(reduce_freeze.get("actual_short_qty")),
+            frozen_long_qty=frozen_long_qty,
+            frozen_short_qty=frozen_short_qty,
+        )
+        return (ordinary_long_qty - ordinary_short_qty) * mid_price
+    exchange_notional = plan_report.get("exchange_actual_net_notional")
+    if exchange_notional is not None and mid_price > 0:
+        return _safe_float(exchange_notional) - (
+            frozen_long_qty - frozen_short_qty
         ) * mid_price
-    legacy = plan_report.get("strategy_actual_net_notional")
-    if legacy is None:
-        legacy = plan_report.get("actual_net_notional")
-    return legacy
+    explicit = plan_report.get("ordinary_actual_net_notional")
+    if explicit is not None:
+        return explicit
+    strategy = plan_report.get("strategy_actual_net_notional")
+    if strategy is not None:
+        return strategy
+    return plan_report.get("actual_net_notional")
 
 
 def _runtime_guard_exposure_inputs(
@@ -12502,6 +14367,8 @@ def _runtime_guard_exposure_inputs(
     now: datetime,
     symbol: str,
     live_exposure_fetcher: Any = None,
+    frozen_long_qty: float | None = None,
+    frozen_short_qty: float | None = None,
 ) -> tuple[Any, Any, str]:
     """Select the (net_notional, unrealized_pnl, source) fed to the runtime guard.
 
@@ -12509,13 +14376,13 @@ def _runtime_guard_exposure_inputs(
       semantics, no live call. There is no stale snapshot to latch on, and
       plan-less guard evaluations must not require network access.
     - FRESH plan (``generated_at`` within ``RUNTIME_GUARD_PLAN_MAX_AGE_SECONDS``):
-      plan values are used and live positionRisk is NOT consulted at all.  The
-      actual-net cap uses account LONG-SHORT including frozen inventory, while
-      unrealized-loss recovery keeps its ledger-scoped strategy PnL semantics.
+      plan values are used and live positionRisk is NOT consulted at all.  Both
+      the actual-net cap and unrealized-loss recovery keep their ordinary,
+      ledger-scoped strategy semantics.
     - STALE plan or a non-empty snapshot missing/unparseable ``generated_at`` (a
-      guard-stopped runner no longer writes plans): re-read account-level exposure
-      from live positionRisk, which unlatches a stop whose pre-stop snapshot no
-      longer matches reality.
+      guard-stopped runner no longer writes plans): re-read exchange exposure,
+      subtract the latest frozen ledger by side, and retain strategy-scoped PnL
+      when frozen inventory exists.
     - Live fetch failure: keep the stale plan values (fail-closed — a stale stop may
       hold longer than necessary, but exposure is never blind-released).
     """
@@ -12523,15 +14390,41 @@ def _runtime_guard_exposure_inputs(
     upnl = latest_plan_report.get("strategy_unrealized_pnl")
     if upnl is None:
         upnl = latest_plan_report.get("unrealized_pnl")
+    if net == RUNTIME_GUARD_FROZEN_SPLIT_FAIL_CLOSED_NOTIONAL:
+        return net, upnl, "frozen_side_split_missing_fail_closed"
     if not latest_plan_report:
         return net, upnl, "no_plan"
     if _runtime_guard_plan_report_is_fresh(latest_plan_report, now=now):
         return net, upnl, "plan"
-    fetcher = live_exposure_fetcher or _runtime_guard_live_exposure
-    live = fetcher(symbol)
+    plan_frozen_long, plan_frozen_short = _plan_frozen_inventory_qtys(
+        latest_plan_report
+    )
+    effective_frozen_long = (
+        plan_frozen_long
+        if frozen_long_qty is None
+        else max(_safe_float(frozen_long_qty), 0.0)
+    )
+    effective_frozen_short = (
+        plan_frozen_short
+        if frozen_short_qty is None
+        else max(_safe_float(frozen_short_qty), 0.0)
+    )
+    if live_exposure_fetcher is None:
+        live = _runtime_guard_live_exposure(
+            symbol,
+            frozen_long_qty=effective_frozen_long,
+            frozen_short_qty=effective_frozen_short,
+        )
+    else:
+        live = live_exposure_fetcher(symbol)
     if live is None:
         return net, upnl, "stale_plan_fail_closed"
-    return live[0], live[1], "live_position_risk"
+    live_upnl = (
+        upnl
+        if effective_frozen_long > 1e-12 or effective_frozen_short > 1e-12
+        else live[1]
+    )
+    return live[0], live_upnl, "live_position_risk"
 
 
 TERMINAL_DRAIN_STATE_KEY = "futures_terminal_drain"
@@ -12964,15 +14857,6 @@ def _terminal_drain_runtime_owner_is_integral(
             or initial_frozen_short < 0
         ):
             return False
-        if loop_state is not None:
-            durable_long, durable_short = _best_quote_frozen_inventory_qtys(
-                loop_state
-            )
-            if (
-                abs(initial_frozen_long - durable_long) > 1e-12
-                or abs(initial_frozen_short - durable_short) > 1e-12
-            ):
-                return False
         exit_status = str(envelope.get("exit_status") or "")
         if exit_status in {"exiting", "exit_blocked"}:
             return drain_state.stage not in {
@@ -14509,51 +16393,6 @@ def _handle_terminal_drain_round(
             contract_integrity_details = {
                 "ledger_errors": ledger_errors,
             }
-        elif contract_integrity_error is None and has_persisted_owner:
-            durable_frozen_long = _safe_float(
-                owned_ledger_snapshot.get("frozen_long_qty")
-            )
-            durable_frozen_short = _safe_float(
-                owned_ledger_snapshot.get("frozen_short_qty")
-            )
-            initial_frozen_long = _safe_float(
-                envelope.get("initial_frozen_long_qty")
-            )
-            initial_frozen_short = _safe_float(
-                envelope.get("initial_frozen_short_qty")
-            )
-            if (
-                abs(initial_frozen_long - durable_frozen_long) > 1e-12
-                or abs(initial_frozen_short - durable_frozen_short) > 1e-12
-            ):
-                contract_integrity_error = (
-                    "run_contract_integrity_frozen_ledger_mismatch"
-                )
-                contract_integrity_details = {
-                    "initial_frozen_long_qty": initial_frozen_long,
-                    "initial_frozen_short_qty": initial_frozen_short,
-                    "durable_frozen_long_qty": durable_frozen_long,
-                    "durable_frozen_short_qty": durable_frozen_short,
-                }
-    elif has_persisted_owner and contract_integrity_error is None:
-        durable_frozen_long, durable_frozen_short = (
-            _best_quote_frozen_inventory_qtys(state)
-        )
-        initial_frozen_long = _safe_float(envelope.get("initial_frozen_long_qty"))
-        initial_frozen_short = _safe_float(envelope.get("initial_frozen_short_qty"))
-        if (
-            abs(initial_frozen_long - durable_frozen_long) > 1e-12
-            or abs(initial_frozen_short - durable_frozen_short) > 1e-12
-        ):
-            contract_integrity_error = (
-                "run_contract_integrity_frozen_ledger_mismatch"
-            )
-            contract_integrity_details = {
-                "initial_frozen_long_qty": initial_frozen_long,
-                "initial_frozen_short_qty": initial_frozen_short,
-                "durable_frozen_long_qty": durable_frozen_long,
-                "durable_frozen_short_qty": durable_frozen_short,
-            }
 
     if contract_integrity_error is not None and not has_persisted_owner:
         integrity_errors = [
@@ -14825,30 +16664,55 @@ def _handle_terminal_drain_round(
                 0.0,
             )
 
-    # A normal terminal-drain fill is not a frozen-ledger release receipt.
-    # Keep the durable frozen quantity unchanged for the whole drain owner so
-    # normal inventory can only decrease toward that protected floor.  If the
-    # exchange position ever falls below it, the pure decision fails closed as
-    # ``frozen_inventory_exceeds_owned`` instead of silently consuming frozen
-    # inventory.
-    frozen_long = max(
-        _safe_float(envelope.get("initial_frozen_long_qty")),
-        0.0,
-    )
-    frozen_short = max(
-        _safe_float(envelope.get("initial_frozen_short_qty")),
-        0.0,
-    )
+    # Frozen inventory is an independent lane.  Its durable ledger is the
+    # authoritative subtraction for this cycle; the terminal owner only drains
+    # the ordinary quantity above that current boundary.
+    if bq_ownership_required and owned_ledger_snapshot is not None:
+        frozen_long = max(
+            _safe_float(owned_ledger_snapshot.get("frozen_long_qty")),
+            0.0,
+        )
+        frozen_short = max(
+            _safe_float(owned_ledger_snapshot.get("frozen_short_qty")),
+            0.0,
+        )
+    else:
+        frozen_long, frozen_short = _best_quote_frozen_inventory_qtys(state)
+    envelope["current_frozen_long_qty"] = frozen_long
+    envelope["current_frozen_short_qty"] = frozen_short
+    ordinary_actual_long_qty = max(long_qty - frozen_long, 0.0)
+    ordinary_actual_short_qty = max(short_qty - frozen_short, 0.0)
+    envelope["current_ordinary_long_qty"] = ordinary_actual_long_qty
+    envelope["current_ordinary_short_qty"] = ordinary_actual_short_qty
     strategy_prefix = _strategy_client_order_prefix(symbol)
-    terminal_open = [row for row in open_orders if _is_terminal_drain_order(row, symbol)]
+    classified_open_orders = _classify_current_frozen_inventory_open_orders(
+        args=args,
+        orders=open_orders,
+        now=cycle_started_at,
+    )
+    frozen_open = [
+        row for row in classified_open_orders if is_frozen_inventory_order(row)
+    ]
+    ordinary_open = [
+        row for row in classified_open_orders if not is_frozen_inventory_order(row)
+    ]
+    terminal_open = [
+        row for row in ordinary_open if _is_terminal_drain_order(row, symbol)
+    ]
     entry_open = [
         row
-        for row in open_orders
+        for row in ordinary_open
         if str(row.get("clientOrderId") or "").startswith(strategy_prefix)
         and not _is_terminal_drain_order(row, symbol)
     ]
     unmanaged_open = [
-        row for row in open_orders if row not in terminal_open and row not in entry_open
+        row
+        for row in ordinary_open
+        if row not in terminal_open and row not in entry_open
+    ]
+    envelope["frozen_open_order_ids"] = [
+        str(row.get("clientOrderId") or row.get("orderId") or "")
+        for row in frozen_open
     ]
     intents = [
         dict(item)
@@ -14881,8 +16745,8 @@ def _handle_terminal_drain_round(
         by_client_id[value] for value in active_ids if value in by_client_id
     ]
 
-    owned_long_qty = long_qty
-    owned_short_qty = short_qty
+    owned_long_qty = ordinary_actual_long_qty
+    owned_short_qty = ordinary_actual_short_qty
     owned_long_cost = long_cost
     owned_short_cost = short_cost
     ownership_errors: list[dict[str, Any]] = []
@@ -14915,8 +16779,8 @@ def _handle_terminal_drain_round(
                 "remaining_normal_short_qty": remaining_normal_short,
             }
         )
-        owned_long_qty = remaining_normal_long + frozen_long
-        owned_short_qty = remaining_normal_short + frozen_short
+        owned_long_qty = remaining_normal_long
+        owned_short_qty = remaining_normal_short
         owned_long_cost = _safe_float(
             envelope.get("initial_normal_long_cost_basis")
         )
@@ -14925,22 +16789,28 @@ def _handle_terminal_drain_round(
         )
         long_tolerance = max(1e-12, owned_long_qty * 1e-9)
         short_tolerance = max(1e-12, owned_short_qty * 1e-9)
-        if position_observation_ok and owned_long_qty > long_qty + long_tolerance:
+        if (
+            position_observation_ok
+            and owned_long_qty > ordinary_actual_long_qty + long_tolerance
+        ):
             ownership_errors.append(
                 {
                     "reason": "owned_inventory_exceeds_exchange",
                     "side": "long",
                     "owned_qty": owned_long_qty,
-                    "actual_qty": long_qty,
+                    "actual_qty": ordinary_actual_long_qty,
                 }
             )
-        if position_observation_ok and owned_short_qty > short_qty + short_tolerance:
+        if (
+            position_observation_ok
+            and owned_short_qty > ordinary_actual_short_qty + short_tolerance
+        ):
             ownership_errors.append(
                 {
                     "reason": "owned_inventory_exceeds_exchange",
                     "side": "short",
                     "owned_qty": owned_short_qty,
-                    "actual_qty": short_qty,
+                    "actual_qty": ordinary_actual_short_qty,
                 }
             )
     if ownership_errors:
@@ -15846,12 +17716,12 @@ def _handle_terminal_drain_round(
         captured_at=cycle_started_at,
         bid_price=bid_price,
         ask_price=ask_price,
-        actual_long_qty=long_qty,
-        actual_short_qty=short_qty,
+        actual_long_qty=ordinary_actual_long_qty,
+        actual_short_qty=ordinary_actual_short_qty,
         owned_long_qty=owned_long_qty,
         owned_short_qty=owned_short_qty,
-        frozen_long_qty=frozen_long,
-        frozen_short_qty=frozen_short,
+        frozen_long_qty=0.0,
+        frozen_short_qty=0.0,
         long_cost_basis=owned_long_cost,
         short_cost_basis=owned_short_cost,
         entries_blocked=bool(envelope.get("entries_blocked")),
@@ -15885,6 +17755,22 @@ def _handle_terminal_drain_round(
         ),
     )
     plan = decide_terminal_drain(state=drain_state, snapshot=snapshot, policy=policy)
+    frozen_lane_present = bool(
+        frozen_long > step_size / 2.0
+        or frozen_short > step_size / 2.0
+        or frozen_open
+    )
+    if plan.stop_allowed and frozen_lane_present and not plan.preserve_inventory:
+        plan = replace(
+            plan,
+            action_id=DrainActionId.STOP_PRESERVE_FROZEN,
+            next_state=replace(
+                plan.next_state,
+                stage=DrainStage.STOPPED_PRESERVED,
+            ),
+            reasons=("frozen_inventory_preserved_by_ledger_boundary",),
+            preserve_inventory=True,
+        )
     drain_state = plan.next_state
     envelope["last_observed_at"] = cycle_started_at.isoformat()
     envelope["last_action"] = plan.action_id.value
@@ -16532,11 +18418,16 @@ def _maybe_handle_runtime_guard(
         latest_mid_price,
         _safe_float(latest_plan_report.get("synthetic_drift_qty")),
     )
+    runtime_frozen_long_qty, runtime_frozen_short_qty = (
+        _best_quote_frozen_inventory_qtys(state)
+    )
     guard_actual_net_notional, guard_unrealized_pnl, _guard_exposure_source = (
         _runtime_guard_exposure_inputs(
             latest_plan_report,
             now=cycle_started_at,
             symbol=str(effective_runtime_args.symbol).upper().strip(),
+            frozen_long_qty=runtime_frozen_long_qty,
+            frozen_short_qty=runtime_frozen_short_qty,
         )
     )
     runtime_guard_result = evaluate_runtime_guards(
@@ -17050,6 +18941,7 @@ def _maybe_handle_runtime_guard(
         api_key=api_key,
         api_secret=api_secret,
         recv_window=args.recv_window,
+        state=state,
     )
     flatten_result = {"started": False, "already_running": False}
     flatten_is_best_quote = _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", "")))
@@ -17737,6 +19629,7 @@ def apply_recovery_profile_gate_to_plan(
         **gate.as_dict(),
         "dropped_order_count": 0,
         "dropped_orders": [],
+        "preserved_frozen_order_count": 0,
     }
     if not gate.managed or gate.active_action is ActionId.NOOP:
         return report
@@ -17746,7 +19639,14 @@ def apply_recovery_profile_gate_to_plan(
             if not isinstance(raw, Mapping):
                 continue
             order = dict(raw)
-            if gate.allows_order(order):
+            frozen_independent = (
+                _is_frozen_inventory_manual_order(order)
+                and _is_authorized_frozen_inventory_order(order)
+            )
+            if frozen_independent:
+                kept.append(order)
+                report["preserved_frozen_order_count"] += 1
+            elif gate.allows_order(order):
                 kept.append(order)
             else:
                 report["dropped_orders"].append(
@@ -17903,7 +19803,14 @@ def _apply_registered_runtime_safety_signal_to_plan(
                 if not isinstance(raw, Mapping):
                     continue
                 order = dict(raw)
-                if _runtime_safety_normal_gtx_reduce(order, signal=signal):
+                authorized_frozen = (
+                    _is_frozen_inventory_manual_order(order)
+                    and _is_authorized_frozen_inventory_order(order)
+                )
+                if (
+                    authorized_frozen
+                    or _runtime_safety_normal_gtx_reduce(order, signal=signal)
+                ):
                     kept.append(order)
                 else:
                     dropped.append(
@@ -17947,14 +19854,33 @@ def _apply_registered_runtime_safety_signal_to_actions(
     if report["active"]:
         kept_places = []
         for order in places:
-            if _runtime_safety_normal_gtx_reduce(order, signal=signal):
+            authorized_frozen = (
+                _is_frozen_inventory_manual_order(order)
+                and _is_authorized_frozen_inventory_order(order)
+            )
+            if (
+                authorized_frozen
+                or _runtime_safety_normal_gtx_reduce(order, signal=signal)
+            ):
                 kept_places.append(order)
             else:
                 dropped_places.append(order)
         places = kept_places
         if allowed_reduce_side is None:
-            dropped_cancels = cancels
-            cancels = []
+            dropped_cancels = [
+                order
+                for order in cancels
+                if not (
+                    _is_frozen_inventory_manual_order(order)
+                    and _is_authorized_frozen_inventory_order(order)
+                )
+            ]
+            cancels = [
+                order
+                for order in cancels
+                if _is_frozen_inventory_manual_order(order)
+                and _is_authorized_frozen_inventory_order(order)
+            ]
         else:
             kept_cancels = [
                 order
@@ -17967,8 +19893,20 @@ def _apply_registered_runtime_safety_signal_to_actions(
             ]
             cancels = kept_cancels
             if cancels:
-                dropped_places.extend(places)
-                places = []
+                dropped_places.extend(
+                    order
+                    for order in places
+                    if not (
+                        _is_frozen_inventory_manual_order(order)
+                        and _is_authorized_frozen_inventory_order(order)
+                    )
+                )
+                places = [
+                    order
+                    for order in places
+                    if _is_frozen_inventory_manual_order(order)
+                    and _is_authorized_frozen_inventory_order(order)
+                ]
     result["place_orders"] = places
     result["place_count"] = len(places)
     result["place_notional"] = sum(
@@ -17997,10 +19935,20 @@ def _guard_registered_runtime_safety_order_before_submit(
     order: Mapping[str, Any],
     now: datetime,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if _looks_like_frozen_inventory_order(order):
+        authorized_order, reason = _current_frozen_inventory_order_authorization(
+            args=args,
+            order=order,
+            now=now,
+            operation="place",
+        )
+        if authorized_order is None:
+            return None, reason
+        return authorized_order, None
     signal, report = _registered_runtime_safety_signal_gate(args, now=now)
-    if not report["active"] or _runtime_safety_normal_gtx_reduce(
-        order,
-        signal=signal,
+    if (
+        not report["active"]
+        or _runtime_safety_normal_gtx_reduce(order, signal=signal)
     ):
         return dict(order), None
     return None, {
@@ -18019,6 +19967,18 @@ def _guard_cancel_order_before_submit(
     actual_net_decision: Mapping[str, Any] | None = None,
     now: datetime,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if _looks_like_frozen_inventory_order(order):
+        authorized_order, reason = _current_frozen_inventory_order_authorization(
+            args=args,
+            order=order,
+            now=now,
+            operation="cancel",
+        )
+        return (
+            (authorized_order, None)
+            if authorized_order is not None
+            else (None, reason)
+        )
     gate = _load_recovery_order_profile_gate(args, now=now)
     expected_managed = bool(
         isinstance(expected_gate, Mapping) and expected_gate.get("managed")
@@ -18076,6 +20036,14 @@ def _apply_recovery_profile_gate_to_actions(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Re-fence one planned mutation set against the current symbol decision."""
 
+    authorized_actions, frozen_authorization = (
+        _authorize_current_frozen_inventory_actions(
+            args=args,
+            actions=actions,
+            now=now,
+        )
+    )
+    actions = authorized_actions
     result = dict(actions)
     place_orders = [
         dict(item)
@@ -18097,19 +20065,34 @@ def _apply_recovery_profile_gate_to_actions(
     )
     dropped_places: list[dict[str, Any]] = []
     dropped_cancels: list[dict[str, Any]] = []
+    frozen_places = [
+        order
+        for order in place_orders
+        if _is_frozen_inventory_manual_order(order)
+        and _is_authorized_frozen_inventory_order(order)
+    ]
+    frozen_cancels = [
+        order
+        for order in cancel_orders
+        if _is_frozen_inventory_manual_order(order)
+        and _is_authorized_frozen_inventory_order(order)
+    ]
+    ordinary_places = [order for order in place_orders if order not in frozen_places]
+    ordinary_cancels = [order for order in cancel_orders if order not in frozen_cancels]
     if authorized and gate.managed:
         kept_places: list[dict[str, Any]] = []
-        for order in place_orders:
+        for order in ordinary_places:
             if gate.allows_order(order):
                 kept_places.append(order)
             else:
                 dropped_places.append(order)
-        place_orders = kept_places
+        place_orders = [*frozen_places, *kept_places]
+        cancel_orders = [*frozen_cancels, *ordinary_cancels]
     elif not authorized:
-        dropped_places = place_orders
-        dropped_cancels = cancel_orders
-        place_orders = []
-        cancel_orders = []
+        dropped_places = ordinary_places
+        dropped_cancels = ordinary_cancels
+        place_orders = frozen_places
+        cancel_orders = frozen_cancels
 
     result["place_orders"] = place_orders
     result["place_count"] = len(place_orders)
@@ -18132,6 +20115,8 @@ def _apply_recovery_profile_gate_to_actions(
         "current_gate": gate.as_dict(),
         "dropped_place_count": len(dropped_places),
         "dropped_cancel_count": len(dropped_cancels),
+        "preserved_frozen_place_count": len(frozen_places),
+        "preserved_frozen_cancel_count": len(frozen_cancels),
         "dropped_orders": [
             {
                 "role": str(item.get("role") or ""),
@@ -18139,6 +20124,7 @@ def _apply_recovery_profile_gate_to_actions(
             }
             for item in dropped_places
         ],
+        "frozen_inventory_authorization": frozen_authorization,
     }
     result["recovery_profile_gate"] = report
     return result, report
@@ -18151,6 +20137,17 @@ def _guard_recovery_profile_order_before_submit(
     expected_gate: Mapping[str, Any] | None,
     now: datetime | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if _looks_like_frozen_inventory_order(order):
+        independent_order, reason = _current_frozen_inventory_order_authorization(
+            args=args,
+            order=order,
+            now=now,
+            operation="place",
+        )
+        if independent_order is None:
+            return None, reason
+        independent_order.pop("_ordinary_recovery_client_order_prefix", None)
+        return independent_order, None
     gate = _load_recovery_order_profile_gate(args, now=now)
     expected_managed = bool(
         isinstance(expected_gate, Mapping) and expected_gate.get("managed")
@@ -24808,6 +26805,11 @@ def apply_hedge_position_notional_caps(
 
 
 def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
+    with exclusive_json_state_lock(Path(args.state_path)):
+        return _generate_plan_report_unlocked(args)
+
+
+def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     symbol = args.symbol.upper().strip()
     plan_now = _utc_now()
     requested_strategy_mode = str(getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
@@ -25328,31 +27330,83 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     uses_exchange_hedge_positions = _uses_exchange_hedge_position_sides(requested_strategy_mode)
     long_position = extract_symbol_position(account_info, symbol, "LONG" if uses_exchange_hedge_positions else None)
     short_position = extract_symbol_position(account_info, symbol, "SHORT") if uses_exchange_hedge_positions else {}
-    if (
-        _is_inventory_target_neutral_mode(requested_strategy_mode)
-        or _is_competition_inventory_grid_mode(requested_strategy_mode)
-        or _is_maker_volatility_inventory_mode(requested_strategy_mode)
-        or (
-            _is_best_quote_maker_volume_mode(requested_strategy_mode)
-            and not _is_hedge_best_quote_maker_volume_mode(requested_strategy_mode)
-        )
-    ):
-        current_long_qty = max(actual_net_qty, 0.0)
-        current_short_qty = max(-actual_net_qty, 0.0)
-    elif _is_one_way_short_mode(requested_strategy_mode):
-        current_long_qty = 0.0
-        current_short_qty = max(-actual_net_qty, 0.0)
+    if uses_exchange_hedge_positions:
+        exchange_long_qty = max(_position_qty(long_position, position_side="LONG"), 0.0)
+        exchange_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0)
     else:
-        current_long_qty = max(_position_qty(long_position, position_side="LONG" if uses_exchange_hedge_positions else None), 0.0)
-        current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0) if uses_exchange_hedge_positions else 0.0
-    exchange_long_qty = current_long_qty
-    exchange_short_qty = current_short_qty
+        # One-way accounts still need an explicit directional side split.  The
+        # requested planner may switch modes later (for example synthetic ->
+        # one_way_short), so deriving sides from that mode loses real shorts.
+        exchange_long_qty = max(actual_net_qty, 0.0)
+        exchange_short_qty = max(-actual_net_qty, 0.0)
     exchange_actual_net_qty = (
         exchange_long_qty - exchange_short_qty
         if uses_exchange_hedge_positions
         else actual_net_qty
     )
     exchange_actual_net_notional = exchange_actual_net_qty * max(mid_price, 0.0)
+    observed_trade_rows = _collect_runner_observed_trade_rows(args, symbol=symbol)
+    if _is_best_quote_maker_volume_mode(requested_strategy_mode):
+        strategy_open_orders = _filter_futures_strategy_orders(open_orders, symbol)
+        if (
+            _is_hedge_best_quote_maker_volume_mode(requested_strategy_mode)
+            and _hedge_best_quote_exchange_effectively_flat(
+                current_long_qty=exchange_long_qty,
+                current_short_qty=exchange_short_qty,
+                mid_price=mid_price,
+                min_notional=symbol_info.get("min_notional"),
+            )
+            and not strategy_open_orders
+        ):
+            best_quote_maker_volume["exchange_flat_resync"] = (
+                reset_best_quote_hedge_ledgers_after_exchange_flat(
+                    state=state,
+                    mid_price=mid_price,
+                    reason="generate_plan_exchange_flat_no_strategy_orders",
+                )
+            )
+        # Exchange positions already reflect fills from the previous cycle.  Bring
+        # every frozen-book receipt path current before proving the ordinary
+        # exchange-minus-frozen boundary; otherwise a valid frozen reduce fill can
+        # make the stale local frozen quantity exceed the live exchange position
+        # and permanently fail before reconciliation can run.
+        best_quote_frozen_manual_sync = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=observed_trade_rows,
+        )
+        best_quote_frozen_binding_reconcile = reconcile_best_quote_frozen_per_lot_bindings(
+            state=state,
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            current_open_orders=open_orders,
+            recv_window=args.recv_window,
+        )
+        best_quote_frozen_pair_release_reconcile = (
+            reconcile_best_quote_frozen_pair_release(
+                state=state,
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                current_open_orders=open_orders,
+                observed_trade_rows=observed_trade_rows,
+                recv_window=args.recv_window,
+            )
+        )
+        best_quote_frozen_pair_release_sync = dict(
+            best_quote_frozen_pair_release_reconcile.get("fill_sync") or {}
+        )
+    frozen_long_qty, frozen_short_qty = _best_quote_frozen_inventory_qtys(state)
+    ordinary_long_qty, ordinary_short_qty = _ordinary_position_qtys(
+        exchange_long_qty=exchange_long_qty,
+        exchange_short_qty=exchange_short_qty,
+        frozen_long_qty=frozen_long_qty,
+        frozen_short_qty=frozen_short_qty,
+    )
+    ordinary_actual_net_qty = ordinary_long_qty - ordinary_short_qty
+    ordinary_actual_net_notional = ordinary_actual_net_qty * max(mid_price, 0.0)
+    current_long_qty = ordinary_long_qty
+    current_short_qty = ordinary_short_qty
     current_long_notional = current_long_qty * max(mid_price, 0.0)
     current_short_notional = current_short_qty * max(mid_price, 0.0)
     if uses_exchange_hedge_positions:
@@ -25361,8 +27415,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         unrealized_pnl = _position_unrealized_pnl(actual_position)
     exchange_unrealized_pnl = unrealized_pnl
     strategy_unrealized_pnl = unrealized_pnl
-    strategy_actual_net_qty = actual_net_qty
-    strategy_actual_net_notional = actual_net_qty * max(mid_price, 0.0)
+    strategy_actual_net_qty = ordinary_actual_net_qty
+    strategy_actual_net_notional = ordinary_actual_net_notional
     volatility_entry_pause = resolve_volatility_entry_pause(
         adaptive_step=adaptive_step,
         state=state,
@@ -25389,7 +27443,6 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             0.0,
         ),
     )
-    observed_trade_rows = _collect_runner_observed_trade_rows(args, symbol=symbol)
     execution_regime = build_execution_regime_report(
         args=args,
         state=state,
@@ -25397,7 +27450,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         bid_price=bid_price,
         ask_price=ask_price,
         mid_price=mid_price,
-        actual_net_notional=actual_net_qty * max(mid_price, 0.0),
+        actual_net_notional=ordinary_actual_net_notional,
     )
     vol_protection = get_volatility_position_protection(
         regime_state=execution_regime.get("state", REGIME_NORMAL),
@@ -25431,44 +27484,29 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     current_long_avg_price = 0.0
     current_short_avg_price = 0.0
     if uses_exchange_hedge_positions:
-        current_long_avg_price = (
+        exchange_long_avg_price = (
             _position_cost_basis_price(long_position, prefer_entry_price=prefer_entry_price_cost_basis)
-            if current_long_qty > 1e-12
+            if exchange_long_qty > 1e-12
             else 0.0
         )
-        current_short_avg_price = (
+        exchange_short_avg_price = (
             _position_cost_basis_price(short_position, prefer_entry_price=prefer_entry_price_cost_basis)
-            if current_short_qty > 1e-12
+            if exchange_short_qty > 1e-12
             else 0.0
         )
+        current_long_avg_price = exchange_long_avg_price if current_long_qty > 1e-12 else 0.0
+        current_short_avg_price = exchange_short_avg_price if current_short_qty > 1e-12 else 0.0
     else:
-        if actual_net_qty > 1e-12:
+        if actual_net_qty > 1e-12 and current_long_qty > 1e-12:
             current_long_avg_price = max(actual_cost_basis_price, 0.0)
-        elif actual_net_qty < -1e-12:
+        elif actual_net_qty < -1e-12 and current_short_qty > 1e-12:
             current_short_avg_price = max(actual_cost_basis_price, 0.0)
-    exchange_long_avg_price = current_long_avg_price
-    exchange_short_avg_price = current_short_avg_price
+        exchange_long_avg_price = max(actual_cost_basis_price, 0.0) if exchange_long_qty > 1e-12 else 0.0
+        exchange_short_avg_price = max(actual_cost_basis_price, 0.0) if exchange_short_qty > 1e-12 else 0.0
     exchange_long_entry_price = max(_safe_float(long_position.get("entryPrice")), 0.0) if uses_exchange_hedge_positions else 0.0
     exchange_short_entry_price = max(_safe_float(short_position.get("entryPrice")), 0.0) if uses_exchange_hedge_positions else 0.0
 
     if _is_best_quote_maker_volume_mode(requested_strategy_mode):
-        strategy_open_orders = _filter_futures_strategy_orders(open_orders, symbol)
-        if (
-            _is_hedge_best_quote_maker_volume_mode(requested_strategy_mode)
-            and _hedge_best_quote_exchange_effectively_flat(
-                current_long_qty=current_long_qty,
-                current_short_qty=current_short_qty,
-                mid_price=mid_price,
-                min_notional=symbol_info.get("min_notional"),
-            )
-            and not strategy_open_orders
-        ):
-            best_quote_maker_volume["exchange_flat_resync"] = reset_best_quote_hedge_ledgers_after_exchange_flat(
-                state=state,
-                mid_price=mid_price,
-                reason="generate_plan_exchange_flat_no_strategy_orders",
-            )
-        frozen_bootstrap_long_qty, frozen_bootstrap_short_qty = _best_quote_frozen_inventory_qtys(state)
         best_quote_reduce_freeze_bootstrap_isolated = bool(
             getattr(effective_args, "best_quote_maker_volume_reduce_freeze_enabled", False)
         )
@@ -25478,8 +27516,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             api_key=api_key,
             api_secret=api_secret,
             recv_window=args.recv_window,
-            current_long_qty=max(current_long_qty - frozen_bootstrap_long_qty, 0.0),
-            current_short_qty=max(current_short_qty - frozen_bootstrap_short_qty, 0.0),
+            current_long_qty=ordinary_long_qty,
+            current_short_qty=ordinary_short_qty,
             current_long_avg_price=current_long_avg_price,
             current_short_avg_price=current_short_avg_price,
             mid_price=mid_price,
@@ -25488,10 +27526,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         best_quote_volume_ledger = reconcile_best_quote_volume_ledger_surplus(
             state=state,
-            current_long_qty=current_long_qty,
-            current_short_qty=current_short_qty,
-            current_long_avg_price=current_long_avg_price,
-            current_short_avg_price=current_short_avg_price,
+            current_long_qty=exchange_long_qty,
+            current_short_qty=exchange_short_qty,
+            current_long_avg_price=exchange_long_avg_price,
+            current_short_avg_price=exchange_short_avg_price,
             current_long_entry_price=exchange_long_entry_price,
             current_short_entry_price=exchange_short_entry_price,
             mid_price=mid_price,
@@ -25500,18 +27538,6 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 for order in _filter_futures_strategy_orders(open_orders, symbol)
                 if "bestquot" in str(order.get("clientOrderId") or "").lower()
             ),
-        )
-        best_quote_frozen_manual_sync = sync_best_quote_frozen_manual_fills(
-            state=state,
-            observed_trade_rows=observed_trade_rows,
-        )
-        best_quote_frozen_binding_reconcile = reconcile_best_quote_frozen_per_lot_bindings(
-            state=state,
-            symbol=symbol,
-            api_key=api_key,
-            api_secret=api_secret,
-            current_open_orders=open_orders,
-            recv_window=args.recv_window,
         )
         if any(
             int(best_quote_frozen_binding_reconcile.get(key) or 0) > 0
@@ -25525,10 +27551,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         ):
             best_quote_volume_ledger = reconcile_best_quote_volume_ledger_surplus(
                 state=state,
-                current_long_qty=current_long_qty,
-                current_short_qty=current_short_qty,
-                current_long_avg_price=current_long_avg_price,
-                current_short_avg_price=current_short_avg_price,
+                current_long_qty=exchange_long_qty,
+                current_short_qty=exchange_short_qty,
+                current_long_avg_price=exchange_long_avg_price,
+                current_short_avg_price=exchange_short_avg_price,
                 current_long_entry_price=exchange_long_entry_price,
                 current_short_entry_price=exchange_short_entry_price,
                 mid_price=mid_price,
@@ -25539,16 +27565,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 position_reconcile_confirm_cycles=1,
             )
-        best_quote_frozen_pair_release_sync = sync_best_quote_frozen_pair_release(
-            state=state,
-            observed_trade_rows=observed_trade_rows,
-        )
         best_quote_maker_volume["volume_ledger"] = dict(best_quote_volume_ledger)
         best_quote_maker_volume["frozen_manual_sync"] = dict(best_quote_frozen_manual_sync)
         best_quote_maker_volume["frozen_per_lot_binding_reconcile"] = dict(
             best_quote_frozen_binding_reconcile
         )
         best_quote_maker_volume["frozen_pair_release_sync"] = dict(best_quote_frozen_pair_release_sync)
+        best_quote_maker_volume["frozen_pair_release_reconcile"] = dict(
+            best_quote_frozen_pair_release_reconcile
+        )
 
     elastic_volume_config = _elastic_volume_config(effective_args)
     competition_start_time = None
@@ -25608,7 +27633,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 threshold_position_notional=elastic_threshold_position_notional,
                 max_long_notional=_safe_float(getattr(effective_args, "max_position_notional", None)),
                 max_short_notional=_safe_float(getattr(effective_args, "max_short_position_notional", None)),
-                actual_net_notional=actual_net_qty * max(mid_price, 0.0),
+                actual_net_notional=ordinary_actual_net_notional,
                 adaptive_step_raw_scale=_safe_float(adaptive_step.get("raw_scale")),
                 volatility_entry_pause_active=bool(volatility_entry_pause.get("active")),
                 volatility_entry_pause_reason=(
@@ -25716,7 +27741,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 depth_notional=getattr(effective_args, "execution_regime_depth_value", None),
                 long_notional=current_long_notional,
                 short_notional=current_short_notional,
-                actual_net_notional=actual_net_qty * max(mid_price, 0.0),
+                actual_net_notional=ordinary_actual_net_notional,
             ),
         )
         adaptive_regime_router["applied"] = True
@@ -26151,7 +28176,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     if startup_pending and not _is_custom_grid_mode(args) and requested_strategy_mode in {"one_way_long", "one_way_short"}:
         flat_start_guard = assess_flat_start_guard(
             strategy_mode=requested_strategy_mode,
-            actual_net_qty=actual_net_qty,
+            actual_net_qty=ordinary_actual_net_qty,
             open_orders=open_orders,
             enabled=bool(getattr(args, "flat_start_enabled", True)),
             block_open_orders=not bool(getattr(args, "cancel_stale", True)),
@@ -26215,25 +28240,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         if requested_strategy_mode == "synthetic_neutral" and strategy_mode != "synthetic_neutral":
             state["synthetic_ledger_resync_required"] = True
 
-    if (
-        _is_inventory_target_neutral_mode(strategy_mode)
-        or _is_maker_volatility_inventory_mode(strategy_mode)
-        or (
-            _is_best_quote_maker_volume_mode(strategy_mode)
-            and not _is_hedge_best_quote_maker_volume_mode(strategy_mode)
-        )
-    ):
-        current_long_qty = max(actual_net_qty, 0.0)
-        current_short_qty = max(-actual_net_qty, 0.0)
-    elif strategy_mode == "hedge_neutral" or _is_hedge_best_quote_maker_volume_mode(strategy_mode):
-        current_long_qty = max(_position_qty(long_position, position_side="LONG"), 0.0)
-        current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0)
-    elif _is_one_way_short_mode(strategy_mode):
-        current_long_qty = 0.0
-        current_short_qty = max(-actual_net_qty, 0.0)
-    else:
-        current_long_qty = max(actual_net_qty, 0.0)
-        current_short_qty = 0.0
+    # Strategy routing may change the planner mode, but it must not change the
+    # physical inventory boundary.  All ordinary planners start from the same
+    # exchange-minus-frozen side snapshot; synthetic mode explicitly replaces
+    # it with its virtual ledger later in its dedicated branch.
+    current_long_qty = ordinary_long_qty
+    current_short_qty = ordinary_short_qty
     current_long_notional = current_long_qty * max(mid_price, 0.0)
     current_short_notional = current_short_qty * max(mid_price, 0.0)
     strategy_open_orders_for_exposure = _filter_futures_strategy_orders(open_orders, symbol)
@@ -27252,7 +29264,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
-            current_net_qty=actual_net_qty,
+            current_net_qty=ordinary_actual_net_qty,
         )
         take_profit_guard = apply_take_profit_profit_guard(
             plan=plan,
@@ -27370,7 +29382,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             plan = build_maker_volatility_inventory_plan(
                 bid_price=bid_price,
                 ask_price=ask_price,
-                current_net_qty=actual_net_qty,
+                current_net_qty=ordinary_actual_net_qty,
                 window_open=window_open,
                 window_high=window_high,
                 window_low=window_low,
@@ -27423,8 +29435,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         }
         cap_controls = {
             "cap_applied": maker_volatility_inventory.get("regime") == "hard_reduce_only",
-            "buy_cap_applied": maker_volatility_inventory.get("regime") == "hard_reduce_only" and actual_net_qty > 0,
-            "short_cap_applied": maker_volatility_inventory.get("regime") == "hard_reduce_only" and actual_net_qty < 0,
+            "buy_cap_applied": maker_volatility_inventory.get("regime") == "hard_reduce_only"
+            and ordinary_actual_net_qty > 0,
+            "short_cap_applied": maker_volatility_inventory.get("regime") == "hard_reduce_only"
+            and ordinary_actual_net_qty < 0,
             "buy_budget_notional": max(_safe_float(getattr(effective_args, "maker_max_long_notional", 300.0)) - current_long_notional, 0.0),
             "short_budget_notional": max(_safe_float(getattr(effective_args, "maker_max_short_notional", 300.0)) - current_short_notional, 0.0),
             "planned_buy_notional": sum(_safe_float(item.get("notional")) for item in list(plan.get("buy_orders", []))),
@@ -27672,11 +29686,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             0,
         )
         best_quote_frozen_pair_release_execution_type = str(
-            getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_execution_type", "aggressive")
-            or "aggressive"
+            getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_execution_type", "maker")
+            or "maker"
         ).strip().lower()
-        if best_quote_frozen_pair_release_execution_type not in {"aggressive", "maker"}:
-            best_quote_frozen_pair_release_execution_type = "aggressive"
+        # Frozen inventory is independent accounting, not an exception to the
+        # strategy's maker-only execution contract.
+        if best_quote_frozen_pair_release_execution_type != "maker":
+            best_quote_frozen_pair_release_execution_type = "maker"
         best_quote_frozen_pair_release_max_30s_abs_return_ratio = max(
             _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio", 0.0015)),
             0.0,
@@ -27703,12 +29719,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             best_quote_inventory_soft_ratio *= best_quote_reduce_freeze_soft_scale
         best_quote_reduce_freeze = _best_quote_reduce_freeze_report(
             state=state,
-            current_long_qty=current_long_qty,
-            current_short_qty=current_short_qty,
-            current_long_avg_price=current_long_avg_price,
-            current_short_avg_price=current_short_avg_price,
+            current_long_qty=exchange_long_qty,
+            current_short_qty=exchange_short_qty,
+            current_long_avg_price=exchange_long_avg_price,
+            current_short_avg_price=exchange_short_avg_price,
             mid_price=mid_price,
             bq_ledger_report=best_quote_volume_ledger,
+            position_long_qty=exchange_long_qty,
+            position_short_qty=exchange_short_qty,
         )
         best_quote_reduce_freeze.update(
             {
@@ -27743,10 +29761,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                     getattr(effective_args, "best_quote_maker_volume_inventory_soft_ratio", 0.60)
                 ),
                 "effective_inventory_soft_ratio": best_quote_inventory_soft_ratio,
-                "actual_long_qty": current_long_qty,
-                "actual_short_qty": current_short_qty,
-                "actual_long_notional": current_long_notional,
-                "actual_short_notional": current_short_notional,
+                "actual_long_qty": exchange_long_qty,
+                "actual_short_qty": exchange_short_qty,
+                "actual_long_notional": exchange_long_qty * mid_price,
+                "actual_short_notional": exchange_short_qty * mid_price,
             }
         )
         freeze_fake_plan = {"buy_orders": [], "sell_orders": []}
@@ -27818,17 +29836,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             quality_medium_bucket_notional=best_quote_reduce_freeze_quality_medium_bucket_notional,
             quality_hard_bucket_notional=best_quote_reduce_freeze_quality_hard_bucket_notional,
             profitable_pair_gate_enabled=best_quote_reduce_freeze_profitable_pair_gate_enabled,
-            current_long_qty=current_long_qty,
-            current_short_qty=current_short_qty,
-            current_long_avg_price=current_long_avg_price,
-            current_short_avg_price=current_short_avg_price,
+            current_long_qty=exchange_long_qty,
+            current_short_qty=exchange_short_qty,
+            current_long_avg_price=exchange_long_avg_price,
+            current_short_avg_price=exchange_short_avg_price,
             mid_price=mid_price,
             bq_ledger_report=best_quote_volume_ledger,
         )
         best_quote_volume_ledger = dict(best_quote_reduce_freeze.get("volume_ledger") or best_quote_volume_ledger)
         best_quote_maker_volume["volume_ledger"] = dict(best_quote_volume_ledger)
-        managed_long_qty = max(_safe_float(best_quote_reduce_freeze.get("managed_long_qty")), 0.0)
-        managed_short_qty = max(_safe_float(best_quote_reduce_freeze.get("managed_short_qty")), 0.0)
         best_quote_reduce_freeze["exchange_unrealized_pnl"] = exchange_unrealized_pnl
         isolated_risk_metrics = bool(best_quote_reduce_freeze.get("isolates_risk_metrics"))
         reduce_freeze_pnl_sync_diff = abs(
@@ -27848,8 +29864,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         best_quote_reduce_freeze["pnl_sync_ok"] = reduce_freeze_pnl_sync_ok
         best_quote_reduce_freeze["pnl_sync_diff"] = reduce_freeze_pnl_sync_diff
         best_quote_reduce_freeze["pnl_sync_tolerance"] = reduce_freeze_pnl_sync_tolerance
-        current_long_qty = managed_long_qty
-        current_short_qty = managed_short_qty
+        frozen_long_qty = max(_safe_float(best_quote_reduce_freeze.get("frozen_long_qty")), 0.0)
+        frozen_short_qty = max(_safe_float(best_quote_reduce_freeze.get("frozen_short_qty")), 0.0)
+        ordinary_long_qty, ordinary_short_qty = _ordinary_position_qtys(
+            exchange_long_qty=exchange_long_qty,
+            exchange_short_qty=exchange_short_qty,
+            frozen_long_qty=frozen_long_qty,
+            frozen_short_qty=frozen_short_qty,
+        )
+        ordinary_actual_net_qty = ordinary_long_qty - ordinary_short_qty
+        ordinary_actual_net_notional = ordinary_actual_net_qty * max(mid_price, 0.0)
+        current_long_qty = ordinary_long_qty
+        current_short_qty = ordinary_short_qty
         current_long_notional = current_long_qty * mid_price
         current_short_notional = current_short_qty * mid_price
         if isolated_risk_metrics:
@@ -27880,7 +29906,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                     0.0,
                 ),
             )
-            volatility_entry_pause["inventory_scope"] = "managed_after_reduce_freeze"
+            volatility_entry_pause["inventory_scope"] = "ordinary_exchange_minus_frozen"
             current_long_avg_price = (
                 _safe_float(best_quote_reduce_freeze.get("managed_long_avg_price"))
                 if (uses_bq_volume_ledger or reduce_freeze_pnl_sync_ok)
@@ -27906,8 +29932,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             strategy_unrealized_pnl = exchange_unrealized_pnl
         best_quote_reduce_freeze["strategy_unrealized_pnl"] = strategy_unrealized_pnl
         unrealized_pnl = strategy_unrealized_pnl
-        strategy_actual_net_qty = current_long_qty - current_short_qty
-        strategy_actual_net_notional = strategy_actual_net_qty * max(mid_price, 0.0)
+        strategy_actual_net_qty = ordinary_actual_net_qty
+        strategy_actual_net_notional = ordinary_actual_net_notional
 
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
@@ -28170,9 +30196,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 same_side_entry_price_guard_gap_ticks=int(
                     getattr(effective_args, "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks", 0)
                 ),
-                frozen_v2_enabled=bool(
-                    getattr(effective_args, "best_quote_maker_volume_frozen_v2_enabled", False)
-                ),
+                # Frozen inventory has a dedicated owner and budget.  Keep its
+                # pressure metrics below for telemetry, but never let the old
+                # frozen_v2 controller scale or close ordinary maker lanes.
+                frozen_v2_enabled=False,
                 frozen_v2_pressure_ratio=float(
                     getattr(effective_args, "best_quote_maker_volume_frozen_v2_pressure_ratio", 0.60)
                 ),
@@ -28202,7 +30229,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 bid_price=bid_price,
                 ask_price=ask_price,
                 mid_price=mid_price,
-                current_net_qty=actual_net_qty,
+                current_net_qty=ordinary_actual_net_qty,
                 cycle_budget_notional=cycle_budget,
                 loss_per_10k_15m=best_quote_loss_per_10k_15m,
                 target_volume_remaining=target_remaining,
@@ -28369,6 +30396,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         best_quote_frozen_pair_release_directive_requested = bool(
             best_quote_frozen_pair_release_directive.get("requested")
         )
+        best_quote_frozen_pair_release_manifest_unresolved = (
+            _frozen_pair_manifest_has_unresolved_legs(
+                best_quote_frozen_pair_release_directive.get("submission_manifest")
+                if isinstance(
+                    best_quote_frozen_pair_release_directive.get(
+                        "submission_manifest"
+                    ),
+                    Mapping,
+                )
+                else None
+            )
+        )
         best_quote_frozen_pair_release_auto_requested = (
             best_quote_frozen_pair_release_directive_requested
             and str(best_quote_frozen_pair_release_directive.get("source") or "") == "auto_frozen_pair_release"
@@ -28383,13 +30422,29 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             else (False, "not_requested")
         )
         if best_quote_frozen_pair_release_directive_requested and not best_quote_frozen_pair_release_authorized:
-            state.pop("best_quote_frozen_inventory_pair_release", None)
-            best_quote_frozen_pair_release_directive = {}
+            if best_quote_frozen_pair_release_manifest_unresolved:
+                best_quote_frozen_pair_release_directive.update(
+                    {
+                        "requested": False,
+                        "cleanup_only": True,
+                        "placement_authorization_status": (
+                            best_quote_frozen_pair_release_auth_reason
+                        ),
+                        "updated_at": _utc_now().isoformat(),
+                    }
+                )
+                state["best_quote_frozen_inventory_pair_release"] = (
+                    best_quote_frozen_pair_release_directive
+                )
+            else:
+                state.pop("best_quote_frozen_inventory_pair_release", None)
+                best_quote_frozen_pair_release_directive = {}
             best_quote_frozen_pair_release_manual_requested = False
             best_quote_frozen_pair_release_auto_requested = False
             best_quote_frozen_pair_release_directive_requested = False
         if (
             not best_quote_frozen_pair_release_directive_requested
+            and not best_quote_frozen_pair_release_manifest_unresolved
             and best_quote_frozen_pair_release_enabled
             and not bool(state.get("best_quote_frozen_inventory_manual_reduce"))
         ):
@@ -28958,7 +31013,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         plan = _generate_competition_inventory_grid_plan(
             state=state,
             trades=inventory_grid_trades,
-            current_position_qty=abs(actual_net_qty),
+            current_position_qty=abs(ordinary_actual_net_qty),
             bid_price=bid_price,
             ask_price=ask_price,
             step_price=effective_args.step_price,
@@ -29000,7 +31055,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "max_short_position_notional": None,
         }
-        target_base_qty = abs(actual_net_qty)
+        target_base_qty = abs(ordinary_actual_net_qty)
         bootstrap_qty = sum(_safe_float(item.get("qty")) for item in list(plan.get("bootstrap_orders", [])))
     elif _is_one_way_short_mode(strategy_mode):
         if _is_best_quote_short_profile(effective_strategy_profile):
@@ -29421,24 +31476,49 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         bootstrap_qty = _safe_float(plan.get("bootstrap_qty", bootstrap_qty))
 
-    adverse_long_cost_price, adverse_long_cost_basis_source = _resolve_adverse_reduce_cost_basis(
-        side="long",
-        requested_strategy_mode=requested_strategy_mode,
-        actual_net_qty=actual_net_qty,
-        actual_cost_basis_price=actual_cost_basis_price,
-        long_position=long_position,
-        short_position=short_position,
-        synthetic_ledger_snapshot=synthetic_ledger_snapshot,
-    )
-    adverse_short_cost_price, adverse_short_cost_basis_source = _resolve_adverse_reduce_cost_basis(
-        side="short",
-        requested_strategy_mode=requested_strategy_mode,
-        actual_net_qty=actual_net_qty,
-        actual_cost_basis_price=actual_cost_basis_price,
-        long_position=long_position,
-        short_position=short_position,
-        synthetic_ledger_snapshot=synthetic_ledger_snapshot,
-    )
+    if _is_best_quote_maker_volume_mode(strategy_mode):
+        # BQ current_* is the canonical ordinary exchange-minus-frozen book.
+        # Reusing the exchange-side weighted average here lets a large frozen
+        # lot silently steer ordinary adverse-reduce and re-entry decisions.
+        adverse_long_cost_price = (
+            max(_safe_float(current_long_avg_price), 0.0)
+            if current_long_qty > 1e-12
+            else 0.0
+        )
+        adverse_short_cost_price = (
+            max(_safe_float(current_short_avg_price), 0.0)
+            if current_short_qty > 1e-12
+            else 0.0
+        )
+        managed_cost_source = str(
+            best_quote_reduce_freeze.get("managed_cost_basis_source")
+            or "ordinary_exchange_minus_frozen"
+        )
+        adverse_long_cost_basis_source = (
+            managed_cost_source if adverse_long_cost_price > 0 else None
+        )
+        adverse_short_cost_basis_source = (
+            managed_cost_source if adverse_short_cost_price > 0 else None
+        )
+    else:
+        adverse_long_cost_price, adverse_long_cost_basis_source = _resolve_adverse_reduce_cost_basis(
+            side="long",
+            requested_strategy_mode=requested_strategy_mode,
+            actual_net_qty=actual_net_qty,
+            actual_cost_basis_price=actual_cost_basis_price,
+            long_position=long_position,
+            short_position=short_position,
+            synthetic_ledger_snapshot=synthetic_ledger_snapshot,
+        )
+        adverse_short_cost_price, adverse_short_cost_basis_source = _resolve_adverse_reduce_cost_basis(
+            side="short",
+            requested_strategy_mode=requested_strategy_mode,
+            actual_net_qty=actual_net_qty,
+            actual_cost_basis_price=actual_cost_basis_price,
+            long_position=long_position,
+            short_position=short_position,
+            synthetic_ledger_snapshot=synthetic_ledger_snapshot,
+        )
     adverse_reduce_enabled = bool(getattr(effective_args, "adverse_reduce_enabled", False)) and not bool(
         (exposure_escalation or {}).get("active")
     )
@@ -29858,7 +31938,19 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             for item in desired_orders
             if str(item.get("side", "")).upper().strip() == "SELL"
         ]
-    strategy_open_orders = _filter_futures_strategy_orders(open_orders, symbol)
+    strategy_open_orders = _classify_current_frozen_inventory_open_orders(
+        args=args,
+        orders=_filter_futures_strategy_orders(open_orders, symbol),
+        now=datetime.now(timezone.utc),
+    )
+    ordinary_strategy_open_orders = [
+        order
+        for order in strategy_open_orders
+        if not is_frozen_inventory_order(order)
+    ]
+    frozen_strategy_open_orders = [
+        order for order in strategy_open_orders if is_frozen_inventory_order(order)
+    ]
     open_orders_for_diff = strategy_open_orders
     sticky_exit_mode = {"key": None, "roles": []}
     previous_sticky_exit_mode_key = str(state.get("sticky_exit_mode_key") or "").strip() or None
@@ -30137,6 +32229,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         _safe_float(getattr(effective_args, "loss_inventory_no_cross_small_entry_notional", 0.0)),
         _safe_float(loss_recovery_brush.get("entry_notional")) if loss_recovery_brush.get("active") else 0.0,
     )
+    # Persist the canonical inventory boundary used by this cycle.  BQ may
+    # explicitly update it once when an ordinary lot is transferred to the
+    # frozen ledger; no planner-local report is allowed to redefine it.
+    report_frozen_long_qty = frozen_long_qty
+    report_frozen_short_qty = frozen_short_qty
+    report_ordinary_long_qty = ordinary_long_qty
+    report_ordinary_short_qty = ordinary_short_qty
+    report_ordinary_actual_net_qty = ordinary_actual_net_qty
+    report_ordinary_actual_net_notional = ordinary_actual_net_notional
     report = {
         "generated_at": _isoformat(_utc_now()),
         "symbol": symbol,
@@ -30234,6 +32335,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "exchange_short_qty": exchange_short_qty,
         "exchange_actual_net_qty": exchange_actual_net_qty,
         "exchange_actual_net_notional": exchange_actual_net_notional,
+        "frozen_long_qty": report_frozen_long_qty,
+        "frozen_short_qty": report_frozen_short_qty,
+        "ordinary_long_qty": report_ordinary_long_qty,
+        "ordinary_short_qty": report_ordinary_short_qty,
+        "ordinary_actual_net_qty": report_ordinary_actual_net_qty,
+        "ordinary_actual_net_notional": report_ordinary_actual_net_notional,
         "strategy_actual_net_qty": strategy_actual_net_qty,
         "strategy_actual_net_notional": strategy_actual_net_notional,
         "unrealized_pnl": unrealized_pnl,
@@ -30353,6 +32460,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "inventory_grid_risk_state": plan.get("risk_state"),
         "tail_cleanup_active": bool(plan.get("tail_cleanup_active")),
         "open_order_count": len(strategy_open_orders),
+        "ordinary_open_order_count": len(ordinary_strategy_open_orders),
+        "frozen_open_order_count": len(frozen_strategy_open_orders),
         "total_open_order_count": len(open_orders),
         "account_snapshot_sources": account_snapshot_sources,
         "kept_orders": diff["kept_orders"],
@@ -30490,7 +32599,114 @@ def _actual_net_exposure_open_orders(
     ]
 
 
+def _cap_ordinary_reduce_only_place_orders_to_position(
+    *,
+    actions: dict[str, Any],
+    strategy_mode: str,
+    current_ordinary_actual_net_qty: float,
+    current_open_orders: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Cap only ordinary reduce orders against ordinary exchange inventory.
+
+    Frozen actions and open orders belong to their independent ledger.  They
+    must not donate capacity to an ordinary exit, and an empty ordinary book
+    must not cause a valid frozen reduction to be dropped before the symbol
+    action coordinator selects its lane.
+    """
+
+    all_place_orders = [
+        dict(item)
+        for item in actions.get("place_orders", [])
+        if isinstance(item, dict)
+    ]
+    all_cancel_orders = [
+        dict(item)
+        for item in actions.get("cancel_orders", [])
+        if isinstance(item, dict)
+    ]
+    frozen_place_orders = [
+        item for item in all_place_orders if is_frozen_inventory_order(item)
+    ]
+    frozen_cancel_orders = [
+        item for item in all_cancel_orders if is_frozen_inventory_order(item)
+    ]
+    ordinary_actions = dict(actions)
+    ordinary_actions.update(
+        {
+            "place_orders": [
+                item
+                for item in all_place_orders
+                if not is_frozen_inventory_order(item)
+            ],
+            "cancel_orders": [
+                item
+                for item in all_cancel_orders
+                if not is_frozen_inventory_order(item)
+            ],
+        }
+    )
+    ordinary_capped = cap_reduce_only_place_orders_to_position(
+        actions=ordinary_actions,
+        strategy_mode=strategy_mode,
+        current_actual_net_qty=current_ordinary_actual_net_qty,
+        current_open_orders=[
+            dict(item)
+            for item in current_open_orders
+            if isinstance(item, dict) and not is_frozen_inventory_order(item)
+        ],
+    )
+    place_orders = [
+        *[
+            dict(item)
+            for item in ordinary_capped.get("place_orders", [])
+            if isinstance(item, dict)
+        ],
+        *frozen_place_orders,
+    ]
+    cancel_orders = [
+        *[
+            dict(item)
+            for item in ordinary_capped.get("cancel_orders", [])
+            if isinstance(item, dict)
+        ],
+        *frozen_cancel_orders,
+    ]
+    result = dict(ordinary_capped)
+    result.update(
+        {
+            "place_orders": place_orders,
+            "cancel_orders": cancel_orders,
+            "place_count": len(place_orders),
+            "cancel_count": len(cancel_orders),
+            "place_notional": sum(
+                _safe_float(item.get("notional")) for item in place_orders
+            ),
+        }
+    )
+    cap_report = dict(result.get("reduce_only_position_cap") or {})
+    cap_report.update(
+        {
+            "inventory_scope": "ordinary_exchange_minus_frozen",
+            "excluded_frozen_place_count": len(frozen_place_orders),
+            "excluded_frozen_cancel_count": len(frozen_cancel_orders),
+        }
+    )
+    result["reduce_only_position_cap"] = cap_report
+    return result
+
+
 def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -> dict[str, Any]:
+    raw_state_path = plan_report.get("state_path") or getattr(args, "state_path", None)
+    if not raw_state_path:
+        if bool(getattr(args, "apply", False)):
+            raise RuntimeError("state_path is required for live execution")
+        return _execute_plan_report_unlocked(args, plan_report)
+    state_path = Path(str(raw_state_path))
+    with exclusive_json_state_lock(state_path):
+        return _execute_plan_report_unlocked(args, plan_report)
+
+
+def _execute_plan_report_unlocked(args: argparse.Namespace, plan_report: dict[str, Any]) -> dict[str, Any]:
     strategy_mode = str(plan_report.get("strategy_mode") or getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
     effective_max_total_notional = _safe_float(plan_report.get("effective_max_total_notional"))
     best_quote_max_order_notional = max(
@@ -30704,6 +32920,16 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             "mid_price": _safe_float(plan_report.get("mid_price")),
             "center_price": _safe_float(plan_report.get("center_price")),
             "open_order_count": int(plan_report.get("open_order_count", 0) or 0),
+            "ordinary_open_order_count": int(
+                plan_report.get(
+                    "ordinary_open_order_count",
+                    plan_report.get("open_order_count", 0),
+                )
+                or 0
+            ),
+            "frozen_open_order_count": int(
+                plan_report.get("frozen_open_order_count", 0) or 0
+            ),
             "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
             "current_short_qty": _safe_float(plan_report.get("current_short_qty")),
             "actual_net_qty": _safe_float(plan_report.get("actual_net_qty")),
@@ -30723,6 +32949,16 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             "synthetic_net_qty": _safe_float(plan_report.get("synthetic_net_qty")),
             "synthetic_drift_qty": _safe_float(plan_report.get("synthetic_drift_qty")),
             "open_order_count": int(plan_report.get("open_order_count", 0) or 0),
+            "ordinary_open_order_count": int(
+                plan_report.get(
+                    "ordinary_open_order_count",
+                    plan_report.get("open_order_count", 0),
+                )
+                or 0
+            ),
+            "frozen_open_order_count": int(
+                plan_report.get("frozen_open_order_count", 0) or 0
+            ),
             "buy_paused": bool(plan_report.get("buy_paused")),
             "pause_reasons": list(plan_report.get("pause_reasons", [])),
             "buy_cap_applied": bool(plan_report.get("buy_cap_applied")),
@@ -30805,23 +33041,67 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             "账户当前启用了 Multi-Assets Mode，Binance 不允许在该模式下切到 ISOLATED。"
         )
 
-    current_strategy_open_orders = _filter_futures_strategy_orders(current_open_orders, symbol)
+    current_strategy_open_orders = _classify_current_frozen_inventory_open_orders(
+        args=args,
+        orders=_filter_futures_strategy_orders(current_open_orders, symbol),
+        now=datetime.now(timezone.utc),
+    )
+    current_ordinary_open_orders = [
+        order
+        for order in current_strategy_open_orders
+        if not is_frozen_inventory_order(order)
+    ]
+    current_frozen_open_orders = [
+        order
+        for order in current_strategy_open_orders
+        if is_frozen_inventory_order(order)
+    ]
+    report["ordinary_open_order_count"] = len(current_ordinary_open_orders)
+    report["frozen_open_order_count"] = len(current_frozen_open_orders)
+    observed_open_order_state = dict(
+        report.get("observed_strategy_open_order_state") or {}
+    )
+    observed_open_order_state.update(
+        {
+            "ordinary_active_order_count": len(current_ordinary_open_orders),
+            "frozen_active_order_count": len(current_frozen_open_orders),
+        }
+    )
+    report["observed_strategy_open_order_state"] = observed_open_order_state
     report["account_snapshot_sources"] = submit_account_snapshot_sources
     expected_open_order_count = int(plan_report.get("open_order_count", 0) or 0)
+    expected_ordinary_open_order_count = int(
+        plan_report.get(
+            "ordinary_open_order_count",
+            expected_open_order_count,
+        )
+        or 0
+    )
     expected_long_qty = _safe_float(plan_report.get("current_long_qty"))
     expected_short_qty = _safe_float(plan_report.get("current_short_qty"))
     expected_actual_net_qty = _safe_float(plan_report.get("actual_net_qty"))
-    expected_exchange_long_qty = expected_long_qty
-    expected_exchange_short_qty = expected_short_qty
-    isolated_best_quote_reduce_freeze = False
-    if _is_hedge_best_quote_maker_volume_mode(strategy_mode):
-        best_quote_metrics = plan_report.get("best_quote_maker_volume")
-        if isinstance(best_quote_metrics, dict):
-            reduce_freeze = best_quote_metrics.get("reduce_freeze")
-            if isinstance(reduce_freeze, dict) and reduce_freeze.get("isolates_risk_metrics"):
-                isolated_best_quote_reduce_freeze = True
-                expected_exchange_long_qty += max(_safe_float(reduce_freeze.get("frozen_long_qty")), 0.0)
-                expected_exchange_short_qty += max(_safe_float(reduce_freeze.get("frozen_short_qty")), 0.0)
+    submit_frozen_long_qty, submit_frozen_short_qty = _plan_frozen_inventory_qtys(
+        plan_report
+    )
+    expected_exchange_long_qty = expected_long_qty + submit_frozen_long_qty
+    expected_exchange_short_qty = expected_short_qty + submit_frozen_short_qty
+    best_quote_metrics = plan_report.get("best_quote_maker_volume")
+    reduce_freeze = (
+        best_quote_metrics.get("reduce_freeze")
+        if isinstance(best_quote_metrics, Mapping)
+        else None
+    )
+    isolated_best_quote_reduce_freeze = bool(
+        _is_best_quote_maker_volume_mode(strategy_mode)
+        and (
+            submit_frozen_long_qty > 1e-12
+            or submit_frozen_short_qty > 1e-12
+            or (
+                isinstance(reduce_freeze, Mapping)
+                and reduce_freeze.get("isolates_risk_metrics")
+            )
+        )
+    )
     if _uses_exchange_hedge_position_sides(strategy_mode):
         current_long_position = extract_symbol_position(account_info, symbol, "LONG")
         current_short_position = extract_symbol_position(account_info, symbol, "SHORT")
@@ -30846,6 +33126,15 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         else:
             current_long_qty = max(current_actual_net_qty, 0.0)
             current_short_qty = 0.0
+    current_ordinary_long_qty, current_ordinary_short_qty = _ordinary_position_qtys(
+        exchange_long_qty=current_long_qty,
+        exchange_short_qty=current_short_qty,
+        frozen_long_qty=submit_frozen_long_qty,
+        frozen_short_qty=submit_frozen_short_qty,
+    )
+    current_ordinary_actual_net_qty = (
+        current_ordinary_long_qty - current_ordinary_short_qty
+    )
     allow_reduce_only_position_surplus = (
         isolated_best_quote_reduce_freeze
         and _all_place_orders_are_forced_hedge_reduces(validation["actions"])
@@ -30882,6 +33171,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         "expected_exchange_short_qty": expected_exchange_short_qty,
         "current_long_qty": current_long_qty,
         "current_short_qty": current_short_qty,
+        "frozen_long_qty": submit_frozen_long_qty,
+        "frozen_short_qty": submit_frozen_short_qty,
+        "ordinary_long_qty": current_ordinary_long_qty,
+        "ordinary_short_qty": current_ordinary_short_qty,
+        "ordinary_actual_net_qty": current_ordinary_actual_net_qty,
         "isolated_best_quote_reduce_freeze": isolated_best_quote_reduce_freeze,
         "reduce_only_position_surplus_allowed": allow_reduce_only_position_surplus,
         "isolated_frozen_position_mismatch_allowed": allow_isolated_frozen_position_mismatch,
@@ -30922,10 +33216,10 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         report["validation"] = validation
         report["position_reconcile"]["exchange_flat_resync"] = exchange_flat_resync
         return _mark_submit_report_blocked(report, reason="hedge_best_quote_exchange_flat_resynced")
-    if len(current_strategy_open_orders) != expected_open_order_count:
+    if len(current_ordinary_open_orders) != expected_ordinary_open_order_count:
         raise RuntimeError("当前未成交委托数量与计划生成时不一致，请等待下一轮刷新")
     # hedge BQ 快市容差：计划生成到提交之间落地的少量成交不再整轮拒绝。
-    # reduce-only 超挂由 cap_reduce_only_place_orders_to_position 兜底，敞口由
+    # 普通 reduce-only 超挂由 ordinary-scoped cap 兜底，敞口由
     # position_reconcile 下轮对齐；容差为 0（默认）时行为与旧版完全一致。
     bq_drift_tolerance_qty = hedge_bq_position_drift_tolerance_qty(
         args=args,
@@ -30989,10 +33283,10 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     ):
         raise RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新")
 
-    validation["actions"] = cap_reduce_only_place_orders_to_position(
+    validation["actions"] = _cap_ordinary_reduce_only_place_orders_to_position(
         actions=validation["actions"],
         strategy_mode=strategy_mode,
-        current_actual_net_qty=current_actual_net_qty,
+        current_ordinary_actual_net_qty=current_ordinary_actual_net_qty,
         current_open_orders=current_strategy_open_orders,
     )
     validation["actions"] = apply_anti_chase_entry_guard_to_actions(
@@ -31015,10 +33309,10 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         plan_report=plan_report,
         strategy_mode=strategy_mode,
     )
-    validation["actions"] = cap_reduce_only_place_orders_to_position(
+    validation["actions"] = _cap_ordinary_reduce_only_place_orders_to_position(
         actions=validation["actions"],
         strategy_mode=strategy_mode,
-        current_actual_net_qty=current_actual_net_qty,
+        current_ordinary_actual_net_qty=current_ordinary_actual_net_qty,
         current_open_orders=current_strategy_open_orders,
     )
     validation["actions"] = suppress_place_orders_with_existing_submitted_buckets(
@@ -31040,12 +33334,9 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         live_bid_price=live_bid_price,
         live_ask_price=live_ask_price,
     )
-    inventory_priority_net_qty = current_actual_net_qty
-    if isolated_best_quote_reduce_freeze:
-        inventory_priority_net_qty = expected_actual_net_qty
     validation["actions"] = prioritize_inventory_reducing_place_orders(
         actions=validation["actions"],
-        current_actual_net_qty=inventory_priority_net_qty,
+        current_actual_net_qty=current_ordinary_actual_net_qty,
         current_long_avg_price=_safe_float(plan_report.get("current_long_avg_price")),
         current_short_avg_price=_safe_float(plan_report.get("current_short_avg_price")),
         step_price=_safe_float((plan_report.get("adaptive_step") or {}).get("effective_step_price"))
@@ -31083,10 +33374,10 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
             min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         )
-        validation["actions"] = cap_reduce_only_place_orders_to_position(
+        validation["actions"] = _cap_ordinary_reduce_only_place_orders_to_position(
             actions=validation["actions"],
             strategy_mode=strategy_mode,
-            current_actual_net_qty=current_actual_net_qty,
+            current_ordinary_actual_net_qty=current_ordinary_actual_net_qty,
             current_open_orders=current_strategy_open_orders,
         )
     if _is_best_quote_maker_volume_mode(strategy_mode):
@@ -31210,33 +33501,18 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     report["runtime_safety_signal_execution"] = (
         runtime_safety_signal_execution
     )
-    best_quote_metrics = plan_report.get("best_quote_maker_volume")
-    frozen_total_cap = (
-        best_quote_metrics.get("frozen_total_cap")
-        if isinstance(best_quote_metrics, dict)
-        and isinstance(best_quote_metrics.get("frozen_total_cap"), dict)
-        else {}
-    )
     live_mid_price = (
         (live_bid_price + live_ask_price) / 2.0
         if live_bid_price > 0 and live_ask_price > 0
         else 0.0
     )
-    current_long_notional = max(current_long_qty * live_mid_price, 0.0)
-    current_short_notional = max(current_short_qty * live_mid_price, 0.0)
+    current_long_notional = max(current_ordinary_long_qty * live_mid_price, 0.0)
+    current_short_notional = max(current_ordinary_short_qty * live_mid_price, 0.0)
     validation["actions"] = apply_projected_entry_exposure_cap_to_actions(
         actions=validation["actions"],
         strategy_mode=strategy_mode,
-        current_long_notional=max(
-            current_long_notional
-            - _safe_float(frozen_total_cap.get("frozen_long_notional")),
-            0.0,
-        ),
-        current_short_notional=max(
-            current_short_notional
-            - _safe_float(frozen_total_cap.get("frozen_short_notional")),
-            0.0,
-        ),
+        current_long_notional=current_long_notional,
+        current_short_notional=current_short_notional,
         current_open_orders=current_strategy_open_orders,
         max_long_notional=_safe_float(
             plan_report.get("max_position_notional")
@@ -31252,9 +33528,14 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         api_secret=api_secret,
         snapshot_open_orders=current_open_orders,
     )
-    validation["actions"] = apply_actual_net_exposure_decision_to_actions(
+    actual_net_exposure_open_orders = _classify_current_frozen_inventory_open_orders(
+        args=args,
+        orders=actual_net_exposure_open_orders,
+        now=datetime.now(timezone.utc),
+    )
+    validation["actions"] = coordinate_symbol_execution_action(
         actions=validation["actions"],
-        current_actual_net_qty=current_actual_net_qty,
+        current_actual_net_qty=current_ordinary_actual_net_qty,
         valuation_price=live_mid_price,
         current_open_orders=actual_net_exposure_open_orders,
         owned_open_orders=_filter_futures_strategy_orders(
@@ -31265,6 +33546,26 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             getattr(args, "max_actual_net_notional", None)
         ),
     )
+    selected_action_decision = validation["actions"].get(
+        "actual_net_exposure_decision"
+    )
+    if (
+        isinstance(selected_action_decision, Mapping)
+        and selected_action_decision.get("selected_lane") == "frozen"
+    ):
+        selected_request_id = str(
+            selected_action_decision.get("selected_frozen_request_id") or ""
+        ).strip()
+        selection_recorded = _record_frozen_inventory_request_selection(
+            args=args,
+            request_id=selected_request_id,
+            now=datetime.now(timezone.utc),
+        )
+        selected_action_decision = dict(selected_action_decision)
+        selected_action_decision["selection_receipt_recorded"] = selection_recorded
+        validation["actions"]["actual_net_exposure_decision"] = (
+            selected_action_decision
+        )
     validation = _authorize_actual_net_safety_cancel_validation(validation)
     report["actual_net_exposure_decision"] = validation["actions"].get(
         "actual_net_exposure_decision"
@@ -31395,10 +33696,21 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     tick_size = _safe_float(symbol_info.get("tick_size"))
     min_qty = symbol_info.get("min_qty")
     min_notional = symbol_info.get("min_notional")
+    pair_manifest_state_path = Path(
+        str(plan_report.get("state_path") or args.state_path)
+    )
+    pair_place_orders = [
+        dict(item)
+        for item in validation["actions"]["place_orders"]
+        if isinstance(item, Mapping)
+        and _is_frozen_inventory_pair_release_order(item)
+    ]
+    pair_submission_manifest: dict[str, Any] | None = None
     for index, order in enumerate(validation["actions"]["place_orders"], start=1):
         role = str(order.get("role", "entry"))
         side = str(order.get("side", "")).upper().strip()
         position_side = _order_position_side(order)
+        is_frozen_pair_order = _is_frozen_inventory_pair_release_order(order)
         if _is_frozen_inventory_manual_order(order) and not _is_authorized_frozen_inventory_order(order):
             report["skipped_orders"].append(
                 {
@@ -31654,12 +33966,46 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                 )
                 last_exc = None
                 break
-            client_order_id = _build_recovery_aware_client_order_id(
-                symbol=symbol,
-                role=role,
-                index=index,
-                order=order,
-            )
+            if is_frozen_pair_order:
+                if pair_submission_manifest is None:
+                    pair_manifest_state = (
+                        read_json(pair_manifest_state_path)
+                        if pair_manifest_state_path.exists()
+                        else None
+                    )
+                    if not isinstance(pair_manifest_state, dict):
+                        raise RuntimeError(
+                            "frozen pair submission manifest state unavailable"
+                        )
+                    pair_submission_manifest = (
+                        _prepare_frozen_pair_submission_manifest(
+                            state=pair_manifest_state,
+                            symbol=symbol,
+                            orders=pair_place_orders,
+                            now=datetime.now(timezone.utc),
+                        )
+                    )
+                    _write_json(pair_manifest_state_path, pair_manifest_state)
+                pair_leg_key = "long" if role.lower().endswith("_long") else "short"
+                pair_manifest_leg = (
+                    (pair_submission_manifest.get("legs") or {}).get(pair_leg_key)
+                    if isinstance(pair_submission_manifest.get("legs"), Mapping)
+                    else None
+                )
+                client_order_id = str(
+                    (pair_manifest_leg or {}).get("client_order_id") or ""
+                ).strip()
+                if not client_order_id:
+                    raise RuntimeError(
+                        "frozen pair submission manifest client id missing"
+                    )
+            else:
+                client_order_id = _build_recovery_aware_client_order_id(
+                    symbol=symbol,
+                    role=role,
+                    index=index,
+                    order=order,
+                )
             if submitted_is_per_lot:
                 binding_state_path = Path(str(plan_report.get("state_path") or args.state_path))
                 binding_state = read_json(binding_state_path) if binding_state_path.exists() else None
@@ -31704,6 +34050,28 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                     last_exc = None
                     break
                 _write_json(binding_state_path, binding_state)
+            if is_frozen_pair_order:
+                pair_transition_state = read_json(pair_manifest_state_path)
+                if not isinstance(pair_transition_state, dict):
+                    raise RuntimeError(
+                        "frozen pair transition state unavailable before POST"
+                    )
+                transition = _record_frozen_pair_leg_transition(
+                    state=pair_transition_state,
+                    request_id=str(
+                        order.get("frozen_inventory_request_id") or ""
+                    ).strip(),
+                    role=role,
+                    status="submitting",
+                    response={"clientOrderId": client_order_id},
+                    now=datetime.now(timezone.utc),
+                )
+                if not transition.get("recorded"):
+                    raise RuntimeError(
+                        "frozen pair submitting transition was not persisted: "
+                        f"{transition.get('reason')}"
+                    )
+                _write_json(pair_manifest_state_path, pair_transition_state)
             try:
                 place_response = post_futures_order(
                     symbol=symbol,
@@ -31718,6 +34086,32 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                     reduce_only=reduce_only,
                     position_side=None if position_side == "BOTH" else position_side,
                 )
+                if is_frozen_pair_order:
+                    pair_transition_state = read_json(pair_manifest_state_path)
+                    if not isinstance(pair_transition_state, dict):
+                        raise RuntimeError(
+                            "frozen pair transition state unavailable after POST"
+                        )
+                    transition = _record_frozen_pair_leg_transition(
+                        state=pair_transition_state,
+                        request_id=str(
+                            order.get("frozen_inventory_request_id") or ""
+                        ).strip(),
+                        role=role,
+                        status="accepted",
+                        response=(
+                            place_response
+                            if isinstance(place_response, Mapping)
+                            else {"clientOrderId": client_order_id}
+                        ),
+                        now=datetime.now(timezone.utc),
+                    )
+                    if not transition.get("recorded"):
+                        raise RuntimeError(
+                            "frozen pair accepted transition was not persisted: "
+                            f"{transition.get('reason')}"
+                        )
+                    _write_json(pair_manifest_state_path, pair_transition_state)
                 report["placed_orders"].append(
                     {
                         "request": {
@@ -31754,6 +34148,28 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             except RuntimeError as exc:
                 last_exc = exc
                 message = str(exc).lower()
+                if is_frozen_pair_order:
+                    pair_transition_state = read_json(pair_manifest_state_path)
+                    if isinstance(pair_transition_state, dict):
+                        deterministic_reject = bool(
+                            "-4164" in message
+                            or _is_reduce_only_reject(exc)
+                            or "-5022" in message
+                            or "post only order will be rejected" in message
+                        )
+                        _record_frozen_pair_leg_transition(
+                            state=pair_transition_state,
+                            request_id=str(
+                                order.get("frozen_inventory_request_id") or ""
+                            ).strip(),
+                            role=role,
+                            status=("rejected" if deterministic_reject else "unknown"),
+                            response={"clientOrderId": client_order_id},
+                            error=str(exc),
+                            now=datetime.now(timezone.utc),
+                        )
+                        _write_json(pair_manifest_state_path, pair_transition_state)
+                    raise
                 if "-4164" in message and "notional must be no smaller than 5" in message:
                     report["skipped_orders"].append(
                         {
@@ -31999,8 +34415,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-frozen-pair-release-max-slippage-ticks", type=int, default=2)
     parser.add_argument(
         "--best-quote-maker-volume-frozen-pair-release-execution-type",
-        choices=("aggressive", "maker"),
-        default="aggressive",
+        choices=("maker",),
+        default="maker",
     )
     parser.add_argument(
         "--best-quote-maker-volume-frozen-pair-release-max-30s-abs-return-ratio",
@@ -33644,11 +36060,12 @@ def main() -> None:
     submit_report_path = Path(args.submit_report_json)
     summary_path = Path(args.summary_jsonl)
     audit_paths = build_audit_paths(summary_path)
-    startup_config_receipt = _record_current_recovery_config_applied(
-        args,
-        state_path=Path(args.state_path),
-        now=datetime.now(timezone.utc),
-    )
+    with exclusive_json_state_lock(Path(args.state_path)):
+        startup_config_receipt = _record_current_recovery_config_applied(
+            args,
+            state_path=Path(args.state_path),
+            now=datetime.now(timezone.utc),
+        )
     if startup_config_receipt is not None:
         print(
             "[recovery-config] applied "
@@ -33685,7 +36102,11 @@ def main() -> None:
         while True:
             cycle += 1
             cycle_started_at = datetime.now(timezone.utc)
+            cycle_state_lock = exclusive_json_state_lock(Path(args.state_path))
+            cycle_state_lock_entered = False
             try:
+                cycle_state_lock.__enter__()
+                cycle_state_lock_entered = True
                 temporary_loss_maintenance = (
                     _maintain_temporary_loss_recovery_receipts(
                         args,
@@ -33717,6 +36138,8 @@ def main() -> None:
                     consecutive_errors = 0
                     if args.iterations and cycle >= args.iterations:
                         break
+                    cycle_state_lock.__exit__(None, None, None)
+                    cycle_state_lock_entered = False
                     time.sleep(args.sleep_seconds)
                     continue
                 recovery_profile_maintenance = _maintain_normal_recovery_profile_gate(
@@ -33750,6 +36173,8 @@ def main() -> None:
                     consecutive_errors = 0
                     if args.iterations and cycle >= args.iterations:
                         break
+                    cycle_state_lock.__exit__(None, None, None)
+                    cycle_state_lock_entered = False
                     time.sleep(args.sleep_seconds)
                     continue
                 pre_guard_audit_sync = {
@@ -33791,6 +36216,8 @@ def main() -> None:
                         break
                     if args.iterations and cycle >= args.iterations:
                         break
+                    cycle_state_lock.__exit__(None, None, None)
+                    cycle_state_lock_entered = False
                     time.sleep(args.sleep_seconds)
                     continue
                 plan_report = generate_plan_report(args)
@@ -34617,11 +37044,17 @@ def main() -> None:
                 if _is_binance_rate_limit_error(exc):
                     backoff = max(RUNNER_RATE_LIMIT_BACKOFF_SECONDS, float(args.sleep_seconds))
                     print(f"[{cycle}] Binance rate limit detected; backing off {backoff:.1f}s")
+                    if cycle_state_lock_entered:
+                        cycle_state_lock.__exit__(None, None, None)
+                        cycle_state_lock_entered = False
                     time.sleep(backoff)
                 if consecutive_errors >= args.max_consecutive_errors:
                     raise SystemExit(
                         f"Stopped after {consecutive_errors} consecutive errors. Inspect {summary_path} and {submit_report_path}."
                     ) from exc
+            finally:
+                if cycle_state_lock_entered:
+                    cycle_state_lock.__exit__(None, None, None)
 
             if args.iterations and cycle >= args.iterations:
                 break

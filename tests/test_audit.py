@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from threading import Thread
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -8,6 +9,7 @@ from unittest.mock import patch
 from grid_optimizer.audit import (
     build_audit_paths,
     collect_new_rows,
+    exclusive_json_state_lock,
     fetch_time_paged,
     income_row_key,
     income_row_time_ms,
@@ -24,6 +26,91 @@ from grid_optimizer.audit import (
 
 
 class AuditTests(unittest.TestCase):
+    def test_json_state_lock_is_reentrant_and_excludes_other_threads(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            contender_errors: list[BaseException] = []
+
+            with exclusive_json_state_lock(path):
+                with exclusive_json_state_lock(path):
+                    pass
+
+                def contend() -> None:
+                    try:
+                        with exclusive_json_state_lock(path, timeout_seconds=0.05):
+                            pass
+                    except BaseException as exc:  # captured for the main test thread
+                        contender_errors.append(exc)
+
+                thread = Thread(target=contend)
+                thread.start()
+                thread.join(timeout=1.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(contender_errors), 1)
+            self.assertIsInstance(contender_errors[0], TimeoutError)
+            with exclusive_json_state_lock(path, timeout_seconds=0.05):
+                pass
+
+    def test_json_state_lock_canonicalizes_symlink_aliases(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            real_dir = Path(tmpdir) / "real"
+            real_dir.mkdir()
+            real_path = real_dir / "state.json"
+            real_path.write_text("{}", encoding="utf-8")
+            alias_path = Path(tmpdir) / "alias-state.json"
+            alias_path.symlink_to(real_path)
+            contender_errors: list[BaseException] = []
+
+            with exclusive_json_state_lock(real_path):
+                def contend() -> None:
+                    try:
+                        with exclusive_json_state_lock(
+                            alias_path,
+                            timeout_seconds=0.05,
+                        ):
+                            pass
+                    except BaseException as exc:
+                        contender_errors.append(exc)
+
+                thread = Thread(target=contend)
+                thread.start()
+                thread.join(timeout=1.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(contender_errors), 1)
+            self.assertIsInstance(contender_errors[0], TimeoutError)
+
+    def test_json_state_lock_accepts_legacy_read_only_lockfile(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text("{}", encoding="utf-8")
+            state_path.chmod(0o600)
+            lock_path = state_path.with_suffix(".json.state.lock")
+            lock_path.write_text("", encoding="utf-8")
+            lock_path.chmod(0o444)
+            original_open = Path.open
+
+            def reject_lockfile_write_open(
+                target: Path,
+                mode: str = "r",
+                *args: object,
+                **kwargs: object,
+            ):
+                if (
+                    target.resolve(strict=False) == lock_path.resolve(strict=False)
+                    and any(flag in mode for flag in ("a", "w", "+"))
+                ):
+                    raise PermissionError("legacy lockfile is not writable")
+                return original_open(target, mode, *args, **kwargs)
+
+            with patch.object(Path, "open", new=reject_lockfile_write_open):
+                with exclusive_json_state_lock(state_path, timeout_seconds=0.05):
+                    pass
+
+            self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(lock_path.stat().st_mode & 0o777, 0o444)
+
     def test_write_json_preserves_existing_file_when_write_is_interrupted(self) -> None:
         with TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.json"

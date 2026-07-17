@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
+import fcntl
 import json
+import os
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
+import threading
+import time
 from typing import Any, Callable, Iterator
 from uuid import uuid4
 
@@ -12,6 +17,8 @@ DEFAULT_AUDIT_LOOKBACK_DAYS = 7
 _JSONL_LINE_COUNT_CACHE: dict[str, tuple[int, int, int]] = {}
 _ISO_BOUNDS_CACHE: dict[str, tuple[int, int, datetime | None, datetime | None]] = {}
 _ARCHIVED_TRADE_AUDIT_ROWS_CACHE: dict[str, tuple[int, int, list[dict[str, Any]]]] = {}
+_JSON_STATE_LOCK_REGISTRY_GUARD = threading.Lock()
+_JSON_STATE_LOCK_REGISTRY: dict[tuple[str, int], dict[str, Any]] = {}
 
 
 def build_audit_paths(events_path: str | Path) -> dict[str, Path]:
@@ -55,6 +62,78 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
         temp_path.replace(path)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+@contextmanager
+def exclusive_json_state_lock(
+    state_path: Path,
+    *,
+    timeout_seconds: float = 30.0,
+) -> Iterator[None]:
+    """Serialize a complete JSON state read/modify/write transaction.
+
+    The lock is per state document, cross-process, and reentrant in the same
+    thread.  Callers must acquire it before the first read and retain it until
+    the atomic replacement has completed; locking only ``write_json`` would
+    still allow stale snapshots to overwrite newer directives or receipts.
+    """
+
+    path = Path(state_path).expanduser().resolve(strict=False)
+    normalized_path = str(path)
+    thread_key = (normalized_path, threading.get_ident())
+    with _JSON_STATE_LOCK_REGISTRY_GUARD:
+        existing = _JSON_STATE_LOCK_REGISTRY.get(thread_key)
+        if existing is not None:
+            existing["depth"] = int(existing["depth"]) + 1
+    if existing is not None:
+        try:
+            yield
+        finally:
+            with _JSON_STATE_LOCK_REGISTRY_GUARD:
+                current = _JSON_STATE_LOCK_REGISTRY[thread_key]
+                current["depth"] = int(current["depth"]) - 1
+        return
+
+    lock_path = path.with_suffix(path.suffix + ".state.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + max(float(timeout_seconds), 0.0)
+    lock_fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT, 0o666)
+    try:
+        lock_file = os.fdopen(lock_fd, "r", encoding="utf-8")
+    except BaseException:
+        os.close(lock_fd)
+        raise
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"timed out waiting for JSON state lock: {path}"
+                    )
+                time.sleep(0.01)
+        with _JSON_STATE_LOCK_REGISTRY_GUARD:
+            _JSON_STATE_LOCK_REGISTRY[thread_key] = {
+                "depth": 1,
+                "file": lock_file,
+            }
+        try:
+            yield
+        finally:
+            with _JSON_STATE_LOCK_REGISTRY_GUARD:
+                current = _JSON_STATE_LOCK_REGISTRY.get(thread_key)
+                if current is not None:
+                    current["depth"] = int(current["depth"]) - 1
+                    if int(current["depth"]) <= 0:
+                        _JSON_STATE_LOCK_REGISTRY.pop(thread_key, None)
+    finally:
+        if acquired:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:

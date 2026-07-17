@@ -13,6 +13,7 @@ from math import ceil
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from .audit import exclusive_json_state_lock
 from .futures_run_lifecycle import (
     resolve_authoritative_run_contract,
     run_contract_identity_from_config,
@@ -75,6 +76,7 @@ from .futures_volatility_safety_observation import (
     validate_volatility_safety_observation,
 )
 from .futures_recovery_shadow import flow_blockers_from_legacy
+from .futures_inventory_boundary import ordinary_side_notionals
 from .futures_recovery_store import (
     JsonRecoveryStore,
     RECOVERY_STATE_KEY,
@@ -750,6 +752,31 @@ def recover_corrupt_loop_state(
     dry_run: bool,
     exchange_snapshot_fetcher: CorruptStateExchangeFetcher | None = None,
 ) -> dict[str, Any] | None:
+    state_path = Path(output_dir) / f"{symbol.upper().strip().lower()}_loop_state.json"
+    with exclusive_json_state_lock(state_path):
+        return _recover_corrupt_loop_state_unlocked(
+            symbol=symbol,
+            output_dir=output_dir,
+            now=now,
+            max_backup_age_seconds=max_backup_age_seconds,
+            min_corrupt_age_seconds=min_corrupt_age_seconds,
+            max_snapshot_age_seconds=max_snapshot_age_seconds,
+            dry_run=dry_run,
+            exchange_snapshot_fetcher=exchange_snapshot_fetcher,
+        )
+
+
+def _recover_corrupt_loop_state_unlocked(
+    *,
+    symbol: str,
+    output_dir: Path,
+    now: datetime,
+    max_backup_age_seconds: float,
+    min_corrupt_age_seconds: float,
+    max_snapshot_age_seconds: float,
+    dry_run: bool,
+    exchange_snapshot_fetcher: CorruptStateExchangeFetcher | None = None,
+) -> dict[str, Any] | None:
     normalized_symbol = symbol.upper().strip()
     slug = normalized_symbol.lower()
     state_path = output_dir / f"{slug}_loop_state.json"
@@ -895,6 +922,65 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return default
+
+
+def _frozen_side_breakdown_error(
+    *,
+    frozen_long_notional: float,
+    frozen_short_notional: float,
+    frozen_total_notional: float,
+) -> str | None:
+    side_total = max(float(frozen_long_notional), 0.0) + max(
+        float(frozen_short_notional), 0.0
+    )
+    total = max(float(frozen_total_notional), 0.0)
+    tolerance = max(total, side_total, 1.0) * 1e-9
+    if total > side_total + tolerance:
+        return "frozen_side_breakdown_missing"
+    return None
+
+
+def _ordinary_inventory_notionals(
+    assessment: Mapping[str, Any],
+) -> tuple[float | None, float | None, str | None, str | None]:
+    """Return ordinary sides only when exchange-minus-frozen is provable."""
+    frozen_long = max(_safe_float(assessment.get("frozen_long_notional")), 0.0)
+    frozen_short = max(_safe_float(assessment.get("frozen_short_notional")), 0.0)
+    frozen_total = max(
+        _safe_float(assessment.get("frozen_total_notional")),
+        frozen_long + frozen_short,
+        0.0,
+    )
+    boundary_error = _frozen_side_breakdown_error(
+        frozen_long_notional=frozen_long,
+        frozen_short_notional=frozen_short,
+        frozen_total_notional=frozen_total,
+    )
+    if boundary_error is not None:
+        return None, None, None, boundary_error
+
+    actual_long = assessment.get("actual_long_notional")
+    actual_short = assessment.get("actual_short_notional")
+    if actual_long is not None and actual_short is not None:
+        try:
+            ordinary_long, ordinary_short = ordinary_side_notionals(
+                exchange_long_notional=actual_long,
+                exchange_short_notional=actual_short,
+                frozen_long_notional=frozen_long,
+                frozen_short_notional=frozen_short,
+            )
+        except ValueError as exc:
+            return None, None, None, str(exc)
+        return ordinary_long, ordinary_short, "exchange_minus_frozen", None
+
+    if frozen_total > 0:
+        return None, None, None, "exchange_position_breakdown_missing"
+    return (
+        max(_safe_float(assessment.get("current_long_notional")), 0.0),
+        max(_safe_float(assessment.get("current_short_notional")), 0.0),
+        "strategy_current_no_frozen",
+        None,
+    )
 
 
 def _is_high_recovery_wear(volume_summary: dict[str, Any]) -> bool:
@@ -1554,20 +1640,6 @@ def _loss_reduce_recovery_updates(
     ):
         if pause_key not in control:
             continue
-        if (
-            str(assessment.get("symbol") or "").upper() == "ARXUSDT"
-            and (
-                _safe_float(assessment.get("frozen_long_notional")) > 0.0
-                or _safe_float(assessment.get("frozen_short_notional")) > 0.0
-            )
-        ):
-            # Frozen ARX inventory has a separate cap/release policy.  A
-            # temporary active-only loss reducer may quote its reduce order,
-            # but must not ratchet the ordinary entry pauses down to the
-            # active balance and strand the two-sided volume loop.
-            if baseline > 0 and _safe_float(control.get(pause_key)) < baseline:
-                updates[pause_key] = baseline
-            continue
         if side not in reducible_sides:
             if baseline > 0 and _safe_float(control.get(pause_key)) < baseline:
                 updates[pause_key] = baseline
@@ -1706,7 +1778,24 @@ def _tick_size(plan: dict[str, Any], control: dict[str, Any]) -> float:
     return _safe_float(info.get("tick_size") or control.get("step_price"), 0.0)
 
 
-def _planned_orders(plan: dict[str, Any], submit: dict[str, Any]) -> list[dict[str, Any]]:
+def _order_is_authorized_frozen(order: Mapping[str, Any]) -> bool:
+    role = str(order.get("role") or "").lower().strip()
+    book = str(order.get("book") or order.get("ledger_class") or "").lower().strip()
+    explicitly_frozen = bool(
+        book == "frozen_bq"
+        or role.startswith("frozen_inventory_")
+        or order.get("manual_frozen_inventory_reduce")
+        or order.get("manual_frozen_inventory_limit")
+        or order.get("frozen_inventory_pair_release")
+        or order.get("frozen_inventory_per_lot_release")
+    )
+    return bool(
+        explicitly_frozen
+        and order.get("frozen_inventory_authorization_validated") is True
+    )
+
+
+def _all_planned_orders(plan: dict[str, Any], submit: dict[str, Any]) -> list[dict[str, Any]]:
     orders: list[dict[str, Any]] = []
     for key in ("buy_orders", "sell_orders", "forced_reduce_orders"):
         for item in list(plan.get(key) or []):
@@ -1718,6 +1807,14 @@ def _planned_orders(plan: dict[str, Any], submit: dict[str, Any]) -> list[dict[s
             if isinstance(item, dict):
                 orders.append(item)
     return orders
+
+
+def _planned_orders(plan: dict[str, Any], submit: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        order
+        for order in _all_planned_orders(plan, submit)
+        if not _order_is_authorized_frozen(order)
+    ]
 
 
 def _order_is_near_market(order: dict[str, Any], *, bid: float, ask: float, tick_size: float, far_ticks: int) -> bool:
@@ -1777,6 +1874,18 @@ def _active_order_count(plan: dict[str, Any], submit: dict[str, Any]) -> int:
         else {}
     )
     plan_summary = submit.get("plan_summary", {}) if isinstance(submit.get("plan_summary"), dict) else {}
+    explicit_ordinary_counts = [
+        _safe_int(mapping.get(key))
+        for mapping, key in (
+            (plan, "ordinary_open_order_count"),
+            (submit, "ordinary_open_order_count"),
+            (observed, "ordinary_active_order_count"),
+            (plan_summary, "ordinary_open_order_count"),
+        )
+        if key in mapping
+    ]
+    if explicit_ordinary_counts:
+        return max(explicit_ordinary_counts)
     return max(
         _safe_int(plan.get("open_order_count")),
         _safe_int(plan.get("total_open_order_count")),
@@ -1853,7 +1962,11 @@ def assess_symbol(
     gross = _safe_float(volume_summary.get("gross_notional"))
     bid, ask = _live_book(plan, submit)
     tick = _tick_size(plan, control)
+    all_planned_orders = _all_planned_orders(plan, submit)
     orders = _planned_orders(plan, submit)
+    frozen_planned_orders = [
+        item for item in all_planned_orders if _order_is_authorized_frozen(item)
+    ]
     reduce_only_orders = [item for item in orders if _order_is_reduce_only(item)]
     entry_orders = [item for item in orders if not _order_is_reduce_only(item)]
     reduce_only_order_count = len(reduce_only_orders)
@@ -1870,8 +1983,20 @@ def assess_symbol(
     entry_sell_order_count = sum(
         1 for item in entry_orders if str(item.get("side") or "").upper().strip() == "SELL"
     )
-    stale_order_count = len(list(plan.get("stale_orders") or []))
-    missing_order_count = len(list(plan.get("missing_orders") or []))
+    stale_orders = list(plan.get("stale_orders") or [])
+    missing_orders = list(plan.get("missing_orders") or [])
+    frozen_stale_order_count = sum(
+        1
+        for item in stale_orders
+        if isinstance(item, Mapping) and _order_is_authorized_frozen(item)
+    )
+    frozen_missing_order_count = sum(
+        1
+        for item in missing_orders
+        if isinstance(item, Mapping) and _order_is_authorized_frozen(item)
+    )
+    stale_order_count = len(stale_orders) - frozen_stale_order_count
+    missing_order_count = len(missing_orders) - frozen_missing_order_count
     reduce_only_only = bool(orders) and entry_order_count == 0
     near_orders = [
         item
@@ -2042,11 +2167,14 @@ def assess_symbol(
         "gross_notional": gross,
         "active_order_count": active_count,
         "planned_order_count": len(orders),
+        "frozen_planned_order_count": len(frozen_planned_orders),
         "planned_entry_order_count": entry_order_count,
         "planned_entry_buy_order_count": entry_buy_order_count,
         "planned_entry_sell_order_count": entry_sell_order_count,
         "stale_order_count": stale_order_count,
         "missing_order_count": missing_order_count,
+        "frozen_stale_order_count": frozen_stale_order_count,
+        "frozen_missing_order_count": frozen_missing_order_count,
         "balancing_entry_only": balancing_entry_only,
         "balancing_entry_requote_safe": balancing_entry_requote_safe,
         "balancing_budget_raise_safe": balancing_budget_raise_safe,
@@ -2396,6 +2524,28 @@ def _best_quote_lot_average_price(lots: Any, fallback: float) -> float:
 
 
 def _restore_arx_frozen_ledger_after_reset(
+    *,
+    output_dir: Path,
+    symbol: str,
+    now: datetime,
+    dry_run: bool,
+    position_snapshot_fetcher: HedgePositionFetcher | None = None,
+) -> dict[str, Any] | None:
+    normalized_symbol = symbol.upper().strip()
+    if normalized_symbol != "ARXUSDT":
+        return None
+    state_path = Path(output_dir) / f"{normalized_symbol.lower()}_loop_state.json"
+    with exclusive_json_state_lock(state_path):
+        return _restore_arx_frozen_ledger_after_reset_unlocked(
+            output_dir=output_dir,
+            symbol=symbol,
+            now=now,
+            dry_run=dry_run,
+            position_snapshot_fetcher=position_snapshot_fetcher,
+        )
+
+
+def _restore_arx_frozen_ledger_after_reset_unlocked(
     *,
     output_dir: Path,
     symbol: str,
@@ -3644,26 +3794,34 @@ def arx_severe_pace_capacity_updates(
     """Temporarily use the profile hard cap before blocking a lagging ARX book.
 
     This does not expand either profile side cap.  It only prevents the 85%
-    soft band from converting a still-safe (under 1,800U exchange side)
+    soft band from converting a still-safe (under 1,800U ordinary side)
     book into reduce-only while a materially behind target needs maker flow.
     """
-    del frozen_long_notional, frozen_short_notional
+    del frozen_total_notional, frozen_long_notional, frozen_short_notional
     profile_cap = max(
         _safe_float(control.get("max_position_notional")),
         _safe_float(control.get("max_short_position_notional")),
         _safe_float(control.get("best_quote_maker_volume_max_long_notional")),
         _safe_float(control.get("best_quote_maker_volume_max_short_notional")),
     )
+    soft_ratio = _safe_float(
+        control.get("best_quote_maker_volume_inventory_soft_ratio")
+    )
+    ordinary_side_max = max(
+        _safe_float(actual_long_notional),
+        _safe_float(actual_short_notional),
+    )
     if (
         not bool(target_pace_behind)
         or float(pace_ratio) >= 0.75
         or bool(near_cap)
         or bool(volatility_entry_pause_active)
-        or float(frozen_total_notional) <= 0.0
         or profile_cap <= 0
         or profile_cap > 1500.0
-        or max(float(actual_long_notional), float(actual_short_notional)) >= 1800.0
-        or _safe_float(control.get("best_quote_maker_volume_inventory_soft_ratio")) >= 1.0
+        or soft_ratio <= 0.0
+        or soft_ratio >= 1.0
+        or ordinary_side_max < profile_cap * soft_ratio
+        or ordinary_side_max >= 1800.0
     ):
         return {}
     return {"best_quote_maker_volume_inventory_soft_ratio": 1.0}
@@ -3879,6 +4037,19 @@ def _net_guard_stop_recovery(
     snapshot_short = _safe_float(reduce_freeze.get("actual_short_notional"))
     exchange_long = _safe_float(exchange.get("long_notional"))
     exchange_short = _safe_float(exchange.get("short_notional"))
+    frozen_long = max(_safe_float(reduce_freeze.get("frozen_long_notional")), 0.0)
+    frozen_short = max(_safe_float(reduce_freeze.get("frozen_short_notional")), 0.0)
+    frozen_v2 = (
+        best_quote.get("frozen_v2")
+        if isinstance(best_quote, dict)
+        and isinstance(best_quote.get("frozen_v2"), dict)
+        else {}
+    )
+    frozen_total = max(
+        frozen_long + frozen_short,
+        _safe_float(frozen_v2.get("frozen_total_notional")),
+        0.0,
+    )
     configured_max_net = _safe_float(control.get("max_actual_net_notional"))
     max_net = _safe_float(recovery_baseline_notional) or configured_max_net
     per_order = max(
@@ -3893,7 +4064,39 @@ def _net_guard_stop_recovery(
         per_order * 2.0,
         100.0,
     )
-    net_notional = exchange_long - exchange_short
+    frozen_boundary_error = _frozen_side_breakdown_error(
+        frozen_long_notional=frozen_long,
+        frozen_short_notional=frozen_short,
+        frozen_total_notional=frozen_total,
+    )
+    if frozen_boundary_error is not None:
+        return {}, {
+            "ok": False,
+            "reason": frozen_boundary_error,
+            "exchange_long_notional": exchange_long,
+            "exchange_short_notional": exchange_short,
+            "frozen_long_notional": frozen_long,
+            "frozen_short_notional": frozen_short,
+            "frozen_total_notional": frozen_total,
+        }
+    try:
+        ordinary_long, ordinary_short = ordinary_side_notionals(
+            exchange_long_notional=exchange_long,
+            exchange_short_notional=exchange_short,
+            frozen_long_notional=frozen_long,
+            frozen_short_notional=frozen_short,
+        )
+    except ValueError as exc:
+        return {}, {
+            "ok": False,
+            "reason": "frozen_ledger_exceeds_exchange_position",
+            "error": str(exc),
+            "exchange_long_notional": exchange_long,
+            "exchange_short_notional": exchange_short,
+            "frozen_long_notional": frozen_long,
+            "frozen_short_notional": frozen_short,
+        }
+    net_notional = ordinary_long - ordinary_short
     net_abs = abs(net_notional)
     details = {
         "ok": False,
@@ -3907,6 +4110,10 @@ def _net_guard_stop_recovery(
         "configured_max_actual_net_notional": configured_max_net,
         "recovery_baseline_notional": _safe_float(recovery_baseline_notional),
         "effective_guard_baseline_notional": max_net,
+        "exchange_total_net_notional": exchange_long - exchange_short,
+        "ordinary_long_notional": ordinary_long,
+        "ordinary_short_notional": ordinary_short,
+        "ordinary_net_notional": net_notional,
         "net_notional": net_notional,
         "net_notional_abs": net_abs,
     }
@@ -4149,7 +4356,12 @@ def recover_inactive_runner(
             }
         if net_guard_live_gate is not None and not bool(net_guard_live_gate.get("ok")):
             stale_only = set(gate["reasons"]).issubset(
-                {"latest_plan_stale", "latest_submit_stale"}
+                {
+                    "latest_plan_stale",
+                    "latest_submit_stale",
+                    "explicit_stop_reason",
+                    "runtime_status_stopped",
+                }
             )
             # A stopped runner necessarily has stale snapshots.  If a prior
             # max-net stop is now back inside its limit and the exchange still
@@ -4542,21 +4754,43 @@ def check_symbol(
     )
     assessment["recovery_entry_reserve_notional"] = recovery_entry_reserve_notional
     max_actual_net_notional = _safe_float(control.get("max_actual_net_notional"))
-    actual_long_for_net = assessment.get("actual_long_notional")
-    actual_short_for_net = assessment.get("actual_short_notional")
-    if actual_long_for_net is None or actual_short_for_net is None:
-        actual_long_for_net = assessment.get("current_long_notional")
-        actual_short_for_net = assessment.get("current_short_notional")
-    actual_net_for_entry = abs(
-        _safe_float(actual_long_for_net) - _safe_float(actual_short_for_net)
+    (
+        ordinary_long_notional,
+        ordinary_short_notional,
+        ordinary_inventory_source,
+        ordinary_boundary_error,
+    ) = _ordinary_inventory_notionals(assessment)
+    ordinary_inventory_available = (
+        ordinary_boundary_error is None
+        and ordinary_long_notional is not None
+        and ordinary_short_notional is not None
+    )
+    ordinary_exchange_inventory_available = (
+        ordinary_inventory_available
+        and ordinary_inventory_source == "exchange_minus_frozen"
+    )
+    actual_net_for_entry = (
+        abs(float(ordinary_long_notional) - float(ordinary_short_notional))
+        if ordinary_inventory_available
+        else None
     )
     net_guard_entry_buffer_ok = (
-        max_actual_net_notional <= 0
-        or actual_net_for_entry + recovery_entry_reserve_notional
-        <= max_actual_net_notional * 0.95
+        ordinary_inventory_available
+        and (
+            max_actual_net_notional <= 0
+            or float(actual_net_for_entry) + recovery_entry_reserve_notional
+            <= max_actual_net_notional * 0.95
+        )
     )
     assessment["actual_net_notional_for_entry"] = actual_net_for_entry
     assessment["net_guard_entry_buffer_ok"] = net_guard_entry_buffer_ok
+    assessment["ordinary_long_notional"] = ordinary_long_notional
+    assessment["ordinary_short_notional"] = ordinary_short_notional
+    assessment["ordinary_inventory_source"] = ordinary_inventory_source
+    assessment["ordinary_exchange_inventory_available"] = (
+        ordinary_exchange_inventory_available
+    )
+    assessment["ordinary_inventory_boundary_error"] = ordinary_boundary_error
     ledger_drift_threshold = max(
         100.0,
         max(
@@ -4624,11 +4858,11 @@ def check_symbol(
     restart = restart_runner or (lambda item_symbol: _default_restart_runner(item_symbol, runner_wrapper=runner_wrapper))
     net_guard_baseline = _safe_float(item.get("net_guard_recovery_baseline_notional"))
     if net_guard_baseline > 0:
-        actual_long = assessment.get("actual_long_notional")
-        actual_short = assessment.get("actual_short_notional")
+        boundary_incident: dict[str, Any] | None = None
+        boundary_terminal_outcome: dict[str, Any] | None = None
         actual_net = (
-            abs(_safe_float(actual_long) - _safe_float(actual_short))
-            if actual_long is not None and actual_short is not None
+            abs(float(ordinary_long_notional) - float(ordinary_short_notional))
+            if ordinary_inventory_available
             else None
         )
         expected_controls = item.get("guard_recovery_controls")
@@ -4686,7 +4920,67 @@ def check_symbol(
                 "recovery_owned",
             ):
                 item.pop(key, None)
+            item.pop("net_guard_inventory_boundary_incident", None)
+            item.pop("net_guard_inventory_boundary_terminal_outcome", None)
+        elif not ordinary_inventory_available:
+            raw_incident = item.get("net_guard_inventory_boundary_incident")
+            raw_incident = (
+                dict(raw_incident) if isinstance(raw_incident, dict) else {}
+            )
+            started_at = _parse_time(raw_incident.get("started_at")) or now
+            deadline_at = _parse_time(raw_incident.get("deadline_at"))
+            if deadline_at is None:
+                deadline_at = started_at + timedelta(
+                    seconds=max(float(max_recovery_seconds), 0.0)
+                )
+            attempt_count = max(
+                _safe_int(raw_incident.get("attempt_count")),
+                0,
+            ) + 1
+            boundary_error = str(
+                ordinary_boundary_error or "ordinary_inventory_boundary_unknown"
+            )
+            manual_required = now >= deadline_at
+            boundary_incident = {
+                "status": "manual_required" if manual_required else "probing",
+                "attempt_count": attempt_count,
+                "started_at": started_at.isoformat(),
+                "deadline_at": deadline_at.isoformat(),
+                "last_checked_at": now.isoformat(),
+                "boundary_error": boundary_error,
+            }
+            item["net_guard_inventory_boundary_incident"] = boundary_incident
+            if manual_required:
+                action = "hold_net_guard_inventory_boundary_manual_required"
+                boundary_terminal_outcome = {
+                    "status": "manual_required",
+                    "effect_stage": "inventory_boundary_reconciliation",
+                    "reason": boundary_error,
+                    "completed_at": now.isoformat(),
+                }
+                item["net_guard_inventory_boundary_terminal_outcome"] = (
+                    boundary_terminal_outcome
+                )
+            else:
+                action = "hold_net_guard_inventory_boundary_unknown"
+                item.pop(
+                    "net_guard_inventory_boundary_terminal_outcome",
+                    None,
+                )
+            item.update(
+                {
+                    "status": (
+                        "net_guard_recovery_manual_required"
+                        if manual_required
+                        else "net_guard_recovery_active"
+                    ),
+                    "last_recovery_check_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
         else:
+            item.pop("net_guard_inventory_boundary_incident", None)
+            item.pop("net_guard_inventory_boundary_terminal_outcome", None)
             drifted_updates = {
                 key: value for key, value in expected_controls.items() if control.get(key) != value
             }
@@ -4766,23 +5060,22 @@ def check_symbol(
             "net_guard_recovery_baseline_notional": net_guard_baseline,
             "net_guard_restore_baseline_notional": restore_baseline,
             "net_guard_actual_notional": actual_net,
+            "net_guard_inventory_boundary_incident": boundary_incident,
+            "net_guard_inventory_boundary_terminal_outcome": (
+                boundary_terminal_outcome
+            ),
         }
         _append_jsonl(
             output_dir / "bq_volume_recovery_guard_events.jsonl",
             {"ts": now.isoformat(), **result},
         )
         return result
-    actual_long = assessment.get("actual_long_notional")
-    actual_short = assessment.get("actual_short_notional")
-    directional_long = _safe_float(
-        actual_long if actual_long is not None else assessment.get("current_long_notional")
-    )
-    directional_short = _safe_float(
-        actual_short if actual_short is not None else assessment.get("current_short_notional")
-    )
+    directional_long = _safe_float(ordinary_long_notional)
+    directional_short = _safe_float(ordinary_short_notional)
     directional_buffer = max(parameters.per_order_notional, 1.0)
     if (
-        bool(control.get("best_quote_maker_volume_suppress_short_reduce_enabled"))
+        ordinary_inventory_available
+        and bool(control.get("best_quote_maker_volume_suppress_short_reduce_enabled"))
         and directional_long <= directional_short + directional_buffer
     ):
         updates = {
@@ -5151,22 +5444,14 @@ def check_symbol(
         if normalized_symbol == "ARXUSDT"
         else {}
     )
-    if normalized_symbol == "ARXUSDT":
+    if normalized_symbol == "ARXUSDT" and ordinary_exchange_inventory_available:
         arx_low_pace_two_sided_restore = arx_low_pace_two_sided_maker_restore_updates(
             control=control,
             target_pace_behind=target_pace_behind,
             pace_ratio=pace_ratio,
             low_pace_seconds=low_pace_seconds,
-            actual_long_notional=_safe_float(
-                assessment.get("current_long_notional")
-                if _safe_float(assessment.get("frozen_long_notional")) > 0.0
-                else assessment.get("actual_long_notional")
-            ),
-            actual_short_notional=_safe_float(
-                assessment.get("current_short_notional")
-                if _safe_float(assessment.get("frozen_short_notional")) > 0.0
-                else assessment.get("actual_short_notional")
-            ),
+            actual_long_notional=float(ordinary_long_notional),
+            actual_short_notional=float(ordinary_short_notional),
             volatility_entry_pause_active=bool(assessment.get("volatility_entry_pause_active")),
             high_recovery_wear=high_recovery_wear or confirmed_loss_reduce_wear,
         )
@@ -5260,53 +5545,29 @@ def check_symbol(
         frozen_total_notional=_safe_float(assessment.get("frozen_total_notional")),
         frozen_long_notional=_safe_float(assessment.get("frozen_long_notional")),
         frozen_short_notional=_safe_float(assessment.get("frozen_short_notional")),
-        actual_long_notional=_safe_float(assessment.get("actual_long_notional")),
-        actual_short_notional=_safe_float(assessment.get("actual_short_notional")),
-    ) if normalized_symbol == "ARXUSDT" else {}
+        actual_long_notional=float(ordinary_long_notional),
+        actual_short_notional=float(ordinary_short_notional),
+    ) if normalized_symbol == "ARXUSDT" and ordinary_exchange_inventory_available else {}
     arx_frozen_inventory_headroom = arx_frozen_inventory_headroom_updates(
         control=control,
         frozen_long_notional=_safe_float(assessment.get("frozen_long_notional")),
         frozen_short_notional=_safe_float(assessment.get("frozen_short_notional")),
     ) if normalized_symbol == "ARXUSDT" else {}
-    frozen_inventory_present = (
-        _safe_float(assessment.get("frozen_long_notional")) > 0.0
-        or _safe_float(assessment.get("frozen_short_notional")) > 0.0
-    )
-    directional_long_notional = _safe_float(
-        assessment.get(
-            "current_long_notional"
-            if frozen_inventory_present
-            else "actual_long_notional"
-        )
-    )
-    directional_short_notional = _safe_float(
-        assessment.get(
-            "current_short_notional"
-            if frozen_inventory_present
-            else "actual_short_notional"
-        )
-    )
+    directional_long_notional = _safe_float(ordinary_long_notional)
+    directional_short_notional = _safe_float(ordinary_short_notional)
     arx_side_cap_unwind = {
         **arx_active_side_cap,
         **arx_frozen_inventory_headroom,
         **arx_side_cap_unwind_updates(
             control=control,
-            # Frozen inventory has its own cap and release policy. Directional
-            # recovery must only react to runner-managed active inventory; a
-            # frozen lot above the active soft band must not latch net-long or
-            # net-short and suppress both normal entry legs. With no frozen
-            # inventory, retain the existing exchange-actual behavior.
             actual_long_notional=directional_long_notional,
             actual_short_notional=directional_short_notional,
             high_recovery_wear=high_recovery_wear or confirmed_loss_reduce_wear,
             recover_cap_ratio=recover_cap_ratio,
             near_cap_ratio=near_cap_ratio,
-            # The runner profile caps only the ordinary ledger.  Once frozen
-            # lots exist, use exchange-side 2,000U limits for side relief and
-            # managed inventory for net balancing.
-            ignore_profile_side_cap=frozen_inventory_present,
-            exchange_long_notional=_safe_float(assessment.get("actual_long_notional")),
-            exchange_short_notional=_safe_float(assessment.get("actual_short_notional")),
+            ignore_profile_side_cap=False,
+            exchange_long_notional=directional_long_notional,
+            exchange_short_notional=directional_short_notional,
             # A normal directional guard only reacts after a soft breach.
             # When a lagging run loses either entry leg to an active cap, keep
             # a bounded release state so ordinary entry cannot refill that
@@ -5323,22 +5584,17 @@ def check_symbol(
                 )
             ),
         ),
-    } if normalized_symbol == "ARXUSDT" else {}
+    } if normalized_symbol == "ARXUSDT" and ordinary_exchange_inventory_available else (
+        arx_active_side_cap if normalized_symbol == "ARXUSDT" else {}
+    )
     arx_low_pace_two_sided_headroom = (
         normalized_symbol == "ARXUSDT"
+        and ordinary_exchange_inventory_available
         and should_keep_arx_low_pace_two_sided_flow(
             target_pace_behind=target_pace_behind,
             pace_ratio=pace_ratio,
-            actual_long_notional=_safe_float(
-                assessment.get("current_long_notional")
-                if _safe_float(assessment.get("frozen_long_notional")) > 0.0
-                else assessment.get("actual_long_notional")
-            ),
-            actual_short_notional=_safe_float(
-                assessment.get("current_short_notional")
-                if _safe_float(assessment.get("frozen_short_notional")) > 0.0
-                else assessment.get("actual_short_notional")
-            ),
+            actual_long_notional=_safe_float(ordinary_long_notional),
+            actual_short_notional=_safe_float(ordinary_short_notional),
             volatility_entry_pause_active=bool(
                 assessment.get("volatility_entry_pause_active")
             ),
@@ -7118,27 +7374,9 @@ def check_symbol(
                 > _safe_float(recovery_original_controls.get(key))
             )
             if recovery_gate_already_raised:
-                if frozen_inventory_present:
-                    # A freeze-isolated runner may rebalance active inventory
-                    # below its soft bands while an earlier anti-chase relief
-                    # is still exactly at the heavier active leg. Permit one
-                    # additional ordinary maker order, but never above the
-                    # active soft band. This is a bounded, reversible gate
-                    # relaxation rather than a change to frozen exposure.
-                    active_soft_limit = max(
-                        _safe_float(assessment.get("long_soft_limit_notional")),
-                        _safe_float(assessment.get("short_soft_limit_notional")),
-                    )
-                    target_gate = float(
-                        ceil(
-                            min(
-                                heavier_inventory + order_notional,
-                                max(active_soft_limit - 1.0, current_gate),
-                            )
-                        )
-                    )
-                else:
-                    target_gate = float(ceil(max(heavier_inventory - 1.0, current_gate)))
+                target_gate = float(
+                    ceil(max(heavier_inventory - 1.0, current_gate))
+                )
             elif no_fill_seconds >= 300.0 and pace_ratio < 0.1:
                 max_inventory = max(
                     _safe_float(assessment.get("max_long_notional")),

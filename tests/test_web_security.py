@@ -327,6 +327,73 @@ class WebSecurityTests(unittest.TestCase):
         mock_delete_order.assert_called_once()
         self.assertEqual(mock_delete_order.call_args.kwargs["orig_client_order_id"], "gx-btcusdc-entry-1")
 
+    @patch("grid_optimizer.web.delete_futures_order")
+    @patch("grid_optimizer.web.fetch_futures_open_orders")
+    def test_cancel_symbol_open_orders_preserves_durable_frozen_refs_and_manifest(
+        self,
+        mock_open_orders,
+        mock_delete_order,
+    ) -> None:
+        frozen_ref_client_id = "gx-bchu-frml-1-deadbeef"
+        frozen_manifest_client_id = "gx-bchu-frpair-2-deadbeef"
+        spoofed_client_id = "gx-bchu-frozen-spoof-deadbeef"
+        ordinary_client_id = "gx-bchu-entry-deadbeef"
+        mock_open_orders.return_value = [
+            {"orderId": 101, "clientOrderId": frozen_ref_client_id},
+            {"orderId": 102, "clientOrderId": frozen_manifest_client_id},
+            {"orderId": 103, "clientOrderId": spoofed_client_id},
+            {"orderId": 104, "clientOrderId": ordinary_client_id},
+        ]
+
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "best_quote_volume_order_refs": {
+                            "101": {
+                                "book": "frozen_bq",
+                                "role": "frozen_inventory_manual_limit_long",
+                                "client_order_id": frozen_ref_client_id,
+                                "frozen_inventory_request_id": "limit-long-1",
+                            }
+                        },
+                        "best_quote_frozen_inventory_pair_release": {
+                            "request_id": "pair-1",
+                            "submission_manifest": {
+                                "version": 1,
+                                "request_id": "pair-1",
+                                "legs": {
+                                    "short": {
+                                        "role": "frozen_inventory_pair_release_short",
+                                        "order_id": "102",
+                                        "client_order_id": frozen_manifest_client_id,
+                                    }
+                                },
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch(
+                "grid_optimizer.web._runner_frozen_inventory_state_path",
+                return_value=state_path,
+            ):
+                result = _cancel_symbol_open_orders(
+                    symbol="BCHUSDT",
+                    api_key="key",
+                    api_secret="secret",
+                )
+
+        self.assertEqual(result["attempted"], 2)
+        self.assertEqual(result["preserved_frozen_count"], 2)
+        canceled_client_ids = {
+            call.kwargs["orig_client_order_id"]
+            for call in mock_delete_order.call_args_list
+        }
+        self.assertEqual(canceled_client_ids, {spoofed_client_id, ordinary_client_id})
+
     def _required_long_risk_guards(self, *, pause: float = 750.0, target: float = 430.0) -> dict[str, float | bool]:
         return {
             "pause_buy_position_notional": pause,
@@ -707,6 +774,194 @@ class WebSecurityTests(unittest.TestCase):
         directive = state["best_quote_frozen_inventory_manual_reduce"]["long"]
         self.assertTrue(directive["requested"])
         self.assertEqual(directive["requested_qty"], 8.0)
+
+    def test_update_frozen_inventory_uses_the_same_state_path_for_lock_and_write(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            locked_path = Path(tmpdir) / "locked-state.json"
+            drifted_path = Path(tmpdir) / "drifted-state.json"
+            locked_path.write_text(
+                json.dumps({"best_quote_frozen_inventory": {"long_qty": 1.0}}),
+                encoding="utf-8",
+            )
+            drifted_path.write_text(
+                json.dumps({"best_quote_frozen_inventory": {"long_qty": 9.0}}),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "grid_optimizer.web._runner_frozen_inventory_state_path",
+                side_effect=[
+                    locked_path,
+                    drifted_path,
+                    drifted_path,
+                    drifted_path,
+                ],
+            ) as resolve_state_path:
+                _update_runner_frozen_inventory(
+                    {"symbol": "PHAROSUSDT", "action": "set", "long_qty": 2.0}
+                )
+
+            locked = json.loads(locked_path.read_text(encoding="utf-8"))
+            drifted = json.loads(drifted_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(resolve_state_path.call_count, 4)
+        self.assertEqual(locked["best_quote_frozen_inventory"]["long_qty"], 1.0)
+        self.assertEqual(drifted["best_quote_frozen_inventory"]["long_qty"], 2.0)
+
+    def test_update_frozen_inventory_rechecks_coordinator_ownership_inside_lock(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "pharosusdt_loop_runner_control.json"
+            state_path = Path(tmpdir) / "pharosusdt_loop_state.json"
+            control_path.write_text(
+                json.dumps({RECOVERY_STATE_KEY: {"schema_version": 1}}),
+                encoding="utf-8",
+            )
+            state_path.write_text("{}", encoding="utf-8")
+
+            with (
+                patch(
+                    "grid_optimizer.web._runner_control_path",
+                    return_value=control_path,
+                ),
+                patch(
+                    "grid_optimizer.web._runner_frozen_inventory_state_path",
+                    return_value=state_path,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "recovery coordinator owns PHAROSUSDT",
+                ):
+                    _update_runner_frozen_inventory(
+                        {
+                            "symbol": "PHAROSUSDT",
+                            "action": "set",
+                            "long_qty": 2.0,
+                        }
+                    )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertNotIn("best_quote_frozen_inventory", state)
+
+    def test_update_frozen_inventory_preserves_runner_owned_lots_and_band_budgets(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            long_lots = [
+                {
+                    "frozen_lot_id": "long-1",
+                    "qty": 50.0,
+                    "entry_price": 1.0,
+                    "freeze_band_key": "band-1",
+                }
+            ]
+            short_lots = [
+                {
+                    "frozen_lot_id": "short-1",
+                    "qty": 30.0,
+                    "entry_price": 1.02,
+                    "freeze_band_key": "band-1",
+                }
+            ]
+            band_budgets = {
+                "band-1": {
+                    "band_key": "band-1",
+                    "frozen_qty": 80.0,
+                }
+            }
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "best_quote_frozen_inventory": {
+                            "long_qty": 50.0,
+                            "short_qty": 30.0,
+                            "long_entry_price": 1.0,
+                            "short_entry_price": 1.02,
+                            "long_lots": long_lots,
+                            "short_lots": short_lots,
+                            "band_budgets": band_budgets,
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("grid_optimizer.web._runner_frozen_inventory_state_path", return_value=state_path):
+                _update_runner_frozen_inventory(
+                    {
+                        "symbol": "PHAROSUSDT",
+                        "action": "reduce_long",
+                        "requested_qty": 8.0,
+                    }
+                )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        ledger = state["best_quote_frozen_inventory"]
+        self.assertEqual(ledger["long_lots"], long_lots)
+        self.assertEqual(ledger["short_lots"], short_lots)
+        self.assertEqual(ledger["band_budgets"], band_budgets)
+
+    def test_update_frozen_inventory_does_not_replace_unresolved_pair_manifest(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "best_quote_frozen_inventory": {
+                            "long_qty": 50.0,
+                            "short_qty": 30.0,
+                            "long_lots": [{"frozen_lot_id": "long-1", "qty": 50.0}],
+                            "short_lots": [{"frozen_lot_id": "short-1", "qty": 30.0}],
+                        },
+                        "best_quote_frozen_inventory_pair_release": {
+                            "requested": True,
+                            "request_id": "pair-in-flight",
+                            "requested_qty": 12.0,
+                            "awaiting_fill_confirmation": True,
+                            "submission_manifest": {
+                                "version": 1,
+                                "request_id": "pair-in-flight",
+                                "phase": "awaiting_reconcile",
+                                "legs": {
+                                    "long": {
+                                        "client_order_id": "gx-long-in-flight",
+                                        "status": "accepted",
+                                        "order_id": "11",
+                                    },
+                                    "short": {
+                                        "client_order_id": "gx-short-in-flight",
+                                        "status": "accepted",
+                                        "order_id": "12",
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("grid_optimizer.web._runner_frozen_inventory_state_path", return_value=state_path):
+                with self.assertRaisesRegex(ValueError, "unresolved|awaiting|in.flight"):
+                    _update_runner_frozen_inventory(
+                        {
+                            "symbol": "PHAROSUSDT",
+                            "action": "pair_release",
+                            "requested_qty": 10.0,
+                        }
+                    )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        directive = state["best_quote_frozen_inventory_pair_release"]
+        self.assertEqual(directive["request_id"], "pair-in-flight")
+        self.assertEqual(
+            directive["submission_manifest"]["legs"]["long"]["order_id"],
+            "11",
+        )
 
     def test_update_frozen_inventory_limit_order_isolates_qty_from_pair_release(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -3006,6 +3261,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(config["best_quote_maker_volume_frozen_total_cap_notional"], 120.0)
         self.assertEqual(config["best_quote_maker_volume_frozen_long_cap_notional"], 80.0)
         self.assertEqual(config["best_quote_maker_volume_frozen_short_cap_notional"], 80.0)
+        self.assertFalse(config["best_quote_maker_volume_frozen_v2_enabled"])
         self.assertTrue(config["best_quote_maker_volume_frozen_pair_release_enabled"])
         self.assertTrue(config["best_quote_maker_volume_frozen_single_leg_take_profit_enabled"])
         self.assertFalse(config["best_quote_maker_volume_frozen_pair_release_allow_loss"])
@@ -3032,6 +3288,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--best-quote-maker-volume-max-order-notional", command)
         self.assertIn("--no-best-quote-maker-volume-active-pair-reduce-enabled", command)
         self.assertIn("--no-best-quote-maker-volume-allow-loss-reduce-only", command)
+        self.assertIn("--no-best-quote-maker-volume-frozen-v2-enabled", command)
+        self.assertNotIn("--best-quote-maker-volume-frozen-v2-enabled", command)
         self.assertIn("--volatility-entry-pause-enabled", command)
         self.assertIn("--no-adaptive-step-dynamic-base-enabled", command)
         self.assertIn("--no-runtime-guard-stop-auto-flatten-enabled", command)

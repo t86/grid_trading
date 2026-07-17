@@ -39,6 +39,7 @@ def test_reduce_freeze_blocks_side_when_cap_remaining_below_min_notional() -> No
         "frozen_short_notional": 0.0,
         "frozen_long_qty": 0.0,
         "frozen_short_qty": 0.0,
+        "ledger_cost_basis_usable": True,
     }
 
     result = _apply_best_quote_reduce_freeze(
@@ -92,6 +93,7 @@ def test_reduce_freeze_clamps_transfer_to_total_cap_remaining_notional() -> None
         "frozen_short_notional": 0.0,
         "frozen_long_qty": 735.0,
         "frozen_short_qty": 0.0,
+        "ledger_cost_basis_usable": True,
     }
 
     result = _apply_best_quote_reduce_freeze(
@@ -154,6 +156,7 @@ def test_reduce_freeze_rechecks_total_cap_between_two_sides() -> None:
             "frozen_short_notional": 0.0,
             "frozen_long_qty": 700.0,
             "frozen_short_qty": 0.0,
+            "ledger_cost_basis_usable": True,
         },
         enabled=True,
         threshold_loss_ratio=0.01,

@@ -4512,6 +4512,109 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             ),
         )
 
+    def test_arx_severe_pace_capacity_does_not_require_frozen_inventory(self) -> None:
+        updates = bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
+            control={
+                "max_position_notional": 800.0,
+                "max_short_position_notional": 800.0,
+                "best_quote_maker_volume_max_long_notional": 1_500.0,
+                "best_quote_maker_volume_max_short_notional": 1_500.0,
+                "best_quote_maker_volume_inventory_soft_ratio": 0.85,
+            },
+            target_pace_behind=True,
+            pace_ratio=0.43,
+            near_cap=False,
+            volatility_entry_pause_active=False,
+            frozen_total_notional=0.0,
+            actual_long_notional=1_400.0,
+            actual_short_notional=100.0,
+        )
+
+        self.assertEqual(
+            updates,
+            {"best_quote_maker_volume_inventory_soft_ratio": 1.0},
+        )
+        self.assertEqual(
+            bq_volume_recovery_guard.arx_severe_pace_capacity_updates(
+                control={
+                    "max_position_notional": 800.0,
+                    "max_short_position_notional": 800.0,
+                    "best_quote_maker_volume_max_long_notional": 1_500.0,
+                    "best_quote_maker_volume_max_short_notional": 1_500.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.85,
+                },
+                target_pace_behind=True,
+                pace_ratio=0.43,
+                near_cap=False,
+                volatility_entry_pause_active=False,
+                frozen_total_notional=800.0,
+                actual_long_notional=400.0,
+                actual_short_notional=100.0,
+            ),
+            {},
+        )
+
+    def test_arx_severe_pace_capacity_receives_ordinary_inventory(self) -> None:
+        now = datetime(2026, 7, 17, 9, 30, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.85,
+                    "max_position_notional": 800.0,
+                    "max_short_position_notional": 800.0,
+                },
+                long_notional=200.0,
+                short_notional=400.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            for path in list(output_dir.glob("reusdt_*")):
+                path.rename(path.with_name(path.name.replace("reusdt_", "arxusdt_", 1)))
+            for name in (
+                "arxusdt_loop_runner_control.json",
+                "arxusdt_loop_latest_plan.json",
+            ):
+                path = output_dir / name
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload["symbol"] = "ARXUSDT"
+                _write_json(path, payload)
+            plan_path = output_dir / "arxusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 1_000.0,
+                    "actual_short_notional": 400.0,
+                    "frozen_long_notional": 800.0,
+                    "frozen_short_notional": 0.0,
+                }
+            }
+            _write_json(plan_path, plan)
+            captured: dict[str, object] = {}
+
+            with patch.object(
+                bq_volume_recovery_guard,
+                "arx_severe_pace_capacity_updates",
+                side_effect=lambda **kwargs: captured.update(kwargs) or {},
+            ):
+                check_symbol(
+                    symbol="ARXUSDT",
+                    output_dir=output_dir,
+                    state={},
+                    now=now,
+                    window_seconds=180,
+                    min_volume_notional=400,
+                    trigger_seconds=120,
+                    trade_rows=[],
+                    restart_runner=lambda _symbol: None,
+                )
+
+            self.assertEqual(captured["actual_long_notional"], 200.0)
+            self.assertEqual(captured["actual_short_notional"], 400.0)
+
     def test_arx_directional_unwind_changes_quote_by_one_tick(self) -> None:
         updates = bq_volume_recovery_guard.arx_directional_unwind_quote_updates(
             {
@@ -6657,6 +6760,138 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertTrue(result["inactive_restart_gate"]["ok"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_inactive_runner_clears_explicit_max_net_stop_when_ordinary_net_is_inside(self) -> None:
+        now = datetime(2026, 7, 17, 4, 25, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now - timedelta(minutes=10),
+                control={
+                    "run_start_time": (now - timedelta(hours=1)).isoformat(),
+                    "run_end_time": (now + timedelta(hours=1)).isoformat(),
+                    "max_actual_net_notional": 120.0,
+                },
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan.update(
+                {
+                    "stop_reason": "max_actual_net_notional_hit",
+                    "runtime_status": "stopped",
+                    "best_quote_maker_volume": {
+                        "reduce_freeze": {
+                            "actual_long_notional": 144.85,
+                            "actual_short_notional": 16.26,
+                            "frozen_long_notional": 63.05,
+                            "frozen_short_notional": 0.0,
+                        }
+                    },
+                }
+            )
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "first_inactive_at": (now - timedelta(seconds=130)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = recover_inactive_runner(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                trigger_seconds=120,
+                restart_cooldown_seconds=600,
+                max_snapshot_age_seconds=300,
+                runner_wrapper="/usr/local/bin/grid-saved-runner",
+                dry_run=False,
+                restart_runner=restarts.append,
+                exchange_snapshot_fetcher=lambda _symbol: {
+                    "open_order_count": 0,
+                    "long_notional": 144.85,
+                    "short_notional": 16.26,
+                },
+            )
+
+            self.assertEqual(result["action"], "restart_runner_inactive")
+            self.assertEqual(result["inactive_restart_gate"]["reasons"], [])
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_net_guard_stop_recovery_excludes_frozen_inventory_from_cap(self) -> None:
+        updates, details = bq_volume_recovery_guard._net_guard_stop_recovery(
+            control={"max_actual_net_notional": 800.0, "per_order_notional": 50.0},
+            plan={
+                "best_quote_maker_volume": {
+                    "reduce_freeze": {
+                        "actual_long_notional": 1_000.0,
+                        "actual_short_notional": 100.0,
+                        "frozen_long_notional": 600.0,
+                        "frozen_short_notional": 0.0,
+                    }
+                }
+            },
+            exchange={
+                "open_order_count": 0,
+                "long_notional": 1_000.0,
+                "short_notional": 100.0,
+            },
+        )
+
+        self.assertEqual(updates, {})
+        self.assertEqual(details["reason"], "exchange_inside_net_guard")
+        self.assertEqual(details["ordinary_net_notional"], 300.0)
+
+    def test_net_guard_stop_recovery_uses_ordinary_direction_when_total_sign_differs(self) -> None:
+        updates, details = bq_volume_recovery_guard._net_guard_stop_recovery(
+            control={"max_actual_net_notional": 150.0, "per_order_notional": 50.0},
+            plan={
+                "best_quote_maker_volume": {
+                    "reduce_freeze": {
+                        "actual_long_notional": 1_000.0,
+                        "actual_short_notional": 400.0,
+                        "frozen_long_notional": 800.0,
+                        "frozen_short_notional": 0.0,
+                    }
+                }
+            },
+            exchange={
+                "open_order_count": 0,
+                "long_notional": 1_000.0,
+                "short_notional": 400.0,
+            },
+        )
+
+        self.assertEqual(details["direction"], "net_short")
+        self.assertEqual(details["ordinary_net_notional"], -200.0)
+        self.assertEqual(updates["best_quote_maker_volume_directional_net_guard"], "net_short")
+
+    def test_net_guard_stop_recovery_fails_closed_without_frozen_side_breakdown(self) -> None:
+        updates, details = bq_volume_recovery_guard._net_guard_stop_recovery(
+            control={"max_actual_net_notional": 150.0, "per_order_notional": 50.0},
+            plan={
+                "best_quote_maker_volume": {
+                    "reduce_freeze": {
+                        "actual_long_notional": 1_000.0,
+                        "actual_short_notional": 400.0,
+                    },
+                    "frozen_v2": {"frozen_total_notional": 800.0},
+                }
+            },
+            exchange={
+                "open_order_count": 0,
+                "long_notional": 1_000.0,
+                "short_notional": 400.0,
+            },
+        )
+
+        self.assertEqual(updates, {})
+        self.assertEqual(details["reason"], "frozen_side_breakdown_missing")
+        self.assertNotIn("direction", details)
+
     def test_loss_reduce_pause_threshold_never_becomes_zero(self) -> None:
         updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
             control={
@@ -6679,21 +6914,31 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
 
         self.assertEqual(updates["pause_short_position_notional"], 1.0)
 
-    def test_arx_frozen_loss_reduce_keeps_active_pause_baseline(self) -> None:
-        updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
-            control={
-                "best_quote_maker_volume_allow_loss_reduce_only": False,
-                "best_quote_maker_volume_cycle_budget_notional": 128.0,
-                "per_order_notional": 32.0,
-                "pause_buy_position_notional": 320.0,
-                "pause_short_position_notional": 240.0,
-            },
+    def test_frozen_inventory_does_not_change_ordinary_loss_reduce_updates(self) -> None:
+        control = {
+            "best_quote_maker_volume_allow_loss_reduce_only": False,
+            "best_quote_maker_volume_cycle_budget_notional": 128.0,
+            "per_order_notional": 32.0,
+            "pause_buy_position_notional": 320.0,
+            "pause_short_position_notional": 240.0,
+        }
+        ordinary_assessment = {
+            "symbol": "ARXUSDT",
+            "current_long_notional": 520.0,
+            "current_short_notional": 280.0,
+            "max_long_notional": 800.0,
+            "max_short_notional": 800.0,
+        }
+        without_frozen = bq_volume_recovery_guard._loss_reduce_recovery_updates(
+            control=control,
+            assessment=ordinary_assessment,
+            pause_baseline_long_notional=620.0,
+            pause_baseline_short_notional=620.0,
+        )
+        with_frozen = bq_volume_recovery_guard._loss_reduce_recovery_updates(
+            control=control,
             assessment={
-                "symbol": "ARXUSDT",
-                "current_long_notional": 520.0,
-                "current_short_notional": 280.0,
-                "max_long_notional": 800.0,
-                "max_short_notional": 800.0,
+                **ordinary_assessment,
                 "frozen_long_notional": 400.0,
                 "frozen_short_notional": 0.0,
             },
@@ -6701,8 +6946,9 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             pause_baseline_short_notional=620.0,
         )
 
-        self.assertEqual(updates["pause_buy_position_notional"], 620.0)
-        self.assertEqual(updates["pause_short_position_notional"], 620.0)
+        self.assertEqual(with_frozen, without_frozen)
+        self.assertNotIn("pause_buy_position_notional", with_frozen)
+        self.assertEqual(with_frozen["pause_short_position_notional"], 620.0)
 
     def test_recovery_parameters_use_one_authoritative_floor_for_all_config_values(self) -> None:
         for configured_min in (32.0, 72.0, 100.0, 120.0, 200.0):
@@ -7073,6 +7319,243 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
             self.assertEqual(control["max_actual_net_notional"], 800.0)
             self.assertFalse(control["best_quote_maker_volume_suppress_short_reduce_enabled"])
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_active_net_guard_restore_uses_ordinary_net_excluding_frozen(self) -> None:
+        now = datetime(2026, 7, 17, 1, 5, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "max_actual_net_notional": 1030.0,
+                    "best_quote_maker_volume_suppress_short_reduce_enabled": True,
+                },
+                long_notional=400.0,
+                short_notional=100.0,
+                recent_trade_notional=80.0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 1_000.0,
+                    "actual_short_notional": 100.0,
+                    "frozen_long_notional": 600.0,
+                    "frozen_short_notional": 0.0,
+                }
+            }
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "net_guard_recovery_baseline_notional": 800.0,
+                        "net_guard_recovery_direction": "net_long",
+                        "recovery_owned": True,
+                        "guard_original_controls": {
+                            "max_actual_net_notional": 800.0,
+                            "best_quote_maker_volume_suppress_short_reduce_enabled": False,
+                        },
+                        "guard_recovery_controls": {
+                            "max_actual_net_notional": 1030.0,
+                            "best_quote_maker_volume_suppress_short_reduce_enabled": True,
+                        },
+                    }
+                }
+            }
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                restart_runner=lambda _symbol: None,
+            )
+
+            self.assertEqual(result["action"], "restore_net_guard_after_rebalance")
+            self.assertEqual(result["net_guard_actual_notional"], 300.0)
+
+    def test_active_net_guard_boundary_unknown_is_bounded_and_auto_recovers(
+        self,
+    ) -> None:
+        now = datetime(2026, 7, 17, 1, 5, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "max_actual_net_notional": 1030.0,
+                    "best_quote_maker_volume_suppress_short_reduce_enabled": True,
+                },
+                long_notional=400.0,
+                short_notional=100.0,
+                recent_trade_notional=80.0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 1_000.0,
+                    "actual_short_notional": 100.0,
+                },
+                "frozen_v2": {"frozen_total_notional": 600.0},
+            }
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "net_guard_recovery_baseline_notional": 800.0,
+                        "net_guard_recovery_direction": "net_long",
+                        "recovery_owned": True,
+                        "guard_original_controls": {
+                            "max_actual_net_notional": 800.0,
+                        },
+                    }
+                }
+            }
+
+            restarts: list[str] = []
+            first = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                max_recovery_seconds=300,
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(
+                first["action"], "hold_net_guard_inventory_boundary_unknown"
+            )
+            self.assertIsNone(first["net_guard_actual_notional"])
+            self.assertEqual(
+                first["assessment"]["ordinary_inventory_boundary_error"],
+                "frozen_side_breakdown_missing",
+            )
+            expected_deadline = now + timedelta(seconds=300)
+            first_incident = first["net_guard_inventory_boundary_incident"]
+            self.assertEqual(first_incident["status"], "probing")
+            self.assertEqual(first_incident["attempt_count"], 1)
+            self.assertEqual(first_incident["started_at"], now.isoformat())
+            self.assertEqual(
+                first_incident["deadline_at"], expected_deadline.isoformat()
+            )
+            self.assertEqual(
+                first_incident["boundary_error"],
+                "frozen_side_breakdown_missing",
+            )
+            item = state["symbols"]["REUSDT"]
+            self.assertEqual(
+                item["net_guard_inventory_boundary_incident"], first_incident
+            )
+            self.assertEqual(restarts, [])
+
+            terminal = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=expected_deadline,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                max_recovery_seconds=300,
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(
+                terminal["action"],
+                "hold_net_guard_inventory_boundary_manual_required",
+            )
+            self.assertIsNone(terminal["net_guard_actual_notional"])
+            self.assertEqual(terminal["changed_keys"], [])
+            self.assertEqual(
+                terminal["assessment"]["ordinary_inventory_boundary_error"],
+                "frozen_side_breakdown_missing",
+            )
+            terminal_incident = terminal["net_guard_inventory_boundary_incident"]
+            self.assertEqual(terminal_incident["status"], "manual_required")
+            self.assertEqual(terminal_incident["attempt_count"], 2)
+            self.assertEqual(terminal_incident["started_at"], now.isoformat())
+            self.assertEqual(
+                terminal_incident["deadline_at"], expected_deadline.isoformat()
+            )
+            self.assertEqual(
+                terminal["net_guard_inventory_boundary_terminal_outcome"],
+                {
+                    "status": "manual_required",
+                    "effect_stage": "inventory_boundary_reconciliation",
+                    "reason": "frozen_side_breakdown_missing",
+                    "completed_at": expected_deadline.isoformat(),
+                },
+            )
+            self.assertEqual(item["status"], "net_guard_recovery_manual_required")
+            self.assertEqual(restarts, [])
+
+            recovered_at = expected_deadline + timedelta(seconds=1)
+            plan["generated_at"] = recovered_at.isoformat()
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_qty": 10.0,
+                    "actual_short_qty": 1.0,
+                    "actual_long_notional": 1_000.0,
+                    "actual_short_notional": 100.0,
+                    "frozen_long_qty": 6.0,
+                    "frozen_short_qty": 0.0,
+                    "frozen_long_notional": 600.0,
+                    "frozen_short_notional": 0.0,
+                    "ledger": {
+                        "long_qty": 6.0,
+                        "short_qty": 0.0,
+                        "long_notional": 600.0,
+                        "short_notional": 0.0,
+                        "long_lots": [
+                            {
+                                "qty": 6.0,
+                                "entry_price": 100.0,
+                                "source": "durable_frozen_ledger",
+                            }
+                        ],
+                        "short_lots": [],
+                        "updated_at": recovered_at.isoformat(),
+                    },
+                },
+                "frozen_v2": {"frozen_total_notional": 600.0},
+            }
+            _write_json(plan_path, plan)
+
+            recovered = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=recovered_at,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                max_recovery_seconds=300,
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(
+                recovered["action"], "restore_net_guard_after_rebalance"
+            )
+            self.assertEqual(recovered["net_guard_actual_notional"], 300.0)
+            self.assertEqual(item["status"], "normal")
+            self.assertNotIn("net_guard_inventory_boundary_incident", item)
+            self.assertNotIn("net_guard_recovery_baseline_notional", item)
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(control["max_actual_net_notional"], 800.0)
             self.assertEqual(restarts, ["REUSDT"])
 
     def test_net_guard_recovery_keeps_original_limit_until_original_buffer_is_reached(self) -> None:
@@ -8081,6 +8564,56 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 active_order_count=1,
                 orders_near_market=True,
             )
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state={},
+                now=now,
+                window_seconds=180,
+                min_volume_notional=400,
+                trigger_seconds=120,
+                trade_rows=[],
+                restart_runner=lambda _symbol: None,
+            )
+
+            self.assertEqual(result["action"], "clear_stale_short_reduce_suppression")
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(control["best_quote_maker_volume_suppress_short_reduce_enabled"])
+
+    def test_stale_short_reduce_cleanup_uses_ordinary_direction_when_total_sign_differs(
+        self,
+    ) -> None:
+        now = datetime(2026, 7, 17, 9, 46, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_suppress_short_reduce_enabled": True,
+                    "per_order_notional": 50.0,
+                },
+                long_notional=200.0,
+                short_notional=400.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 1_000.0,
+                    "actual_short_notional": 400.0,
+                    "frozen_long_notional": 800.0,
+                    "frozen_short_notional": 0.0,
+                }
+            }
+            _write_json(plan_path, plan)
 
             result = check_symbol(
                 symbol="REUSDT",
@@ -9347,6 +9880,62 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 control["best_quote_maker_volume_inventory_bias_min_notional_gap"],
                 190.0,
             )
+
+    def test_frozen_inventory_does_not_consume_ordinary_net_guard_entry_buffer(self) -> None:
+        now = datetime(2026, 7, 17, 11, 23, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "max_actual_net_notional": 1_000.0,
+                    "per_order_notional": 50.0,
+                    "best_quote_maker_volume_cycle_budget_notional": 120.0,
+                    "best_quote_maker_volume_inventory_bias_min_notional_gap": 190.0,
+                },
+                long_notional=416.0,
+                short_notional=71.0,
+                open_order_count=3,
+                active_order_count=3,
+                orders_near_market=True,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 1_016.0,
+                    "actual_short_notional": 71.0,
+                    "frozen_long_notional": 600.0,
+                    "frozen_short_notional": 0.0,
+                }
+            }
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "REUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                inventory_bias_relief_notional_margin=24,
+                restart_runner=lambda _symbol: None,
+            )
+
+            self.assertEqual(
+                result["assessment"]["actual_net_notional_for_entry"], 345.0
+            )
+            self.assertTrue(result["assessment"]["net_guard_entry_buffer_ok"])
 
     def test_restores_inventory_bias_after_volume_recovers(self) -> None:
         now = datetime(2026, 6, 26, 8, 0, tzinfo=timezone.utc)
@@ -10990,6 +11579,205 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 pause_baseline_short_notional=620.0,
             )
         )
+
+    def test_assessment_excludes_authorized_frozen_gtx_from_ordinary_order_counts(self) -> None:
+        now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+        frozen_order = {
+            "role": "frozen_inventory_manual_reduce_long",
+            "side": "SELL",
+            "position_side": "LONG",
+            "price": 100.1,
+            "qty": 1.0,
+            "force_reduce_only": True,
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "post_only": True,
+            "frozen_inventory_request_id": "frozen-long-1",
+            "frozen_inventory_authorization_validated": True,
+        }
+        assessment = bq_volume_recovery_guard.assess_symbol(
+            symbol="BCHUSDT",
+            control={
+                "best_quote_maker_volume_max_long_notional": 200.0,
+                "best_quote_maker_volume_max_short_notional": 200.0,
+            },
+            plan={
+                "generated_at": now.isoformat(),
+                "bid_price": 99.9,
+                "ask_price": 100.1,
+                "symbol_info": {"tick_size": 0.1},
+                "current_long_notional": 0.0,
+                "current_short_notional": 0.0,
+                "open_order_count": 1,
+                "ordinary_open_order_count": 0,
+                "total_open_order_count": 1,
+                "buy_orders": [],
+                "sell_orders": [frozen_order],
+                "best_quote_maker_volume": {
+                    "reduce_freeze": {
+                        "actual_long_notional": 100.0,
+                        "actual_short_notional": 0.0,
+                        "frozen_long_notional": 100.0,
+                        "frozen_short_notional": 0.0,
+                    }
+                },
+            },
+            submit={
+                "generated_at": now.isoformat(),
+                "observed_strategy_open_order_state": {
+                    "active_order_count": 1,
+                    "ordinary_active_order_count": 0,
+                },
+                "plan_summary": {
+                    "open_order_count": 1,
+                    "ordinary_open_order_count": 0,
+                },
+                "validation": {"actions": {"place_orders": []}},
+            },
+            volume_summary={"gross_notional": 0.0},
+            now=now,
+            min_volume_notional=10.0,
+            near_cap_ratio=0.9,
+            far_ticks=4,
+            plan_stale_seconds=60.0,
+        )
+
+        self.assertEqual(assessment["active_order_count"], 0)
+        self.assertEqual(assessment["planned_order_count"], 0)
+        self.assertEqual(assessment["planned_reduce_only_order_count"], 0)
+        self.assertEqual(assessment["planned_entry_order_count"], 0)
+        self.assertIn("no_active_orders", assessment["reasons"])
+
+    def test_assessment_counts_only_ordinary_maker_alongside_authorized_frozen_gtx(self) -> None:
+        now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+        frozen_order = {
+            "role": "frozen_inventory_manual_reduce_long",
+            "side": "SELL",
+            "position_side": "LONG",
+            "price": 100.1,
+            "qty": 1.0,
+            "force_reduce_only": True,
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "post_only": True,
+            "frozen_inventory_request_id": "frozen-long-1",
+            "frozen_inventory_authorization_validated": True,
+        }
+        ordinary_order = {
+            "role": "best_quote_entry_long",
+            "side": "BUY",
+            "position_side": "LONG",
+            "price": 99.9,
+            "qty": 0.2,
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "post_only": True,
+        }
+        assessment = bq_volume_recovery_guard.assess_symbol(
+            symbol="BCHUSDT",
+            control={
+                "best_quote_maker_volume_max_long_notional": 200.0,
+                "best_quote_maker_volume_max_short_notional": 200.0,
+            },
+            plan={
+                "generated_at": now.isoformat(),
+                "bid_price": 99.9,
+                "ask_price": 100.1,
+                "symbol_info": {"tick_size": 0.1},
+                "current_long_notional": 0.0,
+                "current_short_notional": 0.0,
+                "open_order_count": 2,
+                "ordinary_open_order_count": 1,
+                "total_open_order_count": 2,
+                "buy_orders": [ordinary_order],
+                "sell_orders": [frozen_order],
+                "best_quote_maker_volume": {
+                    "reduce_freeze": {
+                        "actual_long_notional": 100.0,
+                        "actual_short_notional": 0.0,
+                        "frozen_long_notional": 100.0,
+                        "frozen_short_notional": 0.0,
+                    }
+                },
+            },
+            submit={
+                "generated_at": now.isoformat(),
+                "observed_strategy_open_order_state": {
+                    "active_order_count": 2,
+                    "ordinary_active_order_count": 1,
+                },
+                "plan_summary": {
+                    "open_order_count": 2,
+                    "ordinary_open_order_count": 1,
+                },
+                "validation": {"actions": {"place_orders": []}},
+            },
+            volume_summary={"gross_notional": 0.0},
+            now=now,
+            min_volume_notional=10.0,
+            near_cap_ratio=0.9,
+            far_ticks=4,
+            plan_stale_seconds=60.0,
+        )
+
+        self.assertEqual(assessment["active_order_count"], 1)
+        self.assertEqual(assessment["planned_order_count"], 1)
+        self.assertEqual(assessment["planned_reduce_only_order_count"], 0)
+        self.assertEqual(assessment["planned_entry_order_count"], 1)
+        self.assertNotIn("no_active_orders", assessment["reasons"])
+
+    def test_assessment_excludes_authorized_frozen_order_drift_counts(self) -> None:
+        now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+        frozen_order = {
+            "role": "frozen_inventory_manual_reduce_long",
+            "book": "frozen_bq",
+            "side": "SELL",
+            "position_side": "LONG",
+            "price": 100.1,
+            "qty": 1.0,
+            "force_reduce_only": True,
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "post_only": True,
+            "frozen_inventory_request_id": "frozen-long-1",
+            "frozen_inventory_authorization_validated": True,
+        }
+        assessment = bq_volume_recovery_guard.assess_symbol(
+            symbol="BCHUSDT",
+            control={
+                "best_quote_maker_volume_max_long_notional": 200.0,
+                "best_quote_maker_volume_max_short_notional": 200.0,
+            },
+            plan={
+                "generated_at": now.isoformat(),
+                "bid_price": 99.9,
+                "ask_price": 100.1,
+                "symbol_info": {"tick_size": 0.1},
+                "current_long_notional": 0.0,
+                "current_short_notional": 0.0,
+                "ordinary_open_order_count": 0,
+                "buy_orders": [],
+                "sell_orders": [],
+                "stale_orders": [frozen_order],
+                "missing_orders": [frozen_order],
+            },
+            submit={
+                "generated_at": now.isoformat(),
+                "ordinary_open_order_count": 0,
+                "validation": {"actions": {"place_orders": []}},
+            },
+            volume_summary={"gross_notional": 0.0},
+            now=now,
+            min_volume_notional=10.0,
+            near_cap_ratio=0.9,
+            far_ticks=4,
+            plan_stale_seconds=60.0,
+        )
+
+        self.assertEqual(assessment["stale_order_count"], 0)
+        self.assertEqual(assessment["missing_order_count"], 0)
+        self.assertEqual(assessment["frozen_stale_order_count"], 1)
+        self.assertEqual(assessment["frozen_missing_order_count"], 1)
 
     def test_two_sided_stale_no_fill_bypasses_cooldown_and_refreshes_sticky(self) -> None:
         now = datetime(2026, 7, 12, 7, 30, tzinfo=timezone.utc)
@@ -14757,6 +15545,12 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 }
             ]
             plan["best_quote_maker_volume"] = {
+                "reduce_freeze": {
+                    "actual_long_notional": 690.0,
+                    "actual_short_notional": 370.0,
+                    "frozen_long_notional": 100.0,
+                    "frozen_short_notional": 0.0,
+                },
                 "metrics": {
                     "same_side_entry_price_guard": {
                         "enabled": True,
@@ -14794,26 +15588,31 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             }
             restarts: list[str] = []
 
-            result = check_symbol(
-                symbol="ARXUSDT",
-                output_dir=output_dir,
-                state=state,
-                now=now,
-                window_seconds=60,
-                min_volume_notional=100.0,
-                daily_target_notional=120_000.0,
-                trigger_seconds=120,
-                cycle_budget_floor_notional=204.0,
-                volume_recovery_cycle_budget_increment=12.0,
-                trade_rows=[
-                    {
-                        "time": int((now - timedelta(minutes=10)).timestamp() * 1000),
-                        "quoteQty": 500.0,
-                    },
-                ],
-                volume_source="exchange_user_trades",
-                restart_runner=restarts.append,
-            )
+            with patch.object(
+                bq_volume_recovery_guard,
+                "arx_low_pace_two_sided_maker_restore_updates",
+                return_value={},
+            ):
+                result = check_symbol(
+                    symbol="ARXUSDT",
+                    output_dir=output_dir,
+                    state=state,
+                    now=now,
+                    window_seconds=60,
+                    min_volume_notional=100.0,
+                    daily_target_notional=120_000.0,
+                    trigger_seconds=120,
+                    cycle_budget_floor_notional=204.0,
+                    volume_recovery_cycle_budget_increment=12.0,
+                    trade_rows=[
+                        {
+                            "time": int((now - timedelta(minutes=10)).timestamp() * 1000),
+                            "quoteQty": 500.0,
+                        },
+                    ],
+                    volume_source="exchange_user_trades",
+                    restart_runner=restarts.append,
+                )
 
             control = json.loads(control_path.read_text(encoding="utf-8"))
             self.assertEqual(

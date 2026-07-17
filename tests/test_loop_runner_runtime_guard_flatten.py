@@ -15,6 +15,7 @@ from grid_optimizer.futures_run_lifecycle import (
     run_contract_snapshot_from_config,
 )
 from grid_optimizer.loop_runner import (
+    _cancel_futures_strategy_entry_orders,
     _cancel_futures_strategy_orders,
     _terminal_drain_ack_handoff_after_normal_event,
     _terminal_drain_exit_contract_from_snapshot,
@@ -259,6 +260,200 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
 
         self.assertEqual(count, 2)
         self.assertEqual(mock_delete_order.call_count, 2)
+
+    @patch("grid_optimizer.loop_runner.delete_futures_order")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    def test_cancel_futures_strategy_orders_preserves_durable_frozen_but_cancels_prefix_spoof(
+        self,
+        mock_open_orders,
+        mock_delete_order,
+    ) -> None:
+        frozen_client_id = "gx-bchu-frozenin-1-deadbeef"
+        spoofed_client_id = "gx-bchu-frozenin-99-spoofed"
+        mock_open_orders.return_value = [
+            {
+                "orderId": 101,
+                "clientOrderId": frozen_client_id,
+                "side": "SELL",
+                "positionSide": "LONG",
+                "price": "220.50",
+                "origQty": "0.100",
+                "executedQty": "0",
+            },
+            {
+                "orderId": 102,
+                "clientOrderId": spoofed_client_id,
+                "side": "BUY",
+                "positionSide": "LONG",
+                "price": "220.00",
+                "origQty": "0.100",
+                "executedQty": "0",
+            },
+        ]
+        state = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 0.283,
+                "short_qty": 0.0,
+                "long_lots": [{"qty": 0.283, "price": 234.0}],
+                "short_lots": [],
+            },
+            "best_quote_frozen_inventory_manual_limit": {
+                "long": {
+                    "requested": True,
+                    "submitted": True,
+                    "request_id": "frozen-limit-long-1",
+                    "requested_qty": 0.1,
+                }
+            },
+            "best_quote_volume_order_refs": {
+                "101": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_manual_limit_long",
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "client_order_id": frozen_client_id,
+                    "frozen_inventory_request_id": "frozen-limit-long-1",
+                }
+            },
+        }
+
+        count = _cancel_futures_strategy_orders(
+            symbol="BCHUSDT",
+            api_key="key",
+            api_secret="secret",
+            recv_window=5000,
+            state=state,
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(mock_delete_order.call_count, 1)
+        self.assertEqual(
+            mock_delete_order.call_args.kwargs["orig_client_order_id"],
+            spoofed_client_id,
+        )
+
+    @patch("grid_optimizer.loop_runner.delete_futures_order")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    def test_cancel_futures_strategy_orders_preserves_durable_frozen_when_directive_is_missing(
+        self,
+        mock_open_orders,
+        mock_delete_order,
+    ) -> None:
+        frozen_client_id = "gx-bchu-frozenin-1-deadbeef"
+        mock_open_orders.return_value = [
+            {
+                "orderId": 101,
+                "clientOrderId": frozen_client_id,
+                "side": "SELL",
+                "positionSide": "LONG",
+                "price": "220.50",
+                "origQty": "0.100",
+                "executedQty": "0",
+            }
+        ]
+        state = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 0.283,
+                "short_qty": 0.0,
+                "long_lots": [{"qty": 0.283, "price": 234.0}],
+                "short_lots": [],
+            },
+            "best_quote_volume_order_refs": {
+                "101": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_manual_limit_long",
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "client_order_id": frozen_client_id,
+                    "frozen_inventory_request_id": "lost-directive",
+                }
+            },
+        }
+
+        count = _cancel_futures_strategy_orders(
+            symbol="BCHUSDT",
+            api_key="key",
+            api_secret="secret",
+            recv_window=5000,
+            state=state,
+        )
+
+        self.assertEqual(count, 0)
+        mock_delete_order.assert_not_called()
+
+    @patch("grid_optimizer.loop_runner.delete_futures_order")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    def test_cancel_futures_strategy_entry_orders_preserves_durable_frozen_but_cancels_prefix_spoof(
+        self,
+        mock_open_orders,
+        mock_delete_order,
+    ) -> None:
+        frozen_client_id = "gx-bchu-frozenin-1-deadbeef"
+        spoofed_client_id = "gx-bchu-frozenin-99-spoofed"
+        mock_open_orders.return_value = [
+            {
+                "orderId": 101,
+                "clientOrderId": frozen_client_id,
+                "side": "SELL",
+                "positionSide": "LONG",
+                "reduceOnly": False,
+                "price": "220.50",
+                "origQty": "0.100",
+                "executedQty": "0",
+            },
+            {
+                "orderId": 102,
+                "clientOrderId": spoofed_client_id,
+                "side": "BUY",
+                "positionSide": "LONG",
+                "reduceOnly": False,
+                "price": "220.00",
+                "origQty": "0.100",
+                "executedQty": "0",
+            },
+        ]
+        state = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 0.283,
+                "short_qty": 0.0,
+                "long_lots": [{"qty": 0.283, "price": 234.0}],
+                "short_lots": [],
+            },
+            "best_quote_frozen_inventory_manual_limit": {
+                "long": {
+                    "requested": True,
+                    "submitted": True,
+                    "request_id": "frozen-limit-long-1",
+                    "requested_qty": 0.1,
+                }
+            },
+            "best_quote_volume_order_refs": {
+                "101": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_manual_limit_long",
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "client_order_id": frozen_client_id,
+                    "frozen_inventory_request_id": "frozen-limit-long-1",
+                }
+            },
+        }
+
+        count = _cancel_futures_strategy_entry_orders(
+            symbol="BCHUSDT",
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            api_key="key",
+            api_secret="secret",
+            recv_window=5000,
+            state=state,
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(mock_delete_order.call_count, 1)
+        self.assertEqual(
+            mock_delete_order.call_args.kwargs["orig_client_order_id"],
+            spoofed_client_id,
+        )
 
     @patch("grid_optimizer.loop_runner._start_futures_flatten_process")
     @patch("grid_optimizer.loop_runner.load_live_flatten_snapshot")
@@ -1512,7 +1707,12 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
                 json.dumps(
                     {
                         "best_quote_frozen_inventory_manual_limit": {
-                            "short": {"requested": True, "qty": 500.0, "price": 0.66}
+                            "short": {
+                                "requested": True,
+                                "request_id": "manual-limit-short-1",
+                                "qty": 500.0,
+                                "price": 0.66,
+                            }
                         }
                     }
                 ),
@@ -1842,6 +2042,8 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
                             "role": "frozen_inventory_manual_limit_short",
                             "side": "BUY",
                             "force_reduce_only": True,
+                            "frozen_inventory_request_id": "manual-limit-short-1",
+                            "frozen_inventory_authorization_validated": True,
                         },
                     ],
                     "cancel_orders": [],

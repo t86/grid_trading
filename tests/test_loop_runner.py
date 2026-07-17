@@ -148,6 +148,7 @@ from grid_optimizer.loop_runner import (
 from grid_optimizer.submit_plan import (
     apply_loss_inventory_no_cross_entry_guard_to_actions,
     apply_loss_reduce_reentry_guard_to_actions,
+    apply_reduce_only_no_loss_guard_to_actions,
 )
 from grid_optimizer.semi_auto_plan import (
     build_hedge_micro_grid_plan,
@@ -247,6 +248,155 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(state["best_quote_frozen_inventory"]["long_lots"][0]["source"], "bq_volume_ledger_transfer")
         self.assertEqual(state["best_quote_volume_ledger"]["long_lots"], [])
         self.assertNotIn("best_quote_reduce_freeze_confirmation", state)
+
+    def test_best_quote_reduce_freeze_fails_closed_before_truncating_frozen_ledger(self) -> None:
+        state = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 0.60,
+                "long_lots": [
+                    {
+                        "qty": 0.60,
+                        "entry_price": 200.0,
+                        "frozen_at": "2026-07-17T00:00:00+00:00",
+                    }
+                ],
+                "short_qty": 0.0,
+                "short_lots": [],
+            }
+        }
+        before = json.loads(json.dumps(state))
+
+        with self.assertRaisesRegex(ValueError, "frozen inventory exceeds exchange position"):
+            _best_quote_reduce_freeze_report(
+                state=state,
+                current_long_qty=0.40,
+                current_short_qty=0.0,
+                current_long_avg_price=200.0,
+                current_short_avg_price=0.0,
+                mid_price=200.0,
+                position_long_qty=0.40,
+                position_short_qty=0.0,
+            )
+
+        self.assertEqual(state, before)
+
+    def test_runtime_guard_uses_explicit_ordinary_when_frozen_total_has_no_side_split(self) -> None:
+        plan = {
+            "mid_price": 100.0,
+            "exchange_long_qty": 1.0,
+            "exchange_short_qty": 0.1,
+            "exchange_actual_net_notional": 90.0,
+            "frozen_total_notional": 60.0,
+            "ordinary_actual_net_notional": 30.0,
+            "strategy_actual_net_notional": 31.0,
+        }
+
+        self.assertEqual(
+            loop_runner_module._runtime_guard_plan_actual_net_notional(plan),
+            30.0,
+        )
+
+    def test_runtime_guard_fails_closed_when_frozen_total_has_no_side_split_or_ordinary(self) -> None:
+        plan = {
+            "mid_price": 100.0,
+            "exchange_long_qty": 1.0,
+            "exchange_short_qty": 0.1,
+            "exchange_actual_net_notional": 90.0,
+            "frozen_total_notional": 60.0,
+        }
+
+        net_notional = loop_runner_module._runtime_guard_plan_actual_net_notional(plan)
+        self.assertLess(net_notional, float("inf"))
+        self.assertGreater(net_notional, 1e100)
+        exposure, _, source = loop_runner_module._runtime_guard_exposure_inputs(
+            plan,
+            now=datetime.now(timezone.utc),
+            symbol="BCHUSDT",
+        )
+        self.assertEqual(exposure, net_notional)
+        self.assertEqual(source, "frozen_side_split_missing_fail_closed")
+
+    def test_ordinary_reduce_only_cap_cannot_consume_frozen_position_capacity(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "role": "best_quote_reduce_long",
+                    "side": "SELL",
+                    "qty": 0.8,
+                    "price": 100.0,
+                    "notional": 80.0,
+                    "force_reduce_only": True,
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+
+        capped = loop_runner_module._cap_ordinary_reduce_only_place_orders_to_position(
+            actions=actions,
+            strategy_mode="best_quote_maker_volume_v1",
+            current_ordinary_actual_net_qty=0.4,
+            current_open_orders=[],
+        )
+
+        self.assertEqual(capped["place_count"], 1)
+        self.assertAlmostEqual(capped["place_orders"][0]["qty"], 0.4)
+        self.assertEqual(
+            capped["reduce_only_position_cap"]["inventory_scope"],
+            "ordinary_exchange_minus_frozen",
+        )
+
+    def test_ordinary_reduce_only_cap_preserves_independent_frozen_lane(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "role": "best_quote_reduce_long",
+                    "side": "SELL",
+                    "qty": 0.8,
+                    "price": 100.0,
+                    "notional": 80.0,
+                    "force_reduce_only": True,
+                },
+                {
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "side": "SELL",
+                    "qty": 0.6,
+                    "price": 100.0,
+                    "notional": 60.0,
+                    "force_reduce_only": True,
+                    "manual_frozen_inventory_reduce": True,
+                    "frozen_inventory_request_id": "frozen-long-1",
+                    "frozen_inventory_authorization_validated": True,
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+        }
+        frozen_open_order = {
+            "clientOrderId": "gx-bchu-frozenin-long-1",
+            "role": "frozen_inventory_manual_limit_long",
+            "side": "SELL",
+            "origQty": "0.2",
+            "executedQty": "0",
+            "reduceOnly": True,
+            "frozen_inventory_authorization_validated": True,
+        }
+
+        capped = loop_runner_module._cap_ordinary_reduce_only_place_orders_to_position(
+            actions=actions,
+            strategy_mode="best_quote_maker_volume_v1",
+            current_ordinary_actual_net_qty=0.4,
+            current_open_orders=[frozen_open_order],
+        )
+
+        by_role = {order["role"]: order for order in capped["place_orders"]}
+        self.assertAlmostEqual(by_role["best_quote_reduce_long"]["qty"], 0.4)
+        self.assertAlmostEqual(
+            by_role["frozen_inventory_manual_reduce_long"]["qty"],
+            0.6,
+        )
 
     def test_best_quote_entry_inventory_cap_guard_blocks_only_new_entries(self) -> None:
         plan = {
@@ -2395,6 +2545,44 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertLessEqual(order["notional"], 20.0 + 1e-12)
         self.assertLess(20.0 - order["notional"], 0.999 * 0.1 + 1e-12)
 
+    def test_manual_frozen_reduce_waits_for_submitted_order_reconcile(self) -> None:
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 50.0,
+                "long_lots": [{"qty": 50.0, "entry_price": 1.0}],
+            },
+            "best_quote_frozen_inventory_manual_reduce": {
+                "long": {
+                    "requested": True,
+                    "submitted": True,
+                    "requested_qty": 20.0,
+                    "request_id": "manual-long-pending",
+                    "expires_at": "2099-01-01T00:00:00+00:00",
+                }
+            },
+        }
+
+        report = apply_best_quote_frozen_inventory_manual_reduce(
+            plan=plan,
+            state=state,
+            report={},
+            bid_price=1.002,
+            ask_price=1.003,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertIn("long_awaiting_order_reconcile", report["blocked_reasons"])
+        self.assertTrue(
+            state["best_quote_frozen_inventory_manual_reduce"]["long"]["submitted"]
+        )
+
     def test_auto_single_leg_below_min_notional_clears_side_and_reselects_larger_batch(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
@@ -3936,7 +4124,221 @@ class LoopRunnerTests(unittest.TestCase):
         ledger = state["best_quote_volume_ledger"]
         self.assertEqual(ledger["position_reconcile_deferred_reason"], "normal_open_orders_active")
 
-    def test_best_quote_frozen_inventory_manual_reduce_places_reduce_only_ioc_order(self) -> None:
+    def test_stale_bq_ledger_does_not_override_exchange_minus_frozen_cost_basis(self) -> None:
+        state = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 10.0,
+                "long_lots": [{"qty": 10.0, "entry_price": 2.0}],
+            },
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [
+                    {"qty": 5.0, "price": 0.5, "source": "trade_fill"}
+                ],
+                "short_lots": [],
+            },
+        }
+
+        stale_ledger = reconcile_best_quote_volume_ledger_surplus(
+            state=state,
+            current_long_qty=20.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.5,
+            current_short_avg_price=0.0,
+            current_long_entry_price=1.5,
+            mid_price=1.0,
+            normal_open_order_count=1,
+            position_reconcile_confirm_cycles=1,
+        )
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=20.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.5,
+            current_short_avg_price=0.0,
+            mid_price=1.0,
+            bq_ledger_report=stale_ledger,
+        )
+
+        self.assertEqual(
+            state["best_quote_volume_ledger"]["position_reconcile_deferred_reason"],
+            "normal_open_orders_active",
+        )
+        self.assertAlmostEqual(report["managed_long_qty"], 10.0)
+        self.assertAlmostEqual(report["managed_long_avg_price"], 1.0)
+        self.assertEqual(
+            report["managed_source"],
+            "exchange_minus_frozen_inventory",
+        )
+
+        guarded = apply_reduce_only_no_loss_guard_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "SELL",
+                        "price": 0.8,
+                        "qty": 1.0,
+                        "notional": 0.8,
+                        "role": "best_quote_reduce_long",
+                        "position_side": "LONG",
+                        "force_reduce_only": True,
+                        "execution_type": "maker",
+                        "time_in_force": "GTX",
+                        "post_only": True,
+                    }
+                ],
+                "cancel_orders": [],
+                "place_count": 1,
+                "cancel_count": 0,
+            },
+            plan_report={
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "take_profit_guard": {
+                    "enabled": True,
+                    "effective_min_profit_ratio": 0.0,
+                    "long_floor_price": report["managed_long_avg_price"],
+                },
+                "current_long_avg_price": report["managed_long_avg_price"],
+            },
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            live_bid_price=0.7,
+            live_ask_price=0.8,
+            tick_size=0.1,
+            min_qty=0.1,
+            min_notional=0.0,
+            step_size=0.1,
+        )
+
+        self.assertEqual(guarded["place_count"], 0)
+        self.assertEqual(
+            guarded["reduce_only_no_loss_guard"]["dropped_orders"][0][
+                "reduce_only_no_loss_drop_reason"
+            ],
+            "long_reduce_below_no_loss_floor",
+        )
+
+    def test_apply_reduce_freeze_does_not_reuse_rejected_stale_ledger(self) -> None:
+        state = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 10.0,
+                "long_lots": [{"qty": 10.0, "entry_price": 2.0}],
+            },
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [
+                    {"qty": 5.0, "price": 2.0, "source": "trade_fill"}
+                ],
+                "short_lots": [],
+                "position_reconcile_deferred_reason": "normal_open_orders_active",
+            },
+        }
+        stale_ledger = loop_runner_module._best_quote_volume_ledger_snapshot(
+            state["best_quote_volume_ledger"],
+            mid_price=1.0,
+        )
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=20.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.5,
+            current_short_avg_price=0.0,
+            mid_price=1.0,
+            bq_ledger_report=stale_ledger,
+        )
+
+        applied = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={
+                "buy_orders": [],
+                "sell_orders": [{"role": "best_quote_reduce_long"}],
+            },
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.10,
+            min_notional=1.0,
+            confirm_cycles=1,
+            frozen_total_cap_notional=1_000.0,
+            frozen_long_cap_notional=1_000.0,
+            current_long_qty=20.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.5,
+            current_short_avg_price=0.0,
+            mid_price=1.0,
+            bq_ledger_report=stale_ledger,
+        )
+
+        self.assertFalse(applied["ledger_cost_basis_usable"])
+        self.assertEqual(applied["managed_source"], "exchange_minus_frozen_inventory")
+        self.assertEqual(applied["events"], [])
+        self.assertAlmostEqual(
+            state["best_quote_frozen_inventory"]["long_qty"],
+            10.0,
+        )
+
+    def test_apply_reduce_freeze_does_not_transfer_rejected_stale_lots(self) -> None:
+        state = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 10.0,
+                "long_lots": [{"qty": 10.0, "entry_price": 2.0}],
+            },
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [
+                    {"qty": 5.0, "price": 2.0, "source": "trade_fill"}
+                ],
+                "short_lots": [],
+                "position_reconcile_deferred_reason": "normal_open_orders_active",
+            },
+        }
+        stale_ledger = loop_runner_module._best_quote_volume_ledger_snapshot(
+            state["best_quote_volume_ledger"],
+            mid_price=0.9,
+        )
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=20.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.5,
+            current_short_avg_price=0.0,
+            mid_price=0.9,
+            bq_ledger_report=stale_ledger,
+        )
+
+        applied = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={
+                "buy_orders": [],
+                "sell_orders": [{"role": "best_quote_reduce_long"}],
+            },
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.05,
+            min_notional=1.0,
+            confirm_cycles=1,
+            frozen_total_cap_notional=1_000.0,
+            frozen_long_cap_notional=1_000.0,
+            current_long_qty=20.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.5,
+            current_short_avg_price=0.0,
+            mid_price=0.9,
+            bq_ledger_report=stale_ledger,
+        )
+
+        self.assertEqual(applied["events"], [])
+        self.assertAlmostEqual(
+            state["best_quote_frozen_inventory"]["long_qty"],
+            10.0,
+        )
+        self.assertEqual(
+            state["best_quote_volume_ledger"]["long_lots"],
+            [{"qty": 5.0, "price": 2.0, "source": "trade_fill"}],
+        )
+
+    def test_best_quote_frozen_inventory_manual_reduce_places_reduce_only_gtx_order(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {"long_qty": 50.0, "long_entry_price": 1.0},
             "best_quote_frozen_inventory_manual_reduce": {
@@ -3965,9 +4367,10 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(order["side"], "SELL")
         self.assertEqual(order["position_side"], "LONG")
         self.assertTrue(order["force_reduce_only"])
-        self.assertEqual(order["execution_type"], "aggressive")
-        self.assertEqual(order["time_in_force"], "IOC")
-        self.assertEqual(order["price"], 0.979)
+        self.assertEqual(order["execution_type"], "maker")
+        self.assertEqual(order["time_in_force"], "GTX")
+        self.assertTrue(order["post_only"])
+        self.assertEqual(order["price"], 0.981)
 
     def test_best_quote_frozen_inventory_manual_reduce_honors_requested_qty(self) -> None:
         state: dict[str, object] = {
@@ -3992,7 +4395,10 @@ class LoopRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(plan["sell_orders"][0]["qty"], 12.0)
-        self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
+        self.assertEqual(
+            state["best_quote_frozen_inventory_manual_reduce"]["long"]["request_id"],
+            "req-long",
+        )
 
     def test_best_quote_frozen_inventory_manual_limit_keeps_post_only_order_target(self) -> None:
         state: dict[str, object] = {
@@ -4286,7 +4692,7 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(directive["requested_qty"], 645.0)
 
-    def test_best_quote_frozen_pair_release_places_paired_ioc_when_stable_and_profitable(self) -> None:
+    def test_best_quote_frozen_pair_release_places_paired_gtx_when_stable_and_profitable(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
                 "long_lots": [{"qty": 50.0, "entry_price": 1.0}],
@@ -4334,8 +4740,10 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(sell_order["position_side"], "LONG")
         self.assertEqual(buy_order["side"], "BUY")
         self.assertEqual(buy_order["position_side"], "SHORT")
-        self.assertEqual(sell_order["time_in_force"], "IOC")
-        self.assertEqual(buy_order["time_in_force"], "IOC")
+        self.assertEqual(sell_order["time_in_force"], "GTX")
+        self.assertEqual(buy_order["time_in_force"], "GTX")
+        self.assertTrue(sell_order["post_only"])
+        self.assertTrue(buy_order["post_only"])
         self.assertTrue(sell_order["frozen_inventory_pair_release"])
         self.assertTrue(buy_order["frozen_inventory_pair_release"])
 
@@ -5756,8 +6164,8 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(release["active"])
         self.assertEqual(release["release_qty"], 99.0)
         self.assertAlmostEqual(release["release_notional"], 99.99, places=6)
-        self.assertAlmostEqual(plan["sell_orders"][0]["notional"], 99.693, places=6)
-        self.assertAlmostEqual(plan["buy_orders"][0]["notional"], 100.287, places=6)
+        self.assertAlmostEqual(plan["sell_orders"][0]["notional"], 100.287, places=6)
+        self.assertAlmostEqual(plan["buy_orders"][0]["notional"], 99.693, places=6)
 
     def test_best_quote_frozen_pair_release_blocks_when_market_not_stable(self) -> None:
         plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
@@ -5794,7 +6202,7 @@ class LoopRunnerTests(unittest.TestCase):
             report={
                 "frozen_long_qty": 50.0,
                 "frozen_short_qty": 50.0,
-                "ledger": {"long_entry_price": 1.0, "short_entry_price": 1.001},
+                "ledger": {"long_entry_price": 1.01, "short_entry_price": 0.99},
             },
             bid_price=0.999,
             ask_price=1.001,
@@ -5829,6 +6237,11 @@ class LoopRunnerTests(unittest.TestCase):
                     "qty": 500.0,
                     "force_reduce_only": True,
                     "manual_frozen_inventory_limit": True,
+                    "frozen_inventory_request_id": "frozen-limit-short-1",
+                    "execution_type": "maker",
+                    "time_in_force": "GTX",
+                    "post_only": True,
+                    "frozen_inventory_authorization_validated": True,
                 },
             ],
         }
@@ -6447,6 +6860,567 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["sell_orders"][0]["position_side"], "SHORT")
         self.assertEqual(report["buy_orders"][0]["price"], 80400.0)
         self.assertEqual(report["sell_orders"][0]["price"], 80400.1)
+
+    @patch("grid_optimizer.loop_runner.load_or_initialize_state")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_reconciles_frozen_fills_before_first_ordinary_snapshot(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_load_state,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        state = {
+            "center_price": 100.0,
+            "created_at": now,
+            "updated_at": now,
+            "startup_pending": False,
+            "best_quote_frozen_inventory": {
+                "long_qty": 1.0,
+                "short_qty": 1.0,
+                "long_lots": [{"qty": 1.0, "entry_price": 99.0, "frozen_at": now}],
+                "short_lots": [{"qty": 1.0, "entry_price": 101.0, "frozen_at": now}],
+            },
+            "best_quote_frozen_inventory_pair_release": {
+                "requested": True,
+                "request_id": "pair-fill",
+                "requested_qty": 0.4,
+            },
+        }
+        mock_load_state.return_value = state
+        mock_symbol_config.return_value = {
+            "tick_size": 0.1,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "99.9", "ask_price": "100.1"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": True}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {
+                    "symbol": "BCHUSDT",
+                    "positionSide": "LONG",
+                    "positionAmt": "0.6",
+                    "entryPrice": "99.0",
+                },
+                {
+                    "symbol": "BCHUSDT",
+                    "positionSide": "SHORT",
+                    "positionAmt": "-0.6",
+                    "entryPrice": "101.0",
+                },
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+        }
+        sync_events: list[str] = []
+
+        def sync_manual(*, state, observed_trade_rows):
+            sync_events.append("manual")
+            return {"applied_fill_count": 0}
+
+        def sync_bindings(**kwargs):
+            sync_events.append("per_lot")
+            return {
+                "resolved_filled_count": 0,
+                "resolved_partial_cancel_count": 0,
+                "resolved_not_found_with_trade_count": 0,
+                "released_zero_fill_count": 0,
+                "released_not_found_count": 0,
+            }
+
+        def sync_pair(*, state, observed_trade_rows):
+            sync_events.append("pair")
+            frozen = state["best_quote_frozen_inventory"]
+            frozen["long_qty"] = 0.6
+            frozen["short_qty"] = 0.6
+            frozen["long_lots"][0]["qty"] = 0.6
+            frozen["short_lots"][0]["qty"] = 0.6
+            return {"enabled": True, "new_paired_release_qty": 0.4}
+
+        original_ordinary_position_qtys = loop_runner_module._ordinary_position_qtys
+
+        def ordinary_position_qtys(**kwargs):
+            sync_events.append("ordinary")
+            return original_ordinary_position_qtys(**kwargs)
+
+        empty_volume_ledger = {
+            "initialized": True,
+            "sync_ok": True,
+            "long_qty": 0.0,
+            "short_qty": 0.0,
+            "long_avg_price": 0.0,
+            "short_avg_price": 0.0,
+            "long_unrealized_pnl": 0.0,
+            "short_unrealized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="BCHUSDT",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                strategy_profile="bchusdt_hedge_best_quote_maker_volume_v1",
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_cycle_budget_notional=40.0,
+                best_quote_maker_volume_max_long_notional=120.0,
+                best_quote_maker_volume_max_short_notional=120.0,
+                best_quote_maker_volume_reduce_freeze_enabled=True,
+                reset_state=False,
+            )
+            with (
+                patch(
+                    "grid_optimizer.loop_runner._collect_runner_observed_trade_rows",
+                    return_value=[],
+                ),
+                patch(
+                    "grid_optimizer.loop_runner.sync_best_quote_frozen_manual_fills",
+                    side_effect=sync_manual,
+                ) as manual_sync,
+                patch(
+                    "grid_optimizer.loop_runner.reconcile_best_quote_frozen_per_lot_bindings",
+                    side_effect=sync_bindings,
+                ) as binding_sync,
+                patch(
+                    "grid_optimizer.loop_runner.sync_best_quote_frozen_pair_release",
+                    side_effect=sync_pair,
+                ) as pair_sync,
+                patch(
+                    "grid_optimizer.loop_runner._ordinary_position_qtys",
+                    side_effect=ordinary_position_qtys,
+                ),
+                patch(
+                    "grid_optimizer.loop_runner.sync_best_quote_volume_ledger",
+                    return_value=empty_volume_ledger,
+                ),
+                patch(
+                    "grid_optimizer.loop_runner.reconcile_best_quote_volume_ledger_surplus",
+                    return_value=empty_volume_ledger,
+                ),
+            ):
+                report = generate_plan_report(args)
+
+        self.assertEqual(sync_events[:4], ["manual", "per_lot", "pair", "ordinary"])
+        manual_sync.assert_called_once()
+        binding_sync.assert_called_once()
+        pair_sync.assert_called_once()
+        self.assertAlmostEqual(report["exchange_long_qty"], 0.6)
+        self.assertAlmostEqual(report["exchange_short_qty"], 0.6)
+        self.assertAlmostEqual(report["frozen_long_qty"], 0.6)
+        self.assertAlmostEqual(report["frozen_short_qty"], 0.6)
+        self.assertAlmostEqual(report["ordinary_long_qty"], 0.0)
+        self.assertAlmostEqual(report["ordinary_short_qty"], 0.0)
+
+    @patch("grid_optimizer.loop_runner.load_or_initialize_state")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_hedge_best_quote_frozen_inventory_never_enters_ordinary_control_inputs(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_load_state,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        mock_load_state.return_value = {
+            "center_price": 100.0,
+            "created_at": now,
+            "updated_at": now,
+            "startup_pending": False,
+            "best_quote_frozen_inventory": {
+                "long_qty": 0.6,
+                "short_qty": 0.0,
+                "long_lots": [{"qty": 0.6, "entry_price": 99.0, "frozen_at": now}],
+                "short_lots": [],
+            },
+        }
+        mock_symbol_config.return_value = {
+            "tick_size": 0.1,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "99.9", "ask_price": "100.1"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": True}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {
+                    "symbol": "BCHUSDT",
+                    "positionSide": "LONG",
+                    "positionAmt": "1.0",
+                    "entryPrice": "99.0",
+                },
+                {
+                    "symbol": "BCHUSDT",
+                    "positionSide": "SHORT",
+                    "positionAmt": "-0.1",
+                    "entryPrice": "101.0",
+                },
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+        }
+        drifted_strategy_ledger = {
+            "initialized": True,
+            "sync_ok": True,
+            "long_qty": 0.9,
+            "short_qty": 0.0,
+            "long_avg_price": 99.0,
+            "short_avg_price": 0.0,
+            "long_unrealized_pnl": 0.9,
+            "short_unrealized_pnl": 0.0,
+            "unrealized_pnl": 0.9,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="BCHUSDT",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                strategy_profile="bchusdt_hedge_best_quote_maker_volume_v1",
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_cycle_budget_notional=40.0,
+                best_quote_maker_volume_max_long_notional=120.0,
+                best_quote_maker_volume_max_short_notional=120.0,
+                best_quote_maker_volume_reduce_freeze_enabled=True,
+                best_quote_maker_volume_frozen_v2_enabled=True,
+                best_quote_maker_volume_frozen_total_cap_notional=60.0,
+                best_quote_maker_volume_frozen_long_cap_notional=60.0,
+                best_quote_maker_volume_frozen_short_cap_notional=60.0,
+                elastic_volume_enabled=True,
+                regime_entry_budget_enabled=True,
+                regime_entry_budget_report_only=True,
+                volatility_entry_pause_enabled=True,
+                reset_state=False,
+            )
+            original_bq_builder = loop_runner_module.build_best_quote_maker_volume_plan
+            original_elastic = loop_runner_module.resolve_elastic_volume_control
+            original_regime_budget = loop_runner_module.resolve_regime_entry_budget_control
+            original_execution_regime = loop_runner_module.build_execution_regime_report
+            original_volatility_pause = loop_runner_module.resolve_volatility_entry_pause
+            with (
+                patch(
+                    "grid_optimizer.loop_runner.sync_best_quote_volume_ledger",
+                    return_value=drifted_strategy_ledger,
+                ),
+                patch(
+                    "grid_optimizer.loop_runner.reconcile_best_quote_volume_ledger_surplus",
+                    return_value=drifted_strategy_ledger,
+                ),
+                patch(
+                    "grid_optimizer.loop_runner.build_best_quote_maker_volume_plan",
+                    wraps=original_bq_builder,
+                ) as bq_builder,
+                patch(
+                    "grid_optimizer.loop_runner.resolve_elastic_volume_control",
+                    wraps=original_elastic,
+                ) as elastic_control,
+                patch(
+                    "grid_optimizer.loop_runner.resolve_regime_entry_budget_control",
+                    wraps=original_regime_budget,
+                ) as regime_budget,
+                patch(
+                    "grid_optimizer.loop_runner.build_execution_regime_report",
+                    wraps=original_execution_regime,
+                ) as execution_regime,
+                patch(
+                    "grid_optimizer.loop_runner.resolve_volatility_entry_pause",
+                    wraps=original_volatility_pause,
+                ) as volatility_pause,
+            ):
+                report = generate_plan_report(args)
+
+        self.assertAlmostEqual(report["exchange_long_qty"], 1.0)
+        self.assertAlmostEqual(report["exchange_short_qty"], 0.1)
+        self.assertAlmostEqual(report["frozen_long_qty"], 0.6)
+        self.assertAlmostEqual(report["ordinary_long_qty"], 0.4)
+        self.assertAlmostEqual(report["ordinary_short_qty"], 0.1)
+        self.assertAlmostEqual(report["current_long_qty"], 0.4)
+        self.assertAlmostEqual(report["current_short_qty"], 0.1)
+        self.assertAlmostEqual(report["strategy_actual_net_qty"], 0.3)
+
+        elastic_inputs = elastic_control.call_args.kwargs["inputs"]
+        self.assertAlmostEqual(elastic_inputs.long_notional, 40.0)
+        self.assertAlmostEqual(elastic_inputs.short_notional, 10.0)
+        self.assertAlmostEqual(elastic_inputs.actual_net_notional, 30.0)
+        regime_inputs = regime_budget.call_args.kwargs["inputs"]
+        self.assertAlmostEqual(regime_inputs.current_long_notional, 40.0)
+        self.assertAlmostEqual(regime_inputs.current_short_notional, 10.0)
+        self.assertAlmostEqual(
+            execution_regime.call_args.kwargs["actual_net_notional"],
+            30.0,
+        )
+        for call in volatility_pause.call_args_list:
+            self.assertAlmostEqual(call.kwargs["current_long_notional"], 40.0)
+            self.assertAlmostEqual(call.kwargs["current_short_notional"], 10.0)
+
+        bq_config = bq_builder.call_args.kwargs["config"]
+        bq_inputs = bq_builder.call_args.kwargs["inputs"]
+        self.assertFalse(bq_config.frozen_v2_enabled)
+        self.assertAlmostEqual(bq_inputs.current_net_qty, 0.3)
+        self.assertAlmostEqual(bq_inputs.current_long_qty, 0.4)
+        self.assertAlmostEqual(bq_inputs.current_short_qty, 0.1)
+        self.assertAlmostEqual(bq_inputs.frozen_long_notional, 60.0)
+        frozen_v2 = report["best_quote_maker_volume"]["metrics"]["frozen_v2"]
+        self.assertEqual(frozen_v2["long_state"], "capped")
+        self.assertFalse(frozen_v2["applied"])
+
+    @patch("grid_optimizer.loop_runner.load_or_initialize_state")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_hedge_best_quote_adverse_reduce_uses_ordinary_managed_cost_basis(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_load_state,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        mock_load_state.return_value = {
+            "center_price": 100.0,
+            "created_at": now,
+            "updated_at": now,
+            "startup_pending": False,
+            "best_quote_frozen_inventory": {
+                "long_qty": 0.6,
+                "short_qty": 0.0,
+                "long_lots": [{"qty": 0.6, "entry_price": 250.0, "frozen_at": now}],
+                "short_lots": [],
+            },
+        }
+        mock_symbol_config.return_value = {
+            "tick_size": 0.1,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "99.9", "ask_price": "100.1"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": True}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {
+                    "symbol": "BCHUSDT",
+                    "positionSide": "LONG",
+                    "positionAmt": "1.0",
+                    # 0.6 frozen @ 250 + 0.4 ordinary @ 100 = exchange average 190.
+                    "entryPrice": "190.0",
+                },
+                {
+                    "symbol": "BCHUSDT",
+                    "positionSide": "SHORT",
+                    "positionAmt": "0.0",
+                    "entryPrice": "0.0",
+                },
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+        }
+        ordinary_ledger = {
+            "initialized": True,
+            "sync_ok": True,
+            "long_qty": 0.4,
+            "short_qty": 0.0,
+            "long_avg_price": 100.0,
+            "short_avg_price": 0.0,
+            "long_unrealized_pnl": 0.0,
+            "short_unrealized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="BCHUSDT",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                strategy_profile="bchusdt_hedge_best_quote_maker_volume_v1",
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_cycle_budget_notional=40.0,
+                best_quote_maker_volume_max_long_notional=120.0,
+                best_quote_maker_volume_max_short_notional=120.0,
+                best_quote_maker_volume_reduce_freeze_enabled=True,
+                reset_state=False,
+            )
+            original_adverse_reduce = loop_runner_module.assess_adverse_inventory_reduce
+            with (
+                patch(
+                    "grid_optimizer.loop_runner.sync_best_quote_volume_ledger",
+                    return_value=ordinary_ledger,
+                ),
+                patch(
+                    "grid_optimizer.loop_runner.reconcile_best_quote_volume_ledger_surplus",
+                    return_value=ordinary_ledger,
+                ),
+                patch(
+                    "grid_optimizer.loop_runner.assess_adverse_inventory_reduce",
+                    wraps=original_adverse_reduce,
+                ) as adverse_reduce,
+            ):
+                report = generate_plan_report(args)
+
+        self.assertAlmostEqual(report["exchange_long_qty"], 1.0)
+        self.assertAlmostEqual(report["frozen_long_qty"], 0.6)
+        self.assertAlmostEqual(report["ordinary_long_qty"], 0.4)
+        self.assertAlmostEqual(
+            adverse_reduce.call_args.kwargs["current_long_cost_price"],
+            100.0,
+        )
+
+    @patch("grid_optimizer.loop_runner.load_or_initialize_state")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_one_way_best_quote_uses_exchange_minus_frozen_as_ordinary_inventory(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_load_state,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        mock_load_state.return_value = {
+            "center_price": 100.0,
+            "created_at": now,
+            "updated_at": now,
+            "startup_pending": False,
+            "best_quote_frozen_inventory": {
+                "long_qty": 0.6,
+                "short_qty": 0.0,
+                "long_lots": [{"qty": 0.6, "entry_price": 99.0, "frozen_at": now}],
+                "short_lots": [],
+            },
+        }
+        mock_symbol_config.return_value = {
+            "tick_size": 0.1,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "99.9", "ask_price": "100.1"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {
+                    "symbol": "BCHUSDT",
+                    "positionSide": "BOTH",
+                    "positionAmt": "1.0",
+                    "entryPrice": "99.0",
+                }
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="BCHUSDT",
+                strategy_mode="best_quote_maker_volume_v1",
+                strategy_profile="bchusdt_best_quote_maker_volume_v1",
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_cycle_budget_notional=40.0,
+                best_quote_maker_volume_max_long_notional=120.0,
+                best_quote_maker_volume_max_short_notional=120.0,
+                best_quote_maker_volume_reduce_freeze_enabled=True,
+                reset_state=False,
+            )
+            original_bq_builder = loop_runner_module.build_best_quote_maker_volume_plan
+            with patch(
+                "grid_optimizer.loop_runner.build_best_quote_maker_volume_plan",
+                wraps=original_bq_builder,
+            ) as bq_builder:
+                report = generate_plan_report(args)
+
+        bq_inputs = bq_builder.call_args.kwargs["inputs"]
+        self.assertAlmostEqual(report["exchange_long_qty"], 1.0)
+        self.assertAlmostEqual(report["frozen_long_qty"], 0.6)
+        self.assertAlmostEqual(report["ordinary_long_qty"], 0.4)
+        self.assertAlmostEqual(report["current_long_qty"], 0.4)
+        self.assertAlmostEqual(report["strategy_actual_net_qty"], 0.4)
+        self.assertAlmostEqual(bq_inputs.current_net_qty, 0.4)
+        self.assertAlmostEqual(bq_inputs.current_long_qty, 0.4)
 
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
@@ -7267,7 +8241,7 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(result, [{"clientOrderId": "gx-btcusdc-001", "orderId": 1}])
 
-    def test_filter_futures_normal_strategy_orders_preserves_frozen_orders(self) -> None:
+    def test_filter_futures_normal_strategy_orders_treats_prefix_only_as_ordinary(self) -> None:
         open_orders = [
             {"clientOrderId": "gx-arxu-bestquot-1", "orderId": 1},
             {"clientOrderId": "gx-arxu-frozen-1", "orderId": 2},
@@ -7277,29 +8251,78 @@ class LoopRunnerTests(unittest.TestCase):
 
         result = loop_runner_module._filter_futures_normal_strategy_orders(open_orders, "ARXUSDT")
 
-        self.assertEqual(result, [{"clientOrderId": "gx-arxu-bestquot-1", "orderId": 1}])
+        self.assertEqual(
+            result,
+            [
+                {"clientOrderId": "gx-arxu-bestquot-1", "orderId": 1},
+                {"clientOrderId": "gx-arxu-frozen-1", "orderId": 2},
+                {"clientOrderId": "gx-arxu-frozenin-1", "orderId": 3},
+            ],
+        )
 
     def test_position_mismatch_recovery_cancels_normal_orders_after_three_errors(self) -> None:
-        args = Namespace(
-            symbol="ARXUSDT",
-            strategy_mode="hedge_best_quote_maker_volume_v1",
-            recv_window=5000,
-        )
-        open_orders = [
-            {"clientOrderId": "gx-arxu-bestquot-1", "orderId": 1},
-            {"clientOrderId": "gx-arxu-frozenin-1", "orderId": 2},
-        ]
-
-        with (
-            patch("grid_optimizer.loop_runner.load_binance_api_credentials", return_value=("key", "secret")),
-            patch("grid_optimizer.loop_runner.fetch_futures_open_orders", return_value=open_orders),
-            patch("grid_optimizer.loop_runner.delete_futures_order", return_value={"status": "CANCELED"}) as cancel,
-        ):
-            result = loop_runner_module._maybe_recover_hedge_bq_position_mismatch(
-                args=args,
-                exc=RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新"),
-                consecutive_errors=3,
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "best_quote_frozen_inventory": {
+                            "long_qty": 0.2,
+                            "short_qty": 0.0,
+                            "long_lots": [{"qty": 0.2, "entry_price": 1.0}],
+                            "short_lots": [],
+                        },
+                        "best_quote_frozen_inventory_manual_reduce": {
+                            "long": {
+                                "requested": True,
+                                "submitted": True,
+                                "request_id": "frozen-2",
+                                "requested_qty": 0.2,
+                                "expires_at": "2099-01-01T00:00:00+00:00",
+                            }
+                        },
+                        "best_quote_volume_order_refs": {
+                            "2": {
+                                "book": "frozen_bq",
+                                "role": "frozen_inventory_manual_reduce_long",
+                                "side": "SELL",
+                                "position_side": "LONG",
+                                "client_order_id": "gx-arxu-frozenin-1",
+                                "frozen_inventory_request_id": "frozen-2",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
             )
+            args = Namespace(
+                symbol="ARXUSDT",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                recv_window=5000,
+                state_path=str(state_path),
+            )
+            open_orders = [
+                {"clientOrderId": "gx-arxu-bestquot-1", "orderId": 1},
+                {
+                    "clientOrderId": "gx-arxu-frozenin-1",
+                    "orderId": 2,
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "origQty": "0.2",
+                    "executedQty": "0",
+                },
+            ]
+
+            with (
+                patch("grid_optimizer.loop_runner.load_binance_api_credentials", return_value=("key", "secret")),
+                patch("grid_optimizer.loop_runner.fetch_futures_open_orders", return_value=open_orders),
+                patch("grid_optimizer.loop_runner.delete_futures_order", return_value={"status": "CANCELED"}) as cancel,
+            ):
+                result = loop_runner_module._maybe_recover_hedge_bq_position_mismatch(
+                    args=args,
+                    exc=RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新"),
+                    consecutive_errors=3,
+                )
 
         self.assertEqual(result["action"], "cancel_normal_orders_for_position_realign")
         self.assertEqual(result["canceled_order_ids"], [1])
@@ -7517,7 +8540,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(after_old_disappears["place_count"], 1)
         self.assertEqual(after_old_disappears["place_orders"], [new_order])
 
-    def test_preserve_frozen_inventory_manual_limit_open_orders_keeps_existing_order(self) -> None:
+    def test_preserve_frozen_inventory_manual_limit_open_orders_keeps_durable_authorization(self) -> None:
         open_orders = [
             {
                 "clientOrderId": "gx-pharosu-frozenin-1-91969317",
@@ -7528,18 +8551,51 @@ class LoopRunnerTests(unittest.TestCase):
                 "origQty": "1500",
                 "executedQty": "0",
                 "orderId": 46174496,
+                "book": "frozen_bq",
+                "role": "frozen_inventory_manual_limit_short",
+                "frozen_inventory_request_id": "frozen-limit-short-1",
+                "frozen_inventory_authorization_validated": True,
             }
         ]
 
         desired = _preserve_frozen_inventory_manual_limit_open_orders(
             existing_orders=open_orders,
             desired_orders=[],
+            state={"best_quote_frozen_inventory": {"short_manual_limit_isolated_qty": 1500.0}},
         )
 
         self.assertEqual(len(desired), 1)
         self.assertEqual(desired[0]["role"], "frozen_inventory_manual_limit_short")
         self.assertEqual(desired[0]["position_side"], "SHORT")
         self.assertAlmostEqual(float(desired[0]["qty"]), 1500.0)
+        self.assertEqual(
+            desired[0]["frozen_inventory_request_id"],
+            "frozen-limit-short-1",
+        )
+        self.assertTrue(desired[0]["frozen_inventory_authorization_validated"])
+        self.assertEqual(desired[0]["book"], "frozen_bq")
+        self.assertEqual(desired[0]["time_in_force"], "GTX")
+        self.assertTrue(desired[0]["post_only"])
+
+    def test_preserve_frozen_inventory_manual_limit_open_orders_rejects_unbound_prefix_spoof(self) -> None:
+        spoofed_order = {
+            "clientOrderId": "gx-pharosu-frozenin-99-spoofed",
+            "side": "BUY",
+            "type": "LIMIT",
+            "positionSide": "SHORT",
+            "price": "0.6290000",
+            "origQty": "1500",
+            "executedQty": "0",
+            "orderId": 46174497,
+        }
+
+        desired = _preserve_frozen_inventory_manual_limit_open_orders(
+            existing_orders=[spoofed_order],
+            desired_orders=[],
+            state={"best_quote_frozen_inventory": {"short_manual_limit_isolated_qty": 1500.0}},
+        )
+
+        self.assertEqual(desired, [])
 
     def test_preserve_frozen_inventory_manual_limit_open_orders_skips_side_with_desired_order(self) -> None:
         open_orders = [
@@ -7871,6 +8927,152 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(actions["place_notional"], 260.0, places=8)
         self.assertEqual(report["execution_request_budget"]["deferred_cancel_count"], 0)
         self.assertEqual(report["execution_request_budget"]["deferred_place_count"], 2)
+
+    def test_apply_execution_request_budget_defers_frozen_pair_atomically_when_budget_is_one(self) -> None:
+        pair_orders = [
+            {
+                "role": "frozen_inventory_pair_release_long",
+                "side": "SELL",
+                "qty": 1.0,
+                "frozen_inventory_pair_release": True,
+                "frozen_inventory_request_id": "pair-1",
+            },
+            {
+                "role": "frozen_inventory_pair_release_short",
+                "side": "BUY",
+                "qty": 1.0,
+                "frozen_inventory_pair_release": True,
+                "frozen_inventory_request_id": "pair-1",
+            },
+        ]
+        report: dict[str, object] = {}
+
+        updated = apply_execution_request_budget_to_actions(
+            validation={
+                "ok": True,
+                "errors": [],
+                "actions": {
+                    "cancel_orders": [],
+                    "place_orders": pair_orders,
+                    "cancel_count": 0,
+                    "place_count": 2,
+                },
+            },
+            report=report,
+            max_places_per_cycle=1,
+        )
+
+        self.assertEqual(updated["actions"]["place_orders"], [])
+        self.assertEqual(updated["actions"]["place_count"], 0)
+        self.assertEqual(
+            [row["role"] for row in report["execution_request_budget"]["deferred_place_orders"]],
+            [
+                "frozen_inventory_pair_release_long",
+                "frozen_inventory_pair_release_short",
+            ],
+        )
+        self.assertEqual(
+            report["execution_request_budget"]["deferred_atomic_place_groups"][0]["reason"],
+            "insufficient_place_budget",
+        )
+
+    def test_apply_execution_request_budget_defers_pair_when_cancel_leaves_one_slot(self) -> None:
+        pair_orders = [
+            {
+                "role": "frozen_inventory_pair_release_long",
+                "side": "SELL",
+                "qty": 1.0,
+                "frozen_inventory_pair_release": True,
+                "frozen_inventory_request_id": "pair-2",
+            },
+            {
+                "role": "frozen_inventory_pair_release_short",
+                "side": "BUY",
+                "qty": 1.0,
+                "frozen_inventory_pair_release": True,
+                "frozen_inventory_request_id": "pair-2",
+            },
+        ]
+        report: dict[str, object] = {}
+
+        updated = apply_execution_request_budget_to_actions(
+            validation={
+                "ok": True,
+                "errors": [],
+                "actions": {
+                    "cancel_orders": [{"orderId": 1}],
+                    "place_orders": pair_orders,
+                    "cancel_count": 1,
+                    "place_count": 2,
+                },
+            },
+            report=report,
+            max_mutations_per_cycle=2,
+        )
+
+        self.assertEqual(updated["actions"]["cancel_count"], 1)
+        self.assertEqual(updated["actions"]["place_count"], 0)
+        self.assertEqual(report["execution_request_budget"]["deferred_place_count"], 2)
+
+    def test_apply_execution_request_budget_allows_single_frozen_pair_repair_with_budget_one(self) -> None:
+        repair = {
+            "role": "frozen_inventory_pair_release_short",
+            "side": "BUY",
+            "frozen_inventory_pair_release": True,
+            "frozen_inventory_request_id": "pair-repair",
+            "frozen_inventory_pair_repair_side": "SHORT",
+        }
+        report: dict[str, object] = {}
+
+        updated = apply_execution_request_budget_to_actions(
+            validation={
+                "ok": True,
+                "errors": [],
+                "actions": {
+                    "cancel_orders": [],
+                    "place_orders": [repair],
+                    "cancel_count": 0,
+                    "place_count": 1,
+                },
+            },
+            report=report,
+            max_places_per_cycle=1,
+        )
+
+        self.assertEqual(updated["actions"]["place_orders"], [repair])
+        self.assertEqual(updated["actions"]["place_count"], 1)
+
+    def test_apply_execution_request_budget_rejects_single_initial_frozen_pair_leg(self) -> None:
+        accidental_leg = {
+            "role": "frozen_inventory_pair_release_long",
+            "side": "SELL",
+            "qty": 1.0,
+            "frozen_inventory_pair_release": True,
+            "frozen_inventory_request_id": "pair-missing-short",
+        }
+        report: dict[str, object] = {}
+
+        updated = apply_execution_request_budget_to_actions(
+            validation={
+                "ok": True,
+                "errors": [],
+                "actions": {
+                    "cancel_orders": [],
+                    "place_orders": [accidental_leg],
+                    "cancel_count": 0,
+                    "place_count": 1,
+                },
+            },
+            report=report,
+            max_places_per_cycle=2,
+        )
+
+        self.assertEqual(updated["actions"]["place_orders"], [])
+        self.assertEqual(updated["actions"]["place_count"], 0)
+        self.assertEqual(
+            report["execution_request_budget"]["deferred_atomic_place_groups"][0]["reason"],
+            "invalid_pair_shape_without_explicit_repair",
+        )
 
     def test_isolate_frozen_pair_release_place_orders_defers_normal_places(self) -> None:
         actions = {
@@ -11614,6 +12816,10 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertIn("take_profit_long", sell_roles)
         self.assertIn("entry_short", sell_roles)
         self.assertFalse(report["active_delever"]["active"])
+    @patch(
+        "grid_optimizer.loop_runner.prioritize_inventory_reducing_place_orders",
+        wraps=prioritize_inventory_reducing_place_orders,
+    )
     @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
     @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
     @patch("grid_optimizer.loop_runner.post_futures_order")
@@ -11636,6 +12842,7 @@ class LoopRunnerTests(unittest.TestCase):
         mock_post_order,
         mock_update_inventory_grid_refs,
         mock_update_refs,
+        mock_prioritize_inventory,
     ) -> None:
         mock_validate_plan_report.return_value = {
             "ok": True,
@@ -11696,6 +12903,14 @@ class LoopRunnerTests(unittest.TestCase):
             maker_retries=0,
             recv_window=5000,
             state_path="output/pharosusdt_hedge_bq_state.json",
+            market_stream=SimpleNamespace(
+                snapshot=lambda max_age_seconds: {
+                    "bid_price": 0.6336,
+                    "ask_price": 0.6337,
+                    "mark_price": 0.63365,
+                    "funding_rate": 0.0001,
+                }
+            ),
         )
         plan_report = {
             "symbol": "PHAROSUSDT",
@@ -11733,6 +12948,116 @@ class LoopRunnerTests(unittest.TestCase):
         )
         mock_update_refs.assert_called_once()
         mock_update_inventory_grid_refs.assert_called_once()
+        self.assertAlmostEqual(
+            mock_prioritize_inventory.call_args.kwargs["current_actual_net_qty"],
+            52.0,
+        )
+
+    def test_execute_one_way_best_quote_reconciles_exchange_but_prioritizes_ordinary(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            args = Namespace(
+                symbol="BCHUSDT",
+                strategy_mode="best_quote_maker_volume_v1",
+                max_new_orders=20,
+                max_total_notional=120.0,
+                cancel_stale=False,
+                max_plan_age_seconds=30,
+                max_mid_drift_steps=20.0,
+                plan_json=str(Path(tmpdir) / "bch_plan.json"),
+                apply=True,
+                margin_type="KEEP",
+                leverage=10,
+                maker_retries=0,
+                recv_window=5000,
+                state_path=str(Path(tmpdir) / "bch_state.json"),
+                market_stream=SimpleNamespace(
+                    snapshot=lambda max_age_seconds: {
+                        "bid_price": 99.9,
+                        "ask_price": 100.1,
+                        "mark_price": 100.0,
+                        "funding_rate": 0.0001,
+                    }
+                ),
+            )
+            plan_report = {
+                "symbol": "BCHUSDT",
+                "strategy_mode": "best_quote_maker_volume_v1",
+                "mid_price": 100.0,
+                "step_price": 0.1,
+                "open_order_count": 0,
+                "current_long_qty": 0.4,
+                "current_short_qty": 0.0,
+                "ordinary_long_qty": 0.4,
+                "ordinary_short_qty": 0.0,
+                "ordinary_actual_net_qty": 0.4,
+                "actual_net_qty": 1.0,
+                "exchange_long_qty": 1.0,
+                "exchange_short_qty": 0.0,
+                "frozen_long_qty": 0.6,
+                "frozen_short_qty": 0.0,
+                "symbol_info": {
+                    "tick_size": 0.1,
+                    "step_size": 0.001,
+                    "min_qty": 0.001,
+                    "min_notional": 5.0,
+                },
+            }
+            validation = {
+                "ok": True,
+                "errors": [],
+                "actions": {
+                    "place_count": 1,
+                    "cancel_count": 0,
+                    "cancel_orders": [],
+                    "place_orders": [
+                        {
+                            "role": "best_quote_entry_long",
+                            "side": "BUY",
+                            "qty": 0.05,
+                            "price": 99.9,
+                        }
+                    ],
+                },
+            }
+            original_prioritize = loop_runner_module.prioritize_inventory_reducing_place_orders
+            with (
+                patch("grid_optimizer.loop_runner.validate_plan_report", return_value=validation),
+                patch("grid_optimizer.loop_runner.load_binance_api_credentials", return_value=("key", "secret")),
+                patch("grid_optimizer.loop_runner.fetch_futures_position_mode", return_value={"dualSidePosition": False}),
+                patch(
+                    "grid_optimizer.loop_runner.fetch_futures_account_info_v3",
+                    return_value={
+                        "multiAssetsMargin": False,
+                        "positions": [
+                            {
+                                "symbol": "BCHUSDT",
+                                "positionSide": "BOTH",
+                                "positionAmt": "1.0",
+                                "entryPrice": "99.0",
+                            }
+                        ],
+                    },
+                ),
+                patch("grid_optimizer.loop_runner.fetch_futures_open_orders", return_value=[]),
+                patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage", return_value={"leverage": 10}),
+                patch("grid_optimizer.loop_runner.post_futures_order", return_value={"orderId": 1}),
+                patch("grid_optimizer.loop_runner.update_synthetic_order_refs"),
+                patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs"),
+                patch(
+                    "grid_optimizer.loop_runner.prioritize_inventory_reducing_place_orders",
+                    wraps=original_prioritize,
+                ) as prioritize,
+            ):
+                report = execute_plan_report(args, plan_report)
+
+        self.assertTrue(report["executed"])
+        self.assertAlmostEqual(report["position_reconcile"]["expected_exchange_long_qty"], 1.0)
+        self.assertAlmostEqual(report["position_reconcile"]["current_long_qty"], 1.0)
+        self.assertAlmostEqual(report["position_reconcile"]["ordinary_long_qty"], 0.4)
+        self.assertAlmostEqual(
+            prioritize.call_args.kwargs["current_actual_net_qty"],
+            0.4,
+        )
 
     @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
     @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
@@ -11767,10 +13092,12 @@ class LoopRunnerTests(unittest.TestCase):
                 "notional": 39.6209,
                 "position_side": "LONG",
                 "force_reduce_only": True,
-                "execution_type": "aggressive",
-                "time_in_force": "IOC",
+                "execution_type": "maker",
+                "time_in_force": "GTX",
+                "post_only": True,
                 "frozen_inventory_pair_release": True,
                 "frozen_inventory_request_id": request_id,
+                "frozen_inventory_authorization_validated": True,
             },
             {
                 "role": "frozen_inventory_pair_release_short",
@@ -11780,10 +13107,12 @@ class LoopRunnerTests(unittest.TestCase):
                 "notional": 39.7204,
                 "position_side": "SHORT",
                 "force_reduce_only": True,
-                "execution_type": "aggressive",
-                "time_in_force": "IOC",
+                "execution_type": "maker",
+                "time_in_force": "GTX",
+                "post_only": True,
                 "frozen_inventory_pair_release": True,
                 "frozen_inventory_request_id": request_id,
+                "frozen_inventory_authorization_validated": True,
             },
         ]
         mock_validate_plan_report.return_value = {
@@ -11808,10 +13137,17 @@ class LoopRunnerTests(unittest.TestCase):
         }
         mock_open_orders.return_value = []
         mock_change_leverage.return_value = {"leverage": 10}
-        mock_post_order.side_effect = [
-            {"orderId": 11, "clientOrderId": "long-release"},
-            {"orderId": 12, "clientOrderId": "short-release"},
-        ]
+        posted_order_count = 0
+
+        def _post_pair_order(**kwargs):
+            nonlocal posted_order_count
+            posted_order_count += 1
+            return {
+                "orderId": 10 + posted_order_count,
+                "clientOrderId": kwargs["new_client_order_id"],
+            }
+
+        mock_post_order.side_effect = _post_pair_order
 
         with TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "opgusdt_state.json"
@@ -11826,6 +13162,14 @@ class LoopRunnerTests(unittest.TestCase):
                             "requested": True,
                             "request_id": request_id,
                             "requested_qty": 199.0,
+                            "requested_at": "2026-07-17T00:00:00+00:00",
+                            "expires_at": "2099-01-01T00:00:00+00:00",
+                        },
+                        "best_quote_frozen_inventory": {
+                            "long_qty": 199.0,
+                            "long_lots": [{"qty": 199.0, "entry_price": 0.2050}],
+                            "short_qty": 3685.0,
+                            "short_lots": [{"qty": 3685.0, "entry_price": 0.2060}],
                         },
                     }
                 )
@@ -11846,9 +13190,9 @@ class LoopRunnerTests(unittest.TestCase):
                 recv_window=5000,
                 state_path=str(state_path),
                 market_stream=SimpleNamespace(snapshot=lambda max_age_seconds: {
-                    "bid_price": 0.6102,
-                    "ask_price": 0.6104,
-                    "mark_price": 0.6103,
+                    "bid_price": 0.1990,
+                    "ask_price": 0.1991,
+                    "mark_price": 0.19905,
                     "funding_rate": 0.0001,
                 }),
             )
@@ -16063,6 +17407,25 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(report["idle"])
         self.assertEqual(report["plan_snapshot"]["inventory_tier"], {})
         self.assertEqual(report["plan_snapshot"]["synthetic_ledger"], {})
+
+    def test_execute_plan_report_requires_state_path_for_live_apply(self) -> None:
+        args = Namespace(
+            symbol="OPNUSDT",
+            strategy_mode="one_way_long",
+            apply=True,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "state_path is required for live execution",
+        ):
+            execute_plan_report(
+                args,
+                {
+                    "symbol": "OPNUSDT",
+                    "strategy_mode": "one_way_long",
+                },
+            )
 
     @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
     @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")

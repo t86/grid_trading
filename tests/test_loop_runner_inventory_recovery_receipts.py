@@ -4,6 +4,7 @@ from argparse import Namespace
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -122,6 +123,70 @@ def _args(state: RecoveryState, tmp_path) -> Namespace:
     return args
 
 
+def _install_frozen_short_request(
+    args: Namespace,
+    *,
+    request_id: str,
+    order_id: int = 88,
+) -> tuple[dict[str, object], dict[str, object]]:
+    client_order_id = f"gx-arxu-frozenin-1-{order_id}"
+    frozen_place: dict[str, object] = {
+        "book": "frozen_bq",
+        "role": "frozen_inventory_manual_reduce_short",
+        "side": "BUY",
+        "position_side": "SHORT",
+        "qty": 1.0,
+        "price": 0.99,
+        "force_reduce_only": True,
+        "execution_type": "maker",
+        "time_in_force": "GTX",
+        "post_only": True,
+        "manual_frozen_inventory_reduce": True,
+        "frozen_inventory_request_id": request_id,
+        "frozen_inventory_authorization_validated": True,
+    }
+    frozen_cancel: dict[str, object] = {
+        **frozen_place,
+        "orderId": order_id,
+        "clientOrderId": client_order_id,
+        "origQty": "1.0",
+        "executedQty": "0",
+    }
+    Path(args.state_path).write_text(
+        json.dumps(
+            {
+                "best_quote_frozen_inventory": {
+                    "long_qty": 0.0,
+                    "long_lots": [],
+                    "short_qty": 2.0,
+                    "short_lots": [{"qty": 2.0, "entry_price": 1.0}],
+                },
+                "best_quote_frozen_inventory_manual_reduce": {
+                    "short": {
+                        "requested": True,
+                        "request_id": request_id,
+                        "requested_qty": 1.0,
+                        "requested_at": NOW.isoformat(),
+                        "expires_at": (NOW + timedelta(minutes=5)).isoformat(),
+                    }
+                },
+                "best_quote_volume_order_refs": {
+                    str(order_id): {
+                        "book": "frozen_bq",
+                        "role": "frozen_inventory_manual_reduce_short",
+                        "side": "BUY",
+                        "position_side": "SHORT",
+                        "client_order_id": client_order_id,
+                        "frozen_inventory_request_id": request_id,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return frozen_place, frozen_cancel
+
+
 def _ordinary_client_order_id(
     state: RecoveryState,
     *,
@@ -200,6 +265,40 @@ def test_inventory_profile_gate_keeps_only_selected_normal_bq_reduce(tmp_path) -
     ]
     assert plan["buy_orders"] == []
     assert report["dropped_order_count"] == 3
+
+
+def test_inventory_profile_gate_preserves_authorized_frozen_order_outside_ordinary_scope(
+    tmp_path,
+) -> None:
+    state = _active_state(ActionId.INVENTORY_RECOVER, Side.SELL)
+    args = _args(state, tmp_path)
+    frozen_order = {
+        "book": "frozen_bq",
+        "role": "frozen_inventory_manual_reduce_short",
+        "side": "BUY",
+        "position_side": "SHORT",
+        "qty": 1.0,
+        "force_reduce_only": True,
+        "execution_type": "maker",
+        "time_in_force": "GTX",
+        "post_only": True,
+        "manual_frozen_inventory_reduce": True,
+        "frozen_inventory_request_id": "frozen-request-1",
+        "frozen_inventory_authorization_validated": True,
+    }
+    with patch("grid_optimizer.loop_runner.JsonRecoveryStore.read", return_value=state):
+        gate = _load_recovery_order_profile_gate(args, now=NOW + timedelta(seconds=1))
+    plan = {
+        "bootstrap_orders": [],
+        "buy_orders": [dict(_orders()[1]), frozen_order],
+        "sell_orders": [dict(_orders()[0])],
+    }
+
+    report = apply_recovery_profile_gate_to_plan(plan=plan, gate=gate)
+
+    assert plan["buy_orders"] == [frozen_order]
+    assert plan["sell_orders"] == [dict(_orders()[0])]
+    assert report["preserved_frozen_order_count"] == 1
 
 
 def test_maker_flow_profile_gate_keeps_only_selected_entry_side(tmp_path) -> None:
@@ -798,6 +897,69 @@ def test_execution_gate_drops_all_mutations_when_plan_generation_is_stale(
     assert filtered["cancel_orders"] == []
     assert report["authorized"] is False
     assert report["reason"] == "recovery_generation_mismatch"
+
+
+def test_execution_gate_preserves_authorized_frozen_mutations_when_ordinary_generation_is_stale(
+    tmp_path,
+) -> None:
+    state = _active_state(ActionId.INVENTORY_RECOVER, Side.SELL)
+    args = _args(state, tmp_path)
+    with patch("grid_optimizer.loop_runner.JsonRecoveryStore.read", return_value=state):
+        planned = _load_recovery_order_profile_gate(
+            args,
+            now=NOW + timedelta(seconds=1),
+        )
+    args.recovery_generation += 1
+    frozen_place, frozen_cancel = _install_frozen_short_request(
+        args,
+        request_id="frozen-request-2",
+    )
+    actions = {
+        "place_orders": [dict(_orders()[0]), frozen_place],
+        "place_count": 2,
+        "cancel_orders": [{"orderId": 99}, frozen_cancel],
+        "cancel_count": 2,
+    }
+
+    with patch("grid_optimizer.loop_runner.JsonRecoveryStore.read", return_value=state):
+        filtered, report = _apply_recovery_profile_gate_to_actions(
+            args=args,
+            actions=actions,
+            expected_gate=planned.as_dict(),
+            now=NOW + timedelta(seconds=2),
+        )
+
+    assert [row["role"] for row in filtered["place_orders"]] == [
+        "frozen_inventory_manual_reduce_short"
+    ]
+    assert [row["orderId"] for row in filtered["cancel_orders"]] == [88]
+    assert report["authorized"] is False
+    assert report["preserved_frozen_place_count"] == 1
+    assert report["preserved_frozen_cancel_count"] == 1
+
+
+def test_submit_fence_preserves_authorized_frozen_order_when_ordinary_owner_changed(
+    tmp_path,
+) -> None:
+    state = _active_state(ActionId.INVENTORY_RECOVER, Side.SELL)
+    args = _args(state, tmp_path)
+    frozen_order, _ = _install_frozen_short_request(
+        args,
+        request_id="frozen-request-3",
+    )
+
+    with patch("grid_optimizer.loop_runner.JsonRecoveryStore.read", return_value=state):
+        guarded, reason = _guard_recovery_profile_order_before_submit(
+            args=args,
+            order=frozen_order,
+            expected_gate=None,
+            now=NOW + timedelta(seconds=2),
+        )
+
+    assert guarded is not None
+    assert guarded["frozen_inventory_request_id"] == "frozen-request-3"
+    assert guarded["frozen_inventory_authorization_validated"] is True
+    assert reason is None
 
 
 def test_non_gtx_response_cannot_create_inventory_progress(tmp_path) -> None:

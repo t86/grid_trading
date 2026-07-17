@@ -14,6 +14,7 @@ from grid_optimizer.loop_runner import (
     _handle_terminal_drain_round,
     _terminal_drain_decision_id,
     _terminal_drain_fetch_user_trades_exact,
+    _terminal_drain_runtime_owner_is_integral,
     _terminal_drain_runtime_integrity_digest,
     _terminal_drain_settle_loss_receipt,
 )
@@ -1101,6 +1102,321 @@ class LoopRunnerTerminalDrainTests(unittest.TestCase):
         mock_post.assert_not_called()
         mock_cancel.assert_not_called()
         mock_reset.assert_not_called()
+
+    def test_durable_frozen_open_order_does_not_enter_terminal_entry_cancel(self) -> None:
+        frozen_client_id = "gx-bchu-frozenin-1-deadbeef"
+        frozen_order = {
+            "symbol": "BCHUSDT",
+            "orderId": 771,
+            "clientOrderId": frozen_client_id,
+            "side": "SELL",
+            "positionSide": "LONG",
+            "type": "LIMIT",
+            "status": "NEW",
+            "price": "220.50",
+            "origQty": "0.100",
+            "executedQty": "0",
+        }
+        frozen_positions = [
+            {
+                "symbol": "BCHUSDT",
+                "positionSide": "LONG",
+                "positionAmt": "0.283",
+                "entryPrice": "236.102158290782",
+            },
+            {
+                "symbol": "BCHUSDT",
+                "positionSide": "SHORT",
+                "positionAmt": "0",
+                "entryPrice": "0",
+            },
+        ]
+        state = self._bq_ledger_state(frozen_long_qty=0.283)
+        state["best_quote_frozen_inventory_manual_limit"] = {
+            "long": {
+                "requested": True,
+                "submitted": True,
+                "request_id": "frozen-limit-long-1",
+                "requested_qty": 0.1,
+            }
+        }
+        state["best_quote_volume_order_refs"] = {
+            "771": {
+                "book": "frozen_bq",
+                "role": "frozen_inventory_manual_limit_long",
+                "side": "SELL",
+                "position_side": "LONG",
+                "client_order_id": frozen_client_id,
+                "frozen_inventory_request_id": "frozen-limit-long-1",
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            args = self._args(state_path)
+            patches = self._base_patches(
+                positions=frozen_positions,
+                open_orders=[frozen_order],
+            )
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patches[5],
+                patches[6],
+                patch("grid_optimizer.loop_runner.post_futures_order") as mock_post,
+                patch("grid_optimizer.loop_runner.delete_futures_order") as mock_cancel,
+            ):
+                first = _handle_terminal_drain_round(
+                    args=args,
+                    cycle=1,
+                    cycle_started_at=NOW,
+                    stats_start_time=None,
+                    runtime_guard_config=self._guard_config(),
+                    runtime_guard_result=self._guard_result(),
+                    cumulative_gross_notional=1_817.0,
+                    state=state,
+                    state_path=state_path,
+                )
+                second = _handle_terminal_drain_round(
+                    args=args,
+                    cycle=2,
+                    cycle_started_at=NOW + timedelta(seconds=2),
+                    stats_start_time=None,
+                    runtime_guard_config=self._guard_config(),
+                    runtime_guard_result=self._guard_result(),
+                    cumulative_gross_notional=1_817.0,
+                    state=json.loads(state_path.read_text(encoding="utf-8")),
+                    state_path=state_path,
+                )
+
+        self.assertEqual(first["terminal_drain_action"], "block_entry")
+        self.assertEqual(second["terminal_drain_action"], "verify_flat")
+        mock_post.assert_not_called()
+        mock_cancel.assert_not_called()
+
+    def test_frozen_fill_during_terminal_owner_uses_current_frozen_subtraction(self) -> None:
+        positions = [
+            {
+                "symbol": "BCHUSDT",
+                "positionSide": "LONG",
+                "positionAmt": "0.240",
+                "entryPrice": "236",
+            },
+            {
+                "symbol": "BCHUSDT",
+                "positionSide": "SHORT",
+                "positionAmt": "0",
+                "entryPrice": "0",
+            },
+        ]
+        state = self._bq_ledger_state(
+            normal_long_qty=0.19,
+            frozen_long_qty=0.05,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            args = self._args(state_path)
+            patches = self._base_patches(positions=positions, open_orders=[])
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patches[5],
+                patches[6],
+                patch(
+                    "grid_optimizer.loop_runner.post_futures_order",
+                    return_value={"orderId": 901, "status": "NEW"},
+                ) as mock_post,
+            ):
+                first = _handle_terminal_drain_round(
+                    args=args,
+                    cycle=1,
+                    cycle_started_at=NOW,
+                    stats_start_time=None,
+                    runtime_guard_config=self._guard_config(),
+                    runtime_guard_result=self._guard_result(),
+                    cumulative_gross_notional=1_817.0,
+                    state=state,
+                    state_path=state_path,
+                )
+                next_state = json.loads(state_path.read_text(encoding="utf-8"))
+                next_state["best_quote_frozen_inventory"] = self._bq_ledger_state(
+                    frozen_long_qty=0.03,
+                )["best_quote_frozen_inventory"]
+                self.assertTrue(
+                    _terminal_drain_runtime_owner_is_integral(
+                        next_state["futures_terminal_drain"],
+                        symbol="BCHUSDT",
+                        loop_state=next_state,
+                    )
+                )
+                positions[0]["positionAmt"] = "0.220"
+                second = _handle_terminal_drain_round(
+                    args=args,
+                    cycle=2,
+                    cycle_started_at=NOW + timedelta(seconds=2),
+                    stats_start_time=None,
+                    runtime_guard_config=self._guard_config(),
+                    runtime_guard_result=self._guard_result(),
+                    cumulative_gross_notional=1_817.0,
+                    state=next_state,
+                    state_path=state_path,
+                )
+
+        self.assertEqual(first["terminal_drain_action"], "block_entry")
+        self.assertEqual(second["terminal_drain_action"], "drain_net_long")
+        self.assertNotIn(
+            "run_contract_integrity_frozen_ledger_mismatch",
+            second["terminal_drain_reasons"],
+        )
+        self.assertNotIn(
+            "owned_inventory_exceeds_exchange",
+            second["terminal_drain_reasons"],
+        )
+        mock_post.assert_called_once()
+
+    def test_frozen_increase_during_terminal_owner_keeps_ordinary_flat(self) -> None:
+        positions = [
+            {
+                "symbol": "BCHUSDT",
+                "positionSide": "LONG",
+                "positionAmt": "0.050",
+                "entryPrice": "236",
+            },
+            {
+                "symbol": "BCHUSDT",
+                "positionSide": "SHORT",
+                "positionAmt": "0",
+                "entryPrice": "0",
+            },
+        ]
+        state = self._bq_ledger_state(frozen_long_qty=0.05)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            args = self._args(state_path)
+            patches = self._base_patches(positions=positions, open_orders=[])
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patches[5],
+                patches[6],
+                patch("grid_optimizer.loop_runner.post_futures_order") as mock_post,
+            ):
+                first = _handle_terminal_drain_round(
+                    args=args,
+                    cycle=1,
+                    cycle_started_at=NOW,
+                    stats_start_time=None,
+                    runtime_guard_config=self._guard_config(),
+                    runtime_guard_result=self._guard_result(),
+                    cumulative_gross_notional=1_817.0,
+                    state=state,
+                    state_path=state_path,
+                )
+                next_state = json.loads(state_path.read_text(encoding="utf-8"))
+                next_state["best_quote_frozen_inventory"] = self._bq_ledger_state(
+                    frozen_long_qty=0.07,
+                )["best_quote_frozen_inventory"]
+                second = _handle_terminal_drain_round(
+                    args=args,
+                    cycle=2,
+                    cycle_started_at=NOW + timedelta(seconds=2),
+                    stats_start_time=None,
+                    runtime_guard_config=self._guard_config(),
+                    runtime_guard_result=self._guard_result(),
+                    cumulative_gross_notional=1_817.0,
+                    state=next_state,
+                    state_path=state_path,
+                )
+
+        self.assertEqual(first["terminal_drain_action"], "block_entry")
+        self.assertEqual(second["terminal_drain_action"], "verify_flat")
+        self.assertNotIn(
+            "run_contract_integrity_frozen_ledger_mismatch",
+            second["terminal_drain_reasons"],
+        )
+        mock_post.assert_not_called()
+
+    def test_unbound_frozen_prefix_open_order_remains_terminal_entry_cancel(self) -> None:
+        spoofed_client_id = "gx-bchu-frozenin-99-spoofed"
+        spoofed_order = {
+            "symbol": "BCHUSDT",
+            "orderId": 772,
+            "clientOrderId": spoofed_client_id,
+            "side": "BUY",
+            "positionSide": "LONG",
+            "type": "LIMIT",
+            "status": "NEW",
+            "price": "220.00",
+            "origQty": "0.100",
+            "executedQty": "0",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state = self._default_bq_state()
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            args = self._args(state_path)
+            patches = self._base_patches(
+                positions=self._positions(),
+                open_orders=[spoofed_order],
+            )
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patches[5],
+                patches[6],
+                patch("grid_optimizer.loop_runner.post_futures_order") as mock_post,
+                patch(
+                    "grid_optimizer.loop_runner.delete_futures_order",
+                    return_value={"status": "CANCELED", "executedQty": "0"},
+                ) as mock_cancel,
+            ):
+                first = _handle_terminal_drain_round(
+                    args=args,
+                    cycle=1,
+                    cycle_started_at=NOW,
+                    stats_start_time=None,
+                    runtime_guard_config=self._guard_config(),
+                    runtime_guard_result=self._guard_result(),
+                    cumulative_gross_notional=1_817.0,
+                    state=state,
+                    state_path=state_path,
+                )
+                second = _handle_terminal_drain_round(
+                    args=args,
+                    cycle=2,
+                    cycle_started_at=NOW + timedelta(seconds=2),
+                    stats_start_time=None,
+                    runtime_guard_config=self._guard_config(),
+                    runtime_guard_result=self._guard_result(),
+                    cumulative_gross_notional=1_817.0,
+                    state=json.loads(state_path.read_text(encoding="utf-8")),
+                    state_path=state_path,
+                )
+
+        self.assertEqual(first["terminal_drain_action"], "block_entry")
+        self.assertEqual(second["terminal_drain_action"], "cancel_entry")
+        mock_post.assert_not_called()
+        self.assertEqual(mock_cancel.call_count, 1)
+        self.assertEqual(
+            mock_cancel.call_args.kwargs["orig_client_order_id"],
+            spoofed_client_id,
+        )
 
     def test_only_explicit_stop_preserve_can_exit_with_residual_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

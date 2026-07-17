@@ -34,16 +34,29 @@ import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-from .audit import fetch_time_paged, trade_row_key, trade_row_time_ms
+from .audit import (
+    exclusive_json_state_lock,
+    fetch_time_paged,
+    trade_row_key,
+    trade_row_time_ms,
+    write_json,
+)
 from .data import (
     delete_futures_order,
     fetch_futures_open_orders,
     fetch_futures_position_risk_v3,
     fetch_futures_user_trades,
 )
+from .futures_inventory_boundary import (
+    durable_frozen_order_identities,
+    ordinary_position_qtys,
+    strict_frozen_side_qtys,
+)
 from .futures_recovery_store import recovery_coordinator_registered
+from .recovery_control_ownership import exclusive_control_lock
 
 
 def _now_iso() -> str:
@@ -88,11 +101,18 @@ def fetch_exchange_sides(sym: str, k: str, s: str) -> tuple[float, float, float,
 
 
 def compute_drift(state: dict[str, Any], long_qty: float, short_qty: float) -> tuple[float, float]:
-    """Ledger+frozen minus exchange, per side."""
+    """Ordinary ledger minus ordinary exchange position, per side."""
     led = state.get("best_quote_volume_ledger") or {}
     fro = state.get("best_quote_frozen_inventory") or {}
-    ldrift = qty_sum(led.get("long_lots")) + qty_sum(fro.get("long_lots")) - long_qty
-    sdrift = qty_sum(led.get("short_lots")) + qty_sum(fro.get("short_lots")) - short_qty
+    frozen_long_qty, frozen_short_qty = strict_frozen_side_qtys(fro)
+    ordinary_long_qty, ordinary_short_qty = ordinary_position_qtys(
+        exchange_long_qty=long_qty,
+        exchange_short_qty=short_qty,
+        frozen_long_qty=frozen_long_qty,
+        frozen_short_qty=frozen_short_qty,
+    )
+    ldrift = qty_sum(led.get("long_lots")) - ordinary_long_qty
+    sdrift = qty_sum(led.get("short_lots")) - ordinary_short_qty
     return ldrift, sdrift
 
 
@@ -188,10 +208,13 @@ def realign_ledger(
     """Rewrite BQ ledger lots to exchange truth, preserving frozen inventory."""
     led = state.get("best_quote_volume_ledger") or {}
     fro = state.get("best_quote_frozen_inventory") or {}
-    fro_l = qty_sum(fro.get("long_lots"))
-    fro_s = qty_sum(fro.get("short_lots"))
-    act_l = max(lq - fro_l, 0.0)
-    act_s = max(sq - fro_s, 0.0)
+    fro_l, fro_s = strict_frozen_side_qtys(fro)
+    act_l, act_s = ordinary_position_qtys(
+        exchange_long_qty=lq,
+        exchange_short_qty=sq,
+        frozen_long_qty=fro_l,
+        frozen_short_qty=fro_s,
+    )
     led["long_lots"] = (
         [{"qty": act_l, "price": lavg, "source": "auto_realign", "side": "LONG"}] if act_l > 0 else []
     )
@@ -282,74 +305,128 @@ def main() -> None:
         print(json.dumps(status))
         return
 
-    if was_active:
-        subprocess.run(["sudo", "-n", "systemctl", "stop", a.service], capture_output=True)
-        time.sleep(2)
+    # The runner, Web frozen actions and legacy repair tools share one state
+    # document.  Use the same state -> control order as the runner/Web, then
+    # recheck coordinator ownership before stopping or mutating anything.
+    with exclusive_json_state_lock(Path(state_path)):
+        with exclusive_control_lock(Path(control_path)):
+            try:
+                with open(control_path, encoding="utf-8") as handle:
+                    locked_control = json.load(handle)
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                locked_control = {}
+            if not isinstance(locked_control, dict):
+                locked_control = {}
+            if recovery_coordinator_registered(locked_control):
+                status["recovery_coordinator_registered"] = True
+                status["action"] = "DEFERRED_TO_FUTURES_RECOVERY_COORDINATOR"
+                status["requested_action"] = "REALIGN_LEDGER"
+                print(json.dumps(status))
+                return
 
-    # Backup must succeed before any mutation: abort the whole realign otherwise.
-    bak = state_path + ".bak_autorealign_" + str(int(time.time()))
-    try:
-        shutil.copy2(state_path, bak)
-    except OSError as exc:
-        status["action"] = "ABORTED_BACKUP_FAILED"
-        status["error"] = str(exc)[:140]
-        print(json.dumps(status))
-        raise SystemExit(1)
+            with open(state_path, encoding="utf-8") as state_handle:
+                locked_state = json.load(state_handle)
+            ldrift, sdrift = compute_drift(locked_state, lq, sq)
+            status["long_drift"] = round(ldrift, 1)
+            status["short_drift"] = round(sdrift, 1)
+            if max(abs(ldrift), abs(sdrift)) <= a.threshold_qty:
+                status["action"] = "none"
+                print(json.dumps(status))
+                return
 
-    # Cancel ONLY the runner's managed (gx-<sym>-) orders. Protective resting orders
-    # (target gate FROZENTP*), manual and external orders stay untouched.
-    canceled = skipped_protected = 0
-    for o in fetch_futures_open_orders(sym, k, s) or []:
-        if not is_managed_order(o, sym):
-            skipped_protected += 1
-            continue
-        try:
-            delete_futures_order(symbol=sym, order_id=o["orderId"], api_key=k, api_secret=s)
-            canceled += 1
-        except Exception:
-            pass
-    status["canceled_managed_orders"] = canceled
-    status["kept_unmanaged_orders"] = skipped_protected
+            if was_active:
+                subprocess.run(
+                    ["sudo", "-n", "systemctl", "stop", a.service],
+                    capture_output=True,
+                )
+                time.sleep(2)
 
-    state = json.load(open(state_path))
-    ledger = state.get("best_quote_volume_ledger") or {}
-    lq, lavg, sq, savg, reflected_trade_rows = fetch_settled_realign_snapshot(
-        sym,
-        k,
-        s,
-        start_time_ms=int(ledger.get("last_trade_time_ms") or 0),
-    )
-    new_lots = realign_ledger(
-        state,
-        lq,
-        lavg,
-        sq,
-        savg,
-        reflected_trade_rows=reflected_trade_rows,
-    )
-    state["updated_at"] = _now_iso()
-    state["updated_by"] = "competition_state_realign"
-    state["last_realign"] = {"at": _now_iso(), "backup": bak, **new_lots}
-    tmp = state_path + ".tmp"
-    json.dump(state, open(tmp, "w"))
-    os.replace(tmp, state_path)
+            # Backup must succeed before any exchange or state mutation.
+            bak = state_path + ".bak_autorealign_" + str(int(time.time()))
+            try:
+                shutil.copy2(state_path, bak)
+            except OSError as exc:
+                status["action"] = "ABORTED_BACKUP_FAILED"
+                status["error"] = str(exc)[:140]
+                print(json.dumps(status))
+                raise SystemExit(1)
 
-    status.update({"backup": bak, "reflected_trade_count": len(reflected_trade_rows), **new_lots})
-    if should_start_after_realign(was_active, a.allow_start_when_stopped):
-        archived = archive_stale_plan(a.workdir, slug)
-        if archived:
-            status["stale_plan_archived"] = archived
-        start = subprocess.run(["sudo", "-n", "systemctl", "start", a.service], capture_output=True)
-        status["action"] = "REALIGNED_AND_RESTARTED"
-        status["start_rc"] = start.returncode
-    else:
-        # Do NOT revive a runner that was already stopped: the stop had a reason
-        # (risk guard / target gate / manual). Realigned books + archived plan mean
-        # the eventual deliberate start is clean.
-        archived = archive_stale_plan(a.workdir, slug)
-        if archived:
-            status["stale_plan_archived"] = archived
-        status["action"] = "REALIGNED_SKIPPED_START_INACTIVE"
+            frozen_order_ids, frozen_client_order_ids = durable_frozen_order_identities(
+                locked_state
+            )
+
+            # Cancel only ordinary runner-managed orders.  Frozen ownership
+            # comes from exact durable refs/manifest identities, never a prefix.
+            canceled = skipped_protected = kept_frozen = 0
+            for o in fetch_futures_open_orders(sym, k, s) or []:
+                order_id = str(o.get("orderId") or o.get("order_id") or "").strip()
+                client_order_id = str(
+                    o.get("clientOrderId") or o.get("client_order_id") or ""
+                ).strip()
+                if order_id in frozen_order_ids or client_order_id in frozen_client_order_ids:
+                    kept_frozen += 1
+                    continue
+                if not is_managed_order(o, sym):
+                    skipped_protected += 1
+                    continue
+                try:
+                    delete_futures_order(
+                        symbol=sym,
+                        order_id=o["orderId"],
+                        api_key=k,
+                        api_secret=s,
+                    )
+                    canceled += 1
+                except Exception:
+                    pass
+            status["canceled_managed_orders"] = canceled
+            status["kept_frozen_orders"] = kept_frozen
+            status["kept_unmanaged_orders"] = skipped_protected
+
+            ledger = locked_state.get("best_quote_volume_ledger") or {}
+            lq, lavg, sq, savg, reflected_trade_rows = fetch_settled_realign_snapshot(
+                sym,
+                k,
+                s,
+                start_time_ms=int(ledger.get("last_trade_time_ms") or 0),
+            )
+            new_lots = realign_ledger(
+                locked_state,
+                lq,
+                lavg,
+                sq,
+                savg,
+                reflected_trade_rows=reflected_trade_rows,
+            )
+            locked_state["updated_at"] = _now_iso()
+            locked_state["updated_by"] = "competition_state_realign"
+            locked_state["last_realign"] = {
+                "at": _now_iso(),
+                "backup": bak,
+                **new_lots,
+            }
+            write_json(Path(state_path), locked_state)
+
+            status.update(
+                {
+                    "backup": bak,
+                    "reflected_trade_count": len(reflected_trade_rows),
+                    **new_lots,
+                }
+            )
+            archived = archive_stale_plan(a.workdir, slug)
+            if archived:
+                status["stale_plan_archived"] = archived
+            if should_start_after_realign(was_active, a.allow_start_when_stopped):
+                start = subprocess.run(
+                    ["sudo", "-n", "systemctl", "start", a.service],
+                    capture_output=True,
+                )
+                status["action"] = "REALIGNED_AND_RESTARTED"
+                status["start_rc"] = start.returncode
+            else:
+                # Never revive a runner this tool did not stop itself.
+                status["action"] = "REALIGNED_SKIPPED_START_INACTIVE"
     print(json.dumps(status))
 
 

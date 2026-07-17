@@ -30,6 +30,7 @@ from urllib.request import Request, urlopen
 
 from .audit import (
     build_audit_paths,
+    exclusive_json_state_lock,
     income_row_time_ms,
     iter_jsonl,
     read_jsonl_filtered,
@@ -121,6 +122,10 @@ from .data import (
     normalize_market_type,
     parse_interval_ms,
     read_latest_cached_close,
+)
+from .futures_inventory_boundary import (
+    durable_frozen_order_identities,
+    is_durable_frozen_order_record,
 )
 from .dry_run import _round_order_price, _round_order_qty
 from .futures_run_lifecycle import (
@@ -532,7 +537,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_frozen_total_cap_notional": 120.0,
             "best_quote_maker_volume_frozen_long_cap_notional": 80.0,
             "best_quote_maker_volume_frozen_short_cap_notional": 80.0,
-            "best_quote_maker_volume_frozen_v2_enabled": True,
+            "best_quote_maker_volume_frozen_v2_enabled": False,
             "best_quote_maker_volume_frozen_v2_pressure_ratio": 0.60,
             "best_quote_maker_volume_frozen_v2_danger_ratio": 0.85,
             "best_quote_maker_volume_frozen_v2_pressure_same_side_entry_scale": 0.50,
@@ -737,7 +742,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.0008,
             "best_quote_maker_volume_frozen_pair_release_allow_loss": False,
             "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks": 2,
-            "best_quote_maker_volume_frozen_pair_release_execution_type": "aggressive",
+            "best_quote_maker_volume_frozen_pair_release_execution_type": "maker",
             "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio": 0.0015,
             "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio": 0.0025,
             "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio": 0.0035,
@@ -842,7 +847,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.0008,
             "best_quote_maker_volume_frozen_pair_release_allow_loss": False,
             "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks": 2,
-            "best_quote_maker_volume_frozen_pair_release_execution_type": "aggressive",
+            "best_quote_maker_volume_frozen_pair_release_execution_type": "maker",
             "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio": 0.0015,
             "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio": 0.0025,
             "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio": 0.0035,
@@ -4399,7 +4404,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.0008,
     "best_quote_maker_volume_frozen_pair_release_allow_loss": False,
     "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks": 2,
-    "best_quote_maker_volume_frozen_pair_release_execution_type": "aggressive",
+    "best_quote_maker_volume_frozen_pair_release_execution_type": "maker",
     "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio": 0.0015,
     "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio": 0.0025,
     "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio": 0.0035,
@@ -10826,6 +10831,10 @@ def _normalize_runner_control_payload(
     config["symbol"] = str(config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
     config["strategy_mode"] = str(config.get("strategy_mode", "one_way_long")).strip() or "one_way_long"
     config["margin_type"] = str(config.get("margin_type", "KEEP")).upper().strip() or "KEEP"
+    # Frozen inventory is an independent ledger.  This legacy pressure switch
+    # must never scale ordinary entry/recovery budgets, regardless of stale
+    # saved controls or incoming Web payloads.
+    config["best_quote_maker_volume_frozen_v2_enabled"] = False
     config.update(
         normalize_runtime_guard_payload(
             config,
@@ -11365,10 +11374,10 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         if pair_release_slippage_ticks is not None and pair_release_slippage_ticks < 0:
             errors.append("best_quote_maker_volume_frozen_pair_release_max_slippage_ticks 必须 >= 0")
         pair_release_execution_type = str(
-            config.get("best_quote_maker_volume_frozen_pair_release_execution_type", "aggressive") or "aggressive"
+            config.get("best_quote_maker_volume_frozen_pair_release_execution_type", "maker") or "maker"
         ).strip().lower()
-        if pair_release_execution_type not in {"aggressive", "maker"}:
-            errors.append("best_quote_maker_volume_frozen_pair_release_execution_type 必须是 aggressive 或 maker")
+        if pair_release_execution_type != "maker":
+            errors.append("best_quote_maker_volume_frozen_pair_release_execution_type 必须是 maker")
         else:
             config["best_quote_maker_volume_frozen_pair_release_execution_type"] = pair_release_execution_type
         same_side_gap_ticks = number("best_quote_maker_volume_same_side_entry_price_guard_gap_ticks")
@@ -11573,6 +11582,7 @@ def _normalize_runner_frozen_inventory_ledger(raw: Any) -> dict[str, Any]:
     long_isolated = min(max(_safe_float(ledger.get("long_manual_limit_isolated_qty", 0.0), "long_manual_limit_isolated_qty"), 0.0), long_qty)
     short_isolated = min(max(_safe_float(ledger.get("short_manual_limit_isolated_qty", 0.0), "short_manual_limit_isolated_qty"), 0.0), short_qty)
     return {
+        **ledger,
         "long_qty": long_qty,
         "short_qty": short_qty,
         "long_notional": max(_safe_float(ledger.get("long_notional", 0.0), "long_notional"), 0.0) if long_qty > 0 else 0.0,
@@ -11591,14 +11601,82 @@ def _normalize_runner_frozen_inventory_ledger(raw: Any) -> dict[str, Any]:
     }
 
 
+def _runner_frozen_pair_manifest_unresolved(raw: Any) -> bool:
+    directive = raw if isinstance(raw, dict) else {}
+    manifest = directive.get("submission_manifest")
+    if not isinstance(manifest, dict):
+        return bool(directive.get("awaiting_fill_confirmation"))
+    legs = manifest.get("legs")
+    if not isinstance(legs, dict) or not legs:
+        return True
+    terminal_statuses = {
+        "filled",
+        "canceled",
+        "cancelled",
+        "expired",
+        "rejected",
+        "not_found",
+    }
+    for raw_leg in legs.values():
+        if not isinstance(raw_leg, dict):
+            return True
+        status = str(
+            raw_leg.get("status") or raw_leg.get("submit_state") or ""
+        ).lower().strip()
+        if status not in terminal_statuses:
+            return True
+    return False
+
+
 def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(payload.get("symbol", "")).upper().strip()
+    if not symbol:
+        raise ValueError("symbol is required")
+    control_path = _runner_control_path(symbol)
+    # Runner cycles already hold state before reading recovery control.  Keep
+    # the same state -> control order here to avoid ABBA deadlocks.  Re-resolve
+    # the state path under the control lock; a concurrent /save either wins and
+    # causes one bounded retry, or this update writes only the path it locked.
+    for attempt in range(2):
+        state_path = _runner_frozen_inventory_state_path(symbol)
+        with exclusive_json_state_lock(state_path):
+            with exclusive_control_lock(control_path):
+                control = _read_json_dict(control_path)
+                if control is None and control_path.exists():
+                    raise ValueError(f"runner control for {symbol} is unreadable")
+                if isinstance(control, dict) and recovery_coordinator_registered(control):
+                    raise ValueError(
+                        f"recovery coordinator owns {symbol}; frozen_inventory must be "
+                        "requested through the coordinator"
+                    )
+                current_state_path = _runner_frozen_inventory_state_path(symbol)
+                if (
+                    current_state_path.expanduser().resolve(strict=False)
+                    != state_path.expanduser().resolve(strict=False)
+                ):
+                    if attempt == 0:
+                        continue
+                    raise TimeoutError(
+                        f"runner state path changed while updating {symbol}; retry"
+                    )
+                return _update_runner_frozen_inventory_unlocked(
+                    payload,
+                    state_path=state_path,
+                )
+    raise TimeoutError(f"runner state path changed while updating {symbol}; retry")
+
+
+def _update_runner_frozen_inventory_unlocked(
+    payload: dict[str, Any],
+    *,
+    state_path: Path,
+) -> dict[str, Any]:
     symbol = str(payload.get("symbol", "")).upper().strip()
     if not symbol:
         raise ValueError("symbol is required")
     action = str(payload.get("action", "set")).strip().lower() or "set"
     if action not in {"set", "clear_long", "clear_short", "reduce_long", "reduce_short", "limit_long", "limit_short", "cancel_limit_long", "cancel_limit_short", "pair_release", "reset"}:
         raise ValueError("unsupported frozen inventory action")
-    state_path = _runner_frozen_inventory_state_path(symbol)
     state = _read_json_dict(state_path) or {}
     ledger = _normalize_runner_frozen_inventory_ledger(state.get("best_quote_frozen_inventory"))
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -11697,6 +11775,10 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
             ledger.pop(f"{side_key}_manual_limit_price", None)
             ledger.pop(f"{side_key}_manual_limit_request_id", None)
         elif action == "pair_release":
+            if _runner_frozen_pair_manifest_unresolved(
+                state.get("best_quote_frozen_inventory_pair_release")
+            ):
+                raise ValueError("frozen pair release has unresolved in-flight manifest")
             if ledger["offset_qty"] <= 1e-12:
                 raise ValueError("frozen long/short offset qty is empty")
             requested_qty = max(_safe_float(payload.get("requested_qty"), "requested_qty"), 0.0)
@@ -11726,7 +11808,7 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
             ledger = {}
 
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json_dict(state_path, state)
     RUNNING_STATUS_API_RESPONSE_CACHE.clear()
     return {
         "symbol": symbol,
@@ -11965,7 +12047,7 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         "--best-quote-maker-volume-frozen-pair-release-max-slippage-ticks",
         str(config.get("best_quote_maker_volume_frozen_pair_release_max_slippage_ticks", 2)),
         "--best-quote-maker-volume-frozen-pair-release-execution-type",
-        str(config.get("best_quote_maker_volume_frozen_pair_release_execution_type", "aggressive")),
+        str(config.get("best_quote_maker_volume_frozen_pair_release_execution_type", "maker")),
         "--best-quote-maker-volume-frozen-pair-release-max-30s-abs-return-ratio",
         str(config.get("best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio", 0.0015)),
         "--best-quote-maker-volume-frozen-pair-release-max-1m-abs-return-ratio",
@@ -13874,6 +13956,26 @@ def _is_strategy_order(order: dict[str, Any], symbol: str) -> bool:
     return client_order_id.startswith(_strategy_client_order_prefix(symbol))
 
 
+def _is_durable_frozen_order_record(raw: Any) -> bool:
+    return is_durable_frozen_order_record(raw)
+
+
+def _durable_frozen_order_identities(symbol: str) -> tuple[set[str], set[str]]:
+    """Return exact exchange identities owned by the frozen ledger.
+
+    Client-order prefixes are intentionally ignored.  The shared runner state
+    is the ownership source, including a prewritten pair manifest whose order
+    ref may not yet contain the final exchange order id.
+    """
+
+    try:
+        state_path = _runner_frozen_inventory_state_path(symbol)
+        state = _read_json_dict(state_path) or {}
+    except Exception:
+        return set(), set()
+    return durable_frozen_order_identities(state)
+
+
 def _is_manual_trade_order(order: dict[str, Any], prefix: str) -> bool:
     client_order_id = str(order.get("clientOrderId", "") or "")
     return client_order_id.startswith(str(prefix or ""))
@@ -15224,9 +15326,40 @@ def _build_stop_execution_summary(
 
 
 def _cancel_symbol_open_orders(*, symbol: str, api_key: str, api_secret: str) -> dict[str, Any]:
-    result = {"attempted": 0, "success": 0, "errors": []}
+    result = {
+        "attempted": 0,
+        "success": 0,
+        "errors": [],
+        "preserved_frozen_count": 0,
+        "preserved_frozen_order_ids": [],
+        "preserved_frozen_client_order_ids": [],
+    }
     open_orders = fetch_futures_open_orders(symbol, api_key, api_secret)
-    strategy_orders = [order for order in open_orders if isinstance(order, dict) and _is_strategy_order(order, symbol)]
+    strategy_orders = [
+        order
+        for order in open_orders
+        if isinstance(order, dict) and _is_strategy_order(order, symbol)
+    ]
+    frozen_order_ids, frozen_client_order_ids = _durable_frozen_order_identities(
+        symbol
+    )
+    frozen_orders = [
+        order
+        for order in strategy_orders
+        if str(order.get("orderId") or "").strip() in frozen_order_ids
+        or str(order.get("clientOrderId") or "").strip() in frozen_client_order_ids
+    ]
+    frozen_order_identity = {id(order) for order in frozen_orders}
+    strategy_orders = [
+        order for order in strategy_orders if id(order) not in frozen_order_identity
+    ]
+    result["preserved_frozen_count"] = len(frozen_orders)
+    result["preserved_frozen_order_ids"] = [
+        order.get("orderId") for order in frozen_orders
+    ]
+    result["preserved_frozen_client_order_ids"] = [
+        str(order.get("clientOrderId") or "") for order in frozen_orders
+    ]
     result["attempted"] = len(strategy_orders)
     result["total_open_orders"] = len(open_orders)
     for order in strategy_orders:
@@ -34565,10 +34698,14 @@ STRATEGIES_PAGE = """<!doctype html>
 
 
 def _safe_float(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number")
     try:
         number = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be a number") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be a finite number")
     return number
 
 
@@ -39913,6 +40050,15 @@ class _Handler(BaseHTTPRequestHandler):
                         clear_volatility_resume_state=True,
                     )
                 self._send_json({"ok": True, **result}, status=200)
+            except TimeoutError as exc:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "retryable": True,
+                    },
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
             except Exception as exc:

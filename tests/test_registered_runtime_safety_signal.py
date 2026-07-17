@@ -153,6 +153,66 @@ def _normal_reports(output_dir: Path, state: object, now: datetime) -> None:
     )
 
 
+def _frozen_short_request(
+    *,
+    request_id: str,
+    order_id: int | None = None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    order: dict[str, object] = {
+        "book": "frozen_bq",
+        "role": "frozen_inventory_manual_reduce_short",
+        "frozen_inventory_request_id": request_id,
+        "side": "BUY",
+        "position_side": "SHORT",
+        "qty": 0.1,
+        "price": 200.0,
+        "force_reduce_only": True,
+        "execution_type": "maker",
+        "time_in_force": "GTX",
+        "post_only": True,
+        "manual_frozen_inventory_reduce": True,
+        "frozen_inventory_authorization_validated": True,
+    }
+    refs: dict[str, object] = {}
+    if order_id is not None:
+        client_order_id = f"gx-bchu-frozenin-1-{order_id}"
+        order.update(
+            {
+                "orderId": order_id,
+                "clientOrderId": client_order_id,
+                "origQty": "0.1",
+                "executedQty": "0",
+            }
+        )
+        refs[str(order_id)] = {
+            "book": "frozen_bq",
+            "role": "frozen_inventory_manual_reduce_short",
+            "side": "BUY",
+            "position_side": "SHORT",
+            "client_order_id": client_order_id,
+            "frozen_inventory_request_id": request_id,
+        }
+    state = {
+        "best_quote_frozen_inventory": {
+            "long_qty": 0.0,
+            "long_lots": [],
+            "short_qty": 0.2,
+            "short_lots": [{"qty": 0.2, "entry_price": 201.0}],
+        },
+        "best_quote_frozen_inventory_manual_reduce": {
+            "short": {
+                "requested": True,
+                "request_id": request_id,
+                "requested_qty": 0.1,
+                "requested_at": NOW.isoformat(),
+                "expires_at": (NOW + timedelta(minutes=5)).isoformat(),
+            }
+        },
+        "best_quote_volume_order_refs": refs,
+    }
+    return order, state
+
+
 @patch("grid_optimizer.loop_runner._start_futures_flatten_process")
 @patch("grid_optimizer.loop_runner.load_live_flatten_snapshot")
 @patch("grid_optimizer.loop_runner._cancel_futures_strategy_orders")
@@ -331,6 +391,44 @@ def test_cancel_submit_guard_rejects_managed_generation_change() -> None:
     assert guarded is None
     assert reason["reason"] == "recovery_cancel_not_authorized"
     assert reason["gate_reason"] == "recovery_generation_mismatch"
+
+
+def test_cancel_submit_guard_preserves_authorized_frozen_order_outside_ordinary_owner() -> None:
+    stale_gate = SimpleNamespace(
+        managed=True,
+        ready=False,
+        reason="recovery_generation_mismatch",
+        active_action=ActionId.INVENTORY_RECOVER,
+        matches=lambda _expected: False,
+    )
+    with TemporaryDirectory() as tmpdir:
+        frozen_order, frozen_state = _frozen_short_request(
+            request_id="frozen-cancel-1",
+            order_id=71,
+        )
+        state_path = Path(tmpdir) / "state.json"
+        state_path.write_text(json.dumps(frozen_state), encoding="utf-8")
+        with (
+            patch(
+                "grid_optimizer.loop_runner._load_recovery_order_profile_gate",
+                return_value=stale_gate,
+            ),
+            patch(
+                "grid_optimizer.loop_runner._registered_runtime_safety_signal_gate",
+                return_value=(None, {"active": False, "reason": None}),
+            ),
+        ):
+            guarded, reason = _guard_cancel_order_before_submit(
+                args=argparse.Namespace(state_path=str(state_path)),
+                order=frozen_order,
+                expected_gate={"managed": True, "generation": 1},
+                now=NOW,
+            )
+
+    assert guarded is not None
+    assert guarded["orderId"] == 71
+    assert guarded["frozen_inventory_authorization_validated"] is True
+    assert reason is None
 
 
 def test_cancel_submit_guard_rechecks_directional_runtime_signal() -> None:
@@ -598,6 +696,114 @@ def test_position_cap_signal_keeps_only_owned_reduce_role() -> None:
     assert [row["role"] for row in actions["place_orders"]] == [
         "best_quote_reduce_long",
     ]
+
+
+def test_position_cap_signal_and_submit_fences_do_not_own_frozen_lane() -> None:
+    with TemporaryDirectory() as tmpdir:
+        args, registered = _registered_args(tmpdir)
+        frozen_order, frozen_state = _frozen_short_request(
+            request_id="frozen-request-91",
+            order_id=91,
+        )
+        Path(args.state_path).write_text(
+            json.dumps(
+                {
+                    **frozen_state,
+                    RUNTIME_SAFETY_SIGNAL_KEY: {
+                        "schema": "futures_recovery_runtime_safety_signal_v1",
+                        "symbol": "BCHUSDT",
+                        "run_contract_id": run_contract_identity_from_config(vars(args)),
+                        "generation": registered.generation,
+                        "decision_id": registered.decision_id,
+                        "observed_at": NOW.isoformat(),
+                        "hard_expires_at": (NOW + timedelta(seconds=120)).isoformat(),
+                        "conditions": [
+                            {
+                                "source": "runtime_guard",
+                                "action_id": "inventory_recover",
+                                "reason": "max_actual_net_notional_hit",
+                                "side": "SELL",
+                                "observed_at": NOW.isoformat(),
+                                "hard_expires_at": (NOW + timedelta(seconds=120)).isoformat(),
+                                "details_digest": "sha256:" + "8" * 64,
+                            }
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        actions, _report = _apply_registered_runtime_safety_signal_to_actions(
+            args=args,
+            actions={
+                "cancel_orders": [],
+                "place_orders": [frozen_order],
+                "cancel_count": 0,
+                "place_count": 1,
+            },
+            now=NOW + timedelta(seconds=1),
+        )
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [dict(frozen_order)],
+            "sell_orders": [],
+        }
+        _apply_registered_runtime_safety_signal_to_plan(
+            args=args,
+            plan=plan,
+            now=NOW + timedelta(seconds=1),
+        )
+        guarded, reason = _guard_registered_runtime_safety_order_before_submit(
+            args=args,
+            order=frozen_order,
+            now=NOW + timedelta(seconds=1),
+        )
+        cancel, cancel_reason = _guard_cancel_order_before_submit(
+            args=args,
+            order=frozen_order,
+            expected_gate=None,
+            now=NOW + timedelta(seconds=1),
+        )
+
+    assert [row["orderId"] for row in actions["place_orders"]] == [91]
+    assert [row["orderId"] for row in plan["buy_orders"]] == [91]
+    assert guarded is not None
+    assert guarded["frozen_inventory_authorization_validated"] is True
+    assert reason is None
+    assert cancel is not None
+    assert cancel["orderId"] == 91
+    assert cancel_reason is None
+
+
+def test_runtime_safety_submit_fence_rejects_frozen_order_without_request_identity() -> None:
+    signal = SimpleNamespace(
+        conditions=(SimpleNamespace(side=SimpleNamespace(value="SELL")),),
+    )
+    unauthorized_frozen = {
+        "book": "frozen_bq",
+        "role": "frozen_inventory_pair_release_short",
+        "side": "BUY",
+        "position_side": "SHORT",
+        "execution_type": "post_only",
+        "time_in_force": "GTX",
+        "frozen_inventory_pair_release": True,
+    }
+    with patch(
+        "grid_optimizer.loop_runner._registered_runtime_safety_signal_gate",
+        return_value=(
+            signal,
+            {"active": True, "reason": "runtime_safety_signal_active"},
+        ),
+    ):
+        guarded, reason = _guard_registered_runtime_safety_order_before_submit(
+            args=argparse.Namespace(),
+            order=unauthorized_frozen,
+            now=NOW,
+        )
+
+    assert guarded is None
+    assert reason is not None
+    assert reason["reason"] == "frozen_inventory_state_unavailable"
 
 
 def test_expired_signal_has_absolute_deadline_and_releases_local_entry_gate() -> None:
