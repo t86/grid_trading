@@ -179,7 +179,7 @@ restart_policy() {
 }
 
 require_no_legacy_recovery_actuators() {
-  local cron_text findings
+  local cron_text findings systemd_findings
   cron_text="$(crontab -l 2>/dev/null || true)"
   findings="$(CRON_TEXT="$cron_text" "$PYTHON_BIN" - "$SYMBOL" <<'PY'
 import os
@@ -228,6 +228,62 @@ PY
           ;;
       esac
     done <<<"$findings"
+    exit 1
+  fi
+
+  systemd_findings="$("$PYTHON_BIN" - "$SYMBOL" <<'PY'
+import re
+import subprocess
+import sys
+
+symbol = sys.argv[1].upper()
+symbol_pattern = re.compile(rf"(?<![A-Z0-9]){re.escape(symbol)}(?![A-Z0-9])")
+safe_symbol_adapters = (
+    "bq_volume_recovery_guard.py",
+    "recovery_coordinator_watchdog.py",
+    "competition_target_gate.py",
+    "competition_health_monitor.py",
+    "bq_liveness_terminal_guard.py",
+    "bq_budget_controller.py",
+    "competition_state_realign.py",
+)
+
+try:
+    timer_text = subprocess.check_output(
+        ["systemctl", "list-timers", "--all", "--no-legend", "--no-pager"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+except (OSError, subprocess.CalledProcessError):
+    raise SystemExit(0)
+
+for raw in timer_text.splitlines():
+    timer = raw.split()[-1] if raw.split() else ""
+    if not timer.endswith(".timer"):
+        continue
+    try:
+        service = subprocess.check_output(
+            ["systemctl", "show", "-p", "Unit", "--value", timer],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        command = subprocess.check_output(
+            ["systemctl", "show", "-p", "ExecStart", "--value", service],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        continue
+    lowered = command.lower()
+    if symbol_pattern.search(command.upper()) is None:
+        continue
+    if not any(adapter in lowered for adapter in safe_symbol_adapters):
+        print(f"{timer}->{service}: {command}")
+PY
+)"
+  if [[ -n "$systemd_findings" ]]; then
+    echo "unclassified systemd recovery executors remain for $SYMBOL; disable or migrate them before ownership cutover:" >&2
+    printf '%s\n' "$systemd_findings" >&2
     exit 1
   fi
 }

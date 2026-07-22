@@ -1373,6 +1373,9 @@ def test_recovery_managed_runner_policy_requires_registered_coordinator_owner() 
     assert "ledger_drift_monitor.py" in script
     assert "allowloss_autorevert.py" in script
     assert "rollover_daily_window.py" in script
+    assert "list-timers" in script
+    assert "ExecStart" in script
+    assert "unclassified systemd recovery executors" in script
     assert 'systemctl daemon-reload' in script
 
 
@@ -1520,6 +1523,50 @@ def test_recovery_managed_runner_policy_audit_rejects_a_legacy_symbol_writer(
     assert completed.returncode != 0
     assert "legacy recovery actuators remain" in completed.stderr
     assert legacy_writer in completed.stderr
+
+
+def test_recovery_managed_runner_policy_audit_rejects_an_unclassified_systemd_timer(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(_registered_control({"symbol": "BCHUSDT"})), encoding="utf-8"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "crontab").write_text("#!/bin/sh\n", encoding="utf-8")
+    (fake_bin / "systemctl").write_text(
+        "#!/bin/sh\n"
+        "case \"$1 $2 $3\" in\n"
+        "  'list-timers --all --no-legend') echo 'n/a n/a n/a n/a legacy-bch.timer' ;;\n"
+        "  'show -p Unit') echo legacy-bch.service ;;\n"
+        "  'show -p ExecStart') echo 'python output/ops/unknown_recovery.py --symbol BCHUSDT --enforce' ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "crontab").chmod(0o755)
+    (fake_bin / "systemctl").chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", "deploy/oracle/configure_recovery_managed_runner.sh", "audit", "BCHUSDT"],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PYTHON_BIN": sys.executable,
+            "RUNNER_SRC_DIR": str(Path.cwd() / "src"),
+            "OUTPUT_DIR": str(output_dir),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "unclassified systemd recovery executors remain" in completed.stderr
+    assert "legacy-bch.timer->legacy-bch.service" in completed.stderr
 
 
 def test_recovery_managed_runner_policy_audit_allows_target_gate_and_observers(
