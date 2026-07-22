@@ -40,6 +40,7 @@ REQUIRE_SOFT_PRESSURE_FOR_ALLOW_LOSS_SYMBOLS="${REQUIRE_SOFT_PRESSURE_FOR_ALLOW_
 ON_UNIT_ACTIVE_SEC="${ON_UNIT_ACTIVE_SEC:-1min}"
 TIMEOUT_START_SEC="${TIMEOUT_START_SEC:-45s}"
 WATCHDOG_MAX_HEARTBEAT_AGE_SECONDS="${WATCHDOG_MAX_HEARTBEAT_AGE_SECONDS:-150}"
+TARGET_GATE_MAX_HEARTBEAT_AGE_SECONDS="${TARGET_GATE_MAX_HEARTBEAT_AGE_SECONDS:-600}"
 WATCHDOG_ALERT_THRESHOLD="${WATCHDOG_ALERT_THRESHOLD:-2}"
 WATCHDOG_ON_UNIT_ACTIVE_SEC="${WATCHDOG_ON_UNIT_ACTIVE_SEC:-1min}"
 
@@ -120,7 +121,7 @@ WorkingDirectory=${APP_DIR}
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=${PYTHONPATH_VALUE}
 EnvironmentFile=${ENV_FILE}
-ExecStart=${PYTHON_BIN} -m grid_optimizer.recovery_coordinator_watchdog --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --guard-state-path ${STATE_PATH} --state-path ${WATCHDOG_STATE_PATH} --alert-config-path ${ALERT_CONFIG_PATH} --max-heartbeat-age-seconds ${WATCHDOG_MAX_HEARTBEAT_AGE_SECONDS} --alert-threshold ${WATCHDOG_ALERT_THRESHOLD} --force-reason coordinator_service_failed
+ExecStart=${PYTHON_BIN} -m grid_optimizer.recovery_coordinator_watchdog --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --guard-state-path ${STATE_PATH} --state-path ${WATCHDOG_STATE_PATH} --alert-config-path ${ALERT_CONFIG_PATH} --max-heartbeat-age-seconds ${WATCHDOG_MAX_HEARTBEAT_AGE_SECONDS} --target-gate-max-heartbeat-age-seconds ${TARGET_GATE_MAX_HEARTBEAT_AGE_SECONDS} --alert-threshold ${WATCHDOG_ALERT_THRESHOLD} --force-reason coordinator_service_failed
 EOF
 
 sudo tee "$WATCHDOG_SERVICE_FILE" >/dev/null <<EOF
@@ -138,7 +139,7 @@ WorkingDirectory=${APP_DIR}
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=${PYTHONPATH_VALUE}
 EnvironmentFile=${ENV_FILE}
-ExecStart=${PYTHON_BIN} -m grid_optimizer.recovery_coordinator_watchdog --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --guard-state-path ${STATE_PATH} --state-path ${WATCHDOG_STATE_PATH} --alert-config-path ${ALERT_CONFIG_PATH} --max-heartbeat-age-seconds ${WATCHDOG_MAX_HEARTBEAT_AGE_SECONDS} --alert-threshold ${WATCHDOG_ALERT_THRESHOLD}
+ExecStart=${PYTHON_BIN} -m grid_optimizer.recovery_coordinator_watchdog --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --guard-state-path ${STATE_PATH} --state-path ${WATCHDOG_STATE_PATH} --alert-config-path ${ALERT_CONFIG_PATH} --max-heartbeat-age-seconds ${WATCHDOG_MAX_HEARTBEAT_AGE_SECONDS} --target-gate-max-heartbeat-age-seconds ${TARGET_GATE_MAX_HEARTBEAT_AGE_SECONDS} --alert-threshold ${WATCHDOG_ALERT_THRESHOLD}
 EOF
 
 sudo tee "$TIMER_FILE" >/dev/null <<EOF

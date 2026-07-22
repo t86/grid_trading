@@ -286,6 +286,8 @@ def test_bq_volume_recovery_guard_oneshot_finishes_before_next_timer_round() -> 
     assert "OnFailure=${FAILURE_ALERT_UNIT_NAME}.service" in script
     assert "grid_optimizer.recovery_coordinator_watchdog" in script
     assert "WATCHDOG_MAX_HEARTBEAT_AGE_SECONDS" in script
+    assert "TARGET_GATE_MAX_HEARTBEAT_AGE_SECONDS" in script
+    assert "--target-gate-max-heartbeat-age-seconds" in script
     assert 'sudo systemctl enable "${WATCHDOG_UNIT_NAME}.timer"' in script
 
 

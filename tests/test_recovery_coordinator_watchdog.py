@@ -11,6 +11,10 @@ from grid_optimizer.futures_recovery_store import (
     RECOVERY_STATE_SCHEMA_VERSION,
     JsonRecoveryStore,
 )
+from grid_optimizer.futures_run_lifecycle import (
+    bind_run_contract_owner,
+    resolve_authoritative_run_contract,
+)
 from grid_optimizer.recovery_coordinator_watchdog import (
     check_symbol,
     main,
@@ -51,6 +55,27 @@ def _healthy_heartbeat(*, checked_at: datetime = NOW) -> dict[str, object]:
             "symbols": {"BCHUSDT": {"healthy": True, "action": "coordinator_noop_hold"}},
         }
     }
+
+
+def _active_target_control() -> dict[str, object]:
+    control = _registered_control()
+    control.update(
+        {
+            "symbol": "BCHUSDT",
+            "strategy_profile": "test_profile",
+            "strategy_mode": "hedge_best_quote_maker_volume_v1",
+            "per_order_notional": 20.0,
+            "run_start_time": "2026-07-22T07:00:00+00:00",
+            "runtime_guard_stats_start_time": "2026-07-22T07:00:00+00:00",
+            "run_end_time": "2026-07-22T09:00:00+00:00",
+            "max_cumulative_notional": 20_000.0,
+            "terminal_drain_exit_policy": "drain_then_preserve",
+            "terminal_drain_absolute_loss_budget": 2.0,
+            "terminal_drain_max_wait_seconds": 600.0,
+        }
+    )
+    owned, _ = bind_run_contract_owner(control, activated_at=NOW)
+    return owned
 
 
 def test_registered_symbol_requires_a_fresh_successful_coordinator_heartbeat() -> None:
@@ -220,6 +245,60 @@ def test_registered_symbol_with_no_alert_delivery_is_unhealthy(tmp_path) -> None
 
     assert result["assessment"]["healthy"] is False
     assert result["assessment"]["reason"] == "alert_delivery_not_configured"
+
+
+def test_active_target_window_requires_a_fresh_target_gate_heartbeat(tmp_path, monkeypatch) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    control = _active_target_control()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(control), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        watchdog, "load_alert_notifier_config", lambda _path: {"enabled": True}
+    )
+
+    result = check_symbol(
+        symbol="BCHUSDT",
+        output_dir=output_dir,
+        guard_state=_healthy_heartbeat(),
+        state={},
+        now=NOW,
+        max_heartbeat_age_seconds=150,
+        alert_threshold=1,
+        alert_config_path=output_dir / "alert.json",
+    )
+
+    assert result["assessment"]["healthy"] is False
+    assert result["assessment"]["reason"] == "target_gate_heartbeat_missing"
+
+    _snapshot, run_contract_id = resolve_authoritative_run_contract(
+        control, expected_symbol="BCHUSDT"
+    )
+    (output_dir / "bchusdt_target_gate_heartbeat.json").write_text(
+        json.dumps(
+            {
+                "schema": "futures_target_gate_heartbeat_v1",
+                "symbol": "BCHUSDT",
+                "run_contract_id": run_contract_id,
+                "checked_at": NOW.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    recovered = check_symbol(
+        symbol="BCHUSDT",
+        output_dir=output_dir,
+        guard_state=_healthy_heartbeat(),
+        state={},
+        now=NOW,
+        max_heartbeat_age_seconds=150,
+        alert_threshold=1,
+        alert_config_path=output_dir / "alert.json",
+    )
+
+    assert recovered["assessment"]["healthy"] is True
+    assert recovered["target_gate"]["reason"] == "target_gate_heartbeat_fresh"
 
 
 def test_watchdog_alerts_when_a_present_control_file_is_unreadable(tmp_path, monkeypatch) -> None:

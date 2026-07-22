@@ -68,6 +68,7 @@ FROZEN_TP_PREFIX = "FROZENTP"
 ACTIVE_TP_PREFIX = "TGTTP"
 LIFECYCLE_INTENT_SCHEMA = "futures_lifecycle_intent_v2"
 LIFECYCLE_INTENT_SOURCE = "competition_target_gate"
+TARGET_GATE_HEARTBEAT_SCHEMA = "futures_target_gate_heartbeat_v1"
 LIFECYCLE_INTENT_COMPLETED_STATUSES = frozenset(
     {"completed", "stopped_clean", "stopped_preserved"}
 )
@@ -373,6 +374,42 @@ def evaluate_triggers(
 
 def _terminal_intent_path(workdir: str, slug: str) -> Path:
     return Path(workdir) / "output" / f"{slug}_terminal_intent.json"
+
+
+def _target_gate_heartbeat_path(workdir: str, slug: str) -> Path:
+    return Path(workdir) / "output" / f"{slug}_target_gate_heartbeat.json"
+
+
+def _write_target_gate_heartbeat(
+    *,
+    workdir: str,
+    slug: str,
+    symbol: str,
+    run_contract_id: str,
+    checked_at: datetime,
+) -> None:
+    """Persist liveness only; this never owns control, orders, or lifecycle."""
+
+    path = _target_gate_heartbeat_path(workdir, slug)
+    payload = {
+        "schema": TARGET_GATE_HEARTBEAT_SCHEMA,
+        "symbol": symbol,
+        "run_contract_id": run_contract_id,
+        "checked_at": checked_at.astimezone(timezone.utc).isoformat(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _intent_id(*, symbol: str, trigger_reason: str, run_contract_id: str) -> str:
@@ -784,6 +821,14 @@ def main() -> None:
             )
         )
         return
+
+    _write_target_gate_heartbeat(
+        workdir=a.workdir,
+        slug=slug,
+        symbol=sym,
+        run_contract_id=control_contract_id,
+        checked_at=now,
+    )
 
     # Rebuild all enforcement terms from the owner's canonical snapshot. CLI
     # wear inputs remain accepted only so old scripts do not fail to parse.

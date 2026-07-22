@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -18,6 +18,10 @@ from .futures_recovery_store import (
     decode_recovery_control_state,
     recovery_coordinator_registered,
 )
+from .futures_run_lifecycle import (
+    resolve_authoritative_run_contract,
+    run_contract_snapshot_from_config,
+)
 from .notifications import alert_source_label, load_alert_notifier_config, send_alert_email
 
 
@@ -25,6 +29,8 @@ HEARTBEAT_KEY = "futures_recovery_guard_heartbeat"
 HEARTBEAT_SCHEMA = "futures_recovery_guard_heartbeat_v1"
 WATCHDOG_HEARTBEAT_KEY = "recovery_coordinator_watchdog_heartbeat"
 WATCHDOG_HEARTBEAT_SCHEMA = "recovery_coordinator_watchdog_heartbeat_v1"
+TARGET_GATE_HEARTBEAT_SCHEMA = "futures_target_gate_heartbeat_v1"
+DEFAULT_TARGET_GATE_MAX_HEARTBEAT_AGE_SECONDS = 600.0
 
 
 def _read_json_with_readability(path: Path) -> tuple[dict[str, Any], bool]:
@@ -56,6 +62,86 @@ def _parse_time(value: Any) -> datetime | None:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return None
     return parsed.astimezone(timezone.utc)
+
+
+def _assess_target_gate_liveness(
+    *,
+    symbol: str,
+    control: Mapping[str, Any],
+    heartbeat: Mapping[str, Any] | None,
+    heartbeat_readable: bool,
+    now: datetime,
+    max_heartbeat_age_seconds: float,
+) -> dict[str, Any] | None:
+    """Require a fresh gate only while a bounded target window is live."""
+
+    if max_heartbeat_age_seconds <= 0:
+        raise ValueError("target_gate_max_heartbeat_age_seconds must be positive")
+    try:
+        raw_snapshot = run_contract_snapshot_from_config(control)
+    except (TypeError, ValueError):
+        return None
+    raw_target = raw_snapshot.get("max_cumulative_notional")
+    if (
+        not isinstance(raw_target, (int, float))
+        or isinstance(raw_target, bool)
+        or raw_target <= 0
+        or raw_snapshot.get("run_end_time") is None
+    ):
+        return None
+    try:
+        snapshot, run_contract_id = resolve_authoritative_run_contract(
+            control,
+            expected_symbol=symbol,
+        )
+    except (TypeError, ValueError) as exc:
+        return {
+            "healthy": False,
+            "reason": "target_gate_run_contract_invalid",
+            "detail": str(exc),
+        }
+    target = snapshot.get("max_cumulative_notional")
+    window_start = _parse_time(snapshot.get("runtime_guard_stats_start_time"))
+    window_end = _parse_time(snapshot.get("run_end_time"))
+    if not isinstance(target, (int, float)) or isinstance(target, bool) or target <= 0:
+        return None
+    if window_start is None or window_end is None:
+        return {
+            "healthy": False,
+            "reason": "target_gate_run_contract_invalid",
+        }
+    checked_now = now.astimezone(timezone.utc)
+    if (
+        checked_now < window_start
+        or checked_now > window_end + timedelta(seconds=max_heartbeat_age_seconds)
+    ):
+        return None
+    if not heartbeat_readable:
+        return {"healthy": False, "reason": "target_gate_heartbeat_unreadable"}
+    if not isinstance(heartbeat, Mapping):
+        return {"healthy": False, "reason": "target_gate_heartbeat_missing"}
+    if heartbeat.get("schema") != TARGET_GATE_HEARTBEAT_SCHEMA:
+        return {"healthy": False, "reason": "target_gate_heartbeat_invalid"}
+    if heartbeat.get("symbol") != str(symbol).upper().strip():
+        return {"healthy": False, "reason": "target_gate_heartbeat_symbol_mismatch"}
+    if heartbeat.get("run_contract_id") != run_contract_id:
+        return {"healthy": False, "reason": "target_gate_heartbeat_contract_mismatch"}
+    checked_at = _parse_time(heartbeat.get("checked_at"))
+    if checked_at is None:
+        return {"healthy": False, "reason": "target_gate_heartbeat_timestamp_invalid"}
+    age_seconds = (checked_now - checked_at).total_seconds()
+    if age_seconds < -60 or age_seconds > max_heartbeat_age_seconds:
+        return {
+            "healthy": False,
+            "reason": "target_gate_heartbeat_stale",
+            "age_seconds": age_seconds,
+        }
+    return {
+        "healthy": True,
+        "reason": "target_gate_heartbeat_fresh",
+        "checked_at": checked_at.isoformat(),
+        "age_seconds": age_seconds,
+    }
 
 
 def assess_coordinator_liveness(
@@ -261,6 +347,9 @@ def check_symbol(
     state: dict[str, Any],
     now: datetime,
     max_heartbeat_age_seconds: float,
+    target_gate_max_heartbeat_age_seconds: float = (
+        DEFAULT_TARGET_GATE_MAX_HEARTBEAT_AGE_SECONDS
+    ),
     alert_threshold: int,
     alert_config_path: Path | None,
     force_reason: str | None = None,
@@ -278,6 +367,25 @@ def check_symbol(
             "recovery_control_unreadable" if not control_readable else None
         ),
     )
+    target_gate_assessment = None
+    if assessment.get("healthy"):
+        heartbeat_path = output_dir / f"{normalized.lower()}_target_gate_heartbeat.json"
+        heartbeat, heartbeat_readable = _read_json_with_readability(heartbeat_path)
+        target_gate_assessment = _assess_target_gate_liveness(
+            symbol=normalized,
+            control=control,
+            heartbeat=heartbeat if heartbeat else None,
+            heartbeat_readable=heartbeat_readable,
+            now=now,
+            max_heartbeat_age_seconds=target_gate_max_heartbeat_age_seconds,
+        )
+        if target_gate_assessment is not None and not target_gate_assessment["healthy"]:
+            assessment = {
+                **assessment,
+                "healthy": False,
+                "reason": str(target_gate_assessment["reason"]),
+                "target_gate": target_gate_assessment,
+            }
     alert_config = load_alert_notifier_config(alert_config_path)
     if assessment.get("tracked") and not alert_config.get("enabled"):
         assessment = {
@@ -292,7 +400,12 @@ def check_symbol(
         alert_threshold=alert_threshold,
         force_alert=bool(force_reason),
     )
-    result: dict[str, Any] = {"symbol": normalized, "assessment": assessment, "alert": None}
+    result: dict[str, Any] = {
+        "symbol": normalized,
+        "assessment": assessment,
+        "target_gate": target_gate_assessment,
+        "alert": None,
+    }
     if should_alert:
         result["alert"] = send_alert_email(
             subject=f"[grid][{alert_source_label()}] {normalized} recovery coordinator unhealthy",
@@ -310,6 +423,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-path", default="output/recovery_coordinator_watchdog_state.json")
     parser.add_argument("--alert-config-path", default="output/alert_notifier_config.json")
     parser.add_argument("--max-heartbeat-age-seconds", type=float, default=150.0)
+    parser.add_argument(
+        "--target-gate-max-heartbeat-age-seconds",
+        type=float,
+        default=DEFAULT_TARGET_GATE_MAX_HEARTBEAT_AGE_SECONDS,
+    )
     parser.add_argument("--alert-threshold", type=int, default=2)
     parser.add_argument("--force-reason", default=None)
     args = parser.parse_args(argv)
@@ -327,6 +445,9 @@ def main(argv: list[str] | None = None) -> int:
             state=state,
             now=now,
             max_heartbeat_age_seconds=float(args.max_heartbeat_age_seconds),
+            target_gate_max_heartbeat_age_seconds=float(
+                args.target_gate_max_heartbeat_age_seconds
+            ),
             alert_threshold=int(args.alert_threshold),
             alert_config_path=Path(args.alert_config_path) if args.alert_config_path else None,
             force_reason=(str(args.force_reason).strip() if args.force_reason else None),

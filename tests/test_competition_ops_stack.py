@@ -452,6 +452,14 @@ def test_gate_enforce_submits_terminal_intent_without_runtime_or_exchange_action
                                  "--workdir", str(tmp_path), "--enforce"])
     out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert out["action"] == "LIFECYCLE_INTENT_SUBMITTED"
+    heartbeat = json.loads(
+        (tmp_path / "output" / "arxusdt_target_gate_heartbeat.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert heartbeat["schema"] == "futures_target_gate_heartbeat_v1"
+    assert heartbeat["symbol"] == "ARXUSDT"
+    assert heartbeat["run_contract_id"] == tg.run_contract_identity_from_config(control)
     assert touched == []
     assert not any("stop" in c for c in calls)
 
