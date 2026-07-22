@@ -392,9 +392,15 @@ class FlowObservation:
 @dataclass(frozen=True)
 class ActionAttempt:
     action_id: ActionId
-    side: Side
-    order_role: OrderRole
+    side: Side | None
+    order_role: OrderRole | None
     exhausted_at: datetime
+
+    def __post_init__(self) -> None:
+        if (self.side is None) != (self.order_role is None):
+            raise ValueError("action attempt side and order role must be paired")
+        if self.exhausted_at.tzinfo is None or self.exhausted_at.utcoffset() is None:
+            raise ValueError("action attempt exhausted_at must be timezone-aware")
 
 
 @dataclass(frozen=True)
@@ -702,8 +708,8 @@ class RecoveryState:
     def with_exhausted_attempt(
         self,
         action_id: ActionId,
-        side: Side,
-        order_role: OrderRole,
+        side: Side | None,
+        order_role: OrderRole | None,
         *,
         now: datetime,
     ) -> "RecoveryState":
@@ -717,8 +723,8 @@ class RecoveryState:
         attempts.sort(
             key=lambda item: (
                 _ACTION_RANK[item.action_id],
-                item.side.value,
-                item.order_role.value,
+                item.side.value if item.side is not None else "",
+                item.order_role.value if item.order_role is not None else "",
             )
         )
         return replace(self, exhausted_attempts=tuple(attempts))
@@ -756,8 +762,8 @@ class RecoveryState:
     def attempt_exhausted(
         self,
         action_id: ActionId,
-        side: Side,
-        order_role: OrderRole,
+        side: Side | None,
+        order_role: OrderRole | None,
     ) -> bool:
         return any(
             (item.action_id, item.side, item.order_role)
@@ -2195,8 +2201,6 @@ class FuturesRecoveryDecisionEngine:
             if (
                 expired
                 and not progressed
-                and state.side is not None
-                and state.order_role is not None
             ):
                 exhausted_state = state.with_exhausted_attempt(
                     state.active_action,
@@ -2996,7 +3000,8 @@ class FuturesRecoveryDecisionEngine:
         assessment: FlowBlockerAssessment,
     ) -> bool:
         return not (
-            assessment.inventory_reduce_sides
+            assessment.runner_faults
+            or assessment.inventory_reduce_sides
             or assessment.loss_only_blocked_sides
             or assessment.missing_entry_sides
         )
@@ -3104,34 +3109,34 @@ class FuturesRecoveryDecisionEngine:
             evaluation = definition.evaluate(assessment, state, self.policy)
             noop_reasons.extend(evaluation.blocked_reasons)
             for candidate in evaluation.candidates:
-                if (
-                    candidate.side is not None
-                    and candidate.order_role is not None
-                    and state.attempt_exhausted(
-                        candidate.action_id,
-                        candidate.side,
-                        candidate.order_role,
-                    )
+                if state.attempt_exhausted(
+                    candidate.action_id,
+                    candidate.side,
+                    candidate.order_role,
                 ):
+                    scope = (
+                        f"{candidate.side.value}:{candidate.order_role.value}"
+                        if candidate.side is not None and candidate.order_role is not None
+                        else "global"
+                    )
                     noop_reasons.append(
                         "action_attempt_exhausted:"
-                        f"{candidate.action_id.value}:"
-                        f"{candidate.side.value}:"
-                        f"{candidate.order_role.value}"
+                        f"{candidate.action_id.value}:{scope}"
                     )
                     exhausted_candidates.append(candidate)
                     continue
                 candidates.append(candidate)
         if not candidates and exhausted_candidates:
-            # Bounded ordinary recovery actions never silently restart their
-            # exhausted tuple. Inventory and maker-flow advance to their
-            # BASELINE_TUNE successor; an exhausted BASELINE_TUNE remains
-            # visibly blocked until the episode changes or clears.
+            # Bounded recovery actions never silently restart their exhausted
+            # tuple. Inventory and maker-flow advance to BASELINE_TUNE; an
+            # exhausted baseline or global runner recovery remains visibly
+            # blocked until its fault episode changes or clears.
             candidates.extend(
                 candidate
                 for candidate in exhausted_candidates
                 if candidate.action_id
                 not in {
+                    ActionId.RUNNER_RECOVER,
                     ActionId.INVENTORY_RECOVER,
                     ActionId.MAKER_FLOW_RECOVER,
                     ActionId.BASELINE_TUNE,
@@ -3204,8 +3209,6 @@ class FuturesRecoveryDecisionEngine:
         state: RecoveryState,
         selected: _Candidate,
     ) -> tuple[ActionAttempt, ...]:
-        if selected.side is None or selected.order_role is None:
-            return state.exhausted_attempts
         return tuple(
             attempt
             for attempt in state.exhausted_attempts

@@ -154,6 +154,12 @@ def _full_state() -> RecoveryState:
                 order_role=OrderRole.ENTRY,
                 exhausted_at=NOW - timedelta(minutes=2),
             ),
+            ActionAttempt(
+                action_id=ActionId.RUNNER_RECOVER,
+                side=None,
+                order_role=None,
+                exhausted_at=NOW - timedelta(minutes=3),
+            ),
         ),
         flow_clocks=MappingProxyType(
             {

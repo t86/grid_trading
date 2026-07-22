@@ -11,6 +11,7 @@ from grid_optimizer.futures_recovery_coordinator import (
     ACTION_DEFINITIONS,
     ACTION_PRIORITY,
     ActivationReceipt,
+    ActionAttempt,
     ActionId,
     ActionMode,
     CleanupProof,
@@ -329,6 +330,73 @@ def test_one_symbol_selects_one_action_commits_once_and_executes_one_effect() ->
     assert effects[0][0] == "ARXUSDT"
     assert effects[0][1].stage is EffectStage.RUNNER_RESTART
     assert effects[0][1].effect_epoch == outcome.effect_epoch
+
+
+def test_timed_out_runner_recovery_is_exhausted_until_the_fault_episode_clears() -> None:
+    engine = FuturesRecoveryDecisionEngine()
+    assessment = FlowBlockerAssessment(runner_faults=("quiet_exchange_order_drift",))
+    initial = RecoveryState.initial("ARXUSDT", BASELINE, now=NOW)
+
+    entered = engine.plan_round(
+        snapshot=_snapshot(now=NOW, assessment=assessment),
+        state=initial,
+        now=NOW,
+        round_id="runner-recover-enter",
+    )
+    acknowledged = engine.plan_round(
+        snapshot=_snapshot(
+            now=NOW + timedelta(seconds=1),
+            assessment=assessment,
+            effect_receipt=EffectReceipt(
+                decision_id=str(entered.next_state.decision_id),
+                stage=EffectStage.RUNNER_RESTART,
+                effect_epoch=int(entered.effect_epoch),
+                observed_at=NOW + timedelta(seconds=1),
+            ),
+        ),
+        state=entered.next_state,
+        now=NOW + timedelta(seconds=1),
+        round_id="runner-recover-ack",
+    )
+
+    timed_out = engine.plan_round(
+        snapshot=_snapshot(
+            now=NOW + timedelta(minutes=5), assessment=assessment
+        ),
+        state=acknowledged.next_state,
+        now=NOW + timedelta(minutes=5),
+        round_id="runner-recover-timeout",
+    )
+
+    assert timed_out.next_state.exhausted_attempts == (
+        ActionAttempt(
+            action_id=ActionId.RUNNER_RECOVER,
+            side=None,
+            order_role=None,
+            exhausted_at=NOW + timedelta(minutes=5),
+        ),
+    )
+    cooled_down = engine.plan_round(
+        snapshot=_snapshot(
+            now=NOW + timedelta(minutes=6), assessment=assessment
+        ),
+        state=timed_out.next_state,
+        now=NOW + timedelta(minutes=6),
+        round_id="runner-recover-cooldown",
+    )
+    blocked = engine.plan_round(
+        snapshot=_snapshot(
+            now=NOW + timedelta(minutes=6, seconds=1), assessment=assessment
+        ),
+        state=cooled_down.next_state,
+        now=NOW + timedelta(minutes=6, seconds=1),
+        round_id="runner-recover-blocked",
+    )
+
+    assert blocked.action_id is ActionId.NOOP
+    assert blocked.liveness_status == "blocked"
+    assert blocked.effect_stage is EffectStage.NONE
+    assert "action_attempt_exhausted:runner_recover:global" in blocked.reasons
 
 
 def test_same_round_is_not_committed_or_executed_again_after_coordinator_restart() -> (
