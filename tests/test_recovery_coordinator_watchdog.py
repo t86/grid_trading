@@ -58,7 +58,7 @@ def _healthy_heartbeat(*, checked_at: datetime = NOW) -> dict[str, object]:
     }
 
 
-def _active_target_control() -> dict[str, object]:
+def _active_target_control(*, target: float = 20_000.0) -> dict[str, object]:
     control = _registered_control()
     control.update(
         {
@@ -69,7 +69,7 @@ def _active_target_control() -> dict[str, object]:
             "run_start_time": "2026-07-22T07:00:00+00:00",
             "runtime_guard_stats_start_time": "2026-07-22T07:00:00+00:00",
             "run_end_time": "2026-07-22T09:00:00+00:00",
-            "max_cumulative_notional": 20_000.0,
+            "max_cumulative_notional": target,
             "terminal_drain_exit_policy": "drain_then_preserve",
             "terminal_drain_absolute_loss_budget": 2.0,
             "terminal_drain_max_wait_seconds": 600.0,
@@ -366,6 +366,58 @@ def test_deadline_requires_current_contract_terminal_intent(tmp_path, monkeypatc
 
     assert recovered["assessment"]["healthy"] is True
     assert recovered["deadline_terminal"]["reason"] == "deadline_terminal_intent_present"
+
+
+def test_deadline_rejects_other_contract_terminal_intent(tmp_path, monkeypatch) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    current_control = _active_target_control()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(current_control), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        watchdog, "load_alert_notifier_config", lambda _path: {"enabled": True}
+    )
+    deadline_now = NOW + timedelta(hours=2)
+    old_control = _active_target_control(target=19_000.0)
+    old_snapshot, old_contract_id = resolve_authoritative_run_contract(
+        old_control, expected_symbol="BCHUSDT"
+    )
+    intent, created = submit_lifecycle_intent(
+        workdir=str(tmp_path),
+        symbol="BCHUSDT",
+        trigger_reason="target_unmet_deadline",
+        requested_at=deadline_now.isoformat(),
+        observed={
+            "gross_notional": 100.0,
+            "target": float(old_snapshot["max_cumulative_notional"]),
+            "realized_pnl": 0.0,
+            "wear_per_10k": 0.0,
+            "trade_count": 1,
+            "window_start": old_snapshot["runtime_guard_stats_start_time"],
+            "window_end": old_snapshot["run_end_time"],
+            "query_end": old_snapshot["run_end_time"],
+            "runtime_guard_primary_reason": "after_end_window",
+            "runtime_guard_matched_reasons": ["after_end_window"],
+        },
+        run_contract_config=old_control,
+    )
+    assert created is True
+    assert intent["run_contract_id"] == old_contract_id
+
+    result = check_symbol(
+        symbol="BCHUSDT",
+        output_dir=output_dir,
+        guard_state=_healthy_heartbeat(checked_at=deadline_now),
+        state={},
+        now=deadline_now,
+        max_heartbeat_age_seconds=150,
+        alert_threshold=1,
+        alert_config_path=output_dir / "alert.json",
+    )
+
+    assert result["assessment"]["healthy"] is False
+    assert result["assessment"]["reason"] == "deadline_terminal_intent_contract_mismatch"
 
 
 def test_watchdog_alerts_when_a_present_control_file_is_unreadable(tmp_path, monkeypatch) -> None:
