@@ -367,7 +367,7 @@ server-side automation stack. Two of its pieces are tracked, symbol-generic pack
 them by `git pull`, not by hand-editing `output/ops/*.py`:
 
 - `python -m grid_optimizer.competition_target_gate`：观察 live control JSON 中的
-  `max_cumulative_notional` 和磨损阈值，然后原子提交
+  `max_cumulative_notional`、磨损阈值和不可变运行截止时间，然后原子提交
   `output/<symbol>_terminal_intent.json`。它不停止/重启服务、不撤单、不平仓；loop runner 是
   maker-only 生命周期排空的唯一所有者。显式目标运行必须同时提供
   `runtime_guard_stats_start_time` 和 `run_end_time`，成交额、目标进度与损耗统一按半开区间
@@ -460,6 +460,10 @@ Built-in production-safety behaviour of the target gate (no cron flags needed):
   `lifecycle_wear_stop_min_gross_notional` 后，`wear_limit_breached` 才能提交自己的 intent。
 - 正目标必须有完整且有效的 `runtime_guard_stats_start_time`、`run_end_time` 与退出契约；缺少或
   非法时在查询交易所或执行任何进程/订单副作用前返回 `invalid_run_contract`。
+- 正目标在 `run_end_time` 后仍未达成、且窗口成交查询完整时，提交
+  `target_unmet_deadline` intent，并附带完整窗口和 `after_end_window` 证明；即使 runner 的 PID/命令
+  已不可用也允许这一次 intent 提交，使 watchdog 能启动终止所有者续做。若仍可读取的 live runner
+  契约与 control 不一致，仍失败关闭，绝不以截止时间覆盖另一运行。
 - `--enforce` 只发布带版本、可幂等的 `futures_lifecycle_intent_v2`。intent 内嵌完整
   `futures_run_contract_snapshot_v3`，并绑定 `futures-run-contract-v3-<digest>`；运行器和 watchdog
   都重新规范化并复算摘要，字段被改写、摘要不匹配或状态未知时可见失败关闭。

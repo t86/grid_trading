@@ -485,6 +485,56 @@ def test_gate_enforce_submits_terminal_intent_without_runtime_or_exchange_action
     }
 
 
+def test_gate_deadline_unmet_submits_intent_when_runner_is_unavailable(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    control = _control(tmp_path, "arxusdt", 100_000)
+    deadline = datetime(2026, 7, 17, 0, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(tg, "_now", lambda: deadline)
+    monkeypatch.setattr(
+        tg,
+        "daily_vol_wear",
+        lambda *a, **k: {
+            "gross_notional": 50_000.0,
+            "realized_pnl": -1.0,
+            "wear_per_10k": 0.2,
+            "trade_count": 1,
+            "window_start": "2026-07-16T00:00:00+00:00",
+            "window_end": "2026-07-17T00:00:00+00:00",
+            "query_end": "2026-07-17T00:00:00+00:00",
+        },
+    )
+
+    _run_gate_main(
+        monkeypatch,
+        [
+            "--symbol",
+            "ARXUSDT",
+            "--service",
+            "grid-loop@ARXUSDT.service",
+            "--workdir",
+            str(tmp_path),
+            "--enforce",
+        ],
+    )
+
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["action"] == "LIFECYCLE_INTENT_SUBMITTED"
+    assert out["trigger"] == "deadline"
+    assert out["live_runner_contract"] == "unavailable_at_deadline"
+    intent = json.loads(
+        (tmp_path / "output" / "arxusdt_terminal_intent.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert intent["trigger_reason"] == "target_unmet_deadline"
+    assert intent["run_contract_id"] == tg.run_contract_identity_from_config(control)
+    assert intent["observed"]["runtime_guard_primary_reason"] == "after_end_window"
+    assert intent["observed"]["runtime_guard_matched_reasons"] == [
+        "after_end_window"
+    ]
+
+
 def test_registered_gate_place_tp_now_is_deferred_before_exchange_order(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
@@ -595,6 +645,11 @@ def test_gate_cli_wear_thresholds_cannot_enable_wear_exit(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     _control(tmp_path, "arxusdt", 100_000)
+    monkeypatch.setattr(
+        tg,
+        "_now",
+        lambda: datetime(2026, 7, 16, 1, tzinfo=timezone.utc),
+    )
     monkeypatch.setattr(
         tg,
         "daily_vol_wear",

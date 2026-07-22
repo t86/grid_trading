@@ -851,6 +851,13 @@ def main() -> None:
         wear_first,
         wear_stop,
     )
+    deadline_unmet = bool(
+        run_contract.run_end_time is not None
+        and now >= run_contract.run_end_time
+        and a.target > 0
+        and vol < a.target
+        and not hit_wear
+    )
     status: dict[str, Any] = {
         "ts": ts, "vol": round(vol, 0), "wear": round(wear, 2), "target": a.target,
         "hit_target": hit_target, "hit_wear": hit_wear, "enforce": a.enforce,
@@ -864,38 +871,53 @@ def main() -> None:
     }
     if not target_ok and wear_stop is None:
         status["config_error"] = "missing_config" if not config_ok else "non_positive_target"
-    if not (hit_target or hit_wear):
+    if not (hit_target or hit_wear or deadline_unmet):
         print(json.dumps(status))
         return
-    status["trigger"] = "target" if hit_target else "wear"
+    status["trigger"] = (
+        "target" if hit_target else ("wear" if hit_wear else "deadline")
+    )
     if not a.enforce:
         status["action"] = "DRY_RUN_would_submit_lifecycle_intent"
         print(json.dumps(status))
         return
 
+    trigger_reason = (
+        "target_reached"
+        if hit_target
+        else ("wear_limit_breached" if hit_wear else "target_unmet_deadline")
+    )
     try:
         live_contract_id = load_live_runner_contract(workdir=a.workdir, slug=slug)
     except (OSError, TypeError, ValueError) as exc:
-        status.update(
-            {
-                "action": "LIFECYCLE_INTENT_REJECTED",
-                "config_error": "live_run_contract_unavailable",
-                "error": str(exc),
-            }
-        )
-        print(json.dumps(status))
-        return
-    if live_contract_id != control_contract_id:
-        status.update(
-            {
-                "action": "LIFECYCLE_INTENT_REJECTED",
-                "config_error": "live_run_contract_mismatch",
-                "control_run_contract_id": control_contract_id,
-                "live_run_contract_id": live_contract_id,
-            }
-        )
-        print(json.dumps(status))
-        return
+        if (
+            trigger_reason == "target_unmet_deadline"
+            and str(exc)
+            in {"live runner pid is unavailable", "live runner command is unavailable"}
+        ):
+            status["live_runner_contract"] = "unavailable_at_deadline"
+        else:
+            status.update(
+                {
+                    "action": "LIFECYCLE_INTENT_REJECTED",
+                    "config_error": "live_run_contract_unavailable",
+                    "error": str(exc),
+                }
+            )
+            print(json.dumps(status))
+            return
+    else:
+        if live_contract_id != control_contract_id:
+            status.update(
+                {
+                    "action": "LIFECYCLE_INTENT_REJECTED",
+                    "config_error": "live_run_contract_mismatch",
+                    "control_run_contract_id": control_contract_id,
+                    "live_run_contract_id": live_contract_id,
+                }
+            )
+            print(json.dumps(status))
+            return
 
     observed = {
         "gross_notional": float(vol),
@@ -909,7 +931,13 @@ def main() -> None:
         "window_end": str(window_stats["window_end"]),
         "query_end": str(window_stats["query_end"]),
     }
-    trigger_reason = "target_reached" if hit_target else "wear_limit_breached"
+    if trigger_reason == "target_unmet_deadline":
+        observed.update(
+            {
+                "runtime_guard_primary_reason": "after_end_window",
+                "runtime_guard_matched_reasons": ["after_end_window"],
+            }
+        )
     try:
         intent, created = submit_lifecycle_intent(
             workdir=a.workdir,
