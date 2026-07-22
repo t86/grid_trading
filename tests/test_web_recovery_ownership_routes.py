@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import io
 import json
+from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
 import pytest
 
-from grid_optimizer.web import _Handler
+from grid_optimizer.futures_recovery_store import JsonRecoveryStore
+from grid_optimizer.web import _Handler, _stop_runner_process
 
 
 @pytest.mark.parametrize(
@@ -124,3 +126,34 @@ def test_unreadable_existing_control_blocks_stop_before_mutation(
         handler._send_json.call_args.args[0]["reason"]
         == "runner_control_unreadable"
     )
+
+
+def test_registered_recovery_stop_boundary_defers_before_any_runner_effect(
+    tmp_path,
+) -> None:
+    control_path = tmp_path / "bchusdt_loop_runner_control.json"
+    JsonRecoveryStore(control_path).register_symbol(
+        "BCHUSDT",
+        {
+            "best_quote_maker_volume_allow_loss_reduce_only": False,
+            "best_quote_maker_volume_net_loss_reduce_enabled": False,
+            "hard_loss_forced_reduce_enabled": False,
+            "volatility_entry_pause_enabled": True,
+        },
+        now=datetime(2026, 7, 22, tzinfo=timezone.utc),
+    )
+
+    with patch("grid_optimizer.web._runner_control_path", return_value=control_path), patch(
+        "grid_optimizer.web._read_runner_process_for_symbol",
+        side_effect=AssertionError("registered stop must not inspect or mutate runner"),
+    ), patch("grid_optimizer.web._execute_stop_actions") as stop_actions:
+        result = _stop_runner_process(
+            "BCHUSDT",
+            cancel_open_orders=True,
+            close_all_positions=True,
+        )
+
+    assert result["actuation_deferred"] is True
+    assert result["requested_action"] == "stop_or_flatten"
+    assert result["stopped"] is False
+    stop_actions.assert_not_called()

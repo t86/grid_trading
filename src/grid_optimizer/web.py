@@ -11463,6 +11463,14 @@ def _defer_registered_runner_web_action(
         )
     elif requested_action == "change_control":
         result["saved"] = False
+    elif requested_action == "stop_or_flatten":
+        result.update(
+            {
+                "stopped": False,
+                "already_stopped": False,
+                "post_stop_actions": {},
+            }
+        )
     return result
 
 
@@ -13668,6 +13676,12 @@ def _stop_runner_process(
     clear_volatility_resume_state: bool = False,
 ) -> dict[str, Any]:
     normalized_symbol = str(symbol or _legacy_runner_symbol()).upper().strip() or _legacy_runner_symbol()
+    deferred = _defer_registered_runner_web_action(
+        symbol=normalized_symbol,
+        requested_action="stop_or_flatten",
+    )
+    if deferred is not None:
+        return deferred
     runner = _read_runner_process_for_symbol(normalized_symbol)
     pid_path = _runner_pid_path(normalized_symbol)
     use_legacy_runner = _uses_legacy_runner(normalized_symbol)
