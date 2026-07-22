@@ -235,6 +235,14 @@ for raw in timer_text.splitlines():
         print(f"cannot inspect target-gate scheduler {timer}: {exc}", file=sys.stderr)
         raise SystemExit(1)
     if is_target_gate(command):
+        try:
+            subprocess.check_call(
+                ["systemctl", "is-active", "--quiet", timer],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            continue
         raise SystemExit(0)
 
 print(

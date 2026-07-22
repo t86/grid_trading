@@ -1493,21 +1493,22 @@ def test_recovery_managed_runner_policy_enables_only_registered_symbol(
 
 
 @pytest.mark.parametrize(
-    ("snapshot_text", "target_gate_present", "error"),
+    ("snapshot_text", "target_gate_mode", "error"),
     [
-        (None, True, "last-valid recovery control snapshot is not valid"),
+        (None, "cron", "last-valid recovery control snapshot is not valid"),
         (
             json.dumps({"symbol": "BCHUSDT"}),
-            True,
+            "cron",
             "last-valid recovery control snapshot is not valid",
         ),
-        (None, False, "no active target-gate scheduler found"),
+        (None, "missing", "no active target-gate scheduler found"),
+        (None, "inactive_timer", "no active target-gate scheduler found"),
     ],
 )
 def test_recovery_managed_runner_policy_refuses_enable_without_valid_recovery_snapshot(
     tmp_path: Path,
     snapshot_text: str | None,
-    target_gate_present: bool,
+    target_gate_mode: str,
     error: str,
 ) -> None:
     output_dir = tmp_path / "output"
@@ -1560,16 +1561,24 @@ def test_recovery_managed_runner_policy_refuses_enable_without_valid_recovery_sn
             "if [ \"$1\" = -l ]; then\n"
             "  echo '*/5 * * * * python -m grid_optimizer.competition_target_gate --symbol BCHUSDT --enforce'\n"
             "fi\n"
-            if target_gate_present
+            if target_gate_mode == "cron"
             else "#!/bin/sh\nexit 0\n"
         ),
         encoding="utf-8",
     )
     (fake_bin / "systemctl").write_text(
         "#!/bin/sh\n"
-        "if [ \"$1\" = is-active ]; then exit 0; fi\n"
-        "if [ \"$1\" = show ]; then echo no; exit 0; fi\n"
-        "exit 0\n",
+        + (
+            "if [ \"$1\" = list-timers ]; then echo 'n/a n/a n/a n/a n/a target-gate.timer'; exit 0; fi\n"
+            "if [ \"$1\" = show ] && [ \"$3\" = Unit ]; then echo target-gate.service; exit 0; fi\n"
+            "if [ \"$1\" = show ] && [ \"$3\" = ExecStart ]; then echo 'python -m grid_optimizer.competition_target_gate --symbol BCHUSDT --enforce'; exit 0; fi\n"
+            "if [ \"$1\" = is-active ] && [ \"$3\" = target-gate.timer ]; then exit 3; fi\n"
+            if target_gate_mode == "inactive_timer"
+            else ""
+        )
+        + "if [ \"$1\" = is-active ]; then exit 0; fi\n"
+        + "if [ \"$1\" = show ]; then echo no; exit 0; fi\n"
+        + "exit 0\n",
         encoding="utf-8",
     )
     (fake_bin / "sudo").chmod(0o755)
