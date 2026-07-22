@@ -640,21 +640,41 @@ def main() -> None:
     # exit contract.  CLI target fallback is intentionally not an enforcement
     # authority because it cannot identify which run owns the observed volume.
     config_ok = False
+    control_unreadable = False
     cfg: dict[str, Any] = {}
+    control_path = os.path.join(
+        a.workdir, "output", f"{slug}_loop_runner_control.json"
+    )
     try:
-        loaded_cfg = json.load(open(os.path.join(a.workdir, "output", f"{slug}_loop_runner_control.json")))
+        loaded_cfg = json.load(open(control_path))
         if not isinstance(loaded_cfg, dict):
             raise ValueError("runner control must be a JSON object")
         cfg = loaded_cfg
         config_ok = True
+    except FileNotFoundError:
+        config_ok = False
     except Exception:
         config_ok = False
+        control_unreadable = True
 
     now = _now()
     ts = now.isoformat()
 
     # Manual: rest the frozen-short TP for an already-stopped runner, then exit.
     if a.place_tp_now:
+        if control_unreadable:
+            print(
+                json.dumps(
+                    {
+                        "ts": ts,
+                        "symbol": sym,
+                        "enforce": a.enforce,
+                        "action": "BLOCKED_UNREADABLE_RECOVERY_CONTROL",
+                        "requested_action": "PLACE_FROZEN_TP",
+                    }
+                )
+            )
+            return
         recovery_owned = bool(
             config_ok
             and (

@@ -271,12 +271,20 @@ def main() -> None:
     rec: dict[str, Any] = {"ts": _now().isoformat(), "symbol": sym, "enforce": a.enforce}
     did_restart = False
 
+    control_readable = True
     try:
         control = json.load(open(cfg, encoding="utf-8"))
+    except FileNotFoundError:
+        control = {}
     except Exception:
         control = {}
-    recovery_managed = is_recovery_managed(sym, control if isinstance(control, dict) else {})
-    enforce_actions = a.enforce and not recovery_managed
+        control_readable = False
+    if not isinstance(control, dict):
+        control = {}
+        control_readable = False
+    recovery_managed = is_recovery_managed(sym, control)
+    control_ownership_unknown = not control_readable
+    enforce_actions = a.enforce and not recovery_managed and not control_ownership_unknown
 
     active = is_active(a.service)
     jout = journal(a.service, a.watchdog_min)
@@ -290,7 +298,10 @@ def main() -> None:
                                                         "reduce_only", "inventory_recover"))
     rec.update({"active": active, "looping": looping, f"placed_{a.watchdog_min}m": placed,
                 "intended_stop": intended, "terminal_stop": terminal_stop})
-    if recovery_managed:
+    if control_ownership_unknown:
+        rec["action"] = "observe_only_unreadable_recovery_control"
+        rec["recovery_coordinator_ownership_unknown"] = True
+    elif recovery_managed:
         rec["action"] = "observe_only_recovery_managed_symbol"
 
     # --- 1. liveness watchdog (only when alive+looping but not placing; rate-limited) ---

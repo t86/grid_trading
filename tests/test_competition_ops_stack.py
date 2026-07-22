@@ -516,6 +516,35 @@ def test_registered_gate_place_tp_now_is_deferred_before_exchange_order(
     assert out["requested_action"] == "PLACE_FROZEN_TP"
 
 
+def test_gate_place_tp_now_refuses_unreadable_control_before_exchange_order(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        "{invalid-json", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        tg,
+        "place_frozen_short_tp",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unreadable control must not authorize frozen TP")
+        ),
+    )
+
+    _run_gate_main(
+        monkeypatch,
+        [
+            "--symbol", "BCHUSDT", "--service", "grid-loop@BCHUSDT.service",
+            "--workdir", str(tmp_path), "--place-tp-now", "--enforce",
+        ],
+    )
+
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["action"] == "BLOCKED_UNREADABLE_RECOVERY_CONTROL"
+    assert out["requested_action"] == "PLACE_FROZEN_TP"
+
+
 def test_gate_terminal_intent_retry_preserves_first_pending_contract(tmp_path: Path) -> None:
     observed = {
         "gross_notional": 100000.0,
@@ -1749,3 +1778,32 @@ def test_health_monitor_terminal_stop_suppresses_governor_and_deadlock(tmp_path:
     assert rec["intended_stop"] is True
     assert rec["deadlock"].get("terminal") is True
     assert "action" not in rec.get("governor", {})
+
+
+def test_health_monitor_unreadable_control_never_actuates(tmp_path: Path, monkeypatch, capsys) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        "{invalid-json", encoding="utf-8"
+    )
+    monkeypatch.setenv("BINANCE_API_KEY", "k")
+    monkeypatch.setenv("BINANCE_API_SECRET", "s")
+    monkeypatch.setattr(
+        "sys.argv",
+        ["hm", "--symbol", "BCHUSDT", "--service", "svc", "--workdir", str(tmp_path), "--enforce"],
+    )
+    monkeypatch.setattr(hm, "is_active", lambda _service: True)
+    monkeypatch.setattr(hm, "journal", lambda *_args: "mid=0.2 placed=0")
+    monkeypatch.setattr(hm, "daily_recent_wear", lambda *_args: (10_000.0, 1.9, 500.0, 5.0))
+    monkeypatch.setattr(hm, "get_offset", lambda _cfg: ("offset", 0))
+    forbidden: list[str] = []
+    monkeypatch.setattr(hm, "restart", lambda *_args: forbidden.append("restart") or {"ok": True})
+    monkeypatch.setattr(hm, "deadlock_unstick", lambda *_args, **_kwargs: forbidden.append("unstick") or {})
+    monkeypatch.setattr(hm, "apply_offset", lambda *_args: forbidden.append("offset"))
+
+    hm.main()
+
+    rec = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert rec["action"] == "observe_only_unreadable_recovery_control"
+    assert rec["recovery_coordinator_ownership_unknown"] is True
+    assert forbidden == []
