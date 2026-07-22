@@ -179,6 +179,8 @@ class RunContract:
     preserve_reason: str | None
     wear_stop_per_10k: float | None
     wear_stop_min_gross_notional: float | None
+    temporary_loss_window_loss_budget: float | None
+    temporary_loss_lease_loss_reserve: float | None
 
     @property
     def bounded(self) -> bool:
@@ -236,6 +238,8 @@ def validate_run_contract(
     run_start_time: datetime | str | None = None,
     wear_stop_per_10k: Any = None,
     wear_stop_min_gross_notional: Any = None,
+    temporary_loss_window_loss_budget: Any = None,
+    temporary_loss_lease_loss_reserve: Any = None,
 ) -> RunContract:
     """Validate run termination terms without reading or mutating runtime state."""
 
@@ -255,6 +259,14 @@ def validate_run_contract(
     wear_min_gross = _normalize_contract_number(
         wear_stop_min_gross_notional,
         "wear_stop_min_gross_notional",
+    )
+    temporary_loss_window_budget = _normalize_contract_number(
+        temporary_loss_window_loss_budget,
+        "temporary_loss_window_loss_budget",
+    )
+    temporary_loss_lease_reserve = _normalize_contract_number(
+        temporary_loss_lease_loss_reserve,
+        "temporary_loss_lease_loss_reserve",
     )
     policy = str(exit_policy).strip() if exit_policy is not None else ""
     normalized_policy = policy or None
@@ -288,6 +300,27 @@ def validate_run_contract(
             )
         if wear_min_gross <= 0:
             raise ValueError("wear_stop_min_gross_notional must be > 0")
+    if temporary_loss_window_budget is None and temporary_loss_lease_reserve is not None:
+        raise ValueError(
+            "temporary_loss_lease_loss_reserve requires temporary_loss_window_loss_budget"
+        )
+    if temporary_loss_window_budget is not None and temporary_loss_lease_reserve is None:
+        raise ValueError(
+            "temporary_loss_window_loss_budget requires temporary_loss_lease_loss_reserve"
+        )
+    if temporary_loss_window_budget is not None:
+        if stats_start is None:
+            raise ValueError(
+                "temporary_loss_window_loss_budget requires runtime_guard_stats_start_time"
+            )
+        if temporary_loss_window_budget <= 0:
+            raise ValueError("temporary_loss_window_loss_budget must be > 0")
+        if temporary_loss_lease_reserve is None or temporary_loss_lease_reserve <= 0:
+            raise ValueError("temporary_loss_lease_loss_reserve must be > 0")
+        if temporary_loss_lease_reserve > temporary_loss_window_budget:
+            raise ValueError(
+                "temporary_loss_lease_loss_reserve cannot exceed temporary_loss_window_loss_budget"
+            )
 
     bounded = deadline is not None or target is not None
     if bounded and normalized_policy is None:
@@ -329,6 +362,8 @@ def validate_run_contract(
         preserve_reason=normalized_reason,
         wear_stop_per_10k=wear_stop,
         wear_stop_min_gross_notional=wear_min_gross,
+        temporary_loss_window_loss_budget=temporary_loss_window_budget,
+        temporary_loss_lease_loss_reserve=temporary_loss_lease_reserve,
     )
 
 
@@ -347,6 +382,12 @@ def run_contract_snapshot_from_config(config: Mapping[str, Any]) -> dict[str, An
         wear_stop_per_10k=config.get("lifecycle_wear_stop_per_10k"),
         wear_stop_min_gross_notional=config.get(
             "lifecycle_wear_stop_min_gross_notional"
+        ),
+        temporary_loss_window_loss_budget=config.get(
+            "temporary_loss_window_loss_budget"
+        ),
+        temporary_loss_lease_loss_reserve=config.get(
+            "temporary_loss_lease_loss_reserve"
         ),
     )
     explicit_max_order = _normalize_contract_number(
@@ -371,7 +412,7 @@ def run_contract_snapshot_from_config(config: Mapping[str, Any]) -> dict[str, An
         "terminal_drain_flat_confirm_cycles",
     )
     return {
-        "schema": "futures_run_contract_snapshot_v3",
+        "schema": "futures_run_contract_snapshot_v4",
         "symbol": str(config.get("symbol") or "").upper().strip(),
         "strategy_profile": str(config.get("strategy_profile") or "").strip(),
         "strategy_mode": str(config.get("strategy_mode") or "").strip(),
@@ -402,6 +443,12 @@ def run_contract_snapshot_from_config(config: Mapping[str, Any]) -> dict[str, An
         "lifecycle_wear_stop_per_10k": contract.wear_stop_per_10k,
         "lifecycle_wear_stop_min_gross_notional": (
             contract.wear_stop_min_gross_notional
+        ),
+        "temporary_loss_window_loss_budget": (
+            contract.temporary_loss_window_loss_budget
+        ),
+        "temporary_loss_lease_loss_reserve": (
+            contract.temporary_loss_lease_loss_reserve
         ),
     }
 

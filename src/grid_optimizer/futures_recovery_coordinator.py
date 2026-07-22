@@ -560,6 +560,7 @@ class SymbolSnapshot:
     exchange_observation_available: bool = True
     effect_receipt: EffectReceipt | None = None
     activation_receipt: ActivationReceipt | None = None
+    temporary_loss_budget_available: bool = True
 
 
 @dataclass(frozen=True)
@@ -2039,6 +2040,14 @@ class FuturesRecoveryDecisionEngine:
             or lease.activated_at is not None
         ):
             raise ValueError("settling phase requires an unactivated loss lease")
+        if not snapshot.temporary_loss_budget_available:
+            return self._exit_active(
+                snapshot,
+                state,
+                now,
+                round_id,
+                reason="temporary_loss_window_budget_unavailable",
+            )
         expired = bool(
             (
                 state.progress_deadline_at is not None
@@ -2166,6 +2175,17 @@ class FuturesRecoveryDecisionEngine:
             )
         if state.active_action is ActionId.SAFETY_CONVERGE:
             return self._plan_active_safety(snapshot, state, now, round_id)
+        if (
+            state.active_action is ActionId.TEMPORARY_LOSS_RELIEF
+            and not snapshot.temporary_loss_budget_available
+        ):
+            return self._exit_active(
+                snapshot,
+                state,
+                now,
+                round_id,
+                reason="temporary_loss_window_budget_unavailable",
+            )
 
         progressed = self._has_current_progress(snapshot, state)
         eligible = self._active_still_eligible(snapshot.assessment, state)

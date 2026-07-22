@@ -191,6 +191,86 @@ def _terminal_test_intent(
     }
 
 
+def test_temporary_loss_window_ledger_requires_complete_usdt_accounting() -> None:
+    control = _terminal_test_control()
+    control.update(
+        {
+            "temporary_loss_window_loss_budget": 3.0,
+            "temporary_loss_lease_loss_reserve": 0.5,
+        }
+    )
+    control.pop("futures_run_contract_owner")
+    control, _ = bind_run_contract_owner(
+        control,
+        activated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+    now = datetime(2026, 7, 16, 1, tzinfo=timezone.utc)
+
+    eligible = bq_volume_recovery_guard._temporary_loss_window_ledger(
+        control=control,
+        symbol="BCHUSDT",
+        now=now,
+        fetch_page=lambda _symbol, start_ms, _end_ms, _limit: (
+            [
+                {
+                    "id": 1,
+                    "time": start_ms + 1,
+                    "realizedPnl": "-0.4",
+                    "commission": "0.01",
+                    "commissionAsset": "USDT",
+                }
+            ]
+            if start_ms == int(datetime(2026, 7, 16, tzinfo=timezone.utc).timestamp() * 1000)
+            else []
+        ),
+    )
+    assert eligible["available"] is True
+    assert eligible["realized_loss"] == 0.4
+    assert eligible["reserved_loss"] == 0.5
+
+    unavailable = bq_volume_recovery_guard._temporary_loss_window_ledger(
+        control=control,
+        symbol="BCHUSDT",
+        now=now,
+        fetch_page=lambda _symbol, start_ms, _end_ms, _limit: (
+            [
+                {
+                    "id": 1,
+                    "time": start_ms + 1,
+                    "realizedPnl": "-0.4",
+                    "commission": "0.00001",
+                    "commissionAsset": "BNB",
+                }
+            ]
+            if start_ms == int(datetime(2026, 7, 16, tzinfo=timezone.utc).timestamp() * 1000)
+            else []
+        ),
+    )
+    assert unavailable["available"] is False
+    assert unavailable["reason"] == "non_usdt_commission_asset:BNB"
+
+    corrupt = bq_volume_recovery_guard._temporary_loss_window_ledger(
+        control=control,
+        symbol="BCHUSDT",
+        now=now,
+        fetch_page=lambda _symbol, start_ms, _end_ms, _limit: (
+            [
+                {
+                    "id": 1,
+                    "time": start_ms + 1,
+                    "realizedPnl": "-0.4",
+                    "commission": "-0.01",
+                    "commissionAsset": "USDT",
+                }
+            ]
+            if start_ms == int(datetime(2026, 7, 16, tzinfo=timezone.utc).timestamp() * 1000)
+            else []
+        ),
+    )
+    assert corrupt["available"] is False
+    assert corrupt["reason"].startswith("temporary_loss_window_unverified:")
+
+
 def _write_registered_normal_reports(
     *,
     output_dir: Path,

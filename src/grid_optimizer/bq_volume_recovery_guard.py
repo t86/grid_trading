@@ -9,7 +9,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from math import ceil
+from math import ceil, isfinite
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
@@ -78,6 +78,7 @@ from .futures_volatility_safety_observation import (
 )
 from .futures_recovery_shadow import flow_blockers_from_legacy
 from .futures_inventory_boundary import ordinary_side_notionals
+from .futures_trade_window import fetch_exact_futures_trade_window
 from .futures_recovery_store import (
     JsonRecoveryStore,
     RECOVERY_STATE_KEY,
@@ -96,6 +97,148 @@ RestartRunner = Callable[[str], object]
 UserTradesPageFetcher = Callable[..., list[dict[str, Any]]]
 CorruptStateExchangeFetcher = Callable[[str], dict[str, Any]]
 HedgePositionFetcher = Callable[[str], dict[str, dict[str, float]]]
+
+
+def _temporary_loss_window_ledger(
+    *,
+    control: Mapping[str, Any],
+    symbol: str,
+    now: datetime,
+    fetch_page: Callable[[str, int, int, int], list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Return one exchange-truth loss ledger and its next-lease reservation.
+
+    This is intentionally an admission gate, not a local counter.  It either
+    pages the complete run window or leaves temporary loss relief disabled.
+    Non-USDT commission also fails closed because this coordinator has no
+    immutable conversion rate for turning it into the USDT loss budget.
+    """
+
+    disabled = {
+        "schema": "temporary_loss_window_ledger_v1",
+        "symbol": symbol.upper().strip(),
+        "captured_at": now.isoformat(),
+        "available": False,
+        "reason": "not_configured",
+        "trade_count": 0,
+        "realized_pnl": 0.0,
+        "realized_loss": 0.0,
+        "commission_by_asset": {},
+        "reserved_loss": 0.0,
+        "remaining_loss_budget": None,
+    }
+    if (
+        control.get("temporary_loss_window_loss_budget") is None
+        and control.get("temporary_loss_lease_loss_reserve") is None
+    ):
+        return disabled
+    try:
+        snapshot, _ = resolve_authoritative_run_contract(
+            control,
+            expected_symbol=symbol,
+        )
+    except (TypeError, ValueError) as exc:
+        return {**disabled, "reason": f"run_contract_unavailable:{exc}"}
+
+    budget = snapshot.get("temporary_loss_window_loss_budget")
+    reserve = snapshot.get("temporary_loss_lease_loss_reserve")
+    if budget is None and reserve is None:
+        return disabled
+    if budget is None or reserve is None:
+        return {**disabled, "reason": "temporary_loss_contract_terms_incomplete"}
+    try:
+        loss_budget = float(budget)
+        lease_reserve = float(reserve)
+        start_raw = snapshot.get("runtime_guard_stats_start_time")
+        if not isinstance(start_raw, str) or not start_raw.strip():
+            raise ValueError("runtime_guard_stats_start_time is required")
+        window_start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+        if window_start.tzinfo is None:
+            raise ValueError("runtime_guard_stats_start_time must be timezone-aware")
+        window_start = window_start.astimezone(timezone.utc)
+    except (TypeError, ValueError) as exc:
+        return {**disabled, "reason": f"temporary_loss_contract_invalid:{exc}"}
+    if (
+        not isfinite(loss_budget)
+        or not isfinite(lease_reserve)
+        or loss_budget <= 0
+        or lease_reserve <= 0
+        or lease_reserve > loss_budget
+    ):
+        return {**disabled, "reason": "temporary_loss_contract_invalid"}
+
+    captured_at = now.astimezone(timezone.utc)
+    start_ms = int(window_start.timestamp() * 1000)
+    end_exclusive_ms = int(captured_at.timestamp() * 1000) + 1
+    if end_exclusive_ms <= start_ms:
+        return {**disabled, "reason": "temporary_loss_window_not_started"}
+    if fetch_page is None:
+        from .data import fetch_futures_user_trades
+
+        api_key = os.environ["BINANCE_API_KEY"]
+        api_secret = os.environ["BINANCE_API_SECRET"]
+        fetch_page = lambda value, start, end, limit: fetch_futures_user_trades(
+            symbol=value,
+            api_key=api_key,
+            api_secret=api_secret,
+            start_time_ms=start,
+            end_time_ms=end,
+            limit=limit,
+            use_cache=False,
+        )
+    try:
+        rows = fetch_exact_futures_trade_window(
+            fetch_page=lambda start, end, limit: fetch_page(symbol, start, end, limit),
+            start_time_ms=start_ms,
+            end_time_exclusive_ms=end_exclusive_ms,
+        )
+        realized_pnl = 0.0
+        commission_by_asset: dict[str, float] = {}
+        for row in rows:
+            realized = float(row["realizedPnl"])
+            commission = float(row["commission"])
+            asset = str(row["commissionAsset"] or "").upper().strip()
+            if (
+                not isfinite(realized)
+                or not isfinite(commission)
+                or commission < 0
+                or not asset
+            ):
+                raise ValueError("trade realizedPnl or commission is invalid")
+            realized_pnl += realized
+            commission_by_asset[asset] = commission_by_asset.get(asset, 0.0) + commission
+            if commission > 0 and asset != "USDT":
+                return {
+                    **disabled,
+                    "reason": f"non_usdt_commission_asset:{asset}",
+                    "trade_count": len(rows),
+                    "realized_pnl": realized_pnl,
+                    "commission_by_asset": commission_by_asset,
+                    "reserved_loss": lease_reserve,
+                }
+    except (KeyError, TypeError, ValueError) as exc:
+        return {**disabled, "reason": f"temporary_loss_window_unverified:{exc}"}
+
+    realized_loss = max(-realized_pnl, 0.0)
+    usdt_commission = commission_by_asset.get("USDT", 0.0)
+    actual_loss = realized_loss + usdt_commission
+    remaining = loss_budget - actual_loss - lease_reserve
+    return {
+        "schema": "temporary_loss_window_ledger_v1",
+        "symbol": symbol.upper().strip(),
+        "captured_at": captured_at.isoformat(),
+        "window_start": window_start.isoformat(),
+        "window_end": captured_at.isoformat(),
+        "available": remaining >= 0.0,
+        "reason": None if remaining >= 0.0 else "temporary_loss_window_budget_exhausted",
+        "trade_count": len(rows),
+        "realized_pnl": realized_pnl,
+        "realized_loss": realized_loss,
+        "commission_by_asset": commission_by_asset,
+        "reserved_loss": lease_reserve,
+        "actual_loss": actual_loss,
+        "remaining_loss_budget": remaining,
+    }
 
 
 @dataclass(frozen=True)
@@ -11149,6 +11292,13 @@ def run_registered_recovery_symbol_round(
         if admission_evidence is not None
         else {}
     )
+    temporary_loss_ledger = _temporary_loss_window_ledger(
+        control=control,
+        symbol=normalized,
+        now=now,
+        fetch_page=fetch_user_trades_page,
+    )
+    runtime_item["registered_temporary_loss_window_ledger"] = temporary_loss_ledger
     snapshot = SymbolSnapshot(
         symbol=normalized,
         captured_at=now,
@@ -11172,6 +11322,7 @@ def run_registered_recovery_symbol_round(
             config_applied_evidence.applied_profile_digest
         ),
         flow_observations=flow_observations,
+        temporary_loss_budget_available=bool(temporary_loss_ledger["available"]),
     )
 
     restart = restart_runner or (
@@ -11264,13 +11415,14 @@ def run_registered_recovery_symbol_round(
             cleanup_proof=cleanup.cleanup_proof,
         )
 
-    # Until accepted userTrades are accumulated in a durable, run-window loss
-    # ledger, episode counts cannot safely authorize another loss lease after
-    # a stable episode or process restart.  Registered symbols therefore keep
-    # recovery alive through bounded GTX baseline tuning, never by reopening
-    # allow_loss on an incomplete budget.
+    # The window ledger is exchange-truth and includes a fresh worst-case
+    # reservation for the next loss lease.  Without it recovery stays on the
+    # bounded GTX baseline path; a local episode counter is never authority to
+    # reopen allow_loss.
     recovery_engine = FuturesRecoveryDecisionEngine(
-        policy=RecoveryPolicy(temporary_loss_relief_enabled=False)
+        policy=RecoveryPolicy(
+            temporary_loss_relief_enabled=bool(temporary_loss_ledger["available"])
+        )
     )
     outcome = RegisteredSymbolRecoveryOrchestrator(
         store=store,
@@ -11325,7 +11477,12 @@ def run_registered_recovery_symbol_round(
         "ordinary_typed_receipt_interface": (
             "strict_plan_submit_manifest_and_user_trades_fill"
         ),
-        "temporary_loss_relief_status": "disabled_pending_window_loss_ledger",
+        "temporary_loss_relief_status": (
+            "enabled_with_verified_window_loss_ledger"
+            if temporary_loss_ledger["available"]
+            else f"disabled:{temporary_loss_ledger['reason']}"
+        ),
+        "temporary_loss_window_ledger": temporary_loss_ledger,
         "dry_run": False,
     }
 

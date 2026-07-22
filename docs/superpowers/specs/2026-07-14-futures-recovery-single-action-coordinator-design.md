@@ -35,6 +35,7 @@ ARX 事件暴露了这个问题，但该模块并非 ARX 专用。它适用于�
 - 目标成交额、显式的 `runtime_guard_stats_start_time` 与带时区的 `run_end_time`；只设置目标而缺少任一统计边界会被拒绝，避免自然日口径混入本次运行或永远追逐不可达目标。
 - 明确的退出策略。有限运行只允许 `drain_then_preserve` 或 `stop_preserve`；不允许可能永久停在 `EXIT_BLOCKED` 的无界 `drain_clean`。
 - 显式、有限的本次终止排空损耗预算。它不能从滚动损耗、未实现亏损或仓位上限自动推导。
+- 临时 `allow_loss` 若要启用，必须额外固化一对正数：`temporary_loss_window_loss_budget`（自 `runtime_guard_stats_start_time` 起的本运行窗口损耗上限）和 `temporary_loss_lease_loss_reserve`（下一次租约的最坏损耗预留）。二者缺一、非正或预留大于窗口上限时，启动校验拒绝；它们绝不能复用终止排空预算。
 - `drain_then_preserve` 的最大等待时间。超时后先阻止入场、逐轮撤销本所有者订单，再保存残余仓位和开放委托快照，以 `STOPPED_PRESERVED` 结束。
 - `stop_preserve` 的明确原因；它同样必须先阻止入场并清理本所有者订单，不能带着仍会成交的策略订单退出。
 
@@ -46,7 +47,7 @@ ARX 事件暴露了这个问题，但该模块并非 ARX 专用。它适用于�
 
 磨损退出同样属于不可变运行契约。只有同时固化正数 `lifecycle_wear_stop_per_10k` 与 `lifecycle_wear_stop_min_gross_notional` 才启用；两者缺失时默认关闭。旧 CLI `--wear-stop` / `--first` 只做兼容解析，不能在运行中临时打开、关闭或改写磨损退出权限。intent 消费者必须从冻结快照重新计算 `-realized_pnl / gross_notional * 10000`，并验证最小成交额和阈值。
 
-运行契约通过 `futures_run_contract_snapshot_v3` 规范化。快照包含交易对、策略配置/模式、运行与统计起止时间、目标、退出策略、绝对损耗预算、最大等待时间、保留原因、有效单笔排空上限、损耗租约、重报价时间和空仓确认轮次；`futures-run-contract-v3-<digest>` 对规范 JSON 求摘要，作为一次运行的稳定身份。有效单笔排空上限在未显式设置时固化为本次 `per_order_notional`，之后即使 control 被改写也不能改变旧退出所有者的行为。
+运行契约通过 `futures_run_contract_snapshot_v4` 规范化。快照包含交易对、策略配置/模式、运行与统计起止时间、目标、退出策略、终止排空预算、临时放亏窗口预算与单次预留、最大等待时间、保留原因、有效单笔排空上限、损耗租约、重报价时间和空仓确认轮次；`futures-run-contract-v4-<digest>` 对规范 JSON 求摘要，作为一次运行的稳定身份。有效单笔排空上限在未显式设置时固化为本次 `per_order_notional`，之后即使 control 被改写也不能改变旧退出所有者的行为。
 
 ```mermaid
 stateDiagram-v2
@@ -67,15 +68,17 @@ stateDiagram-v2
     CANCEL_OWNED_ORDER --> STOPPED_PRESERVED: 无本所有者开放委托并保存残仓
 ```
 
-排空执行严格使用 `LIMIT + GTX` maker-only；Hedge Mode 通过 `positionSide` 表达只减仓语义，不向 Binance 发送冲突的 `reduceOnly` 参数。损耗权限只存在于单个订单的有限 lease，成交回执结算后立即回收，任何路径都不得打开全局 `allow_loss`。`volatility_entry_pause` 默认保持开启。当前分支已将普通恢复的 `TEMPORARY_LOSS_RELIEF` 签发为类型化动作租约；运行器只接受精确匹配当前代际、决策、方向和订单角色的租约，并使用全部已接受订单清单、交易所成交回执和恢复回执完成到期/失败清理。无租约、原始 `allow_loss` 或不匹配租约均失败关闭。这一闭环的源码接线已完成，但并不表示生产已启用；冻结账本专用权限/修复、真实迁移数据和原子切换仍须独立验证。当前实现还只有 episode 级租约次数门禁，尚未把 `userTrades` 实际损耗、磨损和风险预留累计到不可被 episode/重启清零的运行窗口预算；因此已注册的实际协调轮次会明确禁用 TLR 并转入无 `allow_loss` 的 `BASELINE_TUNE`，保留租约自动回收实现供账本完成后接线。补齐该账本前，生产注册门禁不得启用 TLR。
+排空执行严格使用 `LIMIT + GTX` maker-only；Hedge Mode 通过 `positionSide` 表达只减仓语义，不向 Binance 发送冲突的 `reduceOnly` 参数。损耗权限只存在于单个订单的有限 lease，成交回执结算后立即回收，任何路径都不得打开全局 `allow_loss`。`volatility_entry_pause` 默认保持开启。当前分支已将普通恢复的 `TEMPORARY_LOSS_RELIEF` 签发为类型化动作租约；运行器只接受精确匹配当前代际、决策、方向和订单角色的租约，并使用全部已接受订单清单、交易所成交回执和恢复回执完成到期/失败清理。无租约、原始 `allow_loss` 或不匹配租约均失败关闭。
 
-终止 intent、运行器本地状态和外部 watchdog 使用同一所有权协议：外部目标闸门只原子提交 `futures_lifecycle_intent_v2` intent，不再直接停止服务、撤单或 MARKET 平仓。intent 必须同时携带完整的 v3 规范快照和匹配的运行契约摘要；运行器和 watchdog 都重新规范化并复算摘要，缺字段、字段被篡改、摘要不匹配或状态未知时均以可见错误失败关闭，不执行订单或生命周期副作用。
+已注册协调轮次每轮从交易所 `userTrades` 的完整半开运行窗口重建临时放亏账本：按成交 ID 去重，强制校验 `realizedPnl`、`commission` 和 `commissionAsset`，计算实际已实现损耗加 USDT 手续费，再加下一次租约的最坏损耗预留。只有三者不超过不可变窗口预算才允许新租约；完整分页无法证明、字段缺失/非有限、预算耗尽、运行契约不匹配，或存在正数非 USDT 手续费而未提供不可变换算率时均失败关闭，普通恢复转入无 `allow_loss` 的 `BASELINE_TUNE`。已处于 `SETTLING` 或 `ACTIVE` 的临时放亏若下一轮失去此资格，立即进入已有的精确订单清理/基线恢复路径；不能依赖 episode 次数、进程重启或本地 JSONL 续租。该账本是对交易所事实的可重建审计快照，持久化的 action lease 是唯一预留所有权。
+
+终止 intent、运行器本地状态和外部 watchdog 使用同一所有权协议：外部目标闸门只原子提交 `futures_lifecycle_intent_v2` intent，不再直接停止服务、撤单或 MARKET 平仓。intent 必须同时携带完整的 v4 规范快照和匹配的运行契约摘要；运行器和 watchdog 都重新规范化并复算摘要，缺字段、字段被篡改、摘要不匹配或状态未知时均以可见错误失败关闭，不执行订单或生命周期副作用。
 
 未完成的旧 intent 永远按其中冻结的契约续跑：即使随后 control 或新启动参数已改变，也不能借新预算、新最大等待时间或新退出策略覆盖它。BQ guard 在活动退出所有者期间不创建普通恢复动作；watchdog 则把活动 intent 视为“必须恢复的排空工作”，运行器不活动时启动续做、事件缺失或陈旧时重启续做。已完成且仍属于当前运行契约的 intent 是明确的预期停机，不得复活；已完成但属于旧运行契约的 intent 不阻止新运行启动，并由新契约路径归档。非法 intent/快照直接返回失败，不能猜测性归类为“已完成”或“无 intent”。
 
 旧退出所有者归档与新运行接管之间使用显式、一次性的 `futures_terminal_handoff_v1`。归档和 `handoff=pending` 在同一次状态写入中完成；watchdog 只有在该 pending 与当前运行契约完全匹配时才越过旧 `stop_reason` 启动或重启。新运行的第一条正常循环事件先落盘，随后才把 handoff 标记为 `acknowledged`；确认以后 watchdog 恢复尊重当前 stop reason。永久 history 只用于审计，不能持续授权复活，避免新运行后续的人工停机或损耗停机被旧交接记录反复拉起。
 
-显式运行契约不使用 `<symbol>_target_gate_done_YYYYMMDD.flag` 作为权威：旧文件即使仍留在磁盘，也不能阻止当前契约统计/提交 intent，更不能授权当前契约停机；新路径不读取或创建自然日 done marker。运行身份、完成状态和是否允许复活只由 v3 运行契约与 v2 intent 的绑定关系决定。
+显式运行契约不使用 `<symbol>_target_gate_done_YYYYMMDD.flag` 作为权威：旧文件即使仍留在磁盘，也不能阻止当前契约统计/提交 intent，更不能授权当前契约停机；新路径不读取或创建自然日 done marker。运行身份、完成状态和是否允许复活只由 v4 运行契约与 v2 intent 的绑定关系决定。
 
 唯一不能承诺自动成交或立即退出的边界是交易所/账户观测不可用：没有新鲜仓位和订单事实时，系统进入可见的 `EXIT_BLOCKED` 并持续重试，不能猜测性撤单或把未知订单留在交易所后宣称安全结束。交易所事实恢复后，状态机从原阶段继续，无需人工清理本地布尔状态。
 
@@ -2159,7 +2162,7 @@ Web 必须提供 `expected_revision` 和 `expected_generation`。Web 适配器�
 74. 已完成退出在不同新运行契约启动时自动归档释放；未完成退出必须先续做，BQ guard 和 target gate 不得覆盖或创建第二所有者，watchdog 只可启动/重启同一个冻结契约的退出所有者。
 75. 外部 target gate 不再调用 systemd stop、撤单或 MARKET/IOC；它只原子提交可幂等的生命周期 intent。运行器是终止订单和最终停止的唯一执行者。
 76. 有目标的运行必须显式提供 `runtime_guard_stats_start_time`，进度、目标闸门和损耗统一按 `[runtime_guard_stats_start_time, run_end_time)` 统计；任何自然日零点、当前小时或每日 done marker 都不能替代该边界。
-77. `futures_run_contract_snapshot_v3` 是唯一规范运行快照，`futures-run-contract-v3-<digest>` 是稳定运行身份；运行器、目标闸门和 watchdog 必须复算并验证同一摘要。
+77. `futures_run_contract_snapshot_v4` 是唯一规范运行快照，`futures-run-contract-v4-<digest>` 是稳定运行身份；运行器、目标闸门和 watchdog 必须复算并验证同一摘要。
 78. `futures_lifecycle_intent_v2` 必须内嵌完整规范快照和摘要。旧活动 intent 即使遇到新 control 也按冻结契约续跑，不能继承新预算、等待时间或退出策略。
 79. watchdog 对活动 intent 启动/重启同一排空所有者，对已完成且属于当前契约的 intent 保持停机，对已完成旧契约放行新运行，对非法 intent/快照可见失败关闭且不执行 systemd 副作用。
 80. 显式注册 symbol 的普通恢复协调器和类型化临时亏损租约已完成源码接线；这一事实不等于生产 symbol 已注册或生产所有权已切换。

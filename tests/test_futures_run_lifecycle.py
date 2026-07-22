@@ -335,6 +335,47 @@ class FuturesRunContractTests(unittest.TestCase):
         self.assertEqual(contract.wear_stop_per_10k, 2.0)
         self.assertEqual(contract.wear_stop_min_gross_notional, 75_000.0)
 
+    def test_temporary_loss_window_terms_require_a_complete_positive_reservation(self) -> None:
+        contract = self._validate(
+            temporary_loss_window_loss_budget=3.0,
+            temporary_loss_lease_loss_reserve=0.5,
+        )
+
+        self.assertEqual(contract.temporary_loss_window_loss_budget, 3.0)
+        self.assertEqual(contract.temporary_loss_lease_loss_reserve, 0.5)
+
+        invalid_cases = (
+            ({"temporary_loss_window_loss_budget": 3.0}, "requires temporary_loss_lease_loss_reserve"),
+            ({"temporary_loss_lease_loss_reserve": 0.5}, "requires temporary_loss_window_loss_budget"),
+            (
+                {
+                    "temporary_loss_window_loss_budget": 0.0,
+                    "temporary_loss_lease_loss_reserve": 0.5,
+                },
+                "temporary_loss_window_loss_budget must be > 0",
+            ),
+            (
+                {
+                    "temporary_loss_window_loss_budget": 3.0,
+                    "temporary_loss_lease_loss_reserve": 0.0,
+                },
+                "temporary_loss_lease_loss_reserve must be > 0",
+            ),
+            (
+                {
+                    "temporary_loss_window_loss_budget": 0.5,
+                    "temporary_loss_lease_loss_reserve": 1.0,
+                },
+                "temporary_loss_lease_loss_reserve cannot exceed temporary_loss_window_loss_budget",
+            ),
+        )
+        for overrides, message in invalid_cases:
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                ValueError,
+                message,
+            ):
+                self._validate(**overrides)
+
     def test_wear_exit_requires_a_complete_bounded_threshold_pair(self) -> None:
         invalid_cases = (
             ({"wear_stop_per_10k": 2.0}, "wear_stop_min_gross_notional is required"),

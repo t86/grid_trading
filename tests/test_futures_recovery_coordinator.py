@@ -3129,6 +3129,53 @@ def test_window_budget_gate_keeps_temporary_loss_disabled_but_preserves_recovery
     assert "temporary_loss_window_budget_unavailable_baseline_tune" in successor.reasons
 
 
+def test_active_temporary_loss_reclaims_allow_loss_when_window_budget_fails() -> None:
+    engine = FuturesRecoveryDecisionEngine()
+    assessment = FlowBlockerAssessment(
+        inventory_reduce_sides=(Side.SELL,),
+        loss_only_blocked_sides=(Side.SELL,),
+        episode_fingerprint="window-budget-active",
+    )
+    state = RecoveryState.initial("ARXUSDT", BASELINE, now=NOW).with_exhausted_attempt(
+        ActionId.INVENTORY_RECOVER,
+        Side.SELL,
+        OrderRole.REDUCE_ONLY,
+        now=NOW,
+    )
+    entered = engine.plan_round(
+        snapshot=_snapshot(assessment=assessment),
+        state=state,
+        now=NOW,
+        round_id="window-budget-active-enter",
+    )
+    active = _activate_temporary_loss(
+        engine,
+        entered,
+        assessment,
+        now=NOW + timedelta(seconds=1),
+        round_id="window-budget-active-activate",
+    )
+    assert active.next_state.phase is RecoveryPhase.ACTIVE
+
+    reclaimed = engine.plan_round(
+        snapshot=_snapshot(
+            now=NOW + timedelta(seconds=2),
+            assessment=assessment,
+            temporary_loss_budget_available=False,
+        ),
+        state=active.next_state,
+        now=NOW + timedelta(seconds=2),
+        round_id="window-budget-active-reclaim",
+    )
+
+    assert reclaimed.next_state.phase is RecoveryPhase.CLEANING
+    assert reclaimed.next_state.active_action is ActionId.TEMPORARY_LOSS_RELIEF
+    assert reclaimed.desired_profile.fields[
+        "best_quote_maker_volume_allow_loss_reduce_only"
+    ] is False
+    assert "temporary_loss_window_budget_unavailable" in reclaimed.reasons
+
+
 def test_cleared_inventory_blocker_ends_episode_and_reclaims_loss_budget() -> None:
     policy = RecoveryPolicy(max_temporary_loss_leases_per_episode=1)
     engine = FuturesRecoveryDecisionEngine(policy=policy)
