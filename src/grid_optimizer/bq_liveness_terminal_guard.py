@@ -88,11 +88,28 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     control_path = workdir / "output" / f"{symbol.lower()}_loop_runner_control.json"
+    control_readable = True
     try:
         control = json.loads(control_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        control = {}
     except (OSError, UnicodeError, json.JSONDecodeError):
         control = {}
-    if is_recovery_managed(symbol, control if isinstance(control, dict) else {}):
+        control_readable = False
+    if not isinstance(control, dict):
+        control = {}
+        control_readable = False
+    if not control_readable:
+        print(
+            json.dumps(
+                {
+                    "action": "BLOCKED_UNREADABLE_RECOVERY_CONTROL",
+                    "symbol": symbol,
+                }
+            )
+        )
+        return 0
+    if is_recovery_managed(symbol, control):
         print(json.dumps({"action": "observe_only_recovery_managed_symbol", "symbol": symbol}))
         return 0
 
