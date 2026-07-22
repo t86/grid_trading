@@ -137,7 +137,7 @@ flowchart LR
 
 本分支已把显式注册 symbol 的普通恢复从守卫接入通用协调器和持久化执行器，并把协调器生成的目标配置、执行栅栏、类型化临时亏损租约、订单清单和回执交给运行器消费。目标/截止时间的终止排空和外部 target intent 也已接线。对包含 `_futures_recovery_state` 所有权封装的 symbol，旧 BQ 守卫不再继续走下方旧执行分支；封装损坏时也失败关闭，不会退回多写入方。Web 成交量/波动率触发器、磨损守卫和状态重对齐等外部路径对该 symbol 只观察、委托或拒绝直写；未注册 symbol 则保留旧行为，避免本分支在未切换对象上改变生产逻辑。
 
-上述均为源码改动。本分支未部署、未注册任何生产 symbol，也未修改生产运行配置或仓位。本分支已补齐冻结订单归属、GTX 提交回执、pair 崩溃清单和普通通道隔离的源码闭环，但真实生产冻结账本迁移、故障注入、宿主机外部执行器清单、协调器心跳/严重告警和按 symbol 的原子切换/回滚演练仍未完成。在这些硬阻塞解除前，不得部署或注册生产 symbol。合并前必须基于最新 `origin/main` 重放回归；不得用本分支较早的代码覆盖后续生产修复。
+上述均为源码改动。本分支未部署、未注册任何生产 symbol，也未修改生产运行配置或仓位。本分支已补齐冻结订单归属、GTX 提交回执、pair 崩溃清单、普通通道隔离，以及协调器/只读 watchdog 双心跳、严重告警和按 symbol 的 `Restart=no` 切换/受控退休源码闭环。有效的既有冻结账本可随注册保留，普通仓位始终按 `exchange - frozen` 计算；损坏账本或继续创建新冻结仓位仍拒绝注册。真实生产冻结账本迁移、故障注入、宿主机外部执行器清单、告警送达和按 symbol 的切换/回滚演练仍未完成。在这些硬阻塞解除前，不得部署或注册生产 symbol。合并前必须基于最新 `origin/main` 重放回归；不得用本分支较早的代码覆盖后续生产修复。
 
 为避免“不停机但永久无量”，普通 `MAKER_FLOW_RECOVER` 失败后只升级一次数值化 `BASELINE_TUNE`；再次失败进入可见 exhausted 状态，默认五分钟后仅重开该普通动作 tuple。retry 不清空无报价/无提交/无成交时钟、episode 指纹或临时亏损租约使用次数，也不自动开启 `allow_loss`。终止 intent 始终高于 retry，有限运行不会越过截止时间。
 
@@ -2165,7 +2165,7 @@ Web 必须提供 `expected_revision` 和 `expected_generation`。Web 适配器�
 80. 显式注册 symbol 的普通恢复协调器和类型化临时亏损租约已完成源码接线；这一事实不等于生产 symbol 已注册或生产所有权已切换。
 81. 严格 `STABLE` 的每日窗口滚动在同一 symbol 锁内原子更新新运行契约/所有者，并持久化唯一待处理、受栅栏的 `RUNNER_RESTART`；非 `STABLE` 或存在 lease/清理/执行阶段时零写入 `deferred`。
 82. Web 成交量/波动率触发器、磨损守卫和状态重对齐对已注册 symbol 只观察、委托或拒绝直写；损坏所有权封装不得回退旧执行路径。
-83. 冻结账本专用修复、真实生产基线/订单/账本迁移、宿主机外执行器盘点、心跳/严重告警、`Restart=no` 门禁和按 symbol 原子切换/回滚演练完成前，本分支不得部署或注册生产 symbol。
+83. 冻结账本专用修复、真实生产基线/订单/账本迁移、宿主机外执行器盘点、告警实际送达，以及按 symbol 原子切换/回滚演练完成前，本分支不得部署或注册生产 symbol；源码的双心跳、严重告警和 `Restart=no` 门禁不替代这些生产证据。
 84. `MAKER_FLOW_RECOVER`、`INVENTORY_RECOVER` 和 `BASELINE_TUNE` 的进展只接受当前 action/decision/generation/profile/side/role 对应的交易所已接受 `LIMIT + GTX`；计划、准入、MARKET 或非 GTX 记录不能冒充进展。
 85. 普通动作耗尽后先可见阻塞，再按固定有界 backoff 重开该 tuple；重试不清空流量时钟、episode 或 TLR 使用量，终止 intent 在同轮始终优先。
 86. 内部 `target_reached` / `target_unmet_deadline` 先原子持久化同一 v2 intent；恢复未完整回到 `STABLE` 前 runner 只返回 `handoff_pending`，不接受 intent、不读取交易所、不执行排空。

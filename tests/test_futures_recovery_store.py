@@ -601,7 +601,7 @@ def test_two_valid_but_divergent_recovery_slots_fail_closed() -> None:
         assert control_path.read_bytes() == before
 
 
-def test_register_refuses_symbol_with_existing_frozen_inventory() -> None:
+def test_register_preserves_existing_frozen_inventory_as_an_independent_ledger() -> None:
     with TemporaryDirectory() as temp_dir:
         directory = Path(temp_dir)
         control_path = directory / "bchusdt_loop_runner_control.json"
@@ -620,11 +620,34 @@ def test_register_refuses_symbol_with_existing_frozen_inventory() -> None:
             encoding="utf-8",
         )
 
-        with pytest.raises(ValueError, match="frozen inventory"):
+        registered = JsonRecoveryStore(control_path).register_symbol(
+            "BCHUSDT",
+            BASELINE,
+            now=NOW,
+        )
+
+        assert registered.symbol == "BCHUSDT"
+        assert _read_document(state_path)["best_quote_frozen_inventory"]["long_qty"] == 0.1
+        assert JsonRecoveryStore(control_path).read("BCHUSDT") == registered
+
+
+@pytest.mark.parametrize("invalid_qty", ("bad", True, -0.1))
+def test_register_refuses_an_invalid_existing_frozen_inventory_ledger(
+    invalid_qty: object,
+) -> None:
+    with TemporaryDirectory() as temp_dir:
+        directory = Path(temp_dir)
+        control_path = directory / "bchusdt_loop_runner_control.json"
+        (directory / "bchusdt_loop_state.json").write_text(
+            json.dumps(
+                {"best_quote_frozen_inventory": {"long_lots": [{"qty": invalid_qty}]}}
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="frozen inventory ledger is invalid"):
             JsonRecoveryStore(control_path).register_symbol(
-                "BCHUSDT",
-                BASELINE,
-                now=NOW,
+                "BCHUSDT", BASELINE, now=NOW
             )
 
         assert not control_path.exists()

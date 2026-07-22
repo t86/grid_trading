@@ -1122,30 +1122,41 @@ class JsonRecoveryStore:
                             "cannot register recovery while runner state is unreadable"
                         )
                 frozen = runner_state.get("best_quote_frozen_inventory")
-                if isinstance(frozen, MappingABC):
+                if frozen is not None:
+                    if not isinstance(frozen, MappingABC):
+                        raise ValueError(
+                            "cannot register recovery while frozen inventory ledger is invalid"
+                        )
+
+                    def frozen_quantity(value: Any) -> float:
+                        if isinstance(value, bool):
+                            return math.inf
+                        try:
+                            return float(value or 0.0)
+                        except (TypeError, ValueError):
+                            return math.inf
+
                     quantities: list[float] = []
                     for key in ("long_qty", "short_qty"):
-                        try:
-                            quantities.append(float(frozen.get(key) or 0.0))
-                        except (TypeError, ValueError):
-                            quantities.append(math.inf)
+                        quantities.append(frozen_quantity(frozen.get(key)))
                     for key in ("long_lots", "short_lots"):
                         lots = frozen.get(key)
-                        if isinstance(lots, list):
-                            for lot in lots:
-                                if not isinstance(lot, MappingABC):
-                                    quantities.append(math.inf)
-                                    continue
-                                try:
-                                    quantities.append(float(lot.get("qty") or 0.0))
-                                except (TypeError, ValueError):
-                                    quantities.append(math.inf)
+                        if lots is None:
+                            continue
+                        if not isinstance(lots, list):
+                            quantities.append(math.inf)
+                            continue
+                        for lot in lots:
+                            if not isinstance(lot, MappingABC):
+                                quantities.append(math.inf)
+                                continue
+                            quantities.append(frozen_quantity(lot.get("qty")))
                     if any(
-                        not math.isfinite(value) or value > 1e-12
+                        not math.isfinite(value) or value < -1e-12
                         for value in quantities
                     ):
                         raise ValueError(
-                            "cannot register recovery while frozen inventory exists"
+                            "cannot register recovery while frozen inventory ledger is invalid"
                         )
             state = RecoveryState.initial(normalized, baseline, now=now)
             self._write_state(document, current=None, next_state=state)

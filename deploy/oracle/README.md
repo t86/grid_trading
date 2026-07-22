@@ -357,9 +357,9 @@ payloads are easy to start from, but they can silently drop live overrides such 
 > 切换/退休演练仍是硬阻塞。下面的旧生产
 > 部署示例只用于理解现有环境，不得据此部署本分支或注册 symbol。
 >
-> 当前注册门禁会拒绝带有正数/无效冻结库存摘要或 lot、或仍启用 `best_quote_maker_volume_reduce_freeze_enabled`
-> 冻结创建能力的 symbol，防止不完整的冻结修复动作取得所有权；
-> 这只是安全拒绝，不等于冻结账本修复已经实现。扁平受管字段漂移（包括遗留原始 `allow_loss=true`）
+> 当前注册门禁允许保留已验证的正数冻结库存账本；它会拒绝无效冻结摘要/lot，或仍启用
+> `best_quote_maker_volume_reduce_freeze_enabled` 冻结创建能力的 symbol。普通恢复只消费 exchange 减去冻结账本后的
+> normal 仓位，绝不重分类、减少或对冲冻结部分；这只是普通策略隔离，不等于冻结账本修复已经实现。扁平受管字段漂移（包括遗留原始 `allow_loss=true`）
 > 和损坏的普通运行回执 journal 会进入单独的本地状态修复轮次，下一轮再恢复交易，不会要求人工清理布尔状态。
 
 Hedge `best_quote_maker_volume` farming (REUSDT, and now ARXUSDT / OUSDT) is supervised by a small
