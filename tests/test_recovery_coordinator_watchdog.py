@@ -74,6 +74,49 @@ def test_registered_symbol_requires_a_fresh_successful_coordinator_heartbeat() -
     assert stale["reason"] == "coordinator_heartbeat_stale"
 
 
+def test_blocked_symbol_alerts_without_marking_other_symbol_unhealthy() -> None:
+    blocked_heartbeat = {
+        "futures_recovery_guard_heartbeat": {
+            "schema": "futures_recovery_guard_heartbeat_v1",
+            "checked_at": NOW.isoformat(),
+            "ok": False,
+            "symbols": {
+                "BCHUSDT": {
+                    "healthy": True,
+                    "action": "coordinator_noop_hold",
+                    "liveness_status": "healthy",
+                },
+                "ARXUSDT": {
+                    "healthy": False,
+                    "action": "coordinator_safety_converge_hold",
+                    "liveness_status": "blocked",
+                },
+            },
+        }
+    }
+
+    healthy = assess_coordinator_liveness(
+        symbol="BCHUSDT",
+        control=_registered_control("BCHUSDT"),
+        guard_state=blocked_heartbeat,
+        now=NOW,
+        max_heartbeat_age_seconds=150,
+    )
+    blocked = assess_coordinator_liveness(
+        symbol="ARXUSDT",
+        control=_registered_control("ARXUSDT"),
+        guard_state=blocked_heartbeat,
+        now=NOW,
+        max_heartbeat_age_seconds=150,
+    )
+
+    assert healthy["healthy"] is True
+    assert healthy["reason"] == "coordinator_heartbeat_fresh"
+    assert blocked["healthy"] is False
+    assert blocked["reason"] == "coordinator_symbol_blocked"
+    assert blocked["action"] == "coordinator_safety_converge_hold"
+
+
 def test_unregistered_symbol_is_explicitly_observed_without_a_false_alarm() -> None:
     assessment = assess_coordinator_liveness(
         symbol="BCHUSDT",

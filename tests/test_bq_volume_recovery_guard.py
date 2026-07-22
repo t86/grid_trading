@@ -365,6 +365,29 @@ def _write_registered_normal_reports(
 
 
 class BqVolumeRecoveryGuardTests(unittest.TestCase):
+    def test_registered_blocked_round_marks_heartbeat_unhealthy(self) -> None:
+        now = datetime(2026, 7, 22, tzinfo=timezone.utc)
+        state: dict[str, object] = {}
+
+        bq_volume_recovery_guard._record_recovery_guard_heartbeat(
+            state,
+            now=now,
+            registered_symbols=["BCHUSDT"],
+            results=[
+                {
+                    "symbol": "BCHUSDT",
+                    "action": "coordinator_safety_converge_hold",
+                    "liveness_status": "blocked",
+                }
+            ],
+            exit_code=0,
+        )
+
+        heartbeat = state["futures_recovery_guard_heartbeat"]
+        self.assertFalse(heartbeat["ok"])
+        self.assertFalse(heartbeat["symbols"]["BCHUSDT"]["healthy"])
+        self.assertEqual(heartbeat["symbols"]["BCHUSDT"]["liveness_status"], "blocked")
+
     def test_active_entry_baseline_tune_carries_blocker_without_reports(
         self,
     ) -> None:
@@ -1218,6 +1241,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(heartbeat["symbols"]["ARXUSDT"], {
                 "healthy": True,
                 "action": "coordinator_noop_hold",
+                "liveness_status": None,
             })
 
     def test_main_registered_terminal_owner_handoffs_to_coordinator_before_delegation(

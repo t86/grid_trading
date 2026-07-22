@@ -119,13 +119,24 @@ def assess_coordinator_liveness(
         }
     symbols = heartbeat.get("symbols")
     symbol_status = symbols.get(normalized) if isinstance(symbols, Mapping) else None
-    if heartbeat.get("ok") is not True or not isinstance(symbol_status, Mapping):
+    if not isinstance(symbol_status, Mapping):
         return {
             "symbol": normalized,
             "tracked": True,
             "healthy": False,
             "reason": "coordinator_round_failed",
-            "action": symbol_status.get("action") if isinstance(symbol_status, Mapping) else None,
+            "action": None,
+        }
+    # The coordinator executes one isolated action per symbol.  A blocked
+    # neighbor must not hide this symbol's healthy round, while this symbol's
+    # own visible block must remain alertable instead of looking like progress.
+    if symbol_status.get("liveness_status") == "blocked":
+        return {
+            "symbol": normalized,
+            "tracked": True,
+            "healthy": False,
+            "reason": "coordinator_symbol_blocked",
+            "action": symbol_status.get("action"),
         }
     if symbol_status.get("healthy") is not True:
         return {

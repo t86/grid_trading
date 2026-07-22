@@ -368,14 +368,17 @@ def _record_recovery_guard_heartbeat(
     symbol_status: dict[str, dict[str, Any]] = {}
     for symbol in sorted(set(registered_symbols)):
         result = result_by_symbol.get(symbol)
+        liveness_status = result.get("liveness_status") if result is not None else None
         healthy = bool(
             result is not None
             and result.get("action") != "registered_recovery_blocked"
             and not result.get("effect_error")
+            and liveness_status != "blocked"
         )
         symbol_status[symbol] = {
             "healthy": healthy,
             "action": result.get("action") if result is not None else None,
+            "liveness_status": liveness_status,
         }
     state[RECOVERY_GUARD_HEARTBEAT_KEY] = {
         "schema": RECOVERY_GUARD_HEARTBEAT_SCHEMA,
