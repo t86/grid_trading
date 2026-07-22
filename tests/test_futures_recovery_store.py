@@ -41,6 +41,7 @@ from grid_optimizer.futures_recovery_store import (
     RecoveryStateUnavailableError,
     recovery_coordinator_registered,
 )
+from grid_optimizer.recovery_control_ownership import control_last_valid_snapshot_path
 
 
 NOW = datetime(2026, 7, 15, 2, 3, 4, tzinfo=timezone.utc)
@@ -52,6 +53,50 @@ BASELINE = {
         "limits": {"max_orders": 3},
     },
 }
+
+
+def test_registered_store_restores_only_a_valid_last_control_snapshot(tmp_path: Path) -> None:
+    control_path = tmp_path / "arxusdt_loop_runner_control.json"
+    store = JsonRecoveryStore(control_path)
+    registered = store.register_symbol("ARXUSDT", BASELINE, now=NOW)
+    snapshot_path = control_last_valid_snapshot_path(control_path)
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    control_path.write_text("{invalid-json", encoding="utf-8")
+
+    restored = store.restore_last_valid_snapshot("ARXUSDT")
+
+    assert restored.document_revision == registered.document_revision
+    assert json.loads(control_path.read_text(encoding="utf-8")) == snapshot
+    assert store.read("ARXUSDT").document_revision == registered.document_revision
+
+
+def test_registered_store_never_restores_an_invalid_last_control_snapshot(
+    tmp_path: Path,
+) -> None:
+    control_path = tmp_path / "arxusdt_loop_runner_control.json"
+    store = JsonRecoveryStore(control_path)
+    store.register_symbol("ARXUSDT", BASELINE, now=NOW)
+    control_path.write_text("{invalid-json", encoding="utf-8")
+    control_last_valid_snapshot_path(control_path).write_text(
+        json.dumps({"symbol": "ARXUSDT"}), encoding="utf-8"
+    )
+
+    with pytest.raises(RecoveryStateUnavailableError, match="unregistered recovery symbol"):
+        store.restore_last_valid_snapshot("ARXUSDT")
+
+    assert control_path.read_text(encoding="utf-8") == "{invalid-json"
+
+
+def test_registered_store_recovers_from_non_utf8_primary_control(tmp_path: Path) -> None:
+    control_path = tmp_path / "arxusdt_loop_runner_control.json"
+    store = JsonRecoveryStore(control_path)
+    registered = store.register_symbol("ARXUSDT", BASELINE, now=NOW)
+    control_path.write_bytes(b"\xff\xfe")
+
+    restored = store.restore_last_valid_snapshot("ARXUSDT")
+
+    assert restored.document_revision == registered.document_revision
+    assert store.read("ARXUSDT").document_revision == registered.document_revision
 
 
 def _full_state() -> RecoveryState:

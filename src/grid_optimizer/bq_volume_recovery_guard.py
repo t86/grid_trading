@@ -10657,6 +10657,29 @@ def run_registered_recovery_symbol_round(
             dry_run=dry_run,
         )
     except (TypeError, ValueError, RecoveryStateStoreError) as exc:
+        try:
+            restored = store.restore_last_valid_snapshot(
+                normalized,
+                dry_run=dry_run,
+            )
+        except (TypeError, ValueError, RecoveryStateStoreError):
+            restored = None
+        if restored is not None:
+            return {
+                "symbol": normalized,
+                "action": (
+                    "dry_run_registered_recovery_control_snapshot_restore"
+                    if dry_run
+                    else "registered_recovery_control_snapshot_restored"
+                ),
+                "liveness_status": "recovering",
+                "reason": "primary_control_unreadable_last_valid_snapshot",
+                "document_revision": restored.document_revision,
+                "changed_keys": [],
+                "effect_count": 0,
+                "control_cas_count": 1 if not dry_run else 0,
+                "dry_run": dry_run,
+            }
         return {
             "symbol": normalized,
             "action": "registered_recovery_blocked",

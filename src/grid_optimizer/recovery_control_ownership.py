@@ -39,8 +39,12 @@ def mark_recovery_owned(control: dict[str, Any]) -> None:
     control["recovery_control_owner"] = RECOVERY_CONTROL_OWNER
 
 
-def write_control_json_atomically(control_path: Path, payload: dict[str, Any]) -> None:
-    """Replace a control document without exposing a partial shared ``.tmp``."""
+def control_last_valid_snapshot_path(control_path: Path) -> Path:
+    """Durable last structurally-valid control snapshot for coordinator repair."""
+    return control_path.with_name(control_path.name + ".last_valid")
+
+
+def _replace_json_atomically(control_path: Path, payload: dict[str, Any]) -> None:
     control_path.parent.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(
         "w",
@@ -59,6 +63,12 @@ def write_control_json_atomically(control_path: Path, payload: dict[str, Any]) -
     # runner after os.replace.
     os.chmod(temporary_path, 0o644)
     os.replace(temporary_path, control_path)
+
+
+def write_control_json_atomically(control_path: Path, payload: dict[str, Any]) -> None:
+    """Replace control and retain an atomically-written valid recovery snapshot."""
+    _replace_json_atomically(control_path, payload)
+    _replace_json_atomically(control_last_valid_snapshot_path(control_path), payload)
 
 
 @contextmanager

@@ -29,6 +29,7 @@ from .futures_recovery_coordinator import (
     RecoveryState,
 )
 from .recovery_control_ownership import (
+    control_last_valid_snapshot_path,
     exclusive_control_lock,
     write_control_json_atomically,
 )
@@ -1171,6 +1172,45 @@ class JsonRecoveryStore:
                 self._read_document(allow_missing=False), normalized
             )
 
+    def restore_last_valid_snapshot(
+        self, symbol: str, *, dry_run: bool = False
+    ) -> RecoveryState:
+        """Restore only a validated coordinator snapshot after structural loss.
+
+        A readable control document with invalid ownership state is deliberately
+        not replaced: it may be a newer conflicting writer and must remain a
+        visible critical fault.  This repair is limited to an unreadable primary
+        document and a snapshot that independently proves the exact registered
+        symbol and complete managed profile.
+        """
+        normalized = _normalize_symbol(symbol)
+        with exclusive_control_lock(
+            self.control_path, timeout_seconds=self.lock_timeout_seconds
+        ):
+            try:
+                self._read_document(allow_missing=False)
+            except RecoveryStateCorruptError:
+                pass
+            else:
+                raise RecoveryStateCorruptError(
+                    "last-valid recovery restore requires an unreadable primary control"
+                )
+            snapshot_path = control_last_valid_snapshot_path(self.control_path)
+            try:
+                snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise RecoveryStateCorruptError(
+                    f"cannot read last-valid recovery snapshot: {snapshot_path}"
+                ) from exc
+            if not isinstance(snapshot, dict):
+                raise RecoveryStateCorruptError(
+                    "last-valid recovery snapshot must contain a JSON object"
+                )
+            state = self._decode_document_state(snapshot, normalized)
+            if not dry_run:
+                write_control_json_atomically(self.control_path, snapshot)
+            return state
+
     def reconcile_flat_profile(
         self,
         symbol: str,
@@ -1318,7 +1358,7 @@ class JsonRecoveryStore:
             raise RecoveryStateUnavailableError(
                 f"recovery control document is missing: {self.control_path}"
             ) from None
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             raise RecoveryStateCorruptError(
                 f"cannot read recovery control document: {self.control_path}"
             ) from exc
