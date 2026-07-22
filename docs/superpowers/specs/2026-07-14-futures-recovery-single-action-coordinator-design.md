@@ -78,6 +78,8 @@ stateDiagram-v2
 
 目标闸门不是“偶尔可运行”的辅助脚本，而是有目标运行的启动/接管门槛：交接前必须能验证存在非手工的 target-gate cron，或一个当前 `active` 且实际执行 target-gate 的 systemd timer；任一缺失、失活或无法证明时拒绝把 runner 交给受管所有权。到达 `run_end_time` 时，若运行器已明确不可用，目标闸门仍必须提交唯一的截止 intent，使最终结果为 `TARGET_UNMET_DEADLINE` 并保留已经取得的真实统计；若恰好连完整成交查询也不可用，只能提交类型化 `observation_unavailable_at_deadline` 终止 intent，明确保存观测错误和统计不可得事实，绝不能伪造零成交/零损耗为真实结果。运行器恢复后按该 intent 的终止所有者完成核验、排空或保留残仓，不允许重新打开普通刷量、默默延长窗口或让策略永久停在无主暂停。
 
+活动 terminal intent 或 runtime owner 自身携带已校验的冻结契约，因此 watchdog 在主 control 随后结构性不可读时，仍可且只能重发同一 symbol runner 的启动/重启请求，不能读取或重写当前 control、撤单、下新单或创建普通恢复。主 control 的无交易副作用修复仍由协调器按最后有效快照完成；快照也无法证明时保持 critical blocked。这样既不会让“已有退出所有者”因一个可恢复的 control 故障失联，也不会把损坏 control 当作新策略授权。
+
 未完成的旧 intent 永远按其中冻结的契约续跑：即使随后 control 或新启动参数已改变，也不能借新预算、新最大等待时间或新退出策略覆盖它。BQ guard 在活动退出所有者期间不创建普通恢复动作；watchdog 则把活动 intent 视为“必须恢复的排空工作”，运行器不活动时启动续做、事件缺失或陈旧时重启续做。已完成且仍属于当前运行契约的 intent 是明确的预期停机，不得复活；已完成但属于旧运行契约的 intent 不阻止新运行启动，并由新契约路径归档。非法 intent/快照直接返回失败，不能猜测性归类为“已完成”或“无 intent”。
 
 旧退出所有者归档与新运行接管之间使用显式、一次性的 `futures_terminal_handoff_v1`。归档和 `handoff=pending` 在同一次状态写入中完成；watchdog 只有在该 pending 与当前运行契约完全匹配时才越过旧 `stop_reason` 启动或重启。新运行的第一条正常循环事件先落盘，随后才把 handoff 标记为 `acknowledged`；确认以后 watchdog 恢复尊重当前 stop reason。永久 history 只用于审计，不能持续授权复活，避免新运行后续的人工停机或损耗停机被旧交接记录反复拉起。

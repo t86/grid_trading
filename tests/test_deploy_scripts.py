@@ -432,6 +432,106 @@ def test_runner_watchdog_registered_active_terminal_owner_resumes_runner(
     )
 
 
+def test_runner_watchdog_resumes_valid_terminal_owner_when_control_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """A frozen terminal contract must outlive a later control-file fault."""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    control = _owned_control(
+        {
+            "symbol": "BCHUSDT",
+            "strategy_profile": "test_profile",
+            "strategy_mode": "hedge_best_quote_maker_volume_v1",
+            "per_order_notional": 20.0,
+            "run_start_time": "2026-07-16T00:00:00+00:00",
+            "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+            "run_end_time": "2026-07-17T00:00:00+00:00",
+            "max_cumulative_notional": 20_000.0,
+            "terminal_drain_exit_policy": "drain_then_preserve",
+            "terminal_drain_absolute_loss_budget": 2.0,
+            "terminal_drain_max_wait_seconds": 600.0,
+        }
+    )
+    control_path = output_dir / "bchusdt_loop_runner_control.json"
+    control_path.write_text(json.dumps(control), encoding="utf-8")
+    (output_dir / "bchusdt_terminal_intent.json").write_text(
+        json.dumps(_terminal_intent(control)),
+        encoding="utf-8",
+    )
+    control_path.write_text("{unreadable", encoding="utf-8")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls_path = tmp_path / "systemctl.calls"
+    fake_systemctl = fake_bin / "systemctl"
+    fake_systemctl.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$*" >> "$SYSTEMCTL_CALLS"\n'
+        'if [ "$1" = "is-active" ]; then exit 3; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_systemctl.chmod(0o755)
+    (fake_bin / "python3").symlink_to(sys.executable)
+
+    completed = subprocess.run(
+        ["bash", "deploy/oracle/runner_watchdog.sh", "BCHUSDT"],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "SYSTEMCTL_CALLS": str(calls_path),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "start grid-loop@BCHUSDT.service" in calls_path.read_text(
+        encoding="utf-8"
+    )
+    assert "inactive with active terminal owner; start/resume" in completed.stdout
+    assert control_path.read_text(encoding="utf-8") == "{unreadable"
+
+    (output_dir / "bchusdt_terminal_intent.json").unlink()
+    (output_dir / "bchusdt_loop_state.json").write_text(
+        json.dumps(
+            {
+                "futures_terminal_drain": _terminal_runtime_owner(
+                    control,
+                    exit_status="exiting",
+                )
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls_path.unlink()
+    runtime_owner_resume = subprocess.run(
+        ["bash", "deploy/oracle/runner_watchdog.sh", "BCHUSDT"],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "SYSTEMCTL_CALLS": str(calls_path),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert runtime_owner_resume.returncode == 0, runtime_owner_resume.stderr
+    assert "start grid-loop@BCHUSDT.service" in calls_path.read_text(
+        encoding="utf-8"
+    )
+    assert "inactive with active terminal owner; start/resume" in (
+        runtime_owner_resume.stdout
+    )
+
+
 def test_runner_watchdog_registered_without_terminal_owner_never_actuates(
     tmp_path: Path,
 ) -> None:

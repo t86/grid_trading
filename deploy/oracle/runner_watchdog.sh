@@ -116,6 +116,9 @@ from grid_optimizer.futures_terminal_ownership import (
     validate_terminal_intent,
 )
 
+control = None
+current_contract_id = None
+current_contract_error = None
 try:
     with open(control_path, encoding="utf-8") as handle:
         control = json.load(handle)
@@ -126,8 +129,11 @@ try:
         expected_symbol=symbol,
     )
 except (OSError, TypeError, ValueError) as exc:
-    print(f"invalid current run contract: {exc}", file=sys.stderr)
-    raise SystemExit(2)
+    # A validated active terminal owner has its own immutable contract and
+    # must be allowed to resume even if the mutable control document later
+    # becomes unreadable.  Ordinary watchdog decisions still fail closed
+    # below when no such owner exists.
+    current_contract_error = str(exc)
 
 active_statuses = TERMINAL_INTENT_ACTIVE_STATUSES
 completed_statuses = TERMINAL_INTENT_COMPLETED_STATUSES
@@ -169,7 +175,11 @@ if os.path.exists(intent_path):
         raise SystemExit(2)
 
 try:
-    configured_state_path = str(control.get("state_path") or "").strip()
+    configured_state_path = (
+        str(control.get("state_path") or "").strip()
+        if isinstance(control, dict)
+        else ""
+    )
     if configured_state_path:
         state_path = (
             configured_state_path
@@ -224,6 +234,8 @@ try:
                 raise ValueError("invalid terminal handoff envelope")
             handoff_status = str(handoff.get("status") or "")
             if handoff_status == "pending":
+                if not current_contract_id:
+                    raise ValueError("terminal handoff requires current run contract")
                 source_contract_id = verify_snapshot(
                     handoff,
                     label="terminal handoff source",
@@ -246,6 +258,9 @@ except (OSError, TypeError, ValueError) as exc:
 # exists.  It must be resumed until it reaches an explicit terminal outcome.
 if any(state == "active" for state, _ in owner_states):
     print("active")
+elif current_contract_error is not None:
+    print(f"invalid current run contract: {current_contract_error}", file=sys.stderr)
+    raise SystemExit(2)
 elif any(
     state == "completed" and contract_id == current_contract_id
     for state, contract_id in owner_states
