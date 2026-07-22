@@ -1705,6 +1705,54 @@ def test_recovery_managed_runner_policy_audit_allows_target_gate_and_observers(
     assert "no legacy recovery actuators found: BCHUSDT" in completed.stdout
 
 
+def test_recovery_managed_runner_policy_audit_rejects_target_gate_direct_tp_mode(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(_registered_control({"symbol": "BCHUSDT"})), encoding="utf-8"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "crontab").write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = -l ]; then\n"
+        "  echo \"*/5 * * * * python output/ops/competition_target_gate.py --symbol BCHUSDT --place-tp-now --enforce\"\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "systemctl").write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = list-timers ]; then exit 0; fi\n"
+        "if [ \"$1\" = list-units ]; then exit 0; fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "crontab").chmod(0o755)
+    (fake_bin / "systemctl").chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", "deploy/oracle/configure_recovery_managed_runner.sh", "audit", "BCHUSDT"],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PYTHON_BIN": sys.executable,
+            "RUNNER_SRC_DIR": str(Path.cwd() / "src"),
+            "OUTPUT_DIR": str(output_dir),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "unclassified symbol executor" in completed.stderr
+    assert "--place-tp-now" in completed.stderr
+
+
 def test_recovery_managed_runner_policy_audit_refuses_unavailable_systemd_timer_inventory(
     tmp_path: Path,
 ) -> None:

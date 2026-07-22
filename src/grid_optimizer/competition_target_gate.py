@@ -20,8 +20,9 @@ Automatic behaviour:
    The loop runner is the sole owner that consumes the intent and executes its
    maker-only terminal-drain state machine.
 
-``--place-tp-now`` remains an explicit manual maintenance command.  It is not
-part of the automatic target/wear enforcement path.
+``--place-tp-now`` remains an explicit manual maintenance command for
+unregistered symbols.  A recovery-managed symbol defers it to the coordinator
+instead of creating an independent exchange-order writer.
 
 Legacy ``<symbol>_target_gate_done_YYYYMMDD.flag`` files are still observed for
 backward compatibility.  New automatic runs use the idempotent terminal-intent
@@ -56,6 +57,11 @@ from .futures_run_lifecycle import (
 )
 from .futures_terminal_ownership import terminal_intent_id
 from .futures_trade_window import fetch_exact_futures_trade_window
+from .futures_recovery_store import (
+    RECOVERY_STATE_KEY,
+    RECOVERY_STATE_MIRROR_KEY,
+    recovery_coordinator_registered,
+)
 from .recovery_control_ownership import exclusive_control_lock
 
 FROZEN_TP_PREFIX = "FROZENTP"
@@ -649,6 +655,28 @@ def main() -> None:
 
     # Manual: rest the frozen-short TP for an already-stopped runner, then exit.
     if a.place_tp_now:
+        recovery_owned = bool(
+            config_ok
+            and (
+                recovery_coordinator_registered(cfg)
+                or RECOVERY_STATE_KEY in cfg
+                or RECOVERY_STATE_MIRROR_KEY in cfg
+            )
+        )
+        if recovery_owned:
+            print(
+                json.dumps(
+                    {
+                        "ts": ts,
+                        "symbol": sym,
+                        "enforce": a.enforce,
+                        "action": "DEFERRED_TO_FUTURES_RECOVERY_COORDINATOR",
+                        "requested_action": "PLACE_FROZEN_TP",
+                        "actuation_deferred": True,
+                    }
+                )
+            )
+            return
         info = (
             place_frozen_short_tp(sym, k, s, a.workdir, slug, a.tp_ratio, a.tick, a.qty_step)
             if a.enforce else {"dry_run": True}

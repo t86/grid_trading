@@ -214,7 +214,13 @@ for raw in os.environ.get("CRON_TEXT", "").splitlines():
     )
     if legacy_writer:
         print(f"legacy:{line}")
-    elif not any(adapter in lowered for adapter in safe_symbol_adapters):
+    elif (
+        (
+            "competition_target_gate.py" in lowered
+            and "--place-tp-now" in lowered
+        )
+        or not any(adapter in lowered for adapter in safe_symbol_adapters)
+    ):
         print(f"unclassified:{line}")
 PY
 )"
@@ -282,7 +288,13 @@ for raw in timer_text.splitlines():
     lowered = command.lower()
     if symbol_pattern.search(command.upper()) is None:
         continue
-    if not any(adapter in lowered for adapter in safe_symbol_adapters):
+    if (
+        (
+            "competition_target_gate.py" in lowered
+            and "--place-tp-now" in lowered
+        )
+        or not any(adapter in lowered for adapter in safe_symbol_adapters)
+    ):
         print(f"{timer}->{service}: {command}")
 
 try:
@@ -320,7 +332,13 @@ for raw in active_service_text.splitlines():
     lowered = command.lower()
     if symbol_pattern.search(command.upper()) is None:
         continue
-    if not any(adapter in lowered for adapter in safe_symbol_adapters):
+    if (
+        (
+            "competition_target_gate.py" in lowered
+            and "--place-tp-now" in lowered
+        )
+        or not any(adapter in lowered for adapter in safe_symbol_adapters)
+    ):
         print(f"{service}: {command}")
 PY
 )"

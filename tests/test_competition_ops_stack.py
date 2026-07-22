@@ -17,6 +17,7 @@ import grid_optimizer.competition_state_realign as ra
 import grid_optimizer.competition_target_gate as tg
 from grid_optimizer.futures_run_lifecycle import bind_run_contract_owner
 from grid_optimizer.recovery_control_ownership import is_recovery_managed
+from grid_optimizer.futures_recovery_store import JsonRecoveryStore
 
 
 def _write_state(workdir: Path, slug: str, short_lots: list[dict]) -> None:
@@ -482,6 +483,37 @@ def test_gate_enforce_submits_terminal_intent_without_runtime_or_exchange_action
             "query_end": "2026-07-16T01:00:00+00:00",
         },
     }
+
+
+def test_registered_gate_place_tp_now_is_deferred_before_exchange_order(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    control = _control(tmp_path, "arxusdt", 100_000)
+    control_path = tmp_path / "output" / "arxusdt_loop_runner_control.json"
+    JsonRecoveryStore(control_path).register_symbol(
+        "ARXUSDT",
+        control,
+        now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        tg,
+        "place_frozen_short_tp",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("registered target gate must not place frozen TP")
+        ),
+    )
+
+    _run_gate_main(
+        monkeypatch,
+        [
+            "--symbol", "ARXUSDT", "--service", "grid-loop@ARXUSDT.service",
+            "--workdir", str(tmp_path), "--place-tp-now", "--enforce",
+        ],
+    )
+
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["action"] == "DEFERRED_TO_FUTURES_RECOVERY_COORDINATOR"
+    assert out["requested_action"] == "PLACE_FROZEN_TP"
 
 
 def test_gate_terminal_intent_retry_preserves_first_pending_contract(tmp_path: Path) -> None:
