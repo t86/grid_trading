@@ -18,7 +18,7 @@ from .futures_recovery_store import (
     decode_recovery_control_state,
     recovery_coordinator_registered,
 )
-from .notifications import alert_source_label, send_alert_email
+from .notifications import alert_source_label, load_alert_notifier_config, send_alert_email
 
 
 HEARTBEAT_KEY = "futures_recovery_guard_heartbeat"
@@ -249,6 +249,13 @@ def check_symbol(
         max_heartbeat_age_seconds=max_heartbeat_age_seconds,
         force_reason=force_reason,
     )
+    alert_config = load_alert_notifier_config(alert_config_path)
+    if assessment.get("tracked") and not alert_config.get("enabled"):
+        assessment = {
+            **assessment,
+            "healthy": False,
+            "reason": "alert_delivery_not_configured",
+        }
     state, should_alert = update_watchdog_state(
         assessment=assessment,
         state=state,

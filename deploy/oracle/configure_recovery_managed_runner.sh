@@ -29,6 +29,7 @@ COORDINATOR_TIMER_UNIT="${COORDINATOR_TIMER_UNIT:-grid-bq-volume-recovery-guard}
 COORDINATOR_WATCHDOG_TIMER_UNIT="${COORDINATOR_WATCHDOG_TIMER_UNIT:-${COORDINATOR_TIMER_UNIT}-watchdog}"
 COORDINATOR_STATE_PATH="${COORDINATOR_STATE_PATH:-${OUTPUT_DIR}/bq_volume_recovery_guard_state.json}"
 COORDINATOR_WATCHDOG_STATE_PATH="${COORDINATOR_WATCHDOG_STATE_PATH:-${OUTPUT_DIR}/recovery_coordinator_watchdog_state.json}"
+COORDINATOR_ALERT_CONFIG_PATH="${COORDINATOR_ALERT_CONFIG_PATH:-${OUTPUT_DIR}/alert_notifier_config.json}"
 COORDINATOR_HEARTBEAT_MAX_AGE_SECONDS="${COORDINATOR_HEARTBEAT_MAX_AGE_SECONDS:-150}"
 RUNNER_SERVICE_TEMPLATE="${RUNNER_SERVICE_TEMPLATE:-}"
 if [[ -z "$RUNNER_SERVICE_TEMPLATE" ]]; then
@@ -127,6 +128,21 @@ except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
 PY
 }
 
+require_coordinator_alert_delivery() {
+  "$PYTHON_BIN" - "$COORDINATOR_ALERT_CONFIG_PATH" "$RUNNER_SRC_DIR" <<'PY'
+import sys
+
+config_path, src_dir = sys.argv[1:]
+sys.path.insert(0, src_dir)
+from grid_optimizer.notifications import load_alert_notifier_config
+
+config = load_alert_notifier_config(config_path)
+if not config.get("enabled"):
+    print(f"recovery coordinator alert delivery is not configured: {config_path}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
 require_coordinator_heartbeat() {
   "$PYTHON_BIN" - "$SYMBOL" "$COORDINATOR_STATE_PATH" "$COORDINATOR_HEARTBEAT_MAX_AGE_SECONDS" <<'PY'
 import json
@@ -219,6 +235,7 @@ case "$ACTION" in
     require_coordinator_watchdog_timer
     require_coordinator_heartbeat
     require_coordinator_watchdog_heartbeat
+    require_coordinator_alert_delivery
     if [[ "$(restart_policy)" != "no" ]]; then
       echo "recovery-managed runner must use Restart=no: $SERVICE_NAME" >&2
       exit 1
@@ -234,6 +251,7 @@ case "$ACTION" in
     require_coordinator_watchdog_timer
     require_coordinator_heartbeat
     require_coordinator_watchdog_heartbeat
+    require_coordinator_alert_delivery
     temporary_path="$(mktemp)"
     trap 'rm -f "$temporary_path"' EXIT
     printf '[Service]\nRestart=no\n' >"$temporary_path"

@@ -12,6 +12,7 @@ from grid_optimizer.futures_recovery_store import (
     JsonRecoveryStore,
 )
 from grid_optimizer.recovery_coordinator_watchdog import (
+    check_symbol,
     main,
     assess_coordinator_liveness,
     update_watchdog_state,
@@ -129,6 +130,10 @@ def test_failure_alert_is_deduplicated_and_a_new_forced_service_failure_alerts_n
 def test_main_writes_a_fresh_watchdog_completion_heartbeat(tmp_path) -> None:
     output_dir = tmp_path / "output"
     output_dir.mkdir()
+    alert_config_path = output_dir / "alert.json"
+    alert_config_path.write_text(
+        json.dumps({"email_to": ["ops@example.com"]}), encoding="utf-8"
+    )
     (output_dir / "bchusdt_loop_runner_control.json").write_text(
         json.dumps(_registered_control()), encoding="utf-8"
     )
@@ -142,12 +147,35 @@ def test_main_writes_a_fresh_watchdog_completion_heartbeat(tmp_path) -> None:
     assert main([
         "--symbols", "BCHUSDT", "--output-dir", str(output_dir),
         "--guard-state-path", str(guard_state_path), "--state-path", str(state_path),
+        "--alert-config-path", str(alert_config_path),
     ]) == 0
 
     heartbeat = json.loads(state_path.read_text(encoding="utf-8"))["recovery_coordinator_watchdog_heartbeat"]
     assert heartbeat["schema"] == "recovery_coordinator_watchdog_heartbeat_v1"
     assert heartbeat["ok"] is True
     assert heartbeat["symbols"] == {"BCHUSDT": True}
+
+
+def test_registered_symbol_with_no_alert_delivery_is_unhealthy(tmp_path) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(_registered_control()), encoding="utf-8"
+    )
+
+    result = check_symbol(
+        symbol="BCHUSDT",
+        output_dir=output_dir,
+        guard_state=_healthy_heartbeat(),
+        state={},
+        now=NOW,
+        max_heartbeat_age_seconds=150,
+        alert_threshold=1,
+        alert_config_path=output_dir / "missing-alert.json",
+    )
+
+    assert result["assessment"]["healthy"] is False
+    assert result["assessment"]["reason"] == "alert_delivery_not_configured"
 
 
 def test_watchdog_has_no_runner_or_order_actuator() -> None:

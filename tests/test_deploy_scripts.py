@@ -1364,6 +1364,8 @@ def test_recovery_managed_runner_policy_requires_registered_coordinator_owner() 
     assert "require_coordinator_heartbeat" in script
     assert "require_coordinator_watchdog_timer" in script
     assert "require_coordinator_watchdog_heartbeat" in script
+    assert "require_coordinator_alert_delivery" in script
+    assert "load_alert_notifier_config" in script
     assert "recovery_coordinator_watchdog_heartbeat_v1" in script
     assert "futures_recovery_guard_heartbeat_v1" in script
     assert "registered control must be retired before disabling" in script
@@ -1409,6 +1411,9 @@ def test_recovery_managed_runner_policy_enables_only_registered_symbol(
             }
         ),
         encoding="utf-8",
+    )
+    (output_dir / "alert_notifier_config.json").write_text(
+        json.dumps({"email_to": ["ops@example.com"]}), encoding="utf-8"
     )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -1563,6 +1568,71 @@ def test_recovery_managed_runner_policy_refuses_missing_watchdog_heartbeat(
 
     assert completed.returncode != 0
     assert "watchdog heartbeat is not fresh" in completed.stderr
+    assert not (tmp_path / "systemd").exists()
+
+
+def test_recovery_managed_runner_policy_refuses_unconfigured_alert_delivery(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(_registered_control({"symbol": "BCHUSDT"})), encoding="utf-8"
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    (output_dir / "bq_volume_recovery_guard_state.json").write_text(
+        json.dumps(
+            {
+                "futures_recovery_guard_heartbeat": {
+                    "schema": "futures_recovery_guard_heartbeat_v1",
+                    "checked_at": now,
+                    "ok": True,
+                    "symbols": {"BCHUSDT": {"healthy": True}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / "recovery_coordinator_watchdog_state.json").write_text(
+        json.dumps(
+            {
+                "recovery_coordinator_watchdog_heartbeat": {
+                    "schema": "recovery_coordinator_watchdog_heartbeat_v1",
+                    "checked_at": now,
+                    "ok": True,
+                    "symbols": {"BCHUSDT": True},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "systemctl").write_text(
+        "#!/bin/sh\nif [ \"$1\" = is-active ]; then exit 0; fi\nexit 1\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "systemctl").chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", "deploy/oracle/configure_recovery_managed_runner.sh", "enable", "BCHUSDT"],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PYTHON_BIN": sys.executable,
+            "RUNNER_SRC_DIR": str(Path.cwd() / "src"),
+            "OUTPUT_DIR": str(output_dir),
+            "SYSTEMD_DIR": str(tmp_path / "systemd"),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "alert delivery is not configured" in completed.stderr
     assert not (tmp_path / "systemd").exists()
 
 
