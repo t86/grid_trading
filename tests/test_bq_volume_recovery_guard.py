@@ -916,6 +916,43 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 registered.document_revision,
             )
 
+    def test_registered_round_blocks_when_snapshot_restore_write_fails(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            now = datetime(2026, 7, 16, tzinfo=timezone.utc)
+            JsonRecoveryStore(control_path).register_symbol(
+                "BCHUSDT",
+                {"volatility_entry_pause_enabled": True},
+                now=now,
+            )
+            control_path.write_text("{invalid-json", encoding="utf-8")
+            external_effects: list[str] = []
+
+            with patch(
+                "grid_optimizer.futures_recovery_store.write_control_json_atomically",
+                side_effect=OSError("disk full"),
+            ):
+                result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                    symbol="BCHUSDT",
+                    output_dir=output_dir,
+                    guard_state={},
+                    now=now + timedelta(seconds=1),
+                    window_seconds=60.0,
+                    min_volume_notional=1.0,
+                    near_cap_ratio=0.8,
+                    far_ticks=2,
+                    plan_stale_seconds=30.0,
+                    dry_run=False,
+                    runner_wrapper="unused",
+                    restart_runner=external_effects.append,
+                    stop_runner=external_effects.append,
+                )
+
+            self.assertEqual(result["action"], "registered_recovery_blocked")
+            self.assertEqual(result["reason"], "registered_state_corrupt")
+            self.assertEqual(external_effects, [])
+
     def test_registered_guard_requires_exact_maker_fill_after_gtx_acceptance(
         self,
     ) -> None:

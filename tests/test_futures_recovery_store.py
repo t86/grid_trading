@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from types import MappingProxyType
 
 import pytest
+from unittest.mock import patch
 
 from grid_optimizer.futures_recovery_coordinator import (
     ActionAttempt,
@@ -97,6 +98,21 @@ def test_registered_store_recovers_from_non_utf8_primary_control(tmp_path: Path)
 
     assert restored.document_revision == registered.document_revision
     assert store.read("ARXUSDT").document_revision == registered.document_revision
+
+
+def test_registered_store_reports_snapshot_restore_write_failure(tmp_path: Path) -> None:
+    control_path = tmp_path / "arxusdt_loop_runner_control.json"
+    store = JsonRecoveryStore(control_path)
+    store.register_symbol("ARXUSDT", BASELINE, now=NOW)
+    control_path.write_text("{invalid-json", encoding="utf-8")
+
+    with patch(
+        "grid_optimizer.futures_recovery_store.write_control_json_atomically",
+        side_effect=OSError("disk full"),
+    ), pytest.raises(RecoveryStateCorruptError, match="cannot restore last-valid"):
+        store.restore_last_valid_snapshot("ARXUSDT")
+
+    assert control_path.read_text(encoding="utf-8") == "{invalid-json"
 
 
 def _full_state() -> RecoveryState:

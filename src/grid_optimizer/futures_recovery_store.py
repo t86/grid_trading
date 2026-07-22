@@ -1208,7 +1208,12 @@ class JsonRecoveryStore:
                 )
             state = self._decode_document_state(snapshot, normalized)
             if not dry_run:
-                write_control_json_atomically(self.control_path, snapshot)
+                try:
+                    write_control_json_atomically(self.control_path, snapshot)
+                except OSError as exc:
+                    raise RecoveryStateCorruptError(
+                        "cannot restore last-valid recovery snapshot to primary control"
+                    ) from exc
             return state
 
     def reconcile_flat_profile(
