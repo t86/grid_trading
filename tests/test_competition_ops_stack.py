@@ -1666,6 +1666,58 @@ def test_realign_main_cancels_managed_only_and_archives_plan(tmp_path: Path, mon
     assert lots["short_lots"][0]["qty"] == 1400.0
 
 
+def test_realign_main_corrupt_control_never_stops_or_rewrites_state(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A present-but-unreadable control file has unknown ownership: fail closed."""
+    (tmp_path / "output").mkdir(parents=True)
+    state_file = tmp_path / "output" / "arxusdt_loop_state.json"
+    original_state = {
+        "best_quote_volume_ledger": {
+            "long_lots": [{"qty": 500}],
+            "short_lots": [{"qty": 0}],
+        },
+        "best_quote_frozen_inventory": {},
+    }
+    state_file.write_text(json.dumps(original_state), encoding="utf-8")
+    control_file = tmp_path / "output" / "arxusdt_loop_runner_control.json"
+    control_file.write_text("{invalid-json", encoding="utf-8")
+
+    monkeypatch.setenv("BINANCE_API_KEY", "k")
+    monkeypatch.setenv("BINANCE_API_SECRET", "s")
+    monkeypatch.setattr(
+        "sys.argv",
+        ["realign", "--symbol", "ARXUSDT", "--service", "svc", "--workdir", str(tmp_path), "--enforce"],
+    )
+    monkeypatch.setattr(ra, "fetch_exchange_sides", lambda *a, **k: (0.0, 0.0, 0.0, 0.0))
+    monkeypatch.setattr(ra, "is_active", lambda _service: True)
+    forbidden: list[str] = []
+    monkeypatch.setattr(
+        ra.subprocess,
+        "run",
+        lambda *a, **k: forbidden.append("service") or _FakeProc(),
+    )
+    monkeypatch.setattr(
+        ra,
+        "fetch_futures_open_orders",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not inspect orders")),
+    )
+    monkeypatch.setattr(
+        ra,
+        "fetch_settled_realign_snapshot",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not realign")),
+    )
+
+    ra.main()
+
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["action"] == "BLOCKED_UNREADABLE_RECOVERY_CONTROL"
+    assert out["requested_action"] == "REALIGN_LEDGER"
+    assert out["recovery_coordinator_ownership_unknown"] is True
+    assert forbidden == []
+    assert json.loads(state_file.read_text(encoding="utf-8")) == original_state
+
+
 def test_health_monitor_terminal_stop_suppresses_governor_and_deadlock(tmp_path: Path, monkeypatch, capsys) -> None:
     # A runner held in a runtime-guard stop can stay process-alive (service active,
     # journal shows stop_reason). Neither the wear governor (config change + restart)

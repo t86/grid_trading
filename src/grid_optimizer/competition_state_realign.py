@@ -248,6 +248,23 @@ def should_start_after_realign(was_active: bool, allow_start_when_stopped: bool)
     return was_active or allow_start_when_stopped
 
 
+def _load_recovery_control(path: Path) -> tuple[dict[str, Any], bool]:
+    """Return a control document and whether its ownership can be determined.
+
+    A missing control document is an ordinary legacy-runner case.  A present
+    document that cannot be decoded (or is not an object) has unknown owner and
+    must never authorize this legacy executor to stop a service or mutate state.
+    """
+    try:
+        with path.open(encoding="utf-8") as handle:
+            control = json.load(handle)
+    except FileNotFoundError:
+        return {}, True
+    except (json.JSONDecodeError, OSError):
+        return {}, False
+    return (control, True) if isinstance(control, dict) else ({}, False)
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--symbol", required=True)
@@ -273,13 +290,7 @@ def main() -> None:
         "output",
         f"{slug}_loop_runner_control.json",
     )
-    try:
-        with open(control_path, encoding="utf-8") as handle:
-            control = json.load(handle)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        control = {}
-    if not isinstance(control, dict):
-        control = {}
+    control, control_readable = _load_recovery_control(Path(control_path))
     coordinator_registered = recovery_coordinator_registered(control)
 
     lq, lavg, sq, savg = fetch_exchange_sides(sym, k, s)
@@ -291,6 +302,7 @@ def main() -> None:
         "short_drift": round(sdrift, 1), "exch_long": lq, "exch_short": sq,
         "threshold": a.threshold_qty, "was_active": was_active,
         "recovery_coordinator_registered": coordinator_registered,
+        "recovery_coordinator_ownership_unknown": not control_readable,
     }
     if max(abs(ldrift), abs(sdrift)) <= a.threshold_qty or not a.enforce:
         status["action"] = (
@@ -299,8 +311,12 @@ def main() -> None:
         print(json.dumps(status))
         return
 
-    if coordinator_registered:
-        status["action"] = "DEFERRED_TO_FUTURES_RECOVERY_COORDINATOR"
+    if coordinator_registered or not control_readable:
+        status["action"] = (
+            "DEFERRED_TO_FUTURES_RECOVERY_COORDINATOR"
+            if coordinator_registered
+            else "BLOCKED_UNREADABLE_RECOVERY_CONTROL"
+        )
         status["requested_action"] = "REALIGN_LEDGER"
         print(json.dumps(status))
         return
@@ -310,16 +326,18 @@ def main() -> None:
     # recheck coordinator ownership before stopping or mutating anything.
     with exclusive_json_state_lock(Path(state_path)):
         with exclusive_control_lock(Path(control_path)):
-            try:
-                with open(control_path, encoding="utf-8") as handle:
-                    locked_control = json.load(handle)
-            except (FileNotFoundError, json.JSONDecodeError, OSError):
-                locked_control = {}
-            if not isinstance(locked_control, dict):
-                locked_control = {}
-            if recovery_coordinator_registered(locked_control):
-                status["recovery_coordinator_registered"] = True
-                status["action"] = "DEFERRED_TO_FUTURES_RECOVERY_COORDINATOR"
+            locked_control, locked_control_readable = _load_recovery_control(
+                Path(control_path)
+            )
+            locked_coordinator_registered = recovery_coordinator_registered(locked_control)
+            if locked_coordinator_registered or not locked_control_readable:
+                status["recovery_coordinator_registered"] = locked_coordinator_registered
+                status["recovery_coordinator_ownership_unknown"] = not locked_control_readable
+                status["action"] = (
+                    "DEFERRED_TO_FUTURES_RECOVERY_COORDINATOR"
+                    if status["recovery_coordinator_registered"]
+                    else "BLOCKED_UNREADABLE_RECOVERY_CONTROL"
+                )
                 status["requested_action"] = "REALIGN_LEDGER"
                 print(json.dumps(status))
                 return
