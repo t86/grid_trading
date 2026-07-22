@@ -93,6 +93,28 @@ class RunSavedRunnerTests(unittest.TestCase):
             ):
                 run_saved_runner._load_and_bind_futures_run_config("BCHUSDT")
 
+    def test_registered_recovery_runner_requires_a_deadline_even_with_a_volume_target(
+        self,
+    ) -> None:
+        target_only_registered = {
+            "symbol": "BCHUSDT",
+            "strategy_profile": "bch-volume-v1",
+            "strategy_mode": "best_quote_maker_volume",
+            "max_cumulative_notional": 20_000.0,
+            RECOVERY_STATE_KEY: {"schema_version": 1, "state": {}},
+            RECOVERY_STATE_MIRROR_KEY: {"schema_version": 1, "state": {}},
+        }
+
+        with patch(
+            "grid_optimizer.run_saved_runner._load_runner_control_config",
+            return_value=target_only_registered,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "registered recovery runner requires a bounded run contract with run_end_time",
+            ):
+                run_saved_runner._load_and_bind_futures_run_config("BCHUSDT")
+
     def test_owner_persistence_preserves_registered_recovery_envelope_and_desired_fields(
         self,
     ) -> None:

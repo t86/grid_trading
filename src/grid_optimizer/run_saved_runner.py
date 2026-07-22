@@ -118,17 +118,21 @@ def _validate_futures_run_contract(config: dict[str, object]) -> None:
 
 
 def _require_bounded_registered_recovery_contract(config: dict[str, object]) -> None:
-    """Do not start a coordinator-owned runner without a target or deadline."""
+    """Do not start a coordinator-owned runner without an absolute deadline."""
 
     if not recovery_coordinator_registered(config):
         return
-    snapshot = run_contract_snapshot_from_config(config)
     if (
-        snapshot.get("run_end_time") is None
-        and snapshot.get("max_cumulative_notional") is None
+        config.get("run_end_time") is None
+        and config.get("max_cumulative_notional") is not None
     ):
         raise ValueError(
-            "registered recovery runner requires a bounded run contract"
+            "registered recovery runner requires a bounded run contract with run_end_time"
+        )
+    snapshot = run_contract_snapshot_from_config(config)
+    if snapshot.get("run_end_time") is None:
+        raise ValueError(
+            "registered recovery runner requires a bounded run contract with run_end_time"
         )
 
 
@@ -165,8 +169,8 @@ def _load_and_bind_futures_run_config(symbol: str) -> dict[str, object]:
 
     config = _load_runner_control_config(symbol, include_running_process=False)
     config["symbol"] = symbol
-    _validate_futures_run_contract(config)
     _require_bounded_registered_recovery_contract(config)
+    _validate_futures_run_contract(config)
     prepared, owner_changed = bind_run_contract_owner(
         config,
         activated_at=datetime.now(timezone.utc),
@@ -181,8 +185,8 @@ def _load_and_bind_futures_run_config(symbol: str) -> dict[str, object]:
     with exclusive_control_lock(control_path):
         current = _load_runner_control_config(symbol, include_running_process=False)
         current["symbol"] = symbol
-        _validate_futures_run_contract(current)
         _require_bounded_registered_recovery_contract(current)
+        _validate_futures_run_contract(current)
         prepared, owner_changed = bind_run_contract_owner(
             current,
             activated_at=datetime.now(timezone.utc),
