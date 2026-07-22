@@ -22,6 +22,10 @@ from .futures_run_lifecycle import (
     resolve_authoritative_run_contract,
     run_contract_snapshot_from_config,
 )
+from .futures_terminal_ownership import (
+    TerminalIntentValidationError,
+    validate_terminal_intent,
+)
 from .notifications import alert_source_label, load_alert_notifier_config, send_alert_email
 
 
@@ -141,6 +145,75 @@ def _assess_target_gate_liveness(
         "reason": "target_gate_heartbeat_fresh",
         "checked_at": checked_at.isoformat(),
         "age_seconds": age_seconds,
+    }
+
+
+def _assess_deadline_terminal_intent(
+    *,
+    symbol: str,
+    control: Mapping[str, Any],
+    intent: Mapping[str, Any] | None,
+    intent_readable: bool,
+    now: datetime,
+    grace_seconds: float,
+) -> dict[str, Any] | None:
+    """Require the frozen run's terminal owner once its target window closes."""
+
+    if grace_seconds <= 0:
+        raise ValueError("target_gate_max_heartbeat_age_seconds must be positive")
+    try:
+        raw_snapshot = run_contract_snapshot_from_config(control)
+    except (TypeError, ValueError):
+        return None
+    raw_target = raw_snapshot.get("max_cumulative_notional")
+    if (
+        not isinstance(raw_target, (int, float))
+        or isinstance(raw_target, bool)
+        or raw_target <= 0
+        or raw_snapshot.get("run_end_time") is None
+    ):
+        return None
+    try:
+        snapshot, run_contract_id = resolve_authoritative_run_contract(
+            control,
+            expected_symbol=symbol,
+        )
+    except (TypeError, ValueError) as exc:
+        return {
+            "healthy": False,
+            "reason": "deadline_terminal_run_contract_invalid",
+            "detail": str(exc),
+        }
+    window_end = _parse_time(snapshot.get("run_end_time"))
+    if window_end is None:
+        return {
+            "healthy": False,
+            "reason": "deadline_terminal_run_contract_invalid",
+        }
+    if now.astimezone(timezone.utc) < window_end + timedelta(seconds=grace_seconds):
+        return None
+    if not intent_readable:
+        return {"healthy": False, "reason": "deadline_terminal_intent_unreadable"}
+    if not isinstance(intent, Mapping):
+        return {"healthy": False, "reason": "deadline_terminal_intent_missing"}
+    try:
+        validated = validate_terminal_intent(intent, expected_symbol=symbol)
+    except TerminalIntentValidationError as exc:
+        return {
+            "healthy": False,
+            "reason": "deadline_terminal_intent_invalid",
+            "detail": str(exc),
+        }
+    if validated.run_contract_id != run_contract_id:
+        return {
+            "healthy": False,
+            "reason": "deadline_terminal_intent_contract_mismatch",
+        }
+    return {
+        "healthy": True,
+        "reason": "deadline_terminal_intent_present",
+        "status": validated.status,
+        "intent_id": validated.intent_id,
     }
 
 
@@ -368,6 +441,7 @@ def check_symbol(
         ),
     )
     target_gate_assessment = None
+    deadline_terminal_assessment = None
     if assessment.get("healthy"):
         heartbeat_path = output_dir / f"{normalized.lower()}_target_gate_heartbeat.json"
         heartbeat, heartbeat_readable = _read_json_with_readability(heartbeat_path)
@@ -385,6 +459,27 @@ def check_symbol(
                 "healthy": False,
                 "reason": str(target_gate_assessment["reason"]),
                 "target_gate": target_gate_assessment,
+            }
+    if assessment.get("healthy"):
+        intent_path = output_dir / f"{normalized.lower()}_terminal_intent.json"
+        intent, intent_readable = _read_json_with_readability(intent_path)
+        deadline_terminal_assessment = _assess_deadline_terminal_intent(
+            symbol=normalized,
+            control=control,
+            intent=intent if intent else None,
+            intent_readable=intent_readable,
+            now=now,
+            grace_seconds=target_gate_max_heartbeat_age_seconds,
+        )
+        if (
+            deadline_terminal_assessment is not None
+            and not deadline_terminal_assessment["healthy"]
+        ):
+            assessment = {
+                **assessment,
+                "healthy": False,
+                "reason": str(deadline_terminal_assessment["reason"]),
+                "deadline_terminal": deadline_terminal_assessment,
             }
     alert_config = load_alert_notifier_config(alert_config_path)
     if assessment.get("tracked") and not alert_config.get("enabled"):
@@ -404,6 +499,7 @@ def check_symbol(
         "symbol": normalized,
         "assessment": assessment,
         "target_gate": target_gate_assessment,
+        "deadline_terminal": deadline_terminal_assessment,
         "alert": None,
     }
     if should_alert:

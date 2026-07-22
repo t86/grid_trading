@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from grid_optimizer.competition_target_gate import submit_lifecycle_intent
 from grid_optimizer.futures_recovery_coordinator import RecoveryState
 from grid_optimizer.futures_recovery_store import (
     RECOVERY_STATE_KEY,
@@ -299,6 +300,72 @@ def test_active_target_window_requires_a_fresh_target_gate_heartbeat(tmp_path, m
 
     assert recovered["assessment"]["healthy"] is True
     assert recovered["target_gate"]["reason"] == "target_gate_heartbeat_fresh"
+
+
+def test_deadline_requires_current_contract_terminal_intent(tmp_path, monkeypatch) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    control = _active_target_control()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(control), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        watchdog, "load_alert_notifier_config", lambda _path: {"enabled": True}
+    )
+    deadline_now = NOW + timedelta(hours=2)
+
+    missing = check_symbol(
+        symbol="BCHUSDT",
+        output_dir=output_dir,
+        guard_state=_healthy_heartbeat(checked_at=deadline_now),
+        state={},
+        now=deadline_now,
+        max_heartbeat_age_seconds=150,
+        alert_threshold=1,
+        alert_config_path=output_dir / "alert.json",
+    )
+
+    assert missing["assessment"]["healthy"] is False
+    assert missing["assessment"]["reason"] == "deadline_terminal_intent_missing"
+
+    snapshot, _run_contract_id = resolve_authoritative_run_contract(
+        control, expected_symbol="BCHUSDT"
+    )
+    intent, created = submit_lifecycle_intent(
+        workdir=str(tmp_path),
+        symbol="BCHUSDT",
+        trigger_reason="target_unmet_deadline",
+        requested_at=deadline_now.isoformat(),
+        observed={
+            "gross_notional": 100.0,
+            "target": float(snapshot["max_cumulative_notional"]),
+            "realized_pnl": 0.0,
+            "wear_per_10k": 0.0,
+            "trade_count": 1,
+            "window_start": snapshot["runtime_guard_stats_start_time"],
+            "window_end": snapshot["run_end_time"],
+            "query_end": snapshot["run_end_time"],
+            "runtime_guard_primary_reason": "after_end_window",
+            "runtime_guard_matched_reasons": ["after_end_window"],
+        },
+        run_contract_config=control,
+    )
+    assert created is True
+    assert intent["run_contract_id"] == _run_contract_id
+
+    recovered = check_symbol(
+        symbol="BCHUSDT",
+        output_dir=output_dir,
+        guard_state=_healthy_heartbeat(checked_at=deadline_now),
+        state={},
+        now=deadline_now,
+        max_heartbeat_age_seconds=150,
+        alert_threshold=1,
+        alert_config_path=output_dir / "alert.json",
+    )
+
+    assert recovered["assessment"]["healthy"] is True
+    assert recovered["deadline_terminal"]["reason"] == "deadline_terminal_intent_present"
 
 
 def test_watchdog_alerts_when_a_present_control_file_is_unreadable(tmp_path, monkeypatch) -> None:
