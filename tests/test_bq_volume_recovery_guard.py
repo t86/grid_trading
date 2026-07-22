@@ -1377,6 +1377,77 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertFalse(heartbeat["ok"])
             self.assertFalse(heartbeat["symbols"]["ARXUSDT"]["healthy"])
 
+    def test_main_known_registered_symbol_with_corrupt_control_never_falls_back(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "arxusdt_loop_runner_control.json").write_text(
+                "{corrupt",
+                encoding="utf-8",
+            )
+            state_path = output_dir / "guard_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "futures_recovery_guard_heartbeat": {
+                            "schema": "futures_recovery_guard_heartbeat_v1",
+                            "checked_at": "2026-07-16T00:00:00+00:00",
+                            "symbols": {"ARXUSDT": {"healthy": True}},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            blocked = {
+                "symbol": "ARXUSDT",
+                "action": "registered_recovery_blocked",
+                "reason": "registered_state_corrupt",
+                "liveness_status": "blocked",
+                "severity": "critical",
+                "effect_count": 0,
+                "control_cas_count": 0,
+            }
+            with (
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "_terminal_drain_delegation",
+                    return_value=None,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "run_registered_recovery_symbol_round",
+                    return_value=blocked,
+                ) as registered,
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_corrupt_loop_state",
+                    side_effect=AssertionError("corrupt registered control fell back"),
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "check_symbol",
+                    side_effect=AssertionError("corrupt registered control fell back"),
+                ),
+            ):
+                exit_code = bq_volume_recovery_guard.main(
+                    [
+                        "--output-dir",
+                        str(output_dir),
+                        "--state-path",
+                        str(state_path),
+                        "--symbols",
+                        "ARXUSDT",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            registered.assert_called_once()
+            heartbeat = json.loads(state_path.read_text(encoding="utf-8"))[
+                "futures_recovery_guard_heartbeat"
+            ]
+            self.assertFalse(heartbeat["symbols"]["ARXUSDT"]["healthy"])
+
     def test_registered_raw_active_allow_loss_is_repaired_false_in_one_round(self) -> None:
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)

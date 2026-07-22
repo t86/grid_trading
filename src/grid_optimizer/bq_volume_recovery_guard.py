@@ -4876,7 +4876,13 @@ def check_symbol(
         )
         return terminal_delegation
     control_path = _control_path(output_dir, normalized_symbol)
-    if _registered_recovery_envelope_present(control_path):
+    if _registered_recovery_envelope_present(
+        control_path,
+        known_registered=_recovery_guard_previously_owned_symbol(
+            state,
+            normalized_symbol,
+        ),
+    ):
         registered = run_registered_recovery_symbol_round(
             symbol=normalized_symbol,
             output_dir=output_dir,
@@ -10438,9 +10444,46 @@ def _carried_registered_flow_blockers(
     return None
 
 
-def _registered_recovery_envelope_present(control_path: Path) -> bool:
-    control = _read_json(control_path)
-    return recovery_coordinator_registered(control)
+def _recovery_guard_previously_owned_symbol(
+    state: Mapping[str, Any],
+    symbol: str,
+) -> bool:
+    heartbeat = state.get(RECOVERY_GUARD_HEARTBEAT_KEY)
+    if not isinstance(heartbeat, Mapping):
+        return False
+    if heartbeat.get("schema") != RECOVERY_GUARD_HEARTBEAT_SCHEMA:
+        return False
+    symbols = heartbeat.get("symbols")
+    return isinstance(symbols, Mapping) and str(symbol).upper().strip() in symbols
+
+
+def _registered_recovery_envelope_present(
+    control_path: Path,
+    *,
+    known_registered: bool = False,
+) -> bool:
+    """Keep a known coordinator owner fail-closed through control corruption."""
+
+    try:
+        raw = control_path.read_text(encoding="utf-8")
+    except OSError:
+        return bool(known_registered)
+    try:
+        control = json.loads(raw)
+    except json.JSONDecodeError:
+        return bool(
+            known_registered
+            or RECOVERY_STATE_KEY in raw
+            or RECOVERY_STATE_MIRROR_KEY in raw
+        )
+    if not isinstance(control, Mapping):
+        return bool(known_registered)
+    return bool(
+        known_registered
+        or recovery_coordinator_registered(control)
+        or RECOVERY_STATE_KEY in control
+        or RECOVERY_STATE_MIRROR_KEY in control
+    )
 
 
 def _registered_raw_allow_loss_is_unowned(
@@ -11643,7 +11686,10 @@ def main(argv: list[str] | None = None) -> int:
             exit_code = 1
             continue
         control_path = _control_path(output_dir, symbol)
-        if _registered_recovery_envelope_present(control_path):
+        if _registered_recovery_envelope_present(
+            control_path,
+            known_registered=_recovery_guard_previously_owned_symbol(state, symbol),
+        ):
             registered_symbols.append(symbol)
             registered_result = run_registered_recovery_symbol_round(
                 symbol=symbol,
