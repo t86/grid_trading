@@ -572,6 +572,7 @@ class RecoveryPolicy:
     cleanup_retry_interval: timedelta = timedelta(seconds=15)
     exhausted_retry_backoff: timedelta = timedelta(minutes=5)
     max_temporary_loss_leases_per_episode: int = 2
+    temporary_loss_relief_enabled: bool = True
     max_safety_observation_age: timedelta = timedelta(seconds=30)
     terminal_reason_allowlist: frozenset[str] = frozenset(
         {
@@ -602,6 +603,8 @@ class RecoveryPolicy:
             raise ValueError("exhausted_retry_backoff must be positive")
         if self.max_temporary_loss_leases_per_episode < 1:
             raise ValueError("max_temporary_loss_leases_per_episode must be positive")
+        if type(self.temporary_loss_relief_enabled) is not bool:
+            raise ValueError("temporary_loss_relief_enabled must be boolean")
         if self.round_history_size < 1:
             raise ValueError("round_history_size must be positive")
 
@@ -1157,6 +1160,11 @@ def _evaluate_temporary_loss(
             )
         ):
             continue
+        if not policy.temporary_loss_relief_enabled:
+            blocked_reasons.append(
+                f"temporary_loss_window_budget_unavailable:{side.value}"
+            )
+            continue
         already_active = (
             state.active_action is ActionId.TEMPORARY_LOSS_RELIEF
             and state.side is side
@@ -1261,7 +1269,8 @@ def _evaluate_baseline_tune(
     )
     episode_fingerprint = _episode_fingerprint(assessment)
     loss_budget_exhausted = (
-        state.temporary_loss_lease_uses.get(episode_fingerprint, 0)
+        not policy.temporary_loss_relief_enabled
+        or state.temporary_loss_lease_uses.get(episode_fingerprint, 0)
         >= policy.max_temporary_loss_leases_per_episode
     )
     for side in _stable_sides(assessment.inventory_reduce_sides):
@@ -1282,7 +1291,11 @@ def _evaluate_baseline_tune(
                 side,
                 OrderRole.REDUCE_ONLY,
                 (
-                    "temporary_loss_budget_exhausted_baseline_tune"
+                    (
+                        "temporary_loss_window_budget_unavailable_baseline_tune"
+                        if not policy.temporary_loss_relief_enabled
+                        else "temporary_loss_budget_exhausted_baseline_tune"
+                    )
                     if loss_only
                     else "inventory_recovery_exhausted_baseline_tune"
                 ),

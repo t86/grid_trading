@@ -3088,6 +3088,47 @@ def test_temporary_loss_budget_exhaustion_enters_bounded_baseline_tune() -> None
     assert successor.desired_profile.fields["hard_loss_forced_reduce_enabled"] is False
 
 
+def test_window_budget_gate_keeps_temporary_loss_disabled_but_preserves_recovery() -> None:
+    policy = RecoveryPolicy(
+        action_progress_timeout=timedelta(seconds=30),
+        action_hard_ttl=timedelta(seconds=60),
+        temporary_loss_relief_enabled=False,
+    )
+    engine = FuturesRecoveryDecisionEngine(policy=policy)
+    assessment = FlowBlockerAssessment(
+        inventory_reduce_sides=(Side.SELL,),
+        loss_only_blocked_sides=(Side.SELL,),
+        episode_fingerprint="window-budget-not-yet-available",
+    )
+    state = RecoveryState.initial("ARXUSDT", BASELINE, now=NOW).with_exhausted_attempt(
+        ActionId.INVENTORY_RECOVER,
+        Side.SELL,
+        OrderRole.REDUCE_ONLY,
+        now=NOW,
+    )
+
+    successor = engine.plan_round(
+        snapshot=_snapshot(assessment=assessment),
+        state=state,
+        now=NOW,
+        round_id="window-budget-not-yet-available",
+    )
+
+    assert successor.action_id is ActionId.BASELINE_TUNE
+    assert successor.side is Side.SELL
+    assert successor.order_role is OrderRole.REDUCE_ONLY
+    assert successor.next_state.phase is RecoveryPhase.ACTIVE
+    assert successor.desired_profile.execution_policy.time_in_force == "GTX"
+    assert successor.desired_profile.execution_policy.post_only is True
+    assert (
+        successor.desired_profile.fields[
+            "best_quote_maker_volume_allow_loss_reduce_only"
+        ]
+        is False
+    )
+    assert "temporary_loss_window_budget_unavailable_baseline_tune" in successor.reasons
+
+
 def test_cleared_inventory_blocker_ends_episode_and_reclaims_loss_budget() -> None:
     policy = RecoveryPolicy(max_temporary_loss_leases_per_episode=1)
     engine = FuturesRecoveryDecisionEngine(policy=policy)

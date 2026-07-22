@@ -33,6 +33,7 @@ from .futures_recovery_coordinator import (
     EffectReceipt,
     EffectStage,
     FlowBlockerAssessment,
+    FuturesRecoveryDecisionEngine,
     FlowObservation,
     FlowRoleKey,
     LedgerClass,
@@ -11263,9 +11264,18 @@ def run_registered_recovery_symbol_round(
             cleanup_proof=cleanup.cleanup_proof,
         )
 
+    # Until accepted userTrades are accumulated in a durable, run-window loss
+    # ledger, episode counts cannot safely authorize another loss lease after
+    # a stable episode or process restart.  Registered symbols therefore keep
+    # recovery alive through bounded GTX baseline tuning, never by reopening
+    # allow_loss on an incomplete budget.
+    recovery_engine = FuturesRecoveryDecisionEngine(
+        policy=RecoveryPolicy(temporary_loss_relief_enabled=False)
+    )
     outcome = RegisteredSymbolRecoveryOrchestrator(
         store=store,
         effect_executor=execute_effect,
+        engine=recovery_engine,
     ).reconcile(
         snapshot=snapshot,
         now=now,
@@ -11315,6 +11325,7 @@ def run_registered_recovery_symbol_round(
         "ordinary_typed_receipt_interface": (
             "strict_plan_submit_manifest_and_user_trades_fill"
         ),
+        "temporary_loss_relief_status": "disabled_pending_window_loss_ledger",
         "dry_run": False,
     }
 

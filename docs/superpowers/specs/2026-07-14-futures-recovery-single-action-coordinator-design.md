@@ -67,7 +67,7 @@ stateDiagram-v2
     CANCEL_OWNED_ORDER --> STOPPED_PRESERVED: 无本所有者开放委托并保存残仓
 ```
 
-排空执行严格使用 `LIMIT + GTX` maker-only；Hedge Mode 通过 `positionSide` 表达只减仓语义，不向 Binance 发送冲突的 `reduceOnly` 参数。损耗权限只存在于单个订单的有限 lease，成交回执结算后立即回收，任何路径都不得打开全局 `allow_loss`。`volatility_entry_pause` 默认保持开启。当前分支已将普通恢复的 `TEMPORARY_LOSS_RELIEF` 签发为类型化动作租约；运行器只接受精确匹配当前代际、决策、方向和订单角色的租约，并使用全部已接受订单清单、交易所成交回执和恢复回执完成到期/失败清理。无租约、原始 `allow_loss` 或不匹配租约均失败关闭。这一闭环的源码接线已完成，但并不表示生产已启用；冻结账本专用权限/修复、真实迁移数据和原子切换仍须独立验证。当前实现还只有 episode 级租约次数门禁，尚未把 `userTrades` 实际损耗、磨损和风险预留累计到不可被 episode/重启清零的运行窗口预算；补齐该账本前，生产注册门禁不得启用 TLR。
+排空执行严格使用 `LIMIT + GTX` maker-only；Hedge Mode 通过 `positionSide` 表达只减仓语义，不向 Binance 发送冲突的 `reduceOnly` 参数。损耗权限只存在于单个订单的有限 lease，成交回执结算后立即回收，任何路径都不得打开全局 `allow_loss`。`volatility_entry_pause` 默认保持开启。当前分支已将普通恢复的 `TEMPORARY_LOSS_RELIEF` 签发为类型化动作租约；运行器只接受精确匹配当前代际、决策、方向和订单角色的租约，并使用全部已接受订单清单、交易所成交回执和恢复回执完成到期/失败清理。无租约、原始 `allow_loss` 或不匹配租约均失败关闭。这一闭环的源码接线已完成，但并不表示生产已启用；冻结账本专用权限/修复、真实迁移数据和原子切换仍须独立验证。当前实现还只有 episode 级租约次数门禁，尚未把 `userTrades` 实际损耗、磨损和风险预留累计到不可被 episode/重启清零的运行窗口预算；因此已注册的实际协调轮次会明确禁用 TLR 并转入无 `allow_loss` 的 `BASELINE_TUNE`，保留租约自动回收实现供账本完成后接线。补齐该账本前，生产注册门禁不得启用 TLR。
 
 终止 intent、运行器本地状态和外部 watchdog 使用同一所有权协议：外部目标闸门只原子提交 `futures_lifecycle_intent_v2` intent，不再直接停止服务、撤单或 MARKET 平仓。intent 必须同时携带完整的 v3 规范快照和匹配的运行契约摘要；运行器和 watchdog 都重新规范化并复算摘要，缺字段、字段被篡改、摘要不匹配或状态未知时均以可见错误失败关闭，不执行订单或生命周期副作用。
 
