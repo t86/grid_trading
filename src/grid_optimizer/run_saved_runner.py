@@ -11,6 +11,7 @@ from pathlib import Path
 from .futures_run_lifecycle import (
     RUN_CONTRACT_OWNER_KEY,
     bind_run_contract_owner,
+    run_contract_snapshot_from_config,
     validate_run_contract,
 )
 from .futures_recovery_store import (
@@ -116,6 +117,21 @@ def _validate_futures_run_contract(config: dict[str, object]) -> None:
     )
 
 
+def _require_bounded_registered_recovery_contract(config: dict[str, object]) -> None:
+    """Do not start a coordinator-owned runner without a target or deadline."""
+
+    if not recovery_coordinator_registered(config):
+        return
+    snapshot = run_contract_snapshot_from_config(config)
+    if (
+        snapshot.get("run_end_time") is None
+        and snapshot.get("max_cumulative_notional") is None
+    ):
+        raise ValueError(
+            "registered recovery runner requires a bounded run contract"
+        )
+
+
 def _persist_run_contract_owner(
     control_path: Path,
     *,
@@ -150,6 +166,7 @@ def _load_and_bind_futures_run_config(symbol: str) -> dict[str, object]:
     config = _load_runner_control_config(symbol, include_running_process=False)
     config["symbol"] = symbol
     _validate_futures_run_contract(config)
+    _require_bounded_registered_recovery_contract(config)
     prepared, owner_changed = bind_run_contract_owner(
         config,
         activated_at=datetime.now(timezone.utc),
@@ -165,6 +182,7 @@ def _load_and_bind_futures_run_config(symbol: str) -> dict[str, object]:
         current = _load_runner_control_config(symbol, include_running_process=False)
         current["symbol"] = symbol
         _validate_futures_run_contract(current)
+        _require_bounded_registered_recovery_contract(current)
         prepared, owner_changed = bind_run_contract_owner(
             current,
             activated_at=datetime.now(timezone.utc),

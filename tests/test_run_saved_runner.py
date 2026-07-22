@@ -74,6 +74,25 @@ class RunSavedRunnerTests(unittest.TestCase):
         self.assertEqual(built[RUN_CONTRACT_OWNER_KEY], saved[RUN_CONTRACT_OWNER_KEY])
         mock_exec.assert_called_once()
 
+    def test_registered_recovery_runner_refuses_unbounded_start_contract(self) -> None:
+        unbounded_registered = {
+            "symbol": "BCHUSDT",
+            "strategy_profile": "bch-volume-v1",
+            "strategy_mode": "best_quote_maker_volume",
+            RECOVERY_STATE_KEY: {"schema_version": 1, "state": {}},
+            RECOVERY_STATE_MIRROR_KEY: {"schema_version": 1, "state": {}},
+        }
+
+        with patch(
+            "grid_optimizer.run_saved_runner._load_runner_control_config",
+            return_value=unbounded_registered,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "registered recovery runner requires a bounded run contract",
+            ):
+                run_saved_runner._load_and_bind_futures_run_config("BCHUSDT")
+
     def test_owner_persistence_preserves_registered_recovery_envelope_and_desired_fields(
         self,
     ) -> None:
