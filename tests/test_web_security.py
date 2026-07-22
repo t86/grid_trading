@@ -6516,6 +6516,23 @@ class WebSecurityTests(unittest.TestCase):
                 raw_payload={"symbol": "ARXUSDT"},
             )
 
+    def test_save_runner_control_refuses_to_replace_an_unreadable_control(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "arx-control.json"
+            control_path.write_text("{corrupt", encoding="utf-8")
+
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ), self.assertRaisesRegex(ValueError, "runner control.*unreadable"):
+                _save_runner_control_config(
+                    {"symbol": "ARXUSDT"},
+                    symbol="ARXUSDT",
+                )
+
+            self.assertEqual(control_path.read_text(encoding="utf-8"), "{corrupt")
+
     def test_mirror_only_presence_keeps_web_actions_deferred_to_coordinator(self) -> None:
         with TemporaryDirectory() as tmpdir:
             control_path = Path(tmpdir) / "bch-control.json"
@@ -6543,6 +6560,27 @@ class WebSecurityTests(unittest.TestCase):
         self.assertTrue(deferred["recovery_coordinator_registered"])
         self.assertTrue(deferred["actuation_deferred"])
         self.assertFalse(deferred["started"])
+
+    def test_unreadable_runner_control_defers_web_start_before_any_actuation(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "arxusdt_loop_runner_control.json"
+            control_path.write_text("{corrupt", encoding="utf-8")
+
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ):
+                deferred = web_module._defer_registered_runner_web_action(
+                    symbol="ARXUSDT",
+                    requested_action="start_or_restart",
+                )
+
+        self.assertIsNotNone(deferred)
+        assert deferred is not None
+        self.assertTrue(deferred["actuation_deferred"])
+        self.assertEqual(deferred["reason"], "runner_control_unreadable")
+        self.assertEqual(deferred["requested_action"], "start_or_restart")
 
     def test_monitor_page_uses_symbol_dropdown_for_supported_symbols(self) -> None:
         self.assertIn('<select id="symbol">', MONITOR_PAGE)

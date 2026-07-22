@@ -5563,6 +5563,10 @@ def _save_runner_control_config(config: dict[str, Any], *, symbol: str | None = 
     control_path = _runner_control_path(normalized_symbol)
     with exclusive_control_lock(control_path):
         loaded_existing = _read_json_dict(control_path)
+        if loaded_existing is None and control_path.exists():
+            raise ValueError(
+                f"runner control for {normalized_symbol} is unreadable"
+            )
         existing = loaded_existing if isinstance(loaded_existing, dict) else {}
         candidate = dict(config)
         existing_owner = existing.get(RUN_CONTRACT_OWNER_KEY)
@@ -11436,21 +11440,29 @@ def _defer_registered_runner_web_action(
     normalized_symbol = str(symbol or "").upper().strip()
     if not normalized_symbol:
         return None
-    existing = _read_json_dict(_runner_control_path(normalized_symbol))
-    if not (
+    control_path = _runner_control_path(normalized_symbol)
+    existing = _read_json_dict(control_path)
+    unreadable_existing_control = existing is None and control_path.exists()
+    registered = bool(
         recovery_coordinator_registered(candidate or {})
         or (
             isinstance(existing, dict)
             and recovery_coordinator_registered(existing)
         )
-    ):
+    )
+    if not registered and not unreadable_existing_control:
         return None
     result: dict[str, Any] = {
         "symbol": normalized_symbol,
-        "recovery_coordinator_registered": True,
+        "recovery_coordinator_registered": registered,
+        "recovery_coordinator_ownership_unknown": unreadable_existing_control,
         "actuation_deferred": True,
         "deferred": True,
-        "reason": "deferred_to_futures_recovery_coordinator",
+        "reason": (
+            "runner_control_unreadable"
+            if unreadable_existing_control
+            else "deferred_to_futures_recovery_coordinator"
+        ),
         "requested_action": requested_action,
     }
     if requested_action == "start_or_restart":
