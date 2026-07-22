@@ -8,9 +8,13 @@ PYTHON_BIN="${PYTHON_BIN:-${APP_DIR}/.venv/bin/python}"
 PYTHONPATH_VALUE="${PYTHONPATH_VALUE:-${APP_DIR}/src}"
 ENV_FILE="${ENV_FILE:-/home/ubuntu/.config/wangge/binance_api_env.env}"
 TIMER_UNIT_NAME="${TIMER_UNIT_NAME:-grid-bq-volume-recovery-guard}"
+WATCHDOG_UNIT_NAME="${WATCHDOG_UNIT_NAME:-${TIMER_UNIT_NAME}-watchdog}"
+FAILURE_ALERT_UNIT_NAME="${FAILURE_ALERT_UNIT_NAME:-${TIMER_UNIT_NAME}-failure-alert}"
 SYMBOLS="${SYMBOLS:-ARXUSDT,OUSDT}"
 OUTPUT_DIR="${OUTPUT_DIR:-${APP_DIR}/output}"
 STATE_PATH="${STATE_PATH:-${APP_DIR}/output/bq_volume_recovery_guard_state.json}"
+WATCHDOG_STATE_PATH="${WATCHDOG_STATE_PATH:-${APP_DIR}/output/recovery_coordinator_watchdog_state.json}"
+ALERT_CONFIG_PATH="${ALERT_CONFIG_PATH:-${APP_DIR}/output/alert_notifier_config.json}"
 RUNNER_WRAPPER="${RUNNER_WRAPPER:-/usr/local/bin/grid-saved-runner}"
 WINDOW_SECONDS="${WINDOW_SECONDS:-180}"
 MIN_VOLUME_NOTIONAL="${MIN_VOLUME_NOTIONAL:-125}"
@@ -35,6 +39,9 @@ LOSS_REDUCE_QUOTE_OFFSET_EXTRA_TICKS="${LOSS_REDUCE_QUOTE_OFFSET_EXTRA_TICKS:-AR
 REQUIRE_SOFT_PRESSURE_FOR_ALLOW_LOSS_SYMBOLS="${REQUIRE_SOFT_PRESSURE_FOR_ALLOW_LOSS_SYMBOLS:-ARXUSDT}"
 ON_UNIT_ACTIVE_SEC="${ON_UNIT_ACTIVE_SEC:-1min}"
 TIMEOUT_START_SEC="${TIMEOUT_START_SEC:-45s}"
+WATCHDOG_MAX_HEARTBEAT_AGE_SECONDS="${WATCHDOG_MAX_HEARTBEAT_AGE_SECONDS:-150}"
+WATCHDOG_ALERT_THRESHOLD="${WATCHDOG_ALERT_THRESHOLD:-2}"
+WATCHDOG_ON_UNIT_ACTIVE_SEC="${WATCHDOG_ON_UNIT_ACTIVE_SEC:-1min}"
 
 if ! command -v sudo >/dev/null 2>&1; then
   echo "sudo is required for systemd installation." >&2
@@ -75,12 +82,16 @@ fi
 
 SERVICE_FILE="/etc/systemd/system/${TIMER_UNIT_NAME}.service"
 TIMER_FILE="/etc/systemd/system/${TIMER_UNIT_NAME}.timer"
+WATCHDOG_SERVICE_FILE="/etc/systemd/system/${WATCHDOG_UNIT_NAME}.service"
+WATCHDOG_TIMER_FILE="/etc/systemd/system/${WATCHDOG_UNIT_NAME}.timer"
+FAILURE_ALERT_SERVICE_FILE="/etc/systemd/system/${FAILURE_ALERT_UNIT_NAME}.service"
 
 sudo tee "$SERVICE_FILE" >/dev/null <<EOF
 [Unit]
 Description=Grid BQ volume recovery guard
 After=network-online.target
 Wants=network-online.target
+OnFailure=${FAILURE_ALERT_UNIT_NAME}.service
 
 [Service]
 Type=oneshot
@@ -92,6 +103,42 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=${PYTHONPATH_VALUE}
 EnvironmentFile=${ENV_FILE}
 ExecStart=${PYTHON_BIN} -m grid_optimizer.bq_volume_recovery_guard --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --state-path ${STATE_PATH} --runner-wrapper ${RUNNER_WRAPPER} --window-seconds ${WINDOW_SECONDS} --min-volume-notional ${MIN_VOLUME_NOTIONAL} --trigger-seconds ${TRIGGER_SECONDS} --recover-min-volume-notional ${RECOVER_MIN_VOLUME_NOTIONAL} ${DAILY_TARGETS:+--daily-targets ${DAILY_TARGETS}} --target-pace-fraction ${TARGET_PACE_FRACTION} --target-pace-max-multiplier ${TARGET_PACE_MAX_MULTIPLIER} --target-completion-buffer-seconds ${TARGET_COMPLETION_BUFFER_SECONDS} --near-cap-ratio ${NEAR_CAP_RATIO} --recover-cap-ratio ${RECOVER_CAP_RATIO} --far-ticks ${FAR_TICKS} --plan-stale-seconds ${PLAN_STALE_SECONDS} --max-recovery-seconds ${MAX_RECOVERY_SECONDS} --cooldown-seconds ${COOLDOWN_SECONDS} --inventory-bias-relief-notional-margin ${INVENTORY_BIAS_RELIEF_NOTIONAL_MARGIN} --volume-recovery-cycle-budget-increment ${VOLUME_RECOVERY_CYCLE_BUDGET_INCREMENT} --cycle-budget-floors ${CYCLE_BUDGET_FLOORS} --loss-reduce-quote-offset-extra-ticks ${LOSS_REDUCE_QUOTE_OFFSET_EXTRA_TICKS} --require-soft-pressure-for-allow-loss-symbols ${REQUIRE_SOFT_PRESSURE_FOR_ALLOW_LOSS_SYMBOLS} ${PAUSE_BASELINES_FLAG} ${COST_GATE_FLAG}
+EOF
+
+sudo tee "$FAILURE_ALERT_SERVICE_FILE" >/dev/null <<EOF
+[Unit]
+Description=Alert on failed Grid BQ recovery coordinator round
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=30s
+User=${SERVICE_USER}
+Group=${SERVICE_GROUP}
+WorkingDirectory=${APP_DIR}
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=${PYTHONPATH_VALUE}
+EnvironmentFile=${ENV_FILE}
+ExecStart=${PYTHON_BIN} -m grid_optimizer.recovery_coordinator_watchdog --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --guard-state-path ${STATE_PATH} --state-path ${WATCHDOG_STATE_PATH} --alert-config-path ${ALERT_CONFIG_PATH} --max-heartbeat-age-seconds ${WATCHDOG_MAX_HEARTBEAT_AGE_SECONDS} --alert-threshold ${WATCHDOG_ALERT_THRESHOLD} --force-reason coordinator_service_failed
+EOF
+
+sudo tee "$WATCHDOG_SERVICE_FILE" >/dev/null <<EOF
+[Unit]
+Description=Observe Grid BQ recovery coordinator heartbeat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=30s
+User=${SERVICE_USER}
+Group=${SERVICE_GROUP}
+WorkingDirectory=${APP_DIR}
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=${PYTHONPATH_VALUE}
+EnvironmentFile=${ENV_FILE}
+ExecStart=${PYTHON_BIN} -m grid_optimizer.recovery_coordinator_watchdog --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --guard-state-path ${STATE_PATH} --state-path ${WATCHDOG_STATE_PATH} --alert-config-path ${ALERT_CONFIG_PATH} --max-heartbeat-age-seconds ${WATCHDOG_MAX_HEARTBEAT_AGE_SECONDS} --alert-threshold ${WATCHDOG_ALERT_THRESHOLD}
 EOF
 
 sudo tee "$TIMER_FILE" >/dev/null <<EOF
@@ -108,11 +155,30 @@ Unit=${TIMER_UNIT_NAME}.service
 WantedBy=timers.target
 EOF
 
+sudo tee "$WATCHDOG_TIMER_FILE" >/dev/null <<EOF
+[Unit]
+Description=Observe Grid BQ recovery coordinator heartbeat
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${WATCHDOG_ON_UNIT_ACTIVE_SEC}
+AccuracySec=15s
+Unit=${WATCHDOG_UNIT_NAME}.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
 sudo systemctl daemon-reload
 sudo systemctl enable "${TIMER_UNIT_NAME}.timer"
 sudo systemctl restart "${TIMER_UNIT_NAME}.timer"
+sudo systemctl enable "${WATCHDOG_UNIT_NAME}.timer"
+sudo systemctl restart "${WATCHDOG_UNIT_NAME}.timer"
 sudo systemctl start "${TIMER_UNIT_NAME}.service"
+sudo systemctl start "${WATCHDOG_UNIT_NAME}.service"
 
-echo "Installed ${TIMER_UNIT_NAME}.service and ${TIMER_UNIT_NAME}.timer"
+echo "Installed ${TIMER_UNIT_NAME}.service/.timer and read-only ${WATCHDOG_UNIT_NAME}.service/.timer"
 sudo systemctl --no-pager --full status "${TIMER_UNIT_NAME}.service" | sed -n '1,20p' || true
 sudo systemctl --no-pager --full status "${TIMER_UNIT_NAME}.timer" | sed -n '1,20p' || true
+sudo systemctl --no-pager --full status "${WATCHDOG_UNIT_NAME}.service" | sed -n '1,20p' || true
+sudo systemctl --no-pager --full status "${WATCHDOG_UNIT_NAME}.timer" | sed -n '1,20p' || true

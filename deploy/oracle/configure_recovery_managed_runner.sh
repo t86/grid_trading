@@ -26,7 +26,9 @@ PYTHON_BIN="${PYTHON_BIN:-${APP_DIR}/.venv/bin/python}"
 RUNNER_SRC_DIR="${RUNNER_SRC_DIR:-${APP_DIR}/src}"
 OUTPUT_DIR="${OUTPUT_DIR:-${APP_DIR}/output}"
 COORDINATOR_TIMER_UNIT="${COORDINATOR_TIMER_UNIT:-grid-bq-volume-recovery-guard}"
+COORDINATOR_WATCHDOG_TIMER_UNIT="${COORDINATOR_WATCHDOG_TIMER_UNIT:-${COORDINATOR_TIMER_UNIT}-watchdog}"
 COORDINATOR_STATE_PATH="${COORDINATOR_STATE_PATH:-${OUTPUT_DIR}/bq_volume_recovery_guard_state.json}"
+COORDINATOR_WATCHDOG_STATE_PATH="${COORDINATOR_WATCHDOG_STATE_PATH:-${OUTPUT_DIR}/recovery_coordinator_watchdog_state.json}"
 COORDINATOR_HEARTBEAT_MAX_AGE_SECONDS="${COORDINATOR_HEARTBEAT_MAX_AGE_SECONDS:-150}"
 RUNNER_SERVICE_TEMPLATE="${RUNNER_SERVICE_TEMPLATE:-}"
 if [[ -z "$RUNNER_SERVICE_TEMPLATE" ]]; then
@@ -85,6 +87,44 @@ require_coordinator_timer() {
     echo "recovery coordinator timer is not active: ${COORDINATOR_TIMER_UNIT}.timer" >&2
     exit 1
   fi
+}
+
+require_coordinator_watchdog_timer() {
+  if ! systemctl is-active --quiet "${COORDINATOR_WATCHDOG_TIMER_UNIT}.timer"; then
+    echo "recovery coordinator watchdog timer is not active: ${COORDINATOR_WATCHDOG_TIMER_UNIT}.timer" >&2
+    exit 1
+  fi
+}
+
+require_coordinator_watchdog_heartbeat() {
+  "$PYTHON_BIN" - "$SYMBOL" "$COORDINATOR_WATCHDOG_STATE_PATH" "$COORDINATOR_HEARTBEAT_MAX_AGE_SECONDS" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+
+symbol, state_path, max_age_text = sys.argv[1:]
+try:
+    max_age = float(max_age_text)
+    if max_age <= 0:
+        raise ValueError("maximum age must be positive")
+    with open(state_path, encoding="utf-8") as handle:
+        state = json.load(handle)
+    heartbeat = state["recovery_coordinator_watchdog_heartbeat"]
+    if heartbeat.get("schema") != "recovery_coordinator_watchdog_heartbeat_v1":
+        raise ValueError("unexpected watchdog heartbeat schema")
+    checked_at = datetime.fromisoformat(str(heartbeat["checked_at"]).replace("Z", "+00:00"))
+    if checked_at.tzinfo is None:
+        raise ValueError("watchdog heartbeat timestamp has no timezone")
+    age = (datetime.now(timezone.utc) - checked_at.astimezone(timezone.utc)).total_seconds()
+    if age < -60 or age > max_age:
+        raise ValueError(f"watchdog heartbeat age {age:.1f}s is outside 0..{max_age:.1f}s")
+    healthy = heartbeat.get("symbols", {}).get(symbol)
+    if heartbeat.get("ok") is not True or healthy is not True:
+        raise ValueError("watchdog does not confirm a healthy observation for symbol")
+except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    print(f"recovery coordinator watchdog heartbeat is not fresh for {symbol}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
 }
 
 require_coordinator_heartbeat() {
@@ -176,7 +216,9 @@ case "$ACTION" in
       exit 1
     fi
     require_coordinator_timer
+    require_coordinator_watchdog_timer
     require_coordinator_heartbeat
+    require_coordinator_watchdog_heartbeat
     if [[ "$(restart_policy)" != "no" ]]; then
       echo "recovery-managed runner must use Restart=no: $SERVICE_NAME" >&2
       exit 1
@@ -189,7 +231,9 @@ case "$ACTION" in
       exit 1
     fi
     require_coordinator_timer
+    require_coordinator_watchdog_timer
     require_coordinator_heartbeat
+    require_coordinator_watchdog_heartbeat
     temporary_path="$(mktemp)"
     trap 'rm -f "$temporary_path"' EXIT
     printf '[Service]\nRestart=no\n' >"$temporary_path"

@@ -353,7 +353,7 @@ payloads are easy to start from, but they can silently drop live overrides such 
 >
 > 但当前没有任何生产 symbol 完成注册或所有权切换，本分支也未部署。代码现已提供协调器成功心跳、
 > 受管 runner 的 `Restart=no` 门禁和按 symbol 的受控退休/回滚；它们尚未在生产完成演练。冻结账本专用修复闭环、
-> 真实生产基线/订单/账本迁移、宿主机外 cron/systemd/`output/ops` 盘点，以及严重告警和一次完整的
+> 真实生产基线/订单/账本迁移、宿主机外 cron/systemd/`output/ops` 盘点，以及严重告警投递配置和一次完整的
 > 切换/退休演练仍是硬阻塞。下面的旧生产
 > 部署示例只用于理解现有环境，不得据此部署本分支或注册 symbol。
 >
@@ -401,11 +401,11 @@ them by `git pull`, not by hand-editing `output/ops/*.py`:
 进程级监督只负责终止/告警守卫进程，不得代替协调器对任何 symbol 下单、撤单或停启 runner。
 
 当前“守卫一轮已经完成”的心跳边界是：主循环结束后最终写入的
-`output/bq_volume_recovery_guard_state.json` 的 mtime 已推进，并且
-`output/bq_volume_recovery_guard_events.jsonl` 中存在本轮各 symbol 的最新结果记录。timer 已触发、
-oneshot 仍在运行或仅有进程 PID 都不算完成心跳。service 出现 `timeout` / `failed`，或 state mtime
-未按预期推进且事件日志缺少完整本轮记录，都必须触发严重告警。该超时、告警、下一轮自动重入及
-state/event 心跳推进仍是生产 symbol 注册前必须在隔离环境演练的发布门禁，不能因为已有超时配置就视为可上线。
+`output/bq_volume_recovery_guard_state.json` 中 `futures_recovery_guard_heartbeat` 对该 symbol 为成功且新鲜，
+并且事件日志中存在本轮结果记录。timer 已触发、oneshot 仍在运行或仅有进程 PID 都不算完成心跳。
+`install_bq_volume_recovery_guard.sh` 同时安装只读的 `${TIMER_UNIT_NAME}-watchdog`：它连续两轮发现心跳陈旧/失败时告警，并写入自己的完成心跳；
+协调器 service 发生 `timeout` / `failed` 会经 `OnFailure` 立即触发同一告警。watchdog 不会重启 runner、修改 control、撤单或下单，
+所以不会重新引入第二个 writer。该超时、告警、下一轮自动重入及 state/event 心跳推进仍是生产 symbol 注册前必须在隔离环境演练的发布门禁。
 
 The gate and health monitor read exchange `userTrades` for the true wear
 (`-realized_pnl / gross_notional * 1e4`), never the runner's own `loss_per_10k` field. 其中目标闸门
@@ -515,7 +515,7 @@ recovery. 活动终止 intent 的运行器死亡不是“预期停机”，watch
 
 `configure_recovery_managed_runner.sh` 只切换单个 systemd runner 的重启策略，
 不启动、停止、撤单或平仓。它不是注册入口：先由受控迁移写入并校验 recovery
-envelope，再确认 `grid-bq-volume-recovery-guard.timer` 正在运行，并且
+envelope，再确认 `grid-bq-volume-recovery-guard.timer` 与其只读 watchdog timer 正在运行，两个完成心跳均新鲜，并且
 `bq_volume_recovery_guard_state.json` 中该 symbol 的成功心跳不超过 150 秒，最后才执行：
 
 ```bash
