@@ -1004,6 +1004,43 @@ def test_fresh_safety_condition_cannot_restore_baseline_when_effect_receipt_time
     assert timed_out.liveness_status == "blocked"
 
 
+def test_restore_timeout_does_not_bypass_an_exhausted_global_runner_recovery() -> None:
+    state = replace(
+        RecoveryState.initial("ARXUSDT", BASELINE, now=NOW),
+        phase=RecoveryPhase.RESTORING,
+        active_action=ActionId.MAKER_FLOW_RECOVER,
+        decision_id="restore-after-runner-exhausted",
+        side=Side.BUY,
+        order_role=OrderRole.ENTRY,
+        progress_deadline_at=NOW,
+        exhausted_attempts=(
+            ActionAttempt(
+                action_id=ActionId.RUNNER_RECOVER,
+                side=None,
+                order_role=None,
+                exhausted_at=NOW - timedelta(seconds=1),
+            ),
+        ),
+    )
+
+    blocked = FuturesRecoveryDecisionEngine().plan_round(
+        snapshot=_snapshot(
+            now=NOW,
+            assessment=FlowBlockerAssessment(missing_entry_sides=(Side.BUY,)),
+        ),
+        state=state,
+        now=NOW,
+        round_id="restore-after-runner-exhausted",
+    )
+
+    assert blocked.action_id is ActionId.MAKER_FLOW_RECOVER
+    assert blocked.mode is ActionMode.HOLD
+    assert blocked.next_state.phase is RecoveryPhase.RESTORING
+    assert blocked.effect_stage is EffectStage.NONE
+    assert blocked.liveness_status == "blocked"
+    assert "restore_confirmation_timeout" in blocked.next_state.reasons
+
+
 def test_confirmed_runner_recovery_clears_directly_without_second_restart() -> None:
     engine = FuturesRecoveryDecisionEngine(
         policy=RecoveryPolicy(cooldown=timedelta(seconds=5))

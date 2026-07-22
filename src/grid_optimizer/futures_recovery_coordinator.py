@@ -2922,10 +2922,33 @@ class FuturesRecoveryDecisionEngine:
         )
         candidates = self._candidates(synthetic_assessment, state)
         selected = next(
-            candidate
-            for candidate in candidates
-            if candidate.action_id is ActionId.RUNNER_RECOVER
+            (
+                candidate
+                for candidate in candidates
+                if candidate.action_id is ActionId.RUNNER_RECOVER
+            ),
+            None,
         )
+        if selected is None:
+            blocked_state = replace(
+                state,
+                document_revision=state.document_revision + 1,
+                reasons=tuple(
+                    dict.fromkeys(
+                        (*state.reasons, "restore_confirmation_timeout")
+                    )
+                ),
+                pending_effect_stage=EffectStage.NONE,
+                pending_effect_epoch=None,
+                last_round_id=round_id,
+            )
+            return self._round_plan(
+                blocked_state,
+                round_id,
+                mode=ActionMode.HOLD,
+                effect_stage=EffectStage.NONE,
+                liveness_status="blocked",
+            )
         suppressed = (
             (state.active_action,)
             if state.active_action
