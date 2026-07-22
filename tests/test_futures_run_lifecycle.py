@@ -368,6 +368,18 @@ class FuturesRunContractTests(unittest.TestCase):
                 },
                 "temporary_loss_lease_loss_reserve cannot exceed temporary_loss_window_loss_budget",
             ),
+            (
+                {
+                    "run_end_time": None,
+                    "target_value": None,
+                    "exit_policy": None,
+                    "loss_budget": None,
+                    "max_wait_seconds": None,
+                    "temporary_loss_window_loss_budget": 3.0,
+                    "temporary_loss_lease_loss_reserve": 0.5,
+                },
+                "temporary_loss_window_loss_budget requires run_end_time",
+            ),
         )
         for overrides, message in invalid_cases:
             with self.subTest(overrides=overrides), self.assertRaisesRegex(

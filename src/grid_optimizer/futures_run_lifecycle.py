@@ -313,6 +313,8 @@ def validate_run_contract(
             raise ValueError(
                 "temporary_loss_window_loss_budget requires runtime_guard_stats_start_time"
             )
+        if deadline is None:
+            raise ValueError("temporary_loss_window_loss_budget requires run_end_time")
         if temporary_loss_window_budget <= 0:
             raise ValueError("temporary_loss_window_loss_budget must be > 0")
         if temporary_loss_lease_reserve is None or temporary_loss_lease_reserve <= 0:

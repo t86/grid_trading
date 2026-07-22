@@ -35,7 +35,7 @@ ARX 事件暴露了这个问题，但该模块并非 ARX 专用。它适用于�
 - 目标成交额、显式的 `runtime_guard_stats_start_time` 与带时区的 `run_end_time`；只设置目标而缺少任一统计边界会被拒绝，避免自然日口径混入本次运行或永远追逐不可达目标。
 - 明确的退出策略。有限运行只允许 `drain_then_preserve` 或 `stop_preserve`；不允许可能永久停在 `EXIT_BLOCKED` 的无界 `drain_clean`。
 - 显式、有限的本次终止排空损耗预算。它不能从滚动损耗、未实现亏损或仓位上限自动推导。
-- 临时 `allow_loss` 若要启用，必须额外固化一对正数：`temporary_loss_window_loss_budget`（自 `runtime_guard_stats_start_time` 起的本运行窗口损耗上限）和 `temporary_loss_lease_loss_reserve`（下一次租约的最坏损耗预留）。二者缺一、非正或预留大于窗口上限时，启动校验拒绝；它们绝不能复用终止排空预算。
+- 临时 `allow_loss` 若要启用，必须额外固化一对正数：`temporary_loss_window_loss_budget`（自 `runtime_guard_stats_start_time` 起、至带时区 `run_end_time` 为止的本运行窗口损耗上限）和 `temporary_loss_lease_loss_reserve`（下一次租约的最坏损耗预留）。二者缺一、非正、预留大于窗口上限或没有运行截止时间时，启动校验拒绝；它们绝不能复用终止排空预算。带窗口预算的运行因此必须有不可变 owner，不能由后续 control 改写授权。
 - `drain_then_preserve` 的最大等待时间。超时后先阻止入场、逐轮撤销本所有者订单，再保存残余仓位和开放委托快照，以 `STOPPED_PRESERVED` 结束。
 - `stop_preserve` 的明确原因；它同样必须先阻止入场并清理本所有者订单，不能带着仍会成交的策略订单退出。
 
