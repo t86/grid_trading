@@ -18595,7 +18595,11 @@ def _maybe_handle_runtime_guard(
                 if trigger_reason == "target_reached"
                 else (
                     "target_unmet_deadline"
-                    if trigger_reason == "target_unmet_deadline"
+                    if trigger_reason
+                    in {
+                        "target_unmet_deadline",
+                        "observation_unavailable_at_deadline",
+                    }
                     else "condition_unmet"
                 )
             )
@@ -18655,7 +18659,11 @@ def _maybe_handle_runtime_guard(
             if trigger_reason == "target_reached"
             else (
                 ["after_end_window"]
-                if trigger_reason == "target_unmet_deadline"
+                if trigger_reason
+                in {
+                    "target_unmet_deadline",
+                    "observation_unavailable_at_deadline",
+                }
                 else [f"terminal_intent_{trigger_reason}"]
             )
         )

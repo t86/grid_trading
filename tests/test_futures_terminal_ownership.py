@@ -81,6 +81,16 @@ def _intent(
                 "runtime_guard_matched_reasons": ["after_end_window"],
             }
         )
+    elif trigger_reason == "observation_unavailable_at_deadline":
+        requested_at = "2026-07-17T00:00:01+00:00"
+        observed.update(
+            {
+                "gross_notional": 0.0,
+                "query_end": snapshot["run_end_time"],
+                "observation_status": "unavailable",
+                "observation_error": "exchange unavailable",
+            }
+        )
     elif trigger_reason == "wear_limit_breached":
         observed.update(
             {
@@ -112,6 +122,7 @@ def _intent(
     (
         ("target_reached", "pending"),
         ("target_unmet_deadline", "accepted"),
+        ("observation_unavailable_at_deadline", "accepted"),
         ("wear_limit_breached", "executing"),
         ("target_reached", "stopped_clean"),
     ),
