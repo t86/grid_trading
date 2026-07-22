@@ -176,6 +176,75 @@ if not config.get("enabled"):
 PY
 }
 
+require_target_gate_scheduler() {
+  local cron_text
+  cron_text="$(crontab -l 2>/dev/null || true)"
+  CRON_TEXT="$cron_text" "$PYTHON_BIN" - "$SYMBOL" <<'PY'
+import os
+import re
+import subprocess
+import sys
+
+symbol = sys.argv[1].upper()
+symbol_pattern = re.compile(rf"(?<![A-Z0-9]){re.escape(symbol)}(?![A-Z0-9])")
+
+def is_target_gate(command: str) -> bool:
+    lowered = command.lower()
+    return bool(
+        symbol_pattern.search(command.upper())
+        and (
+            (
+                "competition_target_gate.py" in lowered
+                or "grid_optimizer.competition_target_gate" in lowered
+            )
+            or "grid_optimizer.competition_target_gate" in lowered
+        )
+        and "--place-tp-now" not in lowered
+    )
+
+if any(is_target_gate(line) for line in os.environ.get("CRON_TEXT", "").splitlines()):
+    raise SystemExit(0)
+
+try:
+    timer_text = subprocess.check_output(
+        ["systemctl", "list-timers", "--all", "--no-legend", "--no-pager"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+except (OSError, subprocess.CalledProcessError) as exc:
+    print(f"cannot verify target-gate scheduler for {symbol}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+for raw in timer_text.splitlines():
+    fields = raw.split()
+    timer = fields[-1] if fields else ""
+    if not timer.endswith(".timer"):
+        continue
+    try:
+        service = subprocess.check_output(
+            ["systemctl", "show", "-p", "Unit", "--value", timer],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        command = subprocess.check_output(
+            ["systemctl", "show", "-p", "ExecStart", "--value", service],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"cannot inspect target-gate scheduler {timer}: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    if is_target_gate(command):
+        raise SystemExit(0)
+
+print(
+    f"no active target-gate scheduler found for {symbol}; refuse recovery-managed handoff",
+    file=sys.stderr,
+)
+raise SystemExit(1)
+PY
+}
+
 require_coordinator_heartbeat() {
   "$PYTHON_BIN" - "$SYMBOL" "$COORDINATOR_STATE_PATH" "$COORDINATOR_HEARTBEAT_MAX_AGE_SECONDS" <<'PY'
 import json
@@ -226,6 +295,7 @@ safe_symbol_adapters = (
     "bq_volume_recovery_guard.py",
     "recovery_coordinator_watchdog.py",
     "competition_target_gate.py",
+    "grid_optimizer.competition_target_gate",
     "competition_health_monitor.py",
     "bq_liveness_terminal_guard.py",
     "bq_budget_controller.py",
@@ -249,7 +319,10 @@ for raw in os.environ.get("CRON_TEXT", "").splitlines():
         print(f"legacy:{line}")
     elif (
         (
-            "competition_target_gate.py" in lowered
+            (
+                "competition_target_gate.py" in lowered
+                or "grid_optimizer.competition_target_gate" in lowered
+            )
             and "--place-tp-now" in lowered
         )
         or not any(adapter in lowered for adapter in safe_symbol_adapters)
@@ -282,6 +355,7 @@ safe_symbol_adapters = (
     "bq_volume_recovery_guard.py",
     "recovery_coordinator_watchdog.py",
     "competition_target_gate.py",
+    "grid_optimizer.competition_target_gate",
     "competition_health_monitor.py",
     "bq_liveness_terminal_guard.py",
     "bq_budget_controller.py",
@@ -323,7 +397,10 @@ for raw in timer_text.splitlines():
         continue
     if (
         (
-            "competition_target_gate.py" in lowered
+            (
+                "competition_target_gate.py" in lowered
+                or "grid_optimizer.competition_target_gate" in lowered
+            )
             and "--place-tp-now" in lowered
         )
         or not any(adapter in lowered for adapter in safe_symbol_adapters)
@@ -450,6 +527,7 @@ case "$ACTION" in
     require_coordinator_heartbeat
     require_coordinator_watchdog_heartbeat
     require_coordinator_alert_delivery
+    require_target_gate_scheduler
     require_last_valid_control_snapshot
     if [[ "$(restart_policy)" != "no" ]]; then
       echo "recovery-managed runner must use Restart=no: $SERVICE_NAME" >&2
@@ -468,6 +546,7 @@ case "$ACTION" in
     require_coordinator_heartbeat
     require_coordinator_watchdog_heartbeat
     require_coordinator_alert_delivery
+    require_target_gate_scheduler
     require_last_valid_control_snapshot
     temporary_path="$(mktemp)"
     trap 'rm -f "$temporary_path"' EXIT

@@ -1366,6 +1366,7 @@ def test_recovery_managed_runner_policy_requires_registered_coordinator_owner() 
     assert "require_coordinator_watchdog_heartbeat" in script
     assert "require_coordinator_alert_delivery" in script
     assert "require_last_valid_control_snapshot" in script
+    assert "require_target_gate_scheduler" in script
     assert "control_last_valid_snapshot_path" in script
     assert "load_alert_notifier_config" in script
     assert "recovery_coordinator_watchdog_heartbeat_v1" in script
@@ -1435,6 +1436,13 @@ def test_recovery_managed_runner_policy_enables_only_registered_symbol(
     (fake_bin / "sudo").write_text(
         "#!/bin/sh\nexec \"$@\"\n", encoding="utf-8"
     )
+    (fake_bin / "crontab").write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = -l ]; then\n"
+        "  echo '*/5 * * * * python -m grid_optimizer.competition_target_gate --symbol BCHUSDT --enforce'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
     (fake_bin / "systemctl").write_text(
         "#!/bin/sh\n"
         f"echo \"$@\" >> {calls_path}\n"
@@ -1444,6 +1452,7 @@ def test_recovery_managed_runner_policy_enables_only_registered_symbol(
         encoding="utf-8",
     )
     (fake_bin / "sudo").chmod(0o755)
+    (fake_bin / "crontab").chmod(0o755)
     (fake_bin / "systemctl").chmod(0o755)
 
     completed = subprocess.run(
@@ -1484,12 +1493,22 @@ def test_recovery_managed_runner_policy_enables_only_registered_symbol(
 
 
 @pytest.mark.parametrize(
-    "snapshot_text",
-    [None, json.dumps({"symbol": "BCHUSDT"})],
+    ("snapshot_text", "target_gate_present", "error"),
+    [
+        (None, True, "last-valid recovery control snapshot is not valid"),
+        (
+            json.dumps({"symbol": "BCHUSDT"}),
+            True,
+            "last-valid recovery control snapshot is not valid",
+        ),
+        (None, False, "no active target-gate scheduler found"),
+    ],
 )
 def test_recovery_managed_runner_policy_refuses_enable_without_valid_recovery_snapshot(
     tmp_path: Path,
     snapshot_text: str | None,
+    target_gate_present: bool,
+    error: str,
 ) -> None:
     output_dir = tmp_path / "output"
     output_dir.mkdir()
@@ -1535,6 +1554,17 @@ def test_recovery_managed_runner_policy_refuses_enable_without_valid_recovery_sn
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "sudo").write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+    (fake_bin / "crontab").write_text(
+        (
+            "#!/bin/sh\n"
+            "if [ \"$1\" = -l ]; then\n"
+            "  echo '*/5 * * * * python -m grid_optimizer.competition_target_gate --symbol BCHUSDT --enforce'\n"
+            "fi\n"
+            if target_gate_present
+            else "#!/bin/sh\nexit 0\n"
+        ),
+        encoding="utf-8",
+    )
     (fake_bin / "systemctl").write_text(
         "#!/bin/sh\n"
         "if [ \"$1\" = is-active ]; then exit 0; fi\n"
@@ -1543,6 +1573,7 @@ def test_recovery_managed_runner_policy_refuses_enable_without_valid_recovery_sn
         encoding="utf-8",
     )
     (fake_bin / "sudo").chmod(0o755)
+    (fake_bin / "crontab").chmod(0o755)
     (fake_bin / "systemctl").chmod(0o755)
 
     completed = subprocess.run(
@@ -1563,7 +1594,7 @@ def test_recovery_managed_runner_policy_refuses_enable_without_valid_recovery_sn
     )
 
     assert completed.returncode != 0
-    assert "last-valid recovery control snapshot is not valid" in completed.stderr
+    assert error in completed.stderr
     assert not (tmp_path / "systemd").exists()
 
 
