@@ -23,6 +23,7 @@ from grid_optimizer.loop_runner import (
     _terminal_drain_runtime_integrity_digest,
     _maybe_handle_runtime_guard,
     _resolve_loop_authoritative_run_contract,
+    _is_structural_runner_fault,
     _suppress_place_orders_during_runtime_guard_loss_cooldown,
 )
 from grid_optimizer.futures_terminal_drain import (
@@ -34,6 +35,11 @@ from grid_optimizer.futures_terminal_ownership import terminal_intent_id
 
 
 class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
+    def test_structural_runner_fault_is_not_restartable(self) -> None:
+        self.assertTrue(_is_structural_runner_fault(TypeError("missing keyword")))
+        self.assertTrue(_is_structural_runner_fault(AssertionError("broken invariant")))
+        self.assertFalse(_is_structural_runner_fault(RuntimeError("temporary API error")))
+
     def _bounded_args(self, tmpdir: str) -> argparse.Namespace:
         return argparse.Namespace(
             symbol="BCHUSDT",
@@ -1045,12 +1051,16 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
             intent_path.write_text(json.dumps(intent), encoding="utf-8")
             mock_inputs.return_value = (20_001.0, [], None)
             mock_evaluate.return_value = self._tradable_guard_result()
-            mock_terminal_drain.return_value = {
-                "runtime_status": "draining",
-                "stop_triggered": False,
-                "runner_exit_allowed": False,
-                "terminal_drain_action": "block_entry",
-            }
+            def require_complete_terminal_context(**kwargs):
+                self.assertIsNotNone(kwargs["runtime_guard_config"])
+                return {
+                    "runtime_status": "draining",
+                    "stop_triggered": False,
+                    "runner_exit_allowed": False,
+                    "terminal_drain_action": "block_entry",
+                }
+
+            mock_terminal_drain.side_effect = require_complete_terminal_context
 
             summary = _maybe_handle_runtime_guard(
                 args=args,

@@ -246,6 +246,7 @@ EXECUTION_MARKET_SNAPSHOT_CACHE_TTL_SECONDS = 0.25
 RUNNER_MARKET_SNAPSHOT_MAX_AGE_SECONDS = 15.0
 RUNNER_MARKET_STREAM_WARMUP_SECONDS = 8.0
 RUNNER_RATE_LIMIT_BACKOFF_SECONDS = 30.0
+STRUCTURAL_RUNNER_FAULT_EXIT_CODE = 2
 TEMPORARY_LOSS_RUNNER_RECEIPTS_KEY = "_futures_recovery_runner_receipts"
 TEMPORARY_LOSS_RUNNER_RECEIPTS_SCHEMA = "temporary_loss_runner_receipts_v1"
 TEMPORARY_LOSS_RUNNER_RECEIPTS_MAX_EVENTS = 128
@@ -268,6 +269,19 @@ RECOVERY_CONFIG_APPLIED_RECEIPTS_SCHEMA = (
     "futures_recovery_config_applied_receipts_v1"
 )
 RECOVERY_CONFIG_APPLIED_RECEIPTS_MAX_EVENTS = 128
+
+
+def _is_structural_runner_fault(exc: BaseException) -> bool:
+    """Return whether retrying the same process cannot change the outcome.
+
+    These failures are implementation/invariant faults, not exchange transport
+    failures.  Exit with the controlled systemd status instead of turning the
+    same bad code path into an unattended restart loop.
+    """
+
+    return isinstance(exc, (AssertionError, TypeError))
+
+
 AUTO_REGIME_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
     AUTO_REGIME_STABLE_PROFILE: {
         "buy_levels": 8,
@@ -18483,6 +18497,7 @@ def _maybe_handle_runtime_guard(
             cycle=cycle,
             cycle_started_at=cycle_started_at,
             stats_start_time=stats_start_time,
+            runtime_guard_config=runtime_guard_config,
             runtime_guard_result=runtime_guard_result,
             cumulative_gross_notional=cumulative_gross_notional,
             state=state,
@@ -36997,6 +37012,7 @@ def main() -> None:
                             "cycle_inserted": 0,
                             "error": f"{type(db_exc).__name__}: {db_exc}",
                         }
+                state.pop("runner_fault", None)
                 _write_json(state_path, state)
                 _append_jsonl(summary_path, summary)
                 _terminal_drain_ack_handoff_after_normal_event(
@@ -37022,6 +37038,22 @@ def main() -> None:
                     _append_jsonl(summary_path, error_report)
                     print(f"[{cycle}] error: {exc}")
                     raise SystemExit(str(exc)) from exc
+                if _is_structural_runner_fault(exc):
+                    fault = {
+                        "schema": "futures_runner_fault_v1",
+                        "symbol": args.symbol.upper().strip(),
+                        "cycle": cycle,
+                        "error_type": exc.__class__.__name__,
+                        "error_message": str(exc),
+                        "fault_class": "structural",
+                        "restartable": False,
+                        "observed_at": cycle_started_at.astimezone(timezone.utc).isoformat(),
+                    }
+                    state["runner_fault"] = fault
+                    _write_json(state_path, state)
+                    _append_jsonl(summary_path, fault)
+                    print(f"[{cycle}] structural runner fault: {exc}")
+                    raise SystemExit(STRUCTURAL_RUNNER_FAULT_EXIT_CODE) from exc
                 consecutive_errors += 1
                 position_mismatch_recovery = _maybe_recover_hedge_bq_position_mismatch(
                     args=args,
