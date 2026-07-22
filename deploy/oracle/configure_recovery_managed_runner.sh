@@ -7,10 +7,10 @@ Usage: configure_recovery_managed_runner.sh <audit|enable|retire|disable|verify>
 
 Enable writes a per-symbol systemd drop-in with Restart=no.  It refuses to
   operate unless the control document is already registered to the futures
-  recovery coordinator, the coordinator timer is active, and a successful
-  coordinator heartbeat for this symbol is fresh. Disable refuses to remove the
-  drop-in while that registration remains, so ownership cannot fall back to
-  systemd by accident.
+  recovery coordinator, its timer and the symbol runner watchdog timer are
+  active, and a successful coordinator heartbeat for this symbol is fresh.
+  Disable refuses to remove the drop-in while that registration remains, so
+  ownership cannot fall back to systemd by accident.
 EOF
 }
 
@@ -35,9 +35,17 @@ RUNNER_SERVICE_TEMPLATE="${RUNNER_SERVICE_TEMPLATE:-}"
 if [[ -z "$RUNNER_SERVICE_TEMPLATE" ]]; then
   RUNNER_SERVICE_TEMPLATE='grid-loop@{symbol}.service'
 fi
+RUNNER_WATCHDOG_TIMER_TEMPLATE="${RUNNER_WATCHDOG_TIMER_TEMPLATE:-}"
+if [[ -z "$RUNNER_WATCHDOG_TIMER_TEMPLATE" ]]; then
+  RUNNER_WATCHDOG_TIMER_TEMPLATE='grid-loop-watchdog@{symbol}.timer'
+fi
 SYMBOL_LOWER="$(printf '%s' "$SYMBOL" | tr '[:upper:]' '[:lower:]')"
 CONTROL_PATH="${CONTROL_PATH:-${OUTPUT_DIR}/${SYMBOL_LOWER}_loop_runner_control.json}"
 SERVICE_NAME="$(printf '%s' "$RUNNER_SERVICE_TEMPLATE" | sed \
+  -e "s/{symbol}/${SYMBOL}/g" \
+  -e "s/{symbol_upper}/${SYMBOL}/g" \
+  -e "s/{symbol_lower}/${SYMBOL_LOWER}/g")"
+RUNNER_WATCHDOG_TIMER_NAME="$(printf '%s' "$RUNNER_WATCHDOG_TIMER_TEMPLATE" | sed \
   -e "s/{symbol}/${SYMBOL}/g" \
   -e "s/{symbol_upper}/${SYMBOL}/g" \
   -e "s/{symbol_lower}/${SYMBOL_LOWER}/g")"
@@ -119,6 +127,13 @@ PY
 require_coordinator_timer() {
   if ! systemctl is-active --quiet "${COORDINATOR_TIMER_UNIT}.timer"; then
     echo "recovery coordinator timer is not active: ${COORDINATOR_TIMER_UNIT}.timer" >&2
+    exit 1
+  fi
+}
+
+require_runner_watchdog_timer() {
+  if ! systemctl is-active --quiet "$RUNNER_WATCHDOG_TIMER_NAME"; then
+    echo "runner watchdog timer is not active: $RUNNER_WATCHDOG_TIMER_NAME" >&2
     exit 1
   fi
 }
@@ -531,6 +546,7 @@ case "$ACTION" in
     fi
     require_no_legacy_recovery_actuators
     require_coordinator_timer
+    require_runner_watchdog_timer
     require_coordinator_watchdog_timer
     require_coordinator_heartbeat
     require_coordinator_watchdog_heartbeat
@@ -550,6 +566,7 @@ case "$ACTION" in
     fi
     require_no_legacy_recovery_actuators
     require_coordinator_timer
+    require_runner_watchdog_timer
     require_coordinator_watchdog_timer
     require_coordinator_heartbeat
     require_coordinator_watchdog_heartbeat

@@ -522,9 +522,9 @@ recovery. 活动终止 intent 的运行器死亡不是“预期停机”，watch
 
 `configure_recovery_managed_runner.sh` 只切换单个 systemd runner 的重启策略，
 不启动、停止、撤单或平仓。它不是注册入口：先由受控迁移写入并校验 recovery
-envelope，再确认 `grid-bq-volume-recovery-guard.timer` 与其只读 watchdog timer 正在运行，两个完成心跳均新鲜、告警收件人已配置，并且
+envelope，再确认 `grid-bq-volume-recovery-guard.timer` 与其只读 watchdog timer、该 symbol 的 `grid-loop-watchdog@<SYMBOL>.timer` 正在运行，两个完成心跳均新鲜、告警收件人已配置，并且
 `bq_volume_recovery_guard_state.json` 中该 symbol 的成功心跳不超过 150 秒；还必须有可解码、仍注册给该 symbol 的
-`<control>.last_valid` 快照，保证主 control 文件结构损坏时只能先恢复上一个已验证状态、不会失去恢复路径。最后还必须发现
+`<control>.last_valid` 快照，保证主 control 文件结构损坏时只能先恢复上一个已验证状态、不会失去恢复路径。自定义 runner/watchdog 命名时必须通过 `RUNNER_WATCHDOG_TIMER_TEMPLATE` 提供对应 timer 模板。最后还必须发现
 该 symbol 的非人工 `competition_target_gate` cron 或处于 active 的 systemd timer；否则 runner 在截止时失活便无法自动产生终止 intent。最后才执行：
 
 ```bash

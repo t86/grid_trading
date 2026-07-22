@@ -1467,6 +1467,8 @@ def test_recovery_managed_runner_policy_requires_registered_coordinator_owner() 
     assert "require_coordinator_alert_delivery" in script
     assert "require_last_valid_control_snapshot" in script
     assert "require_target_gate_scheduler" in script
+    assert "require_runner_watchdog_timer" in script
+    assert "RUNNER_WATCHDOG_TIMER_TEMPLATE" in script
     assert "control_last_valid_snapshot_path" in script
     assert "load_alert_notifier_config" in script
     assert "recovery_coordinator_watchdog_heartbeat_v1" in script
@@ -1587,28 +1589,32 @@ def test_recovery_managed_runner_policy_enables_only_registered_symbol(
     assert dropin.read_text(encoding="utf-8") == "[Service]\nRestart=no\n"
     calls = calls_path.read_text(encoding="utf-8")
     assert "is-active --quiet grid-bq-volume-recovery-guard.timer" in calls
+    assert "is-active --quiet grid-loop-watchdog@BCHUSDT.timer" in calls
     assert "daemon-reload" in calls
     assert "start grid-loop@BCHUSDT.service" not in calls
     assert "restart grid-loop@BCHUSDT.service" not in calls
 
 
 @pytest.mark.parametrize(
-    ("snapshot_text", "target_gate_mode", "error"),
+    ("snapshot_text", "target_gate_mode", "runner_watchdog_active", "error"),
     [
-        (None, "cron", "last-valid recovery control snapshot is not valid"),
+        (None, "cron", True, "last-valid recovery control snapshot is not valid"),
         (
             json.dumps({"symbol": "BCHUSDT"}),
             "cron",
+            True,
             "last-valid recovery control snapshot is not valid",
         ),
-        (None, "missing", "no active target-gate scheduler found"),
-        (None, "inactive_timer", "no active target-gate scheduler found"),
+        (None, "missing", True, "no active target-gate scheduler found"),
+        (None, "inactive_timer", True, "no active target-gate scheduler found"),
+        (json.dumps(_registered_control({"symbol": "BCHUSDT"})), "cron", False, "runner watchdog timer is not active"),
     ],
 )
 def test_recovery_managed_runner_policy_refuses_enable_without_valid_recovery_snapshot(
     tmp_path: Path,
     snapshot_text: str | None,
     target_gate_mode: str,
+    runner_watchdog_active: bool,
     error: str,
 ) -> None:
     output_dir = tmp_path / "output"
@@ -1674,6 +1680,11 @@ def test_recovery_managed_runner_policy_refuses_enable_without_valid_recovery_sn
             "if [ \"$1\" = show ] && [ \"$3\" = ExecStart ]; then echo 'python -m grid_optimizer.competition_target_gate --symbol BCHUSDT --enforce'; exit 0; fi\n"
             "if [ \"$1\" = is-active ] && [ \"$3\" = target-gate.timer ]; then exit 3; fi\n"
             if target_gate_mode == "inactive_timer"
+            else ""
+        )
+        + (
+            "if [ \"$1\" = is-active ] && [ \"$3\" = grid-loop-watchdog@BCHUSDT.timer ]; then exit 3; fi\n"
+            if not runner_watchdog_active
             else ""
         )
         + "if [ \"$1\" = is-active ]; then exit 0; fi\n"
