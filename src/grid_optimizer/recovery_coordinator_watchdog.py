@@ -27,12 +27,18 @@ WATCHDOG_HEARTBEAT_KEY = "recovery_coordinator_watchdog_heartbeat"
 WATCHDOG_HEARTBEAT_SCHEMA = "recovery_coordinator_watchdog_heartbeat_v1"
 
 
-def _read_json(path: Path) -> dict[str, Any]:
+def _read_json_with_readability(path: Path) -> tuple[dict[str, Any], bool]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    except FileNotFoundError:
+        return {}, True
+    except (json.JSONDecodeError, OSError):
+        return {}, False
+    return (payload, True) if isinstance(payload, dict) else ({}, False)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    return _read_json_with_readability(path)[0]
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -68,7 +74,15 @@ def assess_coordinator_liveness(
         raise ValueError("now must be timezone-aware")
     if max_heartbeat_age_seconds <= 0:
         raise ValueError("max_heartbeat_age_seconds must be positive")
-    if not recovery_coordinator_registered(control):
+    registered = recovery_coordinator_registered(control)
+    if force_reason and not registered:
+        return {
+            "symbol": normalized,
+            "tracked": True,
+            "healthy": False,
+            "reason": force_reason,
+        }
+    if not registered:
         return {
             "symbol": normalized,
             "tracked": False,
@@ -252,13 +266,17 @@ def check_symbol(
     force_reason: str | None = None,
 ) -> dict[str, Any]:
     normalized = str(symbol).upper().strip()
+    control_path = output_dir / f"{normalized.lower()}_loop_runner_control.json"
+    control, control_readable = _read_json_with_readability(control_path)
     assessment = assess_coordinator_liveness(
         symbol=normalized,
-        control=_read_json(output_dir / f"{normalized.lower()}_loop_runner_control.json"),
+        control=control,
         guard_state=guard_state,
         now=now,
         max_heartbeat_age_seconds=max_heartbeat_age_seconds,
-        force_reason=force_reason,
+        force_reason=force_reason or (
+            "recovery_control_unreadable" if not control_readable else None
+        ),
     )
     alert_config = load_alert_notifier_config(alert_config_path)
     if assessment.get("tracked") and not alert_config.get("enabled"):

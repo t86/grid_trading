@@ -17,6 +17,7 @@ from grid_optimizer.recovery_coordinator_watchdog import (
     assess_coordinator_liveness,
     update_watchdog_state,
 )
+import grid_optimizer.recovery_coordinator_watchdog as watchdog
 
 
 NOW = datetime(2026, 7, 22, 8, 0, tzinfo=timezone.utc)
@@ -219,6 +220,36 @@ def test_registered_symbol_with_no_alert_delivery_is_unhealthy(tmp_path) -> None
 
     assert result["assessment"]["healthy"] is False
     assert result["assessment"]["reason"] == "alert_delivery_not_configured"
+
+
+def test_watchdog_alerts_when_a_present_control_file_is_unreadable(tmp_path, monkeypatch) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        "{invalid-json", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        watchdog, "load_alert_notifier_config", lambda _path: {"enabled": True}
+    )
+    monkeypatch.setattr(
+        watchdog, "send_alert_email", lambda **_kwargs: {"sent": True}
+    )
+
+    result = check_symbol(
+        symbol="BCHUSDT",
+        output_dir=output_dir,
+        guard_state={},
+        state={},
+        now=NOW,
+        max_heartbeat_age_seconds=150,
+        alert_threshold=1,
+        alert_config_path=None,
+    )
+
+    assert result["assessment"]["tracked"] is True
+    assert result["assessment"]["healthy"] is False
+    assert result["assessment"]["reason"] == "recovery_control_unreadable"
+    assert result["alert"] == {"sent": True}
 
 
 def test_watchdog_has_no_runner_or_order_actuator() -> None:
