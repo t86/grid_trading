@@ -179,9 +179,9 @@ restart_policy() {
 }
 
 require_no_legacy_recovery_actuators() {
-  local cron_text matches
+  local cron_text findings
   cron_text="$(crontab -l 2>/dev/null || true)"
-  matches="$(CRON_TEXT="$cron_text" "$PYTHON_BIN" - "$SYMBOL" <<'PY'
+  findings="$(CRON_TEXT="$cron_text" "$PYTHON_BIN" - "$SYMBOL" <<'PY'
 import os
 import re
 import sys
@@ -189,26 +189,45 @@ import sys
 symbol = sys.argv[1].upper()
 slug = symbol.lower()
 symbol_pattern = re.compile(rf"(?<![A-Z0-9]){re.escape(symbol)}(?![A-Z0-9])")
+safe_symbol_adapters = (
+    "bq_volume_recovery_guard.py",
+    "recovery_coordinator_watchdog.py",
+    "competition_target_gate.py",
+    "competition_health_monitor.py",
+    "bq_liveness_terminal_guard.py",
+    "bq_budget_controller.py",
+    "competition_state_realign.py",
+)
 for raw in os.environ.get("CRON_TEXT", "").splitlines():
     line = raw.strip()
     if not line or line.startswith("#"):
         continue
     lowered = line.lower()
+    if symbol_pattern.search(line.upper()) is None:
+        continue
     legacy_writer = (
         f"output/ops/{slug}_ledger_drift_monitor.py" in lowered
         or f"output/ops/{slug}_allowloss_autorevert.py" in lowered
         or (
             "rollover_daily_window.py" in lowered
-            and symbol_pattern.search(line.upper()) is not None
         )
     )
     if legacy_writer:
-        print(line)
+        print(f"legacy:{line}")
+    elif not any(adapter in lowered for adapter in safe_symbol_adapters):
+        print(f"unclassified:{line}")
 PY
 )"
-  if [[ -n "$matches" ]]; then
+  if [[ -n "$findings" ]]; then
     echo "legacy recovery actuators remain for $SYMBOL; disable or migrate them before ownership cutover:" >&2
-    printf '%s\n' "$matches" >&2
+    while IFS= read -r finding; do
+      case "$finding" in
+        legacy:*) printf '%s\n' "${finding#legacy:}" >&2 ;;
+        unclassified:*)
+          printf '%s\n' "unclassified symbol executor: ${finding#unclassified:}" >&2
+          ;;
+      esac
+    done <<<"$findings"
     exit 1
   fi
 }
