@@ -411,8 +411,10 @@ def run_contract_snapshot_from_config(config: Mapping[str, Any]) -> dict[str, An
         config.get("terminal_drain_flat_confirm_cycles", 2),
         "terminal_drain_flat_confirm_cycles",
     )
-    return {
-        "schema": "futures_run_contract_snapshot_v4",
+    snapshot = {
+        "schema": "futures_run_contract_snapshot_v4"
+        if contract.temporary_loss_window_loss_budget is not None
+        else "futures_run_contract_snapshot_v3",
         "symbol": str(config.get("symbol") or "").upper().strip(),
         "strategy_profile": str(config.get("strategy_profile") or "").strip(),
         "strategy_mode": str(config.get("strategy_mode") or "").strip(),
@@ -444,13 +446,15 @@ def run_contract_snapshot_from_config(config: Mapping[str, Any]) -> dict[str, An
         "lifecycle_wear_stop_min_gross_notional": (
             contract.wear_stop_min_gross_notional
         ),
-        "temporary_loss_window_loss_budget": (
-            contract.temporary_loss_window_loss_budget
-        ),
-        "temporary_loss_lease_loss_reserve": (
-            contract.temporary_loss_lease_loss_reserve
-        ),
     }
+    if contract.temporary_loss_window_loss_budget is not None:
+        snapshot["temporary_loss_window_loss_budget"] = (
+            contract.temporary_loss_window_loss_budget
+        )
+        snapshot["temporary_loss_lease_loss_reserve"] = (
+            contract.temporary_loss_lease_loss_reserve
+        )
+    return snapshot
 
 
 def run_contract_snapshot_digest(config: Mapping[str, Any]) -> str:

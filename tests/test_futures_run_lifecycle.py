@@ -376,6 +376,35 @@ class FuturesRunContractTests(unittest.TestCase):
             ):
                 self._validate(**overrides)
 
+    def test_window_budget_upgrades_only_its_own_immutable_contract_snapshot(self) -> None:
+        base = {
+            "symbol": "GENERICUSDT",
+            "strategy_profile": "test",
+            "strategy_mode": "hedge_best_quote_maker_volume_v1",
+            "per_order_notional": 20.0,
+            "run_start_time": NOW.isoformat(),
+            "runtime_guard_stats_start_time": NOW.isoformat(),
+            "run_end_time": END.isoformat(),
+            "max_cumulative_notional": 20_000.0,
+            "terminal_drain_exit_policy": "drain_then_preserve",
+            "terminal_drain_absolute_loss_budget": 5.0,
+            "terminal_drain_max_wait_seconds": 900.0,
+        }
+        legacy = run_contract_snapshot_from_config(base)
+        enabled = run_contract_snapshot_from_config(
+            {
+                **base,
+                "temporary_loss_window_loss_budget": 3.0,
+                "temporary_loss_lease_loss_reserve": 0.5,
+            }
+        )
+
+        self.assertEqual(legacy["schema"], "futures_run_contract_snapshot_v3")
+        self.assertNotIn("temporary_loss_window_loss_budget", legacy)
+        self.assertEqual(enabled["schema"], "futures_run_contract_snapshot_v4")
+        self.assertEqual(enabled["temporary_loss_window_loss_budget"], 3.0)
+        self.assertEqual(enabled["temporary_loss_lease_loss_reserve"], 0.5)
+
     def test_wear_exit_requires_a_complete_bounded_threshold_pair(self) -> None:
         invalid_cases = (
             ({"wear_stop_per_10k": 2.0}, "wear_stop_min_gross_notional is required"),
