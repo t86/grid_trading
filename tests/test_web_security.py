@@ -3934,6 +3934,10 @@ class WebSecurityTests(unittest.TestCase):
                 "best_quote_maker_volume_reduce_freeze_quality_easy_bucket_notional": 100.0,
                 "best_quote_maker_volume_reduce_freeze_quality_medium_bucket_notional": 50.0,
                 "best_quote_maker_volume_reduce_freeze_quality_hard_bucket_notional": 25.0,
+                "best_quote_maker_volume_reduce_freeze_long_price_below": 1800.0,
+                "best_quote_maker_volume_reduce_freeze_short_price_above": 1900.0,
+                "best_quote_maker_volume_reduce_freeze_long_band_budget_base_notional": 500.0,
+                "best_quote_maker_volume_reduce_freeze_short_band_budget_base_notional": 300.0,
                 "best_quote_maker_volume_frozen_pair_release_enabled": True,
                 "best_quote_maker_volume_frozen_pair_release_max_notional": 20.0,
                 "best_quote_maker_volume_frozen_pair_release_min_side_notional": 100.0,
@@ -4030,6 +4034,18 @@ class WebSecurityTests(unittest.TestCase):
             "--best-quote-maker-volume-reduce-freeze-quality-hard-bucket-notional"
         )
         self.assertEqual(command[quality_hard_bucket_index + 1], "25.0")
+        long_freeze_price_index = command.index("--best-quote-maker-volume-reduce-freeze-long-price-below")
+        self.assertEqual(command[long_freeze_price_index + 1], "1800.0")
+        short_freeze_price_index = command.index("--best-quote-maker-volume-reduce-freeze-short-price-above")
+        self.assertEqual(command[short_freeze_price_index + 1], "1900.0")
+        long_band_budget_index = command.index(
+            "--best-quote-maker-volume-reduce-freeze-long-band-budget-base-notional"
+        )
+        self.assertEqual(command[long_band_budget_index + 1], "500.0")
+        short_band_budget_index = command.index(
+            "--best-quote-maker-volume-reduce-freeze-short-band-budget-base-notional"
+        )
+        self.assertEqual(command[short_band_budget_index + 1], "300.0")
         self.assertIn("--best-quote-maker-volume-frozen-pair-release-enabled", command)
         pair_release_max_index = command.index("--best-quote-maker-volume-frozen-pair-release-max-notional")
         self.assertEqual(command[pair_release_max_index + 1], "20.0")

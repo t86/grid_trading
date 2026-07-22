@@ -2012,6 +2012,121 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["band_budget"]["short"]["blocked_reason"], "band_budget_exhausted")
         self.assertEqual(state["best_quote_volume_ledger"]["short_qty"], 300.0)
 
+    def test_best_quote_reduce_freeze_uses_side_price_gates_and_anchored_budgets(self) -> None:
+        long_state: dict[str, object] = {
+            "best_quote_volume_ledger": {
+                "long_lots": [{"qty": 500.0 / 1700.0, "price": 1800.0}],
+                "long_qty": 500.0 / 1700.0,
+                "long_avg_price": 1800.0,
+                "initialized": True,
+            },
+        }
+        long_report = _best_quote_reduce_freeze_report(
+            state=long_state,
+            current_long_qty=500.0 / 1700.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1800.0,
+            current_short_avg_price=0.0,
+            mid_price=1810.0,
+            bq_ledger_report=long_state["best_quote_volume_ledger"],
+        )
+        long_report = _apply_best_quote_reduce_freeze(
+            state=long_state,
+            plan={"sell_orders": [{"role": "best_quote_reduce_long"}], "buy_orders": []},
+            report=long_report,
+            enabled=True,
+            threshold_loss_ratio=0.005,
+            min_notional=10.0,
+            current_long_qty=500.0 / 1700.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1800.0,
+            current_short_avg_price=0.0,
+            mid_price=1810.0,
+            bq_ledger_report=long_state["best_quote_volume_ledger"],
+            profitable_pair_gate_enabled=False,
+            band_budget_enabled=True,
+            band_budget_price_ratio=0.05,
+            band_budget_base_notional=1.0,
+            long_freeze_price_below=1800.0,
+            long_band_budget_base_notional=500.0,
+        )
+        self.assertFalse(long_report["applied"])
+        self.assertEqual(long_report["freeze_price_gate"]["long"]["blocked_reason"], "price_not_below_threshold")
+
+        long_report = _best_quote_reduce_freeze_report(
+            state=long_state,
+            current_long_qty=500.0 / 1700.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1800.0,
+            current_short_avg_price=0.0,
+            mid_price=1700.0,
+            bq_ledger_report=long_state["best_quote_volume_ledger"],
+        )
+        long_report = _apply_best_quote_reduce_freeze(
+            state=long_state,
+            plan={"sell_orders": [{"role": "best_quote_reduce_long"}], "buy_orders": []},
+            report=long_report,
+            enabled=True,
+            threshold_loss_ratio=0.005,
+            min_notional=10.0,
+            current_long_qty=500.0 / 1700.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1800.0,
+            current_short_avg_price=0.0,
+            mid_price=1700.0,
+            bq_ledger_report=long_state["best_quote_volume_ledger"],
+            profitable_pair_gate_enabled=False,
+            band_budget_enabled=True,
+            band_budget_price_ratio=0.05,
+            band_budget_base_notional=1.0,
+            long_freeze_price_below=1800.0,
+            long_band_budget_base_notional=500.0,
+        )
+        self.assertTrue(long_report["applied"])
+        self.assertEqual(long_report["band_budget"]["long"]["band_key"], "long:1")
+        self.assertAlmostEqual(long_report["band_budget"]["long"]["base_budget_notional"], 500.0)
+
+        short_state: dict[str, object] = {
+            "best_quote_volume_ledger": {
+                "short_lots": [{"qty": 400.0 / 2000.0, "price": 1900.0}],
+                "short_qty": 400.0 / 2000.0,
+                "short_avg_price": 1900.0,
+                "initialized": True,
+            },
+        }
+        short_report = _best_quote_reduce_freeze_report(
+            state=short_state,
+            current_long_qty=0.0,
+            current_short_qty=400.0 / 2000.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=1900.0,
+            mid_price=2000.0,
+            bq_ledger_report=short_state["best_quote_volume_ledger"],
+        )
+        short_report = _apply_best_quote_reduce_freeze(
+            state=short_state,
+            plan={"sell_orders": [], "buy_orders": [{"role": "best_quote_reduce_short"}]},
+            report=short_report,
+            enabled=True,
+            threshold_loss_ratio=0.005,
+            min_notional=10.0,
+            current_long_qty=0.0,
+            current_short_qty=400.0 / 2000.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=1900.0,
+            mid_price=2000.0,
+            bq_ledger_report=short_state["best_quote_volume_ledger"],
+            profitable_pair_gate_enabled=False,
+            band_budget_enabled=True,
+            band_budget_price_ratio=0.05,
+            band_budget_base_notional=1.0,
+            short_freeze_price_above=1900.0,
+            short_band_budget_base_notional=300.0,
+        )
+        self.assertTrue(short_report["applied"])
+        self.assertEqual(short_report["band_budget"]["short"]["band_key"], "short:1")
+        self.assertAlmostEqual(short_report["band_budget"]["short"]["base_budget_notional"], 300.0)
+
     def test_best_quote_reduce_freeze_band_budget_blocks_below_min_price(self) -> None:
         state: dict[str, object] = {
             "best_quote_volume_ledger": {
