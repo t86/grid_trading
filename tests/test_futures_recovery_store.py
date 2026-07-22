@@ -36,6 +36,7 @@ from grid_optimizer.futures_recovery_store import (
     RECOVERY_STATE_MIRROR_KEY,
     RECOVERY_STATE_KEY,
     JsonRecoveryStore,
+    RecoveryRetirementBlockedError,
     RecoveryStateCorruptError,
     RecoveryStateUnavailableError,
     recovery_coordinator_registered,
@@ -1259,3 +1260,51 @@ def test_flat_managed_control_drift_from_embedded_profile_fails_closed(
             RecoveryStateCorruptError, match="flat managed control drift"
         ):
             JsonRecoveryStore(control_path).read("ARXUSDT")
+
+
+def test_retire_symbol_restores_baseline_and_removes_coordinator_fence() -> None:
+    with TemporaryDirectory() as temp_dir:
+        control_path = Path(temp_dir) / "arxusdt_loop_runner_control.json"
+        store = JsonRecoveryStore(control_path)
+        store.register_symbol("ARXUSDT", BASELINE, now=NOW)
+
+        store.retire_symbol("ARXUSDT")
+
+        retired = _read_document(control_path)
+        assert not recovery_coordinator_registered(retired)
+        assert RECOVERY_STATE_KEY not in retired
+        assert RECOVERY_STATE_MIRROR_KEY not in retired
+        assert retired["volatility_entry_pause_enabled"] is True
+        assert retired["best_quote_maker_volume_cycle_budget_notional"] == 360.0
+
+
+def test_retire_symbol_refuses_an_active_recovery_action() -> None:
+    with TemporaryDirectory() as temp_dir:
+        control_path = Path(temp_dir) / "arxusdt_loop_runner_control.json"
+        store = JsonRecoveryStore(control_path)
+        registered = store.register_symbol("ARXUSDT", BASELINE, now=NOW)
+        active = replace(
+            registered,
+            document_revision=1,
+            generation=1,
+            desired_profile=materialize_profile(
+                baseline=BASELINE,
+                action_id=ActionId.MAKER_FLOW_RECOVER,
+                action_updates={"recovery_order_side": "BUY"},
+            ),
+            phase=RecoveryPhase.ACTIVE,
+            active_action=ActionId.MAKER_FLOW_RECOVER,
+            decision_id="maker-1",
+            side=Side.BUY,
+            order_role=OrderRole.ENTRY,
+            issued_at=NOW,
+            progress_deadline_at=NOW + timedelta(seconds=30),
+            hard_expires_at=NOW + timedelta(minutes=1),
+            last_round_id="round-1",
+        )
+        store.compare_and_swap(
+            "ARXUSDT", expected_revision=0, next_state=active
+        )
+
+        with pytest.raises(RecoveryRetirementBlockedError, match="phase=active"):
+            store.retire_symbol("ARXUSDT")

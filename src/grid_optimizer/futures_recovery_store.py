@@ -102,6 +102,10 @@ class RecoveryStateCorruptError(RecoveryStateStoreError):
     """The control document or embedded recovery state is unsafe to use."""
 
 
+class RecoveryRetirementBlockedError(RecoveryStateStoreError):
+    """A registered symbol still has recovery-owned work to settle."""
+
+
 def _normalize_symbol(symbol: str) -> str:
     normalized = str(symbol).upper().strip()
     if not normalized:
@@ -1219,6 +1223,52 @@ class JsonRecoveryStore:
                 )
             write_control_json_atomically(self.control_path, repaired)
             return state, tuple(sorted(changed))
+
+    def retire_symbol(self, symbol: str) -> None:
+        """Return an entirely quiescent control document to its baseline owner.
+
+        This only removes the coordinator fence; callers must separately keep
+        the runner stopped while performing the systemd ownership handoff.
+        """
+
+        normalized = _normalize_symbol(symbol)
+        with exclusive_control_lock(
+            self.control_path, timeout_seconds=self.lock_timeout_seconds
+        ):
+            document = self._read_document(allow_missing=False)
+            state = self._decode_document_state(document, normalized)
+            blockers: list[str] = []
+            if state.phase is not RecoveryPhase.STABLE:
+                blockers.append(f"phase={state.phase.value}")
+            if state.active_action is not ActionId.NOOP:
+                blockers.append(f"active_action={state.active_action.value}")
+            if state.desired_runner_state != "running":
+                blockers.append(f"desired_runner_state={state.desired_runner_state}")
+            if state.action_lease is not None:
+                blockers.append("action_lease")
+            if state.safety_lease is not None:
+                blockers.append("safety_lease")
+            if state.cleanup_obligation is not None:
+                blockers.append("cleanup_obligation")
+            if state.pending_effect_stage is not EffectStage.NONE:
+                blockers.append(f"pending_effect={state.pending_effect_stage.value}")
+            if state.terminal_stop_confirmed:
+                blockers.append("terminal_stop_confirmed")
+            if blockers:
+                raise RecoveryRetirementBlockedError(
+                    "cannot retire recovery ownership while " + ", ".join(blockers)
+                )
+
+            retired = dict(document)
+            for key in tuple(retired):
+                if _is_managed_recovery_key(key):
+                    retired.pop(key, None)
+            retired.pop(RECOVERY_STATE_KEY, None)
+            retired.pop(RECOVERY_STATE_MIRROR_KEY, None)
+            retired.update(
+                _json_copy(state.baseline_profile.fields, path="baseline_profile.fields")
+            )
+            write_control_json_atomically(self.control_path, retired)
 
     def compare_and_swap(
         self,

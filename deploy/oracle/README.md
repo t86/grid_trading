@@ -351,9 +351,10 @@ payloads are easy to start from, but they can silently drop live overrides such 
 > `STABLE` 下的每日窗口滚动由 `BASELINE_REBASE` 唯一动作原子更新运行契约/所有者，并调度受栅栏的唯一
 > 重启；外部 Web 触发器、磨损守卫和状态重对齐对已注册 symbol 只观察、委托或拒绝直写。
 >
-> 但当前没有任何生产 symbol 完成注册或所有权切换，本分支也未部署。冻结账本专用修复闭环、
-> 真实生产基线/订单/账本迁移、宿主机外 cron/systemd/`output/ops` 盘点、协调器心跳/严重告警、
-> 受管 runner 的 `Restart=no` 门禁和按 symbol 的原子切换/回滚演练仍是硬阻塞。下面的旧生产
+> 但当前没有任何生产 symbol 完成注册或所有权切换，本分支也未部署。代码现已提供协调器成功心跳、
+> 受管 runner 的 `Restart=no` 门禁和按 symbol 的受控退休/回滚；它们尚未在生产完成演练。冻结账本专用修复闭环、
+> 真实生产基线/订单/账本迁移、宿主机外 cron/systemd/`output/ops` 盘点，以及严重告警和一次完整的
+> 切换/退休演练仍是硬阻塞。下面的旧生产
 > 部署示例只用于理解现有环境，不得据此部署本分支或注册 symbol。
 >
 > 当前注册门禁会拒绝带有正数/无效冻结库存摘要或 lot、或仍启用 `best_quote_maker_volume_reduce_freeze_enabled`
@@ -509,6 +510,31 @@ recovery. 活动终止 intent 的运行器死亡不是“预期停机”，watch
 
 恢复协调器的生产切换是另一套门禁：先验证协调器心跳、进程级监督、严重告警、主机外执行器盘点和回滚路径，
 再对单个 symbol 原子转移所有权，并将该受管 runner 校验为 `Restart=no`。不得让 `Restart=on-failure` 与协调器同时拥有重启权。
+
+### 受管 runner 的重启权切换
+
+`configure_recovery_managed_runner.sh` 只切换单个 systemd runner 的重启策略，
+不启动、停止、撤单或平仓。它不是注册入口：先由受控迁移写入并校验 recovery
+envelope，再确认 `grid-bq-volume-recovery-guard.timer` 正在运行，并且
+`bq_volume_recovery_guard_state.json` 中该 symbol 的成功心跳不超过 150 秒，最后才执行：
+
+```bash
+APP_DIR=/home/ubuntu/wangge_api2 \
+COORDINATOR_TIMER_UNIT=grid-bq-volume-recovery-guard \
+deploy/oracle/configure_recovery_managed_runner.sh verify BCHUSDT
+
+APP_DIR=/home/ubuntu/wangge_api2 \
+COORDINATOR_TIMER_UNIT=grid-bq-volume-recovery-guard \
+deploy/oracle/configure_recovery_managed_runner.sh enable BCHUSDT
+```
+
+`enable` 会为 `grid-loop@BCHUSDT.service` 写入独立 drop-in `Restart=no`，随后
+重新读取 systemd 的有效值确认生效；任一步失败都会删除刚写入的 drop-in。已注册
+control 不能执行 `disable`，必须先在 runner 已停止且没有 terminal intent/terminal owner
+时执行 `retire`。`retire` 会在控制文件锁内确认 `STABLE + NOOP`、没有活动 lease、
+cleanup obligation、pending effect 或 terminal stop，再恢复注册前 baseline 并清除
+coordinator envelope；随后才允许 `disable` 移除 drop-in。这避免
+“回滚 systemd 成功、控制仍由协调器所有”造成双 writer。此工具本身不构成生产授权。
 
 Stale-plan guard fallback (`loop_runner`): the runtime guard normally reads the ledger-scoped
 `strategy_actual_net_notional` from the latest plan. Only when a **non-empty** persisted plan

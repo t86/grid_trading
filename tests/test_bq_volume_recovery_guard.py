@@ -1130,6 +1130,14 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             registered.assert_called_once()
             payload = json.loads(stdout.getvalue())
             self.assertEqual(payload["results"], [registered_result])
+            heartbeat = json.loads(
+                (output_dir / "guard_state.json").read_text(encoding="utf-8")
+            )["futures_recovery_guard_heartbeat"]
+            self.assertTrue(heartbeat["ok"])
+            self.assertEqual(heartbeat["symbols"]["ARXUSDT"], {
+                "healthy": True,
+                "action": "coordinator_noop_hold",
+            })
 
     def test_main_registered_terminal_owner_handoffs_to_coordinator_before_delegation(
         self,
@@ -1260,6 +1268,9 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 (output_dir / "guard_state.json").read_text(encoding="utf-8")
             )
             self.assertIsInstance(guard_state, dict)
+            heartbeat = guard_state["futures_recovery_guard_heartbeat"]
+            self.assertFalse(heartbeat["ok"])
+            self.assertFalse(heartbeat["symbols"]["ARXUSDT"]["healthy"])
 
     def test_registered_raw_active_allow_loss_is_repaired_false_in_one_round(self) -> None:
         with TemporaryDirectory() as tmpdir:

@@ -185,6 +185,8 @@ _RECOVERY_CONTROL_KEYS = (
 LOSS_REDUCE_WEAR_PER_10K = 3.0
 ARX_TARGET_PACE_WEAR_PER_10K = 8.0
 EMERGENCY_WEAR_PER_10K = 80.0
+RECOVERY_GUARD_HEARTBEAT_KEY = "futures_recovery_guard_heartbeat"
+RECOVERY_GUARD_HEARTBEAT_SCHEMA = "futures_recovery_guard_heartbeat_v1"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -197,6 +199,46 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     write_control_json_atomically(path, payload)
+
+
+def _record_recovery_guard_heartbeat(
+    state: dict[str, Any],
+    *,
+    now: datetime,
+    registered_symbols: list[str],
+    results: list[dict[str, Any]],
+    exit_code: int,
+) -> None:
+    """Persist evidence that a coordinator-owned symbol completed this round.
+
+    The systemd restart-owner cutover consumes this as a *gate*, never as an
+    actuator.  A scheduled timer alone is not proof that the coordinator
+    actually evaluated a symbol successfully.
+    """
+
+    result_by_symbol = {
+        str(result.get("symbol", "")).upper(): result
+        for result in results
+        if isinstance(result, dict) and result.get("symbol")
+    }
+    symbol_status: dict[str, dict[str, Any]] = {}
+    for symbol in sorted(set(registered_symbols)):
+        result = result_by_symbol.get(symbol)
+        healthy = bool(
+            result is not None
+            and result.get("action") != "registered_recovery_blocked"
+            and not result.get("effect_error")
+        )
+        symbol_status[symbol] = {
+            "healthy": healthy,
+            "action": result.get("action") if result is not None else None,
+        }
+    state[RECOVERY_GUARD_HEARTBEAT_KEY] = {
+        "schema": RECOVERY_GUARD_HEARTBEAT_SCHEMA,
+        "checked_at": now.isoformat(),
+        "ok": exit_code == 0 and all(item["healthy"] for item in symbol_status.values()),
+        "symbols": symbol_status,
+    }
 
 
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
@@ -11337,6 +11379,7 @@ def main(argv: list[str] | None = None) -> int:
         _normalize_symbols(args.require_soft_pressure_for_allow_loss_symbols)
     )
     results = []
+    registered_symbols: list[str] = []
     exit_code = 0
     for symbol in _normalize_symbols(args.symbols):
         terminal_delegation = _terminal_drain_delegation(
@@ -11358,6 +11401,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         control_path = _control_path(output_dir, symbol)
         if _registered_recovery_envelope_present(control_path):
+            registered_symbols.append(symbol)
             registered_result = run_registered_recovery_symbol_round(
                 symbol=symbol,
                 output_dir=output_dir,
@@ -11681,6 +11725,13 @@ def main(argv: list[str] | None = None) -> int:
         results.append(result)
 
     if not args.dry_run:
+        _record_recovery_guard_heartbeat(
+            state,
+            now=now,
+            registered_symbols=registered_symbols,
+            results=results,
+            exit_code=exit_code,
+        )
         _write_json(state_path, state)
     print(json.dumps({"ok": exit_code == 0, "checked_at": now.isoformat(), "results": results}, ensure_ascii=False))
     return exit_code

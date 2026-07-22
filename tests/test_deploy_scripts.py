@@ -1345,3 +1345,292 @@ def test_runner_systemd_installer_narrows_restart_to_failures() -> None:
 
     assert "80-runtime-guard-stop.conf" in script
     assert "Restart=on-failure" in script
+
+
+def test_recovery_managed_runner_policy_requires_registered_coordinator_owner() -> None:
+    script = Path(
+        "deploy/oracle/configure_recovery_managed_runner.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "enable|retire|disable|verify" in script
+    assert "recovery_coordinator_registered" in script
+    assert "decode_recovery_control_state" in script
+    assert 'Restart=no' in script
+    assert 'systemctl is-active --quiet "${COORDINATOR_TIMER_UNIT}.timer"' in script
+    assert "require_coordinator_heartbeat" in script
+    assert "futures_recovery_guard_heartbeat_v1" in script
+    assert "registered control must be retired before disabling" in script
+    assert 'systemctl daemon-reload' in script
+
+
+def test_recovery_managed_runner_policy_enables_only_registered_symbol(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    control = _registered_control({"symbol": "BCHUSDT"})
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(control), encoding="utf-8"
+    )
+    (output_dir / "bq_volume_recovery_guard_state.json").write_text(
+        json.dumps(
+            {
+                "futures_recovery_guard_heartbeat": {
+                    "schema": "futures_recovery_guard_heartbeat_v1",
+                    "checked_at": datetime.now(timezone.utc).isoformat(),
+                    "ok": True,
+                    "symbols": {
+                        "BCHUSDT": {
+                            "healthy": True,
+                            "action": "coordinator_noop_hold",
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls_path = tmp_path / "systemctl.calls"
+    (fake_bin / "sudo").write_text(
+        "#!/bin/sh\nexec \"$@\"\n", encoding="utf-8"
+    )
+    (fake_bin / "systemctl").write_text(
+        "#!/bin/sh\n"
+        f"echo \"$@\" >> {calls_path}\n"
+        "if [ \"$1\" = is-active ]; then exit 0; fi\n"
+        "if [ \"$1\" = show ]; then echo no; exit 0; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "sudo").chmod(0o755)
+    (fake_bin / "systemctl").chmod(0o755)
+
+    completed = subprocess.run(
+        [
+            "bash",
+            "deploy/oracle/configure_recovery_managed_runner.sh",
+            "enable",
+            "BCHUSDT",
+        ],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PYTHON_BIN": sys.executable,
+            "RUNNER_SRC_DIR": str(Path.cwd() / "src"),
+            "OUTPUT_DIR": str(output_dir),
+            "SYSTEMD_DIR": str(tmp_path / "systemd"),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    dropin = (
+        tmp_path
+        / "systemd"
+        / "grid-loop@BCHUSDT.service.d"
+        / "90-futures-recovery-managed.conf"
+    )
+    assert dropin.read_text(encoding="utf-8") == "[Service]\nRestart=no\n"
+    calls = calls_path.read_text(encoding="utf-8")
+    assert "is-active --quiet grid-bq-volume-recovery-guard.timer" in calls
+    assert "daemon-reload" in calls
+    assert "start grid-loop@BCHUSDT.service" not in calls
+    assert "restart grid-loop@BCHUSDT.service" not in calls
+
+
+def test_recovery_managed_runner_policy_refuses_stale_coordinator_heartbeat(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(_registered_control({"symbol": "BCHUSDT"})), encoding="utf-8"
+    )
+    (output_dir / "bq_volume_recovery_guard_state.json").write_text(
+        json.dumps(
+            {
+                "futures_recovery_guard_heartbeat": {
+                    "schema": "futures_recovery_guard_heartbeat_v1",
+                    "checked_at": "2026-07-16T00:00:00+00:00",
+                    "ok": True,
+                    "symbols": {"BCHUSDT": {"healthy": True}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "systemctl").write_text(
+        "#!/bin/sh\nif [ \"$1\" = is-active ]; then exit 0; fi\nexit 1\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "systemctl").chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", "deploy/oracle/configure_recovery_managed_runner.sh", "enable", "BCHUSDT"],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PYTHON_BIN": sys.executable,
+            "RUNNER_SRC_DIR": str(Path.cwd() / "src"),
+            "OUTPUT_DIR": str(output_dir),
+            "SYSTEMD_DIR": str(tmp_path / "systemd"),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "heartbeat is not fresh" in completed.stderr
+    assert not (tmp_path / "systemd").exists()
+
+
+def test_recovery_managed_runner_policy_refuses_rollback_while_registered(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    control = _registered_control({"symbol": "BCHUSDT"})
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(control), encoding="utf-8"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "sudo").write_text(
+        "#!/bin/sh\nexec \"$@\"\n", encoding="utf-8"
+    )
+    (fake_bin / "sudo").chmod(0o755)
+    dropin = (
+        tmp_path
+        / "systemd"
+        / "grid-loop@BCHUSDT.service.d"
+        / "90-futures-recovery-managed.conf"
+    )
+    dropin.parent.mkdir(parents=True)
+    dropin.write_text("[Service]\nRestart=no\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            "bash",
+            "deploy/oracle/configure_recovery_managed_runner.sh",
+            "disable",
+            "BCHUSDT",
+        ],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PYTHON_BIN": sys.executable,
+            "RUNNER_SRC_DIR": str(Path.cwd() / "src"),
+            "OUTPUT_DIR": str(output_dir),
+            "SYSTEMD_DIR": str(tmp_path / "systemd"),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "registered control must be retired" in completed.stderr
+    assert dropin.read_text(encoding="utf-8") == "[Service]\nRestart=no\n"
+
+
+def test_recovery_managed_runner_policy_retires_only_an_inactive_quiescent_symbol(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    control_path = output_dir / "bchusdt_loop_runner_control.json"
+    control_path.write_text(
+        json.dumps(_registered_control({"symbol": "BCHUSDT"})), encoding="utf-8"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "systemctl").write_text(
+        "#!/bin/sh\nif [ \"$1\" = is-active ]; then exit 3; fi\nexit 0\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "systemctl").chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", "deploy/oracle/configure_recovery_managed_runner.sh", "retire", "BCHUSDT"],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PYTHON_BIN": sys.executable,
+            "RUNNER_SRC_DIR": str(Path.cwd() / "src"),
+            "OUTPUT_DIR": str(output_dir),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    retired = json.loads(control_path.read_text(encoding="utf-8"))
+    assert RECOVERY_STATE_KEY not in retired
+    assert RECOVERY_STATE_MIRROR_KEY not in retired
+    assert "recovery coordinator ownership retired" in completed.stdout
+
+
+def test_recovery_managed_runner_policy_disables_only_after_safe_retirement(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    control_path = output_dir / "bchusdt_loop_runner_control.json"
+    control_path.write_text(
+        json.dumps(_registered_control({"symbol": "BCHUSDT"})), encoding="utf-8"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "sudo").write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+    (fake_bin / "systemctl").write_text(
+        "#!/bin/sh\nif [ \"$1\" = is-active ]; then exit 3; fi\nexit 0\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "sudo").chmod(0o755)
+    (fake_bin / "systemctl").chmod(0o755)
+    dropin = (
+        tmp_path
+        / "systemd"
+        / "grid-loop@BCHUSDT.service.d"
+        / "90-futures-recovery-managed.conf"
+    )
+    dropin.parent.mkdir(parents=True)
+    dropin.write_text("[Service]\nRestart=no\n", encoding="utf-8")
+    environment = {
+        **os.environ,
+        "APP_DIR": str(tmp_path),
+        "PYTHON_BIN": sys.executable,
+        "RUNNER_SRC_DIR": str(Path.cwd() / "src"),
+        "OUTPUT_DIR": str(output_dir),
+        "SYSTEMD_DIR": str(tmp_path / "systemd"),
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+    }
+
+    retired = subprocess.run(
+        ["bash", "deploy/oracle/configure_recovery_managed_runner.sh", "retire", "BCHUSDT"],
+        cwd=Path.cwd(), env=environment, capture_output=True, text=True, check=False,
+    )
+    disabled = subprocess.run(
+        ["bash", "deploy/oracle/configure_recovery_managed_runner.sh", "disable", "BCHUSDT"],
+        cwd=Path.cwd(), env=environment, capture_output=True, text=True, check=False,
+    )
+
+    assert retired.returncode == 0, retired.stderr
+    assert disabled.returncode == 0, disabled.stderr
+    assert not dropin.exists()
