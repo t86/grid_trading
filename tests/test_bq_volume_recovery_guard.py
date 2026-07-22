@@ -2928,6 +2928,30 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control_path.read_bytes(), before)
             self.assertEqual(restarts, [])
 
+    def test_legacy_control_writer_refuses_to_replace_unreadable_control(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "bchusdt_loop_runner_control.json"
+            control_path.write_text("{invalid-json", encoding="utf-8")
+            before = control_path.read_bytes()
+            restarts: list[str] = []
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "legacy control update refuses unreadable runner control",
+            ):
+                _apply_control_update(
+                    symbol="BCHUSDT",
+                    control_path=control_path,
+                    control={"best_quote_maker_volume_cycle_budget_notional": 120.0},
+                    updates={"best_quote_maker_volume_cycle_budget_notional": 180.0},
+                    now=datetime(2026, 7, 22, tzinfo=timezone.utc),
+                    dry_run=False,
+                    restart_runner=restarts.append,
+                )
+
+            self.assertEqual(control_path.read_bytes(), before)
+            self.assertEqual(restarts, [])
+
     def test_registered_exchange_order_drift_requires_two_quiet_observations(self) -> None:
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)

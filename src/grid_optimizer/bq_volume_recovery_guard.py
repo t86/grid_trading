@@ -333,12 +333,18 @@ RECOVERY_GUARD_HEARTBEAT_KEY = "futures_recovery_guard_heartbeat"
 RECOVERY_GUARD_HEARTBEAT_SCHEMA = "futures_recovery_guard_heartbeat_v1"
 
 
-def _read_json(path: Path) -> dict[str, Any]:
+def _read_json_with_readability(path: Path) -> tuple[dict[str, Any], bool]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    except FileNotFoundError:
+        return {}, True
+    except (json.JSONDecodeError, OSError):
+        return {}, False
+    return (payload, True) if isinstance(payload, dict) else ({}, False)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    return _read_json_with_readability(path)[0]
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -2465,7 +2471,10 @@ def _apply_control_update(
     # under the symbol lock so a concurrent observer/writer cannot be erased
     # by a stale whole-document write, then keep the lock through restart.
     with exclusive_control_lock(control_path):
-        current = _read_json(control_path) or dict(control)
+        current, current_readable = _read_json_with_readability(control_path)
+        if not current_readable:
+            raise RuntimeError("legacy control update refuses unreadable runner control")
+        current = current or dict(control)
         if recovery_coordinator_registered(current):
             raise RuntimeError(
                 "registered recovery symbol rejects legacy control updates"
