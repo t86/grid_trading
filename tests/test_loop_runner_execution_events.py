@@ -502,11 +502,14 @@ class LoopRunnerExecutionEventHelpersTests(unittest.TestCase):
 
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders", return_value=[])
-    def test_periodic_reconcile_uses_stream_position_when_available(
+    def test_periodic_reconcile_uses_rest_position_when_stream_is_available(
         self,
         _mock_open_orders,
         mock_account_info,
     ) -> None:
+        mock_account_info.return_value = {
+            "positions": [{"symbol": "CHIPUSDT", "positionAmt": "-73"}]
+        }
         stream = SimpleNamespace(
             snapshot_events=lambda: [],
             snapshot_account_positions=lambda: [
@@ -535,8 +538,13 @@ class LoopRunnerExecutionEventHelpersTests(unittest.TestCase):
         )
 
         self.assertTrue(snapshot["ok"])
-        self.assertEqual(snapshot["account_position_source"], "user_data_stream")
-        mock_account_info.assert_not_called()
+        self.assertEqual(snapshot["account_position_source"], "rest")
+        mock_account_info.assert_called_once_with(
+            "key",
+            "secret",
+            recv_window=5000,
+            use_cache=False,
+        )
 
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
     @patch(
@@ -554,6 +562,9 @@ class LoopRunnerExecutionEventHelpersTests(unittest.TestCase):
         _mock_open_orders,
         mock_account_info,
     ) -> None:
+        mock_account_info.return_value = {
+            "positions": [{"symbol": "CHIPUSDT", "positionAmt": "-73"}]
+        }
         captured: list[dict[str, object]] = []
         stream = SimpleNamespace(
             snapshot_events=lambda: [],
@@ -585,7 +596,13 @@ class LoopRunnerExecutionEventHelpersTests(unittest.TestCase):
 
         self.assertEqual(snapshot["open_orders_source"], "rest")
         self.assertEqual([item["clientOrderId"] for item in captured], ["gx-chipu-live"])
-        mock_account_info.assert_not_called()
+        self.assertEqual(snapshot["account_position_source"], "rest")
+        mock_account_info.assert_called_once_with(
+            "key",
+            "secret",
+            recv_window=5000,
+            use_cache=False,
+        )
 
 
 if __name__ == "__main__":
