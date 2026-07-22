@@ -398,6 +398,29 @@ def test_timed_out_runner_recovery_is_exhausted_until_the_fault_episode_clears()
     assert blocked.effect_stage is EffectStage.NONE
     assert "action_attempt_exhausted:runner_recover:global" in blocked.reasons
 
+    cleared = engine.plan_round(
+        snapshot=_snapshot(
+            now=NOW + timedelta(minutes=6, seconds=2),
+            assessment=FlowBlockerAssessment(),
+        ),
+        state=blocked.next_state,
+        now=NOW + timedelta(minutes=6, seconds=2),
+        round_id="runner-recover-fault-cleared",
+    )
+    recovered = engine.plan_round(
+        snapshot=_snapshot(
+            now=NOW + timedelta(minutes=6, seconds=3), assessment=assessment
+        ),
+        state=cleared.next_state,
+        now=NOW + timedelta(minutes=6, seconds=3),
+        round_id="runner-recover-new-fault",
+    )
+
+    assert cleared.next_state.exhausted_attempts == ()
+    assert cleared.liveness_status == "healthy"
+    assert recovered.action_id is ActionId.RUNNER_RECOVER
+    assert recovered.effect_stage is EffectStage.RUNNER_RESTART
+
 
 def test_same_round_is_not_committed_or_executed_again_after_coordinator_restart() -> (
     None
