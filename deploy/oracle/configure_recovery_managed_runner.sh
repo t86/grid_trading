@@ -255,6 +255,7 @@ try:
         stderr=subprocess.DEVNULL,
     )
 except (OSError, subprocess.CalledProcessError):
+    print("__systemd_timer_audit_unavailable__:list_timers")
     raise SystemExit(0)
 
 for raw in timer_text.splitlines():
@@ -273,7 +274,8 @@ for raw in timer_text.splitlines():
             stderr=subprocess.DEVNULL,
         ).strip()
     except (OSError, subprocess.CalledProcessError):
-        continue
+        print(f"__systemd_timer_audit_unavailable__:{timer}")
+        raise SystemExit(0)
     lowered = command.lower()
     if symbol_pattern.search(command.upper()) is None:
         continue
@@ -281,6 +283,11 @@ for raw in timer_text.splitlines():
         print(f"{timer}->{service}: {command}")
 PY
 )"
+  if [[ "$systemd_findings" == __systemd_timer_audit_unavailable__:* ]]; then
+    echo "cannot verify systemd recovery executors for $SYMBOL; refuse ownership cutover:" >&2
+    printf '%s\n' "${systemd_findings#__systemd_timer_audit_unavailable__:}" >&2
+    exit 1
+  fi
   if [[ -n "$systemd_findings" ]]; then
     echo "unclassified systemd recovery executors remain for $SYMBOL; disable or migrate them before ownership cutover:" >&2
     printf '%s\n' "$systemd_findings" >&2

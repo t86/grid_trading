@@ -1589,6 +1589,13 @@ def test_recovery_managed_runner_policy_audit_allows_target_gate_and_observers(
         encoding="utf-8",
     )
     (fake_bin / "crontab").chmod(0o755)
+    (fake_bin / "systemctl").write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = list-timers ]; then exit 0; fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "systemctl").chmod(0o755)
 
     completed = subprocess.run(
         ["bash", "deploy/oracle/configure_recovery_managed_runner.sh", "audit", "BCHUSDT"],
@@ -1608,6 +1615,85 @@ def test_recovery_managed_runner_policy_audit_allows_target_gate_and_observers(
 
     assert completed.returncode == 0, completed.stderr
     assert "no legacy recovery actuators found: BCHUSDT" in completed.stdout
+
+
+def test_recovery_managed_runner_policy_audit_refuses_unavailable_systemd_timer_inventory(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(_registered_control({"symbol": "BCHUSDT"})), encoding="utf-8"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "crontab").write_text("#!/bin/sh\n", encoding="utf-8")
+    (fake_bin / "systemctl").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    (fake_bin / "crontab").chmod(0o755)
+    (fake_bin / "systemctl").chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", "deploy/oracle/configure_recovery_managed_runner.sh", "audit", "BCHUSDT"],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PYTHON_BIN": sys.executable,
+            "RUNNER_SRC_DIR": str(Path.cwd() / "src"),
+            "OUTPUT_DIR": str(output_dir),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "cannot verify systemd recovery executors" in completed.stderr
+    assert "list_timers" in completed.stderr
+
+
+def test_recovery_managed_runner_policy_audit_refuses_unreadable_systemd_timer_service(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(_registered_control({"symbol": "BCHUSDT"})), encoding="utf-8"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "crontab").write_text("#!/bin/sh\n", encoding="utf-8")
+    (fake_bin / "systemctl").write_text(
+        "#!/bin/sh\n"
+        "case \"$1 $2 $3\" in\n"
+        "  'list-timers --all --no-legend') echo 'n/a n/a n/a n/a unknown.timer' ;;\n"
+        "  'show -p Unit') exit 1 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "crontab").chmod(0o755)
+    (fake_bin / "systemctl").chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", "deploy/oracle/configure_recovery_managed_runner.sh", "audit", "BCHUSDT"],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PYTHON_BIN": sys.executable,
+            "RUNNER_SRC_DIR": str(Path.cwd() / "src"),
+            "OUTPUT_DIR": str(output_dir),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "cannot verify systemd recovery executors" in completed.stderr
+    assert "unknown.timer" in completed.stderr
 
 
 def test_recovery_managed_runner_policy_audit_rejects_an_unclassified_symbol_executor(
@@ -1674,7 +1760,10 @@ def test_recovery_managed_runner_policy_refuses_stale_coordinator_heartbeat(
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "systemctl").write_text(
-        "#!/bin/sh\nif [ \"$1\" = is-active ]; then exit 0; fi\nexit 1\n",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = list-timers ]; then exit 0; fi\n"
+        "if [ \"$1\" = is-active ]; then exit 0; fi\n"
+        "exit 1\n",
         encoding="utf-8",
     )
     (fake_bin / "systemctl").chmod(0o755)
@@ -1725,7 +1814,10 @@ def test_recovery_managed_runner_policy_refuses_missing_watchdog_heartbeat(
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "systemctl").write_text(
-        "#!/bin/sh\nif [ \"$1\" = is-active ]; then exit 0; fi\nexit 1\n",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = list-timers ]; then exit 0; fi\n"
+        "if [ \"$1\" = is-active ]; then exit 0; fi\n"
+        "exit 1\n",
         encoding="utf-8",
     )
     (fake_bin / "systemctl").chmod(0o755)
@@ -1790,7 +1882,10 @@ def test_recovery_managed_runner_policy_refuses_unconfigured_alert_delivery(
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "systemctl").write_text(
-        "#!/bin/sh\nif [ \"$1\" = is-active ]; then exit 0; fi\nexit 1\n",
+        "#!/bin/sh\n"
+        "if [ \"$1\" = list-timers ]; then exit 0; fi\n"
+        "if [ \"$1\" = is-active ]; then exit 0; fi\n"
+        "exit 1\n",
         encoding="utf-8",
     )
     (fake_bin / "systemctl").chmod(0o755)
