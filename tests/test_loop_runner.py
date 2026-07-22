@@ -8789,6 +8789,79 @@ class LoopRunnerTests(unittest.TestCase):
 
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    def test_periodic_reconcile_escalates_persistent_rest_position_drift(
+        self,
+        _mock_open_orders,
+        mock_account_info,
+    ) -> None:
+        mock_account_info.return_value = {
+            "positions": [{"symbol": "BTCUSDC", "positionAmt": "600"}]
+        }
+
+        snapshot = _run_periodic_reconcile(
+            state={
+                "last_reconcile": {
+                    "actual_net_qty_diff_confirm_count": 1,
+                    "open_orders_rest_last_sync_at": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                }
+            },
+            cycle=5,
+            interval_cycles=5,
+            symbol="BTCUSDC",
+            strategy_mode="one_way_long",
+            api_key="key",
+            api_secret="secret",
+            recv_window=5000,
+            expected_open_order_count=0,
+            expected_actual_net_qty=10.0,
+        )
+
+        self.assertEqual(snapshot["actual_net_qty_diff_confirm_count"], 2)
+        self.assertTrue(snapshot["protective_stop_required"])
+        self.assertIn(
+            "actual_net_qty_diff_persistent",
+            snapshot["protective_stop_reasons"],
+        )
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    def test_periodic_reconcile_clears_position_drift_confirmation_after_rest_recovers(
+        self,
+        _mock_open_orders,
+        mock_account_info,
+    ) -> None:
+        mock_account_info.return_value = {
+            "positions": [{"symbol": "BTCUSDC", "positionAmt": "10"}]
+        }
+
+        snapshot = _run_periodic_reconcile(
+            state={
+                "last_reconcile": {
+                    "actual_net_qty_diff_confirm_count": 1,
+                    "open_orders_rest_last_sync_at": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                }
+            },
+            cycle=5,
+            interval_cycles=5,
+            symbol="BTCUSDC",
+            strategy_mode="one_way_long",
+            api_key="key",
+            api_secret="secret",
+            recv_window=5000,
+            expected_open_order_count=0,
+            expected_actual_net_qty=10.0,
+        )
+
+        self.assertEqual(snapshot["actual_net_qty_diff_confirm_count"], 0)
+        self.assertFalse(snapshot["protective_stop_required"])
+        self.assertTrue(snapshot["ok"])
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
     def test_periodic_reconcile_marks_persistent_open_order_diff_for_protective_stop(
         self,
         mock_open_orders,

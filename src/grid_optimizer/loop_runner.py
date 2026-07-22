@@ -2309,6 +2309,14 @@ def _run_periodic_reconcile(
     actual_net_qty_diff = actual_net_qty - float(expected_actual_net_qty or 0.0)
     previous_over_10 = int(snapshot.get("open_order_diff_over_10_count", 0) or 0)
     open_order_diff_over_10_count = previous_over_10 + 1 if abs(open_order_diff) > PROTECTIVE_OPEN_ORDER_DIFF_LIMIT else 0
+    previous_position_diff = int(
+        snapshot.get("actual_net_qty_diff_confirm_count", 0) or 0
+    )
+    actual_net_qty_diff_confirm_count = (
+        previous_position_diff + 1
+        if abs(actual_net_qty_diff) > 1e-9
+        else 0
+    )
     protective_stop_reasons: list[str] = []
     protective_warning_reasons: list[str] = []
     stream_age_seconds = stream_position.get("stream_age_seconds") if stream_position is not None else None
@@ -2316,6 +2324,8 @@ def _run_periodic_reconcile(
         protective_warning_reasons.append("account_position_stream_stale")
     if open_order_diff_over_10_count >= PROTECTIVE_OPEN_ORDER_DIFF_CONFIRM_CHECKS:
         protective_stop_reasons.append("open_order_diff_persistent")
+    if actual_net_qty_diff_confirm_count >= PROTECTIVE_OPEN_ORDER_DIFF_CONFIRM_CHECKS:
+        protective_stop_reasons.append("actual_net_qty_diff_persistent")
     ok = abs(open_order_diff) == 0 and abs(actual_net_qty_diff) <= 1e-9 and not protective_stop_reasons
     message_parts: list[str] = []
     if open_order_diff:
@@ -2351,6 +2361,7 @@ def _run_periodic_reconcile(
         "open_order_diff": open_order_diff,
         "open_order_diff_over_10_count": open_order_diff_over_10_count,
         "actual_net_qty_diff": actual_net_qty_diff,
+        "actual_net_qty_diff_confirm_count": actual_net_qty_diff_confirm_count,
         "protective_stop_required": bool(protective_stop_reasons),
         "protective_stop_reasons": protective_stop_reasons,
         "protective_warning_reasons": protective_warning_reasons,
