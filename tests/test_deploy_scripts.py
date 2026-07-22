@@ -1365,6 +1365,8 @@ def test_recovery_managed_runner_policy_requires_registered_coordinator_owner() 
     assert "require_coordinator_watchdog_timer" in script
     assert "require_coordinator_watchdog_heartbeat" in script
     assert "require_coordinator_alert_delivery" in script
+    assert "require_last_valid_control_snapshot" in script
+    assert "control_last_valid_snapshot_path" in script
     assert "load_alert_notifier_config" in script
     assert "recovery_coordinator_watchdog_heartbeat_v1" in script
     assert "futures_recovery_guard_heartbeat_v1" in script
@@ -1388,6 +1390,9 @@ def test_recovery_managed_runner_policy_enables_only_registered_symbol(
     output_dir.mkdir()
     control = _registered_control({"symbol": "BCHUSDT"})
     (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(control), encoding="utf-8"
+    )
+    (output_dir / "bchusdt_loop_runner_control.json.last_valid").write_text(
         json.dumps(control), encoding="utf-8"
     )
     (output_dir / "bq_volume_recovery_guard_state.json").write_text(
@@ -1476,6 +1481,90 @@ def test_recovery_managed_runner_policy_enables_only_registered_symbol(
     assert "daemon-reload" in calls
     assert "start grid-loop@BCHUSDT.service" not in calls
     assert "restart grid-loop@BCHUSDT.service" not in calls
+
+
+@pytest.mark.parametrize(
+    "snapshot_text",
+    [None, json.dumps({"symbol": "BCHUSDT"})],
+)
+def test_recovery_managed_runner_policy_refuses_enable_without_valid_recovery_snapshot(
+    tmp_path: Path,
+    snapshot_text: str | None,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    control = _registered_control({"symbol": "BCHUSDT"})
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(control), encoding="utf-8"
+    )
+    if snapshot_text is not None:
+        (output_dir / "bchusdt_loop_runner_control.json.last_valid").write_text(
+            snapshot_text,
+            encoding="utf-8",
+        )
+    now = datetime.now(timezone.utc).isoformat()
+    (output_dir / "bq_volume_recovery_guard_state.json").write_text(
+        json.dumps(
+            {
+                "futures_recovery_guard_heartbeat": {
+                    "schema": "futures_recovery_guard_heartbeat_v1",
+                    "checked_at": now,
+                    "ok": True,
+                    "symbols": {"BCHUSDT": {"healthy": True}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / "recovery_coordinator_watchdog_state.json").write_text(
+        json.dumps(
+            {
+                "recovery_coordinator_watchdog_heartbeat": {
+                    "schema": "recovery_coordinator_watchdog_heartbeat_v1",
+                    "checked_at": now,
+                    "ok": True,
+                    "symbols": {"BCHUSDT": True},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / "alert_notifier_config.json").write_text(
+        json.dumps({"email_to": ["ops@example.com"]}), encoding="utf-8"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "sudo").write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+    (fake_bin / "systemctl").write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = is-active ]; then exit 0; fi\n"
+        "if [ \"$1\" = show ]; then echo no; exit 0; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "sudo").chmod(0o755)
+    (fake_bin / "systemctl").chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", "deploy/oracle/configure_recovery_managed_runner.sh", "enable", "BCHUSDT"],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PYTHON_BIN": sys.executable,
+            "RUNNER_SRC_DIR": str(Path.cwd() / "src"),
+            "OUTPUT_DIR": str(output_dir),
+            "SYSTEMD_DIR": str(tmp_path / "systemd"),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "last-valid recovery control snapshot is not valid" in completed.stderr
+    assert not (tmp_path / "systemd").exists()
 
 
 @pytest.mark.parametrize(

@@ -516,7 +516,8 @@ recovery. 活动终止 intent 的运行器死亡不是“预期停机”，watch
 `configure_recovery_managed_runner.sh` 只切换单个 systemd runner 的重启策略，
 不启动、停止、撤单或平仓。它不是注册入口：先由受控迁移写入并校验 recovery
 envelope，再确认 `grid-bq-volume-recovery-guard.timer` 与其只读 watchdog timer 正在运行，两个完成心跳均新鲜、告警收件人已配置，并且
-`bq_volume_recovery_guard_state.json` 中该 symbol 的成功心跳不超过 150 秒，最后才执行：
+`bq_volume_recovery_guard_state.json` 中该 symbol 的成功心跳不超过 150 秒；还必须有可解码、仍注册给该 symbol 的
+`<control>.last_valid` 快照，保证主 control 文件结构损坏时只能先恢复上一个已验证状态、不会失去恢复路径。最后才执行：
 
 ```bash
 APP_DIR=/home/ubuntu/wangge_api2 \

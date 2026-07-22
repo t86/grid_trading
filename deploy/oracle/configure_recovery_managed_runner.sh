@@ -83,6 +83,39 @@ except (OSError, TypeError, ValueError, RecoveryStateStoreError) as exc:
 PY
 }
 
+require_last_valid_control_snapshot() {
+  "$PYTHON_BIN" - "$SYMBOL" "$CONTROL_PATH" "$RUNNER_SRC_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+symbol, control_path, src_dir = sys.argv[1:]
+sys.path.insert(0, src_dir)
+from grid_optimizer.futures_recovery_store import (
+    RecoveryStateStoreError,
+    control_last_valid_snapshot_path,
+    decode_recovery_control_state,
+    recovery_coordinator_registered,
+)
+
+snapshot_path = control_last_valid_snapshot_path(Path(control_path))
+try:
+    with open(snapshot_path, encoding="utf-8") as handle:
+        snapshot = json.load(handle)
+    if not isinstance(snapshot, dict):
+        raise ValueError("snapshot must be a JSON object")
+    if not recovery_coordinator_registered(snapshot):
+        raise ValueError("snapshot is not registered to the recovery coordinator")
+    decode_recovery_control_state(snapshot, expected_symbol=symbol)
+except (OSError, UnicodeError, TypeError, ValueError, RecoveryStateStoreError) as exc:
+    print(
+        f"last-valid recovery control snapshot is not valid for {symbol}: {exc}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+}
+
 require_coordinator_timer() {
   if ! systemctl is-active --quiet "${COORDINATOR_TIMER_UNIT}.timer"; then
     echo "recovery coordinator timer is not active: ${COORDINATOR_TIMER_UNIT}.timer" >&2
@@ -417,6 +450,7 @@ case "$ACTION" in
     require_coordinator_heartbeat
     require_coordinator_watchdog_heartbeat
     require_coordinator_alert_delivery
+    require_last_valid_control_snapshot
     if [[ "$(restart_policy)" != "no" ]]; then
       echo "recovery-managed runner must use Restart=no: $SERVICE_NAME" >&2
       exit 1
@@ -434,6 +468,7 @@ case "$ACTION" in
     require_coordinator_heartbeat
     require_coordinator_watchdog_heartbeat
     require_coordinator_alert_delivery
+    require_last_valid_control_snapshot
     temporary_path="$(mktemp)"
     trap 'rm -f "$temporary_path"' EXIT
     printf '[Service]\nRestart=no\n' >"$temporary_path"
