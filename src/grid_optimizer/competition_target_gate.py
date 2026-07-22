@@ -825,6 +825,92 @@ def main() -> None:
             now=now,
         )
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        deadline_expired = bool(
+            run_contract.run_end_time is not None
+            and now >= run_contract.run_end_time
+            and a.target > 0
+        )
+        if deadline_expired and a.enforce:
+            try:
+                load_live_runner_contract(workdir=a.workdir, slug=slug)
+            except (OSError, TypeError, ValueError) as live_exc:
+                if str(live_exc) in {
+                    "live runner pid is unavailable",
+                    "live runner command is unavailable",
+                }:
+                    observed = {
+                        "gross_notional": 0.0,
+                        "realized_pnl": 0.0,
+                        "wear_per_10k": 0.0,
+                        "trade_count": 0,
+                        "target": float(a.target),
+                        "first": wear_first,
+                        "wear_stop": wear_stop,
+                        "window_start": authoritative_snapshot[
+                            "runtime_guard_stats_start_time"
+                        ],
+                        "window_end": authoritative_snapshot["run_end_time"],
+                        "query_end": authoritative_snapshot["run_end_time"],
+                        "observation_status": "unavailable",
+                        "observation_error": f"{type(exc).__name__}: {exc}",
+                    }
+                    try:
+                        intent, created = submit_lifecycle_intent(
+                            workdir=a.workdir,
+                            symbol=sym,
+                            trigger_reason="observation_unavailable_at_deadline",
+                            requested_at=ts,
+                            observed=observed,
+                            run_contract_config={
+                                **cfg,
+                                **authoritative_snapshot,
+                            },
+                        )
+                    except (
+                        OSError,
+                        UnicodeError,
+                        json.JSONDecodeError,
+                        TypeError,
+                        ValueError,
+                    ) as submit_exc:
+                        print(
+                            json.dumps(
+                                {
+                                    "ts": ts,
+                                    "target": a.target,
+                                    "hit_target": False,
+                                    "hit_wear": False,
+                                    "enforce": a.enforce,
+                                    "action": "LIFECYCLE_INTENT_SUBMISSION_FAILED",
+                                    "config_error": "trade_query_incomplete",
+                                    "run_contract_id": control_contract_id,
+                                    "error": str(submit_exc),
+                                }
+                            )
+                        )
+                        return
+                    print(
+                        json.dumps(
+                            {
+                                "ts": ts,
+                                "target": a.target,
+                                "hit_target": False,
+                                "hit_wear": False,
+                                "enforce": a.enforce,
+                                "action": (
+                                    "LIFECYCLE_INTENT_SUBMITTED"
+                                    if created
+                                    else "LIFECYCLE_INTENT_ALREADY_PENDING"
+                                ),
+                                "trigger": "observation_unavailable_at_deadline",
+                                "run_contract_id": control_contract_id,
+                                "live_runner_contract": "unavailable_at_deadline",
+                                "intent_id": intent["intent_id"],
+                                "intent_path": str(_terminal_intent_path(a.workdir, slug)),
+                            }
+                        )
+                    )
+                    return
         print(
             json.dumps(
                 {

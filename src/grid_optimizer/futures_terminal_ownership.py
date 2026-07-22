@@ -36,7 +36,12 @@ TERMINAL_INTENT_STATUSES = (
     TERMINAL_INTENT_ACTIVE_STATUSES | TERMINAL_INTENT_COMPLETED_STATUSES
 )
 TERMINAL_INTENT_TRIGGER_REASONS = frozenset(
-    {"target_reached", "target_unmet_deadline", "wear_limit_breached"}
+    {
+        "target_reached",
+        "target_unmet_deadline",
+        "observation_unavailable_at_deadline",
+        "wear_limit_breached",
+    }
 )
 
 TERMINAL_DRAIN_SCHEMA = "futures_terminal_drain_runtime_v1"
@@ -303,6 +308,16 @@ def validate_terminal_intent(
             or "after_end_window" not in runtime_reasons
         ):
             _invalid("terminal_intent_deadline_proof_invalid")
+    elif trigger_reason == "observation_unavailable_at_deadline":
+        if (
+            observed_target <= 0
+            or query_end != window_end
+            or requested_at < window_end
+            or observed.get("observation_status") != "unavailable"
+            or not isinstance(observed.get("observation_error"), str)
+            or not observed["observation_error"].strip()
+        ):
+            _invalid("terminal_intent_observation_unavailable_proof_invalid")
     else:
         snapshot_first = canonical_snapshot.get(
             "lifecycle_wear_stop_min_gross_notional"

@@ -535,6 +535,48 @@ def test_gate_deadline_unmet_submits_intent_when_runner_is_unavailable(
     ]
 
 
+def test_gate_deadline_observation_failure_submits_explicit_terminal_intent(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    control = _control(tmp_path, "arxusdt", 100_000)
+    monkeypatch.setattr(
+        tg,
+        "_now",
+        lambda: datetime(2026, 7, 17, 0, 1, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        tg,
+        "daily_vol_wear",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("exchange unavailable")),
+    )
+
+    _run_gate_main(
+        monkeypatch,
+        [
+            "--symbol",
+            "ARXUSDT",
+            "--service",
+            "grid-loop@ARXUSDT.service",
+            "--workdir",
+            str(tmp_path),
+            "--enforce",
+        ],
+    )
+
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["action"] == "LIFECYCLE_INTENT_SUBMITTED"
+    assert out["trigger"] == "observation_unavailable_at_deadline"
+    intent = json.loads(
+        (tmp_path / "output" / "arxusdt_terminal_intent.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert intent["trigger_reason"] == "observation_unavailable_at_deadline"
+    assert intent["run_contract_id"] == tg.run_contract_identity_from_config(control)
+    assert intent["observed"]["observation_status"] == "unavailable"
+    assert "exchange unavailable" in intent["observed"]["observation_error"]
+
+
 def test_registered_gate_place_tp_now_is_deferred_before_exchange_order(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:

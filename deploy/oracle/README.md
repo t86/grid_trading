@@ -464,6 +464,9 @@ Built-in production-safety behaviour of the target gate (no cron flags needed):
   `target_unmet_deadline` intent，并附带完整窗口和 `after_end_window` 证明；即使 runner 的 PID/命令
   已不可用也允许这一次 intent 提交，使 watchdog 能启动终止所有者续做。若仍可读取的 live runner
   契约与 control 不一致，仍失败关闭，绝不以截止时间覆盖另一运行。
+- 若 runner 已不可用且到期窗口的成交查询也失败，则提交带查询错误、窗口截止和不可观测标记的
+  `observation_unavailable_at_deadline` intent；它不把哨兵零值当作真实成交，只要求 terminal owner
+  按冻结退出契约收敛，避免无限等待交易所统计恢复。
 - `--enforce` 只发布带版本、可幂等的 `futures_lifecycle_intent_v2`。intent 内嵌完整
   `futures_run_contract_snapshot_v3`，并绑定 `futures-run-contract-v3-<digest>`；运行器和 watchdog
   都重新规范化并复算摘要，字段被改写、摘要不匹配或状态未知时可见失败关闭。
