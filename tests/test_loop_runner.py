@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import grid_optimizer.loop_runner as loop_runner_module
 from grid_optimizer.audit import build_audit_paths
@@ -17610,7 +17610,9 @@ class LoopRunnerTests(unittest.TestCase):
         execute_plan_report(args, plan_report)
 
         reduce_only_values = [call.kwargs["reduce_only"] for call in mock_post_order.call_args_list]
-        self.assertEqual(reduce_only_values, [None, None, True, True, True])
+        # The per-symbol coordinator puts inventory-reducing mutations ahead
+        # of fresh entries, so reduce-only roles are submitted first.
+        self.assertEqual(reduce_only_values, [True, True, True, None, None])
         mock_update_inventory_grid_refs.assert_called_once()
         mock_update_refs.assert_called_once()
 
@@ -18322,9 +18324,23 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertTrue(report["executed"])
         self.assertEqual(report["account_snapshot_sources"]["account_info"], "rest")
-        self.assertEqual(report["account_snapshot_sources"]["open_orders"], "user_data_stream")
+        self.assertEqual(
+            report["account_snapshot_sources"]["open_orders"],
+            "rest_initial_stream_hydration",
+        )
         mock_account_info.assert_called_once_with("key", "secret", recv_window=5000, use_cache=False)
-        mock_open_orders.assert_called_once_with("BILLUSDT", "key", "secret", recv_window=5000, use_cache=False)
+        mock_open_orders.assert_has_calls(
+            [
+                call("BILLUSDT", "key", "secret", recv_window=5000),
+                call(
+                    "BILLUSDT",
+                    "key",
+                    "secret",
+                    recv_window=5000,
+                    use_cache=False,
+                ),
+            ]
+        )
 
     @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
     @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")

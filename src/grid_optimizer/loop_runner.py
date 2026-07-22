@@ -2297,16 +2297,13 @@ def _run_periodic_reconcile(
         actual_open_order_count = int(observed_open_order_state.get("active_order_count", 0) or 0)
         total_open_order_count = None
         open_orders_source = str(observed_open_order_state.get("source") or "observed_events")
-    stream_position = _snapshot_runner_account_position(args, symbol)
-    if stream_position is not None:
-        current_position = stream_position
-        account_position_source = "user_data_stream"
-    else:
-        stale_stream_position = _snapshot_runner_account_position(args, symbol, max_age_seconds=-1.0)
-        account_info = _fetch_runner_account_info_rest(api_key, api_secret, recv_window=recv_window)
-        current_position = extract_symbol_position(account_info, symbol)
-        stream_position = stale_stream_position
-        account_position_source = "rest"
+    # The stream is a low-latency observation channel, not the periodic
+    # reconciliation authority.  A missed account update must not turn an
+    # exchange/local position drift into a false healthy result.
+    stream_position = _snapshot_runner_account_position(args, symbol, max_age_seconds=-1.0)
+    account_info = _fetch_runner_account_info_rest(api_key, api_secret, recv_window=recv_window)
+    current_position = extract_symbol_position(account_info, symbol)
+    account_position_source = "rest"
     actual_net_qty = _safe_float(current_position.get("positionAmt"))
     open_order_diff = actual_open_order_count - int(expected_open_order_count or 0)
     actual_net_qty_diff = actual_net_qty - float(expected_actual_net_qty or 0.0)
@@ -8398,12 +8395,28 @@ def _isolated_frozen_actions_tolerate_position_drift(
         and abs(max(_safe_float(current_short_qty), 0.0) - expected_exchange_short_qty) <= 1e-9
     )
     if not exchange_position_matches:
-        # When frozen inventory is isolated, normal entries are only safe after
-        # the live exchange position matches active+frozen. Reduce-only actions
-        # and cancels may still proceed through the legacy tolerance below.
+        # Frozen inventory is an independent ledger.  A stale frozen snapshot
+        # must not pause ordinary volume indefinitely.  Normal entries remain
+        # safe only when their own side has no ordinary-position surplus; a
+        # reduce-only action keeps the stricter capacity checks below.
+        normal_long_qty = max(
+            _safe_float(current_long_qty) - max(_safe_float(frozen_long_qty), 0.0),
+            0.0,
+        )
+        normal_short_qty = max(
+            _safe_float(current_short_qty) - max(_safe_float(frozen_short_qty), 0.0),
+            0.0,
+        )
         for order in place_orders:
-            if not (bool(order.get("force_reduce_only")) and _is_hedge_side_reduce_order(order)):
-                return False
+            if bool(order.get("force_reduce_only")) and _is_hedge_side_reduce_order(order):
+                continue
+            side = str(order.get("side", "")).upper().strip()
+            position_side = _order_position_side(order)
+            if position_side == "LONG" and side == "BUY" and normal_long_qty <= _safe_float(expected_long_qty) + 1e-9:
+                continue
+            if position_side == "SHORT" and side == "SELL" and normal_short_qty <= _safe_float(expected_short_qty) + 1e-9:
+                continue
+            return False
     long_deficit = current_long_qty + 1e-9 < expected_long_qty
     short_deficit = current_short_qty + 1e-9 < expected_short_qty
     if not long_deficit and not short_deficit:
