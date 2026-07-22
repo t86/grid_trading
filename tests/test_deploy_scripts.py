@@ -1608,6 +1608,12 @@ def test_recovery_managed_runner_policy_enables_only_registered_symbol(
             "last-valid recovery control snapshot is not valid",
         ),
         (None, "missing", True, "no active target-gate scheduler found"),
+        (
+            json.dumps(_registered_control({"symbol": "BCHUSDT"})),
+            "dry_run",
+            True,
+            "no active target-gate scheduler found",
+        ),
         (None, "inactive_timer", True, "no active target-gate scheduler found"),
         (json.dumps(_registered_control({"symbol": "BCHUSDT"})), "cron", False, "runner watchdog timer is not active"),
     ],
@@ -1663,15 +1669,20 @@ def test_recovery_managed_runner_policy_refuses_enable_without_valid_recovery_sn
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "sudo").write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+    cron_gate = (
+        "*/5 * * * * python -m grid_optimizer.competition_target_gate --symbol BCHUSDT --enforce"
+        if target_gate_mode == "cron"
+        else (
+            "*/5 * * * * python -m grid_optimizer.competition_target_gate --symbol BCHUSDT"
+            if target_gate_mode == "dry_run"
+            else ""
+        )
+    )
     (fake_bin / "crontab").write_text(
-        (
-            "#!/bin/sh\n"
-            "if [ \"$1\" = -l ]; then\n"
-            "  echo '*/5 * * * * python -m grid_optimizer.competition_target_gate --symbol BCHUSDT --enforce'\n"
-            "fi\n"
-            if target_gate_mode == "cron"
-            else "#!/bin/sh\nexit 0\n"
-        ),
+        "#!/bin/sh\n"
+        "if [ \"$1\" = -l ]; then\n"
+        + (f"  echo '{cron_gate}'\n" if cron_gate else "")
+        + "fi\n",
         encoding="utf-8",
     )
     (fake_bin / "systemctl").write_text(

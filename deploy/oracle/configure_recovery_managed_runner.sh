@@ -215,6 +215,7 @@ def is_target_gate(command: str) -> bool:
             or "grid_optimizer.competition_target_gate" in lowered
         )
         and "--place-tp-now" not in lowered
+        and "--enforce" in lowered
     )
 
 if any(is_target_gate(line) for line in os.environ.get("CRON_TEXT", "").splitlines()):

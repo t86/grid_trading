@@ -822,13 +822,17 @@ def main() -> None:
         )
         return
 
-    _write_target_gate_heartbeat(
-        workdir=a.workdir,
-        slug=slug,
-        symbol=sym,
-        run_contract_id=control_contract_id,
-        checked_at=now,
-    )
+    # A dry-run proves only parser/config reachability.  It cannot submit the
+    # deadline terminal intent, so it must never satisfy the unattended-run
+    # liveness contract consumed by the coordinator watchdog.
+    if a.enforce:
+        _write_target_gate_heartbeat(
+            workdir=a.workdir,
+            slug=slug,
+            symbol=sym,
+            run_contract_id=control_contract_id,
+            checked_at=now,
+        )
 
     # Rebuild all enforcement terms from the owner's canonical snapshot. CLI
     # wear inputs remain accepted only so old scripts do not fail to parse.

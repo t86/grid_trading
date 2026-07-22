@@ -370,6 +370,7 @@ def test_gate_dry_run_does_not_cancel_frozen_tp(tmp_path: Path, monkeypatch, cap
     _run_gate_main(monkeypatch, ["--symbol", "ARXUSDT", "--service", "grid-loop@ARXUSDT.service",
                                  "--workdir", str(tmp_path)])
     assert canceled["n"] == 0
+    assert not (tmp_path / "output" / "arxusdt_target_gate_heartbeat.json").exists()
 
 
 def test_gate_rejects_bounded_control_without_owner_before_exchange_query(
