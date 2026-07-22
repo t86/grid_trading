@@ -1374,6 +1374,8 @@ def test_recovery_managed_runner_policy_requires_registered_coordinator_owner() 
     assert "allowloss_autorevert.py" in script
     assert "rollover_daily_window.py" in script
     assert "list-timers" in script
+    assert "list-units" in script
+    assert "active_services" in script
     assert "ExecStart" in script
     assert "unclassified systemd recovery executors" in script
     assert 'systemctl daemon-reload' in script
@@ -1569,6 +1571,91 @@ def test_recovery_managed_runner_policy_audit_rejects_an_unclassified_systemd_ti
     assert "legacy-bch.timer->legacy-bch.service" in completed.stderr
 
 
+def test_recovery_managed_runner_policy_audit_rejects_an_unclassified_active_systemd_service(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(_registered_control({"symbol": "BCHUSDT"})), encoding="utf-8"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "crontab").write_text("#!/bin/sh\n", encoding="utf-8")
+    (fake_bin / "systemctl").write_text(
+        "#!/bin/sh\n"
+        "case \"$1 $2 $3\" in\n"
+        "  'list-timers --all --no-legend') exit 0 ;;\n"
+        "  'list-units --type=service --state=active') echo 'legacy-stop-bch.service loaded active running Legacy BCH stop loop' ;;\n"
+        "  'show -p ExecStart') echo 'python output/ops/unknown_recovery.py --symbol BCHUSDT --enforce' ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "crontab").chmod(0o755)
+    (fake_bin / "systemctl").chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", "deploy/oracle/configure_recovery_managed_runner.sh", "audit", "BCHUSDT"],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PYTHON_BIN": sys.executable,
+            "RUNNER_SRC_DIR": str(Path.cwd() / "src"),
+            "OUTPUT_DIR": str(output_dir),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "unclassified systemd recovery executors remain" in completed.stderr
+    assert "legacy-stop-bch.service" in completed.stderr
+
+
+def test_recovery_managed_runner_policy_audit_allows_its_managed_runner_service(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(_registered_control({"symbol": "BCHUSDT"})), encoding="utf-8"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "crontab").write_text("#!/bin/sh\n", encoding="utf-8")
+    (fake_bin / "systemctl").write_text(
+        "#!/bin/sh\n"
+        "case \"$1 $2 $3\" in\n"
+        "  'list-timers --all --no-legend') exit 0 ;;\n"
+        "  'list-units --type=service --state=active') echo 'grid-loop@BCHUSDT.service loaded active running Managed runner' ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "crontab").chmod(0o755)
+    (fake_bin / "systemctl").chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", "deploy/oracle/configure_recovery_managed_runner.sh", "audit", "BCHUSDT"],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PYTHON_BIN": sys.executable,
+            "RUNNER_SRC_DIR": str(Path.cwd() / "src"),
+            "OUTPUT_DIR": str(output_dir),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_recovery_managed_runner_policy_audit_allows_target_gate_and_observers(
     tmp_path: Path,
 ) -> None:
@@ -1592,6 +1679,7 @@ def test_recovery_managed_runner_policy_audit_allows_target_gate_and_observers(
     (fake_bin / "systemctl").write_text(
         "#!/bin/sh\n"
         "if [ \"$1\" = list-timers ]; then exit 0; fi\n"
+        "if [ \"$1\" = list-units ]; then exit 0; fi\n"
         "exit 1\n",
         encoding="utf-8",
     )
@@ -1762,6 +1850,7 @@ def test_recovery_managed_runner_policy_refuses_stale_coordinator_heartbeat(
     (fake_bin / "systemctl").write_text(
         "#!/bin/sh\n"
         "if [ \"$1\" = list-timers ]; then exit 0; fi\n"
+        "if [ \"$1\" = list-units ]; then exit 0; fi\n"
         "if [ \"$1\" = is-active ]; then exit 0; fi\n"
         "exit 1\n",
         encoding="utf-8",
@@ -1816,6 +1905,7 @@ def test_recovery_managed_runner_policy_refuses_missing_watchdog_heartbeat(
     (fake_bin / "systemctl").write_text(
         "#!/bin/sh\n"
         "if [ \"$1\" = list-timers ]; then exit 0; fi\n"
+        "if [ \"$1\" = list-units ]; then exit 0; fi\n"
         "if [ \"$1\" = is-active ]; then exit 0; fi\n"
         "exit 1\n",
         encoding="utf-8",
@@ -1884,6 +1974,7 @@ def test_recovery_managed_runner_policy_refuses_unconfigured_alert_delivery(
     (fake_bin / "systemctl").write_text(
         "#!/bin/sh\n"
         "if [ \"$1\" = list-timers ]; then exit 0; fi\n"
+        "if [ \"$1\" = list-units ]; then exit 0; fi\n"
         "if [ \"$1\" = is-active ]; then exit 0; fi\n"
         "exit 1\n",
         encoding="utf-8",

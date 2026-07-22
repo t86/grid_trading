@@ -231,12 +231,13 @@ PY
     exit 1
   fi
 
-  systemd_findings="$("$PYTHON_BIN" - "$SYMBOL" <<'PY'
+  systemd_findings="$("$PYTHON_BIN" - "$SYMBOL" "$SERVICE_NAME" <<'PY'
 import re
 import subprocess
 import sys
 
 symbol = sys.argv[1].upper()
+managed_runner_service = sys.argv[2]
 symbol_pattern = re.compile(rf"(?<![A-Z0-9]){re.escape(symbol)}(?![A-Z0-9])")
 safe_symbol_adapters = (
     "bq_volume_recovery_guard.py",
@@ -258,6 +259,7 @@ except (OSError, subprocess.CalledProcessError):
     print("__systemd_timer_audit_unavailable__:list_timers")
     raise SystemExit(0)
 
+seen_services = set()
 for raw in timer_text.splitlines():
     timer = raw.split()[-1] if raw.split() else ""
     if not timer.endswith(".timer"):
@@ -276,11 +278,50 @@ for raw in timer_text.splitlines():
     except (OSError, subprocess.CalledProcessError):
         print(f"__systemd_timer_audit_unavailable__:{timer}")
         raise SystemExit(0)
+    seen_services.add(service)
     lowered = command.lower()
     if symbol_pattern.search(command.upper()) is None:
         continue
     if not any(adapter in lowered for adapter in safe_symbol_adapters):
         print(f"{timer}->{service}: {command}")
+
+try:
+    active_service_text = subprocess.check_output(
+        [
+            "systemctl",
+            "list-units",
+            "--type=service",
+            "--state=active",
+            "--no-legend",
+            "--no-pager",
+        ],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+except (OSError, subprocess.CalledProcessError):
+    print("__systemd_timer_audit_unavailable__:active_services")
+    raise SystemExit(0)
+
+for raw in active_service_text.splitlines():
+    service = raw.split()[0] if raw.split() else ""
+    if not service.endswith(".service") or service == managed_runner_service:
+        continue
+    if service in seen_services:
+        continue
+    try:
+        command = subprocess.check_output(
+            ["systemctl", "show", "-p", "ExecStart", "--value", service],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        print(f"__systemd_timer_audit_unavailable__:{service}")
+        raise SystemExit(0)
+    lowered = command.lower()
+    if symbol_pattern.search(command.upper()) is None:
+        continue
+    if not any(adapter in lowered for adapter in safe_symbol_adapters):
+        print(f"{service}: {command}")
 PY
 )"
   if [[ "$systemd_findings" == __systemd_timer_audit_unavailable__:* ]]; then
