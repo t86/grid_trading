@@ -521,6 +521,10 @@ envelope，再确认 `grid-bq-volume-recovery-guard.timer` 与其只读 watchdog
 ```bash
 APP_DIR=/home/ubuntu/wangge_api2 \
 COORDINATOR_TIMER_UNIT=grid-bq-volume-recovery-guard \
+deploy/oracle/configure_recovery_managed_runner.sh audit BCHUSDT
+
+APP_DIR=/home/ubuntu/wangge_api2 \
+COORDINATOR_TIMER_UNIT=grid-bq-volume-recovery-guard \
 deploy/oracle/configure_recovery_managed_runner.sh verify BCHUSDT
 
 APP_DIR=/home/ubuntu/wangge_api2 \
@@ -535,6 +539,9 @@ control 不能执行 `disable`，必须先在 runner 已停止且没有 terminal
 cleanup obligation、pending effect 或 terminal stop，再恢复注册前 baseline 并清除
 coordinator envelope；随后才允许 `disable` 移除 drop-in。这避免
 “回滚 systemd 成功、控制仍由协调器所有”造成双 writer。此工具本身不构成生产授权。
+`audit` 与 `enable`/`verify` 都会拒绝当前用户 crontab 中仍在写入该 symbol 的 legacy drift monitor、
+allow-loss 自动回收脚本或包含该 symbol 的旧 rollover job；target gate、已注册后只读的 health/liveness/budget
+观察器不在此名单内。
 
 Stale-plan guard fallback (`loop_runner`): the runtime guard normally reads the ledger-scoped
 `strategy_actual_net_notional` from the latest plan. Only when a **non-empty** persisted plan

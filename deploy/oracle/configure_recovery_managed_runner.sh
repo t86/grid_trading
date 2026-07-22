@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: configure_recovery_managed_runner.sh <enable|retire|disable|verify> <SYMBOL>
+Usage: configure_recovery_managed_runner.sh <audit|enable|retire|disable|verify> <SYMBOL>
 
 Enable writes a per-symbol systemd drop-in with Restart=no.  It refuses to
   operate unless the control document is already registered to the futures
@@ -16,7 +16,7 @@ EOF
 
 ACTION="${1:-}"
 SYMBOL="$(printf '%s' "${2:-}" | tr '[:lower:]' '[:upper:]')"
-if [[ "$ACTION" != "enable" && "$ACTION" != "retire" && "$ACTION" != "disable" && "$ACTION" != "verify" ]] || [[ ! "$SYMBOL" =~ ^[A-Z0-9]{3,20}$ ]]; then
+if [[ "$ACTION" != "audit" && "$ACTION" != "enable" && "$ACTION" != "retire" && "$ACTION" != "disable" && "$ACTION" != "verify" ]] || [[ ! "$SYMBOL" =~ ^[A-Z0-9]{3,20}$ ]]; then
   usage >&2
   exit 2
 fi
@@ -178,6 +178,41 @@ restart_policy() {
   systemctl show -p Restart --value "$SERVICE_NAME" | tr -d '[:space:]'
 }
 
+require_no_legacy_recovery_actuators() {
+  local cron_text matches
+  cron_text="$(crontab -l 2>/dev/null || true)"
+  matches="$(CRON_TEXT="$cron_text" "$PYTHON_BIN" - "$SYMBOL" <<'PY'
+import os
+import re
+import sys
+
+symbol = sys.argv[1].upper()
+slug = symbol.lower()
+symbol_pattern = re.compile(rf"(?<![A-Z0-9]){re.escape(symbol)}(?![A-Z0-9])")
+for raw in os.environ.get("CRON_TEXT", "").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    lowered = line.lower()
+    legacy_writer = (
+        f"output/ops/{slug}_ledger_drift_monitor.py" in lowered
+        or f"output/ops/{slug}_allowloss_autorevert.py" in lowered
+        or (
+            "rollover_daily_window.py" in lowered
+            and symbol_pattern.search(line.upper()) is not None
+        )
+    )
+    if legacy_writer:
+        print(line)
+PY
+)"
+  if [[ -n "$matches" ]]; then
+    echo "legacy recovery actuators remain for $SYMBOL; disable or migrate them before ownership cutover:" >&2
+    printf '%s\n' "$matches" >&2
+    exit 1
+  fi
+}
+
 require_runner_inactive_without_terminal_artifacts() {
   if systemctl is-active --quiet "$SERVICE_NAME"; then
     echo "runner must be inactive before retiring recovery ownership: $SERVICE_NAME" >&2
@@ -226,11 +261,16 @@ PY
 }
 
 case "$ACTION" in
+  audit)
+    require_no_legacy_recovery_actuators
+    echo "no legacy recovery actuators found: $SYMBOL"
+    ;;
   verify)
     if ! registered_control; then
       echo "recovery registration is missing or invalid for $SYMBOL" >&2
       exit 1
     fi
+    require_no_legacy_recovery_actuators
     require_coordinator_timer
     require_coordinator_watchdog_timer
     require_coordinator_heartbeat
@@ -247,6 +287,7 @@ case "$ACTION" in
       echo "recovery registration is missing or invalid for $SYMBOL" >&2
       exit 1
     fi
+    require_no_legacy_recovery_actuators
     require_coordinator_timer
     require_coordinator_watchdog_timer
     require_coordinator_heartbeat

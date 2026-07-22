@@ -1356,7 +1356,7 @@ def test_recovery_managed_runner_policy_requires_registered_coordinator_owner() 
         "deploy/oracle/configure_recovery_managed_runner.sh"
     ).read_text(encoding="utf-8")
 
-    assert "enable|retire|disable|verify" in script
+    assert "audit|enable|retire|disable|verify" in script
     assert "recovery_coordinator_registered" in script
     assert "decode_recovery_control_state" in script
     assert 'Restart=no' in script
@@ -1369,6 +1369,10 @@ def test_recovery_managed_runner_policy_requires_registered_coordinator_owner() 
     assert "recovery_coordinator_watchdog_heartbeat_v1" in script
     assert "futures_recovery_guard_heartbeat_v1" in script
     assert "registered control must be retired before disabling" in script
+    assert "require_no_legacy_recovery_actuators" in script
+    assert "ledger_drift_monitor.py" in script
+    assert "allowloss_autorevert.py" in script
+    assert "rollover_daily_window.py" in script
     assert 'systemctl daemon-reload' in script
 
 
@@ -1467,6 +1471,96 @@ def test_recovery_managed_runner_policy_enables_only_registered_symbol(
     assert "daemon-reload" in calls
     assert "start grid-loop@BCHUSDT.service" not in calls
     assert "restart grid-loop@BCHUSDT.service" not in calls
+
+
+@pytest.mark.parametrize(
+    "legacy_writer",
+    [
+        "python output/ops/bchusdt_ledger_drift_monitor.py --enforce",
+        "python output/ops/bchusdt_allowloss_autorevert.py --enforce",
+        "python output/ops/rollover_daily_window.py --symbols BCHUSDT,ARXUSDT",
+    ],
+)
+def test_recovery_managed_runner_policy_audit_rejects_a_legacy_symbol_writer(
+    tmp_path: Path,
+    legacy_writer: str,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(_registered_control({"symbol": "BCHUSDT"})), encoding="utf-8"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "crontab").write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = -l ]; then\n"
+        f"  echo \"*/10 * * * * {legacy_writer}\"\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "crontab").chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", "deploy/oracle/configure_recovery_managed_runner.sh", "audit", "BCHUSDT"],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PYTHON_BIN": sys.executable,
+            "RUNNER_SRC_DIR": str(Path.cwd() / "src"),
+            "OUTPUT_DIR": str(output_dir),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "legacy recovery actuators remain" in completed.stderr
+    assert legacy_writer in completed.stderr
+
+
+def test_recovery_managed_runner_policy_audit_allows_target_gate_and_observers(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "bchusdt_loop_runner_control.json").write_text(
+        json.dumps(_registered_control({"symbol": "BCHUSDT"})), encoding="utf-8"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "crontab").write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = -l ]; then\n"
+        "  echo \"*/5 * * * * python output/ops/competition_target_gate.py --symbol BCHUSDT --enforce\"\n"
+        "  echo \"*/5 * * * * python output/ops/competition_health_monitor.py --symbol BCHUSDT --enforce\"\n"
+        "  echo \"*/5 * * * * python output/ops/bq_liveness_terminal_guard.py --symbol BCHUSDT --enforce\"\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "crontab").chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", "deploy/oracle/configure_recovery_managed_runner.sh", "audit", "BCHUSDT"],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PYTHON_BIN": sys.executable,
+            "RUNNER_SRC_DIR": str(Path.cwd() / "src"),
+            "OUTPUT_DIR": str(output_dir),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "no legacy recovery actuators found: BCHUSDT" in completed.stdout
 
 
 def test_recovery_managed_runner_policy_refuses_stale_coordinator_heartbeat(
