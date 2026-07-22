@@ -168,7 +168,7 @@ runner state 的所有读改写同样按 symbol 单一所有权执行。运行�
 
 撤单与下单使用相同的提交前 fence。每笔交易所 delete 之前必须重新读取当前 recovery generation、decision、profile 和运行时安全信号；managed 撤单只有仍匹配计划快照才可执行，方向性 position-cap 信号下只允许撤增险方向。换代、租约到期、信号变为无方向或所有权后来被接管时，旧撤单记录为 `skipped_cancels`，不得执行。
 
-注册前若现有冻结库存摘要或 lot 无效，或 control/baseline 仍启用 `best_quote_maker_volume_reduce_freeze_enabled` 冻结创建能力，所有权切换直接拒绝；已校验的正数冻结账本可原样保留，且始终与普通仓位、普通软硬阈值和刷量恢复隔离。这只是阻止不完整的 `FROZEN_LEDGER_REPAIR` 接管，不代表冻结修复已实现。扁平受管字段漂移、遗留原始 `allow_loss=true` 和损坏的普通回执 journal 分别进入单独的本地修复轮次，下一轮再恢复决策，不能依赖人工清理布尔状态。
+注册前若现有冻结库存摘要或 lot 无效，或 control/baseline 仍启用 `best_quote_maker_volume_reduce_freeze_enabled` 冻结创建能力，所有权切换直接拒绝；已校验的正数冻结账本可原样保留，且始终与普通仓位、普通软硬阈值和刷量恢复隔离。已注册运行中，只有“当前隔离账本为空、最近重启备份含有效冻结 lots、且本轮交易所分侧仓位仍覆盖每笔备份冻结量”这一可证明场景可进入 `FROZEN_LEDGER_REPAIR`：协调器单独恢复冻结账本，再以 `exchange - frozen` 重建普通 lots；它不下单、不改冻结数量、不把冻结仓位计入普通上限。其他坏 ledger 仍失败关闭并要求专用迁移，不能猜测性修复。扁平受管字段漂移、遗留原始 `allow_loss=true` 和损坏的普通回执 journal 分别进入单独的本地修复轮次，下一轮再恢复决策，不能依赖人工清理布尔状态。
 
 改造基线 `main` 已包含的普通 BQ 入场受阻时定向 reduce-only、双侧 entry 受阻时恢复减仓单、ARX 低速时恢复双边近价 maker/临时容量、partial maker book drift 和“近期 submit 只抑制重启但不抑制独立流量恢复”等修复，已作为表征门禁映射到注册 symbol 的 `FlowBlockerAssessment`/标准动作和运行器回执。未注册 symbol 仍保留旧路径；冻结账本专用修复和生产迁移夹具未验证前，不得删除这些兼容路径或将已注册 symbol 当作已可生产启用。
 

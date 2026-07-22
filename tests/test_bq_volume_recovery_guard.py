@@ -976,6 +976,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                         }
                     ],
                 )
+                guard_state: dict[str, object] = {}
                 result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
                     symbol="BCHUSDT",
                     output_dir=output_dir,
@@ -5256,6 +5257,149 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(20.0, restored["best_quote_volume_ledger"]["long_lots"][0]["qty"])
             self.assertEqual(5.0, restored["best_quote_volume_ledger"]["short_lots"][0]["qty"])
             self.assertTrue(Path(result["archived_state_path"]).exists())
+
+    def test_frozen_ledger_reset_restore_is_symbol_generic_and_never_moves_positions(self) -> None:
+        now = datetime(2026, 7, 14, tzinfo=timezone.utc)
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            state_path = output_dir / "bchusdt_loop_state.json"
+            backup_path = state_path.with_name(state_path.name + ".bak_bq_recovery_restart")
+            _write_json(
+                state_path,
+                {
+                    "best_quote_volume_ledger": {
+                        "initialized": True,
+                        "bootstrap_source": "empty_due_to_reduce_freeze_isolation",
+                    }
+                },
+            )
+            _write_json(
+                backup_path,
+                {
+                    "best_quote_frozen_inventory": {
+                        "long_lots": [{"qty": 4.0, "price": 100.0}],
+                        "short_lots": [],
+                    },
+                    "best_quote_volume_ledger": {
+                        "initialized": True,
+                        "long_lots": [{"qty": 2.0, "price": 99.0}],
+                        "short_lots": [],
+                    },
+                },
+            )
+            os.utime(backup_path, (now.timestamp(), now.timestamp()))
+
+            restored = bq_volume_recovery_guard._restore_frozen_ledger_after_reset(
+                output_dir=output_dir,
+                symbol="BCHUSDT",
+                now=now,
+                dry_run=False,
+                position_snapshot_fetcher=lambda _symbol: {
+                    "long": {"qty": 5.0, "entry_price": 100.0},
+                    "short": {"qty": 0.0, "entry_price": 0.0},
+                },
+            )
+
+            self.assertEqual("restore_frozen_ledger_after_reset", restored["action"])
+            self.assertEqual(4.0, restored["frozen_long_qty"])
+            self.assertEqual(5.0, restored["live_long_qty"])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(4.0, state["best_quote_frozen_inventory"]["long_lots"][0]["qty"])
+            self.assertEqual(1.0, state["best_quote_volume_ledger"]["long_lots"][0]["qty"])
+
+    def test_registered_coordinator_owns_one_frozen_ledger_reset_repair(self) -> None:
+        now = datetime(2026, 7, 16, 2, tzinfo=timezone.utc)
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            JsonRecoveryStore(control_path).register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=now - timedelta(minutes=1),
+            )
+            state_path = output_dir / "bchusdt_loop_state.json"
+            backup_path = state_path.with_name(state_path.name + ".bak_bq_recovery_restart")
+            _write_json(
+                state_path,
+                {
+                    "best_quote_volume_ledger": {
+                        "initialized": True,
+                        "bootstrap_source": "empty_due_to_reduce_freeze_isolation",
+                    }
+                },
+            )
+            _write_json(
+                backup_path,
+                {
+                    "best_quote_frozen_inventory": {
+                        "long_lots": [{"qty": 4.0, "price": 100.0}],
+                        "short_lots": [],
+                    },
+                    "best_quote_volume_ledger": {
+                        "initialized": True,
+                        "long_lots": [{"qty": 2.0, "price": 99.0}],
+                        "short_lots": [],
+                    },
+                },
+            )
+            os.utime(backup_path, (now.timestamp(), now.timestamp()))
+
+            probe = bq_volume_recovery_guard._restore_frozen_ledger_after_reset(
+                output_dir=output_dir,
+                symbol="BCHUSDT",
+                now=now,
+                dry_run=True,
+                position_snapshot_fetcher=lambda _symbol: {
+                    "long": {"qty": 5.0, "entry_price": 100.0},
+                    "short": {"qty": 0.0, "entry_price": 0.0},
+                },
+            )
+            self.assertIsNotNone(probe)
+
+            with patch.object(
+                bq_volume_recovery_guard,
+                "_fetch_hedge_position_snapshot",
+                return_value={
+                    "long": {"qty": 5.0, "entry_price": 100.0},
+                    "short": {"qty": 0.0, "entry_price": 0.0},
+                },
+            ):
+                guard_state: dict[str, object] = {}
+                result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                    symbol="BCHUSDT",
+                    output_dir=output_dir,
+                    guard_state=guard_state,
+                    now=now,
+                    window_seconds=60,
+                    min_volume_notional=10,
+                    near_cap_ratio=0.95,
+                    far_ticks=8,
+                    plan_stale_seconds=300,
+                    dry_run=False,
+                    runner_wrapper="/unused",
+                    runner_active_fetcher=lambda _symbol: True,
+                    restart_runner=lambda _symbol: (_ for _ in ()).throw(
+                        AssertionError("frozen ledger local repair restarted runner")
+                    ),
+                )
+
+            self.assertIn(
+                "registered_frozen_ledger_reset_repair",
+                guard_state.get("symbols", {}).get("BCHUSDT", {}),
+            )
+            self.assertEqual("coordinator_frozen_ledger_repair_enter", result["action"])
+            self.assertEqual("active", result["phase"])
+            self.assertEqual("local_state_repair", result["effect_stage"])
+            self.assertEqual(1, result["effect_count"])
+            restored = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertIn("best_quote_frozen_inventory", restored, msg=str(result))
+            self.assertEqual(4.0, restored["best_quote_frozen_inventory"]["long_lots"][0]["qty"])
+
 
     def test_arx_runner_error_loop_ignores_old_error_after_success(self) -> None:
         with TemporaryDirectory() as temp_dir:

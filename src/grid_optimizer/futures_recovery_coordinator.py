@@ -1113,6 +1113,7 @@ def _evaluate_frozen_ledger(
                     "recovery_order_role": OrderRole.FROZEN_HEDGE_ADJUST.value,
                     "recovery_order_ledger_class": LedgerClass.FROZEN_BQ.value,
                 },
+                effect_stage=EffectStage.LOCAL_STATE_REPAIR,
             ),
         )
     )

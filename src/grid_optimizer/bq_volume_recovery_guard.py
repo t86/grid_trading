@@ -2709,7 +2709,7 @@ def _best_quote_lot_average_price(lots: Any, fallback: float) -> float:
     return max(float(fallback), 0.0)
 
 
-def _restore_arx_frozen_ledger_after_reset(
+def _restore_frozen_ledger_after_reset(
     *,
     output_dir: Path,
     symbol: str,
@@ -2718,11 +2718,9 @@ def _restore_arx_frozen_ledger_after_reset(
     position_snapshot_fetcher: HedgePositionFetcher | None = None,
 ) -> dict[str, Any] | None:
     normalized_symbol = symbol.upper().strip()
-    if normalized_symbol != "ARXUSDT":
-        return None
     state_path = Path(output_dir) / f"{normalized_symbol.lower()}_loop_state.json"
     with exclusive_json_state_lock(state_path):
-        return _restore_arx_frozen_ledger_after_reset_unlocked(
+        return _restore_frozen_ledger_after_reset_unlocked(
             output_dir=output_dir,
             symbol=symbol,
             now=now,
@@ -2731,7 +2729,26 @@ def _restore_arx_frozen_ledger_after_reset(
         )
 
 
-def _restore_arx_frozen_ledger_after_reset_unlocked(
+def _restore_arx_frozen_ledger_after_reset(
+    *,
+    output_dir: Path,
+    symbol: str,
+    now: datetime,
+    dry_run: bool,
+    position_snapshot_fetcher: HedgePositionFetcher | None = None,
+) -> dict[str, Any] | None:
+    if symbol.upper().strip() != "ARXUSDT":
+        return None
+    return _restore_frozen_ledger_after_reset(
+        output_dir=output_dir,
+        symbol=symbol,
+        now=now,
+        dry_run=dry_run,
+        position_snapshot_fetcher=position_snapshot_fetcher,
+    )
+
+
+def _restore_frozen_ledger_after_reset_unlocked(
     *,
     output_dir: Path,
     symbol: str,
@@ -2749,8 +2766,6 @@ def _restore_arx_frozen_ledger_after_reset_unlocked(
     replayed as stale inventory.
     """
     normalized_symbol = symbol.upper().strip()
-    if normalized_symbol != "ARXUSDT":
-        return None
     state_path = Path(output_dir) / f"{normalized_symbol.lower()}_loop_state.json"
     backup_path = state_path.with_name(state_path.name + ".bak_bq_recovery_restart")
     current = _read_json(state_path)
@@ -2789,7 +2804,11 @@ def _restore_arx_frozen_ledger_after_reset_unlocked(
 
     result = {
         "symbol": normalized_symbol,
-        "action": "dry_run_restore_arx_frozen_ledger_after_reset" if dry_run else "restore_arx_frozen_ledger_after_reset",
+        "action": (
+            "dry_run_restore_frozen_ledger_after_reset"
+            if dry_run
+            else "restore_frozen_ledger_after_reset"
+        ),
         "changed_keys": ["best_quote_frozen_inventory", "best_quote_volume_ledger"],
         "backup_path": str(backup_path),
         "dry_run": dry_run,
@@ -10273,6 +10292,8 @@ def _registered_blockers_with_ordinary_flow(
         safety_observed_at=base.safety_observed_at,
         runner_faults=base.runner_faults,
         unknown_order_ownership=base.unknown_order_ownership,
+        frozen_ledger_repair_required=base.frozen_ledger_repair_required,
+        frozen_repair_side=base.frozen_repair_side,
         inventory_reduce_sides=inventory_sides,
         loss_only_blocked_sides=loss_sides,
         missing_entry_sides=missing_entry_sides,
@@ -11017,6 +11038,19 @@ def run_registered_recovery_symbol_round(
         assessment=legacy_assessment,
         preflight_results=preflight_results,
     )
+    frozen_reset_repair = _restore_frozen_ledger_after_reset(
+        output_dir=output_dir,
+        symbol=normalized,
+        now=now,
+        dry_run=True,
+    )
+    if frozen_reset_repair is not None:
+        mapped_blockers = replace(
+            mapped_blockers,
+            frozen_ledger_repair_required=True,
+            frozen_repair_side=None,
+        )
+        runtime_item["registered_frozen_ledger_reset_repair"] = frozen_reset_repair
     if volatility_safety_observation is not None:
         mapped_blockers = _blockers_with_volatility_safety_observation(
             mapped_blockers,
@@ -11093,6 +11127,7 @@ def run_registered_recovery_symbol_round(
                 or blockers.runner_faults
                 or blockers.safety_reasons
                 or blockers.unknown_order_ownership
+                or blockers.frozen_ledger_repair_required
                 or recovery_state.active_action
                 in {
                     ActionId.RUNNER_RECOVER,
@@ -11334,6 +11369,43 @@ def run_registered_recovery_symbol_round(
 
     def execute_effect(effect_symbol: str, command: Any) -> None:
         current = store.read(effect_symbol)
+        if (
+            command.stage is EffectStage.LOCAL_STATE_REPAIR
+            and current.active_action is ActionId.FROZEN_LEDGER_REPAIR
+        ):
+            repaired = _restore_frozen_ledger_after_reset(
+                output_dir=output_dir,
+                symbol=effect_symbol,
+                now=now,
+                dry_run=False,
+            )
+            if repaired is None:
+                raise RuntimeError("frozen ledger reset repair is no longer provable")
+            obligation = current.cleanup_obligation
+            if obligation is None:
+                raise RuntimeError("frozen ledger reset repair has no cleanup obligation")
+            receipt = EffectReceipt(
+                decision_id=command.decision_id,
+                stage=command.stage,
+                effect_epoch=command.effect_epoch,
+                observed_at=now,
+            )
+            cleanup = CleanupProof(
+                source_decision_id=obligation.source_decision_id,
+                source_generation=obligation.managed_order_manifest.generation,
+                manifest_digest=obligation.managed_order_manifest.digest,
+                remaining_order_ids=(),
+                user_trades_watermark=0,
+                observed_at=now,
+            )
+            _store_registered_runtime_evidence(
+                runtime_item,
+                recovery_state=current,
+                effect_receipt=receipt,
+                cleanup_proof=cleanup,
+            )
+            runtime_item["registered_frozen_ledger_reset_repair"] = repaired
+            return
         if command.stage in {
             EffectStage.RUNNER_RESTART,
             EffectStage.RUNNER_STOP,
