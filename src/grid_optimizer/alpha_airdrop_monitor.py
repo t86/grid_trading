@@ -370,6 +370,7 @@ def _select_notification_candidates(
         if count >= 3:
             continue
         candidate = dict(match)
+        candidate["bark_notification_sent"] = bool(current.get("bark_notification_sent"))
         candidate["notification_sequence"] = count + 1
         candidate["detected_at"] = now.astimezone(UTC).isoformat()
         candidates.append(candidate)
@@ -382,12 +383,31 @@ def _update_state_for_candidates(state: dict[str, Any], candidates: list[dict[st
         key = _build_match_key(candidate)
         current = updated.get(key) if isinstance(updated.get(key), dict) else {}
         updated[key] = {
+            **current,
             "notification_count": int(current.get("notification_count") or 0) + 1,
             "last_notified_at": now.astimezone(UTC).isoformat(),
             "tweet_url": candidate.get("tweet_url"),
             "created_at": candidate.get("created_at"),
             "points_threshold": candidate.get("points_threshold"),
             "text": candidate.get("text"),
+        }
+    return updated
+
+
+def _update_state_for_bark_candidates(
+    state: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    updated = dict(state)
+    for candidate in candidates:
+        key = _build_match_key(candidate)
+        current = updated.get(key) if isinstance(updated.get(key), dict) else {}
+        updated[key] = {
+            **current,
+            "bark_notification_sent": True,
+            "bark_last_notified_at": now.astimezone(UTC).isoformat(),
         }
     return updated
 
@@ -464,6 +484,52 @@ def _build_bark_body(post: dict[str, Any]) -> str:
     return f"积分门槛 {post.get('points_threshold')}，第 {post.get('notification_sequence')}/3 次提醒\n{summary}"
 
 
+def _is_airdrop_time_passed(post: dict[str, Any], *, now: datetime, tz_offset_hours: int) -> bool:
+    time_hint = str(post.get("time_hint_text") or "")
+    time_match = re.search(r"(\d{1,2}):(\d{2})", time_hint)
+    if time_match is None:
+        return False
+
+    try:
+        created_at = datetime.fromisoformat(str(post.get("created_at") or ""))
+    except ValueError:
+        return False
+    if created_at.tzinfo is None:
+        return False
+
+    offset_match = re.search(r"utc\s*([+-]\d+)?", time_hint, re.IGNORECASE)
+    offset_hours = int(offset_match.group(1) or 0) if offset_match else tz_offset_hours
+    schedule_tz = timezone(timedelta(hours=offset_hours))
+    scheduled_day = created_at.astimezone(schedule_tz).date()
+    text = str(post.get("text") or "")
+    chinese_date = _EXPLICIT_SCHEDULE_DAY_PATTERNS[0].search(text)
+    english_date = _EXPLICIT_SCHEDULE_DAY_PATTERNS[1].search(text)
+    try:
+        if chinese_date:
+            scheduled_day = scheduled_day.replace(month=int(chinese_date.group(1)), day=int(chinese_date.group(2)))
+        elif english_date:
+            month_text = english_date.group(0).split()[0].rstrip(".").casefold()
+            scheduled_day = scheduled_day.replace(month=_EN_MONTHS[month_text[:3]], day=int(english_date.group(1)))
+        else:
+            for pattern, day_offset in _RELATIVE_SCHEDULE_DAY_PATTERNS:
+                if pattern.search(text):
+                    scheduled_day += timedelta(days=day_offset)
+                    break
+        if (chinese_date or english_date) and scheduled_day < created_at.astimezone(schedule_tz).date():
+            scheduled_day = scheduled_day.replace(year=scheduled_day.year + 1)
+        scheduled_at = datetime(
+            scheduled_day.year,
+            scheduled_day.month,
+            scheduled_day.day,
+            int(time_match.group(1)),
+            int(time_match.group(2)),
+            tzinfo=schedule_tz,
+        )
+    except (KeyError, ValueError):
+        return False
+    return now.astimezone(schedule_tz) > scheduled_at
+
+
 def send_bark_notification(
     *,
     bark_endpoint_or_key: str,
@@ -523,6 +589,8 @@ def _send_notifications(
     *,
     alert_config_path: Path | None,
     bark_config_path: Path | None,
+    now: datetime,
+    tz_offset_hours: int,
 ) -> tuple[int, list[dict[str, Any]], int, list[dict[str, Any]]]:
     bark_config = load_bark_config(bark_config_path)
     email_sent = 0
@@ -530,14 +598,19 @@ def _send_notifications(
     bark_sent = 0
     bark_results: list[dict[str, Any]] = []
     for candidate in candidates:
-        bark_result = send_bark_notification(
-            bark_endpoint_or_key=str(bark_config.get("bark_endpoint") or ""),
-            bark_base_url=str(bark_config.get("bark_base_url") or DEFAULT_BARK_URL),
-            bark_level=str(bark_config.get("bark_level") or DEFAULT_BARK_LEVEL),
-            bark_sound=str(bark_config.get("bark_sound") or DEFAULT_BARK_SOUND),
-            bark_call=bool(bark_config.get("bark_call", True)),
-            post=candidate,
-        )
+        if candidate.get("bark_notification_sent"):
+            bark_result = {"sent": False, "error": "bark_already_sent", "url": None}
+        elif _is_airdrop_time_passed(candidate, now=now, tz_offset_hours=tz_offset_hours):
+            bark_result = {"sent": False, "error": "airdrop_time_passed", "url": None}
+        else:
+            bark_result = send_bark_notification(
+                bark_endpoint_or_key=str(bark_config.get("bark_endpoint") or ""),
+                bark_base_url=str(bark_config.get("bark_base_url") or DEFAULT_BARK_URL),
+                bark_level=str(bark_config.get("bark_level") or DEFAULT_BARK_LEVEL),
+                bark_sound=str(bark_config.get("bark_sound") or DEFAULT_BARK_SOUND),
+                bark_call=bool(bark_config.get("bark_call", True)),
+                post=candidate,
+            )
         bark_results.append(bark_result)
         if bark_result.get("sent"):
             bark_sent += 1
@@ -600,6 +673,8 @@ def check_alpha_airdrop_posts(
         candidates,
         alert_config_path=alert_config_path,
         bark_config_path=bark_config_path,
+        now=current_now,
+        tz_offset_hours=tz_offset_hours,
     )
     sent_candidates = [
         candidate
@@ -607,6 +682,12 @@ def check_alpha_airdrop_posts(
         if result.get("sent")
     ]
     new_state = _update_state_for_candidates(state, sent_candidates, now=current_now)
+    bark_sent_candidates = [
+        candidate
+        for candidate, result in zip(candidates, bark_results, strict=False)
+        if result.get("sent")
+    ]
+    new_state = _update_state_for_bark_candidates(new_state, bark_sent_candidates, now=current_now)
     _save_state(state_path, new_state)
     return {
         "checked_at": current_now.astimezone(UTC).isoformat(),

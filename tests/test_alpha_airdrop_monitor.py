@@ -17,12 +17,15 @@ from grid_optimizer.alpha_airdrop_monitor import (
     _extract_entries_from_syndication_html,
     _extract_entries_from_nitter_rss,
     _extract_time_hint_text,
+    _is_airdrop_time_passed,
     _is_today_in_tz,
     _load_state,
     load_bark_config,
     _match_alpha_airdrop_post,
+    _send_notifications,
     _select_notification_candidates,
     _update_state_for_candidates,
+    _update_state_for_bark_candidates,
     check_alpha_airdrop_posts,
     send_bark_notification,
 )
@@ -186,6 +189,102 @@ Eligible users can claim their airdrop using Binance Alpha Points on the Alpha E
             _extract_time_hint_text("请大家准备今天 17:00（UTC+8）领取币安 Alpha 空投并交易！"),
             "17:00（UTC+8）",
         )
+
+    def test_airdrop_time_passed_uses_the_announced_timezone(self) -> None:
+        post = {
+            "created_at": "2026-05-15T07:30:00+00:00",
+            "text": "请大家准备今天 17:00（UTC+8）领取币安 Alpha 空投并交易！",
+            "time_hint_text": "17:00（UTC+8）",
+        }
+
+        self.assertFalse(
+            _is_airdrop_time_passed(
+                post,
+                now=datetime(2026, 5, 15, 8, 59, tzinfo=timezone.utc),
+                tz_offset_hours=8,
+            )
+        )
+        self.assertTrue(
+            _is_airdrop_time_passed(
+                post,
+                now=datetime(2026, 5, 15, 9, 1, tzinfo=timezone.utc),
+                tz_offset_hours=8,
+            )
+        )
+
+    def test_send_notifications_skips_bark_after_announced_airdrop_time(self) -> None:
+        candidate = {
+            "created_at": "2026-05-15T07:30:00+00:00",
+            "text": "请大家准备今天 17:00（UTC+8）领取币安 Alpha 空投并交易！",
+            "time_hint_text": "17:00（UTC+8）",
+        }
+        with (
+            patch("grid_optimizer.alpha_airdrop_monitor.send_bark_notification") as send_bark,
+            patch(
+                "grid_optimizer.alpha_airdrop_monitor.send_alert_email",
+                return_value={"sent": True},
+            ),
+        ):
+            emails_sent, _, bark_sent, bark_results = _send_notifications(
+                [candidate],
+                alert_config_path=None,
+                bark_config_path=None,
+                now=datetime(2026, 5, 15, 9, 1, tzinfo=timezone.utc),
+                tz_offset_hours=8,
+            )
+
+        send_bark.assert_not_called()
+        self.assertEqual(emails_sent, 1)
+        self.assertEqual(bark_sent, 0)
+        self.assertEqual(bark_results, [{"sent": False, "error": "airdrop_time_passed", "url": None}])
+
+    def test_send_notifications_skips_bark_for_previously_notified_post(self) -> None:
+        candidate = {
+            "account": "binancezh",
+            "tweet_id": "100",
+            "bark_notification_sent": True,
+        }
+        with (
+            patch("grid_optimizer.alpha_airdrop_monitor.send_bark_notification") as send_bark,
+            patch(
+                "grid_optimizer.alpha_airdrop_monitor.send_alert_email",
+                return_value={"sent": True},
+            ),
+        ):
+            _, _, bark_sent, bark_results = _send_notifications(
+                [candidate],
+                alert_config_path=None,
+                bark_config_path=None,
+                now=datetime(2026, 5, 15, 9, 1, tzinfo=timezone.utc),
+                tz_offset_hours=8,
+            )
+
+        send_bark.assert_not_called()
+        self.assertEqual(bark_sent, 0)
+        self.assertEqual(bark_results, [{"sent": False, "error": "bark_already_sent", "url": None}])
+
+    def test_update_state_for_bark_candidates_marks_post_as_sent(self) -> None:
+        candidate = {"account": "binancezh", "tweet_id": "100"}
+
+        updated = _update_state_for_bark_candidates(
+            {},
+            [candidate],
+            now=datetime(2026, 5, 15, 9, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertTrue(updated[_build_match_key(candidate)]["bark_notification_sent"])
+
+    def test_update_state_for_email_candidates_preserves_bark_sent_marker(self) -> None:
+        candidate = {"account": "binancezh", "tweet_id": "100"}
+        state = {_build_match_key(candidate): {"bark_notification_sent": True}}
+
+        updated = _update_state_for_candidates(
+            state,
+            [candidate],
+            now=datetime(2026, 5, 15, 9, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertTrue(updated[_build_match_key(candidate)]["bark_notification_sent"])
 
     def test_is_today_in_tz_uses_utc_plus_8_day_boundary(self) -> None:
         now = datetime(2026, 5, 15, 1, 0, tzinfo=timezone.utc)
