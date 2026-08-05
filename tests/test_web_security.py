@@ -3215,7 +3215,7 @@ class WebSecurityTests(unittest.TestCase):
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
-    def test_resolve_runner_start_config_keeps_ethusdc_cycle_budget_executable_and_preserves_positions(
+    def test_resolve_runner_start_config_keeps_ethusdc_requested_cycle_budget_when_exchange_minimum_allows(
         self,
         mock_symbol_config,
         mock_book_tickers,
@@ -3238,7 +3238,28 @@ class WebSecurityTests(unittest.TestCase):
             config["best_quote_maker_volume_min_cycle_budget_notional"],
             config["best_quote_maker_volume_cycle_budget_notional"],
         )
+        self.assertTrue(config["autotune_min_order_notional_only"])
         self.assertFalse(config["runtime_guard_stop_auto_flatten_enabled"])
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_rejects_ethusdc_when_requested_order_is_below_exchange_minimum(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.01,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 20.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "1863.47", "ask_price": "1863.48"}]
+
+        with self.assertRaisesRegex(ValueError, "below exchange working minimum=20.0"):
+            _resolve_runner_start_config(
+                {"symbol": "ETHUSDC", "strategy_profile": "ethusdc_pharos_profit_grid_freeze_v1"}
+            )
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
