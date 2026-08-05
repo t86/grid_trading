@@ -30796,6 +30796,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         best_quote_cost_gate_reduce_fallback = {
             "reduce_short_orders": 0,
             "reduce_long_orders": 0,
+            "loss_protected_fallback_bypasses": 0,
         }
         best_quote_reduce_short_remaining = max(current_short_notional, 0.0)
         best_quote_reduce_long_remaining = max(current_long_notional, 0.0)
@@ -30907,13 +30908,23 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                             notional=fallback_notional,
                             source_order=item,
                         )
-                        if fallback is not None:
+                        fallback_is_non_loss = (
+                            fallback is not None
+                            and (
+                                current_short_avg_price <= 0
+                                or _safe_float(fallback.get("price")) <= current_short_avg_price + 1e-12
+                            )
+                        )
+                        if fallback_is_non_loss:
                             kept_buy_orders.append(fallback)
                             best_quote_reduce_short_remaining = max(
                                 best_quote_reduce_short_remaining - _safe_float(fallback.get("notional")),
                                 0.0,
                             )
                             best_quote_cost_gate_reduce_fallback["reduce_short_orders"] += 1
+                        elif fallback is not None:
+                            kept_buy_orders.append(item)
+                            best_quote_cost_gate_reduce_fallback["loss_protected_fallback_bypasses"] += 1
                 else:
                     kept_buy_orders.append(item)
             plan["buy_orders"] = kept_buy_orders
@@ -30985,13 +30996,23 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                             notional=fallback_notional,
                             source_order=item,
                         )
-                        if fallback is not None:
+                        fallback_is_non_loss = (
+                            fallback is not None
+                            and (
+                                current_long_avg_price <= 0
+                                or _safe_float(fallback.get("price")) >= current_long_avg_price - 1e-12
+                            )
+                        )
+                        if fallback_is_non_loss:
                             kept_sell_orders.append(fallback)
                             best_quote_reduce_long_remaining = max(
                                 best_quote_reduce_long_remaining - _safe_float(fallback.get("notional")),
                                 0.0,
                             )
                             best_quote_cost_gate_reduce_fallback["reduce_long_orders"] += 1
+                        elif fallback is not None:
+                            kept_sell_orders.append(item)
+                            best_quote_cost_gate_reduce_fallback["loss_protected_fallback_bypasses"] += 1
                 else:
                     kept_sell_orders.append(item)
             plan["sell_orders"] = kept_sell_orders
