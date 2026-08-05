@@ -1496,6 +1496,43 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
         self.assertTrue(plan["sell_orders"][0]["force_reduce_only"])
 
+    def test_best_quote_net_loss_reduce_uses_single_opposite_hedge_for_imbalanced_inventory(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_long_notional=500.0,
+                max_short_notional=500.0,
+                net_loss_reduce_enabled=True,
+                net_loss_reduce_min_loss=2.0,
+                net_loss_reduce_ratio=0.005,
+            ),
+            inputs=BestQuoteMakerVolumeInputs(
+                bid_price=100.0,
+                ask_price=100.1,
+                mid_price=100.05,
+                current_net_qty=0.42,
+                current_long_qty=1.06,
+                current_short_qty=0.64,
+                position_side_mode="hedge",
+                cycle_budget_notional=40.0,
+                loss_per_10k_15m=0.2,
+                target_volume_remaining=10_000.0,
+                unrealized_pnl=-4.0,
+                recent_realized_pnl=0.0,
+                tick_size=0.1,
+                step_size=0.001,
+                min_qty=0.001,
+                min_notional=5.0,
+            ),
+        )
+
+        guard = plan["metrics"]["net_loss_reduce"]
+        self.assertTrue(guard["active"])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
+        self.assertFalse(plan["sell_orders"][0].get("force_reduce_only", False))
+
     def test_best_quote_reduce_freeze_marks_losing_reduce_inventory_unmanaged(self) -> None:
         state: dict[str, object] = {
             "best_quote_volume_ledger": {

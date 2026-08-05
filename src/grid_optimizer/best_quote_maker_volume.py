@@ -513,6 +513,8 @@ def build_best_quote_maker_volume_plan(
         projected_short_entry_notional < short_soft
         and projected_short_entry_notional < short_limit
     )
+    entry_long_allowed_before_net_loss = allow_entry_long
+    entry_short_allowed_before_net_loss = allow_entry_short
     reduce_long_only = long_notional > 0 and not allow_entry_long
     reduce_short_only = short_notional > 0 and not allow_entry_short
     if reduce_long_only or reduce_short_only:
@@ -537,6 +539,7 @@ def build_best_quote_maker_volume_plan(
         "threshold_ratio": max(_safe_float(config.net_loss_reduce_ratio), 0.0),
         "min_inventory_notional": max(_safe_float(config.net_loss_reduce_min_inventory_notional), 0.0),
         "target_remaining_notional": 0.0,
+        "hedge_recovery_action": None,
     }
     realized_credit_ratio = max(_safe_float(config.net_loss_reduce_realized_credit_ratio), 0.0)
     net_pnl = _safe_float(inputs.unrealized_pnl) + (_safe_float(inputs.recent_realized_pnl) * realized_credit_ratio)
@@ -1569,6 +1572,46 @@ def build_best_quote_maker_volume_plan(
                     position_side=reduce_short_position_side,
                 )
             )
+
+    if net_loss_reduce_report["active"] and hedge_position_sides:
+        imbalance_notional = long_notional - short_notional
+        hedge_notional = min(cycle_budget, abs(imbalance_notional))
+        if imbalance_notional > 0 and short_notional > 0 and entry_short_allowed_before_net_loss:
+            if short_limit > 0:
+                hedge_notional = min(hedge_notional, max(short_limit - projected_short_entry_notional, 0.0))
+            hedge_orders = _build_entry_ladder(
+                side="SELL",
+                anchor_price=ask,
+                base_gap=gap,
+                total_notional=hedge_notional,
+                slots=1,
+                role="best_quote_entry_short",
+                inputs=inputs,
+                position_side=short_entry_position_side,
+            )
+            if hedge_orders:
+                buy_orders = []
+                sell_orders = hedge_orders
+                net_loss_reduce_report["hedge_recovery_action"] = "entry_short"
+                reasons.append("net_loss_hedge_recovery")
+        elif imbalance_notional < 0 and long_notional > 0 and entry_long_allowed_before_net_loss:
+            if long_limit > 0:
+                hedge_notional = min(hedge_notional, max(long_limit - projected_long_entry_notional, 0.0))
+            hedge_orders = _build_entry_ladder(
+                side="BUY",
+                anchor_price=bid,
+                base_gap=gap,
+                total_notional=hedge_notional,
+                slots=1,
+                role="best_quote_entry_long",
+                inputs=inputs,
+                position_side=long_entry_position_side,
+            )
+            if hedge_orders:
+                buy_orders = hedge_orders
+                sell_orders = []
+                net_loss_reduce_report["hedge_recovery_action"] = "entry_long"
+                reasons.append("net_loss_hedge_recovery")
 
     same_side_entry_price_guard_report = {
         "enabled": bool(config.same_side_entry_price_guard_enabled),
