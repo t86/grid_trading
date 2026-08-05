@@ -3232,10 +3232,10 @@ class WebSecurityTests(unittest.TestCase):
             {"symbol": "ETHUSDC", "strategy_profile": "ethusdc_pharos_profit_grid_freeze_v1"}
         )
 
-        self.assertEqual(config["per_order_notional"], 20.0)
-        self.assertEqual(config["best_quote_maker_volume_cycle_budget_notional"], 40.0)
-        self.assertEqual(config["best_quote_maker_volume_min_cycle_budget_notional"], 20.0)
-        self.assertEqual(config["best_quote_maker_volume_max_order_notional"], 20.0)
+        self.assertEqual(config["per_order_notional"], 22.0)
+        self.assertEqual(config["best_quote_maker_volume_cycle_budget_notional"], 44.0)
+        self.assertEqual(config["best_quote_maker_volume_min_cycle_budget_notional"], 22.0)
+        self.assertEqual(config["best_quote_maker_volume_max_order_notional"], 22.0)
         self.assertLessEqual(
             config["best_quote_maker_volume_min_cycle_budget_notional"],
             config["best_quote_maker_volume_cycle_budget_notional"],
@@ -3258,12 +3258,12 @@ class WebSecurityTests(unittest.TestCase):
         }
         mock_book_tickers.return_value = [{"bid_price": "1863.47", "ask_price": "1863.48"}]
 
-        with self.assertRaisesRegex(ValueError, "below exchange working minimum=20.0"):
+        with self.assertRaisesRegex(ValueError, r"below exchange working minimum=20\.[0-9]+"):
             _resolve_runner_start_config(
                 {
                     "symbol": "ETHUSDC",
                     "strategy_profile": "ethusdc_pharos_profit_grid_freeze_v1",
-                    "best_quote_maker_volume_max_order_notional": 8.0,
+                    "best_quote_maker_volume_max_order_notional": 20.0,
                 }
             )
 

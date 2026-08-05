@@ -9495,6 +9495,14 @@ def _autotune_runner_symbol_config(config: dict[str, Any]) -> dict[str, Any]:
             minimum_working_notional,
             min_qty * mid_price if min_order_notional_only and not full_autotune_enabled else min_qty * mid_price * 2.0,
         )
+    if min_notional > 0 and step_size > 0 and mid_price > 0:
+        minimum_qty_for_notional = math.ceil(
+            (min_notional / (mid_price * step_size)) - 1e-12
+        ) * step_size
+        minimum_working_notional = max(
+            minimum_working_notional,
+            minimum_qty_for_notional * mid_price,
+        )
     if minimum_working_notional > 0:
         max_order_notional = _safe_float(
             tuned.get("best_quote_maker_volume_max_order_notional", 0.0),
