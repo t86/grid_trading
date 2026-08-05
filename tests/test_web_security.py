@@ -3215,6 +3215,33 @@ class WebSecurityTests(unittest.TestCase):
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_keeps_ethusdc_cycle_budget_executable_and_preserves_positions(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.01,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "1863.47", "ask_price": "1863.48"}]
+
+        config = _resolve_runner_start_config(
+            {"symbol": "ETHUSDC", "strategy_profile": "ethusdc_pharos_profit_grid_freeze_v1"}
+        )
+
+        self.assertEqual(config["best_quote_maker_volume_cycle_budget_notional"], 14.0)
+        self.assertEqual(config["best_quote_maker_volume_min_cycle_budget_notional"], 7.0)
+        self.assertLessEqual(
+            config["best_quote_maker_volume_min_cycle_budget_notional"],
+            config["best_quote_maker_volume_cycle_budget_notional"],
+        )
+        self.assertFalse(config["runtime_guard_stop_auto_flatten_enabled"])
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
     def test_resolve_runner_start_config_starts_bch_altcoins_probe_with_maker_safety_guards(
         self,
         mock_symbol_config,
