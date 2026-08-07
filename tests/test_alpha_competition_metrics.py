@@ -287,6 +287,87 @@ def test_article_url_is_exact() -> None:
     assert parse_competition_rule(FIXTURES["QUID"], "QUID").article_url == "https://www.binance.com/en/support/announcement/detail/18d7255a59f74b3d90139c755cc806dd"
 
 
+def test_parser_collects_current_element_table_rows_without_treating_prose_as_rows() -> None:
+    article = copy.deepcopy(FIXTURES["QUID"])
+    data = article["data"]
+    assert isinstance(data, dict)
+    multipliers = (3.5, 3.0, 2.5, 2.0, 1.8, 1.3, 1.0)
+    rows = []
+    for day, multiplier in enumerate(multipliers, start=1):
+        rows.append({
+            "node": "element",
+            "tag": "tr",
+            "children": [
+                {"node": "element", "tag": "td", "children": [
+                    {"node": "element", "tag": "span", "children": [{"node": "text", "text": f"Day {day}"}]},
+                ]},
+                {"node": "element", "tag": "td", "children": [
+                    {"node": "text", "text": "2026-08-05 13:00 (UTC) to 2026-08-06 13:00 (UTC)"},
+                ]},
+                {"node": "element", "tag": "td", "children": [
+                    {"node": "element", "tag": "strong", "children": [{"node": "text", "text": f"{multiplier}x"}]},
+                ]},
+            ],
+        })
+    data["body"] = json.dumps({
+        "node": "element",
+        "tag": "article",
+        "children": [
+            {"node": "element", "tag": "p", "children": [{"node": "text", "text": "1st QUID Trading Competition Promotion Period: 2026-08-05 13:00 (UTC) to 2026-08-12 13:00 (UTC)"}]},
+            {"node": "element", "tag": "p", "children": [{"node": "text", "text": "2nd QUID Trading Competition Promotion Period: 2026-08-12 13:00 (UTC) to 2026-08-19 13:00 (UTC)"}]},
+            {"node": "element", "tag": "p", "children": [{"node": "text", "text": "The top 2,500 users win."}]},
+            {"node": "element", "tag": "p", "children": [{"node": "text", "text": "Day 1 is mentioned in ordinary prose with an unrelated 9.9x reward."}]},
+            {"node": "element", "tag": "table", "children": [
+                {"node": "element", "tag": "tbody", "children": rows},
+            ]},
+        ],
+    })
+
+    assert parse_competition_rule(article, "QUID").multipliers == multipliers
+
+
+@pytest.mark.parametrize("position", ["before", "after"])
+def test_transparent_element_day_prose_is_not_a_multiplier_row(position: str) -> None:
+    article = copy.deepcopy(FIXTURES["QUID"])
+    tree = _tree(article)
+    children = tree["children"]
+    assert isinstance(children, list)
+    rows = children[3:10]
+    prose = {
+        "node": "element",
+        "tag": "div",
+        "children": [{
+            "node": "element",
+            "tag": "span",
+            "children": [{"node": "text", "text": "Day 1 is ordinary prose with an unrelated 9.9x reward."}],
+        }],
+    }
+    table = {
+        "node": "element",
+        "tag": "table",
+        "children": [{
+            "node": "element",
+            "tag": "tbody",
+            "children": [
+                {"node": "element", "tag": "tr", "children": [
+                    {"node": "element", "tag": "td", "children": row["children"]},
+                ]}
+                for row in rows
+            ],
+        }],
+    }
+    competition_section = [prose, table] if position == "before" else [table, prose]
+    tree["children"] = children[:3] + competition_section + children[10:]
+    _set_tree(article, tree)
+    data = article["data"]
+    assert isinstance(data, dict)
+    prose_blocks = [block for block in metrics._body_blocks(data) if "ordinary prose" in block.text]
+
+    assert len(prose_blocks) == 1
+    assert prose_blocks[0].multiplier_row is False
+    assert parse_competition_rule(article, "QUID").multipliers == (3.5, 3.0, 2.5, 2.0, 1.8, 1.3, 1.0)
+
+
 def test_provider_selects_latest_exact_symbol_article() -> None:
     quid_data = FIXTURES["QUID"]["data"]
     assert isinstance(quid_data, dict)
@@ -310,6 +391,58 @@ def test_provider_selects_latest_exact_symbol_article() -> None:
     assert rule.article_code == quid_data["code"]
     assert session.calls[-1][1] == {"articleCode": quid_data["code"]}
     assert all(call[2] == 20 for call in session.calls)
+
+
+def test_provider_selects_unique_catalog_93_from_current_list_envelope() -> None:
+    quid_data = FIXTURES["QUID"]["data"]
+    assert isinstance(quid_data, dict)
+    item = _list_item(FIXTURES["QUID"], release_date=int((NOW - timedelta(days=1)).timestamp() * 1000))
+    session = _FakeSession([
+        _official({"catalogs": [
+            {"catalogId": 48, "articles": [_list_item(FIXTURES["O"])], "catalogs": []},
+            {"catalogId": 93, "articles": [item], "catalogs": []},
+        ]}),
+        _official(quid_data),
+    ])
+    provider = metrics.BinanceCompetitionRuleProvider(session=session)
+
+    rule = provider.fetch_rule("QUID", now=NOW)
+
+    assert rule.article_code == quid_data["code"]
+    assert session.calls[-1][1] == {"articleCode": quid_data["code"]}
+
+
+def test_provider_prefers_legacy_direct_articles_when_catalogs_are_also_present() -> None:
+    quid_data = FIXTURES["QUID"]["data"]
+    assert isinstance(quid_data, dict)
+    item = _list_item(FIXTURES["QUID"], release_date=int((NOW - timedelta(days=1)).timestamp() * 1000))
+    session = _FakeSession([
+        _official({"articles": [item], "catalogs": "ignored because direct articles take priority"}),
+        _official(quid_data),
+    ])
+    provider = metrics.BinanceCompetitionRuleProvider(session=session)
+
+    assert provider.fetch_rule("QUID", now=NOW).article_code == quid_data["code"]
+
+
+@pytest.mark.parametrize("data", [
+    {},
+    {"catalogs": []},
+    {"catalogs": "invalid"},
+    {"catalogs": [None]},
+    {"catalogs": [{"catalogId": 93, "articles": "invalid", "catalogs": []}]},
+    {"catalogs": [
+        {"catalogId": 93, "articles": [], "catalogs": []},
+        {"catalogId": 93, "articles": [], "catalogs": []},
+    ]},
+    {"catalogs": [{"catalogId": 48, "articles": [], "catalogs": "invalid"}]},
+    {"articles": None, "catalogs": [{"catalogId": 93, "articles": [], "catalogs": []}]},
+])
+def test_provider_rejects_missing_ambiguous_or_malformed_catalog_envelopes(data: object) -> None:
+    provider = metrics.BinanceCompetitionRuleProvider(session=_FakeSession([_official(data)]))
+
+    with pytest.raises(RuleParseError, match="article list"):
+        provider.fetch_rule("QUID", now=NOW)
 
 
 def test_provider_pages_when_first_page_has_no_exact_symbol() -> None:

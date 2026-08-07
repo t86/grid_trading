@@ -33,10 +33,17 @@ _DAY_MARKER_RE = re.compile(r"\bDay\s+(?P<day>\d+)\b(?!\s+(?:through|to)\b)", re
 _MULTIPLIER_RE = re.compile(r"(?<![\w.])([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*x\b")
 _RISING_TRADER_RE = re.compile(r"\bRising\s+Trader\b", re.IGNORECASE)
 _BLOCK_NODES = {"paragraph", "p", "row", "heading", "listItem", "list-item"}
+_ELEMENT_BLOCK_TAGS = {"p", "li", "h1", "h2", "h3", "h4", "h5", "h6"}
 
 
 class RuleParseError(ValueError):
     """The official competition article did not contain a usable rule set."""
+
+
+@dataclass(frozen=True)
+class _ArticleBlock:
+    text: str
+    multiplier_row: bool = False
 
 
 @dataclass(frozen=True)
@@ -114,17 +121,23 @@ def _text_descendants(node: object) -> list[str]:
     return [text for value in node.values() if isinstance(value, (Mapping, list)) for text in _text_descendants(value)]
 
 
-def _collect_blocks(node: object) -> list[str]:
+def _collect_blocks(node: object) -> list[_ArticleBlock]:
     if isinstance(node, list):
         return [block for child in node for block in _collect_blocks(child)]
     if not isinstance(node, Mapping):
         return []
     if node.get("node") == "text" and isinstance(node.get("text"), str):
         block = _normalize_text(node["text"])
-        return [block] if block else []
-    if node.get("node") in _BLOCK_NODES:
+        return [_ArticleBlock(block)] if block else []
+    node_type = node.get("node")
+    tag = node.get("tag")
+    table_row = node_type == "row" or node_type == "element" and isinstance(tag, str) and tag.lower() == "tr"
+    semantic_block = node_type in _BLOCK_NODES or (
+        node_type == "element" and isinstance(tag, str) and tag.lower() in _ELEMENT_BLOCK_TAGS
+    )
+    if table_row or semantic_block:
         block = _normalize_text(" ".join(_text_descendants(node)))
-        return [block] if block else []
+        return [_ArticleBlock(block, multiplier_row=table_row)] if block else []
     return [block for value in node.values() if isinstance(value, (Mapping, list)) for block in _collect_blocks(value)]
 
 
@@ -160,7 +173,7 @@ def _published_at_utc(data: Mapping[str, Any]) -> datetime:
         raise RuleParseError("article publishDate is missing or invalid") from exc
 
 
-def _body_blocks(data: Mapping[str, Any]) -> tuple[str, ...]:
+def _body_blocks(data: Mapping[str, Any]) -> tuple[_ArticleBlock, ...]:
     body = data.get("body")
     if not isinstance(body, str):
         raise RuleParseError("article body is missing")
@@ -198,11 +211,30 @@ def _parse_datetime(value: str) -> datetime:
         raise RuleParseError("promotion round has an invalid date") from exc
 
 
-def _parse_rounds(blocks: tuple[str, ...], expected_symbol: str) -> tuple[CompetitionRound, ...]:
-    first_day = next((index for index, block in enumerate(blocks) if _DAY_ROW_START_RE.match(block)), len(blocks))
+def _legacy_multiplier_block(block: _ArticleBlock) -> bool:
+    if block.multiplier_row or _DAY_ROW_START_RE.match(block.text) is None:
+        return False
+    return [int(marker.group("day")) for marker in _DAY_MARKER_RE.finditer(block.text)] == list(range(1, 8))
+
+
+def _multiplier_blocks(blocks: tuple[_ArticleBlock, ...]) -> tuple[_ArticleBlock, ...]:
+    explicit = tuple(
+        block for block in blocks if block.multiplier_row and _DAY_ROW_START_RE.match(block.text) is not None
+    )
+    if explicit:
+        return explicit
+    return tuple(block for block in blocks if _legacy_multiplier_block(block))
+
+
+def _parse_rounds(blocks: tuple[_ArticleBlock, ...], expected_symbol: str) -> tuple[CompetitionRound, ...]:
+    multiplier_blocks = _multiplier_blocks(blocks)
+    first_day = next(
+        (index for index, block in enumerate(blocks) if block in multiplier_blocks),
+        len(blocks),
+    )
     rounds_by_number: dict[int, CompetitionRound] = {}
     for block in blocks[:first_day]:
-        for match in _PERIOD_RE.finditer(block):
+        for match in _PERIOD_RE.finditer(block.text):
             number = int(match.group("number"))
             if match.group("symbol") != expected_symbol:
                 raise RuleParseError("promotion round symbol does not match article")
@@ -220,8 +252,8 @@ def _parse_rounds(blocks: tuple[str, ...], expected_symbol: str) -> tuple[Compet
     return tuple(rounds_by_number[number] for number in sorted(rounds_by_number))
 
 
-def _parse_winner_count(blocks: tuple[str, ...]) -> int:
-    match = _WINNER_RE.search(" ".join(blocks))
+def _parse_winner_count(blocks: tuple[_ArticleBlock, ...]) -> int:
+    match = _WINNER_RE.search(" ".join(block.text for block in blocks))
     if match is None:
         raise RuleParseError("winner count is missing")
     raw = match.group(1)
@@ -237,21 +269,19 @@ def _parse_winner_count(blocks: tuple[str, ...]) -> int:
     return count
 
 
-def _parse_multipliers(blocks: tuple[str, ...]) -> tuple[float, ...]:
+def _parse_multipliers(blocks: tuple[_ArticleBlock, ...]) -> tuple[float, ...]:
     multipliers: dict[int, float] = {}
-    for block in blocks:
-        if _DAY_ROW_START_RE.match(block) is None:
-            continue
-        markers = list(_DAY_MARKER_RE.finditer(block))
+    for block in _multiplier_blocks(blocks):
+        markers = list(_DAY_MARKER_RE.finditer(block.text))
         for index, marker in enumerate(markers):
             day = int(marker.group("day"))
             if day in multipliers:
                 raise RuleParseError("Day multiplier is duplicated")
-            end = markers[index + 1].start() if index + 1 < len(markers) else len(block)
-            rising_trader = _RISING_TRADER_RE.search(block, marker.end(), end)
+            end = markers[index + 1].start() if index + 1 < len(markers) else len(block.text)
+            rising_trader = _RISING_TRADER_RE.search(block.text, marker.end(), end)
             if rising_trader is not None:
                 end = rising_trader.start()
-            multiplier_match = _MULTIPLIER_RE.search(block, marker.end(), end)
+            multiplier_match = _MULTIPLIER_RE.search(block.text, marker.end(), end)
             if multiplier_match is None:
                 raise RuleParseError("Day multiplier is missing")
             multiplier = float(multiplier_match.group(1))
@@ -315,6 +345,37 @@ def _list_article_code(item: Mapping[str, Any]) -> str:
     return value.strip()
 
 
+def _list_articles(data: Mapping[str, Any]) -> list[object]:
+    if "articles" in data:
+        articles = data.get("articles")
+        if not isinstance(articles, list):
+            raise RuleParseError("Binance CMS article list is invalid")
+        return articles
+
+    catalogs = data.get("catalogs")
+    if not isinstance(catalogs, list):
+        raise RuleParseError("Binance CMS article list is invalid")
+    matches: list[Mapping[str, Any]] = []
+    pending: list[object] = list(catalogs)
+    while pending:
+        catalog = pending.pop()
+        if not isinstance(catalog, Mapping):
+            raise RuleParseError("Binance CMS article list is invalid")
+        children = catalog.get("catalogs", [])
+        if not isinstance(children, list):
+            raise RuleParseError("Binance CMS article list is invalid")
+        pending.extend(children)
+        catalog_id = catalog.get("catalogId")
+        if isinstance(catalog_id, int) and not isinstance(catalog_id, bool) and catalog_id == 93:
+            matches.append(catalog)
+    if len(matches) != 1:
+        raise RuleParseError("Binance CMS article list is invalid")
+    articles = matches[0].get("articles")
+    if not isinstance(articles, list):
+        raise RuleParseError("Binance CMS article list is invalid")
+    return articles
+
+
 def _title_matches_symbol(item: Mapping[str, Any], symbol: str) -> bool:
     title = item.get("title")
     if not isinstance(title, str):
@@ -356,9 +417,7 @@ class BinanceCompetitionRuleProvider:
                 _CMS_LIST_PATH,
                 {"type": 1, "catalogId": 93, "pageNo": page_no, "pageSize": 50},
             )
-            raw_articles = data.get("articles")
-            if not isinstance(raw_articles, list):
-                raise RuleParseError("Binance CMS article list is invalid")
+            raw_articles = _list_articles(data)
             articles: list[Mapping[str, Any]] = []
             for item in raw_articles:
                 if not isinstance(item, Mapping):
