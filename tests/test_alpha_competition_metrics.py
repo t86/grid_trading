@@ -5,6 +5,7 @@ from dataclasses import replace
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 import threading
 
 import pytest
@@ -674,3 +675,356 @@ def test_rule_cache_requires_utc_aware_times(tmp_path: Path) -> None:
         cache.store(quid_rule, fetched_at=datetime(2026, 8, 7, 12, 0))
     with pytest.raises(ValueError, match="UTC-aware"):
         cache.get("QUID", now=datetime(2026, 8, 7, 12, 0), loader=lambda _: quid_rule)
+
+
+def _kline(opened: str, *, quote_volume: object) -> list[object]:
+    open_ms = int(datetime.strptime(opened, "%Y-%m-%d %H:%M").replace(tzinfo=UTC).timestamp() * 1000)
+    return [open_ms, "1", "1", "1", "1", "1", open_ms + 3_599_999, quote_volume, 1, "1", "1", "0"]
+
+
+class _FakeMarketClient:
+    def __init__(self, rows: list[list[object]], *, pair: str = "ALPHA_1075USDC") -> None:
+        self.rows = rows
+        self.pair = pair
+        self.calls: list[dict[str, object]] = []
+        self.token_fetches = 0
+
+    def fetch_tokens(self) -> dict[str, object]:
+        self.token_fetches += 1
+        return {"QUID": SimpleNamespace(pair=self.pair)}
+
+    def fetch_klines(
+        self,
+        pair: str,
+        *,
+        interval: str,
+        limit: int,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> list[list[object]]:
+        self.calls.append(
+            {
+                "pair": pair,
+                "interval": interval,
+                "limit": limit,
+                "start_time_ms": start_time_ms,
+                "end_time_ms": end_time_ms,
+            }
+        )
+        return self.rows
+
+
+def test_select_round_uses_half_open_boundaries_and_reports_all_inactive_states() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    first = rule.rounds[0]
+    second = rule.rounds[1]
+    with_gap = replace(
+        rule,
+        rounds=(
+            first,
+            replace(second, start_utc=second.start_utc + timedelta(hours=2), end_utc=second.end_utc + timedelta(hours=2)),
+        ),
+    )
+
+    upcoming = metrics.select_round(with_gap, first.start_utc - timedelta(microseconds=1))
+    first_start = metrics.select_round(with_gap, first.start_utc)
+    first_last = metrics.select_round(with_gap, first.end_utc - timedelta(microseconds=1))
+    between = metrics.select_round(with_gap, first.end_utc)
+    second_start = metrics.select_round(with_gap, with_gap.rounds[1].start_utc)
+    ended = metrics.select_round(with_gap, with_gap.rounds[1].end_utc)
+    contiguous_second = metrics.select_round(rule, rule.rounds[0].end_utc)
+
+    assert upcoming == metrics.RoundSelection("upcoming", None, None, None)
+    assert (first_start.status, first_start.round, first_start.day, first_start.multiplier) == (
+        "active", first, 1, 3.5,
+    )
+    assert (first_last.status, first_last.round, first_last.day, first_last.multiplier) == (
+        "active", first, 7, 1.0,
+    )
+    assert between == metrics.RoundSelection("between_rounds", None, None, None)
+    assert (second_start.status, second_start.round, second_start.day, second_start.multiplier) == (
+        "active", with_gap.rounds[1], 1, 3.5,
+    )
+    assert ended == metrics.RoundSelection("ended", None, None, None)
+    assert (contiguous_second.status, contiguous_second.round, contiguous_second.day) == (
+        "active", rule.rounds[1], 1,
+    )
+
+
+@pytest.mark.parametrize("invalid_timeline", ["partial_overlap", "same_window", "reversed_numbers"])
+def test_select_round_rejects_ambiguous_or_reversed_rule_timelines(invalid_timeline: str) -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    first, second = rule.rounds
+    if invalid_timeline == "partial_overlap":
+        second = replace(
+            second,
+            start_utc=first.end_utc - timedelta(hours=1),
+            end_utc=second.end_utc - timedelta(hours=1),
+        )
+    elif invalid_timeline == "same_window":
+        second = replace(second, start_utc=first.start_utc, end_utc=first.end_utc)
+    else:
+        first = replace(
+            first,
+            start_utc=second.end_utc + timedelta(days=1),
+            end_utc=second.end_utc + timedelta(days=8),
+        )
+    invalid_rule = replace(rule, rounds=(first, second))
+
+    with pytest.raises(RuleParseError, match="rule is invalid"):
+        metrics.select_round(invalid_rule, NOW)
+
+
+def test_rule_cache_uses_shared_validation_for_overlapping_rounds(tmp_path: Path) -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    first, second = rule.rounds
+    overlapping = replace(
+        rule,
+        rounds=(
+            first,
+            replace(
+                second,
+                start_utc=first.end_utc - timedelta(hours=1),
+                end_utc=second.end_utc - timedelta(hours=1),
+            ),
+        ),
+    )
+
+    with pytest.raises(RuleParseError, match="rule is invalid"):
+        metrics.CompetitionRuleCache(tmp_path / "rules.json").store(overlapping, fetched_at=NOW)
+
+
+@pytest.mark.parametrize(
+    ("symbol", "before_boundary", "at_boundary", "expected"),
+    [
+        ("PRL", "2026-08-06 10:00", "2026-08-06 11:00", 100 * 2.0 + 200 * 2.0),
+        ("QUID", "2026-08-06 12:00", "2026-08-06 13:00", 100 * 3.5 + 200 * 3.0),
+    ],
+)
+def test_weight_kline_volume_uses_round_start_for_non_natural_utc_days(
+    symbol: str, before_boundary: str, at_boundary: str, expected: float,
+) -> None:
+    rule = parse_competition_rule(FIXTURES[symbol], symbol)
+
+    result = metrics.weight_kline_volume(
+        rule.rounds[1 if symbol == "PRL" else 0],
+        rule.multipliers,
+        [_kline(before_boundary, quote_volume="100"), _kline(at_boundary, quote_volume="200")],
+    )
+
+    assert result == pytest.approx(expected)
+
+
+def test_weight_kline_volume_deduplicates_open_time_and_ignores_round_outside_rows() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    round_ = rule.rounds[0]
+    rows = [
+        _kline("2026-08-05 12:00", quote_volume="999"),
+        _kline("2026-08-05 13:00", quote_volume="100"),
+        _kline("2026-08-05 13:00", quote_volume="999"),
+        _kline("2026-08-12 13:00", quote_volume="999"),
+    ]
+
+    assert metrics.weight_kline_volume(round_, rule.multipliers, rows) == pytest.approx(350)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [[]],
+        [[True, "1", "1", "1", "1", "1", 0, "10"]],
+        [["not-ms", "1", "1", "1", "1", "1", 0, "10"]],
+        [_kline("2026-08-05 13:00", quote_volume=True)],
+        [_kline("2026-08-05 13:00", quote_volume="nan")],
+        [_kline("2026-08-05 13:00", quote_volume="inf")],
+        [_kline("2026-08-05 13:00", quote_volume="-1")],
+    ],
+)
+def test_weight_kline_volume_rejects_malformed_or_non_finite_rows(rows: list[list[object]]) -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+
+    with pytest.raises(ValueError, match="kline"):
+        metrics.weight_kline_volume(rule.rounds[0], rule.multipliers, rows)
+
+
+def test_weight_kline_volume_validates_duplicate_rows_before_deduplicating() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    valid = _kline("2026-08-05 13:00", quote_volume="100")
+    invalid_duplicate = _kline("2026-08-05 13:00", quote_volume="nan")
+
+    with pytest.raises(ValueError, match="kline"):
+        metrics.weight_kline_volume(rule.rounds[0], rule.multipliers, [valid, invalid_duplicate])
+
+
+def test_thresholds_use_winner_average_and_exclude_personal_rising_trader_multiplier() -> None:
+    result = metrics.calculate_thresholds(weighted_volume=4_800_000, winner_count=2500)
+
+    assert (result.average, result.watch, result.reference, result.safe) == pytest.approx(
+        (1920, 768, 1152, 1920)
+    )
+
+
+@pytest.mark.parametrize(
+    ("weighted_volume", "winner_count"),
+    [(-1, 2500), (float("nan"), 2500), (float("inf"), 2500), (True, 2500), (100, 0), (100, -1), (100, 1.5), (100, True)],
+)
+def test_thresholds_reject_invalid_inputs(weighted_volume: object, winner_count: object) -> None:
+    with pytest.raises(ValueError, match="weighted volume|winner count"):
+        metrics.calculate_thresholds(weighted_volume=weighted_volume, winner_count=winner_count)
+
+
+def test_volume_provider_uses_actual_pair_start_end_and_limit_200() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    round_ = rule.rounds[0]
+    market = _FakeMarketClient([_kline("2026-08-05 13:00", quote_volume="100")])
+
+    requested_after = datetime.now(UTC)
+    result = metrics.CompetitionVolumeProvider(market=market).fetch(rule, round_, NOW)
+    completed_before = datetime.now(UTC)
+
+    assert result.source == "alpha_kline_estimate"
+    assert result.weighted_volume == pytest.approx(350)
+    assert requested_after <= result.updated_at_utc <= completed_before
+    assert market.calls == [
+        {
+            "pair": "ALPHA_1075USDC",
+            "interval": "1h",
+            "limit": 200,
+            "start_time_ms": int(round_.start_utc.timestamp() * 1000),
+            "end_time_ms": int(NOW.timestamp() * 1000),
+        }
+    ]
+
+
+def test_volume_provider_uses_verified_official_total_without_market_requests() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    official_updated = NOW - timedelta(seconds=5)
+    market = _FakeMarketClient([])
+
+    result = metrics.CompetitionVolumeProvider(
+        market=market,
+        official_fetcher=lambda rule_, round_, now: metrics.OfficialVolumeSnapshot(9_000_000, official_updated),
+    ).fetch(rule, rule.rounds[0], NOW)
+
+    assert result == metrics.VolumeSnapshot(9_000_000, "official", official_updated)
+    assert market.token_fetches == 0
+    assert market.calls == []
+
+
+def test_volume_provider_falls_back_only_when_verified_official_total_is_none() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    official_calls: list[tuple[metrics.CompetitionRule, metrics.CompetitionRound, datetime]] = []
+    market = _FakeMarketClient([_kline("2026-08-05 13:00", quote_volume="10")])
+
+    result = metrics.CompetitionVolumeProvider(
+        market=market,
+        official_fetcher=lambda rule_, round_, now: official_calls.append((rule_, round_, now)) or None,
+    ).fetch(rule, rule.rounds[0], NOW)
+
+    assert official_calls == [(rule, rule.rounds[0], NOW)]
+    assert (result.source, result.weighted_volume, market.token_fetches, len(market.calls)) == (
+        "alpha_kline_estimate", 35, 1, 1,
+    )
+
+
+def test_volume_provider_clamps_kline_end_to_round_end() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    round_ = rule.rounds[0]
+    market = _FakeMarketClient([])
+
+    metrics.CompetitionVolumeProvider(market=market).fetch(rule, round_, round_.end_utc + timedelta(days=1))
+
+    assert market.calls[0]["end_time_ms"] == int(round_.end_utc.timestamp() * 1000)
+
+
+def test_volume_provider_counts_the_current_forming_hour_by_open_time() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    round_ = rule.rounds[0]
+    current = round_.start_utc + timedelta(minutes=30)
+    market = _FakeMarketClient([_kline("2026-08-05 13:00", quote_volume="100")])
+
+    result = metrics.CompetitionVolumeProvider(market=market).fetch(rule, round_, current)
+
+    assert result.weighted_volume == pytest.approx(350)
+    assert market.calls[0]["end_time_ms"] == int(current.timestamp() * 1000)
+
+
+@pytest.mark.parametrize(
+    ("weighted_volume", "updated_at"),
+    [
+        ("9000000", NOW),
+        (True, NOW),
+        (-1, NOW),
+        (float("nan"), NOW),
+        (float("inf"), NOW),
+        (9_000_000, datetime(2026, 8, 7, 12, 0)),
+        (9_000_000, datetime(2026, 8, 5, 12, 59, 59, 999999, tzinfo=UTC)),
+        (9_000_000, NOW + timedelta(microseconds=1)),
+    ],
+)
+def test_volume_provider_rejects_invalid_official_snapshot_instead_of_guessing_fallback(
+    weighted_volume: object, updated_at: datetime,
+) -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    market = _FakeMarketClient([])
+    provider = metrics.CompetitionVolumeProvider(
+        market=market,
+        official_fetcher=lambda rule_, round_, now: metrics.OfficialVolumeSnapshot(weighted_volume, updated_at),
+    )
+
+    with pytest.raises(ValueError, match="official"):
+        provider.fetch(rule, rule.rounds[0], NOW)
+
+    assert market.token_fetches == 0
+    assert market.calls == []
+
+
+@pytest.mark.parametrize("updated_at", [datetime(2026, 8, 5, 13, 0, tzinfo=UTC), NOW])
+def test_volume_provider_accepts_official_snapshot_time_boundaries(updated_at: datetime) -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    market = _FakeMarketClient([])
+
+    result = metrics.CompetitionVolumeProvider(
+        market=market,
+        official_fetcher=lambda rule_, round_, now: metrics.OfficialVolumeSnapshot(9_000_000.5, updated_at),
+    ).fetch(rule, rule.rounds[0], NOW)
+
+    assert result == metrics.VolumeSnapshot(9_000_000.5, "official", updated_at)
+    assert market.token_fetches == 0
+    assert market.calls == []
+
+
+def test_volume_provider_does_not_guess_pair_when_symbol_is_missing() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    market = _FakeMarketClient([])
+    market.fetch_tokens = lambda: {}
+
+    with pytest.raises(ValueError, match="pair"):
+        metrics.CompetitionVolumeProvider(market=market).fetch(rule, rule.rounds[0], NOW)
+
+    assert market.calls == []
+
+
+def test_volume_provider_rejects_time_before_round_start() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    market = _FakeMarketClient([])
+
+    with pytest.raises(ValueError, match="round start"):
+        metrics.CompetitionVolumeProvider(market=market).fetch(
+            rule, rule.rounds[0], rule.rounds[0].start_utc - timedelta(microseconds=1)
+        )
+
+    assert market.token_fetches == 0
+    assert market.calls == []
+
+
+def test_calculation_apis_require_utc_aware_datetimes() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    naive_now = datetime(2026, 8, 7, 12, 0)
+
+    with pytest.raises(ValueError, match="UTC-aware"):
+        metrics.select_round(rule, naive_now)
+    with pytest.raises(ValueError, match="UTC-aware"):
+        metrics.CompetitionVolumeProvider(market=_FakeMarketClient([])).fetch(
+            rule, rule.rounds[0], naive_now
+        )

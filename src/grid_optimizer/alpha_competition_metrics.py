@@ -66,6 +66,35 @@ class CachedRuleResult:
 
 
 @dataclass(frozen=True)
+class Thresholds:
+    average: float
+    watch: float
+    reference: float
+    safe: float
+
+
+@dataclass(frozen=True)
+class OfficialVolumeSnapshot:
+    weighted_volume: float
+    updated_at_utc: datetime
+
+
+@dataclass(frozen=True)
+class VolumeSnapshot:
+    weighted_volume: float
+    source: str
+    updated_at_utc: datetime
+
+
+@dataclass(frozen=True)
+class RoundSelection:
+    status: str
+    round: CompetitionRound | None
+    day: int | None
+    multiplier: float | None
+
+
+@dataclass(frozen=True)
 class _CachedRule:
     fetched_at: datetime
     rule: CompetitionRule
@@ -396,6 +425,7 @@ def _validate_rule(rule: object, *, expected_symbol: str | None = None) -> Compe
         if not rule.rounds:
             raise ValueError
         numbers: list[int] = []
+        timeline: list[tuple[datetime, datetime, int]] = []
         for round_ in rule.rounds:
             if (
                 not isinstance(round_, CompetitionRound)
@@ -409,7 +439,13 @@ def _validate_rule(rule: object, *, expected_symbol: str | None = None) -> Compe
             if start >= end or end - start != timedelta(days=7):
                 raise ValueError
             numbers.append(round_.number)
+            timeline.append((start, end, round_.number))
         if numbers != list(range(1, len(numbers) + 1)):
+            raise ValueError
+        ordered_timeline = sorted(timeline)
+        if [number for _start, _end, number in ordered_timeline] != numbers:
+            raise ValueError
+        if any(left[1] > right[0] for left, right in zip(ordered_timeline, ordered_timeline[1:])):
             raise ValueError
         if len(rule.multipliers) != 7:
             raise ValueError
@@ -418,6 +454,189 @@ def _validate_rule(rule: object, *, expected_symbol: str | None = None) -> Compe
     except (AttributeError, OverflowError, TypeError, ValueError, RuleParseError):
         raise RuleParseError("competition rule is invalid") from None
     return rule
+
+
+def select_round(rule: CompetitionRule, now: datetime) -> RoundSelection:
+    valid_rule = _validate_rule(rule)
+    current = _require_utc_aware(now, "now")
+    ordered = sorted(valid_rule.rounds, key=lambda item: item.start_utc)
+    if current < ordered[0].start_utc:
+        return RoundSelection("upcoming", None, None, None)
+    for round_ in ordered:
+        if round_.start_utc <= current < round_.end_utc:
+            day = int((current - round_.start_utc).total_seconds() // 86_400) + 1
+            return RoundSelection("active", round_, day, valid_rule.multipliers[day - 1])
+    for left, right in zip(ordered, ordered[1:]):
+        if left.end_utc <= current < right.start_utc:
+            return RoundSelection("between_rounds", None, None, None)
+    return RoundSelection("ended", None, None, None)
+
+
+def _validate_round_window(round_: object) -> CompetitionRound:
+    if not isinstance(round_, CompetitionRound):
+        raise ValueError("competition round is invalid")
+    start = _require_utc_aware(round_.start_utc, "round start_utc")
+    end = _require_utc_aware(round_.end_utc, "round end_utc")
+    if start >= end or end - start != timedelta(days=7):
+        raise ValueError("competition round is invalid")
+    return round_
+
+
+def _kline_open_time_ms(value: object) -> int:
+    if isinstance(value, bool):
+        raise ValueError("kline open time is invalid")
+    if isinstance(value, int):
+        open_ms = value
+    elif isinstance(value, str) and re.fullmatch(r"\d+", value):
+        open_ms = int(value)
+    else:
+        raise ValueError("kline open time is invalid")
+    if open_ms < 0:
+        raise ValueError("kline open time is invalid")
+    return open_ms
+
+
+def _kline_quote_volume(value: object) -> float:
+    if isinstance(value, bool):
+        raise ValueError("kline quote volume is invalid")
+    try:
+        volume = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError("kline quote volume is invalid") from None
+    if volume < 0 or not math.isfinite(volume):
+        raise ValueError("kline quote volume is invalid")
+    return volume
+
+
+def _official_weighted_volume(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("official weighted volume is invalid")
+    try:
+        volume = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError("official weighted volume is invalid") from None
+    if volume < 0 or not math.isfinite(volume):
+        raise ValueError("official weighted volume is invalid")
+    return volume
+
+
+def weight_kline_volume(
+    round_: CompetitionRound,
+    multipliers: tuple[float, ...],
+    rows: list[list[Any]],
+) -> float:
+    valid_round = _validate_round_window(round_)
+    if not isinstance(multipliers, tuple) or len(multipliers) != 7:
+        raise ValueError("early-bird multipliers must contain seven days")
+    valid_multipliers = tuple(_positive_finite_multiplier(value) for value in multipliers)
+    if not isinstance(rows, list):
+        raise ValueError("kline rows are invalid")
+
+    seen: set[int] = set()
+    total = 0.0
+    for row in rows:
+        if not isinstance(row, list) or len(row) <= 7:
+            raise ValueError("kline row is invalid")
+        open_ms = _kline_open_time_ms(row[0])
+        quote_volume = _kline_quote_volume(row[7])
+        if open_ms in seen:
+            continue
+        seen.add(open_ms)
+        try:
+            opened = datetime.fromtimestamp(open_ms / 1000, tz=_UTC)
+        except (OverflowError, OSError, ValueError):
+            raise ValueError("kline open time is invalid") from None
+        if not valid_round.start_utc <= opened < valid_round.end_utc:
+            continue
+        day_index = int((opened - valid_round.start_utc).total_seconds() // 86_400)
+        total += quote_volume * valid_multipliers[day_index]
+    if not math.isfinite(total):
+        raise ValueError("weighted kline volume is invalid")
+    return total
+
+
+def calculate_thresholds(*, weighted_volume: float, winner_count: int) -> Thresholds:
+    if isinstance(weighted_volume, bool) or not isinstance(weighted_volume, (int, float)):
+        raise ValueError("weighted volume is invalid")
+    try:
+        total = float(weighted_volume)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError("weighted volume is invalid") from None
+    if total < 0 or not math.isfinite(total):
+        raise ValueError("weighted volume is invalid")
+    if isinstance(winner_count, bool) or not isinstance(winner_count, int) or winner_count <= 0:
+        raise ValueError("winner count is invalid")
+    average = total / winner_count
+    return Thresholds(
+        average=average,
+        watch=average * 0.4,
+        reference=average * 0.6,
+        safe=average,
+    )
+
+
+class CompetitionVolumeProvider:
+    def __init__(
+        self,
+        *,
+        market: Any,
+        official_fetcher: Callable[
+            [CompetitionRule, CompetitionRound, datetime], OfficialVolumeSnapshot | None
+        ]
+        | None = None,
+    ) -> None:
+        self.market = market
+        self.official_fetcher = official_fetcher
+
+    def fetch(
+        self,
+        rule: CompetitionRule,
+        round_: CompetitionRound,
+        now: datetime,
+    ) -> VolumeSnapshot:
+        valid_rule = _validate_rule(rule)
+        valid_round = _validate_round_window(round_)
+        if valid_round not in valid_rule.rounds:
+            raise ValueError("competition round does not belong to rule")
+        current = _require_utc_aware(now, "now")
+        if current < valid_round.start_utc:
+            raise ValueError("now must not precede round start")
+
+        if self.official_fetcher is not None:
+            official = self.official_fetcher(valid_rule, valid_round, current)
+            if official is not None:
+                if not isinstance(official, OfficialVolumeSnapshot):
+                    raise ValueError("official volume snapshot is invalid")
+                try:
+                    official_total = _official_weighted_volume(official.weighted_volume)
+                    official_updated = _require_utc_aware(official.updated_at_utc, "official updated_at_utc")
+                except ValueError:
+                    raise ValueError("official volume snapshot is invalid") from None
+                if not valid_round.start_utc <= official_updated <= current:
+                    raise ValueError("official volume snapshot is invalid")
+                return VolumeSnapshot(official_total, "official", official_updated)
+
+        tokens = self.market.fetch_tokens()
+        if not isinstance(tokens, Mapping):
+            raise ValueError("Alpha token pair response is invalid")
+        token = tokens.get(valid_rule.symbol)
+        pair = getattr(token, "pair", None)
+        if not isinstance(pair, str) or not pair.strip():
+            raise ValueError(f"Alpha trading pair is missing for {valid_rule.symbol}")
+        end = min(current, valid_round.end_utc)
+        rows = self.market.fetch_klines(
+            pair.strip(),
+            interval="1h",
+            limit=200,
+            start_time_ms=int(valid_round.start_utc.timestamp() * 1000),
+            end_time_ms=int(end.timestamp() * 1000),
+        )
+        updated_at = datetime.now(_UTC)
+        return VolumeSnapshot(
+            weighted_volume=weight_kline_volume(valid_round, valid_rule.multipliers, rows),
+            source="alpha_kline_estimate",
+            updated_at_utc=updated_at,
+        )
 
 
 def _encode_rule(rule: CompetitionRule) -> dict[str, object]:
