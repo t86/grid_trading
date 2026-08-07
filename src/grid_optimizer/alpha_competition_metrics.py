@@ -1,17 +1,26 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import html
 import json
 import math
+import os
+from pathlib import Path
 import re
+import tempfile
+import threading
 from typing import Any
+
+import requests
 
 
 _UTC = timezone.utc
 _TITLE_PREFIX = "Binance Alpha Trading Competition: Trade "
+_CMS_BASE_URL = "https://www.binance.com"
+_CMS_LIST_PATH = "/bapi/composite/v1/public/cms/article/list/query"
+_CMS_DETAIL_PATH = "/bapi/composite/v1/public/cms/article/detail/query"
 _PERIOD_RE = re.compile(
     r"\b(?P<number>\d+)(?P<suffix>st|nd|rd|th)\s+(?P<symbol>[A-Za-z0-9_]+)\s+"
     r"Trading\s+Competition\s+Promotion\s+Period\s*:\s*"
@@ -48,6 +57,18 @@ class CompetitionRule:
     winner_count: int
     rounds: tuple[CompetitionRound, ...]
     multipliers: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class CachedRuleResult:
+    rule: CompetitionRule
+    stale: bool
+
+
+@dataclass(frozen=True)
+class _CachedRule:
+    fetched_at: datetime
+    rule: CompetitionRule
 
 
 def _normalize_text(value: str) -> str:
@@ -233,3 +254,342 @@ def parse_competition_rule(article: object, expected_symbol: object) -> Competit
         rounds=_parse_rounds(blocks, symbol),
         multipliers=_parse_multipliers(blocks),
     )
+
+
+def _normalized_symbol(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RuleParseError("expected symbol is missing")
+    return value.strip().upper()
+
+
+def _require_utc_aware(value: datetime, name: str) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValueError(f"{name} must be UTC-aware")
+    return value.astimezone(_UTC)
+
+
+def _article_release_ms(item: Mapping[str, Any]) -> int:
+    value = item.get("releaseDate")
+    if isinstance(value, bool):
+        raise RuleParseError("Binance CMS article release date is invalid")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"\d+", value):
+        return int(value)
+    raise RuleParseError("Binance CMS article release date is invalid")
+
+
+def _list_article_code(item: Mapping[str, Any]) -> str:
+    value = item.get("code")
+    if not isinstance(value, str) or not value.strip():
+        raise RuleParseError("Binance CMS article code is invalid")
+    return value.strip()
+
+
+def _title_matches_symbol(item: Mapping[str, Any], symbol: str) -> bool:
+    title = item.get("title")
+    if not isinstance(title, str):
+        raise RuleParseError("Binance CMS article title is invalid")
+    try:
+        _parse_title(title.strip(), symbol)
+    except RuleParseError:
+        return False
+    return True
+
+
+class BinanceCompetitionRuleProvider:
+    def __init__(self, session: requests.Session | None = None) -> None:
+        self.session = session or requests.Session()
+
+    def _get_data(self, path: str, params: dict[str, object]) -> Mapping[str, Any]:
+        try:
+            response = self.session.get(f"{_CMS_BASE_URL}{path}", params=params, timeout=20)
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException:
+            raise RuleParseError("Binance CMS request failed") from None
+        except ValueError:
+            raise RuleParseError("Binance CMS response is malformed") from None
+        if not isinstance(payload, Mapping) or payload.get("code") != "000000":
+            raise RuleParseError("Binance CMS response was rejected")
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            raise RuleParseError("Binance CMS response data is invalid")
+        return data
+
+    def fetch_rule(self, symbol: str, *, now: datetime | None = None) -> CompetitionRule:
+        target = _normalized_symbol(symbol)
+        current = datetime.now(_UTC) if now is None else _require_utc_aware(now, "now")
+        cutoff_ms = int((current - timedelta(days=60)).timestamp() * 1000)
+        candidates: list[Mapping[str, Any]] = []
+        for page_no in range(1, 21):
+            data = self._get_data(
+                _CMS_LIST_PATH,
+                {"type": 1, "catalogId": 93, "pageNo": page_no, "pageSize": 50},
+            )
+            raw_articles = data.get("articles")
+            if not isinstance(raw_articles, list):
+                raise RuleParseError("Binance CMS article list is invalid")
+            articles: list[Mapping[str, Any]] = []
+            for item in raw_articles:
+                if not isinstance(item, Mapping):
+                    raise RuleParseError("Binance CMS article list is invalid")
+                _list_article_code(item)
+                _article_release_ms(item)
+                articles.append(item)
+            candidates.extend(
+                item
+                for item in articles
+                if _article_release_ms(item) >= cutoff_ms and _title_matches_symbol(item, target)
+            )
+            page_is_old = bool(articles) and all(_article_release_ms(item) < cutoff_ms for item in articles)
+            if candidates or not articles or page_is_old:
+                break
+        if not candidates:
+            raise RuleParseError(f"no recent competition announcement for {target}")
+        latest = max(candidates, key=_article_release_ms)
+        code = _list_article_code(latest)
+        detail = self._get_data(_CMS_DETAIL_PATH, {"articleCode": code})
+        rule = parse_competition_rule({"data": detail}, expected_symbol=target)
+        if rule.article_code != code:
+            raise RuleParseError("article detail code does not match article list")
+        return _validate_rule(rule, expected_symbol=target)
+
+
+def _encode_datetime(value: datetime, name: str) -> str:
+    return _require_utc_aware(value, name).isoformat()
+
+
+def _decode_datetime(value: object, name: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} is invalid")
+    parsed = datetime.fromisoformat(value)
+    return _require_utc_aware(parsed, name)
+
+
+def _positive_finite_multiplier(value: object) -> float:
+    try:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError
+        multiplier = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise RuleParseError("competition rule multiplier is invalid") from None
+    if multiplier <= 0 or not math.isfinite(multiplier):
+        raise RuleParseError("competition rule multiplier is invalid")
+    return multiplier
+
+
+def _validate_rule(rule: object, *, expected_symbol: str | None = None) -> CompetitionRule:
+    if not isinstance(rule, CompetitionRule):
+        raise RuleParseError("competition rule is invalid")
+    try:
+        symbol = _normalized_symbol(rule.symbol)
+        if symbol != rule.symbol or re.fullmatch(r"[A-Z0-9_]+", symbol) is None:
+            raise ValueError
+        if expected_symbol is not None and symbol != expected_symbol:
+            raise ValueError
+        if not rule.name.strip() or not rule.article_code.strip() or not rule.title.strip() or not rule.article_url.strip():
+            raise ValueError
+        if isinstance(rule.winner_count, bool) or not isinstance(rule.winner_count, int) or rule.winner_count <= 0:
+            raise ValueError
+        _require_utc_aware(rule.published_at_utc, "published_at_utc")
+        if not rule.rounds:
+            raise ValueError
+        numbers: list[int] = []
+        for round_ in rule.rounds:
+            if (
+                not isinstance(round_, CompetitionRound)
+                or isinstance(round_.number, bool)
+                or not isinstance(round_.number, int)
+                or round_.number <= 0
+            ):
+                raise ValueError
+            start = _require_utc_aware(round_.start_utc, "round start_utc")
+            end = _require_utc_aware(round_.end_utc, "round end_utc")
+            if start >= end or end - start != timedelta(days=7):
+                raise ValueError
+            numbers.append(round_.number)
+        if numbers != list(range(1, len(numbers) + 1)):
+            raise ValueError
+        if len(rule.multipliers) != 7:
+            raise ValueError
+        for multiplier in rule.multipliers:
+            _positive_finite_multiplier(multiplier)
+    except (AttributeError, OverflowError, TypeError, ValueError, RuleParseError):
+        raise RuleParseError("competition rule is invalid") from None
+    return rule
+
+
+def _encode_rule(rule: CompetitionRule) -> dict[str, object]:
+    _validate_rule(rule)
+    return {
+        "symbol": rule.symbol,
+        "name": rule.name,
+        "article_code": rule.article_code,
+        "title": rule.title,
+        "article_url": rule.article_url,
+        "published_at_utc": _encode_datetime(rule.published_at_utc, "published_at_utc"),
+        "winner_count": rule.winner_count,
+        "rounds": [
+            {
+                "number": round_.number,
+                "start_utc": _encode_datetime(round_.start_utc, "round start_utc"),
+                "end_utc": _encode_datetime(round_.end_utc, "round end_utc"),
+            }
+            for round_ in rule.rounds
+        ],
+        "multipliers": list(rule.multipliers),
+    }
+
+
+def _cached_text(data: Mapping[str, object], key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"cached rule {key} is invalid")
+    return value
+
+
+def _decode_rule(value: object) -> CompetitionRule:
+    if not isinstance(value, Mapping):
+        raise ValueError("cached rule is invalid")
+    symbol = _normalized_symbol(value.get("symbol"))
+    winner_count = value.get("winner_count")
+    if isinstance(winner_count, bool) or not isinstance(winner_count, int) or winner_count <= 0:
+        raise ValueError("cached rule winner_count is invalid")
+    raw_rounds = value.get("rounds")
+    if not isinstance(raw_rounds, list):
+        raise ValueError("cached rule rounds are invalid")
+    rounds: list[CompetitionRound] = []
+    for raw_round in raw_rounds:
+        if not isinstance(raw_round, Mapping):
+            raise ValueError("cached rule round is invalid")
+        number = raw_round.get("number")
+        if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+            raise ValueError("cached rule round number is invalid")
+        rounds.append(
+            CompetitionRound(
+                number=number,
+                start_utc=_decode_datetime(raw_round.get("start_utc"), "round start_utc"),
+                end_utc=_decode_datetime(raw_round.get("end_utc"), "round end_utc"),
+            )
+        )
+    raw_multipliers = value.get("multipliers")
+    if not isinstance(raw_multipliers, list):
+        raise ValueError("cached rule multipliers are invalid")
+    multipliers: list[float] = []
+    for raw_multiplier in raw_multipliers:
+        multipliers.append(_positive_finite_multiplier(raw_multiplier))
+    rule = CompetitionRule(
+        symbol=symbol,
+        name=_cached_text(value, "name"),
+        article_code=_cached_text(value, "article_code"),
+        title=_cached_text(value, "title"),
+        article_url=_cached_text(value, "article_url"),
+        published_at_utc=_decode_datetime(value.get("published_at_utc"), "published_at_utc"),
+        winner_count=winner_count,
+        rounds=tuple(rounds),
+        multipliers=tuple(multipliers),
+    )
+    return _validate_rule(rule)
+
+
+class CompetitionRuleCache:
+    def __init__(self, path: Path, *, ttl: timedelta = timedelta(hours=6)) -> None:
+        if ttl <= timedelta(0):
+            raise ValueError("ttl must be positive")
+        self.path = Path(path)
+        self.ttl = ttl
+        self._lock = threading.RLock()
+
+    def _load(self) -> dict[str, _CachedRule]:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, Mapping) or payload.get("version") != 1:
+            return {}
+        raw_rules = payload.get("rules")
+        if not isinstance(raw_rules, Mapping):
+            return {}
+        state: dict[str, _CachedRule] = {}
+        for raw_symbol, raw_entry in raw_rules.items():
+            try:
+                if not isinstance(raw_symbol, str) or not isinstance(raw_entry, Mapping):
+                    raise ValueError("cached rule entry is invalid")
+                symbol = _normalized_symbol(raw_symbol)
+                rule = _decode_rule(raw_entry.get("rule"))
+                if rule.symbol != symbol:
+                    raise ValueError("cached rule symbol is inconsistent")
+                state[symbol] = _CachedRule(
+                    fetched_at=_decode_datetime(raw_entry.get("fetched_at"), "fetched_at"),
+                    rule=rule,
+                )
+            except (AttributeError, OverflowError, TypeError, ValueError, RuleParseError):
+                continue
+        return state
+
+    def _save(self, state: Mapping[str, _CachedRule]) -> None:
+        payload = {
+            "version": 1,
+            "rules": {
+                symbol: {
+                    "fetched_at": _encode_datetime(entry.fetched_at, "fetched_at"),
+                    "rule": _encode_rule(entry.rule),
+                }
+                for symbol, entry in sorted(state.items())
+            },
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.path)
+            temp_path = None
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+
+    def get(
+        self,
+        symbol: str,
+        *,
+        now: datetime,
+        loader: Callable[[str], CompetitionRule],
+    ) -> CachedRuleResult:
+        with self._lock:
+            target = _normalized_symbol(symbol)
+            current = _require_utc_aware(now, "now")
+            state = self._load()
+            cached = state.get(target)
+            if cached is not None:
+                age = current - cached.fetched_at
+                if timedelta(0) <= age < self.ttl:
+                    return CachedRuleResult(cached.rule, False)
+            try:
+                rule = _validate_rule(loader(target), expected_symbol=target)
+            except Exception:
+                if cached is None:
+                    raise
+                return CachedRuleResult(cached.rule, True)
+            state[target] = _CachedRule(current, rule)
+            self._save(state)
+            return CachedRuleResult(rule, False)
+
+    def store(self, rule: CompetitionRule, *, fetched_at: datetime) -> None:
+        with self._lock:
+            valid_rule = _validate_rule(rule)
+            fetched = _require_utc_aware(fetched_at, "fetched_at")
+            state = self._load()
+            state[valid_rule.symbol] = _CachedRule(fetched, valid_rule)
+            self._save(state)
