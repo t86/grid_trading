@@ -236,18 +236,25 @@ INDEX_HTML = r"""<!doctype html>
   <style>
     :root {
       color-scheme: light;
-      --bg: #f6f7f9;
+      --bg: #f4f6f8;
       --panel: #ffffff;
-      --text: #18202a;
+      --text: #17212b;
       --muted: #667085;
-      --line: #d9dee7;
+      --line: #d8dee8;
+      --line-soft: #edf0f4;
       --accent: #0f766e;
-      --accent-soft: #e6f3f1;
+      --accent-soft: #e8f5f2;
+      --blue: #175cd3;
+      --blue-soft: #eaf2ff;
       --warn: #b45309;
+      --warn-soft: #fff4e5;
       --danger: #b42318;
+      --danger-soft: #ffebe9;
       --good: #047857;
+      --good-soft: #e7f6ec;
     }
     * { box-sizing: border-box; }
+    html, body { max-width: 100%; overflow-x: hidden; }
     body {
       margin: 0;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -255,80 +262,191 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text);
       letter-spacing: 0;
     }
-    .shell { max-width: 1280px; margin: 0 auto; padding: 22px 18px 32px; }
+    .shell { width: 100%; max-width: 1320px; margin: 0 auto; padding: 24px 20px 40px; }
     header {
       display: flex;
       align-items: flex-end;
       justify-content: space-between;
-      gap: 16px;
-      margin-bottom: 16px;
+      gap: 20px;
+      margin-bottom: 22px;
     }
-    h1 { margin: 0; font-size: 24px; line-height: 1.15; font-weight: 720; }
-    .sub { margin-top: 6px; color: var(--muted); font-size: 13px; }
+    h1 { margin: 0; font-size: 25px; line-height: 1.15; font-weight: 760; }
+    h2 { margin: 0; font-size: 18px; line-height: 1.3; font-weight: 760; }
+    .sub, .section-copy { margin: 6px 0 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
     .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
     button {
       appearance: none;
       border: 1px solid var(--line);
       background: var(--panel);
       color: var(--text);
-      border-radius: 7px;
-      height: 34px;
-      padding: 0 12px;
-      font-weight: 650;
+      border-radius: 8px;
+      min-height: 36px;
+      padding: 0 14px;
+      font-weight: 680;
       cursor: pointer;
     }
     button.primary { background: var(--accent); border-color: var(--accent); color: white; }
     button:disabled { opacity: .55; cursor: wait; }
+    button:focus-visible, a:focus-visible { outline: 3px solid rgba(23, 92, 211, .28); outline-offset: 2px; }
+    .section-block + .section-block { margin-top: 26px; }
+    .section-heading {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 12px;
+    }
+    .source-time { flex: 0 0 auto; color: var(--muted); font-size: 12px; line-height: 1.5; text-align: right; }
     .kpis {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 10px;
-      margin: 14px 0;
+      margin: 12px 0;
     }
     .kpi {
+      min-width: 0;
+      min-height: 82px;
+      padding: 12px;
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 12px;
-      min-height: 82px;
+      border-radius: 9px;
     }
     .kpi .label { color: var(--muted); font-size: 12px; }
-    .kpi .value { margin-top: 8px; font-size: 21px; font-weight: 760; }
+    .kpi .value { margin-top: 8px; font-size: 21px; font-weight: 760; overflow-wrap: anywhere; }
     .table-wrap {
+      width: 100%;
+      max-width: 100%;
+      overflow: auto;
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 8px;
-      overflow: auto;
+      border-radius: 10px;
+      -webkit-overflow-scrolling: touch;
     }
-    table { width: 100%; border-collapse: collapse; min-width: 1050px; }
-    th, td { padding: 11px 12px; border-bottom: 1px solid var(--line); text-align: right; font-size: 13px; white-space: nowrap; }
-    th { color: var(--muted); font-size: 12px; font-weight: 700; background: #fbfcfd; position: sticky; top: 0; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td {
+      padding: 12px 11px;
+      border-bottom: 1px solid var(--line-soft);
+      text-align: right;
+      font-size: 13px;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+      vertical-align: middle;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      color: var(--muted);
+      background: #fafbfc;
+      font-size: 12px;
+      font-weight: 720;
+      letter-spacing: .01em;
+    }
     td:first-child, th:first-child { text-align: left; }
     tr:last-child td { border-bottom: 0; }
-    .sym { font-weight: 760; }
-    .name { color: var(--muted); font-size: 12px; margin-top: 2px; }
-    .pill {
+    .market-table { min-width: 1050px; }
+    .competition-table { min-width: 1180px; }
+    .competition-table th:nth-child(1) { min-width: 130px; }
+    .competition-table th:nth-child(2) { min-width: 180px; }
+    .competition-table th:last-child { min-width: 220px; }
+    .sym { font-weight: 780; letter-spacing: .01em; }
+    .name { margin-top: 3px; color: var(--muted); font-size: 12px; font-weight: 450; white-space: normal; }
+    .metric-primary { font-weight: 720; }
+    .metric-secondary { margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.45; white-space: normal; }
+    .pill, .status-chip, .source-badge {
       display: inline-flex;
       align-items: center;
-      min-width: 58px;
       justify-content: center;
       border-radius: 999px;
       padding: 3px 8px;
-      background: var(--accent-soft);
-      color: var(--accent);
+      font-size: 12px;
       font-weight: 760;
+      line-height: 1.35;
     }
-    .hot { background: #fff4e5; color: var(--warn); }
-    .very-hot { background: #ffe8e5; color: var(--danger); }
+    .pill { min-width: 58px; background: var(--accent-soft); color: var(--accent); }
+    .hot { background: var(--warn-soft); color: var(--warn); }
+    .very-hot { background: var(--danger-soft); color: var(--danger); }
+    .status-chip { background: #f0f2f5; color: #475467; }
+    .status-chip.active { background: var(--good-soft); color: var(--good); }
+    .status-chip.unavailable { background: var(--danger-soft); color: var(--danger); }
+    .source-badges { display: flex; justify-content: flex-end; align-items: center; gap: 5px; flex-wrap: wrap; }
+    .source-badge { background: var(--blue-soft); color: var(--blue); }
+    .source-badge.official { background: var(--good-soft); color: var(--good); }
+    .source-badge.estimate { background: var(--blue-soft); color: var(--blue); }
+    .source-badge.stale { background: var(--warn-soft); color: var(--warn); }
+    .source-details { margin-top: 6px; color: var(--muted); font-size: 11px; line-height: 1.55; white-space: normal; overflow-wrap: anywhere; }
+    .source-details a { color: var(--blue); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+    .threshold-watch { color: var(--blue); font-weight: 680; }
+    .threshold-reference { color: var(--warn); font-weight: 760; }
+    .threshold-safe { color: var(--good); font-weight: 760; }
     .positive { color: var(--good); }
     .negative { color: var(--danger); }
-    .status { color: var(--muted); font-size: 12px; margin-top: 10px; min-height: 18px; }
-    .errors { margin-top: 10px; color: var(--danger); font-size: 12px; line-height: 1.5; }
+    .status { min-height: 18px; margin-top: 9px; color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+    .errors {
+      min-height: 0;
+      margin-top: 8px;
+      color: var(--danger);
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
     @media (max-width: 760px) {
-      header { align-items: flex-start; flex-direction: column; }
-      .actions { justify-content: flex-start; }
-      .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .shell { padding: 16px 10px 24px; }
+      .shell { padding: 17px 11px 28px; }
+      header { align-items: stretch; flex-direction: column; gap: 14px; margin-bottom: 20px; }
+      h1 { font-size: 22px; }
+      .actions { justify-content: stretch; }
+      .actions button { flex: 1 1 0; min-width: 0; }
+      .section-block + .section-block { margin-top: 24px; }
+      .section-heading { align-items: flex-start; flex-direction: column; gap: 7px; }
+      .source-time { max-width: 100%; text-align: left; overflow-wrap: anywhere; }
+      .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+      .kpi { min-height: 76px; padding: 10px; }
+      .kpi .value { font-size: 18px; }
+      .competition-wrap { overflow: visible; background: transparent; border: 0; }
+      .competition-table { min-width: 0; display: block; }
+      .competition-table thead { display: none; }
+      .competition-table tbody { display: grid; width: 100%; gap: 10px; }
+      .competition-table tbody tr {
+        display: block;
+        width: 100%;
+        padding: 5px 12px;
+        overflow: hidden;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+      }
+      .competition-table tbody td {
+        display: grid;
+        grid-template-columns: 98px minmax(0, 1fr);
+        gap: 10px;
+        align-items: start;
+        width: 100%;
+        padding: 9px 0;
+        text-align: right;
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }
+      .competition-table tbody td:last-child { border-bottom: 0; }
+      .competition-table tbody td::before {
+        content: attr(data-label);
+        color: var(--muted);
+        text-align: left;
+        font-size: 12px;
+        font-weight: 720;
+        line-height: 1.45;
+      }
+      .competition-table .cell-value { min-width: 0; text-align: right; }
+      .competition-table .source-badges { justify-content: flex-end; }
+      .competition-table .name { text-align: right; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        scroll-behavior: auto !important;
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .01ms !important;
+      }
     }
   </style>
 </head>
@@ -337,7 +455,7 @@ INDEX_HTML = r"""<!doctype html>
     <header>
       <div>
         <h1>Binance Alpha Monitor</h1>
-        <div class="sub" id="generated">Loading...</div>
+        <p class="sub">交易赛门槛与实时行情分区展示，每 30 秒自动刷新。</p>
       </div>
       <div class="actions">
         <button id="refreshBtn" class="primary">Refresh</button>
@@ -345,106 +463,313 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </header>
 
-    <section class="kpis">
-      <div class="kpi"><div class="label">Symbols</div><div class="value" id="kpiSymbols">-</div></div>
-      <div class="kpi"><div class="label">Max Multiple</div><div class="value" id="kpiMultiple">-</div></div>
-      <div class="kpi"><div class="label">Top 1h Volume</div><div class="value" id="kpiVolume">-</div></div>
-      <div class="kpi"><div class="label">Spike Rule</div><div class="value" id="kpiRule">-</div></div>
+    <section id="competitionSection" class="section-block" aria-labelledby="competitionTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="competitionTitle">Alpha 交易赛门槛</h2>
+          <p class="section-copy">按当前轮累计加权交易量估算；观察线 0.4、参考线 0.6、安全线 1.0，不含新锐交易者个人 1.2x 加成。</p>
+        </div>
+        <div id="competitionGenerated" class="source-time" role="status" aria-live="polite">等待交易赛数据…</div>
+      </div>
+      <div class="table-wrap competition-wrap">
+        <table class="competition-table">
+          <thead>
+            <tr>
+              <th>币种</th>
+              <th>轮次 / Day / 倒计时</th>
+              <th>当前倍速</th>
+              <th>加权总量</th>
+              <th>获奖人数</th>
+              <th>平均量</th>
+              <th>观察线 0.4</th>
+              <th>参考线 0.6</th>
+              <th>安全线 1.0</th>
+              <th>来源 / 更新时间 / 公告</th>
+            </tr>
+          </thead>
+          <tbody id="competitionRows"></tbody>
+        </table>
+      </div>
+      <div id="competitionErrors" class="errors" role="alert" aria-live="polite"></div>
     </section>
 
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Price</th>
-            <th>1m Vol</th>
-            <th>1m Δ</th>
-            <th>1h Vol</th>
-            <th>20m Avg</th>
-            <th>Multiple</th>
-            <th>Trades</th>
-            <th>24h Vol</th>
-            <th>24h %</th>
-            <th>Closed UTC</th>
-          </tr>
-        </thead>
-        <tbody id="rows"></tbody>
-      </table>
-    </div>
-    <div class="status" id="status"></div>
-    <div class="errors" id="errors"></div>
+    <section id="marketSection" class="section-block" aria-labelledby="marketTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="marketTitle">实时行情监控</h2>
+          <p class="section-copy">保留原有 1 分钟放量、1 小时成交量与告警检查。</p>
+        </div>
+        <div id="marketGenerated" class="source-time" role="status" aria-live="polite">等待行情数据…</div>
+      </div>
+      <div class="kpis">
+        <div class="kpi"><div class="label">Symbols</div><div class="value" id="kpiSymbols">-</div></div>
+        <div class="kpi"><div class="label">Max Multiple</div><div class="value" id="kpiMultiple">-</div></div>
+        <div class="kpi"><div class="label">Top 1h Volume</div><div class="value" id="kpiVolume">-</div></div>
+        <div class="kpi"><div class="label">Spike Rule</div><div class="value" id="kpiRule">-</div></div>
+      </div>
+      <div class="table-wrap market-wrap">
+        <table class="market-table">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Price</th>
+              <th>1m Vol</th>
+              <th>1m Δ</th>
+              <th>1h Vol</th>
+              <th>20m Avg</th>
+              <th>Multiple</th>
+              <th>Trades</th>
+              <th>24h Vol</th>
+              <th>24h %</th>
+              <th>Closed UTC</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <div class="status" id="status" role="status" aria-live="polite"></div>
+      <div class="status" id="alertStatus" role="status" aria-live="polite"></div>
+      <div class="errors" id="errors" role="alert" aria-live="polite"></div>
+    </section>
   </div>
 
   <script>
     const fmt = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 });
+    const integerFmt = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
     const priceFmt = new Intl.NumberFormat('en-US', { maximumFractionDigits: 10 });
+    const statusLabels = {
+      'upcoming': '尚未开始',
+      'active': '进行中',
+      'between_rounds': '轮次间隔',
+      'ended': '交易赛已结束',
+      'rule_unavailable': '规则暂不可用',
+      'volume_unavailable': '交易量暂不可用',
+    };
     const rowsEl = document.getElementById('rows');
+    const competitionRowsEl = document.getElementById('competitionRows');
     const statusEl = document.getElementById('status');
+    const alertStatusEl = document.getElementById('alertStatus');
     const errorsEl = document.getElementById('errors');
+    const competitionErrorsEl = document.getElementById('competitionErrors');
     const refreshBtn = document.getElementById('refreshBtn');
     const checkBtn = document.getElementById('checkBtn');
+    let refreshGeneration = 0;
 
-    function money(v) { return fmt.format(v || 0); }
-    function multipleClass(v) {
-      if (v >= 5) return 'pill very-hot';
-      if (v >= 3) return 'pill hot';
-      return 'pill';
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, character => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      })[character]);
     }
-    function render(data) {
-      document.getElementById('generated').textContent = `Updated ${data.generatedAtUtc}`;
-      document.getElementById('kpiSymbols').textContent = data.rows.length;
-      const maxMult = data.rows.length ? data.rows[0].multiple : 0;
-      document.getElementById('kpiMultiple').textContent = `${maxMult.toFixed(2)}x`;
-      const topVol = data.rows.reduce((m, r) => Math.max(m, r.latest1hQuoteVolume || 0), 0);
-      document.getElementById('kpiVolume').textContent = `${money(topVol)} U`;
-      document.getElementById('kpiRule').textContent = `1m >= ${money(data.config.absoluteMinQuoteVolume)} U`;
-      rowsEl.innerHTML = data.rows.map(row => {
-        const pctClass = row.priceChangePercent24h >= 0 ? 'positive' : 'negative';
-        return `<tr>
-          <td><div class="sym">${row.symbol}</div><div class="name">${row.name} · ${row.alphaId}</div></td>
-          <td>${priceFmt.format(row.lastPrice)}</td>
-          <td>${money(row.latest1mQuoteVolume)}</td>
-          <td class="${row.delta1mQuoteVolume >= 0 ? 'positive' : 'negative'}">${row.delta1mQuoteVolume >= 0 ? '+' : ''}${money(row.delta1mQuoteVolume)}</td>
-          <td>${money(row.latest1hQuoteVolume)}</td>
-          <td>${money(row.baselineQuoteVolume)}</td>
-          <td><span class="${multipleClass(row.multiple)}">${row.multiple.toFixed(2)}x</span></td>
-          <td>${fmt.format(row.trades || 0)}</td>
-          <td>${money(row.tickerQuoteVolume24h)}</td>
-          <td class="${pctClass}">${row.priceChangePercent24h.toFixed(2)}%</td>
-          <td>${row.closedUtc}</td>
-        </tr>`;
-      }).join('');
-      errorsEl.textContent = (data.errors || []).join('\n');
-    }
-    async function refresh() {
-      refreshBtn.disabled = true;
-      statusEl.textContent = 'Refreshing...';
+
+    function safeArticleUrl(value) {
+      if (typeof value !== 'string' || !/^https?:\/\//i.test(value.trim())) return null;
       try {
-        const res = await fetch(`api/snapshot?t=${Date.now()}`, { cache: 'no-store' });
-        const data = await res.json();
-        render(data);
-        statusEl.textContent = 'Live data loaded.';
-      } catch (err) {
-        statusEl.textContent = `Refresh failed: ${err}`;
-      } finally {
-        refreshBtn.disabled = false;
+        const url = new URL(value.trim());
+        return (url.protocol === 'http:' || url.protocol === 'https:') ? url.href : null;
+      } catch (_) {
+        return null;
       }
     }
+
+    function finiteNumber(value) {
+      return typeof value === 'number' && Number.isFinite(value) ? value : null;
+    }
+
+    function money(value) {
+      const number = finiteNumber(value);
+      return number === null ? '—' : fmt.format(number);
+    }
+
+    function formatU(value) {
+      if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
+      return `${fmt.format(value)} U`;
+    }
+
+    function formatInteger(value) {
+      const number = finiteNumber(value);
+      return number === null ? '—' : integerFmt.format(number);
+    }
+
+    function formatUtc(value) {
+      if (typeof value !== 'string' || !value) return '时间未知';
+      const timestamp = Date.parse(value);
+      if (!Number.isFinite(timestamp)) return '时间未知';
+      return `${new Date(timestamp).toISOString().replace('T', ' ').replace('.000Z', ' UTC')}`;
+    }
+
+    function formatCountdown(endUtc, nowMs = Date.now()) {
+      if (typeof endUtc !== 'string' || !endUtc) return '结束时间未知';
+      const endMs = Date.parse(endUtc);
+      if (!Number.isFinite(endMs)) return '结束时间未知';
+      const remainingMs = endMs - nowMs;
+      if (remainingMs <= 0) return '已结束';
+      const totalMinutes = Math.ceil(remainingMs / 60000);
+      const days = Math.floor(totalMinutes / 1440);
+      const hours = Math.floor((totalMinutes % 1440) / 60);
+      const minutes = totalMinutes % 60;
+      const parts = [];
+      if (days) parts.push(`${days}天`);
+      if (hours || days) parts.push(`${hours}小时`);
+      parts.push(`${minutes}分钟`);
+      return `剩余 ${parts.join(' ')}`;
+    }
+
+    function multipleClass(value) {
+      if (value >= 5) return 'pill very-hot';
+      if (value >= 3) return 'pill hot';
+      return 'pill';
+    }
+
+    function sourceContent(row) {
+      const badges = [];
+      if (row.volumeSource === 'official') {
+        badges.push('<span class="source-badge official">官方</span>');
+      } else if (row.volumeSource === 'alpha_kline_estimate') {
+        badges.push('<span class="source-badge estimate">Alpha K线估算</span>');
+      }
+      if (row.stale) badges.push('<span class="source-badge stale">数据已过期</span>');
+      const articleUrl = safeArticleUrl(row.articleUrl);
+      const details = [];
+      if (row.volumeUpdatedAtUtc) details.push(`数据 ${escapeHtml(formatUtc(row.volumeUpdatedAtUtc))}`);
+      if (articleUrl) details.push(`<a href="${escapeHtml(articleUrl)}" target="_blank" rel="noopener noreferrer">官方公告</a>`);
+      if (row.error) details.push(escapeHtml(row.error));
+      if (!badges.length) badges.push(`<span class="status-chip">${escapeHtml(statusLabels[row.status] || '来源暂不可用')}</span>`);
+      return `<div class="cell-value source-cell"><div class="source-badges">${badges.join('')}</div>${details.length ? `<div class="source-details">${details.join(' · ')}</div>` : ''}</div>`;
+    }
+
+    function roundContent(row) {
+      const state = statusLabels[row.status] || '状态未知';
+      if (row.status !== 'active') {
+        const unavailable = row.status === 'rule_unavailable' || row.status === 'volume_unavailable';
+        return `<div class="cell-value"><span class="status-chip${unavailable ? ' unavailable' : ''}">${escapeHtml(state)}</span></div>`;
+      }
+      return `<div class="cell-value"><div class="metric-primary">第 ${escapeHtml(row.round)} 轮 · Day ${escapeHtml(row.day)}</div>
+        <div class="metric-secondary"><span class="status-chip active">进行中</span> · ${escapeHtml(formatCountdown(row.roundEndUtc))}</div></div>`;
+    }
+
+    function renderCompetitionRow(row) {
+      const multiplier = finiteNumber(row.currentMultiplier);
+      return `<tr>
+        <td data-label="币种"><div class="cell-value token-cell"><div class="sym">${escapeHtml(row.symbol)}</div><div class="name">${escapeHtml(row.name)}</div></div></td>
+        <td data-label="轮次 / Day">${roundContent(row)}</td>
+        <td data-label="当前倍速">${multiplier === null ? '—' : `<span class="${multipleClass(multiplier)}">${escapeHtml(multiplier.toFixed(1))}x</span>`}</td>
+        <td data-label="加权总量" class="metric-primary">${escapeHtml(formatU(row.weightedVolume))}</td>
+        <td data-label="获奖人数">${escapeHtml(formatInteger(row.winnerCount))}</td>
+        <td data-label="平均量">${escapeHtml(formatU(row.averageVolume))}</td>
+        <td data-label="观察线 0.4" class="threshold-watch">${escapeHtml(formatU(row.watchThreshold))}</td>
+        <td data-label="参考线 0.6" class="threshold-reference">${escapeHtml(formatU(row.referenceThreshold))}</td>
+        <td data-label="安全线 1.0" class="threshold-safe">${escapeHtml(formatU(row.safeThreshold))}</td>
+        <td data-label="来源 / 更新时间 / 公告">${sourceContent(row)}</td>
+      </tr>`;
+    }
+
+    function validatePayload(data, label) {
+      if (
+        data === null || typeof data !== 'object' || Array.isArray(data) ||
+        !Array.isArray(data.rows) ||
+        !data.rows.every(row => row !== null && typeof row === 'object' && !Array.isArray(row))
+      ) {
+        throw new Error(`${label}数据格式无效`);
+      }
+      return data;
+    }
+
+    function renderCompetition(data) {
+      const payload = validatePayload(data, '交易赛');
+      const rows = payload.rows;
+      document.getElementById('competitionGenerated').textContent = `交易赛更新 ${payload.generatedAtUtc || '时间未知'}`;
+      competitionRowsEl.innerHTML = rows.map(renderCompetitionRow).join('');
+      competitionErrorsEl.textContent = (Array.isArray(payload.errors) ? payload.errors : []).map(String).join('\n');
+    }
+
+    function renderMarket(data) {
+      const payload = validatePayload(data, '行情');
+      const rows = payload.rows;
+      document.getElementById('marketGenerated').textContent = `行情更新 ${payload.generatedAtUtc || '时间未知'}`;
+      document.getElementById('kpiSymbols').textContent = rows.length;
+      const maxMult = rows.length ? finiteNumber(rows[0].multiple) : null;
+      document.getElementById('kpiMultiple').textContent = maxMult === null ? '—' : `${maxMult.toFixed(2)}x`;
+      const topVol = rows.reduce((maximum, row) => Math.max(maximum, finiteNumber(row.latest1hQuoteVolume) || 0), 0);
+      document.getElementById('kpiVolume').textContent = formatU(topVol);
+      const absoluteMinimum = payload.config && typeof payload.config === 'object'
+        ? payload.config.absoluteMinQuoteVolume : null;
+      document.getElementById('kpiRule').textContent = `1m >= ${formatU(absoluteMinimum)}`;
+      rowsEl.innerHTML = rows.map(row => {
+        const delta = finiteNumber(row.delta1mQuoteVolume);
+        const percent = finiteNumber(row.priceChangePercent24h);
+        const multiple = finiteNumber(row.multiple);
+        const pctClass = (percent || 0) >= 0 ? 'positive' : 'negative';
+        return `<tr>
+          <td><div class="sym">${escapeHtml(row.symbol)}</div><div class="name">${escapeHtml(row.name)} · ${escapeHtml(row.alphaId)}</div></td>
+          <td>${escapeHtml(finiteNumber(row.lastPrice) === null ? '—' : priceFmt.format(row.lastPrice))}</td>
+          <td>${escapeHtml(money(row.latest1mQuoteVolume))}</td>
+          <td class="${(delta || 0) >= 0 ? 'positive' : 'negative'}">${delta !== null && delta >= 0 ? '+' : ''}${escapeHtml(money(delta))}</td>
+          <td>${escapeHtml(money(row.latest1hQuoteVolume))}</td>
+          <td>${escapeHtml(money(row.baselineQuoteVolume))}</td>
+          <td>${multiple === null ? '—' : `<span class="${multipleClass(multiple)}">${escapeHtml(multiple.toFixed(2))}x</span>`}</td>
+          <td>${escapeHtml(formatInteger(row.trades))}</td>
+          <td>${escapeHtml(money(row.tickerQuoteVolume24h))}</td>
+          <td class="${pctClass}">${percent === null ? '—' : `${escapeHtml(percent.toFixed(2))}%`}</td>
+          <td>${escapeHtml(row.closedUtc)}</td>
+        </tr>`;
+      }).join('');
+      errorsEl.textContent = (Array.isArray(payload.errors) ? payload.errors : []).map(String).join('\n');
+    }
+
+    async function fetchJson(path, options = {}) {
+      const separator = path.includes('?') ? '&' : '?';
+      const response = await fetch(`${path}${separator}t=${Date.now()}`, { cache: 'no-store', ...options });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.json();
+    }
+
+    async function refresh() {
+      const generation = ++refreshGeneration;
+      refreshBtn.disabled = true;
+      try {
+        const [marketResult, competitionResult] = await Promise.allSettled([
+          fetchJson('api/snapshot'),
+          fetchJson('api/competition'),
+        ]);
+        if (generation !== refreshGeneration) return;
+        if (marketResult.status === 'fulfilled') {
+          try {
+            renderMarket(marketResult.value);
+            statusEl.textContent = '实时行情已更新。';
+          } catch (error) {
+            statusEl.textContent = `行情刷新失败：${error}`;
+          }
+        } else {
+          statusEl.textContent = `行情刷新失败：${marketResult.reason}`;
+        }
+        if (competitionResult.status === 'fulfilled') {
+          try {
+            renderCompetition(competitionResult.value);
+          } catch (error) {
+            competitionErrorsEl.textContent = `交易赛刷新失败：${error}`;
+          }
+        } else {
+          competitionErrorsEl.textContent = `交易赛刷新失败：${competitionResult.reason}`;
+        }
+      } finally {
+        if (generation === refreshGeneration) refreshBtn.disabled = false;
+      }
+    }
+
     async function checkAlert() {
       checkBtn.disabled = true;
-      statusEl.textContent = 'Checking alert rule...';
+      alertStatusEl.textContent = '正在检查告警规则…';
       try {
-        const res = await fetch(`api/check?t=${Date.now()}`, { method: 'POST', cache: 'no-store' });
-        const data = await res.json();
-        statusEl.textContent = `Alert check finished in ${data.elapsedMs} ms${data.dryRun ? ' (dry-run)' : ''}.`;
+        const data = await fetchJson('api/check', { method: 'POST' });
+        alertStatusEl.textContent = `告警检查完成，耗时 ${formatInteger(data.elapsedMs)} ms${data.dryRun ? '（dry-run）' : ''}。`;
         await refresh();
       } catch (err) {
-        statusEl.textContent = `Alert check failed: ${err}`;
+        alertStatusEl.textContent = `告警检查失败：${err}`;
       } finally {
         checkBtn.disabled = false;
       }
     }
+
     refreshBtn.addEventListener('click', refresh);
     checkBtn.addEventListener('click', checkAlert);
     refresh();

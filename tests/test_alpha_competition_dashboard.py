@@ -738,3 +738,146 @@ def test_trace_and_connect_authenticate_before_method_rejection(
 def test_dashboard_production_bind_defaults() -> None:
     assert dashboard.DEFAULT_HOST == "0.0.0.0"
     assert dashboard.DEFAULT_PORT == 8796
+
+
+def test_page_places_competition_thresholds_above_existing_market_monitor() -> None:
+    html = dashboard.INDEX_HTML
+
+    assert html.index('id="competitionSection"') < html.index('id="marketSection"')
+    for marker in (
+        'id="competitionRows"',
+        'class="competition-table"',
+        'data-label="观察线 0.4"',
+        'data-label="参考线 0.6"',
+        'data-label="安全线 1.0"',
+        'id="rows"',
+        '<th>1m Vol</th>',
+        'id="checkBtn"',
+        '不含新锐交易者个人 1.2x 加成',
+    ):
+        assert marker in html
+
+
+def test_page_has_responsive_table_and_mobile_card_contracts() -> None:
+    html = dashboard.INDEX_HTML
+
+    for marker in (
+        ".competition-table { min-width:",
+        "@media (max-width: 760px)",
+        ".competition-table thead { display: none; }",
+        ".competition-table tbody tr {",
+        ".competition-table tbody td::before",
+        "content: attr(data-label)",
+        "overflow-wrap: anywhere",
+        "@media (prefers-reduced-motion: reduce)",
+    ):
+        assert marker in html
+
+
+def test_mobile_multiline_values_stay_inside_the_value_column() -> None:
+    html = dashboard.INDEX_HTML
+
+    assert 'class="cell-value"' in html
+    assert 'class="cell-value source-cell"' in html
+    assert 'class="cell-value token-cell"' in html
+    assert ".competition-table .cell-value { min-width: 0; text-align: right; }" in html
+
+
+def test_page_renders_all_competition_states_without_coercing_missing_values() -> None:
+    html = dashboard.INDEX_HTML
+
+    for marker in (
+        "function formatU(value)",
+        "if (typeof value !== 'number' || !Number.isFinite(value)) return '—'",
+        "function formatCountdown(endUtc",
+        "'upcoming': '尚未开始'",
+        "'active': '进行中'",
+        "'between_rounds': '轮次间隔'",
+        "'ended': '交易赛已结束'",
+        "'rule_unavailable': '规则暂不可用'",
+        "'volume_unavailable': '交易量暂不可用'",
+        "volumeUpdatedAtUtc",
+    ):
+        assert marker in html
+
+
+def test_page_escapes_api_content_and_allows_only_web_article_links() -> None:
+    html = dashboard.INDEX_HTML
+
+    for marker in (
+        "function escapeHtml(value)",
+        "function safeArticleUrl(value)",
+        "url.protocol === 'http:' || url.protocol === 'https:'",
+        "escapeHtml(row.symbol)",
+        "escapeHtml(row.name)",
+        "escapeHtml(row.alphaId)",
+        "escapeHtml(row.error)",
+        'rel="noopener noreferrer"',
+    ):
+        assert marker in html
+
+
+def test_page_refreshes_market_and_competition_independently() -> None:
+    html = dashboard.INDEX_HTML
+
+    assert "Promise.allSettled" in html
+    assert "fetchJson('api/snapshot')" in html
+    assert "fetchJson('api/competition')" in html
+    assert "if (!response.ok)" in html
+    assert "renderMarket(marketResult.value)" in html
+    assert "renderCompetition(competitionResult.value)" in html
+    assert "competitionErrorsEl.textContent" in html
+    assert 'id="alertStatus"' in html
+    assert "await refresh()" in html
+    assert "alertStatusEl.textContent" in html
+
+
+def test_page_ignores_stale_refresh_generations_and_latest_request_owns_button() -> None:
+    html = dashboard.INDEX_HTML
+
+    for marker in (
+        "let refreshGeneration = 0",
+        "const generation = ++refreshGeneration",
+        "if (generation !== refreshGeneration) return",
+        "finally",
+        "if (generation === refreshGeneration) refreshBtn.disabled = false",
+    ):
+        assert marker in html
+
+
+def test_page_validates_api_payloads_and_isolates_renderer_failures() -> None:
+    html = dashboard.INDEX_HTML
+
+    for marker in (
+        "function validatePayload(data, label)",
+        "data === null",
+        "typeof data !== 'object'",
+        "Array.isArray(data)",
+        "!Array.isArray(data.rows)",
+        "data.rows.every",
+    ):
+        assert marker in html
+    market_branch = html.index("if (marketResult.status === 'fulfilled')")
+    market_render = html.index("renderMarket(marketResult.value)", market_branch)
+    market_catch = html.index("} catch (error)", market_render)
+    competition_branch = html.index("if (competitionResult.status === 'fulfilled')")
+    competition_render = html.index("renderCompetition(competitionResult.value)", competition_branch)
+    competition_catch = html.index("} catch (error)", competition_render)
+    assert market_branch < market_render < market_catch
+    assert competition_branch < competition_render < competition_catch
+
+
+def test_page_exposes_accessible_live_regions_and_text_source_badges() -> None:
+    html = dashboard.INDEX_HTML
+
+    assert html.count('role="status" aria-live="polite"') >= 3
+    assert html.count('role="alert" aria-live="polite"') >= 2
+    for marker in (
+        'source-badge official',
+        'source-badge estimate',
+        'source-badge stale',
+        'Alpha K线估算',
+        '>官方<',
+        '>数据已过期<',
+    ):
+        assert marker in html
