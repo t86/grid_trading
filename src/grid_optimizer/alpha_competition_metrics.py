@@ -631,11 +631,10 @@ class CompetitionVolumeProvider:
             start_time_ms=int(valid_round.start_utc.timestamp() * 1000),
             end_time_ms=int(end.timestamp() * 1000),
         )
-        updated_at = datetime.now(_UTC)
         return VolumeSnapshot(
             weighted_volume=weight_kline_volume(valid_round, valid_rule.multipliers, rows),
             source="alpha_kline_estimate",
-            updated_at_utc=updated_at,
+            updated_at_utc=current,
         )
 
 
@@ -812,3 +811,232 @@ class CompetitionRuleCache:
             state = self._load()
             state[valid_rule.symbol] = _CachedRule(fetched, valid_rule)
             self._save(state)
+
+
+def _metrics_row(symbol: str) -> dict[str, object]:
+    return {
+        "symbol": symbol,
+        "name": None,
+        "round": None,
+        "day": None,
+        "roundStartUtc": None,
+        "roundEndUtc": None,
+        "currentMultiplier": None,
+        "weightedVolume": None,
+        "volumeSource": None,
+        "volumeUpdatedAtUtc": None,
+        "winnerCount": None,
+        "averageVolume": None,
+        "watchThreshold": None,
+        "referenceThreshold": None,
+        "safeThreshold": None,
+        "articleUrl": None,
+        "stale": False,
+        "status": "rule_unavailable",
+        "error": None,
+    }
+
+
+def _iso_seconds(value: datetime, name: str) -> str:
+    return _require_utc_aware(value, name).isoformat(timespec="seconds")
+
+
+def _validated_volume_snapshot(
+    value: object,
+    *,
+    round_: CompetitionRound,
+    current: datetime,
+) -> VolumeSnapshot:
+    if not isinstance(value, VolumeSnapshot):
+        raise ValueError("competition volume snapshot is invalid")
+    weighted_volume = _official_weighted_volume(value.weighted_volume)
+    if not isinstance(value.source, str) or not value.source.strip():
+        raise ValueError("competition volume snapshot is invalid")
+    updated_at = _require_utc_aware(value.updated_at_utc, "volume updated_at_utc")
+    if updated_at < round_.start_utc or updated_at > current:
+        raise ValueError("competition volume snapshot is invalid")
+    return VolumeSnapshot(weighted_volume, value.source.strip(), updated_at)
+
+
+class _VolumeUnavailableError(RuntimeError):
+    pass
+
+
+def _normalized_service_symbol(value: object) -> str:
+    if not isinstance(value, str):
+        raise RuleParseError("expected symbol is missing")
+    symbol = value.strip().upper()
+    if re.fullmatch(r"[A-Z0-9]{1,32}", symbol) is None:
+        raise RuleParseError("expected symbol is invalid")
+    return symbol
+
+
+class CompetitionMetricsService:
+    def __init__(
+        self,
+        *,
+        rule_provider: Any,
+        rule_cache: Any,
+        volume_provider: Any,
+        volume_ttl: timedelta = timedelta(seconds=60),
+    ) -> None:
+        if not isinstance(volume_ttl, timedelta) or volume_ttl <= timedelta(0):
+            raise ValueError("volume_ttl must be positive")
+        self.rule_provider = rule_provider
+        self.rule_cache = rule_cache
+        self.volume_provider = volume_provider
+        self.volume_ttl = volume_ttl
+        self._volume_cache: dict[tuple[str, str, int], tuple[datetime, VolumeSnapshot]] = {}
+        self._volume_failures: dict[tuple[str, str, int], tuple[datetime, str]] = {}
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _error(symbol: str, kind: str) -> str:
+        return f"{symbol or 'UNKNOWN'}: competition {kind} unavailable"
+
+    def _rule_result(self, symbol: str, current: datetime) -> CachedRuleResult:
+        result = self.rule_cache.get(
+            symbol,
+            now=current,
+            loader=lambda target: self.rule_provider.fetch_rule(target, now=current),
+        )
+        if not isinstance(result, CachedRuleResult) or not isinstance(result.stale, bool):
+            raise RuleParseError("competition rule cache result is invalid")
+        return CachedRuleResult(
+            _validate_rule(result.rule, expected_symbol=symbol),
+            result.stale,
+        )
+
+    def _volume(
+        self,
+        rule: CompetitionRule,
+        round_: CompetitionRound,
+        current: datetime,
+    ) -> tuple[VolumeSnapshot, bool, str | None]:
+        key = (rule.symbol, rule.article_code, round_.number)
+        for old_key in list(self._volume_cache):
+            if old_key[0] == rule.symbol and old_key[1] != rule.article_code:
+                del self._volume_cache[old_key]
+        for old_key in list(self._volume_failures):
+            if old_key[0] == rule.symbol and old_key[1] != rule.article_code:
+                del self._volume_failures[old_key]
+
+        cached = self._volume_cache.get(key)
+        cached_age = current - cached[0] if cached is not None else None
+        fallback = cached if cached_age is not None and cached_age >= timedelta(0) else None
+        if cached is not None:
+            if cached_age is not None and timedelta(0) <= cached_age < self.volume_ttl:
+                return cached[1], False, None
+
+        failure = self._volume_failures.get(key)
+        if failure is not None:
+            failure_age = current - failure[0]
+            if timedelta(0) <= failure_age < self.volume_ttl:
+                if fallback is None:
+                    raise _VolumeUnavailableError(failure[1])
+                return fallback[1], True, failure[1]
+            del self._volume_failures[key]
+        try:
+            snapshot = _validated_volume_snapshot(
+                self.volume_provider.fetch(rule, round_, current),
+                round_=round_,
+                current=current,
+            )
+        except Exception:
+            error = self._error(rule.symbol, "volume")
+            self._volume_failures[key] = (current, error)
+            if fallback is None:
+                raise _VolumeUnavailableError(error) from None
+            return fallback[1], True, error
+        self._volume_cache[key] = (current, snapshot)
+        self._volume_failures.pop(key, None)
+        return snapshot, False, None
+
+    def _build_row(
+        self,
+        cached_rule: CachedRuleResult,
+        current: datetime,
+    ) -> dict[str, object]:
+        rule = cached_rule.rule
+        selection = select_round(rule, current)
+        row = _metrics_row(rule.symbol)
+        row.update(
+            {
+                "name": rule.name,
+                "winnerCount": rule.winner_count,
+                "articleUrl": rule.article_url,
+                "stale": cached_rule.stale,
+                "status": selection.status,
+            }
+        )
+        if selection.status != "active" or selection.round is None:
+            return row
+
+        round_ = selection.round
+        row.update(
+            {
+                "round": round_.number,
+                "day": selection.day,
+                "roundStartUtc": _iso_seconds(round_.start_utc, "round start_utc"),
+                "roundEndUtc": _iso_seconds(round_.end_utc, "round end_utc"),
+                "currentMultiplier": selection.multiplier,
+            }
+        )
+        try:
+            snapshot, volume_stale, error = self._volume(rule, round_, current)
+        except _VolumeUnavailableError:
+            row["status"] = "volume_unavailable"
+            row["error"] = self._error(rule.symbol, "volume")
+            return row
+
+        thresholds = calculate_thresholds(
+            weighted_volume=snapshot.weighted_volume,
+            winner_count=rule.winner_count,
+        )
+        row.update(
+            {
+                "weightedVolume": snapshot.weighted_volume,
+                "volumeSource": snapshot.source,
+                "volumeUpdatedAtUtc": _iso_seconds(snapshot.updated_at_utc, "volume updated_at_utc"),
+                "averageVolume": thresholds.average,
+                "watchThreshold": thresholds.watch,
+                "referenceThreshold": thresholds.reference,
+                "safeThreshold": thresholds.safe,
+                "stale": cached_rule.stale or volume_stale,
+                "error": error,
+            }
+        )
+        return row
+
+    def collect(self, symbols: list[str], *, now: datetime | None = None) -> dict[str, Any]:
+        current = datetime.now(_UTC) if now is None else _require_utc_aware(now, "now")
+        rows: list[dict[str, object]] = []
+        errors: list[str] = []
+        with self._lock:
+            for raw_symbol in symbols:
+                try:
+                    symbol = _normalized_service_symbol(raw_symbol)
+                except RuleParseError:
+                    symbol = ""
+                    error = self._error(symbol, "rule")
+                    row = _metrics_row(symbol)
+                    row["error"] = error
+                    rows.append(row)
+                    errors.append(error)
+                    continue
+                try:
+                    cached_rule = self._rule_result(symbol, current)
+                except Exception:
+                    error = self._error(symbol, "rule")
+                    row = _metrics_row(symbol)
+                    row["error"] = error
+                else:
+                    row = self._build_row(cached_rule, current)
+                rows.append(row)
+                if isinstance(row["error"], str):
+                    errors.append(row["error"])
+        return {
+            "generatedAtUtc": current.isoformat(timespec="seconds"),
+            "rows": rows,
+            "errors": errors,
+        }

@@ -878,13 +878,11 @@ def test_volume_provider_uses_actual_pair_start_end_and_limit_200() -> None:
     round_ = rule.rounds[0]
     market = _FakeMarketClient([_kline("2026-08-05 13:00", quote_volume="100")])
 
-    requested_after = datetime.now(UTC)
     result = metrics.CompetitionVolumeProvider(market=market).fetch(rule, round_, NOW)
-    completed_before = datetime.now(UTC)
 
     assert result.source == "alpha_kline_estimate"
     assert result.weighted_volume == pytest.approx(350)
-    assert requested_after <= result.updated_at_utc <= completed_before
+    assert result.updated_at_utc == NOW
     assert market.calls == [
         {
             "pair": "ALPHA_1075USDC",
@@ -1028,3 +1026,702 @@ def test_calculation_apis_require_utc_aware_datetimes() -> None:
         metrics.CompetitionVolumeProvider(market=_FakeMarketClient([])).fetch(
             rule, rule.rounds[0], naive_now
         )
+
+
+_SERVICE_ROW_KEYS = {
+    "symbol",
+    "name",
+    "round",
+    "day",
+    "roundStartUtc",
+    "roundEndUtc",
+    "currentMultiplier",
+    "weightedVolume",
+    "volumeSource",
+    "volumeUpdatedAtUtc",
+    "winnerCount",
+    "averageVolume",
+    "watchThreshold",
+    "referenceThreshold",
+    "safeThreshold",
+    "articleUrl",
+    "stale",
+    "status",
+    "error",
+}
+
+
+class _ServiceRuleProvider:
+    def __init__(self, rules: dict[str, metrics.CompetitionRule | Exception]) -> None:
+        self.rules = rules
+        self.calls: list[tuple[str, datetime]] = []
+
+    def fetch_rule(self, symbol: str, *, now: datetime) -> metrics.CompetitionRule:
+        self.calls.append((symbol, now))
+        result = self.rules[symbol]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+class _ServiceRuleCache:
+    def __init__(
+        self,
+        *,
+        stale_symbols: set[str] | None = None,
+        failures: dict[str, Exception] | None = None,
+    ) -> None:
+        self.stale_symbols = stale_symbols or set()
+        self.failures = failures or {}
+        self.calls: list[tuple[str, datetime]] = []
+
+    def get(self, symbol: str, *, now: datetime, loader) -> metrics.CachedRuleResult:
+        self.calls.append((symbol, now))
+        failure = self.failures.get(symbol)
+        if failure is not None:
+            raise failure
+        return metrics.CachedRuleResult(loader(symbol), symbol in self.stale_symbols)
+
+
+class _ServiceVolumeProvider:
+    def __init__(self, results: dict[str, list[metrics.VolumeSnapshot | Exception]]) -> None:
+        self.results = results
+        self.calls: list[tuple[str, int, datetime]] = []
+
+    def fetch(
+        self,
+        rule: metrics.CompetitionRule,
+        round_: metrics.CompetitionRound,
+        now: datetime,
+    ) -> metrics.VolumeSnapshot:
+        self.calls.append((rule.symbol, round_.number, now))
+        values = self.results[rule.symbol]
+        result = values.pop(0) if len(values) > 1 else values[0]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def _service(
+    *,
+    rules: dict[str, metrics.CompetitionRule | Exception],
+    volumes: dict[str, list[metrics.VolumeSnapshot | Exception]] | None = None,
+    stale_symbols: set[str] | None = None,
+    cache_failures: dict[str, Exception] | None = None,
+) -> tuple[
+    metrics.CompetitionMetricsService,
+    _ServiceRuleProvider,
+    _ServiceRuleCache,
+    _ServiceVolumeProvider,
+]:
+    rule_provider = _ServiceRuleProvider(rules)
+    rule_cache = _ServiceRuleCache(stale_symbols=stale_symbols, failures=cache_failures)
+    volume_provider = _ServiceVolumeProvider(volumes or {})
+    return (
+        metrics.CompetitionMetricsService(
+            rule_provider=rule_provider,
+            rule_cache=rule_cache,
+            volume_provider=volume_provider,
+        ),
+        rule_provider,
+        rule_cache,
+        volume_provider,
+    )
+
+
+def test_service_maps_active_metrics_to_fixed_json_friendly_fields() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    updated_at = NOW - timedelta(seconds=1)
+    service, provider, cache, volume = _service(
+        rules={"QUID": rule},
+        volumes={"QUID": [metrics.VolumeSnapshot(4_800_000, "alpha_kline_estimate", updated_at)]},
+    )
+
+    payload = service.collect([" quid "], now=NOW)
+
+    assert set(payload) == {"generatedAtUtc", "rows", "errors"}
+    assert payload["generatedAtUtc"] == "2026-08-07T12:00:00+00:00"
+    assert payload["errors"] == []
+    assert payload["rows"] == [
+        {
+            "symbol": "QUID",
+            "name": "Squid",
+            "round": 1,
+            "day": 2,
+            "roundStartUtc": "2026-08-05T13:00:00+00:00",
+            "roundEndUtc": "2026-08-12T13:00:00+00:00",
+            "currentMultiplier": 3.0,
+            "weightedVolume": 4_800_000.0,
+            "volumeSource": "alpha_kline_estimate",
+            "volumeUpdatedAtUtc": "2026-08-07T11:59:59+00:00",
+            "winnerCount": 2500,
+            "averageVolume": 1920.0,
+            "watchThreshold": 768.0,
+            "referenceThreshold": 1152.0,
+            "safeThreshold": 1920.0,
+            "articleUrl": rule.article_url,
+            "stale": False,
+            "status": "active",
+            "error": None,
+        }
+    ]
+    assert provider.calls == [("QUID", NOW)]
+    assert cache.calls == [("QUID", NOW)]
+    assert volume.calls == [("QUID", 1, NOW)]
+    json.dumps(payload, allow_nan=False)
+
+
+def test_service_keeps_order_and_isolates_rule_and_cache_failures_without_leaking_details() -> None:
+    quid = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    grvt = parse_competition_rule(FIXTURES["GRVT"], "GRVT")
+    o_rule = parse_competition_rule(FIXTURES["O"], "O")
+    service, _provider, _cache, volume = _service(
+        rules={
+            "QUID": RuntimeError("SECRET provider payload {'huge': [...]}"),
+            "GRVT": grvt,
+            "O": o_rule,
+        },
+        volumes={"GRVT": [metrics.VolumeSnapshot(6_100_000, "official", NOW)]},
+        cache_failures={"GRVT": RuntimeError("SECRET cache path /private/cache")},
+    )
+
+    payload = service.collect([" quid ", "grvt", "O"], now=NOW)
+
+    assert [row["symbol"] for row in payload["rows"]] == ["QUID", "GRVT", "O"]
+    assert [row["status"] for row in payload["rows"]] == ["rule_unavailable", "rule_unavailable", "ended"]
+    assert all(set(row) == _SERVICE_ROW_KEYS for row in payload["rows"])
+    assert payload["rows"][0]["weightedVolume"] is None
+    assert payload["rows"][1]["weightedVolume"] is None
+    assert payload["rows"][2]["winnerCount"] == o_rule.winner_count
+    assert volume.calls == []
+    assert payload["errors"] == [payload["rows"][0]["error"], payload["rows"][1]["error"]]
+    assert all(error and "rule unavailable" in error for error in payload["errors"])
+    assert "SECRET" not in json.dumps(payload)
+    assert "private" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    ("status", "current", "rule_factory"),
+    [
+        ("upcoming", datetime(2026, 8, 5, 12, 59, 59, tzinfo=UTC), lambda rule: rule),
+        (
+            "between_rounds",
+            datetime(2026, 8, 12, 13, 30, tzinfo=UTC),
+            lambda rule: replace(
+                rule,
+                rounds=(
+                    rule.rounds[0],
+                    replace(
+                        rule.rounds[1],
+                        start_utc=rule.rounds[1].start_utc + timedelta(hours=1),
+                        end_utc=rule.rounds[1].end_utc + timedelta(hours=1),
+                    ),
+                ),
+            ),
+        ),
+        ("ended", datetime(2026, 8, 19, 13, 0, tzinfo=UTC), lambda rule: rule),
+    ],
+)
+def test_service_inactive_statuses_keep_rule_metadata_without_fetching_volume(
+    status: str,
+    current: datetime,
+    rule_factory,
+) -> None:
+    rule = rule_factory(parse_competition_rule(FIXTURES["QUID"], "QUID"))
+    service, _provider, _cache, volume = _service(rules={"QUID": rule})
+
+    row = service.collect(["QUID"], now=current)["rows"][0]
+
+    assert set(row) == _SERVICE_ROW_KEYS
+    assert row["status"] == status
+    assert (row["name"], row["winnerCount"], row["articleUrl"]) == (
+        rule.name,
+        rule.winner_count,
+        rule.article_url,
+    )
+    for key in (
+        "round",
+        "day",
+        "roundStartUtc",
+        "roundEndUtc",
+        "currentMultiplier",
+        "weightedVolume",
+        "volumeSource",
+        "volumeUpdatedAtUtc",
+        "averageVolume",
+        "watchThreshold",
+        "referenceThreshold",
+        "safeThreshold",
+    ):
+        assert row[key] is None
+    assert row["stale"] is False
+    assert row["error"] is None
+    assert volume.calls == []
+
+
+def test_service_propagates_stale_rule_flag_to_active_row() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    service, _provider, _cache, _volume = _service(
+        rules={"QUID": rule},
+        volumes={"QUID": [metrics.VolumeSnapshot(10, "official", NOW)]},
+        stale_symbols={"QUID"},
+    )
+
+    row = service.collect(["QUID"], now=NOW)["rows"][0]
+
+    assert row["status"] == "active"
+    assert row["stale"] is True
+
+
+def test_service_volume_cache_is_fresh_before_sixty_seconds_and_refreshes_at_boundary() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    service, _provider, _cache, volume = _service(
+        rules={"QUID": rule},
+        volumes={
+            "QUID": [
+                metrics.VolumeSnapshot(100, "official", NOW),
+                metrics.VolumeSnapshot(200, "official", NOW + timedelta(seconds=60)),
+            ]
+        },
+    )
+
+    first = service.collect(["QUID"], now=NOW)["rows"][0]
+    cached = service.collect(["QUID"], now=NOW + timedelta(seconds=59, microseconds=999999))["rows"][0]
+    refreshed = service.collect(["QUID"], now=NOW + timedelta(seconds=60))["rows"][0]
+
+    assert [first["weightedVolume"], cached["weightedVolume"], refreshed["weightedVolume"]] == [100, 100, 200]
+    assert len(volume.calls) == 2
+
+
+def test_service_volume_cache_does_not_reuse_future_entry() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    service, _provider, _cache, volume = _service(
+        rules={"QUID": rule},
+        volumes={
+            "QUID": [
+                metrics.VolumeSnapshot(100, "official", NOW + timedelta(seconds=10)),
+                metrics.VolumeSnapshot(200, "official", NOW),
+            ]
+        },
+    )
+
+    service.collect(["QUID"], now=NOW + timedelta(seconds=10))
+    row = service.collect(["QUID"], now=NOW)["rows"][0]
+
+    assert row["weightedVolume"] == 200
+    assert len(volume.calls) == 2
+
+
+def test_service_volume_cache_is_keyed_by_symbol_and_round_number() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    first_now = rule.rounds[0].end_utc - timedelta(seconds=30)
+    second_now = rule.rounds[1].start_utc
+    service, _provider, _cache, volume = _service(
+        rules={"QUID": rule},
+        volumes={
+            "QUID": [
+                metrics.VolumeSnapshot(100, "official", first_now),
+                metrics.VolumeSnapshot(200, "official", second_now),
+            ]
+        },
+    )
+
+    first = service.collect(["QUID"], now=first_now)["rows"][0]
+    second = service.collect(["QUID"], now=second_now)["rows"][0]
+
+    assert (first["round"], first["weightedVolume"]) == (1, 100)
+    assert (second["round"], second["weightedVolume"]) == (2, 200)
+    assert [(symbol, number) for symbol, number, _now in volume.calls] == [("QUID", 1), ("QUID", 2)]
+
+
+def test_service_volume_refresh_failure_uses_last_known_good_and_reports_stale_error() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    service, _provider, _cache, volume = _service(
+        rules={"QUID": rule},
+        volumes={
+            "QUID": [
+                metrics.VolumeSnapshot(4_800_000, "official", NOW),
+                RuntimeError("SECRET upstream volume payload"),
+            ]
+        },
+    )
+    service.collect(["QUID"], now=NOW)
+
+    payload = service.collect(["QUID"], now=NOW + timedelta(seconds=60))
+    row = payload["rows"][0]
+
+    assert set(row) == _SERVICE_ROW_KEYS
+    assert (row["status"], row["weightedVolume"], row["volumeSource"]) == (
+        "active",
+        4_800_000,
+        "official",
+    )
+    assert row["stale"] is True
+    assert row["error"] == "QUID: competition volume unavailable"
+    assert payload["errors"] == [row["error"]]
+    assert "SECRET" not in json.dumps(payload)
+    assert len(volume.calls) == 2
+
+
+def test_service_volume_failure_without_cache_is_unavailable_not_zero_and_does_not_stop_next_symbol() -> None:
+    quid = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    grvt = parse_competition_rule(FIXTURES["GRVT"], "GRVT")
+    service, _provider, _cache, volume = _service(
+        rules={"QUID": quid, "GRVT": grvt},
+        volumes={
+            "QUID": [RuntimeError("SECRET no volume")],
+            "GRVT": [metrics.VolumeSnapshot(6_100_000, "official", NOW)],
+        },
+    )
+
+    payload = service.collect(["QUID", "GRVT"], now=NOW)
+    unavailable, active = payload["rows"]
+
+    assert [unavailable["status"], active["status"]] == ["volume_unavailable", "active"]
+    assert all(set(row) == _SERVICE_ROW_KEYS for row in payload["rows"])
+    assert unavailable["currentMultiplier"] == 3.0
+    assert unavailable["winnerCount"] == quid.winner_count
+    for key in (
+        "weightedVolume",
+        "volumeSource",
+        "volumeUpdatedAtUtc",
+        "averageVolume",
+        "watchThreshold",
+        "referenceThreshold",
+        "safeThreshold",
+    ):
+        assert unavailable[key] is None
+    assert active["weightedVolume"] == 6_100_000
+    assert payload["errors"] == ["QUID: competition volume unavailable"]
+    assert [call[0] for call in volume.calls] == ["QUID", "GRVT"]
+
+
+def test_service_requires_utc_aware_now_before_calling_dependencies() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    service, provider, cache, volume = _service(rules={"QUID": rule})
+
+    with pytest.raises(ValueError, match="UTC-aware"):
+        service.collect(["QUID"], now=datetime(2026, 8, 7, 12, 0))
+
+    assert provider.calls == []
+    assert cache.calls == []
+    assert volume.calls == []
+
+
+def test_service_serializes_concurrent_volume_cache_misses() -> None:
+    class BlockingVolumeProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def fetch(self, _rule, _round, now: datetime) -> metrics.VolumeSnapshot:
+            self.calls += 1
+            self.entered.set()
+            assert self.release.wait(timeout=2)
+            return metrics.VolumeSnapshot(4_800_000, "official", now)
+
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    provider = _ServiceRuleProvider({"QUID": rule})
+    cache = _ServiceRuleCache()
+    volume = BlockingVolumeProvider()
+    service = metrics.CompetitionMetricsService(
+        rule_provider=provider,
+        rule_cache=cache,
+        volume_provider=volume,
+    )
+    rows: list[dict[str, object]] = []
+
+    def collect() -> None:
+        rows.append(service.collect(["QUID"], now=NOW)["rows"][0])
+
+    first = threading.Thread(target=collect)
+    second = threading.Thread(target=collect)
+    first.start()
+    assert volume.entered.wait(timeout=2)
+    second.start()
+    volume.release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert volume.calls == 1
+    assert [row["weightedVolume"] for row in rows] == [4_800_000, 4_800_000]
+
+
+@pytest.mark.parametrize(
+    "updated_at",
+    [
+        datetime(2026, 8, 5, 12, 59, 59, tzinfo=UTC),
+        datetime(2026, 8, 7, 12, 0),
+        NOW + timedelta(microseconds=1),
+    ],
+)
+def test_service_rejects_volume_snapshot_outside_round_or_collect_time(updated_at: datetime) -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    service, _provider, _cache, volume = _service(
+        rules={"QUID": rule},
+        volumes={"QUID": [metrics.VolumeSnapshot(4_800_000, "official", updated_at)]},
+    )
+
+    row = service.collect(["QUID"], now=NOW)["rows"][0]
+
+    assert row["status"] == "volume_unavailable"
+    assert row["weightedVolume"] is None
+    assert volume.calls == [("QUID", 1, NOW)]
+
+
+def test_service_accepts_volume_snapshot_at_collect_time_boundary() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    service, _provider, _cache, _volume = _service(
+        rules={"QUID": rule},
+        volumes={"QUID": [metrics.VolumeSnapshot(4_800_000, "official", NOW)]},
+    )
+
+    row = service.collect(["QUID"], now=NOW)["rows"][0]
+
+    assert row["status"] == "active"
+    assert row["volumeUpdatedAtUtc"] == "2026-08-07T12:00:00+00:00"
+
+
+def test_service_rejects_future_snapshot_crossing_active_round_end() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    current = rule.rounds[0].end_utc - timedelta(microseconds=1)
+    service, _provider, _cache, _volume = _service(
+        rules={"QUID": rule},
+        volumes={
+            "QUID": [metrics.VolumeSnapshot(4_800_000, "official", rule.rounds[0].end_utc)]
+        },
+    )
+
+    row = service.collect(["QUID"], now=current)["rows"][0]
+
+    assert row["status"] == "volume_unavailable"
+    assert row["weightedVolume"] is None
+
+
+def test_service_does_not_fallback_to_future_cache_when_refresh_fails() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    future = NOW + timedelta(hours=1)
+    service, _provider, _cache, volume = _service(
+        rules={"QUID": rule},
+        volumes={
+            "QUID": [
+                metrics.VolumeSnapshot(4_800_000, "official", future),
+                RuntimeError("refresh failed"),
+            ]
+        },
+    )
+    assert service.collect(["QUID"], now=future)["rows"][0]["status"] == "active"
+
+    row = service.collect(["QUID"], now=NOW)["rows"][0]
+
+    assert row["status"] == "volume_unavailable"
+    assert row["weightedVolume"] is None
+    assert len(volume.calls) == 2
+
+
+def test_service_backs_off_failed_stale_volume_refresh_until_ttl_boundary() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    service, _provider, _cache, volume = _service(
+        rules={"QUID": rule},
+        volumes={
+            "QUID": [
+                metrics.VolumeSnapshot(4_800_000, "official", NOW),
+                RuntimeError("first refresh failed"),
+                RuntimeError("boundary retry failed"),
+            ]
+        },
+    )
+    service.collect(["QUID"], now=NOW)
+
+    first_failure = service.collect(["QUID"], now=NOW + timedelta(seconds=60))["rows"][0]
+    backed_off = service.collect(["QUID"], now=NOW + timedelta(seconds=119, microseconds=999999))["rows"][0]
+    assert len(volume.calls) == 2
+    boundary_retry = service.collect(["QUID"], now=NOW + timedelta(seconds=120))["rows"][0]
+
+    assert [first_failure["status"], backed_off["status"], boundary_retry["status"]] == [
+        "active",
+        "active",
+        "active",
+    ]
+    assert all(row["stale"] is True for row in (first_failure, backed_off, boundary_retry))
+    assert all(row["error"] == "QUID: competition volume unavailable" for row in (first_failure, backed_off, boundary_retry))
+    assert len(volume.calls) == 3
+
+
+def test_service_deduplicates_concurrent_failed_refreshes_with_stale_volume() -> None:
+    class BlockingRefreshVolumeProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def fetch(self, _rule, _round, now: datetime) -> metrics.VolumeSnapshot:
+            self.calls += 1
+            if self.calls == 1:
+                return metrics.VolumeSnapshot(4_800_000, "official", now)
+            self.entered.set()
+            assert self.release.wait(timeout=2)
+            raise RuntimeError("refresh failed")
+
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    provider = _ServiceRuleProvider({"QUID": rule})
+    cache = _ServiceRuleCache()
+    volume = BlockingRefreshVolumeProvider()
+    service = metrics.CompetitionMetricsService(
+        rule_provider=provider,
+        rule_cache=cache,
+        volume_provider=volume,
+    )
+    service.collect(["QUID"], now=NOW)
+    rows: list[dict[str, object]] = []
+    ready = threading.Barrier(3)
+    collecting = [threading.Event(), threading.Event()]
+
+    def collect_expired(index: int) -> None:
+        ready.wait(timeout=2)
+        collecting[index].set()
+        rows.append(service.collect(["QUID"], now=NOW + timedelta(seconds=60))["rows"][0])
+
+    first = threading.Thread(target=collect_expired, args=(0,))
+    second = threading.Thread(target=collect_expired, args=(1,))
+    first.start()
+    second.start()
+    ready.wait(timeout=2)
+    assert all(event.wait(timeout=2) for event in collecting)
+    assert volume.entered.wait(timeout=2)
+    volume.release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert volume.calls == 2
+    assert len(rows) == 2
+    assert all(row["weightedVolume"] == 4_800_000 for row in rows)
+    assert all(row["stale"] is True for row in rows)
+
+
+def test_service_backs_off_concurrent_initial_volume_failures_without_last_known_good() -> None:
+    class BlockingInitialFailureVolumeProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def fetch(self, _rule, _round, _now: datetime) -> metrics.VolumeSnapshot:
+            self.calls += 1
+            self.entered.set()
+            assert self.release.wait(timeout=2)
+            raise RuntimeError("initial fetch failed")
+
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    provider = _ServiceRuleProvider({"QUID": rule})
+    cache = _ServiceRuleCache()
+    volume = BlockingInitialFailureVolumeProvider()
+    service = metrics.CompetitionMetricsService(
+        rule_provider=provider,
+        rule_cache=cache,
+        volume_provider=volume,
+    )
+    ready = threading.Barrier(3)
+    collecting = [threading.Event(), threading.Event()]
+    rows: list[dict[str, object]] = []
+
+    def collect_initial(index: int) -> None:
+        ready.wait(timeout=2)
+        collecting[index].set()
+        rows.append(service.collect(["QUID"], now=NOW)["rows"][0])
+
+    first = threading.Thread(target=collect_initial, args=(0,))
+    second = threading.Thread(target=collect_initial, args=(1,))
+    first.start()
+    second.start()
+    ready.wait(timeout=2)
+    assert all(event.wait(timeout=2) for event in collecting)
+    assert volume.entered.wait(timeout=2)
+    volume.release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert volume.calls == 1
+    assert len(rows) == 2
+    assert all(row["status"] == "volume_unavailable" for row in rows)
+    assert all(row["weightedVolume"] is None for row in rows)
+
+    boundary = service.collect(["QUID"], now=NOW + timedelta(seconds=60))["rows"][0]
+    assert boundary["status"] == "volume_unavailable"
+    assert volume.calls == 2
+
+
+def test_service_volume_cache_identity_includes_article_code() -> None:
+    first_rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    second_rule = replace(
+        first_rule,
+        article_code="new-competition-code",
+        article_url="https://www.binance.com/en/support/announcement/detail/new-competition-code",
+    )
+    service, provider, _cache, volume = _service(
+        rules={"QUID": first_rule},
+        volumes={
+            "QUID": [
+                metrics.VolumeSnapshot(100, "official", NOW),
+                metrics.VolumeSnapshot(200, "official", NOW + timedelta(seconds=1)),
+            ]
+        },
+    )
+    first = service.collect(["QUID"], now=NOW)["rows"][0]
+    provider.rules["QUID"] = second_rule
+
+    second = service.collect(["QUID"], now=NOW + timedelta(seconds=1))["rows"][0]
+
+    assert (first["weightedVolume"], second["weightedVolume"]) == (100, 200)
+    assert second["articleUrl"].endswith("/new-competition-code")
+    assert len(volume.calls) == 2
+
+
+@pytest.mark.parametrize("symbol", [None, True, 3, "", " ", "Q_UID", "QUID-USDT", "A" * 33])
+def test_service_rejects_unsafe_symbol_before_external_io(symbol: object) -> None:
+    service, provider, cache, volume = _service(rules={})
+
+    row = service.collect([symbol], now=NOW)["rows"][0]
+
+    assert row["status"] == "rule_unavailable"
+    assert provider.calls == []
+    assert cache.calls == []
+    assert volume.calls == []
+
+
+def test_service_preserves_duplicate_symbols_and_input_order() -> None:
+    quid = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    grvt = parse_competition_rule(FIXTURES["GRVT"], "GRVT")
+    service, provider, _cache, volume = _service(
+        rules={"QUID": quid, "GRVT": grvt},
+        volumes={
+            "QUID": [metrics.VolumeSnapshot(100, "official", NOW)],
+            "GRVT": [metrics.VolumeSnapshot(200, "official", NOW)],
+        },
+    )
+
+    payload = service.collect([" quid ", "GRVT", "quid"], now=NOW)
+
+    assert [row["symbol"] for row in payload["rows"]] == ["QUID", "GRVT", "QUID"]
+    assert [symbol for symbol, _now in provider.calls] == ["QUID", "GRVT", "QUID"]
+    assert [symbol for symbol, _round, _now in volume.calls] == ["QUID", "GRVT"]
+
+
+def test_service_does_not_mask_internal_row_builder_defect_as_rule_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    service, _provider, _cache, _volume = _service(rules={"QUID": rule})
+
+    def fail_build(*_args) -> dict[str, object]:
+        raise AssertionError("programming defect")
+
+    monkeypatch.setattr(service, "_build_row", fail_build)
+
+    with pytest.raises(AssertionError, match="programming defect"):
+        service.collect(["QUID"], now=NOW)
