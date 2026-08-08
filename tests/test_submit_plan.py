@@ -1666,6 +1666,31 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(capped["place_orders"][1]["qty"], 50.0)
         self.assertEqual(capped["reduce_only_position_cap"]["resized_order_count"], 1)
 
+    def test_reduce_only_cap_hedge_uses_only_ordinary_short_inventory(self) -> None:
+        capped = cap_reduce_only_place_orders_to_position(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "BUY",
+                        "position_side": "SHORT",
+                        "qty": 216.0,
+                        "notional": 62.0,
+                        "role": "best_quote_reduce_short",
+                        "force_reduce_only": True,
+                    }
+                ],
+                "cancel_orders": [],
+            },
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            current_actual_net_qty=3209.9,
+            current_hedge_long_qty=3210.0,
+            current_hedge_short_qty=0.0714406923,
+            current_open_orders=[],
+        )
+
+        self.assertEqual(capped["place_orders"][0]["qty"], 0.0714406923)
+        self.assertEqual(capped["reduce_only_position_cap"]["resized_order_count"], 1)
+
     def test_loss_inventory_guard_drops_losing_short_buy_above_recovery_ceiling(self) -> None:
         actions = {
             "place_orders": [

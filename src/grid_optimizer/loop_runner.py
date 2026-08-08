@@ -32790,6 +32790,8 @@ def _cap_ordinary_reduce_only_place_orders_to_position(
     actions: dict[str, Any],
     strategy_mode: str,
     current_ordinary_actual_net_qty: float,
+    current_ordinary_long_qty: float,
+    current_ordinary_short_qty: float,
     current_open_orders: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Cap only ordinary reduce orders against ordinary exchange inventory.
@@ -32835,6 +32837,8 @@ def _cap_ordinary_reduce_only_place_orders_to_position(
         actions=ordinary_actions,
         strategy_mode=strategy_mode,
         current_actual_net_qty=current_ordinary_actual_net_qty,
+        current_hedge_long_qty=current_ordinary_long_qty,
+        current_hedge_short_qty=current_ordinary_short_qty,
         current_open_orders=[
             dict(item)
             for item in current_open_orders
@@ -33473,6 +33477,8 @@ def _execute_plan_report_unlocked(args: argparse.Namespace, plan_report: dict[st
         actions=validation["actions"],
         strategy_mode=strategy_mode,
         current_ordinary_actual_net_qty=current_ordinary_actual_net_qty,
+        current_ordinary_long_qty=current_ordinary_long_qty,
+        current_ordinary_short_qty=current_ordinary_short_qty,
         current_open_orders=current_strategy_open_orders,
     )
     validation["actions"] = apply_anti_chase_entry_guard_to_actions(
@@ -33499,6 +33505,8 @@ def _execute_plan_report_unlocked(args: argparse.Namespace, plan_report: dict[st
         actions=validation["actions"],
         strategy_mode=strategy_mode,
         current_ordinary_actual_net_qty=current_ordinary_actual_net_qty,
+        current_ordinary_long_qty=current_ordinary_long_qty,
+        current_ordinary_short_qty=current_ordinary_short_qty,
         current_open_orders=current_strategy_open_orders,
     )
     validation["actions"] = suppress_place_orders_with_existing_submitted_buckets(
@@ -33564,6 +33572,8 @@ def _execute_plan_report_unlocked(args: argparse.Namespace, plan_report: dict[st
             actions=validation["actions"],
             strategy_mode=strategy_mode,
             current_ordinary_actual_net_qty=current_ordinary_actual_net_qty,
+            current_ordinary_long_qty=current_ordinary_long_qty,
+            current_ordinary_short_qty=current_ordinary_short_qty,
             current_open_orders=current_strategy_open_orders,
         )
     if _is_best_quote_maker_volume_mode(strategy_mode):

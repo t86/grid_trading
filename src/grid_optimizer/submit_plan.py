@@ -556,12 +556,18 @@ def cap_reduce_only_place_orders_to_position(
     strategy_mode: str,
     current_actual_net_qty: float,
     current_open_orders: list[dict[str, Any]],
+    current_hedge_long_qty: float | None = None,
+    current_hedge_short_qty: float | None = None,
 ) -> dict[str, Any]:
-    """Cap one-way reduce-only places so TP and delever orders cannot over-close the live net position."""
+    """Cap reduce-only places to the live position available on each exit side."""
     place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
     cancel_orders = [dict(item) for item in actions.get("cancel_orders", []) if isinstance(item, dict)]
     normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
-    if normalized_mode in {"hedge_neutral", "hedge_best_quote_maker_volume_v1"} or not place_orders:
+    hedge_mode = normalized_mode in {"hedge_neutral", "hedge_best_quote_maker_volume_v1"}
+    if not place_orders or (
+        hedge_mode
+        and (current_hedge_long_qty is None or current_hedge_short_qty is None)
+    ):
         result = dict(actions)
         result["place_orders"] = place_orders
         result["cancel_orders"] = cancel_orders
@@ -571,16 +577,45 @@ def cap_reduce_only_place_orders_to_position(
         return result
 
     net_qty = Decimal(str(current_actual_net_qty))
-    available_qty_by_side = {
-        "BUY": max(-net_qty, Decimal("0")),
-        "SELL": max(net_qty, Decimal("0")),
-    }
+
+    def cap_side(order: dict[str, Any]) -> str | None:
+        if not hedge_mode:
+            return _reduce_only_cap_side(order=order, strategy_mode=normalized_mode)
+        side = str(order.get("side", "")).upper().strip()
+        position_side = _order_position_side(order)
+        role = str(order.get("role", "entry"))
+        reduce_only = _resolve_reduce_only_flag(
+            strategy_mode=normalized_mode,
+            side=side,
+            role=role,
+        )
+        if order.get("force_reduce_only") is not None:
+            reduce_only = bool(order.get("force_reduce_only"))
+        if not reduce_only:
+            return None
+        if position_side == "LONG" and side == "SELL":
+            return "SELL"
+        if position_side == "SHORT" and side == "BUY":
+            return "BUY"
+        return None
+
+    if hedge_mode:
+        available_qty_by_side = {
+            "BUY": max(Decimal(str(current_hedge_short_qty)), Decimal("0")),
+            "SELL": max(Decimal(str(current_hedge_long_qty)), Decimal("0")),
+        }
+    else:
+        available_qty_by_side = {
+            "BUY": max(-net_qty, Decimal("0")),
+            "SELL": max(net_qty, Decimal("0")),
+        }
     urgent_sides = {
         side
         for side in (
-            _reduce_only_cap_side(order=order, strategy_mode=normalized_mode)
+            cap_side(order)
             for order in place_orders
-            if _is_urgent_reduce_only_order(order, strategy_mode=normalized_mode)
+            if cap_side(order) is not None
+            and _is_urgent_reduce_only_order(order, strategy_mode=normalized_mode)
         )
         if side is not None
     }
@@ -590,7 +625,7 @@ def cap_reduce_only_place_orders_to_position(
             continue
         if not _truthy(open_order.get("reduceOnly")):
             continue
-        side = str(open_order.get("side", "")).upper().strip()
+        side = cap_side(open_order)
         if side in available_qty_by_side:
             if side in urgent_sides and _is_displaceable_reduce_only_open_order(open_order):
                 if not any(_order_matches_cancel(open_order, existing) for existing in cancel_orders):
@@ -610,21 +645,21 @@ def cap_reduce_only_place_orders_to_position(
     dropped_count = 0
     resized_count = 0
     for order in place_orders:
-        cap_side = _reduce_only_cap_side(order=order, strategy_mode=normalized_mode)
-        if cap_side is None:
+        order_cap_side = cap_side(order)
+        if order_cap_side is None:
             capped_place_orders.append(order)
             continue
-        available_qty = available_qty_by_side.get(cap_side, Decimal("0"))
+        available_qty = available_qty_by_side.get(order_cap_side, Decimal("0"))
         requested_qty = _quantity_decimal(order.get("qty"))
         if requested_qty <= Decimal("0") or available_qty <= Decimal("0"):
             dropped_count += 1
             continue
         if requested_qty <= available_qty:
             capped_place_orders.append(order)
-            available_qty_by_side[cap_side] = max(available_qty - requested_qty, Decimal("0"))
+            available_qty_by_side[order_cap_side] = max(available_qty - requested_qty, Decimal("0"))
             continue
         capped_place_orders.append(_clone_order_with_qty(order, available_qty))
-        available_qty_by_side[cap_side] = Decimal("0")
+        available_qty_by_side[order_cap_side] = Decimal("0")
         resized_count += 1
 
     result = dict(actions)
