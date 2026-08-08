@@ -56,6 +56,7 @@ from .futures_inventory_boundary import (
     strict_frozen_side_qtys,
 )
 from .futures_recovery_store import recovery_coordinator_registered
+from .futures_terminal_ownership import terminal_drain_completed_owner_is_integral
 from .recovery_control_ownership import exclusive_control_lock
 
 
@@ -248,6 +249,86 @@ def should_start_after_realign(was_active: bool, allow_start_when_stopped: bool)
     return was_active or allow_start_when_stopped
 
 
+def completed_terminal_resume_eligibility(
+    state: dict[str, Any],
+    *,
+    symbol: str,
+    now: datetime,
+) -> tuple[bool, str]:
+    """Validate the narrow operator-approved recovery from a stale drain owner.
+
+    Terminal drain is normally irreversible for a run contract.  This escape
+    hatch is intentionally limited to an already-completed ``condition_unmet``
+    owner while its volume target and time window are still live.  It never
+    applies to a deadline or completed-target exit.
+    """
+    owner = state.get("futures_terminal_drain")
+    if not isinstance(owner, dict):
+        return False, "terminal_drain_missing"
+    if not terminal_drain_completed_owner_is_integral(
+        owner, symbol=symbol, loop_state=state
+    ):
+        return False, "terminal_drain_not_completed_or_invalid"
+    if str(owner.get("run_outcome") or "") != "condition_unmet":
+        return False, "terminal_drain_outcome_not_condition_unmet"
+    target = float(owner.get("target_value") or 0.0)
+    achieved = float(owner.get("achieved_value") or 0.0)
+    if target <= 0 or achieved >= target - 1e-9:
+        return False, "terminal_drain_target_not_unmet"
+    snapshot = owner.get("run_contract_snapshot")
+    if not isinstance(snapshot, dict):
+        return False, "terminal_drain_snapshot_missing"
+    try:
+        run_start = datetime.fromisoformat(
+            str(snapshot["run_start_time"]).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+        run_end = datetime.fromisoformat(
+            str(snapshot["run_end_time"]).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return False, "terminal_drain_window_invalid"
+    checked_at = now.astimezone(timezone.utc)
+    if checked_at < run_start or checked_at >= run_end:
+        return False, "terminal_drain_window_not_active"
+    if list(owner.get("active_intent_ids") or []):
+        return False, "terminal_drain_order_in_flight"
+    return True, "eligible"
+
+
+def archive_completed_terminal_for_active_target(
+    state: dict[str, Any],
+    *,
+    symbol: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """Archive a validated completed drain without touching inventory ledgers."""
+    eligible, reason = completed_terminal_resume_eligibility(
+        state, symbol=symbol, now=now
+    )
+    if not eligible:
+        raise ValueError(reason)
+    owner = dict(state.pop("futures_terminal_drain"))
+    owner.update(
+        {
+            "archived_at": now.astimezone(timezone.utc).isoformat(),
+            "archive_reason": "explicit_resume_active_unmet_target",
+        }
+    )
+    history = list(state.get("futures_terminal_drain_history") or [])
+    history.append(owner)
+    state["futures_terminal_drain_history"] = history[-20:]
+    state.pop("futures_terminal_handoff", None)
+    state["terminal_drain_resume"] = {
+        "symbol": symbol,
+        "at": now.astimezone(timezone.utc).isoformat(),
+        "reason": "explicit_resume_active_unmet_target",
+        "previous_decision_id": owner.get("decision_id"),
+        "target_value": owner.get("target_value"),
+        "achieved_value": owner.get("achieved_value"),
+    }
+    return owner
+
+
 def _load_recovery_control(path: Path) -> tuple[dict[str, Any], bool]:
     """Return a control document and whether its ownership can be determined.
 
@@ -274,6 +355,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--allow-start-when-stopped", action="store_true",
                     help="Escape hatch: also start the service when it was already "
                          "inactive. Default off — an inactive runner stays down.")
+    ap.add_argument(
+        "--resume-completed-active-target",
+        action="store_true",
+        help="Archive only a completed condition_unmet terminal drain while its "
+        "target window remains active; requires --enforce and no terminal order.",
+    )
     ap.add_argument("--enforce", action="store_true")
     return ap
 
@@ -304,7 +391,14 @@ def main() -> None:
         "recovery_coordinator_registered": coordinator_registered,
         "recovery_coordinator_ownership_unknown": not control_readable,
     }
-    if max(abs(ldrift), abs(sdrift)) <= a.threshold_qty or not a.enforce:
+    if a.resume_completed_active_target and not a.enforce:
+        status["action"] = "DRY_RUN_would_resume_completed_active_target"
+        print(json.dumps(status))
+        return
+    if (
+        not a.resume_completed_active_target
+        and (max(abs(ldrift), abs(sdrift)) <= a.threshold_qty or not a.enforce)
+    ):
         status["action"] = (
             "none" if max(abs(ldrift), abs(sdrift)) <= a.threshold_qty else "DRY_RUN_would_realign"
         )
@@ -344,6 +438,45 @@ def main() -> None:
 
             with open(state_path, encoding="utf-8") as state_handle:
                 locked_state = json.load(state_handle)
+            if a.resume_completed_active_target:
+                if is_active(a.service):
+                    status["action"] = "RESUME_COMPLETED_ACTIVE_TARGET_BLOCKED"
+                    status["reason"] = "runner_still_active"
+                    print(json.dumps(status))
+                    return
+                now = datetime.now(timezone.utc)
+                eligible, reason = completed_terminal_resume_eligibility(
+                    locked_state, symbol=sym, now=now
+                )
+                if not eligible:
+                    status["action"] = "RESUME_COMPLETED_ACTIVE_TARGET_BLOCKED"
+                    status["reason"] = reason
+                    print(json.dumps(status))
+                    return
+                current_orders = fetch_futures_open_orders(sym, k, s) or []
+                if current_orders:
+                    status["action"] = "RESUME_COMPLETED_ACTIVE_TARGET_BLOCKED"
+                    status["reason"] = "open_orders_present"
+                    status["open_order_count"] = len(current_orders)
+                    print(json.dumps(status))
+                    return
+                archived_owner = archive_completed_terminal_for_active_target(
+                    locked_state, symbol=sym, now=now
+                )
+                locked_state["updated_at"] = _now_iso()
+                locked_state["updated_by"] = "competition_state_realign_resume"
+                write_json(Path(state_path), locked_state)
+                status.update(
+                    {
+                        "action": "RESUMED_COMPLETED_ACTIVE_TARGET",
+                        "archived_terminal_decision_id": archived_owner.get("decision_id"),
+                    }
+                )
+                archived = archive_stale_plan(a.workdir, slug)
+                if archived:
+                    status["stale_plan_archived"] = archived
+                print(json.dumps(status))
+                return
             ldrift, sdrift = compute_drift(locked_state, lq, sq)
             status["long_drift"] = round(ldrift, 1)
             status["short_drift"] = round(sdrift, 1)

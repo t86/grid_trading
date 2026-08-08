@@ -1038,6 +1038,67 @@ def test_realign_never_starts_an_already_inactive_runner() -> None:
     assert ra.should_start_after_realign(was_active=False, allow_start_when_stopped=True) is True
 
 
+def test_completed_condition_unmet_terminal_can_resume_active_target(monkeypatch) -> None:
+    now = datetime(2026, 8, 8, 13, 0, tzinfo=timezone.utc)
+    state = {
+        "futures_terminal_drain": {
+            "decision_id": "GRVTUSDT|contract",
+            "run_outcome": "condition_unmet",
+            "target_value": 100_000.0,
+            "achieved_value": 43_000.0,
+            "active_intent_ids": [],
+            "run_contract_snapshot": {
+                "run_start_time": "2026-08-08T00:00:00+00:00",
+                "run_end_time": "2026-08-08T23:59:00+00:00",
+            },
+        },
+        "best_quote_frozen_inventory": {"short_lots": [{"qty": 10.0}]},
+    }
+    monkeypatch.setattr(
+        ra, "terminal_drain_completed_owner_is_integral", lambda *args, **kwargs: True
+    )
+
+    eligible, reason = ra.completed_terminal_resume_eligibility(
+        state, symbol="GRVTUSDT", now=now
+    )
+
+    assert eligible is True
+    assert reason == "eligible"
+    archived = ra.archive_completed_terminal_for_active_target(
+        state, symbol="GRVTUSDT", now=now
+    )
+    assert archived["archive_reason"] == "explicit_resume_active_unmet_target"
+    assert "futures_terminal_drain" not in state
+    assert state["best_quote_frozen_inventory"]["short_lots"] == [{"qty": 10.0}]
+
+
+def test_completed_terminal_resume_rejects_terminal_order(monkeypatch) -> None:
+    state = {
+        "futures_terminal_drain": {
+            "run_outcome": "condition_unmet",
+            "target_value": 100_000.0,
+            "achieved_value": 43_000.0,
+            "active_intent_ids": ["gtd-grvtu-test"],
+            "run_contract_snapshot": {
+                "run_start_time": "2026-08-08T00:00:00+00:00",
+                "run_end_time": "2026-08-08T23:59:00+00:00",
+            },
+        }
+    }
+    monkeypatch.setattr(
+        ra, "terminal_drain_completed_owner_is_integral", lambda *args, **kwargs: True
+    )
+
+    eligible, reason = ra.completed_terminal_resume_eligibility(
+        state,
+        symbol="GRVTUSDT",
+        now=datetime(2026, 8, 8, 13, 0, tzinfo=timezone.utc),
+    )
+
+    assert eligible is False
+    assert reason == "terminal_drain_order_in_flight"
+
+
 def test_registered_recovery_realign_reports_drift_without_actuating(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
