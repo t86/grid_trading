@@ -4353,6 +4353,8 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "best_quote_maker_volume_net_loss_reduce_min_inventory_notional": 0.0,
     "best_quote_maker_volume_allow_loss_reduce_only": False,
     "best_quote_maker_volume_reduce_freeze_enabled": False,
+    "best_quote_maker_volume_reduce_freeze_long_enabled": True,
+    "best_quote_maker_volume_reduce_freeze_short_enabled": True,
     "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
     "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
     "best_quote_maker_volume_reduce_freeze_confirm_cycles": 1,
@@ -10584,6 +10586,8 @@ def _normalize_runner_control_payload(
         "best_quote_maker_volume_suppress_short_reduce_enabled",
         "best_quote_maker_volume_active_pair_reduce_enabled",
         "best_quote_maker_volume_reduce_freeze_enabled",
+        "best_quote_maker_volume_reduce_freeze_long_enabled",
+        "best_quote_maker_volume_reduce_freeze_short_enabled",
         "best_quote_maker_volume_reduce_freeze_profitable_pair_gate_enabled",
         "best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled",
         "best_quote_maker_volume_reduce_freeze_band_budget_enabled",
@@ -11976,6 +11980,12 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         "--best-quote-maker-volume-reduce-freeze-enabled"
         if config.get("best_quote_maker_volume_reduce_freeze_enabled", False)
         else "--no-best-quote-maker-volume-reduce-freeze-enabled",
+        "--best-quote-maker-volume-reduce-freeze-long-enabled"
+        if config.get("best_quote_maker_volume_reduce_freeze_long_enabled", True)
+        else "--no-best-quote-maker-volume-reduce-freeze-long-enabled",
+        "--best-quote-maker-volume-reduce-freeze-short-enabled"
+        if config.get("best_quote_maker_volume_reduce_freeze_short_enabled", True)
+        else "--no-best-quote-maker-volume-reduce-freeze-short-enabled",
         "--best-quote-maker-volume-reduce-freeze-loss-ratio",
         str(config.get("best_quote_maker_volume_reduce_freeze_loss_ratio", 0.01)),
         "--best-quote-maker-volume-reduce-freeze-min-notional",

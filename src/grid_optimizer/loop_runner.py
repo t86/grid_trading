@@ -5531,6 +5531,8 @@ def _apply_best_quote_reduce_freeze(
     plan: dict[str, Any],
     report: dict[str, Any],
     enabled: bool,
+    long_enabled: bool = True,
+    short_enabled: bool = True,
     threshold_loss_ratio: float,
     min_notional: float,
     confirm_cycles: int = 1,
@@ -5580,6 +5582,21 @@ def _apply_best_quote_reduce_freeze(
 ) -> dict[str, Any]:
     report = dict(report)
     report["enabled"] = bool(enabled)
+    safe_long_enabled = bool(long_enabled)
+    safe_short_enabled = bool(short_enabled)
+    freeze_side_gate = {
+        "long": {
+            "enabled": safe_long_enabled,
+            "allows_freeze": safe_long_enabled,
+            "blocked_reason": None if safe_long_enabled else "side_disabled",
+        },
+        "short": {
+            "enabled": safe_short_enabled,
+            "allows_freeze": safe_short_enabled,
+            "blocked_reason": None if safe_short_enabled else "side_disabled",
+        },
+    }
+    report["freeze_side_gate"] = freeze_side_gate
     report["threshold_loss_ratio"] = max(_safe_float(threshold_loss_ratio), 0.0)
     report["min_notional"] = max(_safe_float(min_notional), 0.0)
     report["confirm_cycles"] = max(int(confirm_cycles), 1)
@@ -6159,10 +6176,12 @@ def _apply_best_quote_reduce_freeze(
         "SHORT",
         short_freeze_threshold,
     )
-    if not long_price_gate_allows:
+    if not safe_long_enabled or not long_price_gate_allows:
         long_candidate_lots, long_candidate_qty, long_candidate_notional, long_candidate_loss_ratio = [], 0.0, 0.0, 0.0
-    if not short_price_gate_allows:
+        confirmations.pop("long", None)
+    if not safe_short_enabled or not short_price_gate_allows:
         short_candidate_lots, short_candidate_qty, short_candidate_notional, short_candidate_loss_ratio = [], 0.0, 0.0, 0.0
+        confirmations.pop("short", None)
     use_lot_candidates = ledger_cost_basis_usable
     freeze_pair_gate_report = {
         "enabled": True,
@@ -6395,6 +6414,7 @@ def _apply_best_quote_reduce_freeze(
             "short_extra_ratio": short_dynamic_extra,
         }
         report["band_budget"] = band_budget_report
+        report["freeze_side_gate"] = freeze_side_gate
         report["freeze_price_gate"] = freeze_price_gate
         report["frozen_total_cap"] = frozen_total_cap_report
         report["frozen_side_cap"] = frozen_side_cap_report
@@ -29586,6 +29606,12 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         best_quote_reduce_freeze_enabled = bool(
             getattr(effective_args, "best_quote_maker_volume_reduce_freeze_enabled", False)
         )
+        best_quote_reduce_freeze_long_enabled = bool(
+            getattr(effective_args, "best_quote_maker_volume_reduce_freeze_long_enabled", True)
+        )
+        best_quote_reduce_freeze_short_enabled = bool(
+            getattr(effective_args, "best_quote_maker_volume_reduce_freeze_short_enabled", True)
+        )
         best_quote_reduce_freeze_loss_ratio = max(
             _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_loss_ratio", 0.01)),
             0.0,
@@ -29853,6 +29879,8 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         best_quote_reduce_freeze.update(
             {
                 "enabled": best_quote_reduce_freeze_enabled,
+                "long_enabled": best_quote_reduce_freeze_long_enabled,
+                "short_enabled": best_quote_reduce_freeze_short_enabled,
                 "threshold_loss_ratio": best_quote_reduce_freeze_loss_ratio,
                 "confirm_cycles": best_quote_reduce_freeze_confirm_cycles,
                 "hard_loss_ratio": best_quote_reduce_freeze_hard_loss_ratio,
@@ -29919,6 +29947,8 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             plan=freeze_fake_plan,
             report=best_quote_reduce_freeze,
             enabled=best_quote_reduce_freeze_enabled,
+            long_enabled=best_quote_reduce_freeze_long_enabled,
+            short_enabled=best_quote_reduce_freeze_short_enabled,
             threshold_loss_ratio=best_quote_reduce_freeze_loss_ratio,
             min_notional=best_quote_reduce_freeze_min_notional,
             confirm_cycles=best_quote_reduce_freeze_confirm_cycles,
@@ -34473,6 +34503,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-realized-credit-ratio", type=float, default=1.0)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-min-inventory-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--best-quote-maker-volume-reduce-freeze-long-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-reduce-freeze-short-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-loss-ratio", type=float, default=0.01)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-min-notional", type=float, default=10.0)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-confirm-cycles", type=int, default=1)

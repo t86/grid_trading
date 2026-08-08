@@ -2164,6 +2164,53 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(short_report["band_budget"]["short"]["band_key"], "short:1")
         self.assertAlmostEqual(short_report["band_budget"]["short"]["base_budget_notional"], 300.0)
 
+    def test_best_quote_reduce_freeze_can_disable_long_side_only(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_volume_ledger": {
+                "long_lots": [{"qty": 1.0, "price": 120.0}],
+                "short_lots": [{"qty": 1.0, "price": 100.0}],
+                "long_qty": 1.0,
+                "short_qty": 1.0,
+                "long_avg_price": 120.0,
+                "short_avg_price": 100.0,
+                "initialized": True,
+            },
+        }
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=1.0,
+            current_short_qty=1.0,
+            current_long_avg_price=120.0,
+            current_short_avg_price=100.0,
+            mid_price=110.0,
+            bq_ledger_report=state["best_quote_volume_ledger"],
+        )
+        report = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={
+                "sell_orders": [{"role": "best_quote_reduce_long"}],
+                "buy_orders": [{"role": "best_quote_reduce_short"}],
+            },
+            report=report,
+            enabled=True,
+            long_enabled=False,
+            short_enabled=True,
+            threshold_loss_ratio=0.05,
+            min_notional=10.0,
+            current_long_qty=1.0,
+            current_short_qty=1.0,
+            current_long_avg_price=120.0,
+            current_short_avg_price=100.0,
+            mid_price=110.0,
+            bq_ledger_report=state["best_quote_volume_ledger"],
+            profitable_pair_gate_enabled=False,
+        )
+
+        self.assertTrue(report["freeze_side_gate"]["long"]["enabled"] is False)
+        self.assertEqual(report["freeze_side_gate"]["long"]["blocked_reason"], "side_disabled")
+        self.assertEqual(report["frozen_long_qty"], 0.0)
+        self.assertGreater(report["frozen_short_qty"], 0.0)
+
     def test_best_quote_reduce_freeze_band_budget_blocks_below_min_price(self) -> None:
         state: dict[str, object] = {
             "best_quote_volume_ledger": {
