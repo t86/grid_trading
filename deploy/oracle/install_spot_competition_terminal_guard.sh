@@ -15,6 +15,7 @@ runner_wrapper="${RUNNER_WRAPPER:-/usr/local/bin/grid-saved-runner}"
 config_dir="/etc/grid-spot-terminal"
 service_path="/etc/systemd/system/grid-spot-terminal@.service"
 env_path="${config_dir}/${symbol}.env"
+runner_dropin_dir="/etc/systemd/system/grid-loop@${symbol}.service.d"
 
 sudo install -d -m 0755 "${config_dir}"
 tmp_env="$(mktemp)"
@@ -54,6 +55,15 @@ WantedBy=multi-user.target
 UNIT
 sudo install -m 0644 "${tmp_service}" "${service_path}"
 rm -f "${tmp_service}"
+
+sudo install -d -m 0755 "${runner_dropin_dir}"
+tmp_dropin="$(mktemp)"
+cat >"${tmp_dropin}" <<'UNIT'
+[Service]
+Restart=no
+UNIT
+sudo install -m 0644 "${tmp_dropin}" "${runner_dropin_dir}/90-spot-terminal-no-restart.conf"
+rm -f "${tmp_dropin}"
 
 sudo systemctl daemon-reload
 sudo systemctl enable "grid-spot-terminal@${symbol}.service"
