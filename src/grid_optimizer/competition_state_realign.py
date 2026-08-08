@@ -227,6 +227,61 @@ def realign_ledger(
     return {"new_long": act_l, "new_short": act_s}
 
 
+def repair_frozen_inventory_deficit(
+    state: dict[str, Any], *, long_qty: float, short_qty: float
+) -> dict[str, Any]:
+    """Reconcile only frozen lots that no longer exist on the exchange.
+
+    This is an explicit incident repair, not a release path: it never creates an
+    exchange order or treats the removed quantity as a profitable/paired exit.
+    Lots are retired newest-first and retained in audit history so the exchange
+    remains the source of truth after an ordinary reducer has crossed the
+    frozen boundary.
+    """
+    frozen = dict(state.get("best_quote_frozen_inventory") or {})
+    exchange_qty = {"long": max(float(long_qty), 0.0), "short": max(float(short_qty), 0.0)}
+    repaired: dict[str, Any] = {"long": [], "short": []}
+    for side in ("long", "short"):
+        key = f"{side}_lots"
+        lots = [dict(item) for item in frozen.get(key, []) if isinstance(item, dict)]
+        lot_qty = sum(max(float(item.get("qty") or 0.0), 0.0) for item in lots)
+        aggregate_qty = max(float(frozen.get(f"{side}_qty") or 0.0), 0.0)
+        active_qty = max(lot_qty, aggregate_qty)
+        deficit = max(active_qty - exchange_qty[side], 0.0)
+        if deficit <= 1e-12:
+            continue
+        kept_reversed: list[dict[str, Any]] = []
+        for lot in reversed(lots):
+            qty = max(float(lot.get("qty") or 0.0), 0.0)
+            removed = min(qty, deficit)
+            if removed > 0:
+                retired = dict(lot)
+                retired["qty"] = removed
+                retired["retired_reason"] = "exchange_position_deficit_reconcile"
+                repaired[side].append(retired)
+                qty -= removed
+                deficit -= removed
+            if qty > 1e-12:
+                retained = dict(lot)
+                retained["qty"] = qty
+                kept_reversed.append(retained)
+        kept = list(reversed(kept_reversed))
+        frozen[key] = kept
+        frozen[f"{side}_qty"] = sum(max(float(item.get("qty") or 0.0), 0.0) for item in kept)
+    if any(repaired.values()):
+        history = list(frozen.get("exchange_deficit_reconcile_history") or [])
+        history.append({"at": _now_iso(), "reason": "exchange_position_deficit_reconcile", "retired": repaired})
+        frozen["exchange_deficit_reconcile_history"] = history[-20:]
+        frozen["updated_at"] = _now_iso()
+        state["best_quote_frozen_inventory"] = frozen
+    return {
+        "repaired": bool(any(repaired.values())),
+        "retired_long_qty": sum(float(item.get("qty") or 0.0) for item in repaired["long"]),
+        "retired_short_qty": sum(float(item.get("qty") or 0.0) for item in repaired["short"]),
+        "retired": repaired,
+    }
+
+
 def archive_stale_plan(workdir: str, slug: str) -> str | None:
     """Move the persisted latest-plan snapshot aside so a following start cannot
     latch on its pre-realign net notional (guard reads it before the first fresh
@@ -361,6 +416,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Archive only a completed condition_unmet terminal drain while its "
         "target window remains active; requires --enforce and no terminal order.",
     )
+    ap.add_argument(
+        "--repair-frozen-inventory-deficit",
+        action="store_true",
+        help="Explicitly retire only frozen ledger quantity absent from exchange; requires --enforce.",
+    )
     ap.add_argument("--enforce", action="store_true")
     return ap
 
@@ -382,7 +442,12 @@ def main() -> None:
 
     lq, lavg, sq, savg = fetch_exchange_sides(sym, k, s)
     state = json.load(open(state_path))
-    ldrift, sdrift = compute_drift(state, lq, sq)
+    try:
+        ldrift, sdrift = compute_drift(state, lq, sq)
+    except ValueError:
+        if not (a.repair_frozen_inventory_deficit and a.enforce):
+            raise
+        ldrift = sdrift = 0.0
     was_active = is_active(a.service)
     status: dict[str, Any] = {
         "ts": _now_iso(), "symbol": sym, "long_drift": round(ldrift, 1),
@@ -438,6 +503,41 @@ def main() -> None:
 
             with open(state_path, encoding="utf-8") as state_handle:
                 locked_state = json.load(state_handle)
+            if a.repair_frozen_inventory_deficit:
+                if not a.enforce:
+                    status["action"] = "DRY_RUN_would_repair_frozen_inventory_deficit"
+                    print(json.dumps(status))
+                    return
+                bak = state_path + ".bak_frozen_deficit_" + str(int(time.time()))
+                try:
+                    shutil.copy2(state_path, bak)
+                except OSError as exc:
+                    status["action"] = "ABORTED_BACKUP_FAILED"
+                    status["error"] = str(exc)[:140]
+                    print(json.dumps(status))
+                    raise SystemExit(1)
+                repair = repair_frozen_inventory_deficit(
+                    locked_state, long_qty=lq, short_qty=sq
+                )
+                if not repair["repaired"]:
+                    status["action"] = "FROZEN_INVENTORY_DEFICIT_NOT_PRESENT"
+                    print(json.dumps(status))
+                    return
+                ldrift, sdrift = compute_drift(locked_state, lq, sq)
+                new_lots = realign_ledger(locked_state, lq, lavg, sq, savg)
+                locked_state["updated_at"] = _now_iso()
+                locked_state["updated_by"] = "competition_state_realign_frozen_deficit"
+                locked_state["last_realign"] = {"at": _now_iso(), "backup": bak, **repair, **new_lots}
+                write_json(Path(state_path), locked_state)
+                status.update({"action": "FROZEN_INVENTORY_DEFICIT_REALIGNED", "backup": bak, **repair, **new_lots})
+                archived = archive_stale_plan(a.workdir, slug)
+                if archived:
+                    status["stale_plan_archived"] = archived
+                if should_start_after_realign(was_active, a.allow_start_when_stopped):
+                    start = subprocess.run(["sudo", "-n", "systemctl", "start", a.service], capture_output=True)
+                    status["start_rc"] = start.returncode
+                print(json.dumps(status))
+                return
             if a.resume_completed_active_target:
                 if is_active(a.service):
                     status["action"] = "RESUME_COMPLETED_ACTIVE_TARGET_BLOCKED"

@@ -1272,6 +1272,24 @@ def test_realign_ledger_preserves_frozen_and_writes_active_remainder() -> None:
     assert led["short_lots"] == []
 
 
+def test_repair_frozen_inventory_deficit_retires_only_missing_newest_lot() -> None:
+    state = {
+        "best_quote_frozen_inventory": {
+            "short_lots": [{"qty": 100.0, "entry_price": 0.30}, {"qty": 40.0, "entry_price": 0.29}],
+            "short_qty": 140.0,
+        }
+    }
+
+    repair = ra.repair_frozen_inventory_deficit(state, long_qty=0.0, short_qty=115.0)
+
+    assert repair["repaired"] is True
+    assert repair["retired_short_qty"] == 25.0
+    assert state["best_quote_frozen_inventory"]["short_lots"] == [
+        {"qty": 100.0, "entry_price": 0.30}, {"qty": 15.0, "entry_price": 0.29}
+    ]
+    assert state["best_quote_frozen_inventory"]["short_qty"] == 115.0
+
+
 def test_realign_ledger_seals_reflected_trade_cursor_against_restart_replay(monkeypatch) -> None:
     import grid_optimizer.loop_runner as lr
 
