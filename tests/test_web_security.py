@@ -4149,6 +4149,25 @@ class WebSecurityTests(unittest.TestCase):
         ratio_index = command.index("--best-quote-maker-volume-inventory-soft-ratio")
         self.assertEqual(command[ratio_index + 1], "0.6")
 
+    def test_build_runner_command_replaces_null_inventory_bias_gap_with_default(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "GRVTUSDT",
+                "strategy_profile": "grvt_daily_80k_bq_short_freeze_5pct_v1",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "step_price": 0.0004,
+                "buy_levels": 3,
+                "sell_levels": 3,
+                "per_order_notional": 30.0,
+                "base_position_notional": 0.0,
+                "best_quote_maker_volume_enabled": True,
+                "best_quote_maker_volume_inventory_bias_min_notional_gap": None,
+            }
+        )
+
+        gap_index = command.index("--best-quote-maker-volume-inventory-bias-min-notional-gap")
+        self.assertEqual(command[gap_index + 1], "10.0")
+
     def test_runner_preset_payload_for_maker_volatility_inventory_v1(self) -> None:
         payload = _runner_preset_payload("maker_volatility_inventory_v1", {"symbol": "BARDUSDT"})
 

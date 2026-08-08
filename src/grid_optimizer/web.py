@@ -12143,7 +12143,12 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         "--best-quote-maker-volume-inventory-bias-min-ratio-gap",
         str(config.get("best_quote_maker_volume_inventory_bias_min_ratio_gap", 0.05)),
         "--best-quote-maker-volume-inventory-bias-min-notional-gap",
-        str(config.get("best_quote_maker_volume_inventory_bias_min_notional_gap", 10.0)),
+        str(
+            config.get("best_quote_maker_volume_inventory_bias_min_notional_gap")
+            if config.get("best_quote_maker_volume_inventory_bias_min_notional_gap")
+            is not None
+            else 10.0
+        ),
         "--best-quote-maker-volume-inventory-bias-min-notional-gap-soft-ratio",
         str(config.get("best_quote_maker_volume_inventory_bias_min_notional_gap_soft_ratio", 0.0)),
         "--best-quote-maker-volume-inventory-bias-reduce-share",
