@@ -21651,10 +21651,14 @@ def _best_quote_submit_allow_loss_roles(
     expected_authorization: Mapping[str, Any] | None = None,
     require_expected_authorization: bool = False,
 ) -> set[str] | None:
-    roles: set[str] = {
-        "inventory_unlock_reduce_long",
-        "inventory_unlock_reduce_short",
-    }
+    roles: set[str] = set()
+    if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)):
+        roles.update(
+            {
+                "inventory_unlock_reduce_long",
+                "inventory_unlock_reduce_short",
+            }
+        )
     roles.update(
         temporary_loss_roles
         if temporary_loss_roles is not None

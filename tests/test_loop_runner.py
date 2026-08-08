@@ -17372,14 +17372,12 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(
             roles,
             {
-                "inventory_unlock_reduce_long",
-                "inventory_unlock_reduce_short",
                 "best_quote_active_pair_reduce_long",
                 "best_quote_active_pair_reduce_short",
             },
         )
 
-    def test_best_quote_submit_allow_loss_roles_keep_inventory_unlock_when_disabled(self) -> None:
+    def test_best_quote_submit_allow_loss_roles_blocks_inventory_unlock_when_disabled(self) -> None:
         roles = _best_quote_submit_allow_loss_roles(
             SimpleNamespace(
                 best_quote_maker_volume_allow_loss_reduce_only=False,
@@ -17387,13 +17385,7 @@ class LoopRunnerTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(
-            roles,
-            {
-                "inventory_unlock_reduce_long",
-                "inventory_unlock_reduce_short",
-            },
-        )
+        self.assertIsNone(roles)
 
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
