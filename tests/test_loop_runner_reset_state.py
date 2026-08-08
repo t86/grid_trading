@@ -31,6 +31,47 @@ from grid_optimizer.semi_auto_plan import load_or_initialize_state
 
 
 class LoopRunnerResetStateTests(unittest.TestCase):
+    def test_reset_preserves_authoritative_target_progress(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "bchusdt_loop_state.json"
+            target_progress = {
+                "schema": "futures_target_progress_v1",
+                "symbol": "BCHUSDT",
+                "gross_notional": 123.45,
+            }
+            state_path.write_text(
+                json.dumps({"futures_target_progress": target_progress}),
+                encoding="utf-8",
+            )
+            planner_args = argparse.Namespace(
+                symbol="BCHUSDT",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                step_price=0.1,
+                buy_levels=1,
+                sell_levels=1,
+                per_order_notional=20.0,
+                base_position_notional=0.0,
+                center_price=None,
+                down_trigger_steps=4,
+                up_trigger_steps=8,
+                shift_steps=4,
+            )
+
+            reset_state = load_or_initialize_state(
+                state_path=state_path,
+                args=planner_args,
+                symbol_info={
+                    "tick_size": 0.1,
+                    "step_size": 0.001,
+                    "min_qty": 0.001,
+                    "min_notional": 5.0,
+                },
+                mid_price=500.0,
+                reset_state=True,
+            )
+
+        self.assertEqual(reset_state["futures_target_progress"], target_progress)
+
     def test_reset_preserves_pending_terminal_handoff_until_normal_event_ack(
         self,
     ) -> None:

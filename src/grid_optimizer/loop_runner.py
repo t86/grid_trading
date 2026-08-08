@@ -12138,11 +12138,12 @@ def _persisted_futures_target_progress(
     args: argparse.Namespace,
     runtime_guard_config: Any,
 ) -> float | None:
-    """Return the cycle's authoritative target snapshot or fail closed.
+    """Return the cycle's persisted authoritative target snapshot.
 
     The post-submit summary must not recalculate target volume from the local
-    audit using different deduplication/window rules.  The pre-guard exchange
-    query persists the only target snapshot that is legal for the cycle.
+    audit using different deduplication/window rules.  A just-reset state has
+    no snapshot yet; its caller must then retain its normal in-cycle progress
+    calculation rather than treating the missing state as an exception.
     """
 
     target_raw = getattr(runtime_guard_config, "max_cumulative_notional", None)
@@ -12150,7 +12151,7 @@ def _persisted_futures_target_progress(
         return None
     raw_progress = state.get("futures_target_progress")
     if not isinstance(raw_progress, Mapping):
-        raise ValueError("authoritative target progress snapshot is missing")
+        return None
     expected_contract_id = run_contract_identity_from_config(vars(args))
     symbol = str(args.symbol).upper().strip()
     if raw_progress.get("schema") != "futures_target_progress_v1":

@@ -300,6 +300,20 @@ class LoopRunnerTargetProgressTests(unittest.TestCase):
 
         self.assertEqual(observed, 12_345.0)
 
+    def test_post_cycle_summary_keeps_in_cycle_progress_after_reset(
+        self,
+    ) -> None:
+        args = self._target_args(Path("output/bch_state.json"))
+        config = normalize_runtime_guard_config(vars(args))
+
+        observed = _persisted_futures_target_progress(
+            state={},
+            args=args,
+            runtime_guard_config=config,
+        )
+
+        self.assertIsNone(observed)
+
     def test_post_cycle_summary_rejects_target_snapshot_from_other_contract(self) -> None:
         args = self._target_args(Path("output/bch_state.json"))
         config = normalize_runtime_guard_config(vars(args))

@@ -39,6 +39,9 @@ TERMINAL_LIFECYCLE_STATE_KEYS = (
     "futures_terminal_handoff",
     "futures_terminal_handoff_history",
 )
+RESET_SAFE_RUNTIME_GUARD_STATE_KEYS = (
+    "futures_target_progress",
+)
 
 
 @dataclass(frozen=True)
@@ -2367,6 +2370,7 @@ def load_or_initialize_state(
     preserved_frozen_pair_release: dict[str, Any] = {}
     preserved_recovery_receipt_journals: dict[str, Any] = {}
     preserved_terminal_lifecycle: dict[str, Any] = {}
+    preserved_runtime_guard: dict[str, Any] = {}
 
     def _preserve_reset_safe_state(existing_state: dict[str, Any]) -> None:
         nonlocal preserved_best_quote_volume_ledger
@@ -2377,6 +2381,7 @@ def load_or_initialize_state(
         nonlocal preserved_frozen_pair_release
         nonlocal preserved_recovery_receipt_journals
         nonlocal preserved_terminal_lifecycle
+        nonlocal preserved_runtime_guard
         if isinstance(existing_state.get("best_quote_volume_ledger"), dict):
             preserved_best_quote_volume_ledger = dict(existing_state["best_quote_volume_ledger"])
         if isinstance(existing_state.get("best_quote_volume_order_refs"), dict):
@@ -2395,6 +2400,9 @@ def load_or_initialize_state(
         for key in TERMINAL_LIFECYCLE_STATE_KEYS:
             if key in existing_state:
                 preserved_terminal_lifecycle[key] = existing_state[key]
+        for key in RESET_SAFE_RUNTIME_GUARD_STATE_KEYS:
+            if key in existing_state:
+                preserved_runtime_guard[key] = existing_state[key]
 
     if state_path.exists() and not reset_state:
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -2443,6 +2451,7 @@ def load_or_initialize_state(
         state["best_quote_frozen_inventory_pair_release"] = preserved_frozen_pair_release
     state.update(preserved_recovery_receipt_journals)
     state.update(preserved_terminal_lifecycle)
+    state.update(preserved_runtime_guard)
     if getattr(args, "custom_grid_enabled", False):
         state.update(
             {
