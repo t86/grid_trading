@@ -11921,6 +11921,51 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["buy_orders"], [])
         self.assertEqual(plan["sell_orders"], [])
 
+    def test_threshold_mode_can_release_entry_buffer_below_soft(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state={},
+            enabled=True,
+            current_long_qty=3120.0,
+            current_short_qty=2900.0,
+            current_long_notional=880.0,
+            current_short_notional=820.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=100.0,
+            offset_ticks=1,
+            step_price=0.0006,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.2820,
+            ask_price=0.2821,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=850.0,
+            current_long_avg_price=0.2900,
+            current_short_avg_price=0.2800,
+            max_loss_ratio=0.06,
+            min_relief_notional=100.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["eligible_sides"], ["long"])
+        self.assertEqual(report["order_count"], 1)
+        self.assertIn(
+            "best_quote_active_pair_reduce_long",
+            [item["role"] for item in plan["sell_orders"]],
+        )
+        self.assertNotIn(
+            "best_quote_active_pair_reduce_short",
+            [item["role"] for item in plan["buy_orders"]],
+        )
+
     def test_best_quote_active_pair_reduce_threshold_mode_never_targets_below_threshold(self) -> None:
         plan = {"buy_orders": [], "sell_orders": []}
 

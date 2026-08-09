@@ -23588,8 +23588,10 @@ def apply_best_quote_active_pair_reduce(
             ("long", safe_long_notional, long_soft),
             ("short", safe_short_notional, short_soft),
         )
-        if notional >= soft_notional
-        and (not threshold_side_mode or notional > safe_loss_threshold + 1e-12)
+        if (
+            (threshold_side_mode and notional > safe_loss_threshold + 1e-12)
+            or (not threshold_side_mode and notional >= soft_notional)
+        )
     }
     if threshold_side_mode:
         eligible_sides = threshold_eligible_sides
