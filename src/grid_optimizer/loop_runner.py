@@ -1256,6 +1256,8 @@ def apply_volatility_entry_pause_controls(
     current_short_notional: float = 0.0,
     long_entry_limit_notional: float = 0.0,
     short_entry_limit_notional: float = 0.0,
+    max_long_notional: float = 0.0,
+    max_short_notional: float = 0.0,
     now: datetime | None = None,
     directional_recovery_min_seconds: float = 180.0,
     directional_recovery_min_gap_notional: float = 100.0,
@@ -1296,6 +1298,8 @@ def apply_volatility_entry_pause_controls(
     short_notional = max(_safe_float(current_short_notional), 0.0)
     long_limit = max(_safe_float(long_entry_limit_notional), 0.0)
     short_limit = max(_safe_float(short_entry_limit_notional), 0.0)
+    long_hard_limit = max(_safe_float(max_long_notional), long_limit)
+    short_hard_limit = max(_safe_float(max_short_notional), short_limit)
     both_below_entry_limits = (
         long_limit > 0
         and short_limit > 0
@@ -1313,24 +1317,41 @@ def apply_volatility_entry_pause_controls(
         and light_notional <= heavy_notional * max_light_share + 1e-12
     )
     market_return_1m = _safe_float(dynamic.get("market_return_1m"))
-    directional_recovery_allowed = bool(
+    recovery_window_open = bool(
         not current_trigger
         and not extreme_volatility
         and recovery_observed
-        and both_below_entry_limits
     )
+    directional_recovery_allowed = False
     directional_bypass_side: str | None = None
-    if directional_recovery_allowed:
-        if materially_imbalanced and long_notional > short_notional and market_return_1m <= 0:
+    dynamic_reason = str(dynamic.get("reason") or "")
+    high_volatility = dynamic_reason == "high_volatility_defensive"
+    if recovery_window_open:
+        if (
+            materially_imbalanced
+            and long_notional > short_notional
+            and short_notional < short_limit - 1e-12
+            and (long_hard_limit <= 0 or long_notional < long_hard_limit - 1e-12)
+            and (not high_volatility or market_return_1m <= 0)
+        ):
             bypass_short_pause = True
             directional_bypass_side = "SELL"
-        elif materially_imbalanced and short_notional > long_notional and market_return_1m >= 0:
+            directional_recovery_allowed = True
+        elif (
+            materially_imbalanced
+            and short_notional > long_notional
+            and long_notional < long_limit - 1e-12
+            and (short_hard_limit <= 0 or short_notional < short_hard_limit - 1e-12)
+            and (not high_volatility or market_return_1m >= 0)
+        ):
             bypass_buy_pause = True
             directional_bypass_side = "BUY"
-        elif not materially_imbalanced:
+            directional_recovery_allowed = True
+        elif not materially_imbalanced and both_below_entry_limits:
             bypass_buy_pause = True
             bypass_short_pause = True
             directional_bypass_side = "BOTH"
+            directional_recovery_allowed = True
     volatility_entry_pause["directional_recovery"] = {
         "allowed": directional_recovery_allowed,
         "bypass_side": directional_bypass_side,
@@ -32289,6 +32310,8 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         current_short_notional=controls.get("current_short_notional", current_short_notional),
         long_entry_limit_notional=getattr(effective_args, "pause_buy_position_notional", 0.0),
         short_entry_limit_notional=getattr(effective_args, "pause_short_position_notional", 0.0),
+        max_long_notional=getattr(effective_args, "best_quote_maker_volume_max_long_notional", 0.0),
+        max_short_notional=getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0),
         now=plan_now,
     )
     if anti_chase_entry_guard.get("block_long_entries"):

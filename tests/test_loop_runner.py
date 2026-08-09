@@ -1131,6 +1131,8 @@ class LoopRunnerTests(unittest.TestCase):
             current_short_notional=0.0,
             long_entry_limit_notional=900.0,
             short_entry_limit_notional=900.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
             now=now,
         )
 
@@ -1163,12 +1165,48 @@ class LoopRunnerTests(unittest.TestCase):
             current_short_notional=789.0,
             long_entry_limit_notional=900.0,
             short_entry_limit_notional=900.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
             now=now,
         )
 
         self.assertFalse(controls["buy_paused"])
         self.assertFalse(controls["short_paused"])
         self.assertEqual(pause["directional_recovery"]["bypass_side"], "BOTH")
+
+    def test_volatility_pause_recovery_can_balance_heavy_side_between_soft_and_hard(self) -> None:
+        now = datetime(2026, 8, 9, 1, 30, tzinfo=timezone.utc)
+        controls = {
+            "buy_paused": False,
+            "short_paused": False,
+            "pause_reasons": [],
+            "short_pause_reasons": [],
+        }
+        pause = {
+            "active": True,
+            "trigger_active": False,
+            "reason": "inventory recovery",
+            "state": {"last_trigger_at": (now - timedelta(minutes=5)).isoformat()},
+        }
+
+        apply_volatility_entry_pause_controls(
+            controls=controls,
+            volatility_entry_pause=pause,
+            loss_recovery_brush={},
+            elastic_volume={},
+            dynamic_control={"reason": "normal", "market_return_1m": 0.001},
+            current_long_notional=903.0,
+            current_short_notional=0.0,
+            long_entry_limit_notional=900.0,
+            short_entry_limit_notional=900.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            now=now,
+        )
+
+        self.assertTrue(controls["buy_paused"])
+        self.assertFalse(controls["short_paused"])
+        self.assertEqual(pause["directional_recovery"]["bypass_side"], "SELL")
 
     def test_volatility_pause_never_opens_entry_during_current_or_extreme_shock(self) -> None:
         now = datetime(2026, 8, 9, 1, 30, tzinfo=timezone.utc)
@@ -1199,6 +1237,8 @@ class LoopRunnerTests(unittest.TestCase):
                 current_short_notional=0.0,
                 long_entry_limit_notional=900.0,
                 short_entry_limit_notional=900.0,
+                max_long_notional=1000.0,
+                max_short_notional=1000.0,
                 now=now,
             )
 
