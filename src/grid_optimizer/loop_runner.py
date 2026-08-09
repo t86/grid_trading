@@ -23503,6 +23503,7 @@ def apply_best_quote_active_pair_reduce(
     current_short_avg_price: float | None = None,
     max_loss_ratio: float = 0.005,
     min_relief_notional: float = 0.0,
+    suppress_all_entries_while_active: bool = False,
 ) -> dict[str, Any]:
     report = _best_quote_active_pair_reduce_default_report()
     report["enabled"] = bool(enabled)
@@ -23677,7 +23678,11 @@ def apply_best_quote_active_pair_reduce(
         ("long", "buy_orders", "best_quote_entry_long"),
         ("short", "sell_orders", "best_quote_entry_short"),
     ):
-        if threshold_side_mode and side_name not in eligible_sides:
+        if (
+            threshold_side_mode
+            and side_name not in eligible_sides
+            and not suppress_all_entries_while_active
+        ):
             continue
         kept_orders: list[dict[str, Any]] = []
         for item in plan.get(order_key, []):
@@ -32721,6 +32726,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             current_short_avg_price=current_short_avg_price,
             max_loss_ratio=0.06 if grvt_bounded_loss_recovery else 0.005,
             min_relief_notional=100.0 if grvt_bounded_loss_recovery else 0.0,
+            suppress_all_entries_while_active=grvt_bounded_loss_recovery,
         )
     else:
         state.pop("best_quote_active_pair_reduce", None)

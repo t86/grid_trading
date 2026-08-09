@@ -12040,6 +12040,7 @@ class LoopRunnerTests(unittest.TestCase):
             current_short_avg_price=0.280845,
             max_loss_ratio=0.06,
             min_relief_notional=100.0,
+            suppress_all_entries_while_active=True,
         )
 
         self.assertTrue(report["active"])
@@ -12051,6 +12052,10 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertNotIn(
             "best_quote_entry_long",
             [item["role"] for item in plan["buy_orders"]],
+        )
+        self.assertNotIn(
+            "best_quote_entry_short",
+            [item["role"] for item in plan["sell_orders"]],
         )
         self.assertIn(
             "best_quote_active_pair_reduce_long",
