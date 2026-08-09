@@ -32544,10 +32544,33 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             for item in plan.get("sell_orders", [])
             if isinstance(item, dict) and _is_long_exit_order(item)
         ]
+    balancing_entry_cap_side = anti_chase_entry_guard.get("balancing_bypass_side")
+    dynamic_control_report = (best_quote_maker_volume.get("metrics") or {}).get(
+        "dynamic_control"
+    ) or {}
+    inventory_bias_report = (best_quote_maker_volume.get("metrics") or {}).get(
+        "inventory_bias"
+    ) or {}
+    if (
+        not balancing_entry_cap_side
+        and str(symbol or "").upper().strip() == "GRVTUSDT"
+        and str(dynamic_control_report.get("reason") or "")
+        in {"high_volatility_defensive", "extreme_volatility_defensive"}
+        and bool(inventory_bias_report.get("applied"))
+    ):
+        heavy_side = str(inventory_bias_report.get("side") or "").lower()
+        balancing_entry_cap_side = (
+            "SELL"
+            if heavy_side == "long"
+            else "BUY"
+            if heavy_side == "short"
+            else None
+        )
+    anti_chase_entry_guard["volatility_balancing_cap_side"] = balancing_entry_cap_side
     anti_chase_entry_guard["balancing_entry_trimmed_count"] = (
         cap_grvt_anti_chase_balancing_entries(
             plan=plan,
-            bypass_side=anti_chase_entry_guard.get("balancing_bypass_side"),
+            bypass_side=balancing_entry_cap_side,
         )
     )
 
