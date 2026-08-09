@@ -21650,7 +21650,27 @@ def _best_quote_submit_allow_loss_roles(
     temporary_loss_roles: Iterable[str] | None = None,
     expected_authorization: Mapping[str, Any] | None = None,
     require_expected_authorization: bool = False,
+    plan_report: Mapping[str, Any] | None = None,
 ) -> set[str] | None:
+    report = dict(plan_report or {})
+    threshold = max(
+        _safe_float(report.get("loss_reduce_threshold_notional")),
+        _safe_float(getattr(args, "threshold_position_notional", None)),
+        0.0,
+    )
+
+    def _over_threshold(role: str) -> bool:
+        normalized_role = str(role or "").strip().lower()
+        if threshold <= 0:
+            return False
+        if normalized_role.endswith("_long"):
+            current_notional = _safe_float(report.get("current_long_notional"))
+        elif normalized_role.endswith("_short"):
+            current_notional = _safe_float(report.get("current_short_notional"))
+        else:
+            return False
+        return current_notional > threshold + 1e-12
+
     roles: set[str] = set()
     resolved_temporary_roles = frozenset(
         str(role).strip().lower()
@@ -21670,17 +21690,19 @@ def _best_quote_submit_allow_loss_roles(
         # A raw runtime flag is never sufficient to bypass the no-loss guard.
         # Inventory unlock orders are admitted only while the coordinator's
         # current, side-bound temporary-loss lease is still valid.
-        roles.update(resolved_temporary_roles)
-        if "best_quote_reduce_long" in resolved_temporary_roles:
+        roles.update(role for role in resolved_temporary_roles if _over_threshold(role))
+        if "best_quote_reduce_long" in roles:
             roles.add("inventory_unlock_reduce_long")
-        if "best_quote_reduce_short" in resolved_temporary_roles:
+        if "best_quote_reduce_short" in roles:
             roles.add("inventory_unlock_reduce_short")
     if bool(getattr(args, "best_quote_maker_volume_active_pair_reduce_enabled", False)):
         roles.update(
-            {
+            role
+            for role in (
                 "best_quote_active_pair_reduce_long",
                 "best_quote_active_pair_reduce_short",
-            }
+            )
+            if _over_threshold(role)
         )
     return roles or None
 
@@ -21703,12 +21725,22 @@ def _guard_temporary_loss_order_before_submit(
 
     candidate = dict(order)
     role = str(candidate.get("role") or "").strip().lower()
-    if role not in {"best_quote_reduce_long", "best_quote_reduce_short"}:
+    loss_capable_roles = {
+        "best_quote_reduce_long",
+        "best_quote_reduce_short",
+        "inventory_unlock_reduce_long",
+        "inventory_unlock_reduce_short",
+        "best_quote_active_pair_reduce_long",
+        "best_quote_active_pair_reduce_short",
+    }
+    if role not in loss_capable_roles:
         return candidate, None
     attempted_temporary_bypass = bool(
         getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)
     ) or str(candidate.get("reduce_only_no_loss_guard") or "").startswith(
         "bypassed_allow_loss_role_"
+    ) or role.startswith("inventory_unlock_reduce_") or role.startswith(
+        "best_quote_active_pair_reduce_"
     )
     if not attempted_temporary_bypass:
         return candidate, None
@@ -21745,6 +21777,12 @@ def _guard_temporary_loss_order_before_submit(
         ),
         require_expected_authorization=True,
     )
+    allowed_loss_roles = _best_quote_submit_allow_loss_roles(
+        args,
+        now=now,
+        temporary_loss_roles=temporary_roles,
+        plan_report=plan_report,
+    )
     guarded = apply_reduce_only_no_loss_guard_to_actions(
         actions={
             "place_orders": [candidate],
@@ -21760,11 +21798,7 @@ def _guard_temporary_loss_order_before_submit(
         min_notional=min_notional,
         step_size=step_size,
         enabled=True,
-        allow_loss_roles=_best_quote_submit_allow_loss_roles(
-            args,
-            now=now,
-            temporary_loss_roles=temporary_roles,
-        ),
+        allow_loss_roles=allowed_loss_roles,
     )
     kept = [
         dict(item)
@@ -21780,10 +21814,10 @@ def _guard_temporary_loss_order_before_submit(
     guard_report = guarded.get("reduce_only_no_loss_guard") or {}
     guard_price = (
         guard_report.get("long_floor_price")
-        if role == "best_quote_reduce_long"
+        if role.endswith("_long")
         else guard_report.get("short_ceiling_price")
     )
-    if role not in temporary_roles and _safe_float(guard_price) <= 0:
+    if role not in (allowed_loss_roles or set()) and _safe_float(guard_price) <= 0:
         return None, {
             "reason": "temporary_loss_cost_basis_unavailable",
             "role": role,
@@ -23084,6 +23118,7 @@ def _inventory_unlock_default_report() -> dict[str, Any]:
         "reason": None,
         "current_notional": 0.0,
         "pause_notional": None,
+        "loss_release_threshold_notional": None,
         "target_notional": None,
         "release_cap_notional": 0.0,
         "release_order_notional": 0.0,
@@ -23429,6 +23464,7 @@ def apply_inventory_unlock_release(
     min_notional: float | None,
     bid_price: float,
     ask_price: float,
+    loss_release_threshold_notional: float | None = None,
     position_side: str = "BOTH",
     confirm_cycles: int = 3,
     loss_release_authorized: bool = False,
@@ -23442,6 +23478,11 @@ def apply_inventory_unlock_release(
     safe_qty = max(_safe_float(current_qty), 0.0)
     safe_current_notional = max(_safe_float(current_notional), 0.0)
     safe_pause_notional = max(_safe_float(pause_notional), 0.0)
+    safe_loss_release_threshold = max(
+        _safe_float(loss_release_threshold_notional),
+        safe_pause_notional,
+        0.0,
+    )
     safe_cap_notional = max(_safe_float(release_cap_notional), 0.0)
     safe_per_order_notional = max(_safe_float(per_order_notional), 0.0)
     report.update(
@@ -23452,6 +23493,7 @@ def apply_inventory_unlock_release(
             "max_execution_cycles": safe_max_execution_cycles,
             "current_notional": safe_current_notional,
             "pause_notional": safe_pause_notional if safe_pause_notional > 0 else pause_notional,
+            "loss_release_threshold_notional": safe_loss_release_threshold,
             "release_cap_notional": safe_cap_notional,
         }
     )
@@ -23460,6 +23502,11 @@ def apply_inventory_unlock_release(
         state.pop("inventory_unlock_release", None)
         report["reason"] = "temporary_loss_not_authorized"
         return report
+
+    below_loss_release_threshold = bool(
+        safe_loss_release_threshold <= 0
+        or safe_current_notional <= safe_loss_release_threshold + 1e-12
+    )
 
     freeze_report = dict(reduce_freeze_report or {})
     independent_freeze_first = (
@@ -23524,6 +23571,7 @@ def apply_inventory_unlock_release(
         and safe_qty > 1e-12
         and safe_pause_notional > 0
         and safe_current_notional > safe_pause_notional
+        and not below_loss_release_threshold
         and safe_cap_notional > 0
         and (long_floor_blocks or short_ceiling_blocks)
     )
@@ -23604,7 +23652,11 @@ def apply_inventory_unlock_release(
         report["reason"] = "reentry_price_gate"
         return report
     if not candidate:
-        report["reason"] = "not_stalled"
+        report["reason"] = (
+            "below_loss_release_threshold"
+            if below_loss_release_threshold
+            else "not_stalled"
+        )
         return report
     if stall_count < safe_confirm_cycles:
         report["reason"] = "waiting_for_stall_confirmation"
@@ -28081,6 +28133,14 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
 
     synthetic_ledger_snapshot: dict[str, Any] | None = None
     temporary_loss_authorization: _TemporaryLossRuntimeAuthorization | None = None
+    loss_reduce_threshold_notional = max(
+        _safe_float(getattr(effective_args, "threshold_position_notional", None)),
+        0.0,
+    )
+    ordinary_long_over_loss_reduce_threshold = False
+    ordinary_short_over_loss_reduce_threshold = False
+    temporary_loss_long_authorized = False
+    temporary_loss_short_authorized = False
     excess_inventory_gate = {
         "enabled": bool(getattr(args, "excess_inventory_reduce_only_enabled", False)),
         "active": False,
@@ -30469,9 +30529,41 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             args,
             now=plan_now,
         )
+        loss_reduce_threshold_notional = max(
+            _safe_float(getattr(effective_args, "threshold_position_notional", None)),
+            0.0,
+        )
+        ordinary_current_long_notional = max(
+            _safe_float(current_long_notional),
+            0.0,
+        )
+        ordinary_current_short_notional = max(
+            _safe_float(current_short_notional),
+            0.0,
+        )
+        ordinary_long_over_loss_reduce_threshold = bool(
+            loss_reduce_threshold_notional > 0
+            and ordinary_current_long_notional
+            > loss_reduce_threshold_notional + 1e-12
+        )
+        ordinary_short_over_loss_reduce_threshold = bool(
+            loss_reduce_threshold_notional > 0
+            and ordinary_current_short_notional
+            > loss_reduce_threshold_notional + 1e-12
+        )
+        temporary_loss_long_authorized = bool(
+            temporary_loss_authorization is not None
+            and temporary_loss_authorization.role == "best_quote_reduce_long"
+            and ordinary_long_over_loss_reduce_threshold
+        )
+        temporary_loss_short_authorized = bool(
+            temporary_loss_authorization is not None
+            and temporary_loss_authorization.role == "best_quote_reduce_short"
+            and ordinary_short_over_loss_reduce_threshold
+        )
         temporary_loss_roles = frozenset(
             {temporary_loss_authorization.role}
-            if temporary_loss_authorization is not None
+            if temporary_loss_long_authorized or temporary_loss_short_authorized
             else ()
         )
         best_quote_long_guard_roles, best_quote_short_guard_roles = _best_quote_take_profit_guard_role_sets(
@@ -32057,6 +32149,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             current_qty=current_long_qty,
             current_notional=controls.get("current_long_notional", current_long_notional),
             pause_notional=unlock_long_pause_notional,
+            loss_release_threshold_notional=loss_reduce_threshold_notional,
             release_cap_notional=unlock_release_cap,
             per_order_notional=inventory_tier.get("effective_per_order_notional", getattr(effective_args, "per_order_notional", 0.0)),
             step_price=effective_args.step_price,
@@ -32067,7 +32160,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             bid_price=bid_price,
             ask_price=ask_price,
             position_side="LONG" if hedge_best_quote else "BOTH",
-            loss_release_authorized=temporary_loss_authorization is not None,
+            loss_release_authorized=temporary_loss_long_authorized,
             reduce_freeze_report=best_quote_reduce_freeze,
         )
     elif unlock_short_side:
@@ -32080,6 +32173,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             current_qty=current_short_qty,
             current_notional=controls.get("current_short_notional", current_short_notional),
             pause_notional=unlock_short_pause_notional,
+            loss_release_threshold_notional=loss_reduce_threshold_notional,
             release_cap_notional=unlock_release_cap,
             per_order_notional=inventory_tier.get("effective_per_order_notional", getattr(effective_args, "per_order_notional", 0.0)),
             step_price=effective_args.step_price,
@@ -32090,7 +32184,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             bid_price=bid_price,
             ask_price=ask_price,
             position_side="SHORT" if hedge_best_quote else "BOTH",
-            loss_release_authorized=temporary_loss_authorization is not None,
+            loss_release_authorized=temporary_loss_short_authorized,
             reduce_freeze_report=best_quote_reduce_freeze,
         )
     else:
@@ -32500,6 +32594,25 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             if temporary_loss_authorization is not None
             else None
         ),
+        "loss_reduce_threshold_notional": loss_reduce_threshold_notional,
+        "loss_reduce_threshold_gate": {
+            "current_long_notional": max(
+                _safe_float(controls.get("current_long_notional")), 0.0
+            ),
+            "current_short_notional": max(
+                _safe_float(controls.get("current_short_notional")), 0.0
+            ),
+            "long_over_threshold": bool(
+                loss_reduce_threshold_notional > 0
+                and _safe_float(controls.get("current_long_notional"))
+                > loss_reduce_threshold_notional + 1e-12
+            ),
+            "short_over_threshold": bool(
+                loss_reduce_threshold_notional > 0
+                and _safe_float(controls.get("current_short_notional"))
+                > loss_reduce_threshold_notional + 1e-12
+            ),
+        },
         "recovery_profile_gate": recovery_profile_gate,
         "runtime_safety_signal_gate": runtime_safety_signal_gate,
         "synthetic_trend_follow": synthetic_trend_follow,
@@ -33026,6 +33139,7 @@ def _execute_plan_report_unlocked(args: argparse.Namespace, plan_report: dict[st
                 else None
             ),
             require_expected_authorization=True,
+            plan_report=plan_report,
         ),
     )
     validation["actions"] = isolate_frozen_pair_release_place_orders(validation["actions"])
@@ -33653,6 +33767,7 @@ def _execute_plan_report_unlocked(args: argparse.Namespace, plan_report: dict[st
                 else None
             ),
             require_expected_authorization=True,
+            plan_report=plan_report,
         ),
     )
     validation["actions"] = _apply_best_quote_directional_net_guard_to_actions(

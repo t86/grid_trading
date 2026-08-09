@@ -11122,6 +11122,39 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["buy_orders"], [])
         self.assertNotIn("inventory_unlock_release", state)
 
+    def test_inventory_unlock_release_blocks_loss_below_ordinary_active_threshold(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+        state = {"inventory_unlock_release": {"side": "short", "stall_count": 2}}
+
+        report = apply_inventory_unlock_release(
+            plan=plan,
+            state=state,
+            side="short",
+            entry_paused=True,
+            take_profit_guard={"enabled": True, "short_active": True, "short_ceiling_price": 0.14},
+            current_qty=1000.0,
+            current_notional=150.0,
+            pause_notional=100.0,
+            loss_release_threshold_notional=800.0,
+            release_cap_notional=50.0,
+            per_order_notional=50.0,
+            step_price=0.0001,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.15,
+            ask_price=0.1501,
+            position_side="SHORT",
+            loss_release_authorized=True,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report["reason"], "below_loss_release_threshold")
+        self.assertEqual(report["loss_release_threshold_notional"], 800.0)
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertNotIn("inventory_unlock_release", state)
+
     def test_inventory_unlock_release_limits_continuous_loss_execution_cycles(self) -> None:
         plan = {"buy_orders": [], "sell_orders": []}
         state = {
@@ -17434,8 +17467,14 @@ class LoopRunnerTests(unittest.TestCase):
             SimpleNamespace(
                 best_quote_maker_volume_allow_loss_reduce_only=True,
                 best_quote_maker_volume_active_pair_reduce_enabled=False,
+                threshold_position_notional=800.0,
             ),
             temporary_loss_roles={"best_quote_reduce_short"},
+            plan_report={
+                "loss_reduce_threshold_notional": 800.0,
+                "current_long_notional": 100.0,
+                "current_short_notional": 801.0,
+            },
         )
 
         self.assertEqual(
@@ -17443,12 +17482,35 @@ class LoopRunnerTests(unittest.TestCase):
             {"best_quote_reduce_short", "inventory_unlock_reduce_short"},
         )
 
+    def test_best_quote_submit_allow_loss_lease_is_fail_closed_below_threshold(self) -> None:
+        roles = _best_quote_submit_allow_loss_roles(
+            SimpleNamespace(
+                best_quote_maker_volume_allow_loss_reduce_only=True,
+                best_quote_maker_volume_active_pair_reduce_enabled=False,
+                threshold_position_notional=800.0,
+            ),
+            temporary_loss_roles={"best_quote_reduce_short"},
+            plan_report={
+                "loss_reduce_threshold_notional": 800.0,
+                "current_long_notional": 100.0,
+                "current_short_notional": 799.0,
+            },
+        )
+
+        self.assertIsNone(roles)
+
     def test_best_quote_submit_allow_loss_roles_keep_active_pair_separate(self) -> None:
         roles = _best_quote_submit_allow_loss_roles(
             SimpleNamespace(
                 best_quote_maker_volume_allow_loss_reduce_only=False,
                 best_quote_maker_volume_active_pair_reduce_enabled=True,
-            )
+                threshold_position_notional=800.0,
+            ),
+            plan_report={
+                "loss_reduce_threshold_notional": 800.0,
+                "current_long_notional": 801.0,
+                "current_short_notional": 801.0,
+            },
         )
 
         self.assertEqual(
@@ -17458,6 +17520,22 @@ class LoopRunnerTests(unittest.TestCase):
                 "best_quote_active_pair_reduce_short",
             },
         )
+
+    def test_best_quote_submit_active_pair_loss_role_requires_same_side_threshold(self) -> None:
+        roles = _best_quote_submit_allow_loss_roles(
+            SimpleNamespace(
+                best_quote_maker_volume_allow_loss_reduce_only=False,
+                best_quote_maker_volume_active_pair_reduce_enabled=True,
+                threshold_position_notional=800.0,
+            ),
+            plan_report={
+                "loss_reduce_threshold_notional": 800.0,
+                "current_long_notional": 799.0,
+                "current_short_notional": 801.0,
+            },
+        )
+
+        self.assertEqual(roles, {"best_quote_active_pair_reduce_short"})
 
     def test_best_quote_submit_allow_loss_roles_blocks_inventory_unlock_when_disabled(self) -> None:
         roles = _best_quote_submit_allow_loss_roles(
