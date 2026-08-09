@@ -6867,6 +6867,68 @@ def check_symbol(
                 restart_runner=restart,
             )
         elif (
+            recovery_low_volume
+            and effective_inventory_soft_pressure
+            and bool(
+                control.get(
+                    "best_quote_maker_volume_inventory_bias_opposite_entry_enabled"
+                )
+            )
+            and _safe_float(
+                control.get("best_quote_maker_volume_inventory_bias_reduce_share")
+            )
+            > 0
+            and (
+                (
+                    _safe_float(assessment.get("current_long_notional"))
+                    > _safe_float(assessment.get("current_short_notional"))
+                    and _safe_int(
+                        assessment.get("planned_entry_sell_order_count")
+                    )
+                    > 0
+                )
+                or (
+                    _safe_float(assessment.get("current_short_notional"))
+                    > _safe_float(assessment.get("current_long_notional"))
+                    and _safe_int(
+                        assessment.get("planned_entry_buy_order_count")
+                    )
+                    > 0
+                )
+            )
+            and not bool(assessment.get("volatility_entry_pause_active"))
+        ):
+            updates = {
+                "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                "best_quote_maker_volume_inventory_bias_reduce_share": 0.0,
+            }
+            _remember_recovery_controls(item, control, tuple(updates))
+            _remember_recovery_updates(item, updates)
+            action = (
+                "dry_run_prioritize_opposite_entry_over_dominant_reduce"
+                if dry_run
+                else "prioritize_opposite_entry_over_dominant_reduce"
+            )
+            item.update(
+                {
+                    "status": "recovery_active",
+                    "recovery_started_at": item.get("recovery_started_at")
+                    or now.isoformat(),
+                    "recovery_owned": True,
+                    "last_recovery_action_at": now.isoformat(),
+                    "last_recovery_action": action,
+                }
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+        elif (
             bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and recovery_low_volume
             and effective_inventory_soft_pressure
