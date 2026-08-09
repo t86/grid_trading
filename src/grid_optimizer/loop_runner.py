@@ -20296,7 +20296,11 @@ def _guard_cancel_order_before_submit(
         )
         allowed_cancel_side = (
             reduce_side
-            if decision_action == "cancel_net_decrease_refresh"
+            if decision_action
+            in {
+                "cancel_net_decrease_refresh",
+                "cancel_surplus_balancing_entries",
+            }
             else "BUY" if reduce_side == "SELL" else "SELL"
         )
     side = str(order.get("side") or "").upper().strip()
@@ -33176,7 +33180,11 @@ def _actual_net_safety_cancel_requested(actions: Mapping[str, Any]) -> bool:
     return bool(
         isinstance(decision, Mapping)
         and decision.get("action")
-        in {"cancel_risk_increasing", "cancel_net_decrease_refresh"}
+        in {
+            "cancel_risk_increasing",
+            "cancel_net_decrease_refresh",
+            "cancel_surplus_balancing_entries",
+        }
     )
 
 
@@ -34189,6 +34197,35 @@ def _execute_plan_report_unlocked(args: argparse.Namespace, plan_report: dict[st
         orders=actual_net_exposure_open_orders,
         now=datetime.now(timezone.utc),
     )
+    volatility_pause_report = plan_report.get("volatility_entry_pause")
+    volatility_pause_report = (
+        volatility_pause_report
+        if isinstance(volatility_pause_report, Mapping)
+        else {}
+    )
+    directional_recovery_report = volatility_pause_report.get(
+        "directional_recovery"
+    )
+    directional_recovery_report = (
+        directional_recovery_report
+        if isinstance(directional_recovery_report, Mapping)
+        else {}
+    )
+    high_volatility_directional_report = volatility_pause_report.get(
+        "high_volatility_directional_guard"
+    )
+    high_volatility_directional_report = (
+        high_volatility_directional_report
+        if isinstance(high_volatility_directional_report, Mapping)
+        else {}
+    )
+    serialize_balancing_entries = bool(
+        (
+            directional_recovery_report.get("allowed")
+            and directional_recovery_report.get("bypass_side") in {"BUY", "SELL"}
+        )
+        or high_volatility_directional_report.get("active")
+    )
     validation["actions"] = coordinate_symbol_execution_action(
         actions=validation["actions"],
         current_actual_net_qty=current_ordinary_actual_net_qty,
@@ -34201,6 +34238,7 @@ def _execute_plan_report_unlocked(args: argparse.Namespace, plan_report: dict[st
         max_actual_net_notional=_safe_float(
             getattr(args, "max_actual_net_notional", None)
         ),
+        serialize_balancing_entries=serialize_balancing_entries,
     )
     selected_action_decision = validation["actions"].get(
         "actual_net_exposure_decision"

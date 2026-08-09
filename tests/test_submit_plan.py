@@ -370,6 +370,102 @@ class SubmitPlanTests(unittest.TestCase):
         )
         self.assertEqual(guarded["place_orders"], [])
 
+    def test_directional_recovery_places_only_nearest_balancing_entry(self) -> None:
+        near_entry = {
+            "side": "SELL",
+            "position_side": "SHORT",
+            "price": 201.0,
+            "qty": 0.10,
+            "notional": 20.0,
+            "role": "best_quote_entry_short",
+            "time_in_force": "GTX",
+        }
+        far_entry = {**near_entry, "price": 203.0}
+
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={
+                "place_orders": [far_entry, near_entry],
+                "cancel_orders": [],
+            },
+            current_actual_net_qty=0.50,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=1_000.0,
+            serialize_balancing_entries=True,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "place_serial_balancing_entry",
+        )
+        self.assertEqual(guarded["place_orders"], [near_entry])
+
+    def test_directional_recovery_cancels_surplus_far_balancing_entry(self) -> None:
+        near_entry = {
+            "orderId": 80,
+            "side": "SELL",
+            "positionSide": "SHORT",
+            "price": "201",
+            "origQty": "0.10",
+            "executedQty": "0",
+        }
+        far_entry = {**near_entry, "orderId": 81, "price": "203"}
+
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={"place_orders": [], "cancel_orders": []},
+            current_actual_net_qty=0.50,
+            valuation_price=200.0,
+            current_open_orders=[near_entry, far_entry],
+            owned_open_orders=[near_entry, far_entry],
+            max_actual_net_notional=1_000.0,
+            serialize_balancing_entries=True,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "cancel_surplus_balancing_entries",
+        )
+        self.assertEqual(guarded["cancel_orders"], [far_entry])
+
+    def test_directional_recovery_does_not_stack_on_existing_entry(self) -> None:
+        existing_entry = {
+            "orderId": 82,
+            "side": "SELL",
+            "positionSide": "SHORT",
+            "price": "201",
+            "origQty": "0.10",
+            "executedQty": "0",
+        }
+
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "SELL",
+                        "position_side": "SHORT",
+                        "price": 202.0,
+                        "qty": 0.10,
+                        "notional": 20.0,
+                        "role": "best_quote_entry_short",
+                        "time_in_force": "GTX",
+                    }
+                ],
+                "cancel_orders": [],
+            },
+            current_actual_net_qty=0.50,
+            valuation_price=200.0,
+            current_open_orders=[existing_entry],
+            owned_open_orders=[existing_entry],
+            max_actual_net_notional=1_000.0,
+            serialize_balancing_entries=True,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "hold_existing_serial_balancing_entry",
+        )
+        self.assertEqual(guarded["place_orders"], [])
+
     def test_actual_net_decision_holds_when_pause_removed_all_reducing_candidates(self) -> None:
         guarded = apply_actual_net_exposure_decision_to_actions(
             actions={

@@ -1394,6 +1394,7 @@ def apply_actual_net_exposure_decision_to_actions(
     current_open_orders: Iterable[Any],
     max_actual_net_notional: float,
     owned_open_orders: Iterable[Any] | None = None,
+    serialize_balancing_entries: bool = False,
 ) -> dict[str, Any]:
     """Make the final, single action decision for ordinary net exposure.
 
@@ -1579,6 +1580,119 @@ def apply_actual_net_exposure_decision_to_actions(
             risk_open_sides=risk_open_sides,
         )
 
+    reducing_side = (
+        "SELL" if current > 1e-12 else "BUY" if current < -1e-12 else None
+    )
+
+    def is_balancing_entry(order: Mapping[str, Any], side: str) -> bool:
+        position_side = str(
+            order.get("position_side") or order.get("positionSide") or ""
+        ).upper().strip()
+        role = str(order.get("role") or "").lower().strip()
+        expected_role = (
+            "best_quote_entry_short"
+            if side == "SELL"
+            else "best_quote_entry_long"
+        )
+        return bool(
+            (side == "SELL" and position_side == "SHORT")
+            or (side == "BUY" and position_side == "LONG")
+        ) and (not role or role == expected_role)
+
+    def distance_to_mark(order: Mapping[str, Any]) -> float:
+        price = finite_number(order.get("price"))
+        return abs((price if price is not None else mark_price) - mark_price)
+
+    if serialize_balancing_entries and reducing_side is not None:
+        existing_balancing_entries = [
+            order
+            for order in open_by_side[reducing_side]
+            if is_balancing_entry(order, reducing_side)
+        ]
+        if len(existing_balancing_entries) > 1:
+            kept_entry = min(existing_balancing_entries, key=distance_to_mark)
+            surplus_entries = [
+                order for order in existing_balancing_entries if order is not kept_entry
+            ]
+            surplus_cancels = [
+                order
+                for order in surplus_entries
+                if any(
+                    _order_matches_cancel(order, owned_order)
+                    for owned_order in owned_orders
+                )
+            ]
+            if len(surplus_cancels) != len(surplus_entries):
+                return finish(
+                    "hold",
+                    places=[],
+                    cancels=[],
+                    reason="serial_balancing_cancel_not_authorized",
+                    reducing_side=reducing_side,
+                    existing_balancing_entry_order_count=len(
+                        existing_balancing_entries
+                    ),
+                )
+            return finish(
+                "cancel_surplus_balancing_entries",
+                places=[],
+                cancels=surplus_cancels,
+                reducing_side=reducing_side,
+                existing_balancing_entry_order_count=len(
+                    existing_balancing_entries
+                ),
+                kept_balancing_entry_price=finite_number(kept_entry.get("price")),
+            )
+        if existing_balancing_entries:
+            return finish(
+                "hold_existing_serial_balancing_entry",
+                places=[],
+                cancels=[],
+                reducing_side=reducing_side,
+                existing_balancing_entry_order_count=1,
+            )
+
+        eligible_balancing_entries: list[dict[str, Any]] = []
+        for order in place_orders:
+            if (
+                str(order.get("side") or "").upper().strip() != reducing_side
+                or not is_balancing_entry(order, reducing_side)
+                or not _is_gtx_candidate(order)
+            ):
+                continue
+            notional = marked_notional(order)
+            if notional <= 0 or notional > abs(current) + 1e-9:
+                continue
+            projected_selected = (
+                projected_open_sell - notional
+                if reducing_side == "SELL"
+                else projected_open_buy + notional
+            )
+            if abs(projected_selected) > cap + 1e-9:
+                continue
+            eligible_balancing_entries.append(order)
+        if eligible_balancing_entries:
+            selected_entry = min(
+                eligible_balancing_entries,
+                key=distance_to_mark,
+            )
+            return finish(
+                "place_serial_balancing_entry",
+                places=[selected_entry],
+                cancels=[],
+                reducing_side=reducing_side,
+                existing_balancing_entry_order_count=0,
+                selected_role=str(selected_entry.get("role") or ""),
+            )
+        return finish(
+            "hold",
+            places=[],
+            cancels=[],
+            reason="serial_balancing_entry_unavailable",
+            reducing_side=reducing_side,
+            existing_balancing_entry_order_count=0,
+        )
+
     candidate_notional = {"BUY": 0.0, "SELL": 0.0}
     for order in place_orders:
         side = str(order.get("side") or "").upper().strip()
@@ -1600,7 +1714,6 @@ def apply_actual_net_exposure_decision_to_actions(
             projected_sell_notional=projected_sell,
         )
 
-    reducing_side = "SELL" if current > 1e-12 else "BUY" if current < -1e-12 else None
     existing_reducing_count = (
         len(open_by_side[reducing_side]) if reducing_side is not None else 0
     )
@@ -1717,6 +1830,7 @@ def coordinate_symbol_execution_action(
     current_open_orders: Iterable[Any],
     max_actual_net_notional: float,
     owned_open_orders: Iterable[Any] | None = None,
+    serialize_balancing_entries: bool = False,
 ) -> dict[str, Any]:
     """Select one logical mutation lane for this symbol and cycle.
 
@@ -1896,6 +2010,7 @@ def coordinate_symbol_execution_action(
         current_open_orders=current_open_orders,
         max_actual_net_notional=max_actual_net_notional,
         owned_open_orders=owned_open_orders,
+        serialize_balancing_entries=serialize_balancing_entries,
     )
     ordinary_decision = dict(
         ordinary_result.get("actual_net_exposure_decision") or {}

@@ -468,6 +468,15 @@ def test_cancel_submit_guard_rechecks_directional_runtime_signal() -> None:
             actual_net_decision={"action": "cancel_net_decrease_refresh"},
             now=NOW,
         )
+        serialized, serialized_reason = _guard_cancel_order_before_submit(
+            args=argparse.Namespace(),
+            order={"orderId": 11, "side": "SELL"},
+            expected_gate=None,
+            actual_net_decision={
+                "action": "cancel_surplus_balancing_entries"
+            },
+            now=NOW,
+        )
 
     assert blocked is None
     assert blocked_reason["reason"] == "runtime_safety_signal_blocks_cancel"
@@ -475,6 +484,8 @@ def test_cancel_submit_guard_rechecks_directional_runtime_signal() -> None:
     assert allowed_reason is None
     assert refresh == {"orderId": 10, "side": "SELL"}
     assert refresh_reason is None
+    assert serialized == {"orderId": 11, "side": "SELL"}
+    assert serialized_reason is None
 
 
 def test_position_cap_signal_preserves_owned_reduce_refresh_for_final_arbiter() -> None:
