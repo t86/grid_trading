@@ -9972,6 +9972,89 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 108.0)
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_wrong_way_recovery_keeps_budget_on_available_opposite_entry(self) -> None:
+        now = datetime(2026, 7, 12, 4, 22, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                    "best_quote_maker_volume_inventory_bias_reduce_share": 0.0,
+                    "best_quote_maker_volume_inventory_bias_opposite_entry_enabled": True,
+                    "best_quote_maker_volume_quote_offset_ticks": 0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.95,
+                    "pause_buy_position_notional": 380.0,
+                    "pause_short_position_notional": 350.0,
+                },
+                long_notional=145.0,
+                short_notional=368.0,
+                open_order_count=3,
+                active_order_count=3,
+                orders_near_market=True,
+                recent_trade_notional=20.0,
+            )
+            plan_path = output_dir / "reusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["buy_orders"] = [
+                {
+                    "side": "BUY",
+                    "price": 0.5968,
+                    "qty": 16.0,
+                    "role": "best_quote_entry_long",
+                    "position_side": "LONG",
+                }
+            ]
+            plan["sell_orders"] = [
+                {
+                    "side": "SELL",
+                    "price": 0.5972,
+                    "qty": 16.0,
+                    "role": "best_quote_reduce_long",
+                    "position_side": "LONG",
+                    "force_reduce_only": True,
+                }
+            ]
+            _write_json(plan_path, plan)
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state={
+                    "symbols": {
+                        "REUSDT": {
+                            "status": "recovery_active",
+                            "guard_recovery_controls": {
+                                "best_quote_maker_volume_cycle_budget_notional": 108.0,
+                            },
+                        }
+                    }
+                },
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=0,
+                loss_reduce_quote_offset_extra_ticks=1,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertNotEqual(
+                result["action"],
+                "enable_dominant_leg_reduce_share_for_wrong_way_recovery",
+            )
+            self.assertEqual(
+                control["best_quote_maker_volume_inventory_bias_reduce_share"],
+                0.0,
+            )
+
     def test_loss_reduce_only_lowers_dominant_leg_pause(self) -> None:
         updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
             control={

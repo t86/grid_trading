@@ -6891,6 +6891,31 @@ def check_symbol(
                     and _safe_int(assessment.get("planned_reduce_short_order_count")) <= 0
                 )
             )
+            and not (
+                bool(
+                    control.get(
+                        "best_quote_maker_volume_inventory_bias_opposite_entry_enabled"
+                    )
+                )
+                and (
+                    (
+                        _safe_float(assessment.get("current_long_notional"))
+                        > _safe_float(assessment.get("current_short_notional"))
+                        and _safe_int(
+                            assessment.get("planned_entry_sell_order_count")
+                        )
+                        > 0
+                    )
+                    or (
+                        _safe_float(assessment.get("current_short_notional"))
+                        > _safe_float(assessment.get("current_long_notional"))
+                        and _safe_int(
+                            assessment.get("planned_entry_buy_order_count")
+                        )
+                        > 0
+                    )
+                )
+            )
             and "best_quote_maker_volume_inventory_bias_reduce_share" in control
             and _safe_float(control.get("best_quote_maker_volume_inventory_bias_reduce_share")) < 0.25
             and not bool(assessment.get("volatility_entry_pause_active"))
