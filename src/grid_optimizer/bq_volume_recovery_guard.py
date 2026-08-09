@@ -8396,6 +8396,52 @@ def check_symbol(
                     }
                 )
             elif (
+                normalized_symbol == "GRVTUSDT"
+                and target_pace_behind
+                and bool(assessment.get("balancing_entry_requote_safe"))
+                and bool(assessment.get("all_entry_orders_far"))
+                and bool(assessment.get("low_volume"))
+                and not bool(assessment.get("volatility_entry_pause_active"))
+                and not bool(assessment.get("inventory_soft_pressure"))
+                and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+                and _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) > 0
+            ):
+                current_offset = _safe_int(
+                    control.get("best_quote_maker_volume_quote_offset_ticks")
+                )
+                updates = {
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "best_quote_maker_volume_quote_offset_ticks": current_offset - 1,
+                }
+                _remember_recovery_controls(
+                    item,
+                    control,
+                    ("best_quote_maker_volume_quote_offset_ticks",),
+                )
+                _remember_recovery_updates(item, updates)
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = (
+                    "dry_run_pull_active_grvt_balancing_entry_one_tick_closer"
+                    if dry_run
+                    else "pull_active_grvt_balancing_entry_one_tick_closer"
+                )
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "recovery_owned": True,
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+            elif (
                 recovery_timed_out
                 and not arx_recovery_baseline_net_limit_blocked
                 and not arx_low_pace_two_sided_headroom
