@@ -1794,6 +1794,12 @@ def _loss_reduce_recovery_updates(
         # cannot drain a 2.6k soft-cap inventory quickly enough to reopen flow.
         # Use the already bounded recovery-side cap as the single maker order.
         pair_order_notional = pair_max_notional
+    elif str(assessment.get("symbol") or "").upper() == "GRVTUSDT":
+        # A shallow trim leaves GRVT oscillating directly on its 900U soft
+        # line.  Clear one 100U maker slice so ordinary two-sided entry has
+        # enough room to remain live after recovery.
+        pair_order_notional = max(pair_order_notional, 100.0)
+        pair_max_notional = max(pair_max_notional, pair_order_notional)
     if pair_order_notional > 0:
         updates.update(
             {

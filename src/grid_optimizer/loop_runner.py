@@ -23385,6 +23385,7 @@ def _best_quote_active_pair_reduce_default_report() -> dict[str, Any]:
         "short_soft_notional": 0.0,
         "per_order_notional": 0.0,
         "max_reduce_notional_per_side": 0.0,
+        "min_relief_notional": 0.0,
         "loss_reduce_threshold_notional": 0.0,
         "max_loss_ratio": 0.005,
         "eligible_sides": [],
@@ -23423,6 +23424,7 @@ def apply_best_quote_active_pair_reduce(
     current_long_avg_price: float | None = None,
     current_short_avg_price: float | None = None,
     max_loss_ratio: float = 0.005,
+    min_relief_notional: float = 0.0,
 ) -> dict[str, Any]:
     report = _best_quote_active_pair_reduce_default_report()
     report["enabled"] = bool(enabled)
@@ -23440,6 +23442,7 @@ def apply_best_quote_active_pair_reduce(
     safe_long_avg_price = max(_safe_float(current_long_avg_price), 0.0)
     safe_short_avg_price = max(_safe_float(current_short_avg_price), 0.0)
     safe_max_loss_ratio = max(_safe_float(max_loss_ratio), 0.0)
+    safe_min_relief = max(_safe_float(min_relief_notional), 0.0)
     threshold_side_mode = safe_loss_threshold > 0
     report.update(
         {
@@ -23449,6 +23452,7 @@ def apply_best_quote_active_pair_reduce(
             "short_soft_notional": short_soft,
             "loss_reduce_threshold_notional": safe_loss_threshold,
             "max_loss_ratio": safe_max_loss_ratio,
+            "min_relief_notional": safe_min_relief,
         }
     )
 
@@ -23524,21 +23528,27 @@ def apply_best_quote_active_pair_reduce(
     if not active and touched_soft:
         if threshold_side_mode:
             long_target = (
-                max(
-                    safe_loss_threshold,
-                    long_soft - safe_per_order,
-                    safe_long_notional - safe_max_reduce,
-                    0.0,
+                min(
+                    max(
+                        safe_loss_threshold,
+                        long_soft - safe_per_order,
+                        safe_long_notional - safe_max_reduce,
+                        0.0,
+                    ),
+                    max(safe_long_notional - safe_min_relief, 0.0),
                 )
                 if "long" in eligible_sides
                 else safe_long_notional
             )
             short_target = (
-                max(
-                    safe_loss_threshold,
-                    short_soft - safe_per_order,
-                    safe_short_notional - safe_max_reduce,
-                    0.0,
+                min(
+                    max(
+                        safe_loss_threshold,
+                        short_soft - safe_per_order,
+                        safe_short_notional - safe_max_reduce,
+                        0.0,
+                    ),
+                    max(safe_short_notional - safe_min_relief, 0.0),
                 )
                 if "short" in eligible_sides
                 else safe_short_notional
@@ -30875,6 +30885,8 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         )
         loss_reduce_threshold_notional = max(
             _safe_float(getattr(effective_args, "threshold_position_notional", None)),
+            _safe_float(getattr(effective_args, "pause_buy_position_notional", None)),
+            _safe_float(getattr(effective_args, "pause_short_position_notional", None)),
             0.0,
         )
         ordinary_current_long_notional = max(
@@ -32544,6 +32556,10 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         state.pop("inventory_unlock_release", None)
 
     if _is_best_quote_maker_volume_mode(strategy_mode):
+        grvt_bounded_loss_recovery = (
+            str(effective_strategy_profile or "").strip()
+            == "grvt_daily_80k_bq_short_freeze_5pct_v1"
+        )
         best_quote_active_pair_reduce = apply_best_quote_active_pair_reduce(
             plan=plan,
             state=state,
@@ -32556,7 +32572,16 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             max_short_notional=getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0),
             soft_ratio=best_quote_inventory_soft_ratio,
             min_side_notional=getattr(effective_args, "best_quote_maker_volume_active_pair_reduce_min_side_notional", 0.0),
-            per_order_notional=getattr(effective_args, "best_quote_maker_volume_active_pair_reduce_order_notional", 50.0),
+            per_order_notional=max(
+                _safe_float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_active_pair_reduce_order_notional",
+                        50.0,
+                    )
+                ),
+                100.0 if grvt_bounded_loss_recovery else 0.0,
+            ),
             max_reduce_notional_per_side=getattr(
                 effective_args,
                 "best_quote_maker_volume_active_pair_reduce_max_notional_per_side",
@@ -32574,6 +32599,8 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             loss_reduce_threshold_notional=loss_reduce_threshold_notional,
             current_long_avg_price=current_long_avg_price,
             current_short_avg_price=current_short_avg_price,
+            max_loss_ratio=0.06 if grvt_bounded_loss_recovery else 0.005,
+            min_relief_notional=100.0 if grvt_bounded_loss_recovery else 0.0,
         )
     else:
         state.pop("best_quote_active_pair_reduce", None)
