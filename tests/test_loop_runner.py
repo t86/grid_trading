@@ -12368,6 +12368,59 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["order_count"], 0)
         self.assertEqual(plan["sell_orders"], [])
 
+    def test_grvt_bounded_loss_recovery_allows_ten_percent_cost_distance(self) -> None:
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.31,
+                    "qty": 300.0,
+                    "notional": 93.0,
+                    "role": "best_quote_entry_short",
+                    "position_side": "SHORT",
+                }
+            ],
+        }
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state={},
+            enabled=True,
+            current_long_qty=1.0,
+            current_short_qty=3_100.0,
+            current_long_notional=0.31,
+            current_short_notional=961.0,
+            max_long_notional=1_000.0,
+            max_short_notional=1_000.0,
+            soft_ratio=0.9,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=100.0,
+            offset_ticks=1,
+            step_price=0.0001,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.31,
+            ask_price=0.3101,
+            volatility_entry_pause={"active": True},
+            loss_reduce_threshold_notional=900.0,
+            current_long_avg_price=0.31,
+            current_short_avg_price=0.282,
+            max_loss_ratio=0.20,
+            min_relief_notional=100.0,
+            suppress_all_entries_while_active=True,
+        )
+
+        self.assertEqual(report["reason"], "soft_side_reduce")
+        self.assertEqual(report["eligible_sides"], ["short"])
+        self.assertLess(report["short_expected_loss_ratio"], 0.20)
+        self.assertEqual(
+            [item["role"] for item in plan["buy_orders"]],
+            ["best_quote_active_pair_reduce_short"],
+        )
+
     def test_best_quote_active_pair_reduce_respects_volatility_pause(self) -> None:
         plan = {"buy_orders": [], "sell_orders": []}
 
