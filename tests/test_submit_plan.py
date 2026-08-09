@@ -275,6 +275,101 @@ class SubmitPlanTests(unittest.TestCase):
             ["best_quote_entry_short"],
         )
 
+    def test_actual_net_decision_far_exit_does_not_block_balancing_entry(self) -> None:
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "BUY",
+                        "position_side": "SHORT",
+                        "price": 200.0,
+                        "qty": 0.10,
+                        "notional": 20.0,
+                        "role": "best_quote_reduce_short",
+                        "time_in_force": "GTX",
+                    },
+                    {
+                        "side": "SELL",
+                        "position_side": "SHORT",
+                        "price": 200.0,
+                        "qty": 0.075,
+                        "notional": 15.0,
+                        "role": "best_quote_entry_short",
+                        "time_in_force": "GTX",
+                    },
+                ],
+                "cancel_orders": [],
+            },
+            current_actual_net_qty=0.59,
+            valuation_price=200.0,
+            current_open_orders=[
+                {
+                    "orderId": 77,
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "price": "220",
+                    "origQty": "0.10",
+                    "executedQty": "0",
+                }
+            ],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "place_net_decrease",
+        )
+        self.assertEqual(
+            [order["role"] for order in guarded["place_orders"]],
+            ["best_quote_entry_short"],
+        )
+
+    def test_actual_net_decision_keeps_balancing_entry_serial(self) -> None:
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "BUY",
+                        "position_side": "SHORT",
+                        "price": 200.0,
+                        "qty": 0.10,
+                        "notional": 20.0,
+                        "role": "best_quote_reduce_short",
+                        "time_in_force": "GTX",
+                    },
+                    {
+                        "side": "SELL",
+                        "position_side": "SHORT",
+                        "price": 200.0,
+                        "qty": 0.075,
+                        "notional": 15.0,
+                        "role": "best_quote_entry_short",
+                        "time_in_force": "GTX",
+                    },
+                ],
+                "cancel_orders": [],
+            },
+            current_actual_net_qty=0.59,
+            valuation_price=200.0,
+            current_open_orders=[
+                {
+                    "orderId": 78,
+                    "side": "SELL",
+                    "positionSide": "SHORT",
+                    "price": "201",
+                    "origQty": "0.075",
+                    "executedQty": "0",
+                }
+            ],
+            max_actual_net_notional=120.0,
+        )
+
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "hold_existing_net_decrease",
+        )
+        self.assertEqual(guarded["place_orders"], [])
+
     def test_actual_net_decision_holds_when_pause_removed_all_reducing_candidates(self) -> None:
         guarded = apply_actual_net_exposure_decision_to_actions(
             actions={

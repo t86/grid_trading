@@ -1604,6 +1604,28 @@ def apply_actual_net_exposure_decision_to_actions(
     existing_reducing_count = (
         len(open_by_side[reducing_side]) if reducing_side is not None else 0
     )
+    existing_balancing_entry_count = sum(
+        1
+        for order in (
+            open_by_side[reducing_side] if reducing_side is not None else []
+        )
+        if (
+            (
+                reducing_side == "SELL"
+                and str(
+                    order.get("position_side") or order.get("positionSide") or ""
+                ).upper().strip()
+                == "SHORT"
+            )
+            or (
+                reducing_side == "BUY"
+                and str(
+                    order.get("position_side") or order.get("positionSide") or ""
+                ).upper().strip()
+                == "LONG"
+            )
+        )
+    )
     reducing_refresh_cancels = (
         [
             cancel
@@ -1625,7 +1647,9 @@ def apply_actual_net_exposure_decision_to_actions(
             triggered_reasons=triggered_reasons,
         )
     selected: dict[str, Any] | None = None
-    if reducing_side is not None and existing_reducing_count == 0:
+    if reducing_side is not None and (
+        existing_reducing_count == 0 or existing_balancing_entry_count == 0
+    ):
         eligible: list[tuple[int, int, dict[str, Any]]] = []
         for index, order in enumerate(place_orders):
             if str(order.get("side") or "").upper().strip() != reducing_side:
@@ -1638,15 +1662,25 @@ def apply_actual_net_exposure_decision_to_actions(
             ):
                 continue
             role = str(order.get("role") or "").lower().strip()
+            balancing_entry = (role, reducing_side) in {
+                ("best_quote_entry_short", "SELL"),
+                ("best_quote_entry_long", "BUY"),
+            }
+            if existing_reducing_count > 0 and not balancing_entry:
+                continue
+            projected_selected = (
+                projected_open_sell - notional
+                if reducing_side == "SELL"
+                else projected_open_buy + notional
+            )
+            if abs(projected_selected) > cap + 1e-9:
+                continue
             no_loss_state = str(
                 order.get("reduce_only_no_loss_guard") or ""
             ).lower()
             if "reduce" in role and "bypassed" not in no_loss_state:
                 priority = 0
-            elif (role, reducing_side) in {
-                ("best_quote_entry_short", "SELL"),
-                ("best_quote_entry_long", "BUY"),
-            }:
+            elif balancing_entry:
                 priority = 1
             elif "reduce" in role:
                 priority = 2
@@ -1657,10 +1691,10 @@ def apply_actual_net_exposure_decision_to_actions(
             selected = min(eligible, key=lambda item: (item[0], item[1]))[2]
 
     action = (
-        "hold_existing_net_decrease"
-        if existing_reducing_count > 0
-        else "place_net_decrease"
+        "place_net_decrease"
         if selected is not None
+        else "hold_existing_net_decrease"
+        if existing_reducing_count > 0
         else "hold"
     )
     return finish(
@@ -1668,6 +1702,8 @@ def apply_actual_net_exposure_decision_to_actions(
         places=[selected] if selected is not None else [],
         cancels=[],
         reducing_side=reducing_side,
+        existing_reducing_order_count=existing_reducing_count,
+        existing_balancing_entry_order_count=existing_balancing_entry_count,
         triggered_reasons=triggered_reasons,
         selected_role=str(selected.get("role") or "") if selected else None,
     )
