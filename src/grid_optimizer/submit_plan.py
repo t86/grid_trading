@@ -1625,6 +1625,31 @@ def apply_actual_net_exposure_decision_to_actions(
             eligible.append(order)
         return eligible
 
+    spacing_guard = actions.get("same_side_spacing_guard")
+    protected_spacing_cancels = (
+        spacing_guard.get("protected_cancel_orders", [])
+        if isinstance(spacing_guard, Mapping)
+        else []
+    )
+
+    def authorized_replacement_cancel(
+        existing_entry: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        if not any(
+            _order_matches_cancel(existing_entry, owned_order)
+            for owned_order in owned_orders
+        ):
+            return None
+        return next(
+            (
+                order
+                for order in [*cancel_orders, *protected_spacing_cancels]
+                if isinstance(order, dict)
+                and _order_matches_cancel(existing_entry, order)
+            ),
+            None,
+        )
+
     if serialize_balancing_entries and reducing_side is not None:
         eligible_balancing_entries = eligible_balancing_entries_for(reducing_side)
         existing_balancing_entries = [
@@ -1674,28 +1699,13 @@ def apply_actual_net_exposure_decision_to_actions(
                 if distance_to_mark(order) + 1e-12
                 < distance_to_mark(existing_entry)
             ]
-            spacing_guard = actions.get("same_side_spacing_guard")
-            protected_cancels = (
-                spacing_guard.get("protected_cancel_orders", [])
-                if isinstance(spacing_guard, Mapping)
-                else []
-            )
-            authorized_cancels = [
-                order
-                for order in [*cancel_orders, *protected_cancels]
-                if isinstance(order, dict)
-                and _order_matches_cancel(existing_entry, order)
-                and any(
-                    _order_matches_cancel(existing_entry, owned_order)
-                    for owned_order in owned_orders
-                )
-            ]
-            if closer_entries and authorized_cancels:
+            replacement_cancel = authorized_replacement_cancel(existing_entry)
+            if closer_entries and replacement_cancel is not None:
                 replacement_entry = min(closer_entries, key=distance_to_mark)
                 return finish(
                     "cancel_stale_serial_balancing_entry",
                     places=[],
-                    cancels=[authorized_cancels[0]],
+                    cancels=[replacement_cancel],
                     reducing_side=reducing_side,
                     existing_balancing_entry_order_count=1,
                     stale_balancing_entry_price=finite_number(
@@ -1801,6 +1811,34 @@ def apply_actual_net_exposure_decision_to_actions(
             reducing_side=reducing_side,
             triggered_reasons=triggered_reasons,
         )
+    if reducing_side is not None:
+        closer_replacements = eligible_balancing_entries_for(reducing_side)
+        for existing_entry in open_by_side[reducing_side]:
+            if not is_balancing_entry(existing_entry, reducing_side):
+                continue
+            closer_entries = [
+                order
+                for order in closer_replacements
+                if distance_to_mark(order) + 1e-12
+                < distance_to_mark(existing_entry)
+            ]
+            replacement_cancel = authorized_replacement_cancel(existing_entry)
+            if not closer_entries or replacement_cancel is None:
+                continue
+            replacement_entry = min(closer_entries, key=distance_to_mark)
+            return finish(
+                "cancel_stale_net_decrease_entry_refresh",
+                places=[],
+                cancels=[replacement_cancel],
+                reducing_side=reducing_side,
+                triggered_reasons=triggered_reasons,
+                stale_balancing_entry_price=finite_number(
+                    existing_entry.get("price")
+                ),
+                replacement_balancing_entry_price=finite_number(
+                    replacement_entry.get("price")
+                ),
+            )
     selected: dict[str, Any] | None = None
     if reducing_side is not None and (
         existing_reducing_count == 0 or existing_balancing_entry_count == 0
