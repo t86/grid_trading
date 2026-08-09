@@ -2022,6 +2022,84 @@ def resolve_anti_chase_entry_guard(
     return report
 
 
+def apply_grvt_anti_chase_balancing_bypass(
+    *,
+    report: dict[str, Any],
+    symbol: str,
+    current_long_notional: float,
+    current_short_notional: float,
+    long_soft_notional: float,
+    short_soft_notional: float,
+    min_gap_notional: float = 100.0,
+) -> dict[str, Any]:
+    """Keep only the entry lane that reduces a material GRVT imbalance."""
+
+    if str(symbol or "").upper().strip() != "GRVTUSDT":
+        return report
+    long_notional = max(_safe_float(current_long_notional), 0.0)
+    short_notional = max(_safe_float(current_short_notional), 0.0)
+    gap = abs(long_notional - short_notional)
+    min_gap = max(_safe_float(min_gap_notional), 0.0)
+    bypass_side: str | None = None
+    if (
+        bool(report.get("block_short_entries"))
+        and long_notional > short_notional
+        and gap >= min_gap
+        and short_notional < max(_safe_float(short_soft_notional), 0.0)
+    ):
+        report["block_short_entries"] = False
+        bypass_side = "SELL"
+    elif (
+        bool(report.get("block_long_entries"))
+        and short_notional > long_notional
+        and gap >= min_gap
+        and long_notional < max(_safe_float(long_soft_notional), 0.0)
+    ):
+        report["block_long_entries"] = False
+        bypass_side = "BUY"
+    report["balancing_bypass_side"] = bypass_side
+    report["balancing_bypass_inventory_gap_notional"] = gap
+    report["active"] = bool(
+        report.get("block_long_entries") or report.get("block_short_entries")
+    )
+    return report
+
+
+def cap_grvt_anti_chase_balancing_entries(
+    *,
+    plan: dict[str, Any],
+    bypass_side: str | None,
+) -> int:
+    """During a shock bypass, retain one closest ordinary balancing entry."""
+
+    normalized_side = str(bypass_side or "").upper().strip()
+    if normalized_side not in {"BUY", "SELL"}:
+        return 0
+    order_key = "buy_orders" if normalized_side == "BUY" else "sell_orders"
+    entry_role = (
+        "best_quote_entry_long" if normalized_side == "BUY" else "best_quote_entry_short"
+    )
+    orders = [dict(item) for item in plan.get(order_key, []) if isinstance(item, dict)]
+    entries = [item for item in orders if _order_role(item) == entry_role]
+    if len(entries) <= 1:
+        return 0
+    closest = (
+        max(entries, key=lambda item: _safe_float(item.get("price")))
+        if normalized_side == "BUY"
+        else min(entries, key=lambda item: _safe_float(item.get("price")))
+    )
+    kept_entry = False
+    kept: list[dict[str, Any]] = []
+    for item in orders:
+        if _order_role(item) != entry_role:
+            kept.append(item)
+        elif not kept_entry and item is closest:
+            kept.append(item)
+            kept_entry = True
+    plan[order_key] = kept
+    return len(entries) - 1
+
+
 def _resolve_fixed_center_roll(
     *,
     state: dict[str, Any],
@@ -32430,6 +32508,14 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         max_short_notional=getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0),
         now=plan_now,
     )
+    apply_grvt_anti_chase_balancing_bypass(
+        report=anti_chase_entry_guard,
+        symbol=symbol,
+        current_long_notional=controls.get("current_long_notional", current_long_notional),
+        current_short_notional=controls.get("current_short_notional", current_short_notional),
+        long_soft_notional=getattr(effective_args, "pause_buy_position_notional", 0.0),
+        short_soft_notional=getattr(effective_args, "pause_short_position_notional", 0.0),
+    )
     if anti_chase_entry_guard.get("block_long_entries"):
         controls["buy_paused"] = True
         controls["pause_reasons"] = list(controls.get("pause_reasons", []))
@@ -32458,6 +32544,12 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             for item in plan.get("sell_orders", [])
             if isinstance(item, dict) and _is_long_exit_order(item)
         ]
+    anti_chase_entry_guard["balancing_entry_trimmed_count"] = (
+        cap_grvt_anti_chase_balancing_entries(
+            plan=plan,
+            bypass_side=anti_chase_entry_guard.get("balancing_bypass_side"),
+        )
+    )
 
     unlock_release_cap = _resolve_inventory_unlock_release_cap(
         args=effective_args,

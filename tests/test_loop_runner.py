@@ -85,6 +85,8 @@ from grid_optimizer.loop_runner import (
     apply_hard_loss_forced_reduce,
     apply_inventory_unlock_release,
     apply_best_quote_active_pair_reduce,
+    apply_grvt_anti_chase_balancing_bypass,
+    cap_grvt_anti_chase_balancing_entries,
     _resolve_inventory_unlock_pause_notional,
     _is_best_quote_maker_volume_mode,
     resolve_loss_recovery_brush,
@@ -9299,6 +9301,42 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertFalse(return_only["active"])
         self.assertFalse(amplitude_only["active"])
+
+    def test_grvt_anti_chase_keeps_one_light_side_balancing_entry(self) -> None:
+        guard = {
+            "active": True,
+            "block_long_entries": False,
+            "block_short_entries": True,
+        }
+        apply_grvt_anti_chase_balancing_bypass(
+            report=guard,
+            symbol="GRVTUSDT",
+            current_long_notional=844.0,
+            current_short_notional=542.0,
+            long_soft_notional=900.0,
+            short_soft_notional=900.0,
+        )
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {"role": "best_quote_entry_short", "price": 0.2816},
+                {"role": "best_quote_entry_short", "price": 0.2807},
+                {"role": "best_quote_reduce_long", "price": 0.2973},
+            ],
+        }
+
+        trimmed = cap_grvt_anti_chase_balancing_entries(
+            plan=plan,
+            bypass_side=guard.get("balancing_bypass_side"),
+        )
+
+        self.assertFalse(guard["block_short_entries"])
+        self.assertEqual(guard["balancing_bypass_side"], "SELL")
+        self.assertEqual(trimmed, 1)
+        self.assertEqual(
+            [item["price"] for item in plan["sell_orders"]],
+            [0.2807, 0.2973],
+        )
 
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
