@@ -23709,6 +23709,17 @@ def apply_best_quote_active_pair_reduce(
     short_reached = "short" not in eligible_sides or safe_short_notional <= short_target + 1e-12
     if long_reached and short_reached:
         return _clear("target_reached", completed=True)
+    minimum_actionable_notional = max(_safe_float(min_notional), 0.0)
+    eligible_residuals = [
+        max(current_notional - target_notional, 0.0)
+        for side_name, current_notional, target_notional in (
+            ("long", safe_long_notional, long_target),
+            ("short", safe_short_notional, short_target),
+        )
+        if side_name in eligible_sides
+    ]
+    if eligible_residuals and max(eligible_residuals) < minimum_actionable_notional:
+        return _clear("target_reached_small_residual", completed=True)
 
     suppressed_entry_order_count = 0
     for side_name, order_key, entry_role in (
