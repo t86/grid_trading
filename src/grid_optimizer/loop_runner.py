@@ -1263,14 +1263,20 @@ def apply_volatility_entry_pause_controls(
     directional_recovery_min_gap_notional: float = 100.0,
     directional_recovery_max_light_share: float = 0.50,
 ) -> None:
-    if not volatility_entry_pause.get("active"):
+    dynamic = dynamic_control if isinstance(dynamic_control, dict) else {}
+    extreme_volatility = str(dynamic.get("reason") or "") == "extreme_volatility_defensive"
+    if not volatility_entry_pause.get("active") and not extreme_volatility:
         return
-    if bool(elastic_volume.get("enabled") and elastic_volume.get("applied")):
+    if bool(elastic_volume.get("enabled") and elastic_volume.get("applied")) and not extreme_volatility:
         volatility_entry_pause["entry_pause_absorbed_by_elastic"] = True
         return
 
-    entry_pause_reason = volatility_entry_pause.get("reason") or "active"
-    recovery_active = bool(loss_recovery_brush.get("active"))
+    entry_pause_reason = (
+        "extreme_volatility_defensive"
+        if extreme_volatility
+        else volatility_entry_pause.get("reason") or "active"
+    )
+    recovery_active = bool(loss_recovery_brush.get("active")) and not extreme_volatility
     recovery_side = str(loss_recovery_brush.get("side") or "").lower()
     bypass_buy_pause = recovery_active and recovery_side == "short"
     bypass_short_pause = recovery_active and recovery_side == "long"
@@ -1280,7 +1286,6 @@ def apply_volatility_entry_pause_controls(
     # Once the live shock has cleared, allow only entry flow that reduces a
     # material ordinary-inventory imbalance.  A current trigger or the extreme
     # volatility tier always keeps both entry lanes closed.
-    dynamic = dynamic_control if isinstance(dynamic_control, dict) else {}
     pause_state = volatility_entry_pause.get("state")
     pause_state = pause_state if isinstance(pause_state, dict) else {}
     last_trigger_at = _parse_rescue_guard_time(pause_state.get("last_trigger_at"))
@@ -1292,7 +1297,6 @@ def apply_volatility_entry_pause_controls(
         else 0.0
     )
     current_trigger = bool(volatility_entry_pause.get("trigger_active"))
-    extreme_volatility = str(dynamic.get("reason") or "") == "extreme_volatility_defensive"
     recovery_observed = seconds_since_trigger >= max(float(directional_recovery_min_seconds), 0.0)
     long_notional = max(_safe_float(current_long_notional), 0.0)
     short_notional = max(_safe_float(current_short_notional), 0.0)

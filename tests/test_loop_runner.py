@@ -1246,6 +1246,34 @@ class LoopRunnerTests(unittest.TestCase):
             self.assertTrue(controls["short_paused"])
             self.assertIsNone(pause["directional_recovery"]["bypass_side"])
 
+    def test_extreme_dynamic_control_pauses_entry_without_pause_state(self) -> None:
+        controls = {
+            "buy_paused": False,
+            "short_paused": False,
+            "pause_reasons": [],
+            "short_pause_reasons": [],
+        }
+        pause = {"active": False, "trigger_active": False}
+
+        apply_volatility_entry_pause_controls(
+            controls=controls,
+            volatility_entry_pause=pause,
+            loss_recovery_brush={"active": True, "side": "short"},
+            elastic_volume={"enabled": True, "applied": True},
+            dynamic_control={"reason": "extreme_volatility_defensive"},
+        )
+
+        self.assertTrue(controls["buy_paused"])
+        self.assertTrue(controls["short_paused"])
+        self.assertEqual(
+            controls["pause_reasons"],
+            ["volatility_entry_pause: extreme_volatility_defensive"],
+        )
+        self.assertEqual(
+            controls["short_pause_reasons"],
+            ["volatility_entry_pause: extreme_volatility_defensive"],
+        )
+
     def test_volatility_entry_pause_classifies_best_quote_reduces_as_exits(self) -> None:
         self.assertTrue(_is_long_exit_order({"role": "best_quote_reduce_long"}))
         self.assertTrue(_is_short_exit_order({"role": "best_quote_reduce_short"}))
