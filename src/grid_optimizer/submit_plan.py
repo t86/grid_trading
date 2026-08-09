@@ -1603,7 +1603,30 @@ def apply_actual_net_exposure_decision_to_actions(
         price = finite_number(order.get("price"))
         return abs((price if price is not None else mark_price) - mark_price)
 
+    def eligible_balancing_entries_for(side: str) -> list[dict[str, Any]]:
+        eligible: list[dict[str, Any]] = []
+        for order in place_orders:
+            if (
+                str(order.get("side") or "").upper().strip() != side
+                or not is_balancing_entry(order, side)
+                or not _is_gtx_candidate(order)
+            ):
+                continue
+            notional = marked_notional(order)
+            if notional <= 0 or notional > abs(current) + 1e-9:
+                continue
+            projected_selected = (
+                projected_open_sell - notional
+                if side == "SELL"
+                else projected_open_buy + notional
+            )
+            if abs(projected_selected) > cap + 1e-9:
+                continue
+            eligible.append(order)
+        return eligible
+
     if serialize_balancing_entries and reducing_side is not None:
+        eligible_balancing_entries = eligible_balancing_entries_for(reducing_side)
         existing_balancing_entries = [
             order
             for order in open_by_side[reducing_side]
@@ -1644,6 +1667,44 @@ def apply_actual_net_exposure_decision_to_actions(
                 kept_balancing_entry_price=finite_number(kept_entry.get("price")),
             )
         if existing_balancing_entries:
+            existing_entry = existing_balancing_entries[0]
+            closer_entries = [
+                order
+                for order in eligible_balancing_entries
+                if distance_to_mark(order) + 1e-12
+                < distance_to_mark(existing_entry)
+            ]
+            spacing_guard = actions.get("same_side_spacing_guard")
+            protected_cancels = (
+                spacing_guard.get("protected_cancel_orders", [])
+                if isinstance(spacing_guard, Mapping)
+                else []
+            )
+            authorized_cancels = [
+                order
+                for order in [*cancel_orders, *protected_cancels]
+                if isinstance(order, dict)
+                and _order_matches_cancel(existing_entry, order)
+                and any(
+                    _order_matches_cancel(existing_entry, owned_order)
+                    for owned_order in owned_orders
+                )
+            ]
+            if closer_entries and authorized_cancels:
+                replacement_entry = min(closer_entries, key=distance_to_mark)
+                return finish(
+                    "cancel_stale_serial_balancing_entry",
+                    places=[],
+                    cancels=[authorized_cancels[0]],
+                    reducing_side=reducing_side,
+                    existing_balancing_entry_order_count=1,
+                    stale_balancing_entry_price=finite_number(
+                        existing_entry.get("price")
+                    ),
+                    replacement_balancing_entry_price=finite_number(
+                        replacement_entry.get("price")
+                    ),
+                )
             return finish(
                 "hold_existing_serial_balancing_entry",
                 places=[],
@@ -1652,25 +1713,6 @@ def apply_actual_net_exposure_decision_to_actions(
                 existing_balancing_entry_order_count=1,
             )
 
-        eligible_balancing_entries: list[dict[str, Any]] = []
-        for order in place_orders:
-            if (
-                str(order.get("side") or "").upper().strip() != reducing_side
-                or not is_balancing_entry(order, reducing_side)
-                or not _is_gtx_candidate(order)
-            ):
-                continue
-            notional = marked_notional(order)
-            if notional <= 0 or notional > abs(current) + 1e-9:
-                continue
-            projected_selected = (
-                projected_open_sell - notional
-                if reducing_side == "SELL"
-                else projected_open_buy + notional
-            )
-            if abs(projected_selected) > cap + 1e-9:
-                continue
-            eligible_balancing_entries.append(order)
         if eligible_balancing_entries:
             selected_entry = min(
                 eligible_balancing_entries,
