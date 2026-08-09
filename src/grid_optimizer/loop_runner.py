@@ -21652,23 +21652,29 @@ def _best_quote_submit_allow_loss_roles(
     require_expected_authorization: bool = False,
 ) -> set[str] | None:
     roles: set[str] = set()
-    if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)):
-        roles.update(
-            {
-                "inventory_unlock_reduce_long",
-                "inventory_unlock_reduce_short",
-            }
+    resolved_temporary_roles = frozenset(
+        str(role).strip().lower()
+        for role in (
+            temporary_loss_roles
+            if temporary_loss_roles is not None
+            else _temporary_loss_runtime_allow_roles(
+                args,
+                now=now,
+                expected_authorization=expected_authorization,
+                require_expected_authorization=require_expected_authorization,
+            )
         )
-    roles.update(
-        temporary_loss_roles
-        if temporary_loss_roles is not None
-        else _temporary_loss_runtime_allow_roles(
-            args,
-            now=now,
-            expected_authorization=expected_authorization,
-            require_expected_authorization=require_expected_authorization,
-        )
+        if str(role).strip()
     )
+    if bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)):
+        # A raw runtime flag is never sufficient to bypass the no-loss guard.
+        # Inventory unlock orders are admitted only while the coordinator's
+        # current, side-bound temporary-loss lease is still valid.
+        roles.update(resolved_temporary_roles)
+        if "best_quote_reduce_long" in resolved_temporary_roles:
+            roles.add("inventory_unlock_reduce_long")
+        if "best_quote_reduce_short" in resolved_temporary_roles:
+            roles.add("inventory_unlock_reduce_short")
     if bool(getattr(args, "best_quote_maker_volume_active_pair_reduce_enabled", False)):
         roles.update(
             {
@@ -23073,6 +23079,8 @@ def _inventory_unlock_default_report() -> dict[str, Any]:
         "side": None,
         "stall_count": 0,
         "confirm_cycles": 3,
+        "execution_cycles": 0,
+        "max_execution_cycles": 3,
         "reason": None,
         "current_notional": 0.0,
         "pause_notional": None,
@@ -23423,11 +23431,14 @@ def apply_inventory_unlock_release(
     ask_price: float,
     position_side: str = "BOTH",
     confirm_cycles: int = 3,
+    loss_release_authorized: bool = False,
+    max_execution_cycles: int = 3,
     reduce_freeze_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     report = _inventory_unlock_default_report()
     normalized_side = str(side or "").strip().lower()
     safe_confirm_cycles = max(int(confirm_cycles or 3), 1)
+    safe_max_execution_cycles = max(int(max_execution_cycles or 3), 1)
     safe_qty = max(_safe_float(current_qty), 0.0)
     safe_current_notional = max(_safe_float(current_notional), 0.0)
     safe_pause_notional = max(_safe_float(pause_notional), 0.0)
@@ -23436,12 +23447,19 @@ def apply_inventory_unlock_release(
     report.update(
         {
             "side": normalized_side if normalized_side in {"long", "short"} else None,
+            "enabled": bool(loss_release_authorized),
             "confirm_cycles": safe_confirm_cycles,
+            "max_execution_cycles": safe_max_execution_cycles,
             "current_notional": safe_current_notional,
             "pause_notional": safe_pause_notional if safe_pause_notional > 0 else pause_notional,
             "release_cap_notional": safe_cap_notional,
         }
     )
+
+    if not loss_release_authorized:
+        state.pop("inventory_unlock_release", None)
+        report["reason"] = "temporary_loss_not_authorized"
+        return report
 
     freeze_report = dict(reduce_freeze_report or {})
     independent_freeze_first = (
@@ -23510,6 +23528,7 @@ def apply_inventory_unlock_release(
         and (long_floor_blocks or short_ceiling_blocks)
     )
     previous_reentry_cooldown = int(runtime_state.get("reentry_cooldown_cycles") or 0)
+    previous_execution_cycles = max(int(runtime_state.get("execution_cycles") or 0), 0)
     previous_target_notional = max(_safe_float(runtime_state.get("target_notional")), 0.0)
     previous_release_price = max(_safe_float(runtime_state.get("release_price")), 0.0)
     reentry_gap = max(_safe_float(step_price), _safe_float(tick_size), 0.0)
@@ -23527,6 +23546,7 @@ def apply_inventory_unlock_release(
             "side": normalized_side,
             "stall_count": stall_count,
             "reentry_cooldown_cycles": previous_reentry_cooldown,
+            "execution_cycles": previous_execution_cycles,
             "target_notional": previous_target_notional,
             "release_price": previous_release_price,
         }
@@ -23536,6 +23556,7 @@ def apply_inventory_unlock_release(
             "side": normalized_side,
             "stall_count": 0,
             "reentry_cooldown_cycles": max(previous_reentry_cooldown - 1, 0),
+            "execution_cycles": previous_execution_cycles,
             "target_notional": previous_target_notional,
             "release_price": previous_release_price,
         }
@@ -23544,6 +23565,7 @@ def apply_inventory_unlock_release(
         runtime_state = {}
     report["candidate"] = bool(candidate)
     report["stall_count"] = stall_count
+    report["execution_cycles"] = previous_execution_cycles
     report["reentry_block_active"] = bool(reentry_block_active)
     report["reentry_cooldown_cycles"] = int(runtime_state.get("reentry_cooldown_cycles") or 0)
     if previous_release_price > 0:
@@ -23586,6 +23608,9 @@ def apply_inventory_unlock_release(
         return report
     if stall_count < safe_confirm_cycles:
         report["reason"] = "waiting_for_stall_confirmation"
+        return report
+    if previous_execution_cycles >= safe_max_execution_cycles:
+        report["reason"] = "execution_cycle_limit"
         return report
 
     price_side = "SELL" if normalized_side == "long" else "BUY"
@@ -23648,6 +23673,7 @@ def apply_inventory_unlock_release(
     state["inventory_unlock_release"] = {
         "side": normalized_side,
         "stall_count": stall_count,
+        "execution_cycles": previous_execution_cycles + 1,
         "reentry_cooldown_cycles": 6,
         "target_notional": target_notional,
         "release_price": price,
@@ -23660,6 +23686,7 @@ def apply_inventory_unlock_release(
             "release_price": price,
             "release_qty": qty,
             "release_order_count": 1,
+            "execution_cycles": previous_execution_cycles + 1,
             "reentry_cooldown_cycles": 6,
         }
     )
@@ -32040,6 +32067,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             bid_price=bid_price,
             ask_price=ask_price,
             position_side="LONG" if hedge_best_quote else "BOTH",
+            loss_release_authorized=temporary_loss_authorization is not None,
             reduce_freeze_report=best_quote_reduce_freeze,
         )
     elif unlock_short_side:
@@ -32062,6 +32090,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             bid_price=bid_price,
             ask_price=ask_price,
             position_side="SHORT" if hedge_best_quote else "BOTH",
+            loss_release_authorized=temporary_loss_authorization is not None,
             reduce_freeze_report=best_quote_reduce_freeze,
         )
     else:

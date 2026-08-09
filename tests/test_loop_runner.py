@@ -11049,6 +11049,7 @@ class LoopRunnerTests(unittest.TestCase):
             min_notional=5.0,
             bid_price=0.998,
             ask_price=1.0,
+            loss_release_authorized=True,
         )
 
         release_orders = [order for order in plan["sell_orders"] if order["role"] == "inventory_unlock_reduce_long"]
@@ -11084,11 +11085,78 @@ class LoopRunnerTests(unittest.TestCase):
             min_notional=5.0,
             bid_price=0.998,
             ask_price=1.0,
+            loss_release_authorized=True,
         )
 
         self.assertFalse(report["active"])
         self.assertEqual(report["stall_count"], 1)
         self.assertEqual(plan["sell_orders"], [])
+
+    def test_inventory_unlock_release_requires_temporary_loss_authorization(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+        state = {"inventory_unlock_release": {"side": "short", "stall_count": 2}}
+
+        report = apply_inventory_unlock_release(
+            plan=plan,
+            state=state,
+            side="short",
+            entry_paused=True,
+            take_profit_guard={"enabled": True, "short_active": True, "short_ceiling_price": 0.14},
+            current_qty=1000.0,
+            current_notional=150.0,
+            pause_notional=100.0,
+            release_cap_notional=50.0,
+            per_order_notional=50.0,
+            step_price=0.0001,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.15,
+            ask_price=0.1501,
+            position_side="SHORT",
+        )
+
+        self.assertFalse(report["enabled"])
+        self.assertEqual(report["reason"], "temporary_loss_not_authorized")
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertNotIn("inventory_unlock_release", state)
+
+    def test_inventory_unlock_release_limits_continuous_loss_execution_cycles(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+        state = {
+            "inventory_unlock_release": {
+                "side": "short",
+                "stall_count": 3,
+                "execution_cycles": 3,
+            }
+        }
+
+        report = apply_inventory_unlock_release(
+            plan=plan,
+            state=state,
+            side="short",
+            entry_paused=True,
+            take_profit_guard={"enabled": True, "short_active": True, "short_ceiling_price": 0.14},
+            current_qty=1000.0,
+            current_notional=150.0,
+            pause_notional=100.0,
+            release_cap_notional=50.0,
+            per_order_notional=50.0,
+            step_price=0.0001,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.15,
+            ask_price=0.1501,
+            position_side="SHORT",
+            loss_release_authorized=True,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report["reason"], "execution_cycle_limit")
+        self.assertEqual(plan["buy_orders"], [])
 
     def test_inventory_unlock_release_yields_to_independent_reduce_freeze_candidate(self) -> None:
         plan = {"buy_orders": [], "sell_orders": []}
@@ -11112,6 +11180,7 @@ class LoopRunnerTests(unittest.TestCase):
             min_notional=5.0,
             bid_price=0.998,
             ask_price=1.0,
+            loss_release_authorized=True,
             reduce_freeze_report={
                 "enabled": True,
                 "profitable_pair_gate_enabled": False,
@@ -11150,6 +11219,7 @@ class LoopRunnerTests(unittest.TestCase):
             min_notional=5.0,
             bid_price=0.998,
             ask_price=1.0,
+            loss_release_authorized=True,
             reduce_freeze_report={
                 "enabled": True,
                 "profitable_pair_gate_enabled": True,
@@ -11438,6 +11508,7 @@ class LoopRunnerTests(unittest.TestCase):
             bid_price=236.71,
             ask_price=236.72,
             position_side="SHORT",
+            loss_release_authorized=True,
         )
 
         self.assertTrue(report["active"])
@@ -11493,6 +11564,7 @@ class LoopRunnerTests(unittest.TestCase):
             bid_price=0.14205,
             ask_price=0.14206,
             position_side="SHORT",
+            loss_release_authorized=True,
         )
 
         release_orders = [order for order in plan["buy_orders"] if order["role"] == "inventory_unlock_reduce_short"]
@@ -11546,6 +11618,7 @@ class LoopRunnerTests(unittest.TestCase):
             min_notional=5.0,
             bid_price=0.998,
             ask_price=1.0,
+            loss_release_authorized=True,
         )
 
         self.assertFalse(report["active"])
@@ -11592,6 +11665,7 @@ class LoopRunnerTests(unittest.TestCase):
             min_notional=5.0,
             bid_price=1.0004,
             ask_price=1.0005,
+            loss_release_authorized=True,
         )
 
         self.assertFalse(report["active"])
@@ -17353,12 +17427,20 @@ class LoopRunnerTests(unittest.TestCase):
             )
         )
 
+        self.assertIsNone(roles)
+
+    def test_best_quote_submit_allow_loss_lease_authorizes_matching_inventory_unlock_side(self) -> None:
+        roles = _best_quote_submit_allow_loss_roles(
+            SimpleNamespace(
+                best_quote_maker_volume_allow_loss_reduce_only=True,
+                best_quote_maker_volume_active_pair_reduce_enabled=False,
+            ),
+            temporary_loss_roles={"best_quote_reduce_short"},
+        )
+
         self.assertEqual(
             roles,
-            {
-                "inventory_unlock_reduce_long",
-                "inventory_unlock_reduce_short",
-            },
+            {"best_quote_reduce_short", "inventory_unlock_reduce_short"},
         )
 
     def test_best_quote_submit_allow_loss_roles_keep_active_pair_separate(self) -> None:

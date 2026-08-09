@@ -36,10 +36,6 @@ MIN_ORDER_QTY_BUMP_ROLES = {
     "grid_entry",
 }
 FROZEN_MANUAL_REDUCE_IOC_CROSS_TICKS = 10
-INVENTORY_UNLOCK_ALLOW_LOSS_ROLES = {
-    "inventory_unlock_reduce_long",
-    "inventory_unlock_reduce_short",
-}
 
 
 def _float(value: float) -> str:
@@ -2938,7 +2934,9 @@ def main() -> None:
         min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
-        allow_loss_roles=INVENTORY_UNLOCK_ALLOW_LOSS_ROLES,
+        # This standalone submitter has no durable recovery lease.  Keep the
+        # shared no-loss guard fail-closed for inventory unlock orders.
+        allow_loss_roles=None,
     )
 
     _print_preview(plan_report=plan_report, validation=validation, drift_steps=drift_steps)
@@ -3028,7 +3026,7 @@ def main() -> None:
             min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
             min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
             step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
-            allow_loss_roles=INVENTORY_UNLOCK_ALLOW_LOSS_ROLES,
+            allow_loss_roles=None,
         )
         validation = enforce_execution_action_limits(
             validation=validation,
