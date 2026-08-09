@@ -622,6 +622,53 @@ def test_submit_boundary_keeps_profitable_reduce_when_legacy_recovery_flag_is_on
     assert "_temporary_loss_client_order_prefix" not in guarded
 
 
+def test_submit_boundary_rejects_losing_reduce_on_light_side(
+    tmp_path,
+) -> None:
+    args = Namespace(
+        symbol="GRVTUSDT",
+        best_quote_maker_volume_allow_loss_reduce_only=True,
+        best_quote_maker_volume_active_pair_reduce_enabled=False,
+        threshold_position_notional=900.0,
+        state_path=str(tmp_path / "runner-state.json"),
+        recovery_control_path=str(tmp_path / "control.json"),
+        recovery_generation=None,
+    )
+
+    guarded, reason = _guard_temporary_loss_order_before_submit(
+        args=args,
+        order={
+            "side": "SELL",
+            "price": 1.016,
+            "qty": 100.0,
+            "notional": 101.6,
+            "role": "best_quote_reduce_long",
+            "position_side": "LONG",
+        },
+        plan_report={
+            "current_long_notional": 700.0,
+            "current_short_notional": 925.0,
+            "current_long_avg_price": 1.02,
+            "current_short_avg_price": 0.98,
+            "loss_reduce_threshold_notional": 900.0,
+            "take_profit_min_profit_ratio": 0.001,
+        },
+        strategy_mode="hedge_best_quote_maker_volume_v1",
+        live_bid_price=0.999,
+        live_ask_price=1.000,
+        tick_size=0.001,
+        min_qty=1.0,
+        min_notional=5.0,
+        step_size=1.0,
+        now=NOW,
+    )
+
+    assert guarded is None
+    assert reason is not None
+    assert reason["reason"] == "temporary_loss_lease_not_authorized"
+    assert reason["role"] == "best_quote_reduce_long"
+
+
 def test_submit_boundary_allows_one_active_pair_loss_only_above_fixed_threshold(
     tmp_path,
 ) -> None:
