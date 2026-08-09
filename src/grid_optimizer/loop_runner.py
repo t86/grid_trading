@@ -21817,11 +21817,30 @@ def _guard_temporary_loss_order_before_submit(
         if role.endswith("_long")
         else guard_report.get("short_ceiling_price")
     )
-    if role not in (allowed_loss_roles or set()) and _safe_float(guard_price) <= 0:
+    allowed_loss_role_set = set(allowed_loss_roles or set())
+    if role not in allowed_loss_role_set and _safe_float(guard_price) <= 0:
         return None, {
             "reason": "temporary_loss_cost_basis_unavailable",
             "role": role,
         }
+    guarded_order = kept[0]
+
+    def _restore_force_reduce_only() -> None:
+        if original_force_reduce_only is None:
+            guarded_order.pop("force_reduce_only", None)
+        else:
+            guarded_order["force_reduce_only"] = original_force_reduce_only
+
+    if role not in allowed_loss_role_set:
+        # The shared cost guard kept this order without a loss bypass.  A raw
+        # legacy recovery flag must not suppress an otherwise profitable exit.
+        _restore_force_reduce_only()
+        return guarded_order, None
+    if role.startswith("best_quote_active_pair_reduce_"):
+        # Active-pair recovery is independently bounded by the fixed ordinary
+        # inventory threshold and emits at most one order per eligible side.
+        _restore_force_reduce_only()
+        return guarded_order, None
     authorization = _temporary_loss_runtime_authorization(args, now=now)
     if authorization is None or not authorization.matches(
         expected_authorization
@@ -21832,7 +21851,6 @@ def _guard_temporary_loss_order_before_submit(
             "reason": "temporary_loss_lease_not_authorized",
             "role": role,
         }
-    guarded_order = kept[0]
     guarded_order["_temporary_loss_client_order_prefix"] = (
         temporary_loss_client_order_prefix_for_binding(
             symbol=authorization.symbol,
@@ -21842,10 +21860,7 @@ def _guard_temporary_loss_order_before_submit(
             hard_expires_at=authorization.hard_expires_at,
         )
     )
-    if original_force_reduce_only is None:
-        guarded_order.pop("force_reduce_only", None)
-    else:
-        guarded_order["force_reduce_only"] = original_force_reduce_only
+    _restore_force_reduce_only()
     return guarded_order, None
 
 
@@ -23149,6 +23164,8 @@ def _best_quote_active_pair_reduce_default_report() -> dict[str, Any]:
         "short_soft_notional": 0.0,
         "per_order_notional": 0.0,
         "max_reduce_notional_per_side": 0.0,
+        "loss_reduce_threshold_notional": 0.0,
+        "eligible_sides": [],
         "normal_entry_suppressed": False,
         "suppressed_entry_order_count": 0,
         "triggered": False,
@@ -23180,6 +23197,7 @@ def apply_best_quote_active_pair_reduce(
     bid_price: float,
     ask_price: float,
     volatility_entry_pause: dict[str, Any] | None,
+    loss_reduce_threshold_notional: float | None = None,
 ) -> dict[str, Any]:
     report = _best_quote_active_pair_reduce_default_report()
     report["enabled"] = bool(enabled)
@@ -23193,17 +23211,22 @@ def apply_best_quote_active_pair_reduce(
     safe_soft_ratio = _clamp_ratio(_safe_float(soft_ratio))
     long_soft = max(_safe_float(max_long_notional), 0.0) * safe_soft_ratio
     short_soft = max(_safe_float(max_short_notional), 0.0) * safe_soft_ratio
+    safe_loss_threshold = max(_safe_float(loss_reduce_threshold_notional), 0.0)
+    threshold_side_mode = safe_loss_threshold > 0
     report.update(
         {
             "per_order_notional": safe_per_order,
             "max_reduce_notional_per_side": safe_max_reduce,
             "long_soft_notional": long_soft,
             "short_soft_notional": short_soft,
+            "loss_reduce_threshold_notional": safe_loss_threshold,
         }
     )
 
     existing = state.get("best_quote_active_pair_reduce")
     memory = dict(existing) if isinstance(existing, dict) else {}
+    if threshold_side_mode and memory.get("mode") != "threshold_side_v1":
+        memory = {}
 
     def _clear(reason: str, *, completed: bool = False) -> dict[str, Any]:
         state.pop("best_quote_active_pair_reduce", None)
@@ -23237,16 +23260,67 @@ def apply_best_quote_active_pair_reduce(
 
     heavier_notional = max(safe_long_notional, safe_short_notional)
     lighter_notional = min(safe_long_notional, safe_short_notional)
-    if heavier_notional > 0 and lighter_notional < heavier_notional * 0.5:
+    if (
+        not threshold_side_mode
+        and heavier_notional > 0
+        and lighter_notional < heavier_notional * 0.5
+    ):
         return _clear("pair_imbalance_too_large")
 
     active = bool(memory.get("active"))
-    touched_soft = safe_long_notional >= long_soft or safe_short_notional >= short_soft
+    threshold_eligible_sides = {
+        side
+        for side, notional, soft_notional in (
+            ("long", safe_long_notional, long_soft),
+            ("short", safe_short_notional, short_soft),
+        )
+        if notional >= soft_notional
+        and (not threshold_side_mode or notional > safe_loss_threshold + 1e-12)
+    }
+    if threshold_side_mode:
+        eligible_sides = threshold_eligible_sides
+    else:
+        eligible_sides = (
+            {"long", "short"}
+            if active or bool(threshold_eligible_sides)
+            else set()
+        )
+    if active and threshold_side_mode:
+        eligible_sides = {
+            str(side)
+            for side in memory.get("eligible_sides", [])
+            if str(side) in {"long", "short"}
+        }
+    touched_soft = bool(eligible_sides)
     if not active and touched_soft:
-        long_target = max(safe_long_notional - safe_max_reduce, 0.0)
-        short_target = max(safe_short_notional - safe_max_reduce, 0.0)
+        if threshold_side_mode:
+            long_target = (
+                max(
+                    safe_loss_threshold,
+                    long_soft - safe_per_order,
+                    safe_long_notional - safe_max_reduce,
+                    0.0,
+                )
+                if "long" in eligible_sides
+                else safe_long_notional
+            )
+            short_target = (
+                max(
+                    safe_loss_threshold,
+                    short_soft - safe_per_order,
+                    safe_short_notional - safe_max_reduce,
+                    0.0,
+                )
+                if "short" in eligible_sides
+                else safe_short_notional
+            )
+        else:
+            long_target = max(safe_long_notional - safe_max_reduce, 0.0)
+            short_target = max(safe_short_notional - safe_max_reduce, 0.0)
         memory = {
             "active": True,
+            "mode": "threshold_side_v1" if threshold_side_mode else "paired_v1",
+            "eligible_sides": sorted(eligible_sides),
             "started_at": datetime.now(timezone.utc).isoformat(),
             "long_start_notional": safe_long_notional,
             "short_start_notional": safe_short_notional,
@@ -23264,20 +23338,25 @@ def apply_best_quote_active_pair_reduce(
     report.update(
         {
             "active": True,
+            "eligible_sides": sorted(eligible_sides),
             "long_target_notional": long_target,
             "short_target_notional": short_target,
             "long_start_notional": max(_safe_float(memory.get("long_start_notional")), 0.0),
             "short_start_notional": max(_safe_float(memory.get("short_start_notional")), 0.0),
         }
     )
-    if safe_long_notional <= long_target + 1e-12 and safe_short_notional <= short_target + 1e-12:
+    long_reached = "long" not in eligible_sides or safe_long_notional <= long_target + 1e-12
+    short_reached = "short" not in eligible_sides or safe_short_notional <= short_target + 1e-12
+    if long_reached and short_reached:
         return _clear("target_reached", completed=True)
 
     suppressed_entry_order_count = 0
-    for order_key, entry_role in (
-        ("buy_orders", "best_quote_entry_long"),
-        ("sell_orders", "best_quote_entry_short"),
+    for side_name, order_key, entry_role in (
+        ("long", "buy_orders", "best_quote_entry_long"),
+        ("short", "sell_orders", "best_quote_entry_short"),
     ):
+        if threshold_side_mode and side_name not in eligible_sides:
+            continue
         kept_orders: list[dict[str, Any]] = []
         for item in plan.get(order_key, []):
             if not isinstance(item, dict):
@@ -23305,6 +23384,13 @@ def apply_best_quote_active_pair_reduce(
         current_notional: float,
         target_notional: float,
     ) -> None:
+        competing_role = f"inventory_unlock_reduce_{side_name}"
+        if any(
+            isinstance(item, dict) and _order_role(item) == competing_role
+            for item in plan.get(order_key, [])
+        ):
+            report[f"{side_name}_blocked_by_role"] = competing_role
+            return
         remaining_notional = max(current_notional - target_notional, 0.0)
         budget = min(safe_per_order, safe_max_reduce, remaining_notional, current_notional)
         if budget <= 0:
@@ -23349,26 +23435,28 @@ def apply_best_quote_active_pair_reduce(
         placed.append(order)
         report[f"{side_name}_order_notional"] = notional
 
-    _append_reduce_order(
-        side_name="long",
-        order_side="SELL",
-        order_key="sell_orders",
-        role="best_quote_active_pair_reduce_long",
-        position_side="LONG",
-        current_qty=safe_long_qty,
-        current_notional=safe_long_notional,
-        target_notional=long_target,
-    )
-    _append_reduce_order(
-        side_name="short",
-        order_side="BUY",
-        order_key="buy_orders",
-        role="best_quote_active_pair_reduce_short",
-        position_side="SHORT",
-        current_qty=safe_short_qty,
-        current_notional=safe_short_notional,
-        target_notional=short_target,
-    )
+    if "long" in eligible_sides:
+        _append_reduce_order(
+            side_name="long",
+            order_side="SELL",
+            order_key="sell_orders",
+            role="best_quote_active_pair_reduce_long",
+            position_side="LONG",
+            current_qty=safe_long_qty,
+            current_notional=safe_long_notional,
+            target_notional=long_target,
+        )
+    if "short" in eligible_sides:
+        _append_reduce_order(
+            side_name="short",
+            order_side="BUY",
+            order_key="buy_orders",
+            role="best_quote_active_pair_reduce_short",
+            position_side="SHORT",
+            current_qty=safe_short_qty,
+            current_notional=safe_short_notional,
+            target_notional=short_target,
+        )
     if not placed:
         remaining_long_notional = max(safe_long_notional - long_target, 0.0)
         remaining_short_notional = max(safe_short_notional - short_target, 0.0)
@@ -23380,7 +23468,7 @@ def apply_best_quote_active_pair_reduce(
         return report
 
     report["order_count"] = len(placed)
-    report["reason"] = "soft_pair_reduce"
+    report["reason"] = "soft_side_reduce" if threshold_side_mode else "soft_pair_reduce"
     state["best_quote_active_pair_reduce"] = memory
     return report
 
@@ -32218,6 +32306,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             bid_price=bid_price,
             ask_price=ask_price,
             volatility_entry_pause=volatility_entry_pause,
+            loss_reduce_threshold_notional=loss_reduce_threshold_notional,
         )
     else:
         state.pop("best_quote_active_pair_reduce", None)

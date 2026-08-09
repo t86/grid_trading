@@ -11441,6 +11441,170 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual([item["role"] for item in plan["buy_orders"]], ["best_quote_entry_long"])
         self.assertEqual([item["role"] for item in plan["sell_orders"]], ["best_quote_entry_short"])
 
+    def test_best_quote_active_pair_reduce_threshold_mode_reduces_only_heavy_side(self) -> None:
+        plan = {
+            "buy_orders": [
+                {"side": "BUY", "role": "best_quote_entry_long", "notional": 55.0},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "role": "best_quote_entry_short", "notional": 55.0},
+            ],
+        }
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state={},
+            enabled=True,
+            current_long_qty=3138.0,
+            current_short_qty=1287.0,
+            current_long_notional=907.0,
+            current_short_notional=372.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=55.0,
+            max_reduce_notional_per_side=200.0,
+            offset_ticks=1,
+            step_price=0.0006,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.2890,
+            ask_price=0.2891,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=800.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["reason"], "soft_side_reduce")
+        self.assertEqual(report["eligible_sides"], ["long"])
+        self.assertEqual(report["order_count"], 1)
+        self.assertAlmostEqual(report["long_target_notional"], 845.0)
+        self.assertNotIn("best_quote_entry_long", [item["role"] for item in plan["buy_orders"]])
+        self.assertIn("best_quote_entry_short", [item["role"] for item in plan["sell_orders"]])
+        self.assertIn(
+            "best_quote_active_pair_reduce_long",
+            [item["role"] for item in plan["sell_orders"]],
+        )
+        self.assertNotIn(
+            "best_quote_active_pair_reduce_short",
+            [item["role"] for item in plan["buy_orders"]],
+        )
+
+    def test_best_quote_active_pair_reduce_threshold_mode_does_not_reduce_below_threshold(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state={},
+            enabled=True,
+            current_long_qty=2800.0,
+            current_short_qty=1200.0,
+            current_long_notional=799.0,
+            current_short_notional=340.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.70,
+            min_side_notional=0.0,
+            per_order_notional=55.0,
+            max_reduce_notional_per_side=200.0,
+            offset_ticks=1,
+            step_price=0.0006,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.2890,
+            ask_price=0.2891,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=800.0,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report["reason"], "below_soft")
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(plan["sell_orders"], [])
+
+    def test_best_quote_active_pair_reduce_threshold_mode_never_targets_below_threshold(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state={},
+            enabled=True,
+            current_long_qty=2850.0,
+            current_short_qty=1200.0,
+            current_long_notional=830.0,
+            current_short_notional=340.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.70,
+            min_side_notional=0.0,
+            per_order_notional=55.0,
+            max_reduce_notional_per_side=200.0,
+            offset_ticks=1,
+            step_price=0.0006,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.2890,
+            ask_price=0.2891,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=800.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["long_target_notional"], 800.0)
+        self.assertEqual(report["order_count"], 1)
+        self.assertLessEqual(report["long_order_notional"], 30.0)
+
+    def test_best_quote_active_pair_reduce_does_not_stack_inventory_unlock_same_side(self) -> None:
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {
+                    "side": "SELL",
+                    "role": "inventory_unlock_reduce_long",
+                    "notional": 55.0,
+                }
+            ],
+        }
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state={},
+            enabled=True,
+            current_long_qty=3138.0,
+            current_short_qty=1287.0,
+            current_long_notional=907.0,
+            current_short_notional=372.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=55.0,
+            max_reduce_notional_per_side=200.0,
+            offset_ticks=1,
+            step_price=0.0006,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.2890,
+            ask_price=0.2891,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=800.0,
+        )
+
+        self.assertEqual(report["long_blocked_by_role"], "inventory_unlock_reduce_long")
+        self.assertEqual(
+            [item["role"] for item in plan["sell_orders"]],
+            ["inventory_unlock_reduce_long"],
+        )
+
     def test_best_quote_active_pair_reduce_respects_volatility_pause(self) -> None:
         plan = {"buy_orders": [], "sell_orders": []}
 
