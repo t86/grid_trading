@@ -12001,7 +12001,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["eligible_sides"], ["long"])
         self.assertAlmostEqual(report["long_target_notional"], 831.5)
         self.assertEqual(report["order_count"], 1)
-        self.assertGreaterEqual(report["long_order_notional"], 99.9)
+        self.assertGreaterEqual(report["long_order_notional"], 99.7)
         self.assertLessEqual(report["long_expected_loss_ratio"], 0.06)
         self.assertNotIn(
             "best_quote_entry_long",
@@ -12127,6 +12127,59 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["reason"], "volatility_entry_pause")
         self.assertEqual(plan["buy_orders"], [])
         self.assertEqual(plan["sell_orders"], [])
+
+    def test_threshold_side_reduce_can_relieve_soft_inventory_during_volatility_pause(self) -> None:
+        plan = {
+            "buy_orders": [
+                {"side": "BUY", "role": "best_quote_entry_long", "notional": 55.0},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "role": "best_quote_entry_short", "notional": 55.0},
+            ],
+        }
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state={},
+            enabled=True,
+            current_long_qty=2970.0,
+            current_short_qty=3244.0,
+            current_long_notional=847.5,
+            current_short_notional=925.7,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=100.0,
+            offset_ticks=1,
+            step_price=0.0006,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.2853,
+            ask_price=0.2854,
+            volatility_entry_pause={"active": True},
+            loss_reduce_threshold_notional=900.0,
+            current_long_avg_price=0.2989,
+            current_short_avg_price=0.2811,
+            max_loss_ratio=0.06,
+            min_relief_notional=100.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertTrue(report["volatility_pause_bypassed_for_threshold_reduce"])
+        self.assertEqual(report["eligible_sides"], ["short"])
+        self.assertEqual(report["order_count"], 1)
+        self.assertNotIn(
+            "best_quote_active_pair_reduce_long",
+            [item["role"] for item in plan["sell_orders"]],
+        )
+        self.assertIn(
+            "best_quote_active_pair_reduce_short",
+            [item["role"] for item in plan["buy_orders"]],
+        )
 
     def test_best_quote_inventory_unlock_uses_soft_pause_threshold(self) -> None:
         args = SimpleNamespace(

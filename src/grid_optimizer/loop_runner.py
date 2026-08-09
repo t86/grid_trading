@@ -23559,9 +23559,12 @@ def apply_best_quote_active_pair_reduce(
         return _clear("disabled")
     if safe_per_order <= 0 or safe_max_reduce <= 0:
         return _clear("invalid_budget")
-    if bool((volatility_entry_pause or {}).get("active")):
+    volatility_pause_active = bool((volatility_entry_pause or {}).get("active"))
+    if volatility_pause_active and not threshold_side_mode:
         report["reason"] = "volatility_entry_pause"
         return report
+    if volatility_pause_active:
+        report["volatility_pause_bypassed_for_threshold_reduce"] = True
     if safe_long_qty <= 0 or safe_short_qty <= 0:
         return _clear("missing_active_pair_inventory")
     if safe_min_side > 0 and (safe_long_notional < safe_min_side or safe_short_notional < safe_min_side):
