@@ -763,6 +763,36 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertEqual(adjusted[0]["price"], 0.6015)
         self.assertAlmostEqual(adjusted[0]["notional"], 31.8795)
 
+    def test_preserve_sticky_exit_orders_aliases_active_pair_reduce_role(self) -> None:
+        existing = [
+            {
+                "side": "BUY",
+                "positionSide": "SHORT",
+                "price": "0.2848",
+                "origQty": "351",
+                "reduceOnly": True,
+            }
+        ]
+        desired = [
+            {
+                "side": "BUY",
+                "position_side": "SHORT",
+                "price": 0.2849,
+                "qty": 351.0,
+                "notional": 99.9999,
+                "role": "best_quote_active_pair_reduce_short",
+            }
+        ]
+
+        adjusted = preserve_sticky_exit_orders(
+            existing_orders=existing,
+            desired_orders=desired,
+            sticky_roles={"best_quote_reduce_short"},
+            price_tolerance=0.0001,
+        )
+
+        self.assertEqual(adjusted[0]["price"], 0.2848)
+
     def test_preserve_sticky_exit_orders_releases_best_quote_reduce_outside_tolerance(self) -> None:
         existing = [
             {

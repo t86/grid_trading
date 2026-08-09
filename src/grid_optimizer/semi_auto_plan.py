@@ -2220,6 +2220,10 @@ def preserve_sticky_exit_orders(
 
     def _role(order: dict[str, Any]) -> str:
         role = str(order.get("role", "")).strip()
+        if role == "best_quote_active_pair_reduce_long":
+            return "best_quote_reduce_long"
+        if role == "best_quote_active_pair_reduce_short":
+            return "best_quote_reduce_short"
         if role:
             return role
         side = str(order.get("side", "")).upper().strip()

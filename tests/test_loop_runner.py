@@ -11786,10 +11786,12 @@ class LoopRunnerTests(unittest.TestCase):
         sell_roles = {str(item.get("role")) for item in plan["sell_orders"]}
         self.assertNotIn("best_quote_entry_long", buy_roles)
         self.assertNotIn("best_quote_entry_short", sell_roles)
-        self.assertIn("best_quote_reduce_short", buy_roles)
-        self.assertIn("best_quote_reduce_long", sell_roles)
+        self.assertNotIn("best_quote_reduce_short", buy_roles)
+        self.assertNotIn("best_quote_reduce_long", sell_roles)
         self.assertIn("best_quote_active_pair_reduce_short", buy_roles)
         self.assertIn("best_quote_active_pair_reduce_long", sell_roles)
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertEqual(len(plan["sell_orders"]), 1)
 
     def test_best_quote_active_pair_reduce_keeps_normal_flow_for_large_pair_imbalance(self) -> None:
         plan = {
@@ -12106,6 +12108,56 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(
             [item["role"] for item in plan["sell_orders"]],
             ["inventory_unlock_reduce_long"],
+        )
+
+    def test_best_quote_active_pair_reduce_replaces_same_side_normal_reduce(self) -> None:
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {
+                    "side": "SELL",
+                    "role": "best_quote_reduce_long",
+                    "notional": 100.0,
+                }
+            ],
+        }
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state={},
+            enabled=True,
+            current_long_qty=3200.0,
+            current_short_qty=3000.0,
+            current_long_notional=925.0,
+            current_short_notional=850.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=200.0,
+            offset_ticks=1,
+            step_price=0.0006,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.2848,
+            ask_price=0.2849,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=900.0,
+            current_long_avg_price=0.2856,
+            current_short_avg_price=0.2822,
+            max_loss_ratio=0.06,
+            min_relief_notional=100.0,
+            suppress_all_entries_while_active=True,
+        )
+
+        self.assertEqual(report["order_count"], 1)
+        self.assertEqual(report["long_deduplicated_reduce_order_count"], 1)
+        self.assertEqual(
+            [item["role"] for item in plan["sell_orders"]],
+            ["best_quote_active_pair_reduce_long"],
         )
 
     def test_best_quote_active_pair_reduce_blocks_large_cost_distance(self) -> None:

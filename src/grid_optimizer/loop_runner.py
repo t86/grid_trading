@@ -23712,12 +23712,39 @@ def apply_best_quote_active_pair_reduce(
         target_notional: float,
     ) -> None:
         competing_role = f"inventory_unlock_reduce_{side_name}"
-        if any(
-            isinstance(item, dict) and _order_role(item) == competing_role
+        side_reduce_roles = {
+            f"best_quote_reduce_{side_name}",
+            f"best_quote_active_pair_reduce_{side_name}",
+            competing_role,
+        }
+        competing_orders = [
+            dict(item)
             for item in plan.get(order_key, [])
-        ):
+            if isinstance(item, dict) and _order_role(item) == competing_role
+        ]
+        if competing_orders:
+            plan[order_key] = [
+                dict(item)
+                for item in plan.get(order_key, [])
+                if isinstance(item, dict) and _order_role(item) not in side_reduce_roles
+            ]
+            plan[order_key].append(competing_orders[0])
             report[f"{side_name}_blocked_by_role"] = competing_role
+            report[f"{side_name}_deduplicated_reduce_order_count"] = max(
+                len(competing_orders) - 1,
+                0,
+            )
             return
+        before_count = len(plan.get(order_key, []))
+        plan[order_key] = [
+            dict(item)
+            for item in plan.get(order_key, [])
+            if isinstance(item, dict) and _order_role(item) not in side_reduce_roles
+        ]
+        report[f"{side_name}_deduplicated_reduce_order_count"] = max(
+            before_count - len(plan[order_key]),
+            0,
+        )
         remaining_notional = max(current_notional - target_notional, 0.0)
         budget = min(safe_per_order, safe_max_reduce, remaining_notional, current_notional)
         if budget <= 0:
