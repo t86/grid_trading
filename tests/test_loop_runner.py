@@ -4647,9 +4647,8 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(added_lot["price"], 0.7760318521192392)
         self.assertAlmostEqual(snapshot["long_avg_price"], 0.7951695970403309)
 
-    def test_best_quote_volume_ledger_defers_position_reconcile_with_normal_open_orders(self) -> None:
+    def test_best_quote_volume_ledger_confirms_position_reconcile_with_normal_open_orders(self) -> None:
         state = {
-            "best_quote_frozen_inventory": {"short_qty": 100.0},
             "best_quote_volume_ledger": {
                 "initialized": True,
                 "sync_ok": True,
@@ -4660,20 +4659,42 @@ class LoopRunnerTests(unittest.TestCase):
             },
         }
 
+        for _ in range(4):
+            snapshot = reconcile_best_quote_volume_ledger_surplus(
+                state=state,
+                current_long_qty=20.0,
+                current_short_qty=0.0,
+                current_long_avg_price=1.0,
+                current_short_avg_price=0.0,
+                current_long_entry_price=1.0,
+                mid_price=1.0,
+                normal_open_order_count=1,
+                position_reconcile_confirm_cycles=1,
+            )
+
+        self.assertEqual(snapshot["long_qty"], 10.0)
+        ledger = state["best_quote_volume_ledger"]
+        self.assertEqual(
+            ledger["position_reconcile_deferred_reason"],
+            "normal_open_orders_confirming_position_drift",
+        )
+        self.assertEqual(ledger["position_reconcile_pending_count"], 4)
+
         snapshot = reconcile_best_quote_volume_ledger_surplus(
             state=state,
             current_long_qty=20.0,
-            current_short_qty=100.0,
+            current_short_qty=0.0,
             current_long_avg_price=1.0,
-            current_short_avg_price=1.0,
+            current_short_avg_price=0.0,
+            current_long_entry_price=1.0,
             mid_price=1.0,
             normal_open_order_count=1,
             position_reconcile_confirm_cycles=1,
         )
 
-        self.assertEqual(snapshot["long_qty"], 10.0)
+        self.assertEqual(snapshot["long_qty"], 20.0)
         ledger = state["best_quote_volume_ledger"]
-        self.assertEqual(ledger["position_reconcile_deferred_reason"], "normal_open_orders_active")
+        self.assertEqual(ledger["position_reconcile_pending_count"], 0)
 
     def test_stale_bq_ledger_does_not_override_exchange_minus_frozen_cost_basis(self) -> None:
         state = {
@@ -4714,7 +4735,7 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(
             state["best_quote_volume_ledger"]["position_reconcile_deferred_reason"],
-            "normal_open_orders_active",
+            "normal_open_orders_confirming_position_drift",
         )
         self.assertAlmostEqual(report["managed_long_qty"], 10.0)
         self.assertAlmostEqual(report["managed_long_avg_price"], 1.0)

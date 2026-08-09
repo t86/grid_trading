@@ -3615,8 +3615,6 @@ def reconcile_best_quote_volume_ledger_surplus(
         return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
 
     frozen = dict(state.get("best_quote_frozen_inventory") or {})
-    if not frozen:
-        return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
 
     now_iso = _utc_now().isoformat()
     long_lots = _normalize_best_quote_volume_lots(ledger.get("long_lots"))
@@ -3669,26 +3667,28 @@ def reconcile_best_quote_volume_ledger_surplus(
     long_drift = target_long_qty - current_ledger_long_qty
     short_drift = target_short_qty - current_ledger_short_qty
     has_position_drift = abs(long_drift) > 1e-9 or abs(short_drift) > 1e-9
-    if has_position_drift and int(normal_open_order_count or 0) > 0:
-        ledger["long_lots"] = long_lots
-        ledger["short_lots"] = short_lots
-        ledger["position_reconcile_deferred_reason"] = "normal_open_orders_active"
-        ledger["position_reconcile_pending_count"] = 0
-        ledger["position_reconcile_target_long_qty"] = target_long_qty
-        ledger["position_reconcile_target_short_qty"] = target_short_qty
-        ledger["position_reconcile_ledger_long_qty"] = current_ledger_long_qty
-        ledger["position_reconcile_ledger_short_qty"] = current_ledger_short_qty
-        ledger["position_reconcile_at"] = now_iso
-        ledger["updated_at"] = now_iso
-        state["best_quote_volume_ledger"] = ledger
-        return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
-
     if has_position_drift:
         pending_key = "position_reconcile_pending_count"
-        pending_count = int(ledger.get(pending_key) or 0) + 1
+        same_candidate = all(
+            math.isclose(_safe_float(ledger.get(key)), expected, rel_tol=1e-9, abs_tol=1e-9)
+            for key, expected in (
+                ("position_reconcile_target_long_qty", target_long_qty),
+                ("position_reconcile_target_short_qty", target_short_qty),
+                ("position_reconcile_ledger_long_qty", current_ledger_long_qty),
+                ("position_reconcile_ledger_short_qty", current_ledger_short_qty),
+            )
+        )
+        pending_count = (int(ledger.get(pending_key) or 0) if same_candidate else 0) + 1
         confirm_cycles = max(int(position_reconcile_confirm_cycles or 1), 1)
+        if int(normal_open_order_count or 0) > 0:
+            confirm_cycles = max(confirm_cycles, 5)
         ledger[pending_key] = pending_count
-        ledger["position_reconcile_deferred_reason"] = "confirming_position_drift"
+        ledger["position_reconcile_deferred_reason"] = (
+            "normal_open_orders_confirming_position_drift"
+            if int(normal_open_order_count or 0) > 0
+            else "confirming_position_drift"
+        )
+        ledger["position_reconcile_required_count"] = confirm_cycles
         ledger["position_reconcile_target_long_qty"] = target_long_qty
         ledger["position_reconcile_target_short_qty"] = target_short_qty
         ledger["position_reconcile_ledger_long_qty"] = current_ledger_long_qty
