@@ -6057,6 +6057,81 @@ def check_symbol(
             and not recovery_timeout_required
         ):
             action = "skip_recovery_safety_gate"
+        elif (
+            normalized_symbol == "GRVTUSDT"
+            and (
+                bool(assessment.get("volatility_entry_pause_active"))
+                or "extreme_volatility_defensive"
+                in set(assessment.get("pause_reasons") or [])
+            )
+        ):
+            loss_recovery_enabled = any(
+                (
+                    bool(
+                        control.get(
+                            "best_quote_maker_volume_allow_loss_reduce_only"
+                        )
+                    ),
+                    bool(
+                        control.get(
+                            "best_quote_maker_volume_net_loss_reduce_enabled"
+                        )
+                    ),
+                    bool(
+                        control.get(
+                            "best_quote_maker_volume_active_pair_reduce_enabled"
+                        )
+                    ),
+                )
+            )
+            if loss_recovery_enabled:
+                updates = _restore_recovery_controls(
+                    item,
+                    control,
+                    cycle_budget_floor_notional,
+                )
+                updates.update(
+                    {
+                        "best_quote_maker_volume_allow_loss_reduce_only": False,
+                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                        "best_quote_maker_volume_active_pair_reduce_enabled": False,
+                    }
+                )
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = (
+                    "dry_run_disable_grvt_loss_recovery_during_volatility_pause"
+                    if dry_run
+                    else "disable_grvt_loss_recovery_during_volatility_pause"
+                )
+                _set_post_restore_cooldown(
+                    item,
+                    now=now,
+                    cooldown_seconds=post_restore_cooldown_seconds,
+                )
+                for key in (
+                    "guard_original_controls",
+                    "guard_recovery_controls",
+                    "recovery_started_at",
+                    "recovery_owned",
+                ):
+                    item.pop(key, None)
+            else:
+                action = "hold_grvt_volatility_pause_without_loss_recovery"
+                item.update(
+                    {
+                        "status": "low_volume",
+                        "last_recovery_check_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
         elif arx_low_pace_two_sided_restore:
             _remember_recovery_controls(
                 item,
