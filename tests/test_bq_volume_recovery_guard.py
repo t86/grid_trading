@@ -10795,7 +10795,10 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self._write_common_files(
                 output_dir,
                 now=now,
-                control={"best_quote_maker_volume_inventory_bias_min_notional_gap": 200.0},
+                control={
+                    "best_quote_maker_volume_inventory_bias_min_notional_gap": 200.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 1,
+                },
                 long_notional=990.0,
                 short_notional=850.0,
                 open_order_count=1,
@@ -10829,6 +10832,120 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(result["action"], "enable_allow_loss_reduce_only")
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["REUSDT"])
+
+    def test_high_wear_does_not_reopen_loss_reduce_after_five_minute_sample_clears(self) -> None:
+        now = datetime(2026, 6, 26, 8, 10, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                symbol="GRVTUSDT",
+                control={
+                    "best_quote_maker_volume_inventory_bias_min_notional_gap": 200.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 1,
+                },
+                long_notional=990.0,
+                short_notional=850.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "GRVTUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="GRVTUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                inventory_bias_relief_notional_margin=24,
+                trade_rows=[
+                    {
+                        "id": 1,
+                        "time": int((now - timedelta(minutes=10)).timestamp() * 1000),
+                        "quoteQty": "1000",
+                        "realizedPnl": "-4",
+                    }
+                ],
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "grvtusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(result["assessment"]["high_recovery_wear"])
+            self.assertFalse(result["assessment"]["confirmed_loss_reduce_wear"])
+            self.assertEqual(result["action"], "hold_high_wear_without_loss_reduce")
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, [])
+
+    def test_high_wear_does_not_reopen_loss_reduce_for_ineffective_orders(self) -> None:
+        now = datetime(2026, 6, 26, 8, 10, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                symbol="GRVTUSDT",
+                control={
+                    "best_quote_maker_volume_inventory_bias_min_notional_gap": 200.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 1,
+                },
+                long_notional=990.0,
+                short_notional=850.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=False,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "GRVTUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="GRVTUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                inventory_bias_relief_notional_margin=24,
+                trade_rows=[
+                    {
+                        "id": 1,
+                        "time": int((now - timedelta(minutes=10)).timestamp() * 1000),
+                        "quoteQty": "1000",
+                        "realizedPnl": "-4",
+                    }
+                ],
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "grvtusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(result["assessment"]["high_recovery_wear"])
+            self.assertFalse(result["assessment"]["confirmed_loss_reduce_wear"])
+            self.assertEqual(result["action"], "hold_ineffective_orders_without_soft_pressure")
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, [])
 
     def test_enables_loss_reduce_when_near_market_fills_stay_below_volume_floor(self) -> None:
         now = datetime(2026, 6, 26, 8, 12, tzinfo=timezone.utc)

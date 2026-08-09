@@ -9693,6 +9693,9 @@ def check_symbol(
                     target_pace_behind
                     and no_fill_seconds >= max(float(trigger_seconds), 0.0)
                     and bool(assessment.get("inventory_soft_pressure"))
+                    and not (
+                        normalized_symbol == "GRVTUSDT" and high_recovery_wear
+                    )
                     and not confirmed_loss_reduce_wear
                     and (
                         not post_restore_budget_cooldown_active
@@ -9883,6 +9886,8 @@ def check_symbol(
                     action = "hold_low_volume_without_soft_pressure"
                 elif confirmed_loss_reduce_wear:
                     action = "hold_confirmed_wear_without_loss_reduce"
+                elif normalized_symbol == "GRVTUSDT" and high_recovery_wear:
+                    action = "hold_high_wear_without_loss_reduce"
                 elif recovery_reapply_debounced:
                     action = "hold_loss_reduce_reapply_debounce"
                 elif post_restore_budget_cooldown_active:
@@ -9937,7 +9942,8 @@ def check_symbol(
                     )
                     chosen_action = "disable_inventory_cost_gate"
                 elif (
-                    not confirmed_loss_reduce_wear
+                    not (normalized_symbol == "GRVTUSDT" and high_recovery_wear)
+                    and not confirmed_loss_reduce_wear
                     and not recovery_reapply_debounced
                     and not post_restore_budget_cooldown_active
                     and (
