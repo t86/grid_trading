@@ -23541,7 +23541,19 @@ def apply_best_quote_active_pair_reduce(
         memory = {}
 
     def _clear(reason: str, *, completed: bool = False) -> dict[str, Any]:
-        state.pop("best_quote_active_pair_reduce", None)
+        if completed and threshold_side_mode:
+            completion_memory = dict(memory)
+            completion_memory.update(
+                {
+                    "active": False,
+                    "completed": True,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "completed_reason": reason,
+                }
+            )
+            state["best_quote_active_pair_reduce"] = completion_memory
+        else:
+            state.pop("best_quote_active_pair_reduce", None)
         plan["buy_orders"] = [
             dict(item)
             for item in plan.get("buy_orders", [])
@@ -23558,6 +23570,31 @@ def apply_best_quote_active_pair_reduce(
 
     if not enabled:
         return _clear("disabled")
+    if threshold_side_mode and bool(memory.get("completed")):
+        plan["buy_orders"] = [
+            dict(item)
+            for item in plan.get("buy_orders", [])
+            if isinstance(item, dict)
+            and _order_role(item) != "best_quote_active_pair_reduce_short"
+        ]
+        plan["sell_orders"] = [
+            dict(item)
+            for item in plan.get("sell_orders", [])
+            if isinstance(item, dict)
+            and _order_role(item) != "best_quote_active_pair_reduce_long"
+        ]
+        report.update(
+            {
+                "reason": "lease_completed_waiting_disable",
+                "completed": True,
+                "eligible_sides": [
+                    str(side)
+                    for side in memory.get("eligible_sides", [])
+                    if str(side) in {"long", "short"}
+                ],
+            }
+        )
+        return report
     if safe_per_order <= 0 or safe_max_reduce <= 0:
         return _clear("invalid_budget")
     volatility_pause_active = bool((volatility_entry_pause or {}).get("active"))
