@@ -1251,6 +1251,15 @@ def apply_volatility_entry_pause_controls(
     volatility_entry_pause: dict[str, Any],
     loss_recovery_brush: dict[str, Any],
     elastic_volume: dict[str, Any],
+    dynamic_control: dict[str, Any] | None = None,
+    current_long_notional: float = 0.0,
+    current_short_notional: float = 0.0,
+    long_entry_limit_notional: float = 0.0,
+    short_entry_limit_notional: float = 0.0,
+    now: datetime | None = None,
+    directional_recovery_min_seconds: float = 180.0,
+    directional_recovery_min_gap_notional: float = 100.0,
+    directional_recovery_max_light_share: float = 0.50,
 ) -> None:
     if not volatility_entry_pause.get("active"):
         return
@@ -1265,6 +1274,75 @@ def apply_volatility_entry_pause_controls(
     bypass_short_pause = recovery_active and recovery_side == "long"
     if bypass_buy_pause or bypass_short_pause:
         volatility_entry_pause["loss_recovery_brush_bypass_side"] = "BUY" if bypass_buy_pause else "SELL"
+
+    # Once the live shock has cleared, allow only entry flow that reduces a
+    # material ordinary-inventory imbalance.  A current trigger or the extreme
+    # volatility tier always keeps both entry lanes closed.
+    dynamic = dynamic_control if isinstance(dynamic_control, dict) else {}
+    pause_state = volatility_entry_pause.get("state")
+    pause_state = pause_state if isinstance(pause_state, dict) else {}
+    last_trigger_at = _parse_rescue_guard_time(pause_state.get("last_trigger_at"))
+    safe_now = now or _utc_now()
+    safe_now = safe_now.astimezone(timezone.utc) if safe_now.tzinfo else safe_now.replace(tzinfo=timezone.utc)
+    seconds_since_trigger = (
+        max((safe_now - last_trigger_at).total_seconds(), 0.0)
+        if last_trigger_at is not None
+        else 0.0
+    )
+    current_trigger = bool(volatility_entry_pause.get("trigger_active"))
+    extreme_volatility = str(dynamic.get("reason") or "") == "extreme_volatility_defensive"
+    recovery_observed = seconds_since_trigger >= max(float(directional_recovery_min_seconds), 0.0)
+    long_notional = max(_safe_float(current_long_notional), 0.0)
+    short_notional = max(_safe_float(current_short_notional), 0.0)
+    long_limit = max(_safe_float(long_entry_limit_notional), 0.0)
+    short_limit = max(_safe_float(short_entry_limit_notional), 0.0)
+    both_below_entry_limits = (
+        long_limit > 0
+        and short_limit > 0
+        and long_notional < long_limit - 1e-12
+        and short_notional < short_limit - 1e-12
+    )
+    gap_notional = abs(long_notional - short_notional)
+    min_gap_notional = max(_safe_float(directional_recovery_min_gap_notional), 0.0)
+    max_light_share = min(max(_safe_float(directional_recovery_max_light_share), 0.0), 1.0)
+    heavy_notional = max(long_notional, short_notional)
+    light_notional = min(long_notional, short_notional)
+    materially_imbalanced = bool(
+        heavy_notional > 0
+        and gap_notional >= min_gap_notional
+        and light_notional <= heavy_notional * max_light_share + 1e-12
+    )
+    market_return_1m = _safe_float(dynamic.get("market_return_1m"))
+    directional_recovery_allowed = bool(
+        not current_trigger
+        and not extreme_volatility
+        and recovery_observed
+        and both_below_entry_limits
+    )
+    directional_bypass_side: str | None = None
+    if directional_recovery_allowed:
+        if materially_imbalanced and long_notional > short_notional and market_return_1m <= 0:
+            bypass_short_pause = True
+            directional_bypass_side = "SELL"
+        elif materially_imbalanced and short_notional > long_notional and market_return_1m >= 0:
+            bypass_buy_pause = True
+            directional_bypass_side = "BUY"
+        elif not materially_imbalanced:
+            bypass_buy_pause = True
+            bypass_short_pause = True
+            directional_bypass_side = "BOTH"
+    volatility_entry_pause["directional_recovery"] = {
+        "allowed": directional_recovery_allowed,
+        "bypass_side": directional_bypass_side,
+        "current_trigger": current_trigger,
+        "extreme_volatility": extreme_volatility,
+        "seconds_since_trigger": seconds_since_trigger,
+        "min_observation_seconds": max(float(directional_recovery_min_seconds), 0.0),
+        "ordinary_long_notional": long_notional,
+        "ordinary_short_notional": short_notional,
+        "imbalance_notional": gap_notional,
+        "market_return_1m": market_return_1m,
+    }
 
     if not bypass_buy_pause:
         controls["buy_paused"] = True
@@ -32206,6 +32284,12 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         volatility_entry_pause=volatility_entry_pause,
         loss_recovery_brush=loss_recovery_brush,
         elastic_volume=elastic_volume,
+        dynamic_control=(best_quote_maker_volume.get("metrics") or {}).get("dynamic_control") or {},
+        current_long_notional=controls.get("current_long_notional", current_long_notional),
+        current_short_notional=controls.get("current_short_notional", current_short_notional),
+        long_entry_limit_notional=getattr(effective_args, "pause_buy_position_notional", 0.0),
+        short_entry_limit_notional=getattr(effective_args, "pause_short_position_notional", 0.0),
+        now=plan_now,
     )
     if anti_chase_entry_guard.get("block_long_entries"):
         controls["buy_paused"] = True

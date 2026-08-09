@@ -9982,6 +9982,34 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(updates["pause_buy_position_notional"], 701.0)
         self.assertEqual(updates["pause_short_position_notional"], 620.0)
 
+    def test_grvt_loss_reduce_preserves_configured_soft_bands(self) -> None:
+        updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
+            control={
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
+                "best_quote_maker_volume_cycle_budget_notional": 250.0,
+                "best_quote_maker_volume_min_cycle_budget_notional": 55.0,
+                "best_quote_maker_volume_inventory_soft_ratio": 0.9,
+                "best_quote_maker_volume_active_pair_reduce_enabled": True,
+                "best_quote_maker_volume_active_pair_reduce_order_notional": 55.0,
+                "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 125.0,
+                "per_order_notional": 55.0,
+                "pause_buy_position_notional": 647.0,
+                "pause_short_position_notional": 900.0,
+            },
+            assessment={
+                "symbol": "GRVTUSDT",
+                "current_long_notional": 897.0,
+                "current_short_notional": 0.0,
+                "max_long_notional": 1000.0,
+                "max_short_notional": 1000.0,
+            },
+            pause_baseline_long_notional=900.0,
+            pause_baseline_short_notional=900.0,
+        )
+
+        self.assertEqual(updates["pause_buy_position_notional"], 900.0)
+        self.assertNotIn("pause_short_position_notional", updates)
+
     def test_loss_reduce_uses_pair_reducer_and_aligns_soft_to_pause(self) -> None:
         updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
             control={

@@ -1818,6 +1818,18 @@ def _loss_reduce_recovery_updates(
         target_soft_ratio = min(soft_ratio_candidates)
         if current_soft_ratio <= 0 or target_soft_ratio < current_soft_ratio:
             updates["best_quote_maker_volume_inventory_soft_ratio"] = target_soft_ratio
+    if str(assessment.get("symbol") or "").upper() == "GRVTUSDT":
+        # GRVT loss permission is bounded by its separate 800U loss threshold
+        # and expected-loss-distance gate. Lowering the 900U entry soft bands
+        # cannot make a deep-loss reduce executable; it only strands both entry
+        # lanes and creates a recovery deadlock.
+        for pause_key, baseline in (
+            ("pause_buy_position_notional", pause_baseline_long_notional),
+            ("pause_short_position_notional", pause_baseline_short_notional),
+        ):
+            if baseline > 0 and _safe_float(control.get(pause_key)) < baseline:
+                updates[pause_key] = baseline
+        return updates
     buffer_notional = resolved.loss_reduce_cycle_budget_cap_notional
     if buffer_notional <= 0:
         return updates
