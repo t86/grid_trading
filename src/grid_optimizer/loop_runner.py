@@ -23863,8 +23863,16 @@ def apply_best_quote_active_pair_reduce(
             target_notional=short_target,
         )
     if not placed:
-        remaining_long_notional = max(safe_long_notional - long_target, 0.0)
-        remaining_short_notional = max(safe_short_notional - short_target, 0.0)
+        remaining_long_notional = (
+            max(safe_long_notional - long_target, 0.0)
+            if "long" in eligible_sides
+            else 0.0
+        )
+        remaining_short_notional = (
+            max(safe_short_notional - short_target, 0.0)
+            if "short" in eligible_sides
+            else 0.0
+        )
         minimum_actionable_notional = max(_safe_float(min_notional), 0.0)
         if max(remaining_long_notional, remaining_short_notional) < minimum_actionable_notional:
             return _clear("target_reached_small_residual", completed=True)
