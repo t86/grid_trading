@@ -32734,10 +32734,26 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 100.0 if grvt_bounded_loss_recovery else 0.0,
             ),
-            max_reduce_notional_per_side=getattr(
-                effective_args,
-                "best_quote_maker_volume_active_pair_reduce_max_notional_per_side",
-                200.0,
+            max_reduce_notional_per_side=(
+                min(
+                    max(
+                        _safe_float(
+                            getattr(
+                                effective_args,
+                                "best_quote_maker_volume_active_pair_reduce_max_notional_per_side",
+                                200.0,
+                            )
+                        ),
+                        0.0,
+                    ),
+                    100.0,
+                )
+                if grvt_bounded_loss_recovery
+                else getattr(
+                    effective_args,
+                    "best_quote_maker_volume_active_pair_reduce_max_notional_per_side",
+                    200.0,
+                )
             ),
             offset_ticks=getattr(effective_args, "best_quote_maker_volume_active_pair_reduce_offset_ticks", 1),
             step_price=effective_args.step_price,
