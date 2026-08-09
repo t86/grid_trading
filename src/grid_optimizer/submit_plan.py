@@ -1603,9 +1603,27 @@ def apply_actual_net_exposure_decision_to_actions(
         price = finite_number(order.get("price"))
         return abs((price if price is not None else mark_price) - mark_price)
 
-    def eligible_balancing_entries_for(side: str) -> list[dict[str, Any]]:
+    spacing_guard = actions.get("same_side_spacing_guard")
+    protected_spacing_cancels = (
+        spacing_guard.get("protected_cancel_orders", [])
+        if isinstance(spacing_guard, Mapping)
+        else []
+    )
+    suppressed_spacing_places = (
+        spacing_guard.get("suppressed_place_orders", [])
+        if isinstance(spacing_guard, Mapping)
+        else []
+    )
+
+    def eligible_balancing_entries_for(
+        side: str, *, include_suppressed: bool = False
+    ) -> list[dict[str, Any]]:
         eligible: list[dict[str, Any]] = []
-        for order in place_orders:
+        candidates = [
+            *place_orders,
+            *(suppressed_spacing_places if include_suppressed else []),
+        ]
+        for order in candidates:
             if (
                 str(order.get("side") or "").upper().strip() != side
                 or not is_balancing_entry(order, side)
@@ -1624,13 +1642,6 @@ def apply_actual_net_exposure_decision_to_actions(
                 continue
             eligible.append(order)
         return eligible
-
-    spacing_guard = actions.get("same_side_spacing_guard")
-    protected_spacing_cancels = (
-        spacing_guard.get("protected_cancel_orders", [])
-        if isinstance(spacing_guard, Mapping)
-        else []
-    )
 
     def authorized_replacement_cancel(
         existing_entry: Mapping[str, Any],
@@ -1651,12 +1662,15 @@ def apply_actual_net_exposure_decision_to_actions(
         )
 
     if serialize_balancing_entries and reducing_side is not None:
-        eligible_balancing_entries = eligible_balancing_entries_for(reducing_side)
         existing_balancing_entries = [
             order
             for order in open_by_side[reducing_side]
             if is_balancing_entry(order, reducing_side)
         ]
+        eligible_balancing_entries = eligible_balancing_entries_for(
+            reducing_side,
+            include_suppressed=bool(existing_balancing_entries),
+        )
         if len(existing_balancing_entries) > 1:
             kept_entry = min(existing_balancing_entries, key=distance_to_mark)
             surplus_entries = [
@@ -1812,7 +1826,10 @@ def apply_actual_net_exposure_decision_to_actions(
             triggered_reasons=triggered_reasons,
         )
     if reducing_side is not None:
-        closer_replacements = eligible_balancing_entries_for(reducing_side)
+        closer_replacements = eligible_balancing_entries_for(
+            reducing_side,
+            include_suppressed=True,
+        )
         for existing_entry in open_by_side[reducing_side]:
             if not is_balancing_entry(existing_entry, reducing_side):
                 continue

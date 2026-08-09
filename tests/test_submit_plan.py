@@ -608,6 +608,63 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(guarded["cancel_orders"], [existing_entry])
         self.assertEqual(guarded["place_orders"], [])
 
+    def test_cap_recovery_replaces_stale_entry_when_spacing_suppressed_candidate(self) -> None:
+        existing_entry = {
+            "orderId": 86,
+            "side": "SELL",
+            "positionSide": "SHORT",
+            "price": "0.2792",
+            "origQty": "338",
+            "executedQty": "0",
+        }
+        closer_entry = {
+            "side": "SELL",
+            "position_side": "SHORT",
+            "price": 0.2791,
+            "qty": 451.0,
+            "notional": 125.8741,
+            "role": "best_quote_entry_short",
+            "time_in_force": "GTX",
+        }
+
+        guarded = apply_actual_net_exposure_decision_to_actions(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "BUY",
+                        "position_side": "SHORT",
+                        "price": 0.2788,
+                        "qty": 903.0,
+                        "notional": 251.7564,
+                        "role": "best_quote_reduce_short",
+                        "force_reduce_only": True,
+                        "time_in_force": "GTX",
+                    }
+                ],
+                "cancel_orders": [],
+                "same_side_spacing_guard": {
+                    "suppressed_place_orders": [closer_entry],
+                    "protected_cancel_orders": [dict(existing_entry)],
+                },
+            },
+            current_actual_net_qty=2002.0,
+            valuation_price=0.2788,
+            current_open_orders=[existing_entry],
+            owned_open_orders=[existing_entry],
+            max_actual_net_notional=650.0,
+            serialize_balancing_entries=False,
+        )
+
+        decision = guarded["actual_net_exposure_decision"]
+        self.assertEqual(
+            decision["action"],
+            "cancel_stale_net_decrease_entry_refresh",
+        )
+        self.assertEqual(decision["stale_balancing_entry_price"], 0.2792)
+        self.assertEqual(decision["replacement_balancing_entry_price"], 0.2791)
+        self.assertEqual(guarded["cancel_orders"], [existing_entry])
+        self.assertEqual(guarded["place_orders"], [])
+
     def test_actual_net_decision_holds_when_pause_removed_all_reducing_candidates(self) -> None:
         guarded = apply_actual_net_exposure_decision_to_actions(
             actions={
