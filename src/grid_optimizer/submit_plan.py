@@ -1773,6 +1773,37 @@ def apply_actual_net_exposure_decision_to_actions(
         triggered_reasons.append("projected_buy_over_cap")
     if projected_sell < -cap - 1e-9:
         triggered_reasons.append("projected_sell_over_cap")
+    if reducing_side is not None:
+        closer_replacements = eligible_balancing_entries_for(
+            reducing_side,
+            include_suppressed=True,
+        )
+        for existing_entry in open_by_side[reducing_side]:
+            if not is_balancing_entry(existing_entry, reducing_side):
+                continue
+            closer_entries = [
+                order
+                for order in closer_replacements
+                if distance_to_mark(order) + 1e-12
+                < distance_to_mark(existing_entry)
+            ]
+            replacement_cancel = authorized_replacement_cancel(existing_entry)
+            if not closer_entries or replacement_cancel is None:
+                continue
+            replacement_entry = min(closer_entries, key=distance_to_mark)
+            return finish(
+                "cancel_stale_net_decrease_entry_refresh",
+                places=[],
+                cancels=[replacement_cancel],
+                reducing_side=reducing_side,
+                triggered_reasons=triggered_reasons,
+                stale_balancing_entry_price=finite_number(
+                    existing_entry.get("price")
+                ),
+                replacement_balancing_entry_price=finite_number(
+                    replacement_entry.get("price")
+                ),
+            )
     if not triggered_reasons:
         return finish(
             "normal",
@@ -1825,37 +1856,6 @@ def apply_actual_net_exposure_decision_to_actions(
             reducing_side=reducing_side,
             triggered_reasons=triggered_reasons,
         )
-    if reducing_side is not None:
-        closer_replacements = eligible_balancing_entries_for(
-            reducing_side,
-            include_suppressed=True,
-        )
-        for existing_entry in open_by_side[reducing_side]:
-            if not is_balancing_entry(existing_entry, reducing_side):
-                continue
-            closer_entries = [
-                order
-                for order in closer_replacements
-                if distance_to_mark(order) + 1e-12
-                < distance_to_mark(existing_entry)
-            ]
-            replacement_cancel = authorized_replacement_cancel(existing_entry)
-            if not closer_entries or replacement_cancel is None:
-                continue
-            replacement_entry = min(closer_entries, key=distance_to_mark)
-            return finish(
-                "cancel_stale_net_decrease_entry_refresh",
-                places=[],
-                cancels=[replacement_cancel],
-                reducing_side=reducing_side,
-                triggered_reasons=triggered_reasons,
-                stale_balancing_entry_price=finite_number(
-                    existing_entry.get("price")
-                ),
-                replacement_balancing_entry_price=finite_number(
-                    replacement_entry.get("price")
-                ),
-            )
     selected: dict[str, Any] | None = None
     if reducing_side is not None and (
         existing_reducing_count == 0 or existing_balancing_entry_count == 0

@@ -629,18 +629,7 @@ class SubmitPlanTests(unittest.TestCase):
 
         guarded = apply_actual_net_exposure_decision_to_actions(
             actions={
-                "place_orders": [
-                    {
-                        "side": "BUY",
-                        "position_side": "SHORT",
-                        "price": 0.2788,
-                        "qty": 903.0,
-                        "notional": 251.7564,
-                        "role": "best_quote_reduce_short",
-                        "force_reduce_only": True,
-                        "time_in_force": "GTX",
-                    }
-                ],
+                "place_orders": [],
                 "cancel_orders": [],
                 "same_side_spacing_guard": {
                     "suppressed_place_orders": [closer_entry],
@@ -651,7 +640,7 @@ class SubmitPlanTests(unittest.TestCase):
             valuation_price=0.2788,
             current_open_orders=[existing_entry],
             owned_open_orders=[existing_entry],
-            max_actual_net_notional=650.0,
+            max_actual_net_notional=1_000.0,
             serialize_balancing_entries=False,
         )
 
