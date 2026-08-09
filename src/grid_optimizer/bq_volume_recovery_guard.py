@@ -6027,6 +6027,8 @@ def check_symbol(
     )
     grvt_post_shock_soft_release_safe = (
         grvt_volatility_pause
+        and not active_pair_reduce_deadlock
+        and not post_restore_budget_cooldown_active
         and not bool(directional_recovery.get("extreme_volatility"))
         and "extreme_volatility_defensive"
         not in set(assessment.get("pause_reasons") or [])

@@ -15793,6 +15793,114 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
             self.assertEqual(restarts, ["GRVTUSDT"])
 
+    def test_grvt_post_shock_loss_ratio_deadlock_disables_release_and_cools_down(self) -> None:
+        now = datetime(2026, 8, 9, 1, 46, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                symbol="GRVTUSDT",
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_active_pair_reduce_enabled": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 250.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 3,
+                    "pause_buy_position_notional": 900.0,
+                    "pause_short_position_notional": 900.0,
+                },
+                long_notional=1.0,
+                short_notional=935.0,
+                open_order_count=0,
+                active_order_count=0,
+            )
+            plan_path = output_dir / "grvtusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan.update(
+                {
+                    "volatility_entry_pause": {
+                        "active": True,
+                        "directional_recovery": {
+                            "extreme_volatility": False,
+                            "seconds_since_trigger": 240.0,
+                            "min_observation_seconds": 180.0,
+                        },
+                    },
+                    "inventory_unlock_release": {"execution_cycles": 0},
+                    "best_quote_active_pair_reduce": {
+                        "enabled": True,
+                        "active": True,
+                        "reason": "no_valid_reduce_order",
+                        "order_count": 0,
+                        "suppressed_entry_order_count": 2,
+                        "short_blocked_reason": "loss_ratio_above_limit",
+                    },
+                    "pause_reasons": ["volatility_entry_pause", "inventory_soft"],
+                    "short_pause_reasons": ["volatility_entry_pause", "inventory_soft"],
+                }
+            )
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "GRVTUSDT": {
+                        "status": "recovery_active",
+                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                        "recovery_started_at": (now - timedelta(minutes=1)).isoformat(),
+                        "recovery_owned": True,
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_active_pair_reduce_enabled": False,
+                            "best_quote_maker_volume_quote_offset_ticks": 1,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="GRVTUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                daily_target_notional=100_000.0,
+                require_soft_pressure_for_allow_loss=False,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "grvtusdt_loop_runner_control.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                result["action"],
+                "disable_grvt_loss_recovery_during_volatility_pause",
+            )
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertFalse(control["best_quote_maker_volume_active_pair_reduce_enabled"])
+            self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 1)
+            self.assertEqual(restarts, ["GRVTUSDT"])
+
+            result = check_symbol(
+                symbol="GRVTUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now + timedelta(seconds=30),
+                window_seconds=60,
+                min_volume_notional=100,
+                trigger_seconds=120,
+                daily_target_notional=100_000.0,
+                require_soft_pressure_for_allow_loss=False,
+                restart_runner=restarts.append,
+            )
+            self.assertEqual(
+                result["action"],
+                "hold_grvt_volatility_pause_without_loss_recovery",
+            )
+            self.assertEqual(restarts, ["GRVTUSDT"])
+
     def test_severe_one_sided_stall_bypasses_general_cooldown(self) -> None:
         now = datetime(2026, 6, 26, 10, 10, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
