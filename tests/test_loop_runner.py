@@ -1249,6 +1249,80 @@ class LoopRunnerTests(unittest.TestCase):
             self.assertTrue(controls["short_paused"])
             self.assertIsNone(pause["directional_recovery"]["bypass_side"])
 
+    def test_grvt_extreme_tier_recovers_only_balancing_side_after_observation(self) -> None:
+        now = datetime(2026, 8, 9, 2, 30, tzinfo=timezone.utc)
+        controls = {
+            "buy_paused": False,
+            "short_paused": False,
+            "pause_reasons": [],
+            "short_pause_reasons": [],
+        }
+        pause = {
+            "active": False,
+            "trigger_active": False,
+            "state": {"last_trigger_at": (now - timedelta(minutes=5)).isoformat()},
+        }
+
+        apply_volatility_entry_pause_controls(
+            symbol="GRVTUSDT",
+            controls=controls,
+            volatility_entry_pause=pause,
+            loss_recovery_brush={},
+            elastic_volume={},
+            dynamic_control={
+                "reason": "extreme_volatility_defensive",
+                "market_return_1m": 0.008,
+            },
+            current_long_notional=920.0,
+            current_short_notional=250.0,
+            long_entry_limit_notional=900.0,
+            short_entry_limit_notional=900.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            now=now,
+        )
+
+        self.assertTrue(controls["buy_paused"])
+        self.assertFalse(controls["short_paused"])
+        self.assertEqual(pause["directional_recovery"]["bypass_side"], "SELL")
+        self.assertTrue(
+            pause["directional_recovery"]["extreme_directional_only"]
+        )
+
+    def test_grvt_extreme_tier_keeps_both_sides_paused_during_current_trigger(self) -> None:
+        now = datetime(2026, 8, 9, 2, 30, tzinfo=timezone.utc)
+        controls = {
+            "buy_paused": False,
+            "short_paused": False,
+            "pause_reasons": [],
+            "short_pause_reasons": [],
+        }
+        pause = {
+            "active": True,
+            "trigger_active": True,
+            "state": {"last_trigger_at": (now - timedelta(minutes=5)).isoformat()},
+        }
+
+        apply_volatility_entry_pause_controls(
+            symbol="GRVTUSDT",
+            controls=controls,
+            volatility_entry_pause=pause,
+            loss_recovery_brush={},
+            elastic_volume={},
+            dynamic_control={"reason": "extreme_volatility_defensive"},
+            current_long_notional=920.0,
+            current_short_notional=250.0,
+            long_entry_limit_notional=900.0,
+            short_entry_limit_notional=900.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            now=now,
+        )
+
+        self.assertTrue(controls["buy_paused"])
+        self.assertTrue(controls["short_paused"])
+        self.assertIsNone(pause["directional_recovery"]["bypass_side"])
+
     def test_extreme_dynamic_control_pauses_entry_without_pause_state(self) -> None:
         controls = {
             "buy_paused": False,

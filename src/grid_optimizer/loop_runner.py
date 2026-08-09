@@ -1264,13 +1264,15 @@ def apply_volatility_entry_pause_controls(
     directional_recovery_min_gap_notional: float = 100.0,
     directional_recovery_max_light_share: float = 0.50,
 ) -> None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    is_grvt = normalized_symbol == "GRVTUSDT"
     dynamic = dynamic_control if isinstance(dynamic_control, dict) else {}
     dynamic_reason = str(dynamic.get("reason") or "")
     extreme_volatility = dynamic_reason == "extreme_volatility_defensive"
     high_volatility = dynamic_reason == "high_volatility_defensive"
     pause_active = bool(volatility_entry_pause.get("active"))
     if (
-        str(symbol or "").upper().strip() == "GRVTUSDT"
+        is_grvt
         and high_volatility
         and not pause_active
     ):
@@ -1337,8 +1339,9 @@ def apply_volatility_entry_pause_controls(
         volatility_entry_pause["loss_recovery_brush_bypass_side"] = "BUY" if bypass_buy_pause else "SELL"
 
     # Once the live shock has cleared, allow only entry flow that reduces a
-    # material ordinary-inventory imbalance.  A current trigger or the extreme
-    # volatility tier always keeps both entry lanes closed.
+    # material ordinary-inventory imbalance. GRVT may resume that balancing
+    # lane under the widened extreme tier after the observation window, but it
+    # never resumes both lanes while the tier remains extreme.
     pause_state = volatility_entry_pause.get("state")
     pause_state = pause_state if isinstance(pause_state, dict) else {}
     last_trigger_at = _parse_rescue_guard_time(pause_state.get("last_trigger_at"))
@@ -1376,8 +1379,8 @@ def apply_volatility_entry_pause_controls(
     market_return_1m = _safe_float(dynamic.get("market_return_1m"))
     recovery_window_open = bool(
         not current_trigger
-        and not extreme_volatility
         and recovery_observed
+        and (not extreme_volatility or is_grvt)
     )
     directional_recovery_allowed = False
     directional_bypass_side: str | None = None
@@ -1402,7 +1405,11 @@ def apply_volatility_entry_pause_controls(
             bypass_buy_pause = True
             directional_bypass_side = "BUY"
             directional_recovery_allowed = True
-        elif not materially_imbalanced and both_below_entry_limits:
+        elif (
+            not extreme_volatility
+            and not materially_imbalanced
+            and both_below_entry_limits
+        ):
             bypass_buy_pause = True
             bypass_short_pause = True
             directional_bypass_side = "BOTH"
@@ -1412,6 +1419,7 @@ def apply_volatility_entry_pause_controls(
         "bypass_side": directional_bypass_side,
         "current_trigger": current_trigger,
         "extreme_volatility": extreme_volatility,
+        "extreme_directional_only": bool(is_grvt and extreme_volatility),
         "seconds_since_trigger": seconds_since_trigger,
         "min_observation_seconds": max(float(directional_recovery_min_seconds), 0.0),
         "ordinary_long_notional": long_notional,
