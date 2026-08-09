@@ -1669,6 +1669,42 @@ class RecoverOppositeEntryTests(unittest.TestCase):
         self.assertIn("best_quote_reduce_long", sell_roles)
         self.assertNotIn("best_quote_entry_short", sell_roles)
 
+    def test_soft_recovery_uses_one_reduce_of_at_least_100_per_overweight_side(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.9,
+                soft_recovery_min_reduce_notional=100.0,
+            ),
+            inputs=BestQuoteMakerVolumeInputs(
+                bid_price=0.2806,
+                ask_price=0.2807,
+                mid_price=0.28065,
+                current_net_qty=0.0,
+                cycle_budget_notional=160.0,
+                loss_per_10k_15m=0.0,
+                target_volume_remaining=90_000.0,
+                tick_size=0.0001,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+                max_order_notional=55.0,
+                current_long_qty=3_305.0,
+                current_short_qty=3_244.0,
+                position_side_mode="hedge",
+            ),
+        )
+
+        reduce_short = [o for o in plan["buy_orders"] if o["role"] == "best_quote_reduce_short"]
+        reduce_long = [o for o in plan["sell_orders"] if o["role"] == "best_quote_reduce_long"]
+        self.assertEqual(len(reduce_short), 1)
+        self.assertEqual(len(reduce_long), 1)
+        self.assertGreaterEqual(reduce_short[0]["notional"], 99.7)
+        self.assertGreaterEqual(reduce_long[0]["notional"], 99.7)
+        self.assertEqual(plan["metrics"]["soft_recovery_min_reduce_notional"], 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()

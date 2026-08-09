@@ -2568,6 +2568,7 @@ def _uses_entry_price_cost_basis(strategy_profile: str | None) -> bool:
         "ethusdc_um_volume_long_v1",
         "billusdt_best_quote_maker_volume_reset_v1",
         "arxusdt_best_quote_maker_volume_114_v2",
+        "grvt_daily_80k_bq_short_freeze_5pct_v1",
         "pharosusdt_adaptive_regime_router_v1",
         "pharosusdt_best_quote_maker_volume_v1",
         "reusdt_daily_75k_nofreeze_volume_v8",
@@ -30532,6 +30533,19 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                 loss_per_10k_soft=float(getattr(effective_args, "best_quote_maker_volume_loss_per_10k_soft", 0.5)),
                 loss_per_10k_hard=float(getattr(effective_args, "best_quote_maker_volume_loss_per_10k_hard", 0.8)),
                 soft_loss_budget_scale=float(getattr(effective_args, "best_quote_maker_volume_soft_loss_budget_scale", 0.50)),
+                soft_recovery_min_reduce_notional=max(
+                    float(
+                        getattr(
+                            effective_args,
+                            "best_quote_maker_volume_soft_recovery_min_reduce_notional",
+                            0.0,
+                        )
+                    ),
+                    100.0
+                    if str(effective_strategy_profile or "").strip()
+                    == "grvt_daily_80k_bq_short_freeze_5pct_v1"
+                    else 0.0,
+                ),
                 min_cycle_budget_notional=float(getattr(effective_args, "best_quote_maker_volume_min_cycle_budget_notional", 20.0)),
                 dynamic_tick_enabled=bool(getattr(effective_args, "best_quote_maker_volume_dynamic_tick_enabled", False)),
                 dynamic_tick_tight_offset_ticks=int(
@@ -35013,6 +35027,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-loss-per-10k-soft", type=float, default=0.5)
     parser.add_argument("--best-quote-maker-volume-loss-per-10k-hard", type=float, default=0.8)
     parser.add_argument("--best-quote-maker-volume-soft-loss-budget-scale", type=float, default=0.50)
+    parser.add_argument("--best-quote-maker-volume-soft-recovery-min-reduce-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-min-cycle-budget-notional", type=float, default=20.0)
     parser.add_argument("--best-quote-maker-volume-pending-entry-buffer-share", type=float, default=0.5)
     parser.add_argument("--best-quote-maker-volume-below-soft-cost-gap-scale", type=float, default=1.0)
@@ -36404,6 +36419,8 @@ def main() -> None:
         raise SystemExit("--regime-entry-budget-defensive-inventory-usage-ratio must be > 0")
     if args.regime_entry_budget_tick_dominated_ratio < 0 or args.regime_entry_budget_coarse_tick_ratio < 0:
         raise SystemExit("--regime-entry-budget tick ratios must be >= 0")
+    if args.best_quote_maker_volume_soft_recovery_min_reduce_notional < 0:
+        raise SystemExit("--best-quote-maker-volume-soft-recovery-min-reduce-notional must be >= 0")
     if (
         args.best_quote_maker_volume_below_soft_cost_gap_scale < 0
         or args.best_quote_maker_volume_below_soft_adverse_threshold_scale < 0

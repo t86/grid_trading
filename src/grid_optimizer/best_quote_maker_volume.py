@@ -19,6 +19,7 @@ class BestQuoteMakerVolumeConfig:
     loss_per_10k_soft: float = 0.5
     loss_per_10k_hard: float = 0.8
     soft_loss_budget_scale: float = 0.50
+    soft_recovery_min_reduce_notional: float = 0.0
     min_cycle_budget_notional: float = 20.0
     dynamic_tick_enabled: bool = False
     dynamic_tick_tight_offset_ticks: int = 2
@@ -161,11 +162,16 @@ def _build_order(
     inputs: BestQuoteMakerVolumeInputs,
     position_side: str = "BOTH",
     force_reduce_only: bool | None = None,
+    min_effective_notional_cap: float = 0.0,
 ) -> dict[str, Any] | None:
     rounded_price = _round_order_price(price, inputs.tick_size, side)
     if rounded_price <= 0 or notional <= 0:
         return None
-    max_order_notional = max(_safe_float(inputs.max_order_notional), 0.0)
+    max_order_notional = max(
+        _safe_float(inputs.max_order_notional),
+        _safe_float(min_effective_notional_cap),
+        0.0,
+    )
     effective_notional = min(notional, max_order_notional) if max_order_notional > 0 else notional
     qty = _round_order_qty(effective_notional / rounded_price, inputs.step_size)
     order_notional = qty * rounded_price
@@ -1066,6 +1072,31 @@ def build_best_quote_maker_volume_plan(
         other_notional = max(exposure_notional - side_notional, 0.0)
         return max(exposure_notional - floor - other_notional, 0.0)
 
+    soft_recovery_min_reduce_notional = max(
+        _safe_float(config.soft_recovery_min_reduce_notional),
+        0.0,
+    )
+
+    def _soft_recovery_floor(side_notional: float, soft_notional: float) -> float:
+        if soft_notional <= 0 or side_notional <= soft_notional + 1e-12:
+            return 0.0
+        return soft_recovery_min_reduce_notional
+
+    def _recovery_reduce_notional(
+        planned_notional: float,
+        side_notional: float,
+        soft_notional: float,
+    ) -> float:
+        requested = max(
+            _safe_float(planned_notional),
+            _soft_recovery_floor(side_notional, soft_notional),
+        )
+        return min(
+            requested,
+            max(_safe_float(side_notional), 0.0),
+            _net_loss_reduce_cap(side_notional),
+        )
+
     buy_orders: list[dict[str, Any]] = []
     sell_orders: list[dict[str, Any]] = []
     max_entry_orders_per_side = max(int(_safe_float(config.max_entry_orders_per_side)), 1)
@@ -1209,15 +1240,16 @@ def build_best_quote_maker_volume_plan(
                 _build_order(
                     side="BUY",
                     price=_price_with_gap(bid, short_reduce_gap, -1),
-                    notional=min(
+                    notional=_recovery_reduce_notional(
                         reduce_notional * reduce_short_budget_scale,
                         short_notional,
-                        _net_loss_reduce_cap(short_notional),
+                        short_soft,
                     ),
                     role="best_quote_reduce_short",
                     inputs=inputs,
                     position_side=reduce_short_position_side,
                     force_reduce_only=True,
+                    min_effective_notional_cap=_soft_recovery_floor(short_notional, short_soft),
                 ),
             )
             if config.inventory_bias_opposite_entry_enabled:
@@ -1258,15 +1290,16 @@ def build_best_quote_maker_volume_plan(
                 _build_order(
                     side="SELL",
                     price=_price_with_gap(ask, long_reduce_gap, 1),
-                    notional=min(
+                    notional=_recovery_reduce_notional(
                         reduce_notional * reduce_long_budget_scale,
                         long_notional,
-                        _net_loss_reduce_cap(long_notional),
+                        long_soft,
                     ),
                     role="best_quote_reduce_long",
                     inputs=inputs,
                     position_side=reduce_long_position_side,
                     force_reduce_only=True,
+                    min_effective_notional_cap=_soft_recovery_floor(long_notional, long_soft),
                 ),
             )
             if config.inventory_bias_opposite_entry_enabled:
@@ -1304,15 +1337,16 @@ def build_best_quote_maker_volume_plan(
         reduce_short_order = _build_order(
             side="BUY",
             price=_price_with_gap(bid, reduce_short_gap, -1),
-            notional=min(
+            notional=_recovery_reduce_notional(
                 buy_side_notional * reduce_short_budget_scale,
                 short_notional,
-                _net_loss_reduce_cap(short_notional),
+                short_soft,
             ),
             role="best_quote_reduce_short",
             inputs=inputs,
             position_side=reduce_short_position_side,
             force_reduce_only=True,
+            min_effective_notional_cap=_soft_recovery_floor(short_notional, short_soft),
         )
         _append_order(buy_orders, reduce_short_order)
         reduce_short_price = _safe_float(reduce_short_order.get("price")) if reduce_short_order else 0.0
@@ -1402,15 +1436,16 @@ def build_best_quote_maker_volume_plan(
         reduce_short_order = _build_order(
             side="BUY",
             price=_price_with_gap(bid, reduce_short_gap, -1),
-            notional=min(
+            notional=_recovery_reduce_notional(
                 buy_side_notional * reduce_short_budget_scale,
                 short_notional,
-                _net_loss_reduce_cap(short_notional),
+                short_soft,
             ),
             role="best_quote_reduce_short",
             inputs=inputs,
             position_side=reduce_short_position_side,
             force_reduce_only=True,
+            min_effective_notional_cap=_soft_recovery_floor(short_notional, short_soft),
         )
         _append_order(buy_orders, reduce_short_order)
         if (
@@ -1437,15 +1472,16 @@ def build_best_quote_maker_volume_plan(
         reduce_long_order = _build_order(
             side="SELL",
             price=_price_with_gap(ask, reduce_long_gap, 1),
-            notional=min(
+            notional=_recovery_reduce_notional(
                 sell_side_notional * reduce_long_budget_scale,
                 long_notional,
-                _net_loss_reduce_cap(long_notional),
+                long_soft,
             ),
             role="best_quote_reduce_long",
             inputs=inputs,
             position_side=reduce_long_position_side,
             force_reduce_only=True,
+            min_effective_notional_cap=_soft_recovery_floor(long_notional, long_soft),
         )
         _append_order(sell_orders, reduce_long_order)
         reduce_long_price = _safe_float(reduce_long_order.get("price")) if reduce_long_order else 0.0
@@ -1534,15 +1570,16 @@ def build_best_quote_maker_volume_plan(
         reduce_long_order = _build_order(
             side="SELL",
             price=_price_with_gap(ask, reduce_long_gap, 1),
-            notional=min(
+            notional=_recovery_reduce_notional(
                 sell_side_notional * reduce_long_budget_scale,
                 long_notional,
-                _net_loss_reduce_cap(long_notional),
+                long_soft,
             ),
             role="best_quote_reduce_long",
             inputs=inputs,
             position_side=reduce_long_position_side,
             force_reduce_only=True,
+            min_effective_notional_cap=_soft_recovery_floor(long_notional, long_soft),
         )
         _append_order(sell_orders, reduce_long_order)
         if (
@@ -1721,6 +1758,7 @@ def build_best_quote_maker_volume_plan(
             "projected_short_entry_notional": projected_short_entry_notional,
             "cycle_budget_notional": cycle_budget,
             "base_cycle_budget_notional": base_cycle_budget,
+            "soft_recovery_min_reduce_notional": soft_recovery_min_reduce_notional,
             "long_inventory_ratio": long_inventory_ratio,
             "short_inventory_ratio": short_inventory_ratio,
             "inventory_ratio": inventory_ratio,

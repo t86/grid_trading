@@ -10116,6 +10116,9 @@ class LoopRunnerTests(unittest.TestCase):
     def test_arx_best_quote_volume_profile_uses_entry_price_cost_basis(self) -> None:
         self.assertTrue(_uses_entry_price_cost_basis("arxusdt_best_quote_maker_volume_114_v2"))
 
+    def test_grvt_best_quote_volume_profile_uses_entry_price_cost_basis(self) -> None:
+        self.assertTrue(_uses_entry_price_cost_basis("grvt_daily_80k_bq_short_freeze_5pct_v1"))
+
     def test_trumpusdc_volume_long_profile_uses_v4_cost_guards(self) -> None:
         self.assertTrue(_uses_entry_price_cost_basis("trumpusdc_volume_long_v4"))
         self.assertTrue(_uses_volume_long_v4_staged_delever("trumpusdc_volume_long_v4"))
