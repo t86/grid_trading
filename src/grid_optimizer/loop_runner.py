@@ -2980,6 +2980,28 @@ def _best_quote_trade_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> 
     return ""
 
 
+def _summarize_ordinary_best_quote_open_order_roles(
+    orders: Iterable[Mapping[str, Any]],
+) -> dict[str, int]:
+    counts = {
+        "ordinary_active_entry_long_order_count": 0,
+        "ordinary_active_entry_short_order_count": 0,
+        "ordinary_active_reduce_long_order_count": 0,
+        "ordinary_active_reduce_short_order_count": 0,
+    }
+    role_to_key = {
+        "best_quote_entry_long": "ordinary_active_entry_long_order_count",
+        "best_quote_entry_short": "ordinary_active_entry_short_order_count",
+        "best_quote_reduce_long": "ordinary_active_reduce_long_order_count",
+        "best_quote_reduce_short": "ordinary_active_reduce_short_order_count",
+    }
+    for order in orders:
+        key = role_to_key.get(_best_quote_trade_role_from_row(order))
+        if key is not None:
+            counts[key] += 1
+    return counts
+
+
 def _best_quote_frozen_manual_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> str:
     client_order_id = str((row or {}).get("clientOrderId") or (row or {}).get("client_order_id") or "").strip()
     parts = client_order_id.lower().split("-")
@@ -33722,6 +33744,9 @@ def _execute_plan_report_unlocked(args: argparse.Namespace, plan_report: dict[st
         {
             "ordinary_active_order_count": len(current_ordinary_open_orders),
             "frozen_active_order_count": len(current_frozen_open_orders),
+            **_summarize_ordinary_best_quote_open_order_roles(
+                current_ordinary_open_orders
+            ),
         }
     )
     report["observed_strategy_open_order_state"] = observed_open_order_state

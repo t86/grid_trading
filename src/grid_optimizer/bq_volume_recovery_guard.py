@@ -2101,6 +2101,28 @@ def _active_order_count(plan: dict[str, Any], submit: dict[str, Any]) -> int:
     )
 
 
+def _ordinary_opposite_entry_available(assessment: Mapping[str, Any]) -> bool:
+    current_long = _safe_float(assessment.get("current_long_notional"))
+    current_short = _safe_float(assessment.get("current_short_notional"))
+    if current_long > current_short:
+        return bool(
+            _safe_int(assessment.get("planned_entry_sell_order_count")) > 0
+            or _safe_int(
+                assessment.get("ordinary_active_entry_short_order_count")
+            )
+            > 0
+        )
+    if current_short > current_long:
+        return bool(
+            _safe_int(assessment.get("planned_entry_buy_order_count")) > 0
+            or _safe_int(
+                assessment.get("ordinary_active_entry_long_order_count")
+            )
+            > 0
+        )
+    return False
+
+
 def _position_caps(plan: dict[str, Any], control: dict[str, Any]) -> tuple[float, float]:
     long_cap = _safe_float(
         plan.get("effective_max_position_notional")
@@ -2227,6 +2249,17 @@ def assess_symbol(
         is not None
     ]
     active_count = _active_order_count(plan, submit)
+    observed = (
+        submit.get("observed_strategy_open_order_state", {})
+        if isinstance(submit.get("observed_strategy_open_order_state"), dict)
+        else {}
+    )
+    ordinary_active_entry_long_order_count = _safe_int(
+        observed.get("ordinary_active_entry_long_order_count")
+    )
+    ordinary_active_entry_short_order_count = _safe_int(
+        observed.get("ordinary_active_entry_short_order_count")
+    )
     low_volume = gross < max(float(min_volume_notional), 0.0) or active_count <= 0
     if low_volume:
         reasons.append("low_volume")
@@ -2378,6 +2411,8 @@ def assess_symbol(
         "planned_entry_order_count": entry_order_count,
         "planned_entry_buy_order_count": entry_buy_order_count,
         "planned_entry_sell_order_count": entry_sell_order_count,
+        "ordinary_active_entry_long_order_count": ordinary_active_entry_long_order_count,
+        "ordinary_active_entry_short_order_count": ordinary_active_entry_short_order_count,
         "stale_order_count": stale_order_count,
         "missing_order_count": missing_order_count,
         "frozen_stale_order_count": frozen_stale_order_count,
@@ -6878,24 +6913,7 @@ def check_symbol(
                 control.get("best_quote_maker_volume_inventory_bias_reduce_share")
             )
             > 0
-            and (
-                (
-                    _safe_float(assessment.get("current_long_notional"))
-                    > _safe_float(assessment.get("current_short_notional"))
-                    and _safe_int(
-                        assessment.get("planned_entry_sell_order_count")
-                    )
-                    > 0
-                )
-                or (
-                    _safe_float(assessment.get("current_short_notional"))
-                    > _safe_float(assessment.get("current_long_notional"))
-                    and _safe_int(
-                        assessment.get("planned_entry_buy_order_count")
-                    )
-                    > 0
-                )
-            )
+            and _ordinary_opposite_entry_available(assessment)
             and not bool(assessment.get("volatility_entry_pause_active"))
         ):
             updates = {
@@ -6959,24 +6977,7 @@ def check_symbol(
                         "best_quote_maker_volume_inventory_bias_opposite_entry_enabled"
                     )
                 )
-                and (
-                    (
-                        _safe_float(assessment.get("current_long_notional"))
-                        > _safe_float(assessment.get("current_short_notional"))
-                        and _safe_int(
-                            assessment.get("planned_entry_sell_order_count")
-                        )
-                        > 0
-                    )
-                    or (
-                        _safe_float(assessment.get("current_short_notional"))
-                        > _safe_float(assessment.get("current_long_notional"))
-                        and _safe_int(
-                            assessment.get("planned_entry_buy_order_count")
-                        )
-                        > 0
-                    )
-                )
+                and _ordinary_opposite_entry_available(assessment)
             )
             and "best_quote_maker_volume_inventory_bias_reduce_share" in control
             and _safe_float(control.get("best_quote_maker_volume_inventory_bias_reduce_share")) < 0.25

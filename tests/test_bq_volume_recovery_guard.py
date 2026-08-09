@@ -10055,6 +10055,126 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 0.0,
             )
 
+    def test_wrong_way_recovery_keeps_budget_on_live_ordinary_opposite_entry(self) -> None:
+        now = datetime(2026, 7, 12, 4, 22, 30, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                    "best_quote_maker_volume_inventory_bias_reduce_share": 0.0,
+                    "best_quote_maker_volume_inventory_bias_opposite_entry_enabled": True,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.95,
+                    "pause_buy_position_notional": 350.0,
+                    "pause_short_position_notional": 350.0,
+                },
+                long_notional=368.0,
+                short_notional=145.0,
+                open_order_count=0,
+                active_order_count=1,
+                recent_trade_notional=20.0,
+            )
+            submit_path = output_dir / "reusdt_loop_latest_submit.json"
+            submit = json.loads(submit_path.read_text(encoding="utf-8"))
+            submit["observed_strategy_open_order_state"].update(
+                {
+                    "ordinary_active_order_count": 1,
+                    "ordinary_active_entry_short_order_count": 1,
+                }
+            )
+            _write_json(submit_path, submit)
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state={"symbols": {"REUSDT": {"status": "recovery_active"}}},
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=0,
+                restart_runner=lambda _symbol: None,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertNotEqual(
+                result["action"],
+                "enable_dominant_leg_reduce_share_for_wrong_way_recovery",
+            )
+            self.assertEqual(
+                result["assessment"]["ordinary_active_entry_short_order_count"],
+                1,
+            )
+            self.assertEqual(
+                control["best_quote_maker_volume_inventory_bias_reduce_share"],
+                0.0,
+            )
+
+    def test_wrong_way_recovery_ignores_frozen_opposite_entry(self) -> None:
+        now = datetime(2026, 7, 12, 4, 22, 45, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                    "best_quote_maker_volume_inventory_bias_reduce_share": 0.0,
+                    "best_quote_maker_volume_inventory_bias_opposite_entry_enabled": True,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.95,
+                    "pause_buy_position_notional": 350.0,
+                    "pause_short_position_notional": 350.0,
+                },
+                long_notional=368.0,
+                short_notional=145.0,
+                open_order_count=0,
+                active_order_count=2,
+                recent_trade_notional=20.0,
+            )
+            submit_path = output_dir / "reusdt_loop_latest_submit.json"
+            submit = json.loads(submit_path.read_text(encoding="utf-8"))
+            submit["observed_strategy_open_order_state"].update(
+                {
+                    "ordinary_active_order_count": 1,
+                    "ordinary_active_entry_short_order_count": 0,
+                    "frozen_active_order_count": 1,
+                    "frozen_active_entry_short_order_count": 1,
+                }
+            )
+            _write_json(submit_path, submit)
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state={"symbols": {"REUSDT": {"status": "recovery_active"}}},
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=0,
+                restart_runner=lambda _symbol: None,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                result["action"],
+                "enable_dominant_leg_reduce_share_for_wrong_way_recovery",
+            )
+            self.assertEqual(
+                control["best_quote_maker_volume_inventory_bias_reduce_share"],
+                0.25,
+            )
+
     def test_wrong_way_recovery_restores_budget_to_available_opposite_entry(self) -> None:
         now = datetime(2026, 7, 12, 4, 23, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
@@ -10129,6 +10249,65 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
             self.assertFalse(
                 control["best_quote_maker_volume_net_loss_reduce_enabled"]
+            )
+            self.assertEqual(restarts, ["REUSDT"])
+
+    def test_wrong_way_recovery_restores_budget_to_live_ordinary_opposite_entry(self) -> None:
+        now = datetime(2026, 7, 12, 4, 23, 30, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 72.0,
+                    "best_quote_maker_volume_inventory_bias_reduce_share": 0.25,
+                    "best_quote_maker_volume_inventory_bias_opposite_entry_enabled": True,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.95,
+                    "pause_buy_position_notional": 350.0,
+                    "pause_short_position_notional": 350.0,
+                },
+                long_notional=368.0,
+                short_notional=145.0,
+                open_order_count=0,
+                active_order_count=1,
+                recent_trade_notional=20.0,
+            )
+            submit_path = output_dir / "reusdt_loop_latest_submit.json"
+            submit = json.loads(submit_path.read_text(encoding="utf-8"))
+            submit["observed_strategy_open_order_state"].update(
+                {
+                    "ordinary_active_order_count": 1,
+                    "ordinary_active_entry_short_order_count": 1,
+                }
+            )
+            _write_json(submit_path, submit)
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="REUSDT",
+                output_dir=output_dir,
+                state={"symbols": {"REUSDT": {"status": "recovery_active"}}},
+                now=now,
+                window_seconds=180,
+                min_volume_notional=100,
+                trigger_seconds=0,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "reusdt_loop_runner_control.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                result["action"],
+                "prioritize_opposite_entry_over_dominant_reduce",
+            )
+            self.assertEqual(
+                control["best_quote_maker_volume_inventory_bias_reduce_share"],
+                0.0,
             )
             self.assertEqual(restarts, ["REUSDT"])
 

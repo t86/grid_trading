@@ -13,6 +13,7 @@ from grid_optimizer.loop_runner import (
     _should_backfill_open_orders_rest,
     _should_backfill_trade_rest,
     _snapshot_runner_account_position,
+    _summarize_ordinary_best_quote_open_order_roles,
     _summarize_runner_strategy_open_order_state,
     _summarize_runner_strategy_execution_events,
     _snapshot_runner_execution_events,
@@ -22,6 +23,32 @@ from grid_optimizer.loop_runner import (
 
 
 class LoopRunnerExecutionEventHelpersTests(unittest.TestCase):
+    def test_summarize_ordinary_best_quote_open_order_roles(self) -> None:
+        summary = _summarize_ordinary_best_quote_open_order_roles(
+            [
+                {
+                    "clientOrderId": "gx-grvtu-bestquot-0-12345678",
+                    "side": "SELL",
+                    "positionSide": "SHORT",
+                },
+                {
+                    "clientOrderId": "gx-grvtu-bestquot-1-12345678",
+                    "side": "BUY",
+                    "positionSide": "SHORT",
+                },
+                {
+                    "clientOrderId": "gx-grvtu-bestquot-2-12345678",
+                    "side": "BUY",
+                    "positionSide": "LONG",
+                },
+            ]
+        )
+
+        self.assertEqual(summary["ordinary_active_entry_short_order_count"], 1)
+        self.assertEqual(summary["ordinary_active_reduce_short_order_count"], 1)
+        self.assertEqual(summary["ordinary_active_entry_long_order_count"], 1)
+        self.assertEqual(summary["ordinary_active_reduce_long_order_count"], 0)
+
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
     def test_maybe_start_runner_user_data_stream_skips_without_credentials(self, mock_credentials) -> None:
         mock_credentials.return_value = None
