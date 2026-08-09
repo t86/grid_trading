@@ -1091,6 +1091,7 @@ class LoopRunnerTests(unittest.TestCase):
         volatility_entry_pause = {"active": True, "reason": "fast move"}
 
         apply_volatility_entry_pause_controls(
+            symbol="GRVTUSDT",
             controls=controls,
             volatility_entry_pause=volatility_entry_pause,
             loss_recovery_brush={"active": True, "side": "short"},
@@ -1119,6 +1120,7 @@ class LoopRunnerTests(unittest.TestCase):
         }
 
         apply_volatility_entry_pause_controls(
+            symbol="GRVTUSDT",
             controls=controls,
             volatility_entry_pause=pause,
             loss_recovery_brush={},
@@ -1156,6 +1158,7 @@ class LoopRunnerTests(unittest.TestCase):
         }
 
         apply_volatility_entry_pause_controls(
+            symbol="GRVTUSDT",
             controls=controls,
             volatility_entry_pause=pause,
             loss_recovery_brush={},
@@ -1272,6 +1275,107 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(
             controls["short_pause_reasons"],
             ["volatility_entry_pause: extreme_volatility_defensive"],
+        )
+
+    def test_high_volatility_drop_blocks_only_long_entry_when_long_heavy(self) -> None:
+        controls = {
+            "buy_paused": False,
+            "short_paused": False,
+            "pause_reasons": [],
+            "short_pause_reasons": [],
+        }
+        pause = {"active": False, "trigger_active": False}
+
+        apply_volatility_entry_pause_controls(
+            symbol="GRVTUSDT",
+            controls=controls,
+            volatility_entry_pause=pause,
+            loss_recovery_brush={},
+            elastic_volume={},
+            dynamic_control={
+                "reason": "high_volatility_defensive",
+                "market_return_1m": -0.003,
+            },
+            current_long_notional=885.0,
+            current_short_notional=289.0,
+            long_entry_limit_notional=900.0,
+            short_entry_limit_notional=900.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+        )
+
+        self.assertTrue(controls["buy_paused"])
+        self.assertFalse(controls["short_paused"])
+        self.assertEqual(
+            pause["high_volatility_directional_guard"]["blocked_side"],
+            "BUY",
+        )
+
+    def test_high_volatility_rise_blocks_only_short_entry_when_short_heavy(self) -> None:
+        controls = {
+            "buy_paused": False,
+            "short_paused": False,
+            "pause_reasons": [],
+            "short_pause_reasons": [],
+        }
+        pause = {"active": False, "trigger_active": False}
+
+        apply_volatility_entry_pause_controls(
+            symbol="GRVTUSDT",
+            controls=controls,
+            volatility_entry_pause=pause,
+            loss_recovery_brush={},
+            elastic_volume={},
+            dynamic_control={
+                "reason": "high_volatility_defensive",
+                "market_return_1m": 0.003,
+            },
+            current_long_notional=280.0,
+            current_short_notional=890.0,
+            long_entry_limit_notional=900.0,
+            short_entry_limit_notional=900.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+        )
+
+        self.assertFalse(controls["buy_paused"])
+        self.assertTrue(controls["short_paused"])
+        self.assertEqual(
+            pause["high_volatility_directional_guard"]["blocked_side"],
+            "SELL",
+        )
+
+    def test_high_volatility_balanced_inventory_keeps_both_entries_available(self) -> None:
+        controls = {
+            "buy_paused": False,
+            "short_paused": False,
+            "pause_reasons": [],
+            "short_pause_reasons": [],
+        }
+        pause = {"active": False, "trigger_active": False}
+
+        apply_volatility_entry_pause_controls(
+            symbol="GRVTUSDT",
+            controls=controls,
+            volatility_entry_pause=pause,
+            loss_recovery_brush={},
+            elastic_volume={},
+            dynamic_control={
+                "reason": "high_volatility_defensive",
+                "market_return_1m": -0.003,
+            },
+            current_long_notional=840.0,
+            current_short_notional=780.0,
+            long_entry_limit_notional=900.0,
+            short_entry_limit_notional=900.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+        )
+
+        self.assertFalse(controls["buy_paused"])
+        self.assertFalse(controls["short_paused"])
+        self.assertFalse(
+            pause["high_volatility_directional_guard"]["active"]
         )
 
     def test_volatility_entry_pause_classifies_best_quote_reduces_as_exits(self) -> None:

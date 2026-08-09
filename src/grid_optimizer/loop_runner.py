@@ -1247,6 +1247,7 @@ def resolve_volatility_entry_pause(
 
 def apply_volatility_entry_pause_controls(
     *,
+    symbol: str = "",
     controls: dict[str, Any],
     volatility_entry_pause: dict[str, Any],
     loss_recovery_brush: dict[str, Any],
@@ -1264,10 +1265,62 @@ def apply_volatility_entry_pause_controls(
     directional_recovery_max_light_share: float = 0.50,
 ) -> None:
     dynamic = dynamic_control if isinstance(dynamic_control, dict) else {}
-    extreme_volatility = str(dynamic.get("reason") or "") == "extreme_volatility_defensive"
-    if not volatility_entry_pause.get("active") and not extreme_volatility:
+    dynamic_reason = str(dynamic.get("reason") or "")
+    extreme_volatility = dynamic_reason == "extreme_volatility_defensive"
+    high_volatility = dynamic_reason == "high_volatility_defensive"
+    pause_active = bool(volatility_entry_pause.get("active"))
+    if (
+        str(symbol or "").upper().strip() == "GRVTUSDT"
+        and high_volatility
+        and not pause_active
+    ):
+        long_notional = max(_safe_float(current_long_notional), 0.0)
+        short_notional = max(_safe_float(current_short_notional), 0.0)
+        gap_notional = abs(long_notional - short_notional)
+        heavy_notional = max(long_notional, short_notional)
+        light_notional = min(long_notional, short_notional)
+        min_gap_notional = max(_safe_float(directional_recovery_min_gap_notional), 0.0)
+        max_light_share = min(
+            max(_safe_float(directional_recovery_max_light_share), 0.0),
+            1.0,
+        )
+        materially_imbalanced = bool(
+            heavy_notional > 0
+            and gap_notional >= min_gap_notional
+            and light_notional <= heavy_notional * max_light_share + 1e-12
+        )
+        market_return_1m = _safe_float(dynamic.get("market_return_1m"))
+        blocked_side: str | None = None
+        if materially_imbalanced and long_notional > short_notional and market_return_1m < 0:
+            controls["buy_paused"] = True
+            controls["pause_reasons"] = list(controls.get("pause_reasons", []))
+            controls["pause_reasons"].append(
+                "high_volatility_directional: long-heavy drop"
+            )
+            blocked_side = "BUY"
+        elif materially_imbalanced and short_notional > long_notional and market_return_1m > 0:
+            controls["short_paused"] = True
+            controls["short_pause_reasons"] = list(
+                controls.get("short_pause_reasons", [])
+            )
+            controls["short_pause_reasons"].append(
+                "high_volatility_directional: short-heavy rise"
+            )
+            blocked_side = "SELL"
+        volatility_entry_pause["high_volatility_directional_guard"] = {
+            "active": blocked_side is not None,
+            "blocked_side": blocked_side,
+            "ordinary_long_notional": long_notional,
+            "ordinary_short_notional": short_notional,
+            "imbalance_notional": gap_notional,
+            "market_return_1m": market_return_1m,
+        }
         return
-    if bool(elastic_volume.get("enabled") and elastic_volume.get("applied")) and not extreme_volatility:
+    if not pause_active and not extreme_volatility:
+        return
+    if pause_active and bool(
+        elastic_volume.get("enabled") and elastic_volume.get("applied")
+    ) and not extreme_volatility:
         volatility_entry_pause["entry_pause_absorbed_by_elastic"] = True
         return
 
@@ -1328,8 +1381,6 @@ def apply_volatility_entry_pause_controls(
     )
     directional_recovery_allowed = False
     directional_bypass_side: str | None = None
-    dynamic_reason = str(dynamic.get("reason") or "")
-    high_volatility = dynamic_reason == "high_volatility_defensive"
     if recovery_window_open:
         if (
             materially_imbalanced
@@ -32305,6 +32356,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         controls["short_pause_reasons"].append(f"unrealized_loss_entry_guard: {guard_reason}")
 
     apply_volatility_entry_pause_controls(
+        symbol=symbol,
         controls=controls,
         volatility_entry_pause=volatility_entry_pause,
         loss_recovery_brush=loss_recovery_brush,
