@@ -21838,7 +21838,39 @@ def _guard_temporary_loss_order_before_submit(
         return guarded_order, None
     if role.startswith("best_quote_active_pair_reduce_"):
         # Active-pair recovery is independently bounded by the fixed ordinary
-        # inventory threshold and emits at most one order per eligible side.
+        # inventory threshold, a conservative cost-distance cap, and at most
+        # one order per eligible side. Re-check the distance at submit time so
+        # a stale or replayed plan cannot bypass the planner guard.
+        reported_max_loss_ratio = _safe_float(
+            (plan_report.get("best_quote_active_pair_reduce") or {}).get(
+                "max_loss_ratio"
+            )
+        )
+        max_loss_ratio = (
+            reported_max_loss_ratio if reported_max_loss_ratio > 0 else 0.005
+        )
+        submitted_price = max(_safe_float(guarded_order.get("price")), 0.0)
+        if role.endswith("_long"):
+            cost_basis = max(_safe_float(plan_report.get("current_long_avg_price")), 0.0)
+            loss_ratio = (
+                max((cost_basis - submitted_price) / cost_basis, 0.0)
+                if cost_basis > 0 and submitted_price > 0
+                else float("inf")
+            )
+        else:
+            cost_basis = max(_safe_float(plan_report.get("current_short_avg_price")), 0.0)
+            loss_ratio = (
+                max((submitted_price - cost_basis) / cost_basis, 0.0)
+                if cost_basis > 0 and submitted_price > 0
+                else float("inf")
+            )
+        if loss_ratio > max_loss_ratio + 1e-12:
+            return None, {
+                "reason": "active_pair_loss_ratio_above_limit",
+                "role": role,
+                "loss_ratio": loss_ratio,
+                "max_loss_ratio": max_loss_ratio,
+            }
         _restore_force_reduce_only()
         return guarded_order, None
     authorization = _temporary_loss_runtime_authorization(args, now=now)
@@ -23165,6 +23197,7 @@ def _best_quote_active_pair_reduce_default_report() -> dict[str, Any]:
         "per_order_notional": 0.0,
         "max_reduce_notional_per_side": 0.0,
         "loss_reduce_threshold_notional": 0.0,
+        "max_loss_ratio": 0.005,
         "eligible_sides": [],
         "normal_entry_suppressed": False,
         "suppressed_entry_order_count": 0,
@@ -23198,6 +23231,9 @@ def apply_best_quote_active_pair_reduce(
     ask_price: float,
     volatility_entry_pause: dict[str, Any] | None,
     loss_reduce_threshold_notional: float | None = None,
+    current_long_avg_price: float | None = None,
+    current_short_avg_price: float | None = None,
+    max_loss_ratio: float = 0.005,
 ) -> dict[str, Any]:
     report = _best_quote_active_pair_reduce_default_report()
     report["enabled"] = bool(enabled)
@@ -23212,6 +23248,9 @@ def apply_best_quote_active_pair_reduce(
     long_soft = max(_safe_float(max_long_notional), 0.0) * safe_soft_ratio
     short_soft = max(_safe_float(max_short_notional), 0.0) * safe_soft_ratio
     safe_loss_threshold = max(_safe_float(loss_reduce_threshold_notional), 0.0)
+    safe_long_avg_price = max(_safe_float(current_long_avg_price), 0.0)
+    safe_short_avg_price = max(_safe_float(current_short_avg_price), 0.0)
+    safe_max_loss_ratio = max(_safe_float(max_loss_ratio), 0.0)
     threshold_side_mode = safe_loss_threshold > 0
     report.update(
         {
@@ -23220,6 +23259,7 @@ def apply_best_quote_active_pair_reduce(
             "long_soft_notional": long_soft,
             "short_soft_notional": short_soft,
             "loss_reduce_threshold_notional": safe_loss_threshold,
+            "max_loss_ratio": safe_max_loss_ratio,
         }
     )
 
@@ -23405,6 +23445,20 @@ def apply_best_quote_active_pair_reduce(
         )
         if price <= 0:
             return
+        cost_basis = safe_long_avg_price if side_name == "long" else safe_short_avg_price
+        if threshold_side_mode:
+            if cost_basis <= 0 or safe_max_loss_ratio <= 0:
+                report[f"{side_name}_blocked_reason"] = "loss_ratio_guard_unavailable"
+                return
+            loss_ratio = (
+                max((cost_basis - price) / cost_basis, 0.0)
+                if side_name == "long"
+                else max((price - cost_basis) / cost_basis, 0.0)
+            )
+            report[f"{side_name}_expected_loss_ratio"] = loss_ratio
+            if loss_ratio > safe_max_loss_ratio + 1e-12:
+                report[f"{side_name}_blocked_reason"] = "loss_ratio_above_limit"
+                return
         qty = _round_order_qty(min(current_qty, budget / price), step_size)
         notional = qty * price
         if qty <= 0:
@@ -32307,6 +32361,8 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             ask_price=ask_price,
             volatility_entry_pause=volatility_entry_pause,
             loss_reduce_threshold_notional=loss_reduce_threshold_notional,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
         )
     else:
         state.pop("best_quote_active_pair_reduce", None)

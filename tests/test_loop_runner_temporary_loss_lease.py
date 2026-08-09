@@ -469,9 +469,9 @@ def test_submit_boundary_rechecks_expired_lease_before_order_post() -> None:
     args = _args(active)
     order = {
         "side": "SELL",
-        "price": 0.96,
+        "price": 1.016,
         "qty": 100.0,
-        "notional": 96.0,
+        "notional": 101.6,
         "role": "best_quote_reduce_long",
         "position_side": "LONG",
     }
@@ -636,9 +636,9 @@ def test_submit_boundary_allows_one_active_pair_loss_only_above_fixed_threshold(
     )
     order = {
         "side": "SELL",
-        "price": 0.96,
+        "price": 1.016,
         "qty": 100.0,
-        "notional": 96.0,
+        "notional": 101.6,
         "role": "best_quote_active_pair_reduce_long",
         "position_side": "LONG",
         "force_reduce_only": True,
@@ -687,7 +687,7 @@ def test_submit_boundary_allows_one_active_pair_loss_only_above_fixed_threshold(
 
     assert above_reason is None
     assert above is not None
-    assert above["price"] == pytest.approx(0.96)
+    assert above["price"] == pytest.approx(1.016)
     assert "_temporary_loss_client_order_prefix" not in above
     assert below is None
     assert below_reason["reason"] == "temporary_loss_lease_not_authorized"

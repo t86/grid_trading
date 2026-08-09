@@ -11475,6 +11475,8 @@ class LoopRunnerTests(unittest.TestCase):
             ask_price=0.2891,
             volatility_entry_pause={"active": False},
             loss_reduce_threshold_notional=800.0,
+            current_long_avg_price=0.2900,
+            current_short_avg_price=0.2880,
         )
 
         self.assertTrue(report["active"])
@@ -11520,6 +11522,8 @@ class LoopRunnerTests(unittest.TestCase):
             ask_price=0.2891,
             volatility_entry_pause={"active": False},
             loss_reduce_threshold_notional=800.0,
+            current_long_avg_price=0.2900,
+            current_short_avg_price=0.2880,
         )
 
         self.assertFalse(report["active"])
@@ -11554,6 +11558,8 @@ class LoopRunnerTests(unittest.TestCase):
             ask_price=0.2891,
             volatility_entry_pause={"active": False},
             loss_reduce_threshold_notional=800.0,
+            current_long_avg_price=0.2900,
+            current_short_avg_price=0.2880,
         )
 
         self.assertTrue(report["active"])
@@ -11597,6 +11603,8 @@ class LoopRunnerTests(unittest.TestCase):
             ask_price=0.2891,
             volatility_entry_pause={"active": False},
             loss_reduce_threshold_notional=800.0,
+            current_long_avg_price=0.2900,
+            current_short_avg_price=0.2880,
         )
 
         self.assertEqual(report["long_blocked_by_role"], "inventory_unlock_reduce_long")
@@ -11604,6 +11612,43 @@ class LoopRunnerTests(unittest.TestCase):
             [item["role"] for item in plan["sell_orders"]],
             ["inventory_unlock_reduce_long"],
         )
+
+    def test_best_quote_active_pair_reduce_blocks_large_cost_distance(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state={},
+            enabled=True,
+            current_long_qty=3202.0,
+            current_short_qty=2448.0,
+            current_long_notional=916.89,
+            current_short_notional=700.98,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=55.0,
+            max_reduce_notional_per_side=200.0,
+            offset_ticks=1,
+            step_price=0.0006,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.2863,
+            ask_price=0.2864,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=800.0,
+            current_long_avg_price=0.29895,
+            current_short_avg_price=0.29880,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["long_blocked_reason"], "loss_ratio_above_limit")
+        self.assertGreater(report["long_expected_loss_ratio"], 0.04)
+        self.assertEqual(report["order_count"], 0)
+        self.assertEqual(plan["sell_orders"], [])
 
     def test_best_quote_active_pair_reduce_respects_volatility_pause(self) -> None:
         plan = {"buy_orders": [], "sell_orders": []}
