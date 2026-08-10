@@ -6045,6 +6045,24 @@ def check_symbol(
         and not confirmed_loss_reduce_wear
         and not recovery_timed_out
     )
+    grvt_dual_soft_dynamic_release_safe = (
+        grvt_volatility_pause
+        and not bool(assessment.get("volatility_entry_pause_active"))
+        and not active_pair_reduce_deadlock
+        and bool(assessment.get("low_volume"))
+        and target_pace_behind
+        and _safe_int(assessment.get("planned_entry_order_count")) == 0
+        and bool(assessment.get("planned_reduce_only_only"))
+        and _safe_float(assessment.get("ordinary_long_notional"))
+        > _safe_float(assessment.get("long_soft_limit_notional"))
+        and _safe_float(assessment.get("ordinary_short_notional"))
+        > _safe_float(assessment.get("short_soft_limit_notional"))
+        and _safe_float(assessment.get("ordinary_long_notional"))
+        <= _safe_float(assessment.get("max_long_notional"))
+        and _safe_float(assessment.get("ordinary_short_notional"))
+        <= _safe_float(assessment.get("max_short_notional"))
+        and not recovery_timed_out
+    )
     grvt_soft_loss_profile_active = (
         bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
         and not bool(control.get("best_quote_maker_volume_net_loss_reduce_enabled"))
@@ -6146,7 +6164,10 @@ def check_symbol(
             and not recovery_timeout_required
         ):
             action = "skip_recovery_safety_gate"
-        elif grvt_post_shock_soft_release_safe and not grvt_soft_loss_profile_active:
+        elif (
+            grvt_post_shock_soft_release_safe
+            or grvt_dual_soft_dynamic_release_safe
+        ) and not grvt_soft_loss_profile_active:
             loss_updates = _loss_reduce_recovery_updates(
                 control=control,
                 assessment=assessment,
@@ -6179,11 +6200,18 @@ def check_symbol(
                 dry_run=dry_run,
                 restart_runner=restart,
             )
-            action = (
-                "dry_run_enable_grvt_post_shock_soft_loss_release"
-                if dry_run
-                else "enable_grvt_post_shock_soft_loss_release"
-            )
+            if grvt_dual_soft_dynamic_release_safe:
+                action = (
+                    "dry_run_enable_grvt_dual_soft_loss_release"
+                    if dry_run
+                    else "enable_grvt_dual_soft_loss_release"
+                )
+            else:
+                action = (
+                    "dry_run_enable_grvt_post_shock_soft_loss_release"
+                    if dry_run
+                    else "enable_grvt_post_shock_soft_loss_release"
+                )
             item.update(
                 {
                     "status": "recovery_active",
@@ -6194,8 +6222,15 @@ def check_symbol(
                     "last_recovery_action": action,
                 }
             )
-        elif grvt_post_shock_soft_release_safe and grvt_soft_loss_profile_active:
-            action = "hold_grvt_post_shock_soft_loss_release"
+        elif (
+            grvt_post_shock_soft_release_safe
+            or grvt_dual_soft_dynamic_release_safe
+        ) and grvt_soft_loss_profile_active:
+            action = (
+                "hold_grvt_dual_soft_loss_release"
+                if grvt_dual_soft_dynamic_release_safe
+                else "hold_grvt_post_shock_soft_loss_release"
+            )
             item.update(
                 {
                     "status": "recovery_active",
