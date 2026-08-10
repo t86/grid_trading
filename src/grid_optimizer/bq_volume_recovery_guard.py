@@ -5021,8 +5021,15 @@ def check_symbol(
     effective_inventory_soft_pressure = bool(assessment.get("inventory_soft_pressure")) and not (
         actual_inventory_below_soft
     )
+    # GRVT's bounded active-pair relief is the escape hatch from a soft-cap
+    # deadlock. Its lease/cap guards remain in force, but wear must not turn
+    # it off before ordinary inventory has actually cleared the soft limit.
+    grvt_soft_loss_relief_override = (
+        normalized_symbol == "GRVTUSDT" and effective_inventory_soft_pressure
+    )
     assessment["actual_inventory_below_soft"] = actual_inventory_below_soft
     assessment["effective_inventory_soft_pressure"] = effective_inventory_soft_pressure
+    assessment["grvt_soft_loss_relief_override"] = grvt_soft_loss_relief_override
     recovery_entry_reserve_notional = max(
         _safe_float(control.get("per_order_notional")),
         _safe_float(control.get("maker_order_notional")),
@@ -6913,6 +6920,7 @@ def check_symbol(
         elif (
             confirmed_loss_reduce_wear
             and bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
+            and not grvt_soft_loss_relief_override
         ):
             current_budget = _safe_float(
                 control.get("best_quote_maker_volume_cycle_budget_notional")
@@ -6988,6 +6996,7 @@ def check_symbol(
         elif (
             high_recovery_wear
             and confirmed_loss_reduce_wear
+            and not grvt_soft_loss_relief_override
             and not bool(control.get("best_quote_maker_volume_allow_loss_reduce_only"))
             and bool(control.get("best_quote_maker_volume_active_pair_reduce_enabled"))
             and _safe_int(assessment.get("planned_reduce_only_order_count")) > 0
@@ -9771,6 +9780,7 @@ def check_symbol(
             and not post_restore_budget_cooldown_active
             and (
                 critical_arx_inventory_pace_override
+                or grvt_soft_loss_relief_override
                 or (not high_recovery_wear and not confirmed_loss_reduce_wear)
             )
             and effective_inventory_soft_pressure
@@ -9889,8 +9899,11 @@ def check_symbol(
             elif (
                 effective_inventory_soft_pressure
                 and not effective_near_market_flow
-                and not high_recovery_wear
-                and not confirmed_loss_reduce_wear
+                and (not high_recovery_wear or grvt_soft_loss_relief_override)
+                and (
+                    not confirmed_loss_reduce_wear
+                    or grvt_soft_loss_relief_override
+                )
                 and not recovery_reapply_debounced
                 and not post_restore_budget_cooldown_active
             ):
@@ -10032,9 +10045,14 @@ def check_symbol(
                     and no_fill_seconds >= max(float(trigger_seconds), 0.0)
                     and bool(assessment.get("inventory_soft_pressure"))
                     and not (
-                        normalized_symbol == "GRVTUSDT" and high_recovery_wear
+                        normalized_symbol == "GRVTUSDT"
+                        and high_recovery_wear
+                        and not grvt_soft_loss_relief_override
                     )
-                    and not confirmed_loss_reduce_wear
+                    and (
+                        not confirmed_loss_reduce_wear
+                        or grvt_soft_loss_relief_override
+                    )
                     and (
                         not post_restore_budget_cooldown_active
                         or arx_severe_volume_priority_recovery
@@ -10222,9 +10240,13 @@ def check_symbol(
                     action = "hold_effective_near_market_flow"
                 elif require_soft_pressure_for_allow_loss and not effective_inventory_soft_pressure:
                     action = "hold_low_volume_without_soft_pressure"
-                elif confirmed_loss_reduce_wear:
+                elif confirmed_loss_reduce_wear and not grvt_soft_loss_relief_override:
                     action = "hold_confirmed_wear_without_loss_reduce"
-                elif normalized_symbol == "GRVTUSDT" and high_recovery_wear:
+                elif (
+                    normalized_symbol == "GRVTUSDT"
+                    and high_recovery_wear
+                    and not grvt_soft_loss_relief_override
+                ):
                     action = "hold_high_wear_without_loss_reduce"
                 elif recovery_reapply_debounced:
                     action = "hold_loss_reduce_reapply_debounce"
@@ -10280,8 +10302,15 @@ def check_symbol(
                     )
                     chosen_action = "disable_inventory_cost_gate"
                 elif (
-                    not (normalized_symbol == "GRVTUSDT" and high_recovery_wear)
-                    and not confirmed_loss_reduce_wear
+                    not (
+                        normalized_symbol == "GRVTUSDT"
+                        and high_recovery_wear
+                        and not grvt_soft_loss_relief_override
+                    )
+                    and (
+                        not confirmed_loss_reduce_wear
+                        or grvt_soft_loss_relief_override
+                    )
                     and not recovery_reapply_debounced
                     and not post_restore_budget_cooldown_active
                     and (
