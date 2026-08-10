@@ -6976,13 +6976,27 @@ def check_symbol(
             and not bool(assessment.get("near_cap"))
             and _safe_int(assessment.get("planned_entry_order_count")) >= 2
             and _safe_int(assessment.get("planned_reduce_only_order_count")) == 0
-            and _safe_float(control.get("best_quote_maker_volume_cycle_budget_notional"))
-            < cycle_budget_floor_notional
+            and (
+                _safe_float(
+                    control.get("best_quote_maker_volume_cycle_budget_notional")
+                )
+                < cycle_budget_floor_notional
+                or _safe_int(
+                    control.get("best_quote_maker_volume_quote_offset_ticks")
+                )
+                > 1
+            )
         ):
+            current_budget = _safe_float(
+                control.get("best_quote_maker_volume_cycle_budget_notional")
+            )
             updates = {
                 "best_quote_maker_volume_allow_loss_reduce_only": False,
                 "best_quote_maker_volume_net_loss_reduce_enabled": False,
-                "best_quote_maker_volume_cycle_budget_notional": cycle_budget_floor_notional,
+                "best_quote_maker_volume_cycle_budget_notional": max(
+                    current_budget,
+                    cycle_budget_floor_notional,
+                ),
                 "best_quote_maker_volume_quote_offset_ticks": max(
                     _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")) - 1,
                     1,
