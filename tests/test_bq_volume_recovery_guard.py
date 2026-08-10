@@ -10833,7 +10833,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["REUSDT"])
 
-    def test_high_wear_does_not_reopen_loss_reduce_after_five_minute_sample_clears(self) -> None:
+    def test_grvt_high_wear_reopens_loss_reduce_when_ordinary_inventory_is_over_soft(self) -> None:
         now = datetime(2026, 6, 26, 8, 10, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -10886,9 +10886,10 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
             self.assertTrue(result["assessment"]["high_recovery_wear"])
             self.assertFalse(result["assessment"]["confirmed_loss_reduce_wear"])
-            self.assertEqual(result["action"], "hold_high_wear_without_loss_reduce")
-            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
-            self.assertEqual(restarts, [])
+            self.assertTrue(result["assessment"]["grvt_soft_loss_relief_override"])
+            self.assertEqual(result["action"], "enable_allow_loss_reduce_only")
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, ["GRVTUSDT"])
 
     def test_high_wear_does_not_reopen_loss_reduce_for_ineffective_orders(self) -> None:
         now = datetime(2026, 6, 26, 8, 10, tzinfo=timezone.utc)
