@@ -6304,6 +6304,19 @@ def check_symbol(
                         "best_quote_maker_volume_active_pair_reduce_enabled": False,
                     }
                 )
+                if target_pace_behind and not bool(
+                    assessment.get("volatility_entry_pause_active")
+                ):
+                    restored_offset = _safe_int(
+                        updates.get(
+                            "best_quote_maker_volume_quote_offset_ticks",
+                            control.get("best_quote_maker_volume_quote_offset_ticks"),
+                        )
+                    )
+                    updates["best_quote_maker_volume_quote_offset_ticks"] = max(
+                        restored_offset - 1,
+                        1,
+                    )
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
@@ -6372,6 +6385,19 @@ def check_symbol(
                         "best_quote_maker_volume_active_pair_reduce_enabled": False,
                     }
                 )
+                if target_pace_behind and not bool(
+                    assessment.get("volatility_entry_pause_active")
+                ):
+                    restored_offset = _safe_int(
+                        updates.get(
+                            "best_quote_maker_volume_quote_offset_ticks",
+                            control.get("best_quote_maker_volume_quote_offset_ticks"),
+                        )
+                    )
+                    updates["best_quote_maker_volume_quote_offset_ticks"] = max(
+                        restored_offset - 1,
+                        1,
+                    )
                 changed, backup_path = _apply_control_update(
                     symbol=normalized_symbol,
                     control_path=control_path,
