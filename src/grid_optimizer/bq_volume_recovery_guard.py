@@ -6922,6 +6922,12 @@ def check_symbol(
                 control,
                 wear_backoff_floor,
             )
+            restored_quote_offset = _safe_int(
+                updates.get(
+                    "best_quote_maker_volume_quote_offset_ticks",
+                    control.get("best_quote_maker_volume_quote_offset_ticks"),
+                )
+            )
             updates.update(
                 {
                     "best_quote_maker_volume_allow_loss_reduce_only": False,
@@ -6932,9 +6938,21 @@ def check_symbol(
                         current_budget
                         - max(float(volume_recovery_cycle_budget_increment), 0.0),
                     ),
-                    "best_quote_maker_volume_quote_offset_ticks": max(
-                        _safe_int(control.get("best_quote_maker_volume_quote_offset_ticks")),
-                        1,
+                    "best_quote_maker_volume_quote_offset_ticks": (
+                        max(restored_quote_offset - 1, 1)
+                        if normalized_symbol == "GRVTUSDT"
+                        and target_pace_behind
+                        and not bool(
+                            assessment.get("volatility_entry_pause_active")
+                        )
+                        else max(
+                            _safe_int(
+                                control.get(
+                                    "best_quote_maker_volume_quote_offset_ticks"
+                                )
+                            ),
+                            1,
+                        )
                     ),
                 }
             )

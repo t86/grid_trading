@@ -14449,6 +14449,81 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertNotIn("guard_recovery_controls", state["symbols"]["REUSDT"])
             self.assertEqual(restarts, ["REUSDT"])
 
+    def test_grvt_high_wear_release_close_tightens_restored_offset(self) -> None:
+        now = datetime(2026, 8, 10, 13, 0, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                symbol="GRVTUSDT",
+                control={
+                    "best_quote_maker_volume_allow_loss_reduce_only": True,
+                    "best_quote_maker_volume_active_pair_reduce_enabled": True,
+                    "best_quote_maker_volume_cycle_budget_notional": 250.0,
+                    "best_quote_maker_volume_quote_offset_ticks": 11,
+                    "best_quote_maker_volume_min_cycle_budget_notional": 240.0,
+                    "per_order_notional": 55.0,
+                    "pause_buy_position_notional": 900.0,
+                    "pause_short_position_notional": 900.0,
+                },
+                long_notional=800.0,
+                short_notional=805.0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "GRVTUSDT": {
+                        "status": "recovery_active",
+                        "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
+                        "guard_original_controls": {
+                            "best_quote_maker_volume_allow_loss_reduce_only": False,
+                            "best_quote_maker_volume_active_pair_reduce_enabled": False,
+                            "best_quote_maker_volume_cycle_budget_notional": 260.0,
+                            "best_quote_maker_volume_quote_offset_ticks": 10,
+                        },
+                        "guard_recovery_controls": {
+                            "best_quote_maker_volume_allow_loss_reduce_only": True,
+                            "best_quote_maker_volume_active_pair_reduce_enabled": True,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="GRVTUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=300,
+                min_volume_notional=1,
+                trigger_seconds=120,
+                daily_target_notional=150_000.0,
+                trade_rows=[
+                    {
+                        "id": 1,
+                        "time": int((now - timedelta(minutes=2)).timestamp() * 1000),
+                        "quoteQty": "100",
+                        "realizedPnl": "-0.3",
+                    }
+                ],
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "grvtusdt_loop_runner_control.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(result["action"], "disable_loss_reduce_for_high_wear")
+            self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertFalse(control["best_quote_maker_volume_active_pair_reduce_enabled"])
+            self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 9)
+            self.assertEqual(restarts, ["GRVTUSDT"])
+
     def test_zero_order_budget_pause_repairs_legacy_wear_backoff_state(self) -> None:
         now = datetime(2026, 7, 12, 10, 35, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
