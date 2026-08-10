@@ -1271,6 +1271,12 @@ def apply_volatility_entry_pause_controls(
     extreme_volatility = dynamic_reason == "extreme_volatility_defensive"
     high_volatility = dynamic_reason == "high_volatility_defensive"
     pause_active = bool(volatility_entry_pause.get("active"))
+    # Dynamic volatility control is a sizing/spacing control.  It must not
+    # silently become a second entry pause when the explicit pause is off.
+    # In particular, GRVT's extreme tier is allowed to keep both maker lanes
+    # live at its reduced budget and widened step.
+    if extreme_volatility and not pause_active:
+        return
     if (
         is_grvt
         and high_volatility

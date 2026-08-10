@@ -1252,7 +1252,7 @@ class LoopRunnerTests(unittest.TestCase):
             self.assertTrue(controls["short_paused"])
             self.assertIsNone(pause["directional_recovery"]["bypass_side"])
 
-    def test_grvt_extreme_tier_recovers_only_balancing_side_after_observation(self) -> None:
+    def test_grvt_extreme_tier_keeps_both_sides_live_when_pause_is_off(self) -> None:
         now = datetime(2026, 8, 9, 2, 30, tzinfo=timezone.utc)
         controls = {
             "buy_paused": False,
@@ -1285,12 +1285,9 @@ class LoopRunnerTests(unittest.TestCase):
             now=now,
         )
 
-        self.assertTrue(controls["buy_paused"])
+        self.assertFalse(controls["buy_paused"])
         self.assertFalse(controls["short_paused"])
-        self.assertEqual(pause["directional_recovery"]["bypass_side"], "SELL")
-        self.assertTrue(
-            pause["directional_recovery"]["extreme_directional_only"]
-        )
+        self.assertNotIn("directional_recovery", pause)
 
     def test_grvt_extreme_tier_keeps_both_sides_paused_during_current_trigger(self) -> None:
         now = datetime(2026, 8, 9, 2, 30, tzinfo=timezone.utc)
@@ -1326,7 +1323,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(controls["short_paused"])
         self.assertIsNone(pause["directional_recovery"]["bypass_side"])
 
-    def test_extreme_dynamic_control_pauses_entry_without_pause_state(self) -> None:
+    def test_extreme_dynamic_control_does_not_pause_entry_without_pause_state(self) -> None:
         controls = {
             "buy_paused": False,
             "short_paused": False,
@@ -1343,16 +1340,10 @@ class LoopRunnerTests(unittest.TestCase):
             dynamic_control={"reason": "extreme_volatility_defensive"},
         )
 
-        self.assertTrue(controls["buy_paused"])
-        self.assertTrue(controls["short_paused"])
-        self.assertEqual(
-            controls["pause_reasons"],
-            ["volatility_entry_pause: extreme_volatility_defensive"],
-        )
-        self.assertEqual(
-            controls["short_pause_reasons"],
-            ["volatility_entry_pause: extreme_volatility_defensive"],
-        )
+        self.assertFalse(controls["buy_paused"])
+        self.assertFalse(controls["short_paused"])
+        self.assertEqual(controls["pause_reasons"], [])
+        self.assertEqual(controls["short_pause_reasons"], [])
 
     def test_high_volatility_drop_blocks_only_long_entry_when_long_heavy(self) -> None:
         controls = {
