@@ -12265,6 +12265,113 @@ class LoopRunnerTests(unittest.TestCase):
         )
         self.assertNotIn("best_quote_active_pair_reduce", state)
 
+    def test_threshold_mode_rearms_original_side_after_entry_refill(self) -> None:
+        state = {
+            "best_quote_active_pair_reduce": {
+                "active": False,
+                "mode": "threshold_side_v1",
+                "eligible_sides": ["long", "short"],
+                "trigger_count": 1,
+                "completed": True,
+            }
+        }
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {"side": "SELL", "role": "best_quote_entry_short", "notional": 55.0}
+            ],
+        }
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state=state,
+            enabled=True,
+            current_long_qty=2640.0,
+            current_short_qty=2370.0,
+            current_long_notional=960.0,
+            current_short_notional=864.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=100.0,
+            offset_ticks=1,
+            step_price=0.0006,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.3635,
+            ask_price=0.3636,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=900.0,
+            current_long_avg_price=0.3700,
+            current_short_avg_price=0.3300,
+            max_loss_ratio=0.20,
+            min_relief_notional=100.0,
+            suppress_all_entries_while_active=True,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertTrue(report["rearmed_after_refill"])
+        self.assertEqual(report["eligible_sides"], ["long"])
+        self.assertEqual(
+            state["best_quote_active_pair_reduce"]["trigger_count"],
+            2,
+        )
+        self.assertEqual(
+            [item["role"] for item in plan["sell_orders"]],
+            ["best_quote_active_pair_reduce_long"],
+        )
+
+    def test_threshold_mode_does_not_rearm_after_three_cycles(self) -> None:
+        state = {
+            "best_quote_active_pair_reduce": {
+                "active": False,
+                "mode": "threshold_side_v1",
+                "eligible_sides": ["long"],
+                "trigger_count": 3,
+                "completed": True,
+            }
+        }
+        plan = {"buy_orders": [], "sell_orders": []}
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state=state,
+            enabled=True,
+            current_long_qty=2640.0,
+            current_short_qty=2370.0,
+            current_long_notional=960.0,
+            current_short_notional=864.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=100.0,
+            offset_ticks=1,
+            step_price=0.0006,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.3635,
+            ask_price=0.3636,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=900.0,
+            current_long_avg_price=0.3700,
+            current_short_avg_price=0.3300,
+            max_loss_ratio=0.20,
+            min_relief_notional=100.0,
+            suppress_all_entries_while_active=True,
+        )
+
+        self.assertEqual(report["reason"], "lease_completed_waiting_disable")
+        self.assertEqual(report["execution_cycles"], 3)
+        self.assertEqual(report["order_count"], 0)
+
     def test_best_quote_active_pair_reduce_does_not_stack_inventory_unlock_same_side(self) -> None:
         plan = {
             "buy_orders": [],

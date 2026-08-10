@@ -23603,31 +23603,6 @@ def apply_best_quote_active_pair_reduce(
 
     if not enabled:
         return _clear("disabled")
-    if threshold_side_mode and bool(memory.get("completed")):
-        plan["buy_orders"] = [
-            dict(item)
-            for item in plan.get("buy_orders", [])
-            if isinstance(item, dict)
-            and _order_role(item) != "best_quote_active_pair_reduce_short"
-        ]
-        plan["sell_orders"] = [
-            dict(item)
-            for item in plan.get("sell_orders", [])
-            if isinstance(item, dict)
-            and _order_role(item) != "best_quote_active_pair_reduce_long"
-        ]
-        report.update(
-            {
-                "reason": "lease_completed_waiting_disable",
-                "completed": True,
-                "eligible_sides": [
-                    str(side)
-                    for side in memory.get("eligible_sides", [])
-                    if str(side) in {"long", "short"}
-                ],
-            }
-        )
-        return report
     if safe_per_order <= 0 or safe_max_reduce <= 0:
         return _clear("invalid_budget")
     volatility_pause_active = bool((volatility_entry_pause or {}).get("active"))
@@ -23664,6 +23639,40 @@ def apply_best_quote_active_pair_reduce(
             or (not threshold_side_mode and notional >= soft_notional)
         )
     }
+    if threshold_side_mode and bool(memory.get("completed")):
+        prior_eligible_sides = {
+            str(side)
+            for side in memory.get("eligible_sides", [])
+            if str(side) in {"long", "short"}
+        }
+        rebreached_sides = threshold_eligible_sides & prior_eligible_sides
+        trigger_count = max(int(memory.get("trigger_count") or 0), 0)
+        if rebreached_sides and trigger_count < 3:
+            threshold_eligible_sides = rebreached_sides
+            memory = {"trigger_count": trigger_count}
+            report["rearmed_after_refill"] = True
+        else:
+            plan["buy_orders"] = [
+                dict(item)
+                for item in plan.get("buy_orders", [])
+                if isinstance(item, dict)
+                and _order_role(item) != "best_quote_active_pair_reduce_short"
+            ]
+            plan["sell_orders"] = [
+                dict(item)
+                for item in plan.get("sell_orders", [])
+                if isinstance(item, dict)
+                and _order_role(item) != "best_quote_active_pair_reduce_long"
+            ]
+            report.update(
+                {
+                    "reason": "lease_completed_waiting_disable",
+                    "completed": True,
+                    "eligible_sides": sorted(prior_eligible_sides),
+                    "execution_cycles": trigger_count,
+                }
+            )
+            return report
     if threshold_side_mode:
         eligible_sides = threshold_eligible_sides
     else:
