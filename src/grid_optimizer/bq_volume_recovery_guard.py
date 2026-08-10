@@ -6276,7 +6276,7 @@ def check_symbol(
             grvt_post_shock_soft_release_safe
             or grvt_dual_soft_dynamic_release_safe
             or grvt_single_soft_dynamic_release_safe
-        ) and grvt_soft_loss_profile_active:
+        ) and grvt_soft_loss_profile_active and not grvt_dynamic_loss_release_in_progress:
             if grvt_dual_soft_dynamic_release_safe:
                 action = "hold_grvt_dual_soft_loss_release"
             elif grvt_single_soft_dynamic_release_safe:
