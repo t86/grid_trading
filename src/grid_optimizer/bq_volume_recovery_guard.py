@@ -6068,6 +6068,30 @@ def check_symbol(
         and not bool(control.get("best_quote_maker_volume_net_loss_reduce_enabled"))
         and bool(control.get("best_quote_maker_volume_active_pair_reduce_enabled"))
     )
+    grvt_dynamic_loss_release_in_progress = (
+        normalized_symbol == "GRVTUSDT"
+        and grvt_soft_loss_profile_active
+        and bool(item.get("recovery_owned"))
+        and not bool(assessment.get("volatility_entry_pause_active"))
+        and not active_pair_reduce_deadlock
+        and not recovery_timed_out
+    )
+    active_pair_reduce_report = plan.get("best_quote_active_pair_reduce")
+    active_pair_reduce_report = (
+        active_pair_reduce_report
+        if isinstance(active_pair_reduce_report, dict)
+        else {}
+    )
+    grvt_dynamic_release_two_sided_flow_restored = (
+        grvt_dynamic_loss_release_in_progress
+        and bool(active_pair_reduce_report.get("completed"))
+        and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) > 0
+        and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) > 0
+        and _safe_float(assessment.get("ordinary_long_notional"))
+        <= _safe_float(assessment.get("long_soft_limit_notional"))
+        and _safe_float(assessment.get("ordinary_short_notional"))
+        <= _safe_float(assessment.get("short_soft_limit_notional"))
+    )
 
     action_verification: str | None = None
     control_updated_at = _parse_time(control.get("recovery_control_updated_at"))
@@ -6238,6 +6262,55 @@ def check_symbol(
                     "last_recovery_action": action,
                 }
             )
+        elif grvt_dynamic_loss_release_in_progress:
+            if grvt_dynamic_release_two_sided_flow_restored:
+                updates = _restore_recovery_controls(
+                    item,
+                    control,
+                    cycle_budget_floor_notional,
+                )
+                updates.update(
+                    {
+                        "best_quote_maker_volume_allow_loss_reduce_only": False,
+                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                        "best_quote_maker_volume_active_pair_reduce_enabled": False,
+                    }
+                )
+                changed, backup_path = _apply_control_update(
+                    symbol=normalized_symbol,
+                    control_path=control_path,
+                    control=control,
+                    updates=updates,
+                    now=now,
+                    dry_run=dry_run,
+                    restart_runner=restart,
+                )
+                action = (
+                    "dry_run_restore_grvt_after_dynamic_two_sided_flow"
+                    if dry_run
+                    else "restore_grvt_after_dynamic_two_sided_flow"
+                )
+                _set_post_restore_cooldown(
+                    item,
+                    now=now,
+                    cooldown_seconds=post_restore_cooldown_seconds,
+                )
+                for key in (
+                    "guard_original_controls",
+                    "guard_recovery_controls",
+                    "recovery_started_at",
+                    "recovery_owned",
+                ):
+                    item.pop(key, None)
+            else:
+                action = "hold_grvt_dynamic_loss_release_until_two_sided_flow"
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_recovery_check_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
         elif grvt_volatility_pause:
             loss_recovery_enabled = any(
                 (
