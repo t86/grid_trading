@@ -5368,6 +5368,32 @@ def _transfer_best_quote_volume_to_frozen(
     band_record: dict[str, Any] | None = None
     band_key = ""
     if bool(band_budget_enabled):
+        migrated_lots = []
+        for lot in _normalize_best_quote_volume_lots(frozen.get(source_key)):
+            migrated_lot = dict(lot)
+            if not str(migrated_lot.get("freeze_band_key") or "").strip():
+                entry_price = max(
+                    _safe_float(migrated_lot.get("entry_price", migrated_lot.get("price"))),
+                    0.0,
+                )
+                freeze_loss_ratio = max(_safe_float(migrated_lot.get("loss_ratio")), 0.0)
+                freeze_price = max(_safe_float(migrated_lot.get("freeze_price")), 0.0)
+                if freeze_price <= 0 and entry_price > 0:
+                    if normalized_side == "long":
+                        freeze_price = entry_price * max(1.0 - freeze_loss_ratio, 0.0)
+                    else:
+                        freeze_price = entry_price * (1.0 + freeze_loss_ratio)
+                legacy_band = _best_quote_freeze_band_info(
+                    side=normalized_side,
+                    price=freeze_price,
+                    band_ratio=band_budget_price_ratio,
+                    anchor_price=band_budget_anchor_price,
+                )
+                if legacy_band is not None:
+                    migrated_lot["freeze_price"] = freeze_price
+                    migrated_lot["freeze_band_key"] = legacy_band["band_key"]
+            migrated_lots.append(migrated_lot)
+        frozen[source_key] = migrated_lots
         safe_min_price = max(_safe_float(band_budget_min_price), 0.0)
         band_info = _best_quote_freeze_band_info(
             side=normalized_side,
@@ -5492,6 +5518,7 @@ def _transfer_best_quote_volume_to_frozen(
         frozen_lot = {
             "qty": _safe_float(item.get("qty")),
             "entry_price": _safe_float(item.get("price")),
+            "freeze_price": safe_mid,
             "frozen_at": now_iso,
             "reason": reason,
             "loss_ratio": max(_safe_float(item.get("freeze_loss_ratio")) or _safe_float(loss_ratio), 0.0),

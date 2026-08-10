@@ -2702,6 +2702,45 @@ class LoopRunnerTests(unittest.TestCase):
         # the requested 50 fits in the freed budget and is actually frozen
         self.assertAlmostEqual(transfer["transferred_qty"], 50.0, places=6)
 
+    def test_best_quote_freeze_band_budget_migrates_legacy_lots(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_lots": [
+                    {
+                        "qty": 100.0,
+                        "entry_price": 1.0,
+                        "loss_ratio": 0.04,
+                    }
+                ],
+            },
+            "best_quote_volume_ledger": {
+                "short_lots": [{"qty": 50.0, "price": 1.0}],
+                "short_qty": 50.0,
+                "short_avg_price": 1.0,
+                "initialized": True,
+            },
+        }
+
+        transfer = _transfer_best_quote_volume_to_frozen(
+            state=state,
+            side="short",
+            qty=50.0,
+            reason="reduce_loss_ratio_threshold",
+            loss_ratio=0.04,
+            mid_price=1.04,
+            band_budget_enabled=True,
+            band_budget_price_ratio=0.05,
+            band_budget_base_notional=104.0,
+            band_budget_anchor_price=1.0,
+        )
+
+        migrated_lot = state["best_quote_frozen_inventory"]["short_lots"][0]
+        self.assertEqual(migrated_lot["freeze_band_key"], "short:0")
+        self.assertAlmostEqual(migrated_lot["freeze_price"], 1.04)
+        self.assertEqual(transfer["band_budget"]["active_frozen_qty"], 100.0)
+        self.assertEqual(transfer["band_budget"]["blocked_reason"], "band_budget_exhausted")
+        self.assertEqual(transfer["transferred_qty"], 0.0)
+
     def test_arm_frozen_single_leg_take_profit_short_at_profit(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
