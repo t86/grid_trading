@@ -32650,6 +32650,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         current_short_notional=controls.get("current_short_notional", current_short_notional),
         long_soft_notional=getattr(effective_args, "pause_buy_position_notional", 0.0),
         short_soft_notional=getattr(effective_args, "pause_short_position_notional", 0.0),
+        min_gap_notional=0.0,
     )
     if anti_chase_entry_guard.get("block_long_entries"):
         controls["buy_paused"] = True

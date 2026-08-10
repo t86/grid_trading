@@ -9390,6 +9390,27 @@ class LoopRunnerTests(unittest.TestCase):
             [0.2807, 0.2973],
         )
 
+    def test_grvt_anti_chase_allows_one_balancing_entry_for_small_gap(self) -> None:
+        guard = {
+            "active": True,
+            "block_long_entries": False,
+            "block_short_entries": True,
+        }
+
+        apply_grvt_anti_chase_balancing_bypass(
+            report=guard,
+            symbol="GRVTUSDT",
+            current_long_notional=899.0,
+            current_short_notional=885.0,
+            long_soft_notional=900.0,
+            short_soft_notional=900.0,
+            min_gap_notional=0.0,
+        )
+
+        self.assertFalse(guard["block_short_entries"])
+        self.assertEqual(guard["balancing_bypass_side"], "SELL")
+        self.assertEqual(guard["balancing_bypass_inventory_gap_notional"], 14.0)
+
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
     def test_periodic_reconcile_ignores_manual_open_orders(
