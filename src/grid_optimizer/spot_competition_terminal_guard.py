@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -71,6 +72,55 @@ def cleanup_trigger(
         if now_monotonic - inactive_since >= max(inactive_grace_seconds, 0.0):
             return "runner_stopped"
     return None
+
+
+def select_effective_target(
+    *,
+    primary_target: float,
+    fallback_target: float,
+    decision_after_seconds: float,
+    elapsed_seconds: float,
+    loss_per_10k: float,
+    loss_active: bool,
+    loss_threshold_per_10k: float,
+) -> tuple[float, str]:
+    primary = max(float(primary_target), 0.0)
+    fallback = max(float(fallback_target), 0.0)
+    if (
+        fallback <= 0
+        or fallback >= primary
+        or decision_after_seconds <= 0
+        or loss_threshold_per_10k <= 0
+        or elapsed_seconds < decision_after_seconds
+    ):
+        return primary, "primary"
+    if loss_active and loss_per_10k > loss_threshold_per_10k:
+        return fallback, "loss_fallback"
+    return primary, "primary"
+
+
+def _read_latest_jsonl(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, 2)
+            end = fh.tell()
+            if end <= 0:
+                return {}
+            pos = end - 1
+            while pos > 0:
+                fh.seek(pos)
+                if fh.read(1) == b"\n" and pos < end - 1:
+                    break
+                pos -= 1
+            fh.seek(pos + 1 if pos > 0 else 0)
+            line = fh.readline().decode("utf-8", errors="replace").strip()
+    except OSError:
+        return {}
+    try:
+        payload = json.loads(line)
+    except (ValueError, json.JSONDecodeError):
+        return {}
+    return dict(payload) if isinstance(payload, dict) else {}
 
 
 def _runner_active(service: str) -> bool:
@@ -291,6 +341,8 @@ def _run(args: argparse.Namespace) -> int:
     state.setdefault("commission_quote", 0.0)
     state.setdefault("start_ms", int(args.start_ms))
     state.setdefault("target_volume", float(args.target_volume))
+    state.setdefault("effective_target_volume", float(args.target_volume))
+    state.setdefault("target_mode", "primary")
     state.setdefault("started_at", _now_iso())
     state.setdefault("started_epoch", time.time())
     _write_json(state_path, state)
@@ -310,9 +362,42 @@ def _run(args: argparse.Namespace) -> int:
             inactive_since = None
         elif bool(state.get("armed")):
             inactive_since = inactive_since or time.monotonic()
+        elapsed_seconds = max(time.time() - _safe_float(state.get("started_epoch")), 0.0)
+        runner_summary = _read_latest_jsonl(Path(args.runner_events)) if args.runner_events else {}
+        loss_per_10k = _safe_float(runner_summary.get("rolling_hourly_loss_per_10k"))
+        loss_active = bool(runner_summary.get("rolling_hourly_loss_per_10k_active"))
+        effective_target, target_mode = select_effective_target(
+            primary_target=float(args.target_volume),
+            fallback_target=float(args.loss_fallback_target_volume),
+            decision_after_seconds=float(args.loss_decision_after_seconds),
+            elapsed_seconds=elapsed_seconds,
+            loss_per_10k=loss_per_10k,
+            loss_active=loss_active,
+            loss_threshold_per_10k=float(args.loss_threshold_per_10k),
+        )
+        if target_mode != str(state.get("target_mode", "primary")):
+            _append_event(
+                events_path,
+                "target_mode_changed",
+                target_mode=target_mode,
+                effective_target_volume=effective_target,
+                rolling_hourly_loss_per_10k=loss_per_10k,
+                rolling_hourly_loss_per_10k_active=loss_active,
+                elapsed_seconds=elapsed_seconds,
+            )
+        state["effective_target_volume"] = effective_target
+        state["target_mode"] = target_mode
+        state["loss_decision"] = {
+            "decision_after_seconds": float(args.loss_decision_after_seconds),
+            "elapsed_seconds": elapsed_seconds,
+            "fallback_target_volume": float(args.loss_fallback_target_volume),
+            "rolling_hourly_loss_per_10k": loss_per_10k,
+            "rolling_hourly_loss_per_10k_active": loss_active,
+            "threshold_per_10k": float(args.loss_threshold_per_10k),
+        }
         reason = cleanup_trigger(
             volume=_safe_float(state.get("gross_notional")),
-            target=float(args.target_volume),
+            target=effective_target,
             armed=bool(state.get("armed")),
             runner_active=active,
             inactive_since=inactive_since,
@@ -323,7 +408,7 @@ def _run(args: argparse.Namespace) -> int:
             if time.time() - _safe_float(state.get("started_epoch")) >= float(args.startup_grace_seconds):
                 reason = "runner_start_timeout"
         state["runner_active"] = active
-        state["remaining"] = max(float(args.target_volume) - _safe_float(state.get("gross_notional")), 0.0)
+        state["remaining"] = max(effective_target - _safe_float(state.get("gross_notional")), 0.0)
         _write_json(state_path, state)
         if reason:
             state["phase"] = "stopping"
@@ -375,6 +460,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--events", required=True)
     parser.add_argument("--spot-flatten-events", required=True)
     parser.add_argument("--futures-flatten-events", required=True)
+    parser.add_argument("--runner-events", default=os.getenv("RUNNER_EVENTS", ""))
+    parser.add_argument(
+        "--loss-decision-after-seconds",
+        type=float,
+        default=float(os.getenv("LOSS_DECISION_AFTER_SECONDS", "0") or 0),
+    )
+    parser.add_argument(
+        "--loss-threshold-per-10k",
+        type=float,
+        default=float(os.getenv("LOSS_THRESHOLD_PER_10K", "0") or 0),
+    )
+    parser.add_argument(
+        "--loss-fallback-target-volume",
+        type=float,
+        default=float(os.getenv("LOSS_FALLBACK_TARGET_VOLUME", "0") or 0),
+    )
     parser.add_argument("--spot-flatten-prefix", default="sctgspot")
     parser.add_argument("--futures-flatten-prefix", default="sctgfut")
     parser.add_argument("--poll-seconds", type=float, default=5.0)

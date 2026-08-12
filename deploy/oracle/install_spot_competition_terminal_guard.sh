@@ -12,6 +12,10 @@ start_ms="$3"
 app_dir="${APP_DIR:-/home/ubuntu/wangge}"
 python_bin="${PYTHON_BIN:-${app_dir}/.venv/bin/python}"
 runner_wrapper="${RUNNER_WRAPPER:-/usr/local/bin/grid-saved-runner}"
+runner_events="${RUNNER_EVENTS:-output/${symbol,,}_spot_events.jsonl}"
+loss_decision_after_seconds="${LOSS_DECISION_AFTER_SECONDS:-0}"
+loss_threshold_per_10k="${LOSS_THRESHOLD_PER_10K:-0}"
+loss_fallback_target_volume="${LOSS_FALLBACK_TARGET_VOLUME:-0}"
 config_dir="/etc/grid-spot-terminal"
 service_path="/etc/systemd/system/grid-spot-terminal@.service"
 env_path="${config_dir}/${symbol}.env"
@@ -25,7 +29,11 @@ printf '%s\n' \
   "START_MS=${start_ms}" \
   "APP_DIR=${app_dir}" \
   "PYTHON_BIN=${python_bin}" \
-  "RUNNER_WRAPPER=${runner_wrapper}" >"${tmp_env}"
+  "RUNNER_WRAPPER=${runner_wrapper}" \
+  "RUNNER_EVENTS=${runner_events}" \
+  "LOSS_DECISION_AFTER_SECONDS=${loss_decision_after_seconds}" \
+  "LOSS_THRESHOLD_PER_10K=${loss_threshold_per_10k}" \
+  "LOSS_FALLBACK_TARGET_VOLUME=${loss_fallback_target_volume}" >"${tmp_env}"
 sudo install -m 0644 "${tmp_env}" "${env_path}"
 
 tmp_service="$(mktemp)"
