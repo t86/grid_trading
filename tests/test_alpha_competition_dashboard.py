@@ -1403,6 +1403,59 @@ def test_page_places_competition_thresholds_above_existing_market_monitor() -> N
         assert marker in html
 
 
+def test_page_has_fixed_discovery_alert_region_above_competition_table() -> None:
+    html = dashboard.INDEX_HTML
+
+    status = '<div id="competitionDiscoveryStatus" class="discovery-status" role="alert" aria-live="polite" hidden></div>'
+    assert status in html
+    assert html.index(status) < html.index('<div class="table-wrap competition-wrap">')
+
+
+def test_page_renders_stale_and_escaped_discovery_errors_in_the_alert_region() -> None:
+    html = dashboard.INDEX_HTML
+
+    for rendering_contract in (
+        "if (payload.discoveryStale === true) discoveryMessages.push('公告发现数据已过期，正在保留最近一次成功名单。')",
+        "const discoveryErrors = (Array.isArray(payload.errors) ? payload.errors : []).filter(isDiscoveryError)",
+        "competitionDiscoveryStatusEl.innerHTML = discoveryMessages.map(message => escapeHtml(message)).join('<br>')",
+        "competitionDiscoveryStatusEl.hidden = discoveryMessages.length === 0",
+    ):
+        assert rendering_contract in html
+
+
+def test_page_renders_upcoming_round_metadata_and_start_countdowns() -> None:
+    html = dashboard.INDEX_HTML
+
+    for rendering_contract in (
+        "function formatStartCountdown(startUtc, nowMs = Date.now())",
+        "if (!Number.isFinite(startMs)) return '开始时间未知'",
+        "if (remainingMs <= 0) return '即将开始'",
+        "const pendingLabel = row.status === 'upcoming' ? '未开始' : '轮间等待'",
+        "${escapeHtml(pendingLabel)} · ${escapeHtml(formatStartCountdown(row.roundStartUtc))}",
+        "第 ${escapeHtml(row.round)} 轮 · ${escapeHtml(formatUtc(row.roundStartUtc))} → ${escapeHtml(formatUtc(row.roundEndUtc))}",
+    ):
+        assert rendering_contract in html
+
+
+def test_page_forces_non_active_competition_metrics_to_dashes() -> None:
+    html = dashboard.INDEX_HTML
+
+    assert "const pending = row.status === 'upcoming' || row.status === 'between_rounds'" in html
+    for field in (
+        "currentMultiplier",
+        "weightedVolume",
+        "leaderboardThreshold",
+        "averageVolume",
+        "watchThreshold",
+        "referenceThreshold",
+        "safeThreshold",
+    ):
+        assert f"pending ? '—' :" in html[html.index(f'data-label=\"'):]  # renderer uses an explicit pending guard
+        assert field in html[html.index("function renderCompetitionRow(row)") : html.index("function validatePayload")]
+    assert '<td data-label="获奖人数">${escapeHtml(formatInteger(row.winnerCount))}</td>' in html
+    assert '<td data-label="来源 / 更新时间 / 公告">${sourceContent(row)}</td>' in html
+
+
 def test_page_has_responsive_table_and_mobile_card_contracts() -> None:
     html = dashboard.INDEX_HTML
 

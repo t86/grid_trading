@@ -721,6 +721,16 @@ INDEX_HTML = r"""<!doctype html>
       white-space: pre-wrap;
       overflow-wrap: anywhere;
     }
+    .discovery-status {
+      margin: 0 0 8px;
+      padding: 7px 10px;
+      color: var(--warn);
+      background: var(--warn-soft);
+      border-radius: 8px;
+      font-size: 12px;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
     @media (max-width: 760px) {
       .shell { padding: 17px 11px 28px; }
       header { align-items: stretch; flex-direction: column; gap: 14px; margin-bottom: 20px; }
@@ -801,6 +811,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div id="competitionGenerated" class="source-time" role="status" aria-live="polite">等待交易赛数据…</div>
       </div>
+      <div id="competitionDiscoveryStatus" class="discovery-status" role="alert" aria-live="polite" hidden></div>
       <div class="table-wrap competition-wrap">
         <table class="competition-table">
           <thead>
@@ -882,6 +893,7 @@ INDEX_HTML = r"""<!doctype html>
     const alertStatusEl = document.getElementById('alertStatus');
     const errorsEl = document.getElementById('errors');
     const competitionErrorsEl = document.getElementById('competitionErrors');
+    const competitionDiscoveryStatusEl = document.getElementById('competitionDiscoveryStatus');
     const refreshBtn = document.getElementById('refreshBtn');
     const checkBtn = document.getElementById('checkBtn');
     let refreshGeneration = 0;
@@ -945,6 +957,23 @@ INDEX_HTML = r"""<!doctype html>
       return `剩余 ${parts.join(' ')}`;
     }
 
+    function formatStartCountdown(startUtc, nowMs = Date.now()) {
+      if (typeof startUtc !== 'string' || !startUtc) return '开始时间未知';
+      const startMs = Date.parse(startUtc);
+      if (!Number.isFinite(startMs)) return '开始时间未知';
+      const remainingMs = startMs - nowMs;
+      if (remainingMs <= 0) return '即将开始';
+      const totalMinutes = Math.ceil(remainingMs / 60000);
+      const days = Math.floor(totalMinutes / 1440);
+      const hours = Math.floor((totalMinutes % 1440) / 60);
+      const minutes = totalMinutes % 60;
+      const parts = [];
+      if (days) parts.push(`${days}天`);
+      if (hours || days) parts.push(`${hours}小时`);
+      parts.push(`${minutes}分钟`);
+      return `距离开始 ${parts.join(' ')}`;
+    }
+
     function multipleClass(value) {
       if (value >= 5) return 'pill very-hot';
       if (value >= 3) return 'pill hot';
@@ -970,6 +999,11 @@ INDEX_HTML = r"""<!doctype html>
 
     function roundContent(row) {
       const state = statusLabels[row.status] || '状态未知';
+      if (row.status === 'upcoming' || row.status === 'between_rounds') {
+        const pendingLabel = row.status === 'upcoming' ? '未开始' : '轮间等待';
+        return `<div class="cell-value"><div class="metric-primary">第 ${escapeHtml(row.round)} 轮 · ${escapeHtml(formatUtc(row.roundStartUtc))} → ${escapeHtml(formatUtc(row.roundEndUtc))}</div>
+          <div class="metric-secondary"><span class="status-chip">${escapeHtml(pendingLabel)} · ${escapeHtml(formatStartCountdown(row.roundStartUtc))}</span></div></div>`;
+      }
       if (row.status !== 'active') {
         const unavailable = row.status === 'rule_unavailable' || row.status === 'volume_unavailable';
         return `<div class="cell-value"><span class="status-chip${unavailable ? ' unavailable' : ''}">${escapeHtml(state)}</span></div>`;
@@ -994,18 +1028,19 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function renderCompetitionRow(row) {
+      const pending = row.status === 'upcoming' || row.status === 'between_rounds';
       const multiplier = finiteNumber(row.currentMultiplier);
       return `<tr>
         <td data-label="币种"><div class="cell-value token-cell"><div class="sym">${escapeHtml(row.symbol)}</div><div class="name">${escapeHtml(row.name)}</div></div></td>
         <td data-label="轮次 / Day">${roundContent(row)}</td>
-        <td data-label="当前倍速">${multiplier === null ? '—' : `<span class="${multipleClass(multiplier)}">${escapeHtml(multiplier.toFixed(1))}x</span>`}</td>
-        <td data-label="加权总量" class="metric-primary">${escapeHtml(formatU(row.weightedVolume))}</td>
+        <td data-label="当前倍速">${pending ? '—' : multiplier === null ? '—' : `<span class="${multipleClass(multiplier)}">${escapeHtml(multiplier.toFixed(1))}x</span>`}</td>
+        <td data-label="加权总量" class="metric-primary">${pending ? '—' : escapeHtml(formatU(row.weightedVolume))}</td>
         <td data-label="获奖人数">${escapeHtml(formatInteger(row.winnerCount))}</td>
-        <td data-label="实际榜单门槛">${leaderboardThresholdContent(row)}</td>
-        <td data-label="平均量">${escapeHtml(formatU(row.averageVolume))}</td>
-        <td data-label="观察线 0.4" class="threshold-watch">${escapeHtml(formatU(row.watchThreshold))}</td>
-        <td data-label="参考线 0.6" class="threshold-reference">${escapeHtml(formatU(row.referenceThreshold))}</td>
-        <td data-label="安全线 1.0" class="threshold-safe">${escapeHtml(formatU(row.safeThreshold))}</td>
+        <td data-label="实际榜单门槛">${pending ? '—' : leaderboardThresholdContent(row)}</td>
+        <td data-label="平均量">${pending ? '—' : escapeHtml(formatU(row.averageVolume))}</td>
+        <td data-label="观察线 0.4" class="threshold-watch">${pending ? '—' : escapeHtml(formatU(row.watchThreshold))}</td>
+        <td data-label="参考线 0.6" class="threshold-reference">${pending ? '—' : escapeHtml(formatU(row.referenceThreshold))}</td>
+        <td data-label="安全线 1.0" class="threshold-safe">${pending ? '—' : escapeHtml(formatU(row.safeThreshold))}</td>
         <td data-label="来源 / 更新时间 / 公告">${sourceContent(row)}</td>
       </tr>`;
     }
@@ -1024,6 +1059,12 @@ INDEX_HTML = r"""<!doctype html>
     function renderCompetition(data) {
       const payload = validatePayload(data, '交易赛');
       const rows = payload.rows;
+      const isDiscoveryError = error => String(error).toLowerCase().includes('discovery');
+      const discoveryErrors = (Array.isArray(payload.errors) ? payload.errors : []).filter(isDiscoveryError);
+      const discoveryMessages = discoveryErrors.map(String);
+      if (payload.discoveryStale === true) discoveryMessages.push('公告发现数据已过期，正在保留最近一次成功名单。');
+      competitionDiscoveryStatusEl.innerHTML = discoveryMessages.map(message => escapeHtml(message)).join('<br>');
+      competitionDiscoveryStatusEl.hidden = discoveryMessages.length === 0;
       document.getElementById('competitionGenerated').textContent = `交易赛更新 ${payload.generatedAtUtc || '时间未知'}`;
       competitionRowsEl.innerHTML = rows.map(renderCompetitionRow).join('');
       competitionErrorsEl.textContent = (Array.isArray(payload.errors) ? payload.errors : []).map(String).join('\n');
