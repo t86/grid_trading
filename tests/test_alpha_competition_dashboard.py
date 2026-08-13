@@ -4,6 +4,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 import math
@@ -19,6 +20,12 @@ import pytest
 
 from grid_optimizer.alpha_market import AlphaToken
 from grid_optimizer import alpha_competition_dashboard as dashboard
+from grid_optimizer import alpha_competition_discovery as discovery
+from grid_optimizer import alpha_competition_metrics as metrics
+
+
+UTC = timezone.utc
+DISCOVERED_AT = datetime(2026, 8, 13, 2, 0, tzinfo=UTC)
 
 
 class FakeMarket:
@@ -86,15 +93,90 @@ def _clear_auth_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class FakeCompetitionService:
     def __init__(self) -> None:
-        self.calls: list[list[str]] = []
+        self.calls: list[tuple[list[metrics.CompetitionRule], datetime]] = []
 
-    def collect(self, symbols: list[str]) -> dict[str, Any]:
-        self.calls.append(symbols)
+    def collect_rules(
+        self,
+        rules: list[metrics.CompetitionRule],
+        *,
+        now: datetime,
+    ) -> dict[str, Any]:
+        self.calls.append((rules, now))
         return {
             "generatedAtUtc": "2026-08-07T00:00:00+00:00",
-            "rows": [{"symbol": symbol, "name": "章鱼"} for symbol in symbols],
+            "rows": [{"symbol": rule.symbol, "name": "章鱼"} for rule in rules],
             "errors": [],
         }
+
+
+class FakeDynamicCompetitionService:
+    def __init__(self, errors: list[str] | None = None) -> None:
+        self.errors = errors or []
+        self.calls: list[tuple[list[metrics.CompetitionRule], datetime]] = []
+
+    def collect_rules(
+        self,
+        rules: list[metrics.CompetitionRule],
+        *,
+        now: datetime,
+    ) -> dict[str, Any]:
+        self.calls.append((rules, now))
+        return {
+            "generatedAtUtc": now.isoformat(timespec="seconds"),
+            "rows": [
+                {"symbol": rule.symbol, "name": rule.name, "status": "upcoming"}
+                for rule in rules
+            ],
+            "errors": list(self.errors),
+        }
+
+
+class FakeDiscoveryService:
+    def __init__(self, snapshot: discovery.DiscoverySnapshot) -> None:
+        self.snapshot = snapshot
+        self.calls: list[datetime] = []
+
+    def discover(self, *, now: datetime) -> discovery.DiscoverySnapshot:
+        self.calls.append(now)
+        return self.snapshot
+
+
+def _discovery_snapshot(
+    symbols: tuple[str, ...] = ("DOS", "POWER"),
+    *,
+    stale: bool = True,
+    errors: tuple[str, ...] = ("competition announcement discovery unavailable",),
+    discovered_at: datetime | None = DISCOVERED_AT,
+) -> discovery.DiscoverySnapshot:
+    competitions: list[discovery.DiscoveredCompetition] = []
+    for index, symbol in enumerate(symbols):
+        article_code = f"{symbol.lower()}-article"
+        title = f"Binance Alpha Trading Competition: Trade Project ({symbol}) and Win"
+        announcement = metrics.CompetitionAnnouncement(
+            symbol=symbol,
+            article_code=article_code,
+            title=title,
+            released_at_utc=DISCOVERED_AT - timedelta(days=1),
+        )
+        rule = metrics.CompetitionRule(
+            symbol=symbol,
+            name=f"Project {index}",
+            article_code=article_code,
+            title=title,
+            article_url=f"https://www.binance.com/en/support/announcement/detail/{article_code}",
+            published_at_utc=announcement.released_at_utc,
+            winner_count=1_000,
+            rounds=(
+                metrics.CompetitionRound(
+                    1,
+                    DISCOVERED_AT + timedelta(days=1),
+                    DISCOVERED_AT + timedelta(days=8),
+                ),
+            ),
+            multipliers=(3.5, 3.0, 2.5, 2.0, 1.8, 1.3, 1.0),
+        )
+        competitions.append(discovery.DiscoveredCompetition(announcement, rule, DISCOVERED_AT))
+    return discovery.DiscoverySnapshot(discovered_at, tuple(competitions), stale, errors)
 
 
 class DeferredSubmitter:
@@ -215,12 +297,15 @@ def running_server(
     *,
     market: Any | None = None,
     competition_service: Any | None = None,
+    discovery_service: Any | None = None,
 ) -> Any:
     server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
     if market is not None:
         server.market = market  # type: ignore[attr-defined]
     if competition_service is not None:
         server.competition_service = competition_service  # type: ignore[attr-defined]
+    if discovery_service is not None:
+        server.discovery_service = discovery_service  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, name="test-alpha-dashboard")
     thread.start()
     try:
@@ -236,8 +321,10 @@ def running_server(
 @pytest.fixture(autouse=True)
 def reset_competition_service() -> Any:
     dashboard._COMPETITION_SERVICE = None
+    dashboard._DISCOVERY_SERVICE = None
     yield
     dashboard._COMPETITION_SERVICE = None
+    dashboard._DISCOVERY_SERVICE = None
 
 
 @pytest.fixture
@@ -251,10 +338,16 @@ def fake_competition_service() -> FakeCompetitionService:
 
 
 @pytest.fixture
+def fake_discovery_service() -> FakeDiscoveryService:
+    return FakeDiscoveryService(_discovery_snapshot(stale=False, errors=()))
+
+
+@pytest.fixture
 def http_server(
     monkeypatch: pytest.MonkeyPatch,
     fake_market: FakeMarket,
     fake_competition_service: FakeCompetitionService,
+    fake_discovery_service: FakeDiscoveryService,
 ) -> Any:
     monkeypatch.setenv("ALPHA_DASHBOARD_USERNAME", "alpha-user")
     monkeypatch.setenv("ALPHA_DASHBOARD_PASSWORD", "alpha-password")
@@ -264,7 +357,11 @@ def http_server(
         "check_alert_once",
         lambda: {"ok": True, "returnCode": 0, "elapsedMs": 1, "dryRun": True},
     )
-    with running_server(market=fake_market, competition_service=fake_competition_service) as server:
+    with running_server(
+        market=fake_market,
+        competition_service=fake_competition_service,
+        discovery_service=fake_discovery_service,
+    ) as server:
         yield server
 
 
@@ -378,6 +475,44 @@ def test_competition_service_uses_official_default_cache_path(monkeypatch: pytes
     dashboard.competition_service()
 
     assert paths == [Path("/home/ubuntu/.cache/binance-alpha-volume-alert/competition_rules.json")]
+
+
+def test_discovery_service_is_lazy_thread_safe_and_uses_official_default_cache_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[tuple[str, Any]] = []
+    provider = object()
+    cache = object()
+    service = object()
+    monkeypatch.delenv("ALPHA_COMPETITION_DISCOVERY_CACHE", raising=False)
+    monkeypatch.setattr(
+        dashboard,
+        "BinanceCompetitionRuleProvider",
+        lambda: created.append(("provider", None)) or provider,
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "CompetitionDiscoveryCache",
+        lambda path: created.append(("cache", path)) or cache,
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "CompetitionDiscoveryService",
+        lambda *, provider, cache: created.append(("service", (provider, cache))) or service,
+    )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: dashboard.discovery_service(), range(32)))
+
+    assert results == [service] * 32
+    assert created == [
+        ("provider", None),
+        (
+            "cache",
+            Path("/home/ubuntu/.cache/binance-alpha-volume-alert/competition_discovery.json"),
+        ),
+        ("service", (provider, cache)),
+    ]
 
 
 def test_all_routes_require_basic_auth(http_server: HttpServerHarness) -> None:
@@ -548,7 +683,7 @@ def test_api_snapshot_keeps_healthy_symbols_when_one_market_lookup_fails(
     assert secret.encode() not in response.body
 
 
-def test_api_competition_uses_configured_symbol_order_and_utf8_json(
+def test_api_competition_uses_discovered_symbol_order_and_utf8_json(
     http_server: HttpServerHarness,
     fake_competition_service: FakeCompetitionService,
 ) -> None:
@@ -557,9 +692,140 @@ def test_api_competition_uses_configured_symbol_order_and_utf8_json(
     assert response.status_code == 200
     assert response.headers["Content-Type"] == "application/json; charset=utf-8"
     assert response.headers["Cache-Control"] == "no-store, max-age=0"
-    assert [row["symbol"] for row in response.json()["rows"]] == ["QUID", "GRVT", "O", "PRL", "CAP"]
+    assert [row["symbol"] for row in response.json()["rows"]] == ["DOS", "POWER"]
     assert b"\xe7\xab\xa0\xe9\xb1\xbc" in response.body
-    assert fake_competition_service.calls == [["QUID", "GRVT", "O", "PRL", "CAP"]]
+    rules, now = fake_competition_service.calls[0]
+    assert [rule.symbol for rule in rules] == ["DOS", "POWER"]
+    assert now.tzinfo is UTC
+
+
+def test_queryless_apis_use_discovered_rules_in_order_and_ignore_alpha_symbols(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DynamicMarket(FakeMarket):
+        def fetch_tokens(self) -> dict[str, AlphaToken]:
+            self.fetch_token_calls += 1
+            return {
+                "DOS": AlphaToken("DOS", "ALPHA_2001", "DOS", "BSC", 0.1, 1_000, 10, "ALPHA_2001USDT"),
+                "POWER": AlphaToken("POWER", "ALPHA_2002", "POWER", "BSC", 0.2, 2_000, 20, "ALPHA_2002USDT"),
+            }
+
+    monkeypatch.setenv("ALPHA_DASHBOARD_USERNAME", "alpha-user")
+    monkeypatch.setenv("ALPHA_DASHBOARD_PASSWORD", "alpha-password")
+    monkeypatch.setenv("ALPHA_SYMBOLS", "QUID,GRVT")
+    discovery_service = FakeDiscoveryService(_discovery_snapshot(stale=False, errors=()))
+    competition_service = FakeDynamicCompetitionService()
+    market = DynamicMarket()
+
+    with running_server(
+        market=market,
+        competition_service=competition_service,
+        discovery_service=discovery_service,
+    ) as server:
+        snapshot = server.get("/api/snapshot")
+        competition = server.get("/api/competition?symbols=QUID")
+
+    assert snapshot.status_code == competition.status_code == 200
+    assert snapshot.json()["symbols"] == ["DOS", "POWER"]
+    assert [row["symbol"] for row in competition.json()["rows"]] == ["DOS", "POWER"]
+    assert len(discovery_service.calls) == 2
+    rules, metrics_now = competition_service.calls[0]
+    assert [rule.symbol for rule in rules] == ["DOS", "POWER"]
+    assert metrics_now == discovery_service.calls[1]
+
+
+def test_competition_first_empty_discovery_error_remains_visible_with_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ALPHA_DASHBOARD_USERNAME", "alpha-user")
+    monkeypatch.setenv("ALPHA_DASHBOARD_PASSWORD", "alpha-password")
+    discovery_service = FakeDiscoveryService(
+        _discovery_snapshot(
+            (),
+            discovered_at=None,
+            errors=("competition announcement discovery unavailable",),
+        )
+    )
+    competition_service = FakeDynamicCompetitionService()
+
+    with running_server(
+        competition_service=competition_service,
+        discovery_service=discovery_service,
+    ) as server:
+        response = server.get("/api/competition")
+
+    assert response.status_code == 200
+    assert response.json()["rows"] == []
+    assert response.json()["discoveredAtUtc"] is None
+    assert response.json()["discoveryStale"] is True
+    assert response.json()["errors"] == ["competition announcement discovery unavailable"]
+
+
+def test_competition_merges_discovery_metadata_and_errors_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ALPHA_DASHBOARD_USERNAME", "alpha-user")
+    monkeypatch.setenv("ALPHA_DASHBOARD_PASSWORD", "alpha-password")
+    snapshot = _discovery_snapshot(errors=("first discovery error", "second discovery error"))
+    discovery_service = FakeDiscoveryService(snapshot)
+    competition_service = FakeDynamicCompetitionService(["metrics error"])
+
+    with running_server(
+        competition_service=competition_service,
+        discovery_service=discovery_service,
+    ) as server:
+        response = server.get("/api/competition")
+
+    assert response.status_code == 200
+    assert response.json()["discoveredAtUtc"] == "2026-08-13T02:00:00+00:00"
+    assert response.json()["discoveryStale"] is True
+    assert response.json()["errors"] == [
+        "first discovery error",
+        "second discovery error",
+        "metrics error",
+    ]
+
+
+def test_explicit_snapshot_symbols_do_not_trigger_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ALPHA_DASHBOARD_USERNAME", "alpha-user")
+    monkeypatch.setenv("ALPHA_DASHBOARD_PASSWORD", "alpha-password")
+    discovery_service = FakeDiscoveryService(_discovery_snapshot())
+    market = FakeMarket()
+
+    with running_server(market=market, discovery_service=discovery_service) as server:
+        response = server.get("/api/snapshot?symbols=GRVT,QUID")
+
+    assert response.status_code == 200
+    assert response.json()["symbols"] == ["GRVT", "QUID"]
+    assert discovery_service.calls == []
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, ValueError])
+def test_queryless_snapshot_discovery_failures_are_stable_json_and_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: type[Exception],
+) -> None:
+    secret = "secret-token /private/discovery/cache.json"
+
+    class RaisingDiscoveryService:
+        def discover(self, *, now: datetime) -> discovery.DiscoverySnapshot:
+            raise failure(secret)
+
+    monkeypatch.setenv("ALPHA_DASHBOARD_USERNAME", "alpha-user")
+    monkeypatch.setenv("ALPHA_DASHBOARD_PASSWORD", "alpha-password")
+
+    with running_server(
+        market=FakeMarket(),
+        discovery_service=RaisingDiscoveryService(),
+    ) as server:
+        response = server.get("/api/snapshot")
+
+    assert response.status_code == 500
+    assert response.headers["Content-Type"] == "application/json; charset=utf-8"
+    assert response.json() == {"ok": False, "error": "internal server error"}
+    assert secret.encode() not in response.body
 
 
 def test_apply_leaderboard_thresholds_returns_immediately_and_refreshes_single_flight() -> None:
@@ -910,7 +1176,7 @@ def test_api_internal_errors_are_stable_json_and_redacted(
             raise RuntimeError(secret)
 
     class RaisingCompetitionService:
-        def collect(self, symbols: list[str]) -> Any:
+        def collect_rules(self, rules: list[metrics.CompetitionRule], *, now: datetime) -> Any:
             raise RuntimeError(secret)
 
     if target == "market":
@@ -1013,7 +1279,12 @@ def test_snapshot_api_normalizes_non_finite_market_and_config_values(
                 "priceChangePercent": "-Infinity",
             }
 
-    with running_server(market=NonFiniteMarket()) as server:
+    with running_server(
+        market=NonFiniteMarket(),
+        discovery_service=FakeDiscoveryService(
+            _discovery_snapshot(("QUID",), stale=False, errors=())
+        ),
+    ) as server:
         response = server.get("/api/snapshot")
 
     assert response.status_code == 200
@@ -1054,6 +1325,7 @@ def test_snapshot_api_normalizes_non_finite_market_and_config_values(
 def test_snapshot_query_rejects_invalid_or_excessive_symbols_without_market_call(
     http_server: HttpServerHarness,
     fake_market: FakeMarket,
+    fake_discovery_service: FakeDiscoveryService,
     query: str,
 ) -> None:
     response = http_server.get(f"/api/snapshot?symbols={query}")
@@ -1062,6 +1334,7 @@ def test_snapshot_query_rejects_invalid_or_excessive_symbols_without_market_call
     assert response.headers["Content-Type"] == "application/json; charset=utf-8"
     assert response.headers["Cache-Control"] == "no-store, max-age=0"
     assert fake_market.fetch_token_calls == 0
+    assert fake_discovery_service.calls == []
 
 
 def test_snapshot_query_deduplicates_symbols_without_changing_order(

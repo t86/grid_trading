@@ -1246,3 +1246,49 @@ class CompetitionMetricsService:
             "rows": rows,
             "errors": errors,
         }
+
+    def collect_rules(
+        self,
+        rules: list[CompetitionRule],
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        current = datetime.now(_UTC) if now is None else _require_utc_aware(now, "now")
+        rows: list[dict[str, object]] = []
+        errors: list[str] = []
+        with self._lock:
+            for supplied_rule in rules:
+                try:
+                    rule = _validate_rule(supplied_rule)
+                except RuleParseError:
+                    try:
+                        symbol = _normalized_service_symbol(getattr(supplied_rule, "symbol", ""))
+                    except RuleParseError:
+                        symbol = ""
+                    error = self._error(symbol, "rule")
+                    row = _metrics_row(symbol)
+                    row["error"] = error
+                else:
+                    selection = select_round(rule, current)
+                    if selection.status == "ended":
+                        continue
+                    row = self._build_row(CachedRuleResult(rule, False), current)
+                    if selection.status in {"upcoming", "between_rounds"}:
+                        next_round = next(
+                            round_ for round_ in rule.rounds if round_.start_utc > current
+                        )
+                        row.update(
+                            {
+                                "round": next_round.number,
+                                "roundStartUtc": _iso_seconds(next_round.start_utc, "round start_utc"),
+                                "roundEndUtc": _iso_seconds(next_round.end_utc, "round end_utc"),
+                            }
+                        )
+                rows.append(row)
+                if isinstance(row["error"], str):
+                    errors.append(row["error"])
+        return {
+            "generatedAtUtc": current.isoformat(timespec="seconds"),
+            "rows": rows,
+            "errors": errors,
+        }

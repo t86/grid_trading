@@ -1636,6 +1636,82 @@ def test_service_maps_active_metrics_to_fixed_json_friendly_fields() -> None:
     json.dumps(payload, allow_nan=False)
 
 
+def test_service_collect_rules_uses_supplied_order_and_omits_ended_without_rule_io() -> None:
+    active = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    upcoming = replace(parse_competition_rule(FIXTURES["GRVT"], "GRVT"), rounds=tuple(
+        replace(
+            round_,
+            start_utc=round_.start_utc + timedelta(days=30),
+            end_utc=round_.end_utc + timedelta(days=30),
+        )
+        for round_ in parse_competition_rule(FIXTURES["GRVT"], "GRVT").rounds
+    ))
+    ended = parse_competition_rule(FIXTURES["O"], "O")
+    gap_rule = parse_competition_rule(FIXTURES["CAP"], "CAP")
+    between = replace(
+        gap_rule,
+        rounds=(
+            replace(
+                gap_rule.rounds[0],
+                start_utc=NOW - timedelta(days=8),
+                end_utc=NOW - timedelta(days=1),
+            ),
+            replace(
+                gap_rule.rounds[1],
+                start_utc=NOW + timedelta(hours=1),
+                end_utc=NOW + timedelta(days=7, hours=1),
+            ),
+        ),
+    )
+    service, provider, cache, volume = _service(
+        rules={},
+        volumes={"QUID": [metrics.VolumeSnapshot(4_800_000, "official", NOW)]},
+    )
+
+    payload = service.collect_rules([upcoming, active, between, ended], now=NOW)
+
+    assert [row["symbol"] for row in payload["rows"]] == ["GRVT", "QUID", "CAP"]
+    assert [row["status"] for row in payload["rows"]] == ["upcoming", "active", "between_rounds"]
+    assert (payload["rows"][0]["round"], payload["rows"][0]["roundStartUtc"], payload["rows"][0]["roundEndUtc"]) == (
+        1,
+        upcoming.rounds[0].start_utc.isoformat(timespec="seconds"),
+        upcoming.rounds[0].end_utc.isoformat(timespec="seconds"),
+    )
+    assert (payload["rows"][2]["round"], payload["rows"][2]["roundStartUtc"], payload["rows"][2]["roundEndUtc"]) == (
+        2,
+        between.rounds[1].start_utc.isoformat(timespec="seconds"),
+        between.rounds[1].end_utc.isoformat(timespec="seconds"),
+    )
+    for row in (payload["rows"][0], payload["rows"][2]):
+        assert row["day"] is None
+        assert row["currentMultiplier"] is None
+        assert row["weightedVolume"] is None
+        assert row["averageVolume"] is None
+        assert row["safeThreshold"] is None
+    assert payload["rows"][1]["weightedVolume"] == 4_800_000
+    assert payload["errors"] == []
+    assert provider.calls == []
+    assert cache.calls == []
+    assert volume.calls == [("QUID", 1, NOW)]
+
+
+def test_service_collect_rules_validates_each_rule_and_sanitizes_failures() -> None:
+    valid = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    invalid = replace(valid, name="")
+    service, provider, cache, volume = _service(rules={})
+
+    payload = service.collect_rules([invalid, valid], now=NOW)
+
+    assert [row["symbol"] for row in payload["rows"]] == ["QUID", "QUID"]
+    assert payload["rows"][0]["status"] == "rule_unavailable"
+    assert payload["rows"][0]["error"] == "QUID: competition rule unavailable"
+    assert payload["errors"] == ["QUID: competition rule unavailable", "QUID: competition volume unavailable"]
+    assert "invalid" not in json.dumps(payload).lower()
+    assert provider.calls == []
+    assert cache.calls == []
+    assert volume.calls == [("QUID", 1, NOW)]
+
+
 def test_service_keeps_order_and_isolates_rule_and_cache_failures_without_leaking_details() -> None:
     quid = parse_competition_rule(FIXTURES["QUID"], "QUID")
     grvt = parse_competition_rule(FIXTURES["GRVT"], "GRVT")

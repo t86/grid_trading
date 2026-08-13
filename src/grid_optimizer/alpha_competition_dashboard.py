@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import alpha_volume_alert as alert
 from .alpha_market import AlphaMarketClient
+from .alpha_competition_discovery import CompetitionDiscoveryCache, CompetitionDiscoveryService
 from .alpha_competition_metrics import (
     BinanceCompetitionRuleProvider,
     CompetitionMetricsService,
@@ -32,9 +33,12 @@ DEFAULT_HOST = os.environ.get("ALPHA_DASHBOARD_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.environ.get("ALPHA_DASHBOARD_PORT", "8796"))
 DEFAULT_SYMBOLS = ("QUID", "GRVT", "O", "PRL", "CAP")
 DEFAULT_RULE_CACHE = "/home/ubuntu/.cache/binance-alpha-volume-alert/competition_rules.json"
+DEFAULT_DISCOVERY_CACHE = "/home/ubuntu/.cache/binance-alpha-volume-alert/competition_discovery.json"
 
 _COMPETITION_SERVICE: CompetitionMetricsService | None = None
 _COMPETITION_SERVICE_LOCK = threading.Lock()
+_DISCOVERY_SERVICE: CompetitionDiscoveryService | None = None
+_DISCOVERY_SERVICE_LOCK = threading.Lock()
 _ALERT_CHECK_LOCK = threading.Lock()
 _SNAPSHOT_SYMBOL_RE = re.compile(r"[A-Z0-9]{1,32}")
 _MAX_SNAPSHOT_SYMBOLS = 32
@@ -537,6 +541,20 @@ def competition_service() -> CompetitionMetricsService:
                 volume_provider=CompetitionVolumeProvider(market=market),
             )
         return _COMPETITION_SERVICE
+
+
+def discovery_service() -> CompetitionDiscoveryService:
+    global _DISCOVERY_SERVICE
+    with _DISCOVERY_SERVICE_LOCK:
+        if _DISCOVERY_SERVICE is None:
+            cache_path = Path(
+                os.environ.get("ALPHA_COMPETITION_DISCOVERY_CACHE", DEFAULT_DISCOVERY_CACHE)
+            )
+            _DISCOVERY_SERVICE = CompetitionDiscoveryService(
+                provider=BinanceCompetitionRuleProvider(),
+                cache=CompetitionDiscoveryCache(cache_path),
+            )
+        return _DISCOVERY_SERVICE
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -1110,6 +1128,20 @@ INDEX_HTML = r"""<!doctype html>
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _discovery(self, current: datetime) -> Any:
+        service = getattr(self.server, "discovery_service", None) or discovery_service()
+        return service.discover(now=current)
+
+    @staticmethod
+    def _add_discovery_metadata(payload: dict[str, Any], snapshot: Any) -> dict[str, Any]:
+        discovered_at = snapshot.discovered_at_utc
+        payload["discoveredAtUtc"] = (
+            None if discovered_at is None else discovered_at.isoformat(timespec="seconds")
+        )
+        payload["discoveryStale"] = snapshot.stale
+        payload["errors"] = [*snapshot.errors, *payload.get("errors", [])]
+        return payload
+
     def _auth_credentials(self) -> tuple[str, str] | None:
         try:
             return _configured_auth_credentials()
@@ -1200,11 +1232,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/snapshot":
             try:
-                symbols = _symbols_from_query(parsed.query)
+                if parse_qs(parsed.query, keep_blank_values=True).get("symbols") is not None:
+                    symbols = _symbols_from_query(parsed.query)
+                else:
+                    symbols = None
             except ValueError:
                 self._send_bad_request()
                 return
             try:
+                if symbols is None:
+                    current = datetime.now(timezone.utc)
+                    snapshot = self._discovery(current)
+                    symbols = [rule.symbol for rule in snapshot.rules]
                 market = getattr(self.server, "market", None)
                 self._send_json(collect_snapshot(symbols, market=market))
             except (Exception, SystemExit) as exc:
@@ -1212,8 +1251,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/competition":
             try:
+                current = datetime.now(timezone.utc)
+                snapshot = self._discovery(current)
                 service = getattr(self.server, "competition_service", None) or competition_service()
-                self._send_json(_apply_leaderboard_thresholds(service.collect(_symbols_from_env())))
+                payload = service.collect_rules(list(snapshot.rules), now=current)
+                self._add_discovery_metadata(payload, snapshot)
+                self._send_json(_apply_leaderboard_thresholds(payload))
             except (Exception, SystemExit) as exc:
                 self._send_internal_error(exc)
             return
