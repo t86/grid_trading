@@ -8,6 +8,7 @@ SERVICE_USER="${SERVICE_USER:-ubuntu}"
 HOST="${ALPHA_DASHBOARD_HOST:-127.0.0.1}"
 PORT="${ALPHA_DASHBOARD_PORT:-8796}"
 RULE_CACHE="${ALPHA_COMPETITION_RULE_CACHE:-/home/ubuntu/.cache/binance-alpha-volume-alert/competition_rules.json}"
+DISCOVERY_CACHE="${ALPHA_COMPETITION_DISCOVERY_CACHE:-/home/ubuntu/.cache/binance-alpha-volume-alert/competition_discovery.json}"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 BACKUP_PATH="${UNIT_PATH}.backup.$(date -u +%Y%m%dT%H%M%SZ).$$"
 UNIT_STAGE="${UNIT_PATH}.stage.$$.${RANDOM}"
@@ -49,6 +50,7 @@ fi
 validate_absolute_path "APP_DIR" "$APP_DIR"
 validate_absolute_path "PYTHON_BIN" "$PYTHON_BIN"
 validate_absolute_path "ALPHA_COMPETITION_RULE_CACHE" "$RULE_CACHE"
+validate_absolute_path "ALPHA_COMPETITION_DISCOVERY_CACHE" "$DISCOVERY_CACHE"
 
 if [ ! -d "${APP_DIR}/src/grid_optimizer" ]; then
   fail "APP_DIR does not contain src/grid_optimizer."
@@ -68,25 +70,29 @@ PYTHON_BIN="${PYTHON_DIR}/${PYTHON_NAME}"
 if ! RULE_CACHE="$(realpath -m "$RULE_CACHE")"; then
   fail "ALPHA_COMPETITION_RULE_CACHE could not be canonicalized."
 fi
+if ! DISCOVERY_CACHE="$(realpath -m "$DISCOVERY_CACHE")"; then
+  fail "ALPHA_COMPETITION_DISCOVERY_CACHE could not be canonicalized."
+fi
 validate_absolute_path "APP_DIR" "$APP_DIR"
 validate_absolute_path "PYTHON_BIN" "$PYTHON_BIN"
 validate_absolute_path "ALPHA_COMPETITION_RULE_CACHE" "$RULE_CACHE"
+validate_absolute_path "ALPHA_COMPETITION_DISCOVERY_CACHE" "$DISCOVERY_CACHE"
 
 APP_HOME="$(dirname "$APP_DIR")"
 CACHE_DIR="$(dirname "$RULE_CACHE")"
+DISCOVERY_CACHE_DIR="$(dirname "$DISCOVERY_CACHE")"
 EXPECTED_CACHE_DIR="${APP_HOME}/.cache/binance-alpha-volume-alert"
-if [ "$CACHE_DIR" = "/" ] || [ "$CACHE_DIR" != "$EXPECTED_CACHE_DIR" ]; then
-  fail "ALPHA_COMPETITION_RULE_CACHE must be directly under the dedicated app-home cache directory."
+if [ "$CACHE_DIR" = "/" ] || [ "$DISCOVERY_CACHE_DIR" = "/" ]; then
+  fail "Alpha competition caches must not use the filesystem root."
+fi
+if [ "$CACHE_DIR" != "$EXPECTED_CACHE_DIR" ] || [ "$DISCOVERY_CACHE_DIR" != "$EXPECTED_CACHE_DIR" ]; then
+  fail "Alpha competition caches must be directly under the dedicated app-home cache directory."
 fi
 if [ -L "${APP_HOME}/.cache" ] || [ -L "$EXPECTED_CACHE_DIR" ]; then
   fail "The dedicated cache path must not contain symlinked cache directories."
 fi
 if [ -e "$CACHE_DIR" ] && [ ! -d "$CACHE_DIR" ]; then
   fail "The dedicated cache path exists but is not a directory."
-fi
-CACHE_DIR_EXISTS=0
-if [ -d "$CACHE_DIR" ]; then
-  CACHE_DIR_EXISTS=1
 fi
 
 HAD_OLD_UNIT=0
@@ -117,7 +123,72 @@ if sudo test -e "$UNIT_PATH" || sudo test -L "$UNIT_PATH"; then
     "3:failed") WAS_ACTIVE_STATE="failed" ;;
     *) fail "Could not determine the existing service active state safely." ;;
   esac
+fi
 
+if ! sudo bash -s -- "$APP_HOME" "$EXPECTED_CACHE_DIR" "$SERVICE_USER" <<'SCRIPT'
+set -euo pipefail
+app_home="$1"
+expected_cache_dir="$2"
+service_user="$3"
+
+cd -P -- "$app_home"
+[ "$(pwd -P)" = "$app_home" ]
+if [ -L .cache ]; then
+  exit 1
+fi
+if [ ! -e .cache ]; then
+  mkdir -- .cache
+elif [ ! -d .cache ]; then
+  exit 1
+fi
+cd -P -- .cache
+[ "$(pwd -P)" = "${app_home}/.cache" ]
+if [ -L binance-alpha-volume-alert ]; then
+  exit 1
+fi
+cache_created=0
+if [ ! -e binance-alpha-volume-alert ]; then
+  mkdir -- binance-alpha-volume-alert
+  cache_created=1
+elif [ ! -d binance-alpha-volume-alert ]; then
+  exit 1
+fi
+cd -P -- binance-alpha-volume-alert
+[ "$(pwd -P)" = "$expected_cache_dir" ]
+if (( cache_created )); then
+  chown -- "${service_user}:${service_user}" .
+  chmod 0750 .
+fi
+SCRIPT
+then
+  fail "The dedicated cache directory could not be prepared safely."
+fi
+
+if [ "$(realpath "$EXPECTED_CACHE_DIR")" != "$EXPECTED_CACHE_DIR" ]; then
+  fail "The dedicated cache directory changed after preparation."
+fi
+PROBE_NAME=".alpha-dashboard-install-write-probe.$$"
+if ! sudo -u "$SERVICE_USER" sh -c '
+set -eu
+cache_dir="$1"
+probe_name="$2"
+cd -P -- "$cache_dir"
+[ "$(pwd -P)" = "$cache_dir" ]
+cleanup() {
+  rm -f -- "$probe_name"
+}
+trap cleanup EXIT HUP INT TERM
+(set -C; : > "$probe_name") 2>/dev/null
+rm -- "$probe_name"
+trap - EXIT HUP INT TERM
+' sh "$EXPECTED_CACHE_DIR" "$PROBE_NAME"; then
+  fail "SERVICE_USER cannot write the dedicated cache directory safely."
+fi
+if [ "$(realpath "$EXPECTED_CACHE_DIR")" != "$EXPECTED_CACHE_DIR" ]; then
+  fail "The dedicated cache directory changed during the write probe."
+fi
+
+if (( HAD_OLD_UNIT )); then
   sudo cp -a -- "$UNIT_PATH" "$BACKUP_PATH"
 fi
 
@@ -200,10 +271,6 @@ rollback() {
 }
 trap 'rollback $?' ERR
 
-if (( ! CACHE_DIR_EXISTS )); then
-  sudo install -d --mode=0750 --owner="$SERVICE_USER" --group="$SERVICE_USER" -- "$CACHE_DIR"
-fi
-
 cat >"$UNIT_TMP" <<EOF
 [Unit]
 Description=Binance Alpha competition dashboard
@@ -220,6 +287,7 @@ EnvironmentFile=-/home/ubuntu/.config/binance-alpha-volume-alert.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=${APP_DIR}/src
 Environment=ALPHA_COMPETITION_RULE_CACHE=${RULE_CACHE}
+Environment=ALPHA_COMPETITION_DISCOVERY_CACHE=${DISCOVERY_CACHE}
 ExecStart=${PYTHON_BIN} -m grid_optimizer.alpha_competition_dashboard --host ${HOST} --port ${PORT}
 Restart=on-failure
 RestartSec=3

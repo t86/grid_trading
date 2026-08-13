@@ -49,6 +49,22 @@ def installer_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
         ),
     )
     _write_executable(
+        fake_bin / "chown",
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import json
+            import os
+            from pathlib import Path
+            import sys
+
+            Path(os.environ["FAKE_CHOWN_MARKER"]).write_text(
+                json.dumps(sys.argv[1:])
+            )
+            """
+        ),
+    )
+    _write_executable(
         fake_bin / "sudo",
         textwrap.dedent(
             """\
@@ -57,6 +73,7 @@ def installer_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
             import os
             from pathlib import Path
             import shutil
+            import subprocess
             import sys
 
             root = Path(os.environ["FAKE_SYSTEM_ROOT"])
@@ -72,6 +89,34 @@ def installer_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
                 return Path(raw)
 
             command, rest = args[0], args[1:]
+            if command == "bash" and rest[:2] == ["-s", "--"]:
+                script = sys.stdin.read()
+                if os.environ.get("FAKE_RACE_CACHE_ROOT") == "1":
+                    cache_root = Path(rest[2]) / ".cache"
+                    outside = Path(os.environ["FAKE_RACE_OUTSIDE"])
+                    outside.mkdir(parents=True, exist_ok=True)
+                    if cache_root.is_dir() and not cache_root.is_symlink():
+                        shutil.rmtree(cache_root)
+                    else:
+                        cache_root.unlink(missing_ok=True)
+                    cache_root.symlink_to(outside, target_is_directory=True)
+                completed = subprocess.run(
+                    ["/bin/bash", "-s", "--", *rest[2:]],
+                    input=script,
+                    text=True,
+                    env=os.environ,
+                )
+                sys.exit(completed.returncode)
+
+            if command == "-u" and rest[1:3] == ["sh", "-c"]:
+                if os.environ.get("FAKE_SERVICE_WRITE_DENIED") == "1":
+                    sys.exit(1)
+                completed = subprocess.run(
+                    ["/bin/sh", *rest[2:]],
+                    env=os.environ,
+                )
+                sys.exit(completed.returncode)
+
             if command == "test":
                 predicate, path = rest[-2], mapped(rest[-1])
                 matches = {
@@ -239,8 +284,13 @@ def installer_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
             "ALPHA_COMPETITION_RULE_CACHE": str(
                 tmp_path / ".cache/binance-alpha-volume-alert/rules.json"
             ),
+            "ALPHA_COMPETITION_DISCOVERY_CACHE": str(
+                tmp_path
+                / ".cache/binance-alpha-volume-alert/competition_discovery.json"
+            ),
             "FAKE_SYSTEM_ROOT": str(fake_root),
             "FAKE_SUDO_LOG": str(tmp_path / "sudo.log"),
+            "FAKE_CHOWN_MARKER": str(tmp_path / "chown-marker.json"),
             "SIMULATED_SECRET": "must-not-appear-in-output",
         }
     )
@@ -278,6 +328,10 @@ def test_installer_runs_repo_module_and_keeps_existing_env_files() -> None:
         "EnvironmentFile=-/home/ubuntu/.config/binance-alpha-volume-alert.env" in text
     )
     assert "ALPHA_COMPETITION_RULE_CACHE" in text
+    assert (
+        'ALPHA_COMPETITION_DISCOVERY_CACHE:-/home/ubuntu/.cache/'
+        'binance-alpha-volume-alert/competition_discovery.json'
+    ) in text
     assert 'systemctl is-active --quiet "${SERVICE_NAME}.service"' in text
     assert "rollback" in text
 
@@ -298,6 +352,10 @@ def test_success_installs_unit_and_does_not_rollback(
     assert f"Environment=PYTHONPATH={env['APP_DIR']}/src" in unit
     assert f"Environment=ALPHA_COMPETITION_RULE_CACHE={env['ALPHA_COMPETITION_RULE_CACHE']}" in unit
     assert (
+        "Environment=ALPHA_COMPETITION_DISCOVERY_CACHE="
+        f"{env['ALPHA_COMPETITION_DISCOVERY_CACHE']}"
+    ) in unit
+    assert (
         f"ExecStart={env['PYTHON_BIN']} -m grid_optimizer.alpha_competition_dashboard "
         "--host 127.0.0.1 --port 8796"
     ) in unit
@@ -316,16 +374,18 @@ def test_success_installs_unit_and_does_not_rollback(
     assert stage_path.startswith(f"{unit_system_path}.stage.")
     assert ["mv", stage_path, unit_system_path] in calls
     assert not list(unit_path.parent.glob(f"{SERVICE_NAME}.service.stage.*"))
-    cache_dir = str(Path(env["ALPHA_COMPETITION_RULE_CACHE"]).parent)
-    assert [
-        "install",
-        "-d",
-        "--mode=0750",
-        "--owner=dashboard-user",
-        "--group=dashboard-user",
+    cache_dir = Path(env["ALPHA_COMPETITION_RULE_CACHE"]).parent
+    assert cache_dir.is_dir()
+    assert cache_dir.stat().st_mode & 0o777 == 0o750
+    secure_prepares = [call for call in calls if call[:3] == ["bash", "-s", "--"]]
+    assert len(secure_prepares) == 1
+    assert secure_prepares[0][-2:] == [str(cache_dir), "dashboard-user"]
+    assert json.loads(Path(env["FAKE_CHOWN_MARKER"]).read_text()) == [
         "--",
-        cache_dir,
-    ] in calls
+        "dashboard-user:dashboard-user",
+        ".",
+    ]
+    assert not any(cache_dir.glob(".alpha-dashboard-install-write-probe.*"))
     assert "must-not-appear-in-output" not in result.stdout + result.stderr
 
 
@@ -419,9 +479,59 @@ def test_existing_cache_directory_is_not_chowned_or_chmodded(
 
     assert result.returncode == 0, result.stderr
     assert cache_dir.stat().st_mode & 0o777 == 0o711
-    assert not any(
-        call[0] == "install" and "-d" in call for call in _sudo_calls(env)
+    secure_prepares = [
+        call for call in _sudo_calls(env) if call[:3] == ["bash", "-s", "--"]
+    ]
+    assert len(secure_prepares) == 1
+    assert not any(cache_dir.glob(".alpha-dashboard-install-write-probe.*"))
+
+
+def test_cache_root_race_does_not_follow_symlink_or_touch_unit(
+    installer_env: tuple[dict[str, str], Path], tmp_path: Path
+) -> None:
+    env, fake_root = installer_env
+    unit_path = fake_root / "systemd" / f"{SERVICE_NAME}.service"
+    unit_path.write_text("old unit\n")
+    outside = tmp_path / "outside"
+    env.update(
+        {
+            "FAKE_RACE_CACHE_ROOT": "1",
+            "FAKE_RACE_OUTSIDE": str(outside),
+            "FAKE_WAS_ENABLED": "1",
+            "FAKE_WAS_ACTIVE": "1",
+        }
     )
+
+    result = _run(env)
+
+    assert result.returncode != 0
+    assert not (outside / "binance-alpha-volume-alert").exists()
+    assert unit_path.read_text() == "old unit\n"
+    assert not list(unit_path.parent.glob(f"{SERVICE_NAME}.service.backup.*"))
+
+
+def test_unwritable_existing_cache_fails_before_unit_backup(
+    installer_env: tuple[dict[str, str], Path]
+) -> None:
+    env, fake_root = installer_env
+    cache_dir = Path(env["ALPHA_COMPETITION_RULE_CACHE"]).parent
+    cache_dir.mkdir(parents=True)
+    cache_dir.chmod(0o711)
+    unit_path = fake_root / "systemd" / f"{SERVICE_NAME}.service"
+    unit_path.write_text("old unit\n")
+    env.update(
+        {
+            "FAKE_SERVICE_WRITE_DENIED": "1",
+            "FAKE_WAS_ENABLED": "1",
+            "FAKE_WAS_ACTIVE": "1",
+        }
+    )
+
+    result = _run(env)
+
+    assert result.returncode != 0
+    assert unit_path.read_text() == "old unit\n"
+    assert not list(unit_path.parent.glob(f"{SERVICE_NAME}.service.backup.*"))
 
 
 def test_python_path_is_canonicalized_without_resolving_venv_executable_symlink(
@@ -442,9 +552,13 @@ def test_python_path_is_canonicalized_without_resolving_venv_executable_symlink(
     assert f"ExecStart={target} " not in unit
 
 
+@pytest.mark.parametrize(
+    "cache_variable",
+    ["ALPHA_COMPETITION_RULE_CACHE", "ALPHA_COMPETITION_DISCOVERY_CACHE"],
+)
 @pytest.mark.parametrize("case", ["root", "tmp", "dotdot"])
 def test_rejects_cache_outside_dedicated_app_home(
-    installer_env: tuple[dict[str, str], Path], case: str
+    installer_env: tuple[dict[str, str], Path], cache_variable: str, case: str
 ) -> None:
     env, fake_root = installer_env
     app_home = Path(env["APP_DIR"]).parent
@@ -454,7 +568,7 @@ def test_rejects_cache_outside_dedicated_app_home(
         "dotdot": app_home
         / ".cache/binance-alpha-volume-alert/../escape/rules.json",
     }
-    env["ALPHA_COMPETITION_RULE_CACHE"] = str(paths[case])
+    env[cache_variable] = str(paths[case])
 
     result = _run(env)
 
@@ -629,6 +743,10 @@ def test_stage_cleanup_failure_warns_without_failing_success(
         ("ALPHA_DASHBOARD_HOST", "127.0.0.1\\nExecStart=/bin/false"),
         ("ALPHA_DASHBOARD_PORT", "70000"),
         ("ALPHA_COMPETITION_RULE_CACHE", "/tmp/cache path/rules.json"),
+        (
+            "ALPHA_COMPETITION_DISCOVERY_CACHE",
+            "/tmp/cache path/competition_discovery.json",
+        ),
     ],
 )
 def test_rejects_unsafe_unit_values(
