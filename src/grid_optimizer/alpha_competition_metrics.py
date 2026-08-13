@@ -507,7 +507,14 @@ class BinanceCompetitionRuleProvider:
             symbols.append(announcement.symbol)
         return symbols
 
-    def fetch_announcement_rule(self, announcement: CompetitionAnnouncement) -> CompetitionRule:
+    def fetch_announcement_rule(
+        self,
+        announcement: CompetitionAnnouncement,
+        *,
+        now: datetime | None = None,
+    ) -> CompetitionRule:
+        if now is not None:
+            _require_utc_aware(now, "now")
         expected = _validate_announcement(announcement)
         detail = self._get_data(_CMS_DETAIL_PATH, {"articleCode": expected.article_code})
         if _required_text(detail, "code") != expected.article_code:
@@ -554,7 +561,7 @@ class BinanceCompetitionRuleProvider:
         if not candidates:
             raise RuleParseError(f"no recent competition announcement for {target}")
         latest = max(candidates, key=lambda item: item.released_at_utc)
-        return self.fetch_announcement_rule(latest)
+        return self.fetch_announcement_rule(latest, now=current)
 
 
 def _encode_datetime(value: datetime, name: str) -> str:
@@ -881,6 +888,16 @@ def _decode_rule(value: object) -> CompetitionRule:
         multipliers=tuple(multipliers),
     )
     return _validate_rule(rule)
+
+
+def encode_competition_rule(rule: CompetitionRule) -> dict[str, object]:
+    """Encode one validated competition rule for durable JSON storage."""
+    return _encode_rule(rule)
+
+
+def decode_competition_rule(value: object) -> CompetitionRule:
+    """Decode and validate one competition rule from durable JSON storage."""
+    return _decode_rule(value)
 
 
 class CompetitionRuleCache:
