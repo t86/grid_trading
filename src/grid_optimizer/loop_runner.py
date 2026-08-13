@@ -23640,15 +23640,8 @@ def apply_best_quote_active_pair_reduce(
         )
     }
     if threshold_side_mode and bool(memory.get("completed")):
-        prior_eligible_sides = {
-            str(side)
-            for side in memory.get("eligible_sides", [])
-            if str(side) in {"long", "short"}
-        }
-        rebreached_sides = threshold_eligible_sides & prior_eligible_sides
         trigger_count = max(int(memory.get("trigger_count") or 0), 0)
-        if rebreached_sides and trigger_count < 3:
-            threshold_eligible_sides = rebreached_sides
+        if threshold_eligible_sides:
             memory = {"trigger_count": trigger_count}
             report["rearmed_after_refill"] = True
         else:
@@ -23668,7 +23661,11 @@ def apply_best_quote_active_pair_reduce(
                 {
                     "reason": "lease_completed_waiting_disable",
                     "completed": True,
-                    "eligible_sides": sorted(prior_eligible_sides),
+                    "eligible_sides": [
+                        str(side)
+                        for side in memory.get("eligible_sides", [])
+                        if str(side) in {"long", "short"}
+                    ],
                     "execution_cycles": trigger_count,
                 }
             )
@@ -23681,12 +23678,6 @@ def apply_best_quote_active_pair_reduce(
             if active or bool(threshold_eligible_sides)
             else set()
         )
-    if active and threshold_side_mode:
-        eligible_sides = {
-            str(side)
-            for side in memory.get("eligible_sides", [])
-            if str(side) in {"long", "short"}
-        }
     touched_soft = bool(eligible_sides)
     if not active and touched_soft:
         if threshold_side_mode:

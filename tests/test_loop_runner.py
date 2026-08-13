@@ -12137,7 +12137,7 @@ class LoopRunnerTests(unittest.TestCase):
             [item["role"] for item in plan["sell_orders"]],
         )
 
-    def test_threshold_mode_completion_latches_until_disabled_before_switching_side(self) -> None:
+    def test_threshold_mode_completion_rearms_when_another_ordinary_side_crosses_threshold(self) -> None:
         state: dict[str, Any] = {}
         first_plan = {"buy_orders": [], "sell_orders": []}
 
@@ -12210,52 +12210,14 @@ class LoopRunnerTests(unittest.TestCase):
             suppress_all_entries_while_active=True,
         )
 
-        self.assertTrue(second["completed"])
-        self.assertEqual(second["reason"], "target_reached_small_residual")
-        self.assertEqual(
-            [item["role"] for item in second_plan["sell_orders"]],
-            ["best_quote_entry_short"],
+        self.assertTrue(second["active"])
+        self.assertFalse(second["completed"])
+        self.assertEqual(second["eligible_sides"], ["short"])
+        self.assertEqual(second["order_count"], 1)
+        self.assertIn(
+            "best_quote_active_pair_reduce_short",
+            [item["role"] for item in second_plan["buy_orders"]],
         )
-        self.assertFalse(
-            any(
-                item.get("role") == "best_quote_active_pair_reduce_short"
-                for item in second_plan["buy_orders"]
-            )
-        )
-
-        latched_plan = {"buy_orders": [], "sell_orders": []}
-        latched = apply_best_quote_active_pair_reduce(
-            plan=latched_plan,
-            state=state,
-            enabled=True,
-            current_long_qty=2948.0,
-            current_short_qty=3143.0,
-            current_long_notional=847.4,
-            current_short_notional=903.5,
-            max_long_notional=1000.0,
-            max_short_notional=1000.0,
-            soft_ratio=0.90,
-            min_side_notional=0.0,
-            per_order_notional=100.0,
-            max_reduce_notional_per_side=100.0,
-            offset_ticks=1,
-            step_price=0.0006,
-            tick_size=0.0001,
-            step_size=1.0,
-            min_qty=1.0,
-            min_notional=5.0,
-            bid_price=0.2873,
-            ask_price=0.2874,
-            volatility_entry_pause={"active": False},
-            loss_reduce_threshold_notional=900.0,
-            current_long_avg_price=0.2887,
-            current_short_avg_price=0.2866,
-            max_loss_ratio=0.06,
-            min_relief_notional=100.0,
-            suppress_all_entries_while_active=True,
-        )
-        self.assertEqual(latched["reason"], "lease_completed_waiting_disable")
-        self.assertEqual(latched["order_count"], 0)
 
         apply_best_quote_active_pair_reduce(
             plan={"buy_orders": [], "sell_orders": []},
