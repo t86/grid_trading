@@ -18,6 +18,7 @@ from grid_optimizer.alpha_competition_metrics import RuleParseError, parse_compe
 FIXTURES = json.loads((Path(__file__).parent / "fixtures" / "alpha_competition_articles.json").read_text())
 UTC = timezone.utc
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+DISCOVERY_NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
 
 
 class _FakeResponse:
@@ -91,6 +92,33 @@ def _append_block(article: dict[str, object], text: str) -> None:
     _set_tree(article, tree)
 
 
+def _replace_period_label(article: dict[str, object], *, round_number: int, label: str) -> None:
+    tree = _tree(article)
+    children = tree["children"]
+    assert isinstance(children, list)
+    block = children[round_number - 1]
+    assert isinstance(block, dict)
+    text = json.dumps(block).replace("DAPPOS Trading Competition", f"{label} Trading Competition")
+    children[round_number - 1] = json.loads(text)
+    _set_tree(article, tree)
+
+
+def _announcement(
+    article: dict[str, object],
+    *,
+    symbol: str,
+    released_at_utc: datetime = DISCOVERY_NOW,
+) -> metrics.CompetitionAnnouncement:
+    data = article["data"]
+    assert isinstance(data, dict)
+    return metrics.CompetitionAnnouncement(
+        symbol=symbol,
+        article_code=str(data["code"]),
+        title=str(data["title"]),
+        released_at_utc=released_at_utc,
+    )
+
+
 @pytest.mark.parametrize(
     ("symbol", "name", "code", "published", "winner", "rounds", "multipliers"),
     [
@@ -108,6 +136,30 @@ def test_parses_all_official_competition_articles(symbol, name, code, published,
     assert rule.winner_count == winner
     assert tuple((round_.start_utc.strftime("%Y-%m-%d %H:%M"), round_.end_utc.strftime("%Y-%m-%d %H:%M")) for round_ in rule.rounds) == rounds
     assert rule.multipliers == multipliers
+
+
+def test_dos_accepts_consistent_project_name_period_labels() -> None:
+    rule = parse_competition_rule(FIXTURES["DOS"], "DOS")
+
+    assert (rule.symbol, rule.name, rule.article_code) == (
+        "DOS", "DAPPOS", "2e19d56645a2472fa3dbf1b8bf2c7efe",
+    )
+    assert [round_.number for round_ in rule.rounds] == [1, 2]
+
+
+def test_period_labels_must_still_be_consistent_within_one_article() -> None:
+    article = copy.deepcopy(FIXTURES["DOS"])
+    _replace_period_label(article, round_number=2, label="OTHER")
+
+    with pytest.raises(RuleParseError, match="promotion round labels conflict"):
+        parse_competition_rule(article, "DOS")
+
+
+def test_period_labels_are_compared_case_insensitively() -> None:
+    article = copy.deepcopy(FIXTURES["DOS"])
+    _replace_period_label(article, round_number=2, label="dappos")
+
+    assert [round_.number for round_ in parse_competition_rule(article, "DOS").rounds] == [1, 2]
 
 
 @pytest.mark.parametrize("bad_title", [
@@ -366,6 +418,286 @@ def test_transparent_element_day_prose_is_not_a_multiplier_row(position: str) ->
     assert len(prose_blocks) == 1
     assert prose_blocks[0].multiplier_row is False
     assert parse_competition_rule(article, "QUID").multipliers == (3.5, 3.0, 2.5, 2.0, 1.8, 1.3, 1.0)
+
+
+def test_provider_enumerates_recent_competition_announcements_by_article_code() -> None:
+    release = int((DISCOVERY_NOW - timedelta(days=1)).timestamp() * 1000)
+    power = {
+        "code": "8bd4e92286d8474fa440091eea5672ff",
+        "title": "Binance Alpha Trading Competition: Trade Power Protocol (POWER) and Share Rewards",
+        "releaseDate": release - 1,
+    }
+    noise = {
+        "code": "noise-code",
+        "title": "Binance Adds a New Alpha Token",
+        "releaseDate": release - 2,
+    }
+    session = _FakeSession([
+        _official({"articles": [_list_item(FIXTURES["DOS"], release_date=release), power, noise]}),
+        _official({"articles": []}),
+    ])
+    provider = metrics.BinanceCompetitionRuleProvider(session=session)
+
+    result = provider.fetch_recent_announcements(now=DISCOVERY_NOW)
+
+    assert [(item.symbol, item.article_code) for item in result] == [
+        ("DOS", "2e19d56645a2472fa3dbf1b8bf2c7efe"),
+        ("POWER", "8bd4e92286d8474fa440091eea5672ff"),
+    ]
+    assert result[0] == metrics.CompetitionAnnouncement(
+        symbol="DOS",
+        article_code="2e19d56645a2472fa3dbf1b8bf2c7efe",
+        title=FIXTURES["DOS"]["data"]["title"],
+        released_at_utc=datetime.fromtimestamp(release / 1000, tz=UTC),
+    )
+    assert [call[1]["pageNo"] for call in session.calls] == [1, 2]
+
+
+def test_provider_deduplicates_exact_announcement_metadata_by_article_code() -> None:
+    item = _list_item(
+        FIXTURES["DOS"],
+        release_date=int((DISCOVERY_NOW - timedelta(days=1)).timestamp() * 1000),
+    )
+    session = _FakeSession([_official({"articles": [item, copy.deepcopy(item)]}), _official({"articles": []})])
+
+    result = metrics.BinanceCompetitionRuleProvider(session=session).fetch_recent_announcements(
+        now=DISCOVERY_NOW
+    )
+
+    assert len(result) == 1
+    assert result[0].article_code == item["code"]
+
+
+def test_provider_does_not_treat_a_recent_duplicate_only_page_as_old() -> None:
+    item = _list_item(
+        FIXTURES["DOS"],
+        release_date=int((DISCOVERY_NOW - timedelta(days=1)).timestamp() * 1000),
+    )
+    session = _FakeSession([
+        _official({"articles": [item]}),
+        _official({"articles": [copy.deepcopy(item)]}),
+        _official({"articles": []}),
+    ])
+
+    result = metrics.BinanceCompetitionRuleProvider(session=session).fetch_recent_announcements(
+        now=DISCOVERY_NOW
+    )
+
+    assert len(result) == 1
+    assert [call[1]["pageNo"] for call in session.calls] == [1, 2, 3]
+
+
+def test_provider_rejects_conflicting_announcement_metadata_for_one_article_code() -> None:
+    release = int((DISCOVERY_NOW - timedelta(days=1)).timestamp() * 1000)
+    first = _list_item(FIXTURES["DOS"], release_date=release)
+    conflict = copy.deepcopy(first)
+    conflict["title"] = "Binance Alpha Trading Competition: Trade Other (OTHER) and Share Rewards"
+    provider = metrics.BinanceCompetitionRuleProvider(
+        session=_FakeSession([_official({"articles": [first, conflict]})])
+    )
+
+    with pytest.raises(RuleParseError, match="metadata conflict"):
+        provider.fetch_recent_announcements(now=DISCOVERY_NOW)
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        None,
+        {"code": "", "title": "Binance Adds a New Alpha Token", "releaseDate": 1},
+        {"code": "noise", "title": "Binance Adds a New Alpha Token", "releaseDate": True},
+        {"code": "noise", "title": None, "releaseDate": 1},
+    ],
+)
+def test_provider_rejects_malformed_items_even_when_the_title_is_not_a_competition(item: object) -> None:
+    provider = metrics.BinanceCompetitionRuleProvider(
+        session=_FakeSession([_official({"articles": [item]})])
+    )
+
+    with pytest.raises(RuleParseError):
+        provider.fetch_recent_announcements(now=DISCOVERY_NOW)
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "binance Alpha Trading Competition: Trade Project (O) and Earn Rewards",
+        "Binance Alpha Trading Competition: trade Project (O) and Earn Rewards",
+        "Binance Alpha Trading Competition: Trade Project (o) and Earn Rewards",
+        "Binance Alpha Trading Competition: Trade Project(O) and Earn Rewards",
+        "Binance Alpha Trading Competition: Trade Other (OTHER) and Earn; Trade o1.exchange (O) and Earn More",
+        "Binance Alpha Trading Competition: Trade Project (BAD-SYMBOL) and Earn Rewards",
+        f"Binance Alpha Trading Competition: Trade Project ({'A' * 33}) and Earn Rewards",
+        "Binance Alpha Trading Competition: Trade Project (O) anderson Rewards",
+        "Binance Alpha Trading Competition:Trade Project (O) and Earn Rewards",
+    ],
+)
+def test_announcement_title_parser_does_not_find_an_incidental_o_identity(title: str) -> None:
+    release = int((DISCOVERY_NOW - timedelta(days=1)).timestamp() * 1000)
+    session = _FakeSession([
+        _official({"articles": [{"code": "candidate", "title": title, "releaseDate": release}]}),
+        _official({"articles": []}),
+    ])
+
+    announcements = metrics.BinanceCompetitionRuleProvider(
+        session=session
+    ).fetch_recent_announcements(now=DISCOVERY_NOW)
+
+    assert all(item.symbol != "O" for item in announcements)
+
+
+@pytest.mark.parametrize("name", ["  ", "\t "])
+def test_announcement_title_parser_rejects_whitespace_only_project_name(name: str) -> None:
+    release = int((DISCOVERY_NOW - timedelta(days=1)).timestamp() * 1000)
+    session = _FakeSession([
+        _official({"articles": [{
+            "code": "missing-project-name",
+            "title": f"Binance Alpha Trading Competition: Trade {name}(DOS) and Rewards",
+            "releaseDate": release,
+        }]}),
+        _official({"articles": []}),
+    ])
+
+    announcements = metrics.BinanceCompetitionRuleProvider(
+        session=session
+    ).fetch_recent_announcements(now=DISCOVERY_NOW)
+
+    assert announcements == []
+
+
+def test_announcement_title_parser_accepts_parentheses_inside_the_project_name() -> None:
+    release = int((DISCOVERY_NOW - timedelta(days=1)).timestamp() * 1000)
+    session = _FakeSession([
+        _official({"articles": [{
+            "code": "parenthesized-project",
+            "title": "Binance Alpha Trading Competition: Trade Project (Labs) (DOS) and Earn Rewards",
+            "releaseDate": release,
+        }]}),
+        _official({"articles": []}),
+    ])
+
+    announcements = metrics.BinanceCompetitionRuleProvider(
+        session=session
+    ).fetch_recent_announcements(now=DISCOVERY_NOW)
+
+    assert [(item.symbol, item.article_code) for item in announcements] == [
+        ("DOS", "parenthesized-project"),
+    ]
+
+
+def test_rule_parser_accepts_parentheses_inside_the_project_name() -> None:
+    article = copy.deepcopy(FIXTURES["DOS"])
+    data = article["data"]
+    assert isinstance(data, dict)
+    data["title"] = "Binance Alpha Trading Competition: Trade Project (Labs) (DOS) and Earn Rewards"
+
+    rule = parse_competition_rule(article, "DOS")
+
+    assert (rule.symbol, rule.name) == ("DOS", "Project (Labs)")
+
+
+def test_provider_fetches_parenthesized_project_announcement_rule_end_to_end() -> None:
+    detail = copy.deepcopy(FIXTURES["DOS"]["data"])
+    assert isinstance(detail, dict)
+    detail["code"] = "parenthesized-project"
+    detail["title"] = "Binance Alpha Trading Competition: Trade Project (Labs) (DOS) and Earn Rewards"
+    item = {
+        "code": detail["code"],
+        "title": detail["title"],
+        "releaseDate": int((DISCOVERY_NOW - timedelta(days=1)).timestamp() * 1000),
+    }
+    provider = metrics.BinanceCompetitionRuleProvider(session=_FakeSession([
+        _official({"articles": [item]}),
+        _official({"articles": []}),
+        _official(detail),
+    ]))
+
+    announcements = provider.fetch_recent_announcements(now=DISCOVERY_NOW)
+    rule = provider.fetch_announcement_rule(announcements[0])
+
+    assert (rule.symbol, rule.name, rule.article_code) == (
+        "DOS", "Project (Labs)", "parenthesized-project",
+    )
+
+
+def test_provider_includes_cutoff_boundary_and_stops_on_an_entirely_old_page() -> None:
+    cutoff = DISCOVERY_NOW - timedelta(days=60)
+    page_one = [
+        _list_item(FIXTURES["DOS"], release_date=int((DISCOVERY_NOW - timedelta(days=1)).timestamp() * 1000)),
+        _list_item(FIXTURES["O"], release_date=int((cutoff - timedelta(milliseconds=1)).timestamp() * 1000)),
+    ]
+    page_two = [
+        _list_item(FIXTURES["QUID"], release_date=int(cutoff.timestamp() * 1000)),
+    ]
+    page_three = [
+        _list_item(FIXTURES["GRVT"], release_date=int((cutoff - timedelta(days=1)).timestamp() * 1000)),
+    ]
+    session = _FakeSession([
+        _official({"articles": page_one}),
+        _official({"articles": page_two}),
+        _official({"articles": page_three}),
+    ])
+
+    result = metrics.BinanceCompetitionRuleProvider(session=session).fetch_recent_announcements(
+        now=DISCOVERY_NOW
+    )
+
+    assert [item.symbol for item in result] == ["DOS", "QUID"]
+    assert [call[1]["pageNo"] for call in session.calls] == [1, 2, 3]
+
+
+def test_provider_fetches_rule_for_an_announcement_and_validates_identity() -> None:
+    announcement = _announcement(FIXTURES["DOS"], symbol="DOS")
+    detail = FIXTURES["DOS"]["data"]
+    assert isinstance(detail, dict)
+    session = _FakeSession([_official(detail)])
+
+    rule = metrics.BinanceCompetitionRuleProvider(session=session).fetch_announcement_rule(announcement)
+
+    assert (rule.symbol, rule.article_code, rule.title) == (
+        announcement.symbol,
+        announcement.article_code,
+        announcement.title,
+    )
+    assert session.calls[0][1] == {"articleCode": announcement.article_code}
+
+
+def test_provider_rejects_announcement_detail_code_mismatch() -> None:
+    announcement = _announcement(FIXTURES["DOS"], symbol="DOS")
+    detail = copy.deepcopy(FIXTURES["DOS"]["data"])
+    assert isinstance(detail, dict)
+    detail["code"] = "different-code"
+
+    with pytest.raises(RuleParseError, match="code"):
+        metrics.BinanceCompetitionRuleProvider(
+            session=_FakeSession([_official(detail)])
+        ).fetch_announcement_rule(announcement)
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Binance Alpha Trading Competition: Trade DAPPOS (DOS) and Earn Different Rewards",
+        "Binance Alpha Trading Competition: Trade DAPPOS (OTHER) and Share Rewards",
+    ],
+)
+def test_provider_rejects_announcement_detail_title_or_symbol_mismatch(title: str) -> None:
+    announcement = _announcement(FIXTURES["DOS"], symbol="DOS")
+    detail = copy.deepcopy(FIXTURES["DOS"]["data"])
+    assert isinstance(detail, dict)
+    detail["title"] = title
+
+    with pytest.raises(RuleParseError, match="identity"):
+        metrics.BinanceCompetitionRuleProvider(
+            session=_FakeSession([_official(detail)])
+        ).fetch_announcement_rule(announcement)
+
+
+def test_recent_announcement_provider_requires_utc_aware_now() -> None:
+    provider = metrics.BinanceCompetitionRuleProvider(session=_FakeSession([]))
+
+    with pytest.raises(ValueError, match="UTC-aware"):
+        provider.fetch_recent_announcements(now=datetime(2026, 8, 13, 12, 0))
 
 
 def test_provider_selects_latest_exact_symbol_article() -> None:

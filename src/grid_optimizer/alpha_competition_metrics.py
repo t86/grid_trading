@@ -17,10 +17,9 @@ import requests
 
 
 _UTC = timezone.utc
-_TITLE_PREFIX = "Binance Alpha Trading Competition: Trade "
 _COMPETITION_TITLE_SYMBOL_RE = re.compile(
-    r"^Binance Alpha Trading Competition:\s*Trade\s+.+?\(([A-Z0-9_]+)\)\s+and\b",
-    re.IGNORECASE,
+    r"^Binance Alpha Trading Competition: Trade (?P<name>\s*?\S.*?) "
+    r"\((?P<symbol>[A-Z0-9_]{1,32})\) and\b",
 )
 _CMS_BASE_URL = "https://www.binance.com"
 _CMS_LIST_PATH = "/bapi/composite/v1/public/cms/article/list/query"
@@ -68,6 +67,14 @@ class CompetitionRule:
     winner_count: int
     rounds: tuple[CompetitionRound, ...]
     multipliers: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class CompetitionAnnouncement:
+    symbol: str
+    article_code: str
+    title: str
+    released_at_utc: datetime
 
 
 @dataclass(frozen=True)
@@ -188,18 +195,18 @@ def _body_blocks(data: Mapping[str, Any]) -> tuple[_ArticleBlock, ...]:
     return tuple(_collect_blocks(tree))
 
 
+def _competition_title_identity(title: str) -> tuple[str, str] | None:
+    match = _COMPETITION_TITLE_SYMBOL_RE.match(title.strip())
+    if match is None:
+        return None
+    return match.group("name").strip(), match.group("symbol")
+
+
 def _parse_title(title: str, symbol: str) -> str:
-    if not title.startswith(_TITLE_PREFIX):
+    identity = _competition_title_identity(title)
+    if identity is None or identity[1] != symbol:
         raise RuleParseError("article title does not match the competition")
-    remainder = title[len(_TITLE_PREFIX):]
-    identity_start = remainder.find(" (")
-    expected_identity = f" ({symbol})"
-    if identity_start < 0 or not remainder.startswith(expected_identity, identity_start):
-        raise RuleParseError("article title does not match the competition")
-    suffix = remainder[identity_start + len(expected_identity):]
-    if re.match(r"\s+and\b", suffix) is None:
-        raise RuleParseError("article title does not match the competition")
-    return remainder[:identity_start].strip() or symbol
+    return identity[0]
 
 
 def _ordinal_suffix(number: int) -> str:
@@ -230,7 +237,8 @@ def _multiplier_blocks(blocks: tuple[_ArticleBlock, ...]) -> tuple[_ArticleBlock
     return tuple(block for block in blocks if _legacy_multiplier_block(block))
 
 
-def _parse_rounds(blocks: tuple[_ArticleBlock, ...], expected_symbol: str) -> tuple[CompetitionRound, ...]:
+def _parse_rounds(blocks: tuple[_ArticleBlock, ...]) -> tuple[CompetitionRound, ...]:
+    period_label: str | None = None
     multiplier_blocks = _multiplier_blocks(blocks)
     first_day = next(
         (index for index, block in enumerate(blocks) if block in multiplier_blocks),
@@ -239,9 +247,12 @@ def _parse_rounds(blocks: tuple[_ArticleBlock, ...], expected_symbol: str) -> tu
     rounds_by_number: dict[int, CompetitionRound] = {}
     for block in blocks[:first_day]:
         for match in _PERIOD_RE.finditer(block.text):
+            label = match.group("symbol").upper()
+            if period_label is None:
+                period_label = label
+            elif label != period_label:
+                raise RuleParseError("promotion round labels conflict")
             number = int(match.group("number"))
-            if match.group("symbol") != expected_symbol:
-                raise RuleParseError("promotion round symbol does not match article")
             if number <= 0 or match.group("suffix") != _ordinal_suffix(number):
                 raise RuleParseError("promotion round number is invalid")
             round_ = CompetitionRound(number, _parse_datetime(match.group("start")), _parse_datetime(match.group("end")))
@@ -314,7 +325,7 @@ def parse_competition_rule(article: object, expected_symbol: object) -> Competit
         article_url=f"https://www.binance.com/en/support/announcement/detail/{code}",
         published_at_utc=_published_at_utc(data),
         winner_count=_parse_winner_count(blocks),
-        rounds=_parse_rounds(blocks, symbol),
+        rounds=_parse_rounds(blocks),
         multipliers=_parse_multipliers(blocks),
     )
 
@@ -384,21 +395,42 @@ def _competition_symbol_from_title(item: Mapping[str, Any]) -> str | None:
     title = item.get("title")
     if not isinstance(title, str):
         raise RuleParseError("Binance CMS article title is invalid")
-    match = _COMPETITION_TITLE_SYMBOL_RE.search(title.strip())
-    if match is None:
-        return None
-    return match.group(1).upper()
+    identity = _competition_title_identity(title)
+    return identity[1] if identity is not None else None
 
 
-def _title_matches_symbol(item: Mapping[str, Any], symbol: str) -> bool:
+def _announcement_from_item(item: Mapping[str, Any]) -> CompetitionAnnouncement | None:
+    code = _list_article_code(item)
+    release_ms = _article_release_ms(item)
     title = item.get("title")
     if not isinstance(title, str):
         raise RuleParseError("Binance CMS article title is invalid")
+    title = title.strip()
+    symbol = _competition_symbol_from_title(item)
+    if symbol is None:
+        return None
     try:
-        _parse_title(title.strip(), symbol)
-    except RuleParseError:
-        return False
-    return True
+        released_at_utc = datetime.fromtimestamp(release_ms / 1000, tz=_UTC)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise RuleParseError("Binance CMS article release date is invalid") from exc
+    return CompetitionAnnouncement(symbol, code, title, released_at_utc)
+
+
+def _validate_announcement(announcement: object) -> CompetitionAnnouncement:
+    if not isinstance(announcement, CompetitionAnnouncement):
+        raise RuleParseError("competition announcement is invalid")
+    try:
+        symbol = _normalized_symbol(announcement.symbol)
+        if symbol != announcement.symbol or re.fullmatch(r"[A-Z0-9_]{1,32}", symbol) is None:
+            raise ValueError
+        if not announcement.article_code.strip() or not announcement.title.strip():
+            raise ValueError
+        _require_utc_aware(announcement.released_at_utc, "released_at_utc")
+        if _competition_symbol_from_title({"title": announcement.title}) != symbol:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError, RuleParseError):
+        raise RuleParseError("competition announcement is invalid") from None
+    return announcement
 
 
 class BinanceCompetitionRuleProvider:
@@ -421,42 +453,83 @@ class BinanceCompetitionRuleProvider:
             raise RuleParseError("Binance CMS response data is invalid")
         return data
 
-    def fetch_recent_symbols(self, *, now: datetime | None = None, days: int = 60) -> list[str]:
+    def fetch_recent_announcements(
+        self,
+        *,
+        now: datetime | None = None,
+        days: int = 60,
+    ) -> list[CompetitionAnnouncement]:
         current = datetime.now(_UTC) if now is None else _require_utc_aware(now, "now")
         cutoff_ms = int((current - timedelta(days=days)).timestamp() * 1000)
-        symbols: list[str] = []
-        seen: set[str] = set()
+        announcements: list[CompetitionAnnouncement] = []
+        seen: dict[str, tuple[str, int]] = {}
         for page_no in range(1, 21):
             data = self._get_data(
                 _CMS_LIST_PATH,
                 {"type": 1, "catalogId": 93, "pageNo": page_no, "pageSize": 50},
             )
             raw_articles = _list_articles(data)
-            articles: list[Mapping[str, Any]] = []
+            releases: list[int] = []
             for item in raw_articles:
                 if not isinstance(item, Mapping):
                     raise RuleParseError("Binance CMS article list is invalid")
-                _list_article_code(item)
-                _article_release_ms(item)
-                articles.append(item)
-            for item in articles:
-                if _article_release_ms(item) < cutoff_ms:
+                code = _list_article_code(item)
+                release_ms = _article_release_ms(item)
+                releases.append(release_ms)
+                title = item.get("title")
+                if not isinstance(title, str):
+                    raise RuleParseError("Binance CMS article title is invalid")
+                title = title.strip()
+                metadata = (title, release_ms)
+                existing = seen.get(code)
+                if existing is not None:
+                    if existing != metadata:
+                        raise RuleParseError("Binance CMS article metadata conflict")
                     continue
-                symbol = _competition_symbol_from_title(item)
-                if symbol is None or symbol in seen:
+                seen[code] = metadata
+                if release_ms < cutoff_ms:
                     continue
-                seen.add(symbol)
-                symbols.append(symbol)
-            page_is_old = bool(articles) and all(_article_release_ms(item) < cutoff_ms for item in articles)
-            if not articles or page_is_old:
+                announcement = _announcement_from_item(item)
+                if announcement is not None:
+                    announcements.append(announcement)
+            page_is_old = bool(raw_articles) and all(release < cutoff_ms for release in releases)
+            if not raw_articles or page_is_old:
                 break
+        return announcements
+
+    def fetch_recent_symbols(self, *, now: datetime | None = None, days: int = 60) -> list[str]:
+        symbols: list[str] = []
+        seen: set[str] = set()
+        for announcement in self.fetch_recent_announcements(now=now, days=days):
+            if announcement.symbol in seen:
+                continue
+            seen.add(announcement.symbol)
+            symbols.append(announcement.symbol)
         return symbols
+
+    def fetch_announcement_rule(self, announcement: CompetitionAnnouncement) -> CompetitionRule:
+        expected = _validate_announcement(announcement)
+        detail = self._get_data(_CMS_DETAIL_PATH, {"articleCode": expected.article_code})
+        if _required_text(detail, "code") != expected.article_code:
+            raise RuleParseError("article detail code does not match announcement")
+        if _required_text(detail, "title") != expected.title:
+            raise RuleParseError("article detail identity does not match announcement")
+        try:
+            detail_symbol = _competition_symbol_from_title(detail)
+        except RuleParseError:
+            raise RuleParseError("article detail identity does not match announcement") from None
+        if detail_symbol != expected.symbol:
+            raise RuleParseError("article detail identity does not match announcement")
+        rule = parse_competition_rule({"data": detail}, expected_symbol=expected.symbol)
+        if rule.title != expected.title or rule.symbol != expected.symbol:
+            raise RuleParseError("article detail identity does not match announcement")
+        return _validate_rule(rule, expected_symbol=expected.symbol)
 
     def fetch_rule(self, symbol: str, *, now: datetime | None = None) -> CompetitionRule:
         target = _normalized_symbol(symbol)
         current = datetime.now(_UTC) if now is None else _require_utc_aware(now, "now")
         cutoff_ms = int((current - timedelta(days=60)).timestamp() * 1000)
-        candidates: list[Mapping[str, Any]] = []
+        candidates: list[CompetitionAnnouncement] = []
         for page_no in range(1, 21):
             data = self._get_data(
                 _CMS_LIST_PATH,
@@ -467,26 +540,21 @@ class BinanceCompetitionRuleProvider:
             for item in raw_articles:
                 if not isinstance(item, Mapping):
                     raise RuleParseError("Binance CMS article list is invalid")
-                _list_article_code(item)
-                _article_release_ms(item)
+                announcement = _announcement_from_item(item)
                 articles.append(item)
-            candidates.extend(
-                item
-                for item in articles
-                if _article_release_ms(item) >= cutoff_ms and _title_matches_symbol(item, target)
-            )
+                if (
+                    announcement is not None
+                    and _article_release_ms(item) >= cutoff_ms
+                    and announcement.symbol == target
+                ):
+                    candidates.append(announcement)
             page_is_old = bool(articles) and all(_article_release_ms(item) < cutoff_ms for item in articles)
             if candidates or not articles or page_is_old:
                 break
         if not candidates:
             raise RuleParseError(f"no recent competition announcement for {target}")
-        latest = max(candidates, key=_article_release_ms)
-        code = _list_article_code(latest)
-        detail = self._get_data(_CMS_DETAIL_PATH, {"articleCode": code})
-        rule = parse_competition_rule({"data": detail}, expected_symbol=target)
-        if rule.article_code != code:
-            raise RuleParseError("article detail code does not match article list")
-        return _validate_rule(rule, expected_symbol=target)
+        latest = max(candidates, key=lambda item: item.released_at_utc)
+        return self.fetch_announcement_rule(latest)
 
 
 def _encode_datetime(value: datetime, name: str) -> str:
