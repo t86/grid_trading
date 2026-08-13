@@ -12308,7 +12308,7 @@ class LoopRunnerTests(unittest.TestCase):
             ["best_quote_active_pair_reduce_long"],
         )
 
-    def test_threshold_mode_does_not_rearm_after_three_cycles(self) -> None:
+    def test_threshold_mode_rearms_after_three_cycles_when_ordinary_position_rebreaches(self) -> None:
         state = {
             "best_quote_active_pair_reduce": {
                 "active": False,
@@ -12351,9 +12351,14 @@ class LoopRunnerTests(unittest.TestCase):
             suppress_all_entries_while_active=True,
         )
 
-        self.assertEqual(report["reason"], "lease_completed_waiting_disable")
-        self.assertEqual(report["execution_cycles"], 3)
-        self.assertEqual(report["order_count"], 0)
+        self.assertEqual(report["reason"], "soft_side_reduce")
+        self.assertTrue(report["active"])
+        self.assertFalse(report["completed"])
+        self.assertEqual(report["order_count"], 1)
+        self.assertIn(
+            "best_quote_active_pair_reduce_long",
+            [item["role"] for item in plan["sell_orders"]],
+        )
 
     def test_best_quote_active_pair_reduce_does_not_stack_inventory_unlock_same_side(self) -> None:
         plan = {
