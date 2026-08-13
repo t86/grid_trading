@@ -18,6 +18,10 @@ import requests
 
 _UTC = timezone.utc
 _TITLE_PREFIX = "Binance Alpha Trading Competition: Trade "
+_COMPETITION_TITLE_SYMBOL_RE = re.compile(
+    r"^Binance Alpha Trading Competition:\s*Trade\s+.+?\(([A-Z0-9_]+)\)\s+and\b",
+    re.IGNORECASE,
+)
 _CMS_BASE_URL = "https://www.binance.com"
 _CMS_LIST_PATH = "/bapi/composite/v1/public/cms/article/list/query"
 _CMS_DETAIL_PATH = "/bapi/composite/v1/public/cms/article/detail/query"
@@ -376,6 +380,16 @@ def _list_articles(data: Mapping[str, Any]) -> list[object]:
     return articles
 
 
+def _competition_symbol_from_title(item: Mapping[str, Any]) -> str | None:
+    title = item.get("title")
+    if not isinstance(title, str):
+        raise RuleParseError("Binance CMS article title is invalid")
+    match = _COMPETITION_TITLE_SYMBOL_RE.search(title.strip())
+    if match is None:
+        return None
+    return match.group(1).upper()
+
+
 def _title_matches_symbol(item: Mapping[str, Any], symbol: str) -> bool:
     title = item.get("title")
     if not isinstance(title, str):
@@ -406,6 +420,37 @@ class BinanceCompetitionRuleProvider:
         if not isinstance(data, Mapping):
             raise RuleParseError("Binance CMS response data is invalid")
         return data
+
+    def fetch_recent_symbols(self, *, now: datetime | None = None, days: int = 60) -> list[str]:
+        current = datetime.now(_UTC) if now is None else _require_utc_aware(now, "now")
+        cutoff_ms = int((current - timedelta(days=days)).timestamp() * 1000)
+        symbols: list[str] = []
+        seen: set[str] = set()
+        for page_no in range(1, 21):
+            data = self._get_data(
+                _CMS_LIST_PATH,
+                {"type": 1, "catalogId": 93, "pageNo": page_no, "pageSize": 50},
+            )
+            raw_articles = _list_articles(data)
+            articles: list[Mapping[str, Any]] = []
+            for item in raw_articles:
+                if not isinstance(item, Mapping):
+                    raise RuleParseError("Binance CMS article list is invalid")
+                _list_article_code(item)
+                _article_release_ms(item)
+                articles.append(item)
+            for item in articles:
+                if _article_release_ms(item) < cutoff_ms:
+                    continue
+                symbol = _competition_symbol_from_title(item)
+                if symbol is None or symbol in seen:
+                    continue
+                seen.add(symbol)
+                symbols.append(symbol)
+            page_is_old = bool(articles) and all(_article_release_ms(item) < cutoff_ms for item in articles)
+            if not articles or page_is_old:
+                break
+        return symbols
 
     def fetch_rule(self, symbol: str, *, now: datetime | None = None) -> CompetitionRule:
         target = _normalized_symbol(symbol)
@@ -1066,6 +1111,23 @@ class CompetitionMetricsService:
             }
         )
         return row
+
+    def active_recent_symbols(self, *, now: datetime | None = None) -> list[str]:
+        current = datetime.now(_UTC) if now is None else _require_utc_aware(now, "now")
+        fetch_recent = getattr(self.rule_provider, "fetch_recent_symbols", None)
+        if not callable(fetch_recent):
+            return []
+        active: list[str] = []
+        with self._lock:
+            for raw_symbol in fetch_recent(now=current):
+                try:
+                    symbol = _normalized_service_symbol(raw_symbol)
+                    cached_rule = self._rule_result(symbol, current)
+                    if select_round(cached_rule.rule, current).status == "active":
+                        active.append(symbol)
+                except Exception:
+                    continue
+        return active
 
     def collect(self, symbols: list[str], *, now: datetime | None = None) -> dict[str, Any]:
         current = datetime.now(_UTC) if now is None else _require_utc_aware(now, "now")
