@@ -64,9 +64,25 @@ def _configured_auth_credentials() -> tuple[str, str]:
     return grid_username, grid_password
 
 
-def _symbols_from_env() -> list[str]:
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _fallback_symbols_from_env() -> list[str]:
     raw = os.environ.get("ALPHA_SYMBOLS", ",".join(DEFAULT_SYMBOLS))
     return [symbol.strip().upper() for symbol in raw.split(",") if symbol.strip()]
+
+
+def _symbols_from_env() -> list[str]:
+    fallback = _fallback_symbols_from_env()
+    if not _env_truthy("ALPHA_AUTO_SYMBOLS", "0"):
+        return fallback
+    try:
+        service = competition_service()
+        active = service.active_recent_symbols()
+    except Exception:
+        return fallback
+    return active or fallback
 
 
 def _symbols_from_query(query: str) -> list[str]:
@@ -100,6 +116,156 @@ def _finite_float(value: Any, default: float = 0.0) -> float:
 def _finite_sum(values: list[float]) -> float:
     total = sum(values)
     return total if math.isfinite(total) else 0.0
+
+
+_LEADERBOARD_ENDPOINTS = (
+    "/bapi/defi/v1/private/wallet-direct/buw/competition/rank/list",
+    "/bapi/defi/v1/private/wallet-direct/buw/wallet/competition/rank/list",
+    "/bapi/defi/v1/private/wallet-direct/buw/activity/competition/rank/list",
+    "/bapi/defi/v1/private/wallet-direct/buw/wallet/activity/competition/rank/list",
+)
+
+
+def _binance_web_cookie() -> str:
+    cookie = os.environ.get("BINANCE_WEB_COOKIE") or os.environ.get("ALPHA_BINANCE_WEB_COOKIE") or ""
+    cookie_file = os.environ.get("BINANCE_WEB_COOKIE_FILE") or os.environ.get("ALPHA_BINANCE_WEB_COOKIE_FILE")
+    if not cookie and cookie_file:
+        try:
+            cookie = Path(cookie_file).read_text(encoding="utf-8").strip()
+        except OSError:
+            cookie = ""
+    return cookie.strip()
+
+
+def _find_numeric_field(value: Any, keys: set[str]) -> float | None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if any(name in key_text for name in keys):
+                parsed = _finite_float(item, -1.0)
+                if parsed >= 0:
+                    return parsed
+        for item in value.values():
+            found = _find_numeric_field(item, keys)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _find_numeric_field(item, keys)
+            if found is not None:
+                return found
+    return None
+
+
+def _find_ranked_rows(value: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        rank_value = _find_numeric_field(value, {"rank"})
+        volume_value = _find_numeric_field(value, {"volume", "amount", "threshold"})
+        if rank_value is not None and volume_value is not None:
+            rows.append(value)
+        for item in value.values():
+            rows.extend(_find_ranked_rows(item))
+    elif isinstance(value, list):
+        for item in value:
+            rows.extend(_find_ranked_rows(item))
+    return rows
+
+
+def _fetch_leaderboard_threshold(row: dict[str, Any]) -> dict[str, Any]:
+    cookie = _binance_web_cookie()
+    if not cookie:
+        return {
+            "leaderboardThreshold": None,
+            "leaderboardThresholdRank": row.get("winnerCount"),
+            "leaderboardThresholdUpdatedAt": None,
+            "leaderboardThresholdUpdatedAtLabel": None,
+            "leaderboardThresholdSource": "binance_private_api",
+            "leaderboardThresholdNote": "BINANCE_WEB_COOKIE is not configured",
+        }
+
+    import requests
+
+    symbol = str(row.get("symbol") or "").upper()
+    winner_count = _safe_int(row.get("winnerCount"), 0)
+    if not symbol or winner_count <= 0:
+        return {}
+    page_size = 20
+    page_no = max(1, (winner_count + page_size - 1) // page_size)
+    params_variants = (
+        {"symbol": symbol, "pageNo": page_no, "pageSize": page_size},
+        {"tokenSymbol": symbol, "pageNo": page_no, "pageSize": page_size},
+        {"articleCode": str(row.get("articleUrl") or "").rstrip("/").split("/")[-1], "symbol": symbol, "pageNo": page_no, "pageSize": page_size},
+    )
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0",
+        "clienttype": "web",
+        "Cookie": cookie,
+        "Referer": "https://www.binance.com/en/activity",
+    }
+    last_error = "leaderboard API unavailable"
+    with requests.Session() as session:
+        for endpoint in _LEADERBOARD_ENDPOINTS:
+            for params in params_variants:
+                params = {key: value for key, value in params.items() if value not in (None, "")}
+                try:
+                    response = session.get(f"https://www.binance.com{endpoint}", params=params, headers=headers, timeout=12)
+                    payload = response.json()
+                except Exception as exc:
+                    last_error = str(exc)
+                    continue
+                if isinstance(payload, dict) and str(payload.get("code")) == "100001005":
+                    return {
+                        "leaderboardThreshold": None,
+                        "leaderboardThresholdRank": winner_count,
+                        "leaderboardThresholdUpdatedAt": None,
+                        "leaderboardThresholdUpdatedAtLabel": None,
+                        "leaderboardThresholdSource": "binance_private_api",
+                        "leaderboardThresholdNote": "Binance login cookie is invalid or expired",
+                    }
+                rows = _find_ranked_rows(payload)
+                best: tuple[int, float] | None = None
+                for item in rows:
+                    rank = int(_find_numeric_field(item, {"rank"}) or 0)
+                    volume = _find_numeric_field(item, {"volume", "amount", "threshold"})
+                    if rank <= 0 or volume is None:
+                        continue
+                    distance = abs(rank - winner_count)
+                    if best is None or distance < best[0]:
+                        best = (distance, volume)
+                if best is not None:
+                    return {
+                        "leaderboardThreshold": best[1],
+                        "leaderboardThresholdRank": winner_count,
+                        "leaderboardThresholdUpdatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "leaderboardThresholdUpdatedAtLabel": "",
+                        "leaderboardThresholdSource": "binance_private_api",
+                        "leaderboardThresholdNote": endpoint,
+                    }
+    return {
+        "leaderboardThreshold": None,
+        "leaderboardThresholdRank": winner_count,
+        "leaderboardThresholdUpdatedAt": None,
+        "leaderboardThresholdUpdatedAtLabel": None,
+        "leaderboardThresholdSource": "binance_private_api",
+        "leaderboardThresholdNote": last_error,
+    }
+
+
+def _apply_leaderboard_thresholds(payload: dict[str, Any]) -> dict[str, Any]:
+    for row in payload.get("rows", []):
+        if not isinstance(row, dict):
+            continue
+        row.setdefault("leaderboardThreshold", None)
+        row.setdefault("leaderboardThresholdRank", None)
+        row.setdefault("leaderboardThresholdUpdatedAt", None)
+        row.setdefault("leaderboardThresholdUpdatedAtLabel", None)
+        row.setdefault("leaderboardThresholdSource", None)
+        row.setdefault("leaderboardThresholdNote", None)
+        if row.get("status") == "active":
+            row.update(_fetch_leaderboard_threshold(row))
+    return payload
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -181,6 +347,7 @@ def collect_snapshot(symbols: list[str], market: Any | None = None) -> dict[str,
         "rows": rows,
         "errors": errors,
         "config": {
+            "autoSymbols": _env_truthy("ALPHA_AUTO_SYMBOLS", "0"),
             "spikeMultiple": _finite_float(os.environ.get("ALPHA_SPIKE_MULTIPLE", "3"), 3.0),
             "minQuoteVolume": _finite_float(os.environ.get("ALPHA_MIN_QUOTE_VOLUME", "1000"), 1000.0),
             "absoluteMinQuoteVolume": _finite_float(
@@ -345,7 +512,7 @@ INDEX_HTML = r"""<!doctype html>
     td:first-child, th:first-child { text-align: left; }
     tr:last-child td { border-bottom: 0; }
     .market-table { min-width: 1050px; }
-    .competition-table { min-width: 1180px; }
+    .competition-table { min-width: 1280px; }
     .competition-table th:nth-child(1) { min-width: 130px; }
     .competition-table th:nth-child(2) { min-width: 180px; }
     .competition-table th:last-child { min-width: 220px; }
@@ -480,6 +647,7 @@ INDEX_HTML = r"""<!doctype html>
               <th>当前倍速</th>
               <th>加权总量</th>
               <th>获奖人数</th>
+              <th>实际榜单门槛</th>
               <th>平均量</th>
               <th>观察线 0.4</th>
               <th>参考线 0.6</th>
@@ -647,6 +815,21 @@ INDEX_HTML = r"""<!doctype html>
         <div class="metric-secondary"><span class="status-chip active">进行中</span> · ${escapeHtml(formatCountdown(row.roundEndUtc))}</div></div>`;
     }
 
+    function leaderboardThresholdContent(row) {
+      const threshold = finiteNumber(row.leaderboardThreshold);
+      if (threshold === null) return '<div class="cell-value">—</div>';
+      const details = [];
+      if (row.leaderboardThresholdUpdatedAtLabel) {
+        details.push(escapeHtml(row.leaderboardThresholdUpdatedAtLabel));
+      } else if (row.leaderboardThresholdUpdatedAt) {
+        details.push(escapeHtml(formatUtc(row.leaderboardThresholdUpdatedAt)));
+      }
+      if (row.leaderboardThresholdRank) details.push(`第 ${escapeHtml(row.leaderboardThresholdRank)} 名`);
+      if (row.leaderboardThresholdSource) details.push(escapeHtml(row.leaderboardThresholdSource));
+      if (row.leaderboardThresholdNote) details.push(escapeHtml(row.leaderboardThresholdNote));
+      return `<div class="cell-value"><div class="metric-primary">${escapeHtml(formatU(threshold))}</div>${details.length ? `<div class="metric-secondary">${details.join(' · ')}</div>` : ''}</div>`;
+    }
+
     function renderCompetitionRow(row) {
       const multiplier = finiteNumber(row.currentMultiplier);
       return `<tr>
@@ -655,6 +838,7 @@ INDEX_HTML = r"""<!doctype html>
         <td data-label="当前倍速">${multiplier === null ? '—' : `<span class="${multipleClass(multiplier)}">${escapeHtml(multiplier.toFixed(1))}x</span>`}</td>
         <td data-label="加权总量" class="metric-primary">${escapeHtml(formatU(row.weightedVolume))}</td>
         <td data-label="获奖人数">${escapeHtml(formatInteger(row.winnerCount))}</td>
+        <td data-label="实际榜单门槛">${leaderboardThresholdContent(row)}</td>
         <td data-label="平均量">${escapeHtml(formatU(row.averageVolume))}</td>
         <td data-label="观察线 0.4" class="threshold-watch">${escapeHtml(formatU(row.watchThreshold))}</td>
         <td data-label="参考线 0.6" class="threshold-reference">${escapeHtml(formatU(row.referenceThreshold))}</td>
@@ -884,7 +1068,7 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/competition":
             try:
                 service = getattr(self.server, "competition_service", None) or competition_service()
-                self._send_json(service.collect(_symbols_from_env()))
+                self._send_json(_apply_leaderboard_thresholds(service.collect(_symbols_from_env())))
             except (Exception, SystemExit) as exc:
                 self._send_internal_error(exc)
             return
