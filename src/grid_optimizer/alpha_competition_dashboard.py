@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+from concurrent.futures import ThreadPoolExecutor
 import hmac
 import json
 import math
@@ -14,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from . import alpha_volume_alert as alert
@@ -124,6 +125,115 @@ _LEADERBOARD_ENDPOINTS = (
     "/bapi/defi/v1/private/wallet-direct/buw/activity/competition/rank/list",
     "/bapi/defi/v1/private/wallet-direct/buw/wallet/activity/competition/rank/list",
 )
+_LEADERBOARD_SOURCE = "binance_private_api"
+_LEADERBOARD_SUCCESS_TTL_SECONDS = 300.0
+_LEADERBOARD_FAILURE_TTL_SECONDS = 60.0
+
+
+def _leaderboard_result(
+    row: dict[str, Any],
+    *,
+    threshold: float | None = None,
+    note: str,
+    updated_at: str | None = None,
+    winner_count: int | None = None,
+) -> dict[str, Any]:
+    if winner_count is None:
+        parsed_winner_count = _exact_integer(row.get("winnerCount"))
+        winner_count = parsed_winner_count if parsed_winner_count is not None and parsed_winner_count > 0 else None
+    return {
+        "leaderboardThreshold": threshold,
+        "leaderboardThresholdRank": winner_count,
+        "leaderboardThresholdUpdatedAt": updated_at,
+        "leaderboardThresholdUpdatedAtLabel": "" if updated_at else None,
+        "leaderboardThresholdSource": _LEADERBOARD_SOURCE,
+        "leaderboardThresholdNote": note,
+    }
+
+
+def _leaderboard_identity(row: dict[str, Any]) -> tuple[str, str] | None:
+    symbol = str(row.get("symbol") or "").strip().upper()
+    article_url = str(row.get("articleUrl") or "").strip()
+    article_code = urlparse(article_url).path.rstrip("/").split("/")[-1]
+    if not symbol or not article_code:
+        return None
+    return symbol, article_code
+
+
+class _BoundedSubmitter:
+    def __init__(self, *, max_workers: int, max_pending: int) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="alpha-leaderboard")
+        self._capacity = threading.BoundedSemaphore(max_pending)
+
+    def submit(self, task: Callable[[], None]) -> bool:
+        if not self._capacity.acquire(blocking=False):
+            return False
+
+        def run() -> None:
+            try:
+                task()
+            finally:
+                self._capacity.release()
+
+        try:
+            self._executor.submit(run)
+        except RuntimeError:
+            self._capacity.release()
+            return False
+        return True
+
+
+class _LeaderboardThresholdRefresher:
+    def __init__(
+        self,
+        *,
+        fetcher: Callable[[dict[str, Any]], dict[str, Any]],
+        submitter: Any,
+        clock: Callable[[], float] = time.monotonic,
+        success_ttl: float = _LEADERBOARD_SUCCESS_TTL_SECONDS,
+        failure_ttl: float = _LEADERBOARD_FAILURE_TTL_SECONDS,
+    ) -> None:
+        self._fetcher = fetcher
+        self._submitter = submitter
+        self._clock = clock
+        self._success_ttl = success_ttl
+        self._failure_ttl = failure_ttl
+        self._lock = threading.Lock()
+        self._cache: dict[tuple[str, str], tuple[float, int, dict[str, Any]]] = {}
+        self._inflight: set[tuple[str, str]] = set()
+
+    def get(self, row: dict[str, Any]) -> dict[str, Any]:
+        identity = _leaderboard_identity(row)
+        winner_count = _exact_integer(row.get("winnerCount"))
+        if identity is None or winner_count is None or winner_count <= 0:
+            return _leaderboard_result(row, note="leaderboard API unavailable")
+
+        now = self._clock()
+        with self._lock:
+            cached = self._cache.get(identity)
+            if cached is not None and cached[0] > now and cached[1] == winner_count:
+                return dict(cached[2])
+            if identity in self._inflight:
+                return _leaderboard_result(row, note="leaderboard refresh in progress")
+            self._inflight.add(identity)
+
+        task_row = dict(row)
+        accepted = self._submitter.submit(lambda: self._refresh(identity, winner_count, task_row))
+        if accepted is False:
+            with self._lock:
+                self._inflight.discard(identity)
+            return _leaderboard_result(row, note="leaderboard refresh capacity unavailable")
+        return _leaderboard_result(row, note="leaderboard refresh in progress")
+
+    def _refresh(self, identity: tuple[str, str], winner_count: int, row: dict[str, Any]) -> None:
+        try:
+            result = self._fetcher(row)
+        except (Exception, SystemExit):
+            result = _leaderboard_result(row, note="leaderboard API unavailable")
+        ttl = self._success_ttl if result.get("leaderboardThreshold") is not None else self._failure_ttl
+        with self._lock:
+            self._cache[identity] = (self._clock() + ttl, winner_count, dict(result))
+            self._inflight.discard(identity)
 
 
 def _binance_web_cookie() -> str:
@@ -138,30 +248,48 @@ def _binance_web_cookie() -> str:
 
 
 def _find_numeric_field(value: Any, keys: set[str]) -> float | None:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            key_text = str(key).lower()
-            if any(name in key_text for name in keys):
-                parsed = _finite_float(item, -1.0)
-                if parsed >= 0:
-                    return parsed
-        for item in value.values():
-            found = _find_numeric_field(item, keys)
-            if found is not None:
-                return found
-    elif isinstance(value, list):
-        for item in value:
-            found = _find_numeric_field(item, keys)
-            if found is not None:
-                return found
+    if not isinstance(value, dict):
+        return None
+    for key, item in value.items():
+        key_text = str(key).replace("_", "").lower()
+        if key_text in keys:
+            return _non_negative_number(item)
+    return None
+
+
+def _non_negative_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+    elif isinstance(value, str):
+        if not re.fullmatch(r"(?:0|[1-9]\d*)(?:\.\d+)?", value):
+            return None
+        parsed = float(value)
+    else:
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0 else None
+
+
+def _exact_integer(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if math.isfinite(value) and value.is_integer() else None
+    if isinstance(value, str):
+        if not re.fullmatch(r"0|[1-9]\d*", value):
+            return None
+        return int(value)
     return None
 
 
 def _find_ranked_rows(value: Any) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if isinstance(value, dict):
-        rank_value = _find_numeric_field(value, {"rank"})
-        volume_value = _find_numeric_field(value, {"volume", "amount", "threshold"})
+        rank_value = _exact_integer(value.get("rank"))
+        volume_value = _find_numeric_field(value, {"volume", "amount", "threshold", "quotevolume"})
         if rank_value is not None and volume_value is not None:
             rows.append(value)
         for item in value.values():
@@ -172,30 +300,58 @@ def _find_ranked_rows(value: Any) -> list[dict[str, Any]]:
     return rows
 
 
-def _fetch_leaderboard_threshold(row: dict[str, Any]) -> dict[str, Any]:
+_LEADERBOARD_LIST_KEYS = {"rows", "ranklist", "leaderboard", "list"}
+
+
+def _direct_text_field(value: dict[str, Any], keys: set[str]) -> str | None:
+    found: set[str] = set()
+    for key, item in value.items():
+        if str(key).replace("_", "").lower() in keys and isinstance(item, (str, int)) and not isinstance(item, bool):
+            text = str(item).strip()
+            if text:
+                found.add(text)
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def _matching_competition_rank_trees(value: Any, identity: tuple[str, str]) -> list[Any]:
+    trees: list[Any] = []
+    if isinstance(value, dict):
+        symbol = _direct_text_field(value, {"symbol", "tokensymbol"})
+        article_code = _direct_text_field(value, {"articlecode", "articleid"})
+        if symbol is not None and article_code is not None and (symbol.upper(), article_code) == identity:
+            for key, item in value.items():
+                if str(key).replace("_", "").lower() in _LEADERBOARD_LIST_KEYS:
+                    trees.append(item)
+        for item in value.values():
+            trees.extend(_matching_competition_rank_trees(item, identity))
+    elif isinstance(value, list):
+        for item in value:
+            trees.extend(_matching_competition_rank_trees(item, identity))
+    return trees
+
+
+def _fetch_leaderboard_threshold(
+    row: dict[str, Any],
+    *,
+    session_factory: Callable[[], Any] | None = None,
+) -> dict[str, Any]:
     cookie = _binance_web_cookie()
     if not cookie:
-        return {
-            "leaderboardThreshold": None,
-            "leaderboardThresholdRank": row.get("winnerCount"),
-            "leaderboardThresholdUpdatedAt": None,
-            "leaderboardThresholdUpdatedAtLabel": None,
-            "leaderboardThresholdSource": "binance_private_api",
-            "leaderboardThresholdNote": "BINANCE_WEB_COOKIE is not configured",
-        }
+        return _leaderboard_result(row, note="BINANCE_WEB_COOKIE is not configured")
 
     import requests
 
-    symbol = str(row.get("symbol") or "").upper()
-    winner_count = _safe_int(row.get("winnerCount"), 0)
-    if not symbol or winner_count <= 0:
-        return {}
+    identity = _leaderboard_identity(row)
+    winner_count = _exact_integer(row.get("winnerCount"))
+    if identity is None or winner_count is None or winner_count <= 0:
+        return _leaderboard_result(row, note="leaderboard API unavailable", winner_count=None)
+    symbol, article_code = identity
     page_size = 20
     page_no = max(1, (winner_count + page_size - 1) // page_size)
     params_variants = (
         {"symbol": symbol, "pageNo": page_no, "pageSize": page_size},
         {"tokenSymbol": symbol, "pageNo": page_no, "pageSize": page_size},
-        {"articleCode": str(row.get("articleUrl") or "").rstrip("/").split("/")[-1], "symbol": symbol, "pageNo": page_no, "pageSize": page_size},
+        {"articleCode": article_code, "symbol": symbol, "pageNo": page_no, "pageSize": page_size},
     )
     headers = {
         "Accept": "application/json, text/plain, */*",
@@ -204,56 +360,45 @@ def _fetch_leaderboard_threshold(row: dict[str, Any]) -> dict[str, Any]:
         "Cookie": cookie,
         "Referer": "https://www.binance.com/en/activity",
     }
-    last_error = "leaderboard API unavailable"
-    with requests.Session() as session:
+    make_session = requests.Session if session_factory is None else session_factory
+    with make_session() as session:
         for endpoint in _LEADERBOARD_ENDPOINTS:
             for params in params_variants:
                 params = {key: value for key, value in params.items() if value not in (None, "")}
                 try:
                     response = session.get(f"https://www.binance.com{endpoint}", params=params, headers=headers, timeout=12)
                     payload = response.json()
-                except Exception as exc:
-                    last_error = str(exc)
+                except (Exception, SystemExit):
                     continue
                 if isinstance(payload, dict) and str(payload.get("code")) == "100001005":
-                    return {
-                        "leaderboardThreshold": None,
-                        "leaderboardThresholdRank": winner_count,
-                        "leaderboardThresholdUpdatedAt": None,
-                        "leaderboardThresholdUpdatedAtLabel": None,
-                        "leaderboardThresholdSource": "binance_private_api",
-                        "leaderboardThresholdNote": "Binance login cookie is invalid or expired",
-                    }
-                rows = _find_ranked_rows(payload)
-                best: tuple[int, float] | None = None
-                for item in rows:
-                    rank = int(_find_numeric_field(item, {"rank"}) or 0)
-                    volume = _find_numeric_field(item, {"volume", "amount", "threshold"})
-                    if rank <= 0 or volume is None:
-                        continue
-                    distance = abs(rank - winner_count)
-                    if best is None or distance < best[0]:
-                        best = (distance, volume)
-                if best is not None:
-                    return {
-                        "leaderboardThreshold": best[1],
-                        "leaderboardThresholdRank": winner_count,
-                        "leaderboardThresholdUpdatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                        "leaderboardThresholdUpdatedAtLabel": "",
-                        "leaderboardThresholdSource": "binance_private_api",
-                        "leaderboardThresholdNote": endpoint,
-                    }
-    return {
-        "leaderboardThreshold": None,
-        "leaderboardThresholdRank": winner_count,
-        "leaderboardThresholdUpdatedAt": None,
-        "leaderboardThresholdUpdatedAtLabel": None,
-        "leaderboardThresholdSource": "binance_private_api",
-        "leaderboardThresholdNote": last_error,
-    }
+                    return _leaderboard_result(row, note="Binance login cookie is invalid or expired")
+                for rank_tree in _matching_competition_rank_trees(payload, identity):
+                    for item in _find_ranked_rows(rank_tree):
+                        rank = _exact_integer(item.get("rank"))
+                        volume = _find_numeric_field(item, {"volume", "amount", "threshold", "quotevolume"})
+                        if rank != winner_count or volume is None:
+                            continue
+                        return _leaderboard_result(
+                            row,
+                            threshold=volume,
+                            note="available",
+                            updated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                            winner_count=winner_count,
+                        )
+    return _leaderboard_result(row, note="leaderboard API unavailable", winner_count=winner_count)
 
 
-def _apply_leaderboard_thresholds(payload: dict[str, Any]) -> dict[str, Any]:
+_LEADERBOARD_REFRESHER = _LeaderboardThresholdRefresher(
+    fetcher=_fetch_leaderboard_threshold,
+    submitter=_BoundedSubmitter(max_workers=2, max_pending=4),
+)
+
+
+def _apply_leaderboard_thresholds(
+    payload: dict[str, Any],
+    *,
+    refresher: _LeaderboardThresholdRefresher = _LEADERBOARD_REFRESHER,
+) -> dict[str, Any]:
     for row in payload.get("rows", []):
         if not isinstance(row, dict):
             continue
@@ -264,7 +409,7 @@ def _apply_leaderboard_thresholds(payload: dict[str, Any]) -> dict[str, Any]:
         row.setdefault("leaderboardThresholdSource", None)
         row.setdefault("leaderboardThresholdNote", None)
         if row.get("status") == "active":
-            row.update(_fetch_leaderboard_threshold(row))
+            row.update(refresher.get(row))
     return payload
 
 

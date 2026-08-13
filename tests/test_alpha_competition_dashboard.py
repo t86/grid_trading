@@ -97,6 +97,61 @@ class FakeCompetitionService:
         }
 
 
+class DeferredSubmitter:
+    def __init__(self) -> None:
+        self.tasks: list[Any] = []
+
+    def submit(self, task: Any) -> None:
+        self.tasks.append(task)
+
+    def run_next(self) -> None:
+        task = self.tasks.pop(0)
+        task()
+
+
+class FakeLeaderboardResponse:
+    def __init__(self, payload: Any) -> None:
+        self.payload = payload
+
+    def json(self) -> Any:
+        return self.payload
+
+
+class FakeLeaderboardSession:
+    def __init__(self, payload: Any = None, *, error: Exception | None = None) -> None:
+        self.payload = payload
+        self.error = error
+        self.calls: list[tuple[str, dict[str, Any], dict[str, str], int]] = []
+
+    def __enter__(self) -> FakeLeaderboardSession:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        return None
+
+    def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any],
+        headers: dict[str, str],
+        timeout: int,
+    ) -> FakeLeaderboardResponse:
+        self.calls.append((url, params, headers, timeout))
+        if self.error is not None:
+            raise self.error
+        return FakeLeaderboardResponse(self.payload)
+
+
+def _leaderboard_row() -> dict[str, Any]:
+    return {
+        "symbol": "QUID",
+        "status": "active",
+        "winnerCount": 2_500,
+        "articleUrl": "https://www.binance.com/en/support/announcement/article-quid",
+    }
+
+
 @dataclass(frozen=True)
 class HttpResult:
     status_code: int
@@ -505,6 +560,323 @@ def test_api_competition_uses_configured_symbol_order_and_utf8_json(
     assert [row["symbol"] for row in response.json()["rows"]] == ["QUID", "GRVT", "O", "PRL", "CAP"]
     assert b"\xe7\xab\xa0\xe9\xb1\xbc" in response.body
     assert fake_competition_service.calls == [["QUID", "GRVT", "O", "PRL", "CAP"]]
+
+
+def test_apply_leaderboard_thresholds_returns_immediately_and_refreshes_single_flight() -> None:
+    submitter = DeferredSubmitter()
+    fetch_calls: list[str] = []
+
+    def fetch(row: dict[str, Any]) -> dict[str, Any]:
+        fetch_calls.append(row["symbol"])
+        return {
+            "leaderboardThreshold": 12_345.0,
+            "leaderboardThresholdRank": 2_500,
+            "leaderboardThresholdUpdatedAt": "2026-08-13T03:00:00+00:00",
+            "leaderboardThresholdUpdatedAtLabel": "",
+            "leaderboardThresholdSource": "binance_private_api",
+            "leaderboardThresholdNote": "available",
+        }
+
+    refresher = dashboard._LeaderboardThresholdRefresher(
+        fetcher=fetch,
+        submitter=submitter,
+        clock=lambda: 100.0,
+    )
+    payload = {"rows": [_leaderboard_row()]}
+
+    first = dashboard._apply_leaderboard_thresholds(payload, refresher=refresher)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        concurrent = list(
+            pool.map(
+                lambda _: dashboard._apply_leaderboard_thresholds(
+                    {"rows": [_leaderboard_row()]},
+                    refresher=refresher,
+                ),
+                range(16),
+            )
+        )
+
+    assert fetch_calls == []
+    assert len(submitter.tasks) == 1
+    assert first["rows"][0]["leaderboardThreshold"] is None
+    assert first["rows"][0]["leaderboardThresholdNote"] == "leaderboard refresh in progress"
+    assert all(
+        result["rows"][0]["leaderboardThresholdNote"] == "leaderboard refresh in progress"
+        for result in concurrent
+    )
+
+    submitter.run_next()
+
+    refreshed = dashboard._apply_leaderboard_thresholds({"rows": [_leaderboard_row()]}, refresher=refresher)
+    assert fetch_calls == ["QUID"]
+    assert refreshed["rows"][0]["leaderboardThreshold"] == 12_345.0
+    assert len(submitter.tasks) == 0
+
+
+def test_leaderboard_refresh_failure_is_redacted_and_cached_until_retry_ttl() -> None:
+    submitter = DeferredSubmitter()
+    now = [100.0]
+    secret = "private-cookie /private/cookie.txt"
+    fetch_calls = 0
+
+    def fetch(row: dict[str, Any]) -> dict[str, Any]:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        raise RuntimeError(secret)
+
+    refresher = dashboard._LeaderboardThresholdRefresher(
+        fetcher=fetch,
+        submitter=submitter,
+        clock=lambda: now[0],
+        failure_ttl=15.0,
+    )
+
+    refresher.get(_leaderboard_row())
+    submitter.run_next()
+    failed = refresher.get(_leaderboard_row())
+    again = refresher.get(_leaderboard_row())
+
+    assert fetch_calls == 1
+    assert len(submitter.tasks) == 0
+    assert failed == again
+    assert failed["leaderboardThreshold"] is None
+    assert failed["leaderboardThresholdNote"] == "leaderboard API unavailable"
+    assert secret not in str(failed)
+
+    now[0] += 16.0
+    refresher.get(_leaderboard_row())
+    assert len(submitter.tasks) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "symbol": "QUID",
+            "articleCode": "article-quid",
+            "rows": [{"rank": 2_499, "volume": "101"}],
+        },
+        {
+            "symbol": "QUID",
+            "articleCode": "article-quid",
+            "rows": [{"rank": 2_500.9, "volume": "101"}],
+        },
+        {
+            "symbol": "QUID",
+            "articleCode": "article-quid",
+            "rows": [{"rank": "2500.9", "volume": "101"}],
+        },
+        {
+            "symbol": "QUID",
+            "articleCode": "article-quid",
+            "rows": [{"rank": "2500.0", "volume": "101"}],
+        },
+        {
+            "symbol": "QUID",
+            "articleCode": "article-quid",
+            "rows": [{"rank": float("nan"), "volume": "101"}],
+        },
+        {
+            "symbol": "QUID",
+            "articleCode": "article-quid",
+            "rows": [{"rank": float("inf"), "volume": "101"}],
+        },
+        {
+            "symbol": "GRVT",
+            "articleCode": "article-quid",
+            "rows": [{"rank": 2_500, "volume": "102"}],
+        },
+        {
+            "symbol": "QUID",
+            "articleCode": "article-grvt",
+            "rows": [{"rank": 2_500, "volume": "103"}],
+        },
+        {
+            "symbol": "QUID",
+            "articleCode": "article-quid",
+            "rows": [{"ranking": 2_500, "volume": "104"}],
+        },
+        {
+            "symbol": "QUID",
+            "articleCode": "article-quid",
+            "rows": [{"rank": 2_500}, {"volume": "104"}],
+        },
+        {"rows": [{"rank": 2_500, "volume": "104"}]},
+    ],
+    ids=[
+        "wrong-rank",
+        "fractional-numeric-rank",
+        "fractional-string-rank",
+        "decimal-string-rank",
+        "nan-rank",
+        "infinite-rank",
+        "wrong-symbol",
+        "wrong-article",
+        "missing-exact-rank",
+        "split-rank-volume",
+        "missing-identity",
+    ],
+)
+def test_fetch_leaderboard_threshold_rejects_unverified_competition_or_rank(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, Any],
+) -> None:
+    monkeypatch.setenv("BINANCE_WEB_COOKIE", "private-cookie")
+    session = FakeLeaderboardSession(payload)
+
+    result = dashboard._fetch_leaderboard_threshold(_leaderboard_row(), session_factory=lambda: session)
+
+    assert result["leaderboardThreshold"] is None
+    assert result["leaderboardThresholdRank"] == 2_500
+    assert result["leaderboardThresholdNote"] == "leaderboard API unavailable"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "data": [
+                {"symbol": "QUID"},
+                {"articleCode": "article-quid"},
+                {"rows": [{"rank": 2_500, "volume": "12345.5"}]},
+            ]
+        },
+        {
+            "competition": {"symbol": "QUID", "articleCode": "article-quid"},
+            "rows": [{"rank": 2_500, "volume": "12345.5"}],
+        },
+    ],
+    ids=["identity-split-across-objects", "identity-and-ranks-unrelated-siblings"],
+)
+def test_fetch_leaderboard_threshold_rejects_unbound_identity_and_ranks(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, Any],
+) -> None:
+    monkeypatch.setenv("BINANCE_WEB_COOKIE", "private-cookie")
+    session = FakeLeaderboardSession(payload)
+
+    result = dashboard._fetch_leaderboard_threshold(_leaderboard_row(), session_factory=lambda: session)
+
+    assert result["leaderboardThreshold"] is None
+    assert result["leaderboardThresholdNote"] == "leaderboard API unavailable"
+
+
+def test_fetch_leaderboard_threshold_accepts_rank_from_bound_competition_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BINANCE_WEB_COOKIE", "private-cookie")
+    session = FakeLeaderboardSession(
+        {
+            "data": {
+                "competitions": [
+                    {
+                        "symbol": "GRVT",
+                        "articleCode": "article-grvt",
+                        "rows": [{"rank": 2_500, "volume": "99999"}],
+                    },
+                    {
+                        "symbol": "QUID",
+                        "articleCode": "article-quid",
+                        "rankList": [{"rank": 2_500, "volume": "12345.5"}],
+                    },
+                ]
+            }
+        }
+    )
+
+    result = dashboard._fetch_leaderboard_threshold(_leaderboard_row(), session_factory=lambda: session)
+
+    assert result["leaderboardThreshold"] == 12_345.5
+    assert result["leaderboardThresholdRank"] == 2_500
+
+
+@pytest.mark.parametrize(
+    "volume",
+    [True, False, float("nan"), float("inf"), -1, "-1"],
+    ids=["true", "false", "nan", "infinite", "negative-number", "negative-string"],
+)
+def test_fetch_leaderboard_threshold_rejects_invalid_volume(
+    monkeypatch: pytest.MonkeyPatch,
+    volume: Any,
+) -> None:
+    monkeypatch.setenv("BINANCE_WEB_COOKIE", "private-cookie")
+    session = FakeLeaderboardSession(
+        {
+            "symbol": "QUID",
+            "articleCode": "article-quid",
+            "rows": [{"rank": 2_500, "volume": volume}],
+        }
+    )
+
+    result = dashboard._fetch_leaderboard_threshold(_leaderboard_row(), session_factory=lambda: session)
+
+    assert result["leaderboardThreshold"] is None
+    assert result["leaderboardThresholdNote"] == "leaderboard API unavailable"
+
+
+@pytest.mark.parametrize(
+    "winner_count",
+    [True, False, 2_500.9, "2500.9", float("nan"), float("inf")],
+    ids=["true", "false", "fractional-number", "fractional-string", "nan", "infinite"],
+)
+def test_fetch_leaderboard_threshold_rejects_invalid_winner_count(
+    monkeypatch: pytest.MonkeyPatch,
+    winner_count: Any,
+) -> None:
+    monkeypatch.setenv("BINANCE_WEB_COOKIE", "private-cookie")
+    row = {**_leaderboard_row(), "winnerCount": winner_count}
+    session = FakeLeaderboardSession(
+        {
+            "symbol": "QUID",
+            "articleCode": "article-quid",
+            "rows": [{"rank": 2_500, "volume": "12345.5"}],
+        }
+    )
+
+    result = dashboard._fetch_leaderboard_threshold(row, session_factory=lambda: session)
+
+    assert result["leaderboardThreshold"] is None
+    assert result["leaderboardThresholdRank"] is None
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("rank", [2_500, "2500"], ids=["integer", "canonical-string"])
+@pytest.mark.parametrize("winner_count", [2_500, "2500"], ids=["integer-winners", "string-winners"])
+def test_fetch_leaderboard_threshold_accepts_exact_identity_rank_and_winner_count(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: Any,
+    winner_count: Any,
+) -> None:
+    monkeypatch.setenv("BINANCE_WEB_COOKIE", "private-cookie")
+    session = FakeLeaderboardSession(
+        {
+            "symbol": "quid",
+            "articleCode": "article-quid",
+            "rows": [{"rank": rank, "volume": "12345.5"}],
+        }
+    )
+
+    row = {**_leaderboard_row(), "winnerCount": winner_count}
+    result = dashboard._fetch_leaderboard_threshold(row, session_factory=lambda: session)
+
+    assert result["leaderboardThreshold"] == 12_345.5
+    assert result["leaderboardThresholdRank"] == 2_500
+    assert result["leaderboardThresholdNote"] == "available"
+    assert all(call[0].startswith("https://www.binance.com/") for call in session.calls)
+
+
+def test_fetch_leaderboard_threshold_reports_invalid_cookie_without_echoing_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "private-cookie /private/cookie.txt"
+    monkeypatch.setenv("BINANCE_WEB_COOKIE", secret)
+    session = FakeLeaderboardSession({"code": "100001005", "message": secret})
+
+    result = dashboard._fetch_leaderboard_threshold(_leaderboard_row(), session_factory=lambda: session)
+
+    assert result["leaderboardThreshold"] is None
+    assert result["leaderboardThresholdNote"] == "Binance login cookie is invalid or expired"
+    assert secret not in str(result)
 
 
 def test_api_check_preserves_post_behavior_and_json_headers(http_server: HttpServerHarness) -> None:
