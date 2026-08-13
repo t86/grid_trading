@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 from pathlib import Path
 import threading
 
@@ -433,6 +434,28 @@ def test_list_failure_uses_last_known_good_and_marks_stale(tmp_path: Path) -> No
     assert result.errors == ("competition announcement discovery unavailable",)
 
 
+def test_list_failure_logs_only_the_fixed_redacted_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service = discovery.CompetitionDiscoveryService(
+        provider=_FailingListProvider(),
+        cache=discovery.CompetitionDiscoveryCache(tmp_path / "discovery.json"),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=discovery.__name__):
+        result = service.discover(now=NOW)
+
+    assert result.errors == ("competition announcement discovery unavailable",)
+    assert [record.getMessage() for record in caplog.records] == [
+        "competition announcement discovery unavailable"
+    ]
+    logs = caplog.text
+    assert "secret" not in logs
+    assert "private" not in logs
+    assert "/" not in logs
+
+
 def test_cached_ended_rule_is_removed_even_when_list_request_fails(tmp_path: Path) -> None:
     prl = _announcement("PRL")
     cache = discovery.CompetitionDiscoveryCache(tmp_path / "discovery.json")
@@ -470,6 +493,61 @@ def test_new_bad_article_is_visible_without_hiding_healthy_rules(tmp_path: Path)
     assert result.discovered_at_utc is None
     assert result.errors == ("DOS: competition announcement rule unavailable",)
     assert provider.detail_calls == [dos.article_code, power.article_code]
+
+
+def test_detail_failure_logs_only_the_validated_symbol_and_fixed_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    dos = _announcement("DOS")
+
+    class SecretDetailProvider(_Provider):
+        def fetch_announcement_rule(
+            self,
+            announcement: CompetitionAnnouncement,
+            *,
+            now: datetime,
+        ) -> CompetitionRule:
+            raise RuntimeError("secret private /tmp/provider-token")
+
+    service = discovery.CompetitionDiscoveryService(
+        provider=SecretDetailProvider([dos], {}),
+        cache=discovery.CompetitionDiscoveryCache(tmp_path / "discovery.json"),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=discovery.__name__):
+        result = service.discover(now=NOW)
+
+    assert result.errors == ("DOS: competition announcement rule unavailable",)
+    assert [record.getMessage() for record in caplog.records] == [
+        "DOS: competition announcement rule unavailable"
+    ]
+    logs = caplog.text
+    assert "secret" not in logs
+    assert "private" not in logs
+    assert "/tmp" not in logs
+
+
+def test_unsafe_announcement_symbol_never_reaches_detail_or_logs(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    unsafe = _announcement("SECRET/PATH")
+    provider = _Provider([unsafe], {})
+    service = discovery.CompetitionDiscoveryService(
+        provider=provider,
+        cache=discovery.CompetitionDiscoveryCache(tmp_path / "discovery.json"),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=discovery.__name__):
+        result = service.discover(now=NOW)
+
+    assert provider.detail_calls == []
+    assert result.errors == ("competition announcement discovery unavailable",)
+    assert [record.getMessage() for record in caplog.records] == [
+        "competition announcement discovery unavailable"
+    ]
+    assert "SECRET/PATH" not in caplog.text
 
 
 def test_cached_bad_detail_retains_old_rule_until_known_final_end(tmp_path: Path) -> None:
@@ -586,6 +664,80 @@ def test_partial_and_cache_store_failures_are_cooled_down(
     assert store_provider.list_calls == 1
 
 
+def test_refresh_limits_new_rule_requests_and_resumes_after_cooldown(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    announcements = [
+        _announcement(
+            f"P{index:02d}",
+            released_at=NOW - timedelta(minutes=index),
+        )
+        for index in range(12)
+    ]
+    rules = {
+        item.article_code: _rule(item, first_start=NOW - timedelta(days=1))
+        for item in announcements
+    }
+    cache_path = tmp_path / "discovery.json"
+    provider = _Provider(announcements, rules)
+    service = discovery.CompetitionDiscoveryService(
+        provider=provider,
+        cache=discovery.CompetitionDiscoveryCache(cache_path),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=discovery.__name__):
+        first = service.discover(now=NOW)
+
+    assert provider.detail_calls == [item.article_code for item in announcements[:8]]
+    assert [rule.symbol for rule in first.rules] == [item.symbol for item in announcements[:8]]
+    assert first.discovered_at_utc is None
+    assert first.stale is True
+    assert first.errors == ("competition announcement refresh budget exhausted",)
+    assert [record.getMessage() for record in caplog.records] == [
+        "competition announcement refresh budget exhausted"
+    ]
+    assert not cache_path.exists()
+
+    second = service.discover(now=NOW + timedelta(minutes=5))
+
+    assert provider.detail_calls[8:] == [item.article_code for item in announcements[8:]]
+    assert len(provider.detail_calls[:8]) <= 8
+    assert len(provider.detail_calls[8:]) <= 8
+    assert len(provider.detail_calls) == 12
+    assert [rule.symbol for rule in second.rules] == [item.symbol for item in announcements]
+    assert second.discovered_at_utc == NOW + timedelta(minutes=5)
+    assert second.stale is False
+    assert second.errors == ()
+
+
+def test_failed_rules_do_not_starve_a_later_valid_announcement(tmp_path: Path) -> None:
+    failing = [_announcement(f"F{index}") for index in range(8)]
+    valid = _announcement("VALID")
+    announcements = [*failing, valid]
+    provider = _Provider(
+        announcements,
+        {valid.article_code: _rule(valid, first_start=NOW - timedelta(days=1))},
+    )
+    service = discovery.CompetitionDiscoveryService(
+        provider=provider,
+        cache=discovery.CompetitionDiscoveryCache(tmp_path / "discovery.json"),
+    )
+
+    first = service.discover(now=NOW)
+    first_calls = list(provider.detail_calls)
+    second = service.discover(now=NOW + timedelta(minutes=5))
+    second_calls = provider.detail_calls[len(first_calls):]
+
+    assert first_calls == [item.article_code for item in failing]
+    assert len(first_calls) <= 8
+    assert second_calls[0] == valid.article_code
+    assert len(second_calls) <= 8
+    assert first.rules == ()
+    assert [rule.symbol for rule in second.rules] == ["VALID"]
+    assert second.stale is True
+
+
 def test_reverse_clock_does_not_apply_refresh_attempt_cooldown(tmp_path: Path) -> None:
     provider = _FailingListProvider()
     service = discovery.CompetitionDiscoveryService(
@@ -621,6 +773,36 @@ def test_cache_write_failure_keeps_new_memory_result_but_marks_it_stale(
     assert result.stale is True
     assert result.errors == ("competition discovery cache unavailable",)
     assert "secret" not in " ".join(result.errors)
+
+
+def test_cache_write_failure_logs_only_the_fixed_redacted_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    dos = _announcement("DOS")
+    service, _provider = _service(
+        tmp_path,
+        [dos],
+        {dos.article_code: _rule(dos, first_start=NOW - timedelta(days=1))},
+    )
+
+    def fail_store(_snapshot: discovery.DiscoverySnapshot) -> None:
+        raise OSError("secret private /tmp/discovery.json")
+
+    monkeypatch.setattr(service.cache, "store", fail_store)
+
+    with caplog.at_level(logging.WARNING, logger=discovery.__name__):
+        result = service.discover(now=NOW)
+
+    assert result.errors == ("competition discovery cache unavailable",)
+    assert [record.getMessage() for record in caplog.records] == [
+        "competition discovery cache unavailable"
+    ]
+    logs = caplog.text
+    assert "secret" not in logs
+    assert "private" not in logs
+    assert "/tmp" not in logs
 
 
 class _BlockingProvider(_Provider):

@@ -4,8 +4,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import os
 from pathlib import Path
+import re
 import tempfile
 import threading
 from typing import Any
@@ -21,6 +23,9 @@ from grid_optimizer.alpha_competition_metrics import (
 _UTC = timezone.utc
 _DISCOVERY_ERROR = "competition announcement discovery unavailable"
 _CACHE_ERROR = "competition discovery cache unavailable"
+_REFRESH_BUDGET_ERROR = "competition announcement refresh budget exhausted"
+_MAX_RULE_REQUESTS_PER_REFRESH = 8
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -72,7 +77,7 @@ def _validate_announcement(value: object) -> CompetitionAnnouncement:
     if not isinstance(value, CompetitionAnnouncement):
         raise TypeError("competition announcement is invalid")
     symbol = _require_text(value.symbol, "announcement symbol")
-    if symbol != symbol.upper():
+    if symbol != symbol.upper() or re.fullmatch(r"[A-Z0-9_]{1,32}", symbol) is None:
         raise ValueError("announcement symbol is invalid")
     _require_text(value.article_code, "announcement article code")
     _require_text(value.title, "announcement title")
@@ -258,6 +263,7 @@ class CompetitionDiscoveryService:
         self._refresh_lock = threading.Lock()
         self._memory = cache.load()
         self._last_attempt_utc: datetime | None = None
+        self._detail_cursor_article_code: str | None = None
 
     @staticmethod
     def _age_is_fresh(timestamp: datetime, current: datetime, ttl: timedelta) -> bool:
@@ -339,6 +345,7 @@ class CompetitionDiscoveryService:
             raw_announcements = self.provider.fetch_recent_announcements(now=current)
             announcements = self._announcements(raw_announcements)
         except Exception:
+            logger.warning(_DISCOVERY_ERROR)
             failed = replace(
                 previous,
                 stale=True,
@@ -350,9 +357,10 @@ class CompetitionDiscoveryService:
         cached_by_code = {
             item.announcement.article_code: item for item in previous.competitions
         }
-        refreshed: list[DiscoveredCompetition] = []
+        refreshed_by_code: dict[str, DiscoveredCompetition] = {}
         errors: list[str] = []
         seen_codes: set[str] = set()
+        detail_candidates: list[CompetitionAnnouncement] = []
         for announcement in announcements:
             code = announcement.article_code
             if code in seen_codes:
@@ -360,22 +368,53 @@ class CompetitionDiscoveryService:
             seen_codes.add(code)
             cached = cached_by_code.get(code)
             if self._can_reuse(cached, announcement, current):
-                refreshed.append(cached)
+                refreshed_by_code[code] = cached
                 continue
+            detail_candidates.append(announcement)
+
+        candidate_codes = [item.article_code for item in detail_candidates]
+        try:
+            start = candidate_codes.index(self._detail_cursor_article_code)
+        except ValueError:
+            start = 0
+        rotated = detail_candidates[start:] + detail_candidates[:start]
+        attempted = rotated[:_MAX_RULE_REQUESTS_PER_REFRESH]
+        deferred = rotated[_MAX_RULE_REQUESTS_PER_REFRESH:]
+        self._detail_cursor_article_code = (
+            deferred[0].article_code if deferred else None
+        )
+
+        for announcement in attempted:
+            code = announcement.article_code
+            cached = cached_by_code.get(code)
             try:
                 rule = self.provider.fetch_announcement_rule(announcement, now=current)
                 discovered = _validate_discovered(
                     DiscoveredCompetition(announcement, rule, current)
                 )
             except Exception:
-                errors.append(
-                    f"{announcement.symbol}: competition announcement rule unavailable"
-                )
+                error = f"{announcement.symbol}: competition announcement rule unavailable"
+                logger.warning(error)
+                errors.append(error)
                 if cached is not None and not self._is_ended(cached, current):
-                    refreshed.append(cached)
+                    refreshed_by_code[code] = cached
                 continue
             if not self._is_ended(discovered, current):
-                refreshed.append(discovered)
+                refreshed_by_code[code] = discovered
+
+        if deferred:
+            logger.warning(_REFRESH_BUDGET_ERROR)
+            errors.append(_REFRESH_BUDGET_ERROR)
+            for announcement in deferred:
+                cached = cached_by_code.get(announcement.article_code)
+                if cached is not None and not self._is_ended(cached, current):
+                    refreshed_by_code[announcement.article_code] = cached
+
+        refreshed = [
+            refreshed_by_code[item.article_code]
+            for item in announcements
+            if item.article_code in refreshed_by_code
+        ]
 
         extras = sorted(
             (
@@ -396,6 +435,7 @@ class CompetitionDiscoveryService:
             try:
                 self.cache.store(state)
             except OSError:
+                logger.warning(_CACHE_ERROR)
                 state = replace(state, stale=True, errors=(_CACHE_ERROR,))
         self._memory = state
         return self._view(state, current)

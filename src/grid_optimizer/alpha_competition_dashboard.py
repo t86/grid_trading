@@ -40,7 +40,7 @@ _COMPETITION_SERVICE_LOCK = threading.Lock()
 _DISCOVERY_SERVICE: CompetitionDiscoveryService | None = None
 _DISCOVERY_SERVICE_LOCK = threading.Lock()
 _ALERT_CHECK_LOCK = threading.Lock()
-_SNAPSHOT_SYMBOL_RE = re.compile(r"[A-Z0-9]{1,32}")
+_SNAPSHOT_SYMBOL_RE = re.compile(r"[A-Z0-9_]{1,32}")
 _MAX_SNAPSHOT_SYMBOLS = 32
 _ALLOWED_METHODS = {
     "/": "GET",
@@ -1056,6 +1056,20 @@ INDEX_HTML = r"""<!doctype html>
       return data;
     }
 
+    function competitionSymbols(data) {
+      const rows = validatePayload(data, '交易赛').rows;
+      const symbols = [];
+      const seen = new Set();
+      for (const row of rows) {
+        const symbol = row.symbol;
+        if (typeof symbol !== 'string' || !/^[A-Z0-9_]{1,32}$/.test(symbol)) continue;
+        if (seen.has(symbol)) continue;
+        seen.add(symbol);
+        symbols.push(symbol);
+      }
+      return symbols;
+    }
+
     function renderCompetition(data) {
       const payload = validatePayload(data, '交易赛');
       const rows = payload.rows;
@@ -1115,12 +1129,37 @@ INDEX_HTML = r"""<!doctype html>
       const generation = ++refreshGeneration;
       refreshBtn.disabled = true;
       try {
-        const [marketResult, competitionResult] = await Promise.allSettled([
-          fetchJson('api/snapshot'),
-          fetchJson('api/competition'),
-        ]);
+        let competitionResult;
+        try {
+          competitionResult = { status: 'fulfilled', value: await fetchJson('api/competition') };
+        } catch (reason) {
+          competitionResult = { status: 'rejected', reason };
+        }
         if (generation !== refreshGeneration) return;
-        if (marketResult.status === 'fulfilled') {
+        let marketResult = null;
+        if (competitionResult.status === 'fulfilled') {
+          let symbols;
+          try {
+            symbols = competitionSymbols(competitionResult.value);
+          } catch (reason) {
+            competitionResult = { status: 'rejected', reason };
+            symbols = [];
+          }
+          if (symbols.length) {
+            try {
+              const query = encodeURIComponent(symbols.join(','));
+              marketResult = { status: 'fulfilled', value: await fetchJson(`api/snapshot?symbols=${query}`) };
+            } catch (reason) {
+              marketResult = { status: 'rejected', reason };
+            }
+          } else {
+            marketResult = { status: 'fulfilled', value: { rows: [], errors: [], symbols: [] } };
+          }
+        }
+        if (generation !== refreshGeneration) return;
+        if (marketResult === null) {
+          statusEl.textContent = '行情未刷新：交易赛名单刷新失败。';
+        } else if (marketResult.status === 'fulfilled') {
           try {
             renderMarket(marketResult.value);
             statusEl.textContent = '实时行情已更新。';

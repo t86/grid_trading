@@ -500,6 +500,23 @@ def test_provider_rejects_conflicting_announcement_metadata_for_one_article_code
         provider.fetch_recent_announcements(now=DISCOVERY_NOW)
 
 
+def test_provider_rejects_a_cms_page_larger_than_the_requested_limit() -> None:
+    item = _list_item(
+        FIXTURES["DOS"],
+        release_date=int((DISCOVERY_NOW - timedelta(days=1)).timestamp() * 1000),
+    )
+    session = _FakeSession([
+        _official({"articles": [copy.deepcopy(item) for _ in range(51)]}),
+        _official({"articles": []}),
+    ])
+    provider = metrics.BinanceCompetitionRuleProvider(session=session)
+
+    with pytest.raises(RuleParseError, match="^Binance CMS article list is invalid$"):
+        provider.fetch_recent_announcements(now=DISCOVERY_NOW)
+
+    assert len(session.calls) == 1
+
+
 @pytest.mark.parametrize(
     "item",
     [

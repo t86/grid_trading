@@ -363,7 +363,7 @@ def _list_article_code(item: Mapping[str, Any]) -> str:
 def _list_articles(data: Mapping[str, Any]) -> list[object]:
     if "articles" in data:
         articles = data.get("articles")
-        if not isinstance(articles, list):
+        if not isinstance(articles, list) or len(articles) > 50:
             raise RuleParseError("Binance CMS article list is invalid")
         return articles
 
@@ -386,7 +386,7 @@ def _list_articles(data: Mapping[str, Any]) -> list[object]:
     if len(matches) != 1:
         raise RuleParseError("Binance CMS article list is invalid")
     articles = matches[0].get("articles")
-    if not isinstance(articles, list):
+    if not isinstance(articles, list) or len(articles) > 50:
         raise RuleParseError("Binance CMS article list is invalid")
     return articles
 

@@ -655,6 +655,29 @@ def test_api_snapshot_uses_injected_market_and_json_headers(
     assert [row["symbol"] for row in response.json()["rows"]] == ["QUID"]
 
 
+def test_api_snapshot_accepts_an_underscore_symbol_used_by_the_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnderscoreMarket(FakeMarket):
+        def fetch_tokens(self) -> dict[str, AlphaToken]:
+            return {
+                "ABC_DEF": AlphaToken(
+                    "ABC_DEF", "ALPHA_2000", "ABC Def", "BSC", 0.1, 1_000, 10,
+                    "ALPHA_2000USDT",
+                )
+            }
+
+    monkeypatch.setenv("ALPHA_DASHBOARD_USERNAME", "alpha-user")
+    monkeypatch.setenv("ALPHA_DASHBOARD_PASSWORD", "alpha-password")
+    with running_server(market=UnderscoreMarket()) as server:
+        response = server.get("/api/snapshot?symbols=ABC_DEF")
+
+    assert response.status_code == 200
+    assert response.json()["symbols"] == ["ABC_DEF"]
+    assert [row["symbol"] for row in response.json()["rows"]] == ["ABC_DEF"]
+    assert "/^[A-Z0-9_]{1,32}$/" in dashboard.INDEX_HTML
+
+
 @pytest.mark.parametrize("failure_stage", ["klines", "ticker"])
 def test_api_snapshot_keeps_healthy_symbols_when_one_market_lookup_fails(
     http_server: HttpServerHarness,
@@ -1515,12 +1538,19 @@ def test_page_escapes_api_content_and_allows_only_web_article_links() -> None:
         assert marker in html
 
 
-def test_page_refreshes_market_and_competition_independently() -> None:
+def test_page_fetches_market_for_the_validated_competition_roster_in_order() -> None:
     html = dashboard.INDEX_HTML
 
-    assert "Promise.allSettled" in html
-    assert "fetchJson('api/snapshot')" in html
-    assert "fetchJson('api/competition')" in html
+    competition_fetch = html.index("await fetchJson('api/competition')")
+    snapshot_fetch = html.index("await fetchJson(`api/snapshot?symbols=${query}`)")
+    assert competition_fetch < snapshot_fetch
+    assert "function competitionSymbols(data)" in html
+    assert "/^[A-Z0-9_]{1,32}$/" in html
+    assert "const query = encodeURIComponent(symbols.join(','))" in html
+    assert "if (seen.has(symbol)) continue" in html
+    assert "rows: [], errors: [], symbols: []" in html
+    assert "Promise.allSettled" not in html
+    assert "fetchJson('api/snapshot')" not in html
     assert "if (!response.ok)" in html
     assert "renderMarket(marketResult.value)" in html
     assert "renderCompetition(competitionResult.value)" in html
@@ -1528,6 +1558,15 @@ def test_page_refreshes_market_and_competition_independently() -> None:
     assert 'id="alertStatus"' in html
     assert "await refresh()" in html
     assert "alertStatusEl.textContent" in html
+
+
+def test_page_preserves_market_when_the_competition_roster_request_fails() -> None:
+    html = dashboard.INDEX_HTML
+
+    assert "let marketResult = null" in html
+    assert "if (marketResult === null)" in html
+    assert "statusEl.textContent = '行情未刷新：交易赛名单刷新失败。'" in html
+    assert "value: { rows: [], errors: [], symbols: [] }" in html
 
 
 def test_page_ignores_stale_refresh_generations_and_latest_request_owns_button() -> None:
