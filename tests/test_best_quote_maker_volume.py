@@ -887,6 +887,7 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
                 dynamic_control_high_volatility_ratio=1.0,
                 dynamic_control_extreme_volatility_ratio=2.0,
                 dynamic_control_trend_return_ratio=0.002,
+                dynamic_control_trend_bias_requires_inventory_imbalance=True,
                 dynamic_control_trend_inventory_guard_enabled=True,
                 dynamic_control_trend_inventory_guard_start_ratio=0.70,
                 dynamic_control_trend_inventory_guard_min_score=0.55,
@@ -1180,6 +1181,46 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         guard = plan["metrics"]["trend_inventory_guard"]
         self.assertTrue(guard["applied"])
         self.assertTrue(guard["guard_short_inventory"])
+
+    def test_trend_controls_keep_two_sided_flow_without_material_imbalance(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.9,
+                inventory_bias_min_notional_gap=80.0,
+                dynamic_control_enabled=True,
+                dynamic_control_high_volatility_ratio=0.0035,
+                dynamic_control_extreme_volatility_ratio=0.009,
+                dynamic_control_trend_return_ratio=0.002,
+                dynamic_control_trend_bias_requires_inventory_imbalance=True,
+                dynamic_control_trend_inventory_guard_enabled=True,
+                dynamic_control_trend_inventory_guard_start_ratio=0.70,
+                dynamic_control_trend_inventory_guard_min_score=0.55,
+                dynamic_control_trend_inventory_guard_min_volatility_ratio=0.0035,
+            ),
+            inputs=_inputs(
+                bid_price=1.0,
+                ask_price=1.01,
+                mid_price=1.005,
+                current_long_qty=870.0,
+                current_short_qty=808.0,
+                cycle_budget_notional=100.0,
+                tick_size=0.01,
+                step_size=1.0,
+                position_side_mode="hedge",
+                market_return_1m=-0.003,
+                market_return_5m=-0.006,
+                market_amplitude_5m=0.006,
+            ),
+        )
+
+        self.assertTrue(plan["buy_orders"])
+        self.assertTrue(plan["sell_orders"])
+        self.assertFalse(plan["metrics"]["trend_inventory_guard"]["applied"])
+        self.assertEqual(plan["metrics"]["dynamic_control"]["buy_budget_share"], 0.5)
+        self.assertEqual(plan["metrics"]["dynamic_control"]["sell_budget_share"], 0.5)
 
     def test_dynamic_control_shortens_base_spacing_when_volume_conditions_are_quiet(self) -> None:
         plan = build_best_quote_maker_volume_plan(

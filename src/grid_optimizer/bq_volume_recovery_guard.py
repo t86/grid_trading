@@ -331,6 +331,11 @@ GRVT_AUTO_CYCLE_BUDGET_CEILING_NOTIONAL = 100.0
 LOSS_REDUCE_WEAR_PER_10K = 3.0
 ARX_TARGET_PACE_WEAR_PER_10K = 8.0
 EMERGENCY_WEAR_PER_10K = 80.0
+# GRVT recovery is deliberately paced by a fresh five-minute sample.  Its
+# frozen inventory is isolated from ordinary inventory controls, so a stale
+# loss-reduce print must not suppress restoring ordinary two-sided flow.
+GRVT_RECOVERY_WEAR_PER_10K = 50.0
+GRVT_EMERGENCY_WEAR_PER_10K = 200.0
 RECOVERY_GUARD_HEARTBEAT_KEY = "futures_recovery_guard_heartbeat"
 RECOVERY_GUARD_HEARTBEAT_SCHEMA = "futures_recovery_guard_heartbeat_v1"
 
@@ -1180,18 +1185,32 @@ def _ordinary_inventory_notionals(
     )
 
 
-def _is_high_recovery_wear(volume_summary: dict[str, Any]) -> bool:
+def _recovery_wear_thresholds(symbol: str) -> tuple[float, float]:
+    if str(symbol).upper() == "GRVTUSDT":
+        return GRVT_RECOVERY_WEAR_PER_10K, GRVT_EMERGENCY_WEAR_PER_10K
+    return LOSS_REDUCE_WEAR_PER_10K, EMERGENCY_WEAR_PER_10K
+
+
+def _is_high_recovery_wear(
+    volume_summary: dict[str, Any], *, symbol: str = ""
+) -> bool:
     trailing_5m_wear = _safe_float(
         volume_summary.get("trailing_5m_realized_wear_per_10k")
     )
     trailing_15m_wear = _safe_float(
         volume_summary.get("trailing_15m_realized_wear_per_10k")
     )
+    high_wear_threshold, emergency_wear_threshold = _recovery_wear_thresholds(symbol)
+    if str(symbol).upper() == "GRVTUSDT":
+        return (
+            _safe_float(volume_summary.get("trailing_5m_gross_notional")) >= 100.0
+            and trailing_5m_wear > high_wear_threshold
+        )
     return (
         _safe_float(volume_summary.get("trailing_15m_gross_notional")) >= 100.0
         and (
-            trailing_15m_wear > LOSS_REDUCE_WEAR_PER_10K
-            or trailing_5m_wear > EMERGENCY_WEAR_PER_10K
+            trailing_15m_wear > high_wear_threshold
+            or trailing_5m_wear > emergency_wear_threshold
         )
     )
 
@@ -1926,19 +1945,22 @@ def _loss_reduce_flow_control_updates(
 
 
 def _normal_entry_wear_backoff_confirmed(
-    volume_summary: dict[str, Any], *, target_pace_behind: bool
+    volume_summary: dict[str, Any], *, target_pace_behind: bool, symbol: str = ""
 ) -> bool:
     wear_5m = _safe_float(volume_summary.get("trailing_5m_realized_wear_per_10k"))
     wear_15m = _safe_float(volume_summary.get("trailing_15m_realized_wear_per_10k"))
     volume_5m = _safe_float(volume_summary.get("trailing_5m_gross_notional"))
     volume_15m = _safe_float(volume_summary.get("trailing_15m_gross_notional"))
-    if volume_15m < 100.0 or max(wear_5m, wear_15m) <= LOSS_REDUCE_WEAR_PER_10K:
+    wear_threshold, _ = _recovery_wear_thresholds(symbol)
+    if str(symbol).upper() == "GRVTUSDT":
+        return volume_5m >= 100.0 and wear_5m > wear_threshold
+    if volume_15m < 100.0 or max(wear_5m, wear_15m) <= wear_threshold:
         return False
     if not target_pace_behind:
         return True
     # While badly behind target, stale loss-reduce wear in the 15m window must
     # not immediately throttle newly restored normal entry flow.
-    return volume_5m >= 100.0 and wear_5m > LOSS_REDUCE_WEAR_PER_10K
+    return volume_5m >= 100.0 and wear_5m > wear_threshold
 
 
 def _recovery_inventory_buffer_ok(
@@ -5623,17 +5645,19 @@ def check_symbol(
     trailing_15m_realized_wear_per_10k = _safe_float(
         volume_summary.get("trailing_15m_realized_wear_per_10k")
     )
-    high_recovery_wear = _is_high_recovery_wear(volume_summary)
+    high_recovery_wear = _is_high_recovery_wear(
+        volume_summary, symbol=normalized_symbol
+    )
     trailing_5m_gross_notional = _safe_float(
         volume_summary.get("trailing_5m_gross_notional")
     )
-    loss_reduce_wear_threshold = (
-        ARX_TARGET_PACE_WEAR_PER_10K
-        if normalized_symbol == "ARXUSDT" and target_pace_behind
-        else LOSS_REDUCE_WEAR_PER_10K
+    loss_reduce_wear_threshold, emergency_wear_threshold = _recovery_wear_thresholds(
+        normalized_symbol
     )
+    if normalized_symbol == "ARXUSDT" and target_pace_behind:
+        loss_reduce_wear_threshold = ARX_TARGET_PACE_WEAR_PER_10K
     confirmed_loss_reduce_wear = (
-        trailing_5m_realized_wear_per_10k > EMERGENCY_WEAR_PER_10K
+        trailing_5m_realized_wear_per_10k > emergency_wear_threshold
         or (
             trailing_5m_gross_notional >= 100.0
             and trailing_5m_realized_wear_per_10k > loss_reduce_wear_threshold
@@ -7910,6 +7934,7 @@ def check_symbol(
             _normal_entry_wear_backoff_confirmed(
                 volume_summary,
                 target_pace_behind=target_pace_behind,
+                symbol=normalized_symbol,
             )
             and not recovery_reapply_debounced
             and not post_restore_budget_cooldown_active

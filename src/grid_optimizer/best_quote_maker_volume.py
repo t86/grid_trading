@@ -52,6 +52,7 @@ class BestQuoteMakerVolumeConfig:
     dynamic_control_extreme_volatility_step_scale: float = 2.5
     dynamic_control_trend_return_ratio: float = 0.002
     dynamic_control_trend_bias_max: float = 0.35
+    dynamic_control_trend_bias_requires_inventory_imbalance: bool = False
     dynamic_control_trend_entry_guard_enabled: bool = False
     dynamic_control_trend_entry_guard_min_score: float = 0.75
     dynamic_control_trend_entry_guard_min_volatility_ratio: float = 0.0
@@ -815,8 +816,32 @@ def build_best_quote_maker_volume_plan(
         trend_score = _clamp(_safe_float(dynamic_control_report.get("trend_score")), -1.0, 1.0)
         volatility_ratio = max(_safe_float(dynamic_control_report.get("volatility_ratio")), 0.0)
         volatility_ok = min_volatility <= 0 or volatility_ratio >= min_volatility
-        long_guard = volatility_ok and long_inventory_ratio >= start_ratio and trend_score <= -min_score
-        short_guard = volatility_ok and short_inventory_ratio >= start_ratio and trend_score >= min_score
+        imbalance_floor = max(
+            _safe_float(config.inventory_bias_min_notional_gap),
+            max(long_soft, short_soft)
+            * max(_safe_float(config.inventory_bias_min_notional_gap_soft_ratio), 0.0),
+        )
+        require_imbalance = bool(
+            config.dynamic_control_trend_bias_requires_inventory_imbalance
+        )
+        long_guard = (
+            volatility_ok
+            and long_inventory_ratio >= start_ratio
+            and (
+                not require_imbalance
+                or long_notional - short_notional >= imbalance_floor
+            )
+            and trend_score <= -min_score
+        )
+        short_guard = (
+            volatility_ok
+            and short_inventory_ratio >= start_ratio
+            and (
+                not require_imbalance
+                or short_notional - long_notional >= imbalance_floor
+            )
+            and trend_score >= min_score
+        )
         if long_guard or short_guard:
             if long_guard:
                 trend_inventory_guard_report.update(
@@ -848,6 +873,8 @@ def build_best_quote_maker_volume_plan(
                     "reduce_extra_ticks": reduce_extra_ticks,
                     "trend_score": trend_score,
                     "volatility_ratio": volatility_ratio,
+                    "imbalance_floor_notional": imbalance_floor,
+                    "requires_imbalance": require_imbalance,
                 }
             )
             reasons.append("trend_inventory_guard")
@@ -980,12 +1007,33 @@ def build_best_quote_maker_volume_plan(
     if config.dynamic_control_enabled and buy_slot_active and sell_slot_active:
         max_bias = _clamp(_safe_float(config.dynamic_control_trend_bias_max), 0.0, 0.45)
         trend_score = _clamp(_safe_float(dynamic_control_report.get("trend_score")), -1.0, 1.0)
-        buy_share = _clamp(0.5 + (trend_score * max_bias), 0.05, 0.95)
+        bias_imbalance_floor = max(
+            _safe_float(config.inventory_bias_min_notional_gap),
+            max(long_soft, short_soft)
+            * max(_safe_float(config.inventory_bias_min_notional_gap_soft_ratio), 0.0),
+        )
+        material_inventory_imbalance = (
+            abs(short_notional - long_notional) >= bias_imbalance_floor
+        )
+        require_imbalance = bool(
+            config.dynamic_control_trend_bias_requires_inventory_imbalance
+        )
+        effective_trend_score = (
+            trend_score
+            if material_inventory_imbalance or not require_imbalance
+            else 0.0
+        )
+        buy_share = _clamp(0.5 + (effective_trend_score * max_bias), 0.05, 0.95)
         sell_share = 1.0 - buy_share
         buy_side_notional = cycle_budget * buy_share
         sell_side_notional = cycle_budget * sell_share
         dynamic_control_report["buy_budget_share"] = buy_share
         dynamic_control_report["sell_budget_share"] = sell_share
+        dynamic_control_report["trend_budget_bias_applied"] = (
+            material_inventory_imbalance or not require_imbalance
+        )
+        dynamic_control_report["trend_budget_bias_imbalance_floor_notional"] = bias_imbalance_floor
+        dynamic_control_report["trend_budget_bias_requires_inventory_imbalance"] = require_imbalance
     long_entry_budget_scale = _clamp(_safe_float(trend_entry_guard_report["long_entry_budget_scale"]), 0.0, 1.0)
     short_entry_budget_scale = _clamp(_safe_float(trend_entry_guard_report["short_entry_budget_scale"]), 0.0, 1.0)
     long_entry_budget_scale *= _clamp(

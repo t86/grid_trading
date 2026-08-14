@@ -5952,6 +5952,25 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 }
             )
         )
+
+    def test_grvt_high_recovery_wear_uses_fresh_relaxed_threshold(self) -> None:
+        stale_loss = {
+            "trailing_5m_gross_notional": 100.0,
+            "trailing_15m_gross_notional": 500.0,
+            "trailing_5m_realized_wear_per_10k": 20.0,
+            "trailing_15m_realized_wear_per_10k": 160.0,
+        }
+        self.assertFalse(
+            bq_volume_recovery_guard._is_high_recovery_wear(
+                stale_loss, symbol="GRVTUSDT"
+            )
+        )
+        self.assertTrue(
+            bq_volume_recovery_guard._is_high_recovery_wear(
+                {**stale_loss, "trailing_5m_realized_wear_per_10k": 50.1},
+                symbol="GRVTUSDT",
+            )
+        )
         self.assertTrue(
             bq_volume_recovery_guard._is_high_recovery_wear(
                 {

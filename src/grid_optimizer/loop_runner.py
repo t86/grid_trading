@@ -31353,6 +31353,9 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                 dynamic_control_trend_bias_max=float(
                     getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_bias_max", 0.35)
                 ),
+                dynamic_control_trend_bias_requires_inventory_imbalance=(
+                    str(getattr(effective_args, "symbol", "")).upper() == "GRVTUSDT"
+                ),
                 dynamic_control_trend_entry_guard_enabled=bool(
                     getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled", False)
                 ),
