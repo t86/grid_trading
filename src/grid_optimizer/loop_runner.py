@@ -24021,44 +24021,49 @@ def apply_best_quote_active_pair_reduce(
     }
     if threshold_side_mode and bool(memory.get("completed")):
         trigger_count = max(int(memory.get("trigger_count") or 0), 0)
-        if threshold_eligible_sides:
-            completed_at = _parse_state_datetime(memory.get("completed_at"))
-            cooldown_remaining = (
-                max(
-                    safe_rearm_cooldown
-                    - (effective_now - completed_at).total_seconds(),
-                    0.0,
-                )
-                if completed_at is not None and safe_rearm_cooldown > 0
-                else 0.0
+        completed_at = _parse_state_datetime(memory.get("completed_at"))
+        cooldown_remaining = (
+            max(
+                safe_rearm_cooldown
+                - (effective_now - completed_at).total_seconds(),
+                0.0,
             )
-            if cooldown_remaining > 0:
-                suppressed_entry_order_count = 0
-                for side_name, order_key, entry_role in (
-                    ("long", "buy_orders", "best_quote_entry_long"),
-                    ("short", "sell_orders", "best_quote_entry_short"),
-                ):
-                    if side_name not in threshold_eligible_sides and not suppress_all_entries_while_active:
+            if completed_at is not None and safe_rearm_cooldown > 0
+            else 0.0
+        )
+        cooldown_sides = threshold_eligible_sides | {
+            str(side)
+            for side in memory.get("eligible_sides", [])
+            if str(side) in {"long", "short"}
+        }
+        if cooldown_remaining > 0 and cooldown_sides:
+            suppressed_entry_order_count = 0
+            for side_name, order_key, entry_role in (
+                ("long", "buy_orders", "best_quote_entry_long"),
+                ("short", "sell_orders", "best_quote_entry_short"),
+            ):
+                if side_name not in cooldown_sides:
+                    continue
+                kept_orders: list[dict[str, Any]] = []
+                for item in plan.get(order_key, []):
+                    if not isinstance(item, dict):
                         continue
-                    kept_orders: list[dict[str, Any]] = []
-                    for item in plan.get(order_key, []):
-                        if not isinstance(item, dict):
-                            continue
-                        if _order_role(item) == entry_role:
-                            suppressed_entry_order_count += 1
-                            continue
-                        kept_orders.append(dict(item))
-                    plan[order_key] = kept_orders
-                report.update(
-                    {
-                        "reason": "rearm_cooldown_active",
-                        "eligible_sides": sorted(threshold_eligible_sides),
-                        "normal_entry_suppressed": suppressed_entry_order_count > 0,
-                        "suppressed_entry_order_count": suppressed_entry_order_count,
-                        "rearm_cooldown_remaining_seconds": cooldown_remaining,
-                    }
-                )
-                return report
+                    if _order_role(item) == entry_role:
+                        suppressed_entry_order_count += 1
+                        continue
+                    kept_orders.append(dict(item))
+                plan[order_key] = kept_orders
+            report.update(
+                {
+                    "reason": "rearm_cooldown_active",
+                    "eligible_sides": sorted(cooldown_sides),
+                    "normal_entry_suppressed": suppressed_entry_order_count > 0,
+                    "suppressed_entry_order_count": suppressed_entry_order_count,
+                    "rearm_cooldown_remaining_seconds": cooldown_remaining,
+                }
+            )
+            return report
+        if threshold_eligible_sides:
             memory = {"trigger_count": trigger_count}
             report["rearmed_after_refill"] = True
         else:
