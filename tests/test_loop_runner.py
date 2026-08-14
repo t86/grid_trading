@@ -342,6 +342,8 @@ class LoopRunnerTests(unittest.TestCase):
             actions=actions,
             strategy_mode="best_quote_maker_volume_v1",
             current_ordinary_actual_net_qty=0.4,
+            current_ordinary_long_qty=0.4,
+            current_ordinary_short_qty=0.0,
             current_open_orders=[],
         )
 
@@ -393,6 +395,8 @@ class LoopRunnerTests(unittest.TestCase):
             actions=actions,
             strategy_mode="best_quote_maker_volume_v1",
             current_ordinary_actual_net_qty=0.4,
+            current_ordinary_long_qty=0.4,
+            current_ordinary_short_qty=0.0,
             current_open_orders=[frozen_open_order],
         )
 
@@ -12191,6 +12195,137 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"], [])
         self.assertEqual(len(plan["buy_orders"]), 1)
         self.assertLessEqual(plan["buy_orders"][0]["notional"], 100.0 + 1e-9)
+
+    def test_grvt_pressure_guard_caps_total_role_independent_ordinary_reduce(self) -> None:
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "role": "directional_safety_reduce_long",
+                    "qty": 245.0,
+                    "price": 0.3260,
+                    "notional": 79.87,
+                    "force_reduce_only": True,
+                },
+                {
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "role": "best_quote_reduce_long",
+                    "qty": 245.0,
+                    "price": 0.3260,
+                    "notional": 79.87,
+                    "force_reduce_only": True,
+                },
+                {
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "qty": 920.0,
+                    "price": 0.3260,
+                    "notional": 299.92,
+                    "force_reduce_only": True,
+                    "manual_frozen_inventory_reduce": True,
+                    "frozen_inventory_request_id": "frozen-long-1",
+                },
+            ],
+        }
+
+        report = apply_grvt_ordinary_inventory_pressure_guard(
+            plan=plan,
+            current_long_notional=1_003.0,
+            current_short_notional=817.5,
+            long_pressure_notional=900.0,
+            short_pressure_notional=900.0,
+            max_reduce_notional=100.0,
+            step_size=1.0,
+        )
+
+        ordinary = [
+            item
+            for item in plan["sell_orders"]
+            if not loop_runner_module.is_frozen_inventory_order(item)
+        ]
+        frozen = [
+            item
+            for item in plan["sell_orders"]
+            if loop_runner_module.is_frozen_inventory_order(item)
+        ]
+        self.assertAlmostEqual(sum(item["notional"] for item in ordinary), 100.0, delta=0.326)
+        self.assertEqual(len(frozen), 1)
+        self.assertAlmostEqual(frozen[0]["notional"], 299.92)
+        self.assertEqual(report["capped_pressure_reduce_order_count"], 1)
+
+    def test_grvt_submit_pressure_guard_uses_live_ordinary_inventory_as_final_invariant(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "role": "best_quote_reduce_long",
+                    "qty": 1_533.0,
+                    "price": 0.3261,
+                    "notional": 499.9113,
+                    "force_reduce_only": True,
+                },
+                {
+                    "side": "BUY",
+                    "position_side": "SHORT",
+                    "role": "submit_only_reduce_short",
+                    "qty": 920.0,
+                    "price": 0.3260,
+                    "notional": 299.92,
+                    "force_reduce_only": True,
+                },
+                {
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "qty": 920.0,
+                    "price": 0.3260,
+                    "notional": 299.92,
+                    "force_reduce_only": True,
+                    "manual_frozen_inventory_reduce": True,
+                    "frozen_inventory_request_id": "frozen-long-1",
+                },
+            ],
+            "cancel_orders": [],
+        }
+        plan_report = {
+            "effective_strategy_profile": "grvt_daily_80k_bq_short_freeze_5pct_v1",
+            "best_quote_maker_volume": {
+                "ordinary_inventory_pressure_guard": {
+                    "active": True,
+                    "eligible_sides": ["short"],
+                    "long_pressure_notional": 900.0,
+                    "short_pressure_notional": 900.0,
+                    "max_reduce_notional": 100.0,
+                }
+            },
+            "symbol_info": {"step_size": 1.0},
+        }
+
+        guarded = loop_runner_module._apply_grvt_submit_ordinary_inventory_pressure_guard(
+            actions=actions,
+            plan_report=plan_report,
+            current_ordinary_long_qty=2_500.0,
+            current_ordinary_short_qty=3_077.0,
+            live_bid_price=0.3259,
+            live_ask_price=0.3261,
+        )
+
+        ordinary_roles = [
+            item["role"]
+            for item in guarded["place_orders"]
+            if not loop_runner_module.is_frozen_inventory_order(item)
+        ]
+        self.assertEqual(ordinary_roles, ["submit_only_reduce_short"])
+        self.assertLessEqual(guarded["place_orders"][0]["notional"], 100.0 + 1e-9)
+        self.assertIn(
+            "frozen_inventory_manual_reduce_long",
+            [item["role"] for item in guarded["place_orders"]],
+        )
 
     def test_grvt_small_net_breach_uses_bounded_pressure_reduce_instead_of_terminal_drain(self) -> None:
         plan = {

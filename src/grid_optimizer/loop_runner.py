@@ -23683,7 +23683,12 @@ def apply_grvt_ordinary_inventory_pressure_guard(
     max_reduce_notional: float,
     step_size: float | None,
 ) -> dict[str, Any]:
-    """Keep ordinary GRVT reductions on the pressured side and bound each action."""
+    """Keep ordinary GRVT reductions on pressured sides and bound each side's total.
+
+    The check is intentionally semantic rather than role-based so a later
+    safety/fallback path cannot bypass it by using a different reduce role.
+    Frozen-inventory orders remain on their independent authorized lane.
+    """
     safe_long_notional = max(_safe_float(current_long_notional), 0.0)
     safe_short_notional = max(_safe_float(current_short_notional), 0.0)
     safe_long_pressure = max(_safe_float(long_pressure_notional), 0.0)
@@ -23706,39 +23711,155 @@ def apply_grvt_ordinary_inventory_pressure_guard(
         "max_reduce_notional": safe_max_reduce,
         "suppressed_opposite_reduce_order_count": 0,
         "capped_pressure_reduce_order_count": 0,
+        "suppressed_excess_reduce_order_count": 0,
     }
     if not eligible_sides:
         return report
 
-    for side_name, order_key, reduce_roles in (
-        ("long", "sell_orders", {"best_quote_reduce_long", "inventory_unlock_reduce_long"}),
-        ("short", "buy_orders", {"best_quote_reduce_short", "inventory_unlock_reduce_short"}),
-    ):
-        kept_orders: list[dict[str, Any]] = []
-        for item in plan.get(order_key, []):
-            if not isinstance(item, dict):
-                continue
-            order = dict(item)
-            if _order_role(order) not in reduce_roles:
-                kept_orders.append(order)
-                continue
-            if side_name not in eligible_sides:
-                report["suppressed_opposite_reduce_order_count"] += 1
-                continue
-            price = max(_safe_float(order.get("price")), 0.0)
-            notional = max(_safe_float(order.get("notional")), 0.0)
-            if safe_max_reduce > 0 and price > 0 and notional > safe_max_reduce + 1e-12:
-                qty = _round_order_qty(safe_max_reduce / price, step_size)
-                if qty <= 0:
-                    continue
-                order["qty"] = qty
-                if "quantity" in order:
-                    order["quantity"] = qty
-                order["notional"] = qty * price
-                report["capped_pressure_reduce_order_count"] += 1
+    remaining_notional = {
+        "long": safe_max_reduce,
+        "short": safe_max_reduce,
+    }
+    desired_orders = [
+        *[dict(item) for item in plan.get("buy_orders", []) if isinstance(item, dict)],
+        *[dict(item) for item in plan.get("sell_orders", []) if isinstance(item, dict)],
+    ]
+    kept_orders: list[dict[str, Any]] = []
+    for order in desired_orders:
+        if is_frozen_inventory_order(order):
             kept_orders.append(order)
-        plan[order_key] = kept_orders
+            continue
+        side = str(order.get("side") or "").upper().strip()
+        position_side = _order_position_side(order)
+        role = _order_role(order)
+        reduce_like = bool(order.get("force_reduce_only")) or "reduce" in role
+        reduce_side = (
+            "long"
+            if reduce_like and side == "SELL" and position_side == "LONG"
+            else "short"
+            if reduce_like and side == "BUY" and position_side == "SHORT"
+            else None
+        )
+        if reduce_side is None:
+            kept_orders.append(order)
+            continue
+        if reduce_side not in eligible_sides:
+            report["suppressed_opposite_reduce_order_count"] += 1
+            continue
+        if safe_max_reduce <= 0:
+            kept_orders.append(order)
+            continue
+
+        remaining = max(remaining_notional[reduce_side], 0.0)
+        if remaining <= 1e-12:
+            report["suppressed_excess_reduce_order_count"] += 1
+            continue
+        price = max(_safe_float(order.get("price")), 0.0)
+        qty = max(_safe_float(order.get("qty", order.get("quantity"))), 0.0)
+        notional = max(_safe_float(order.get("notional")), price * qty)
+        if price > 0 and notional > remaining + 1e-12:
+            qty = _round_order_qty(remaining / price, step_size)
+            if qty <= 0:
+                report["suppressed_excess_reduce_order_count"] += 1
+                continue
+            order["qty"] = qty
+            if "quantity" in order:
+                order["quantity"] = qty
+            notional = qty * price
+            order["notional"] = notional
+            report["capped_pressure_reduce_order_count"] += 1
+        remaining_notional[reduce_side] = max(remaining - notional, 0.0)
+        kept_orders.append(order)
+
+    plan["buy_orders"] = [
+        item for item in kept_orders if str(item.get("side") or "").upper().strip() == "BUY"
+    ]
+    plan["sell_orders"] = [
+        item for item in kept_orders if str(item.get("side") or "").upper().strip() == "SELL"
+    ]
     return report
+
+
+def _apply_grvt_submit_ordinary_inventory_pressure_guard(
+    *,
+    actions: dict[str, Any],
+    plan_report: Mapping[str, Any],
+    current_ordinary_long_qty: float,
+    current_ordinary_short_qty: float,
+    live_bid_price: float,
+    live_ask_price: float,
+) -> dict[str, Any]:
+    """Final submit-boundary invariant for GRVT ordinary reductions."""
+    if (
+        str(plan_report.get("effective_strategy_profile") or "").strip()
+        != "grvt_daily_80k_bq_short_freeze_5pct_v1"
+    ):
+        return actions
+    best_quote = plan_report.get("best_quote_maker_volume")
+    pressure_guard = (
+        best_quote.get("ordinary_inventory_pressure_guard")
+        if isinstance(best_quote, Mapping)
+        else None
+    )
+    if not isinstance(pressure_guard, Mapping):
+        return actions
+    live_mid_price = (
+        (max(_safe_float(live_bid_price), 0.0) + max(_safe_float(live_ask_price), 0.0)) / 2.0
+        if _safe_float(live_bid_price) > 0 and _safe_float(live_ask_price) > 0
+        else max(_safe_float(plan_report.get("mid_price")), 0.0)
+    )
+    temporary_plan = {
+        "buy_orders": [
+            dict(item)
+            for item in actions.get("place_orders", [])
+            if isinstance(item, dict) and str(item.get("side") or "").upper().strip() == "BUY"
+        ],
+        "sell_orders": [
+            dict(item)
+            for item in actions.get("place_orders", [])
+            if isinstance(item, dict) and str(item.get("side") or "").upper().strip() == "SELL"
+        ],
+    }
+    report = apply_grvt_ordinary_inventory_pressure_guard(
+        plan=temporary_plan,
+        current_long_notional=max(_safe_float(current_ordinary_long_qty), 0.0) * live_mid_price,
+        current_short_notional=max(_safe_float(current_ordinary_short_qty), 0.0) * live_mid_price,
+        long_pressure_notional=_safe_float(pressure_guard.get("long_pressure_notional")),
+        short_pressure_notional=_safe_float(pressure_guard.get("short_pressure_notional")),
+        max_reduce_notional=min(
+            max(_safe_float(pressure_guard.get("max_reduce_notional")), 0.0) or 100.0,
+            100.0,
+        ),
+        step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+    )
+    guarded_by_identity: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for item in [*temporary_plan["buy_orders"], *temporary_plan["sell_orders"]]:
+        key = (
+            _order_role(item),
+            str(item.get("side") or "").upper().strip(),
+            _order_position_side(item),
+            _safe_float(item.get("price")),
+        )
+        guarded_by_identity.setdefault(key, []).append(item)
+    guarded_orders: list[dict[str, Any]] = []
+    for raw_order in actions.get("place_orders", []):
+        if not isinstance(raw_order, dict):
+            continue
+        key = (
+            _order_role(raw_order),
+            str(raw_order.get("side") or "").upper().strip(),
+            _order_position_side(raw_order),
+            _safe_float(raw_order.get("price")),
+        )
+        matches = guarded_by_identity.get(key, [])
+        if matches:
+            guarded_orders.append(matches.pop(0))
+    result = dict(actions)
+    result["place_orders"] = guarded_orders
+    result["place_count"] = len(guarded_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in guarded_orders)
+    result["ordinary_inventory_pressure_guard"] = report
+    return result
 
 
 def apply_best_quote_active_pair_reduce(
@@ -33436,6 +33557,41 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             min_notional=symbol_info.get("min_notional"),
         )
         best_quote_maker_volume["directional_net_guard"] = dict(best_quote_directional_net_guard)
+        if grvt_bounded_loss_recovery:
+            grvt_inventory_pressure_guard = apply_grvt_ordinary_inventory_pressure_guard(
+                plan=plan,
+                current_long_notional=controls.get("current_long_notional", current_long_notional),
+                current_short_notional=controls.get("current_short_notional", current_short_notional),
+                long_pressure_notional=(
+                    max(
+                        _safe_float(
+                            getattr(effective_args, "best_quote_maker_volume_max_long_notional", 0.0)
+                        ),
+                        0.0,
+                    )
+                    * best_quote_inventory_soft_ratio
+                ),
+                short_pressure_notional=(
+                    max(
+                        _safe_float(
+                            getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0)
+                        ),
+                        0.0,
+                    )
+                    * best_quote_inventory_soft_ratio
+                ),
+                max_reduce_notional=100.0,
+                step_size=symbol_info.get("step_size"),
+            )
+            best_quote_maker_volume["ordinary_inventory_pressure_guard"] = dict(
+                grvt_inventory_pressure_guard
+            )
+            cap_controls["planned_buy_notional"] = sum(
+                _safe_float(item.get("notional")) for item in list(plan.get("buy_orders", []))
+            )
+            cap_controls["planned_short_notional"] = sum(
+                _safe_float(item.get("notional")) for item in list(plan.get("sell_orders", []))
+            )
         desired_orders = [
             *plan["buy_orders"],
             *plan["sell_orders"],
@@ -34653,14 +34809,44 @@ def _execute_plan_report_unlocked(args: argparse.Namespace, plan_report: dict[st
     if _is_hedge_best_quote_maker_volume_mode(strategy_mode):
         best_quote_metrics = plan_report.get("best_quote_maker_volume")
         reduce_freeze = best_quote_metrics.get("reduce_freeze") if isinstance(best_quote_metrics, dict) else None
+        ordinary_pressure_guard = (
+            best_quote_metrics.get("ordinary_inventory_pressure_guard")
+            if isinstance(best_quote_metrics, dict)
+            else None
+        )
         same_side_entry_guard = (
             best_quote_metrics.get("same_side_entry_price_guard") if isinstance(best_quote_metrics, dict) else None
+        )
+        submit_mid_price = (
+            (live_bid_price + live_ask_price) / 2.0
+            if live_bid_price > 0 and live_ask_price > 0
+            else max(_safe_float(plan_report.get("mid_price")), 0.0)
         )
         validation["actions"] = convert_blocked_best_quote_entry_to_actual_side_reduce(
             actions=validation["actions"],
             same_side_entry_guard=same_side_entry_guard if isinstance(same_side_entry_guard, Mapping) else None,
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
+            current_long_notional=current_ordinary_long_qty * submit_mid_price,
+            current_short_notional=current_ordinary_short_qty * submit_mid_price,
+            long_soft_notional=(
+                _safe_float(ordinary_pressure_guard.get("long_pressure_notional"))
+                if isinstance(ordinary_pressure_guard, Mapping)
+                else None
+            ),
+            short_soft_notional=(
+                _safe_float(ordinary_pressure_guard.get("short_pressure_notional"))
+                if isinstance(ordinary_pressure_guard, Mapping)
+                else None
+            ),
+            pressure_reduce_max_notional=(
+                min(
+                    max(_safe_float(ordinary_pressure_guard.get("max_reduce_notional")), 0.0),
+                    100.0,
+                )
+                if isinstance(ordinary_pressure_guard, Mapping)
+                else None
+            ),
             frozen_long_qty=(
                 _safe_float(reduce_freeze.get("frozen_long_qty")) if isinstance(reduce_freeze, Mapping) else 0.0
             ),
@@ -34904,6 +35090,14 @@ def _execute_plan_report_unlocked(args: argparse.Namespace, plan_report: dict[st
         validation["actions"]["actual_net_exposure_decision"] = (
             selected_action_decision
         )
+    validation["actions"] = _apply_grvt_submit_ordinary_inventory_pressure_guard(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        current_ordinary_long_qty=current_ordinary_long_qty,
+        current_ordinary_short_qty=current_ordinary_short_qty,
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+    )
     validation = _authorize_actual_net_safety_cancel_validation(validation)
     report["actual_net_exposure_decision"] = validation["actions"].get(
         "actual_net_exposure_decision"
