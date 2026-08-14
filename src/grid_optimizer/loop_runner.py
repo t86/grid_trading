@@ -23568,6 +23568,7 @@ def _best_quote_active_pair_reduce_default_report() -> dict[str, Any]:
         "eligible_sides": [],
         "normal_entry_suppressed": False,
         "suppressed_entry_order_count": 0,
+        "suppressed_noneligible_reduce_order_count": 0,
         "triggered": False,
         "completed": False,
     }
@@ -23603,6 +23604,7 @@ def apply_best_quote_active_pair_reduce(
     max_loss_ratio: float = 0.005,
     min_relief_notional: float = 0.0,
     suppress_all_entries_while_active: bool = False,
+    suppress_noneligible_reduce_while_active: bool = False,
 ) -> dict[str, Any]:
     report = _best_quote_active_pair_reduce_default_report()
     report["enabled"] = bool(enabled)
@@ -23819,6 +23821,35 @@ def apply_best_quote_active_pair_reduce(
     ]
     if eligible_residuals and max(eligible_residuals) < minimum_actionable_notional:
         return _clear("target_reached_small_residual", completed=True)
+
+    if threshold_side_mode and suppress_noneligible_reduce_while_active:
+        suppressed_noneligible_reduce_order_count = 0
+        for side_name, order_key, reduce_roles in (
+            (
+                "long",
+                "sell_orders",
+                {"best_quote_reduce_long", "inventory_unlock_reduce_long"},
+            ),
+            (
+                "short",
+                "buy_orders",
+                {"best_quote_reduce_short", "inventory_unlock_reduce_short"},
+            ),
+        ):
+            if side_name in eligible_sides:
+                continue
+            kept_orders: list[dict[str, Any]] = []
+            for item in plan.get(order_key, []):
+                if not isinstance(item, dict):
+                    continue
+                if _order_role(item) in reduce_roles:
+                    suppressed_noneligible_reduce_order_count += 1
+                    continue
+                kept_orders.append(dict(item))
+            plan[order_key] = kept_orders
+        report["suppressed_noneligible_reduce_order_count"] = (
+            suppressed_noneligible_reduce_order_count
+        )
 
     suppressed_entry_order_count = 0
     for side_name, order_key, entry_role in (
@@ -32943,6 +32974,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             max_loss_ratio=0.20 if grvt_bounded_loss_recovery else 0.005,
             min_relief_notional=100.0 if grvt_bounded_loss_recovery else 0.0,
             suppress_all_entries_while_active=grvt_bounded_loss_recovery,
+            suppress_noneligible_reduce_while_active=grvt_bounded_loss_recovery,
         )
     else:
         state.pop("best_quote_active_pair_reduce", None)
