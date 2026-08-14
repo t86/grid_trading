@@ -927,7 +927,7 @@ class SubmitPlanTests(unittest.TestCase):
             1,
         )
 
-    def test_symbol_coordinator_treats_frozen_pair_as_one_logical_cycle_action(self) -> None:
+    def test_symbol_coordinator_keeps_ordinary_flow_with_frozen_pair(self) -> None:
         frozen_pair = [
             {
                 "book": "frozen_bq",
@@ -973,14 +973,11 @@ class SubmitPlanTests(unittest.TestCase):
             max_actual_net_notional=120.0,
         )
 
-        self.assertEqual(
-            guarded["actual_net_exposure_decision"]["action"],
-            "frozen_inventory_action",
-        )
-        self.assertEqual(guarded["place_orders"], frozen_pair)
+        self.assertEqual(guarded["actual_net_exposure_decision"]["action"], "normal")
+        self.assertEqual(guarded["place_orders"], [ordinary_entry, *frozen_pair])
         self.assertEqual(
             guarded["actual_net_exposure_decision"]["deferred_ordinary_place_count"],
-            1,
+            0,
         )
 
     def test_symbol_coordinator_selects_only_one_frozen_request_group(self) -> None:

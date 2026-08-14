@@ -35232,7 +35232,12 @@ def _execute_plan_report_unlocked(args: argparse.Namespace, plan_report: dict[st
     )
     if (
         isinstance(selected_action_decision, Mapping)
-        and selected_action_decision.get("selected_lane") == "frozen"
+        and str(selected_action_decision.get("selected_frozen_request_id") or "").strip()
+        and any(
+            is_frozen_inventory_order(item)
+            for item in validation["actions"].get("place_orders", [])
+            if isinstance(item, Mapping)
+        )
     ):
         selected_request_id = str(
             selected_action_decision.get("selected_frozen_request_id") or ""
