@@ -238,6 +238,45 @@ def test_watchdogs_do_not_mark_systemd_failed_before_threshold() -> None:
         assert 'if [ "${fail_count}" -lt "${FAILURE_THRESHOLD}" ]; then\n  exit 0\nfi' in script
 
 
+def test_ssh_hardening_uses_per_source_limits_and_validates_before_reload() -> None:
+    script = Path("deploy/oracle/install_ssh_hardening.sh").read_text(encoding="utf-8")
+
+    assert "LoginGraceTime 20" in script
+    assert "MaxAuthTries 3" in script
+    assert "MaxStartups 20:50:40" in script
+    assert "PerSourceMaxStartups 3" in script
+    assert '"${SSHD_BIN}" -t' in script
+    assert 'systemctl reload "${SSH_SERVICE}"' in script
+
+
+def test_reverse_tunnel_is_loopback_only_and_key_pinned() -> None:
+    script = Path("deploy/oracle/install_ssh_reverse_tunnel.sh").read_text(encoding="utf-8")
+
+    assert "REMOTE_HOST_KEY_LINE must be supplied" in script
+    assert "must be a single pinned ED25519 key" in script
+    assert "StrictHostKeyChecking=yes" in script
+    assert "ExitOnForwardFailure=yes" in script
+    assert "ServerAliveInterval=15" in script
+    assert "ServerAliveCountMax=3" in script
+    assert "127.0.0.1:${REMOTE_LISTEN_PORT}:127.0.0.1:22" in script
+
+
+def test_ssh_watchdog_has_threshold_cooldown_and_safe_recovery() -> None:
+    script = Path("deploy/oracle/ssh_access_watchdog.sh").read_text(encoding="utf-8")
+    installer = Path("deploy/oracle/install_ssh_access_watchdog.sh").read_text(encoding="utf-8")
+
+    assert 'if [ "${fail_count}" -lt "${FAILURE_THRESHOLD}" ]; then' in script
+    assert "COOLDOWN_SECONDS" in script
+    assert '"${SSHD_BIN}" -t' in script
+    assert '"${SYSTEMCTL_BIN}" restart "${SSH_SERVICE}"' in script
+    assert "loginctl" not in script
+    assert "pkill" not in script
+    assert 'command=\\"/bin/true\\"' in installer
+    assert "no-port-forwarding" in installer
+    assert "StrictHostKeyChecking=yes" in script
+    assert "OnUnitActiveSec=${ON_UNIT_ACTIVE_SEC}" in installer
+
+
 def test_output_logrotate_installer_uses_copytruncate_timer() -> None:
     script = Path("deploy/oracle/install_output_logrotate.sh").read_text(encoding="utf-8")
 
