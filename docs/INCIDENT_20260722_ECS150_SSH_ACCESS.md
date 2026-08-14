@@ -199,10 +199,72 @@ _handle_terminal_drain_round() missing 1 required keyword-only argument: 'runtim
 
 ### 8.2 备用控制链路
 
-本次没有部署反向 SSH 隧道。若需要完全摆脱公网 22 和云后台依赖，可后续设计由 150 主动连接 111 的专用反向隧道，并使用独立受限密钥和 localhost 绑定端口。
+2026-08-14 已部署由 150 主动连接 111 的专用反向隧道，详见第 9 节。
 
 ### 8.3 其他安全项
 
 - UFW 和 fail2ban 在检查时均未启用；
 - key-only 已阻断 root 和密码认证，但公网仍会产生 TCP/密钥扫描流量；
 - 若本次排查期间使用的 Web Basic Auth 内容不是占位符，应单独轮换，不能写入仓库或日志。
+
+## 9. 2026-08-14 SSH 韧性加固
+
+本轮只修改 SSH 基础设施，没有切换 `/home/ubuntu/wangge_api2_repo` 的 commit，没有重启 Web/runner，也没有调用任何交易接口。实现代码位于 `main` commit `0befe0e`；150 使用独立工作树 `/home/ubuntu/wangge_ssh_resilience` 运行这些脚本，避免把应用目录落后的业务提交一起发布。
+
+### 9.1 抗扫描参数
+
+`/etc/ssh/sshd_config.d/01-wangge-ssh-resilience.conf` 的有效参数为：
+
+```text
+LoginGraceTime 20
+MaxAuthTries 3
+MaxStartups 20:50:40
+PerSourceMaxStartups 3
+```
+
+安装脚本在 reload 前执行 `sshd -t`，失败会恢复旧 drop-in。`PerSourceMaxStartups 3` 只限制同一来源尚未完成认证的连接，不限制已经认证的会话。
+
+### 9.2 经 111 的救援入口
+
+150 的 `wangge-ssh-reverse-tunnel.service` 主动连接 111，并把 150 的 `127.0.0.1:22` 映射到 111 的 `127.0.0.1:22150`。该端口不监听 111 的公网地址。隧道使用独立密钥、固定 111 的 ED25519 主机密钥；111 上对应公钥强制 `/bin/false`、启用 `restrict`，仅重新允许监听 `127.0.0.1:22150`。
+
+公网 22 不可用时，先登录 111，再执行：
+
+```bash
+ssh -p 22150 \
+  -o BatchMode=yes \
+  -o StrictHostKeyChecking=yes \
+  -i ~/.ssh/id_ed25519_ubuntu_43_131_232_150 \
+  ubuntu@127.0.0.1
+```
+
+111 的 `~/.ssh/known_hosts` 已固定 `[127.0.0.1]:22150` 对应的 150 ED25519 主机密钥。不要用 `StrictHostKeyChecking=no` 代替该校验。
+
+### 9.3 本机自动恢复
+
+`wangge-ssh-watchdog.timer` 每约 30 秒运行一次真实 localhost SSH 握手。探针密钥只允许来自 loopback、强制 `/bin/true`，并禁止 PTY、转发、agent、X11 和 user rc。连续 3 次失败后，看门狗：
+
+1. 重建 ssh.service 正常启动所需的 `/run/sshd`；
+2. 执行 `sshd -t`，配置无效时拒绝重启；
+3. 重启 `ssh.service`，等待后再次完成真实 SSH 探针；
+4. 写入 10 分钟恢复冷却时间，避免重启风暴。
+
+它不会调用 `loginctl`、杀死既有 SSH session、重启 Web/runner 或修改交易状态。
+
+### 9.4 故障演练结果
+
+受控停止 `ssh.socket` 和 `ssh.service` 后，已有管理会话保持在线。日志依次记录 `1/3`、`2/3`、`3/3`，随后出现 `SSH listener restarted and localhost probe recovered`；状态计数恢复为 0。恢复后验证：
+
+- 10 次顺序公网 key 登录成功；
+- 111 经 `127.0.0.1:22150` 严格主机校验登录成功；
+- `ssh`、`ssh.socket`、反向隧道、看门狗 timer、`grid-web-api2` 均为 active；
+- `/api/health` 返回成功；
+- 应用目录仍为原 commit `ef887fb` 且 tracked 工作树干净。
+
+### 9.5 回滚
+
+- 抗扫描参数：恢复 `01-wangge-ssh-resilience.conf.bak.<timestamp>`（若存在）或删除该 drop-in，执行 `sshd -t` 后 reload `ssh`；
+- 反向隧道：`systemctl disable --now wangge-ssh-reverse-tunnel.service`，并删除 111 `authorized_keys` 中注释为 `wangge-150-reverse-rescue` 的一行；
+- 看门狗：`systemctl disable --now wangge-ssh-watchdog.timer`，删除 150 `authorized_keys` 中注释为 `wangge-local-ssh-watchdog` 的一行。
+
+公开 HTTP `curl` 修复 SSH 的接口仍未启用。当前 8789 使用明文 HTTP Basic Auth，不适合作为 root 级恢复控制面；`recover_web` 仍只负责 Web 进程恢复。
