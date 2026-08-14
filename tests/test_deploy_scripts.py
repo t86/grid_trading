@@ -259,6 +259,7 @@ def test_reverse_tunnel_is_loopback_only_and_key_pinned() -> None:
     assert "ServerAliveInterval=15" in script
     assert "ServerAliveCountMax=3" in script
     assert "127.0.0.1:${REMOTE_LISTEN_PORT}:127.0.0.1:22" in script
+    assert 'command="/bin/false",restrict,port-forwarding' in script
 
 
 def test_ssh_watchdog_has_threshold_cooldown_and_safe_recovery() -> None:

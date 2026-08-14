@@ -78,5 +78,5 @@ if [ "${START_SERVICE}" = "1" ]; then
   systemctl restart "${SERVICE_NAME}.service"
 fi
 
-printf 'AUTHORIZED_KEY_OPTIONS=no-agent-forwarding,no-X11-forwarding,no-pty,no-user-rc,permitlisten="127.0.0.1:%s" %s\n' \
+printf 'AUTHORIZED_KEY_OPTIONS=command="/bin/false",restrict,port-forwarding,permitlisten="127.0.0.1:%s" %s\n' \
   "${REMOTE_LISTEN_PORT}" "$(cat "${KEY_DIR}/id_ed25519.pub")"
