@@ -6190,6 +6190,24 @@ def check_symbol(
         and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) == 0
         and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) == 0
     )
+    # Timeout/debounce state can clear recovery_owned while leaving the
+    # loss-release controls active.  Use live controls and live entry state
+    # for this escape hatch so the guard cannot retain a zero-entry profile.
+    grvt_loss_lease_below_soft_no_entry_deadlock = (
+        normalized_symbol == "GRVTUSDT"
+        and grvt_soft_loss_profile_active
+        and not bool(assessment.get("volatility_entry_pause_active"))
+        and not active_pair_reduce_deadlock
+        and bool(assessment.get("low_volume"))
+        and target_pace_behind
+        and _safe_float(assessment.get("ordinary_long_notional"))
+        <= _safe_float(assessment.get("long_soft_limit_notional"))
+        and _safe_float(assessment.get("ordinary_short_notional"))
+        <= _safe_float(assessment.get("short_soft_limit_notional"))
+        and _safe_int(assessment.get("planned_entry_order_count")) == 0
+        and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) == 0
+        and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) == 0
+    )
 
     action_verification: str | None = None
     control_updated_at = _parse_time(control.get("recovery_control_updated_at"))
@@ -6286,6 +6304,55 @@ def check_symbol(
             and not recovery_timeout_required
         ):
             action = "skip_recovery_safety_gate"
+        elif grvt_loss_lease_below_soft_no_entry_deadlock:
+            updates = _restore_recovery_controls(
+                item,
+                control,
+                cycle_budget_floor_notional,
+            )
+            updates.update(
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "best_quote_maker_volume_active_pair_reduce_enabled": False,
+                }
+            )
+            restored_offset = _safe_int(
+                updates.get(
+                    "best_quote_maker_volume_quote_offset_ticks",
+                    control.get("best_quote_maker_volume_quote_offset_ticks"),
+                )
+            )
+            updates["best_quote_maker_volume_quote_offset_ticks"] = max(
+                restored_offset - 1,
+                1,
+            )
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+            action = (
+                "dry_run_restore_grvt_below_soft_zero_entry_deadlock"
+                if dry_run
+                else "restore_grvt_below_soft_zero_entry_deadlock"
+            )
+            _set_post_restore_cooldown(
+                item,
+                now=now,
+                cooldown_seconds=post_restore_cooldown_seconds,
+            )
+            for key in (
+                "guard_original_controls",
+                "guard_recovery_controls",
+                "recovery_started_at",
+                "recovery_owned",
+            ):
+                item.pop(key, None)
         elif (
             grvt_post_shock_soft_release_safe
             or grvt_dual_soft_dynamic_release_safe

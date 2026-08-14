@@ -16388,7 +16388,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 2)
             self.assertEqual(restarts, ["GRVTUSDT"])
 
-    def test_grvt_dynamic_release_below_soft_without_entries_restores_entry(self) -> None:
+    def test_grvt_loss_lease_below_soft_without_entries_restores_entry(self) -> None:
         now = datetime(2026, 8, 10, 13, 5, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -16437,13 +16437,6 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "GRVTUSDT": {
                         "status": "recovery_active",
                         "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
-                        "recovery_started_at": (now - timedelta(minutes=1)).isoformat(),
-                        "recovery_owned": True,
-                        "guard_original_controls": {
-                            "best_quote_maker_volume_active_pair_reduce_enabled": False,
-                            "best_quote_maker_volume_cycle_budget_notional": 260.0,
-                            "best_quote_maker_volume_quote_offset_ticks": 3,
-                        },
                     }
                 }
             }
@@ -16467,7 +16460,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 )
             )
             self.assertEqual(
-                result["action"], "restore_grvt_after_dynamic_release_below_soft"
+                result["action"], "restore_grvt_below_soft_zero_entry_deadlock"
             )
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertFalse(control["best_quote_maker_volume_active_pair_reduce_enabled"])
