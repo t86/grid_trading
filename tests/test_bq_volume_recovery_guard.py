@@ -11986,6 +11986,29 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             item["guard_recovery_controls"],
         )
 
+    def test_grvt_stale_original_cycle_is_rebased_to_current_safe_budget(self) -> None:
+        item = {
+            "guard_original_controls": {
+                "best_quote_maker_volume_cycle_budget_notional": 260.0,
+            },
+            "guard_recovery_controls": {
+                "best_quote_maker_volume_cycle_budget_notional": 50.0,
+            },
+        }
+
+        changed = _reconcile_recovery_cycle_budget_state(
+            item,
+            {"best_quote_maker_volume_cycle_budget_notional": 50.0},
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            item["guard_original_controls"][
+                "best_quote_maker_volume_cycle_budget_notional"
+            ],
+            50.0,
+        )
+
     def test_grvt_recovery_update_cannot_write_cycle_budget_above_100u(self) -> None:
         now = datetime(2026, 8, 14, 9, 0, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

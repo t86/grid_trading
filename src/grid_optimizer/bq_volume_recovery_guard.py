@@ -1693,10 +1693,22 @@ def _reconcile_recovery_cycle_budget_state(
     expected = item.get("guard_recovery_controls")
     if not isinstance(expected, dict) or budget_key not in expected:
         return False
-    if abs(
-        _safe_float(control.get(budget_key))
-        - _safe_float(expected.get(budget_key))
-    ) <= 1e-9:
+    current_budget = _safe_float(control.get(budget_key))
+    expected_budget = _safe_float(expected.get(budget_key))
+    if abs(current_budget - expected_budget) <= 1e-9:
+        original = item.get("guard_original_controls")
+        if (
+            isinstance(original, dict)
+            and _safe_float(original.get(budget_key))
+            > GRVT_AUTO_CYCLE_BUDGET_CEILING_NOTIONAL
+        ):
+            original = dict(original)
+            original[budget_key] = min(
+                current_budget,
+                GRVT_AUTO_CYCLE_BUDGET_CEILING_NOTIONAL,
+            )
+            item["guard_original_controls"] = original
+            return True
         return False
     changed = False
     for state_key in ("guard_original_controls", "guard_recovery_controls"):
