@@ -268,6 +268,7 @@ def test_ssh_watchdog_has_threshold_cooldown_and_safe_recovery() -> None:
 
     assert 'if [ "${fail_count}" -lt "${FAILURE_THRESHOLD}" ]; then' in script
     assert "COOLDOWN_SECONDS" in script
+    assert "install -d -o root -g root -m 0755 /run/sshd" in script
     assert '"${SSHD_BIN}" -t' in script
     assert '"${SYSTEMCTL_BIN}" restart "${SSH_SERVICE}"' in script
     assert "loginctl" not in script

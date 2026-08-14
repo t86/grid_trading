@@ -55,6 +55,10 @@ if [ "$((NOW_EPOCH - last_recovery))" -lt "${COOLDOWN_SECONDS}" ]; then
   exit 0
 fi
 
+# ssh.service normally creates this RuntimeDirectory before ExecStartPre.  When
+# the entire listener is down, the external watchdog must recreate it before
+# the same sshd configuration check can run.
+install -d -o root -g root -m 0755 /run/sshd
 if ! "${SSHD_BIN}" -t; then
   logger -t wangge-ssh-watchdog "sshd configuration invalid; refusing restart" || true
   exit 1
