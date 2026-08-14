@@ -23997,10 +23997,34 @@ def apply_best_quote_active_pair_reduce(
             else 0.0
         )
         if cooldown_remaining > 0:
+            cooldown_sides = {
+                str(side)
+                for side in memory.get("eligible_sides", [])
+                if str(side) in {"long", "short"}
+            }
+            suppressed_entry_order_count = 0
+            for side_name, order_key, entry_role in (
+                ("long", "buy_orders", "best_quote_entry_long"),
+                ("short", "sell_orders", "best_quote_entry_short"),
+            ):
+                if side_name not in cooldown_sides:
+                    continue
+                kept_orders: list[dict[str, Any]] = []
+                for item in plan.get(order_key, []):
+                    if not isinstance(item, dict):
+                        continue
+                    if _order_role(item) == entry_role:
+                        suppressed_entry_order_count += 1
+                        continue
+                    kept_orders.append(dict(item))
+                plan[order_key] = kept_orders
             report.update(
                 {
                     "reason": "disabled_cooldown_memory_preserved",
                     "completed": True,
+                    "eligible_sides": sorted(cooldown_sides),
+                    "normal_entry_suppressed": suppressed_entry_order_count > 0,
+                    "suppressed_entry_order_count": suppressed_entry_order_count,
                     "rearm_cooldown_remaining_seconds": cooldown_remaining,
                 }
             )

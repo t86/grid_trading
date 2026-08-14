@@ -12957,8 +12957,17 @@ class LoopRunnerTests(unittest.TestCase):
             }
         }
 
+        plan = {
+            "buy_orders": [
+                {"side": "BUY", "role": "best_quote_entry_long", "notional": 50.0}
+            ],
+            "sell_orders": [
+                {"side": "SELL", "role": "best_quote_entry_short", "notional": 50.0}
+            ],
+        }
+
         report = apply_best_quote_active_pair_reduce(
-            plan={"buy_orders": [], "sell_orders": []},
+            plan=plan,
             state=state,
             enabled=False,
             current_long_qty=2500.0,
@@ -12988,6 +12997,12 @@ class LoopRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(report["reason"], "disabled_cooldown_memory_preserved")
+        self.assertTrue(report["normal_entry_suppressed"])
+        self.assertEqual(
+            [item["role"] for item in plan["buy_orders"]],
+            ["best_quote_entry_long"],
+        )
+        self.assertEqual(plan["sell_orders"], [])
         self.assertIn("best_quote_active_pair_reduce", state)
 
 
