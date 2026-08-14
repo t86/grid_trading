@@ -322,6 +322,8 @@ _RECOVERY_CONTROL_KEYS = (
     "sticky_exit_price_tolerance_steps",
 )
 
+GRVT_AUTO_CYCLE_BUDGET_CEILING_NOTIONAL = 100.0
+
 # Keep generic loss-reduction protection separate from the bounded ARX
 # catch-up mode. A few dollars per 10k of maker turnover is expected while a
 # lagging ARX runner rebuilds two-sided capacity, but that must not weaken the
@@ -1596,6 +1598,11 @@ def apply_target_pace_cycle_budget_floor(
         upper_bound = min(upper_bound, headroom_capacity)
     upper_bound = max(upper_bound, current_budget, static_floor)
     target_floor = max(static_floor, min(rounded_target, upper_bound))
+    if str(assessment.get("symbol") or "").upper().strip() == "GRVTUSDT":
+        target_floor = min(
+            target_floor,
+            max(static_floor, GRVT_AUTO_CYCLE_BUDGET_CEILING_NOTIONAL),
+        )
     volume_summary.update(
         {
             "target_cycle_budget_floor_notional": target_floor,
@@ -1674,6 +1681,36 @@ def _remember_recovery_updates(item: dict[str, Any], updates: dict[str, Any]) ->
         if key in _RECOVERY_CONTROL_KEYS:
             expected[key] = value
     item["guard_recovery_controls"] = expected
+
+
+def _reconcile_recovery_cycle_budget_state(
+    item: dict[str, Any],
+    control: Mapping[str, Any],
+) -> bool:
+    """Release stale cycle ownership after an external control override."""
+
+    budget_key = "best_quote_maker_volume_cycle_budget_notional"
+    expected = item.get("guard_recovery_controls")
+    if not isinstance(expected, dict) or budget_key not in expected:
+        return False
+    if abs(
+        _safe_float(control.get(budget_key))
+        - _safe_float(expected.get(budget_key))
+    ) <= 1e-9:
+        return False
+    changed = False
+    for state_key in ("guard_original_controls", "guard_recovery_controls"):
+        values = item.get(state_key)
+        if not isinstance(values, dict) or budget_key not in values:
+            continue
+        cleaned = dict(values)
+        cleaned.pop(budget_key, None)
+        if cleaned:
+            item[state_key] = cleaned
+        else:
+            item.pop(state_key, None)
+        changed = True
+    return changed
 
 
 def _recovery_original_controls_are_usable(item: Mapping[str, Any]) -> bool:
@@ -2513,6 +2550,14 @@ def _apply_control_update(
     if recovery_coordinator_registered(control):
         raise RuntimeError(
             "registered recovery symbol rejects legacy control updates"
+        )
+    if symbol.upper().strip() == "GRVTUSDT" and (
+        "best_quote_maker_volume_cycle_budget_notional" in updates
+    ):
+        updates = dict(updates)
+        updates["best_quote_maker_volume_cycle_budget_notional"] = min(
+            _safe_float(updates["best_quote_maker_volume_cycle_budget_notional"]),
+            GRVT_AUTO_CYCLE_BUDGET_CEILING_NOTIONAL,
         )
     if symbol.upper().strip() == "ARXUSDT":
         proposed = {**control, **updates}
@@ -5125,6 +5170,8 @@ def check_symbol(
     # explicit runner min-cycle value cannot be lowered by a guard CLI default.
     cycle_budget_floor_notional = parameters.effective_cycle_budget_floor_notional
     item = _symbol_state(state, normalized_symbol)
+    if normalized_symbol == "GRVTUSDT":
+        _reconcile_recovery_cycle_budget_state(item, control)
     original_controls = item.get("guard_original_controls")
     if isinstance(original_controls, dict):
         for key, baseline in (

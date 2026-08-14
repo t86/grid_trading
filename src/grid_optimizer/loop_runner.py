@@ -23893,6 +23893,8 @@ def apply_best_quote_active_pair_reduce(
     min_relief_notional: float = 0.0,
     suppress_all_entries_while_active: bool = False,
     suppress_noneligible_reduce_while_active: bool = False,
+    now: datetime | None = None,
+    rearm_cooldown_seconds: float = 0.0,
 ) -> dict[str, Any]:
     report = _best_quote_active_pair_reduce_default_report()
     report["enabled"] = bool(enabled)
@@ -23912,6 +23914,8 @@ def apply_best_quote_active_pair_reduce(
     safe_max_loss_ratio = max(_safe_float(max_loss_ratio), 0.0)
     safe_min_relief = max(_safe_float(min_relief_notional), 0.0)
     threshold_side_mode = safe_loss_threshold > 0
+    effective_now = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    safe_rearm_cooldown = max(_safe_float(rearm_cooldown_seconds), 0.0)
     report.update(
         {
             "per_order_notional": safe_per_order,
@@ -23936,7 +23940,7 @@ def apply_best_quote_active_pair_reduce(
                 {
                     "active": False,
                     "completed": True,
-                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "completed_at": effective_now.isoformat(),
                     "completed_reason": reason,
                 }
             )
@@ -23998,6 +24002,43 @@ def apply_best_quote_active_pair_reduce(
     if threshold_side_mode and bool(memory.get("completed")):
         trigger_count = max(int(memory.get("trigger_count") or 0), 0)
         if threshold_eligible_sides:
+            completed_at = _parse_state_datetime(memory.get("completed_at"))
+            cooldown_remaining = (
+                max(
+                    safe_rearm_cooldown
+                    - (effective_now - completed_at).total_seconds(),
+                    0.0,
+                )
+                if completed_at is not None and safe_rearm_cooldown > 0
+                else 0.0
+            )
+            if cooldown_remaining > 0:
+                suppressed_entry_order_count = 0
+                for side_name, order_key, entry_role in (
+                    ("long", "buy_orders", "best_quote_entry_long"),
+                    ("short", "sell_orders", "best_quote_entry_short"),
+                ):
+                    if side_name not in threshold_eligible_sides and not suppress_all_entries_while_active:
+                        continue
+                    kept_orders: list[dict[str, Any]] = []
+                    for item in plan.get(order_key, []):
+                        if not isinstance(item, dict):
+                            continue
+                        if _order_role(item) == entry_role:
+                            suppressed_entry_order_count += 1
+                            continue
+                        kept_orders.append(dict(item))
+                    plan[order_key] = kept_orders
+                report.update(
+                    {
+                        "reason": "rearm_cooldown_active",
+                        "eligible_sides": sorted(threshold_eligible_sides),
+                        "normal_entry_suppressed": suppressed_entry_order_count > 0,
+                        "suppressed_entry_order_count": suppressed_entry_order_count,
+                        "rearm_cooldown_remaining_seconds": cooldown_remaining,
+                    }
+                )
+                return report
             memory = {"trigger_count": trigger_count}
             report["rearmed_after_refill"] = True
         else:
@@ -24070,7 +24111,7 @@ def apply_best_quote_active_pair_reduce(
             "active": True,
             "mode": "threshold_side_v1" if threshold_side_mode else "paired_v1",
             "eligible_sides": sorted(eligible_sides),
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": effective_now.isoformat(),
             "long_start_notional": safe_long_notional,
             "short_start_notional": safe_short_notional,
             "long_target_notional": long_target,
@@ -33300,6 +33341,8 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             min_relief_notional=100.0 if grvt_bounded_loss_recovery else 0.0,
             suppress_all_entries_while_active=grvt_bounded_loss_recovery,
             suppress_noneligible_reduce_while_active=grvt_bounded_loss_recovery,
+            now=plan_now,
+            rearm_cooldown_seconds=300.0 if grvt_bounded_loss_recovery else 0.0,
         )
     else:
         state.pop("best_quote_active_pair_reduce", None)

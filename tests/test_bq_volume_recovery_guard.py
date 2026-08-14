@@ -16,6 +16,7 @@ from grid_optimizer import bq_volume_recovery_guard
 from grid_optimizer.bq_volume_recovery_guard import (
     _apply_control_update,
     _arx_independent_freeze_policy_updates,
+    _reconcile_recovery_cycle_budget_state,
     apply_daily_target_pace_floor,
     apply_target_pace_cycle_budget_floor,
     check_symbol,
@@ -10843,6 +10844,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 symbol="GRVTUSDT",
                 control={
                     "best_quote_maker_volume_inventory_bias_min_notional_gap": 200.0,
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.9,
                     "best_quote_maker_volume_quote_offset_ticks": 1,
                 },
                 long_notional=990.0,
@@ -10887,7 +10889,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertTrue(result["assessment"]["high_recovery_wear"])
             self.assertFalse(result["assessment"]["confirmed_loss_reduce_wear"])
             self.assertTrue(result["assessment"]["grvt_soft_loss_relief_override"])
-            self.assertEqual(result["action"], "enable_allow_loss_reduce_only")
+            self.assertEqual(result["action"], "enable_soft_inventory_loss_reduce")
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["GRVTUSDT"])
 
@@ -11919,6 +11921,103 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(floor, 140.0)
         self.assertEqual(volume_summary["trailing_60m_gross_notional"], 4000.0)
         self.assertEqual(volume_summary["target_cycle_budget_ladder_capacity"], 256.0)
+
+    def test_grvt_target_pace_cycle_floor_never_auto_raises_above_100u(self) -> None:
+        now = datetime(2026, 8, 14, 9, 0, tzinfo=timezone.utc)
+        rows = [
+            {
+                "id": 1,
+                "time": int((now - timedelta(minutes=30)).timestamp() * 1000),
+                "quoteQty": "500",
+            }
+        ]
+        volume_summary = {"required_hourly_notional": 12_000.0}
+
+        floor = apply_target_pace_cycle_budget_floor(
+            volume_summary=volume_summary,
+            rows=rows,
+            now=now,
+            control={
+                "best_quote_maker_volume_cycle_budget_notional": 100.0,
+                "per_order_notional": 100.0,
+                "maker_order_notional": 100.0,
+                "buy_levels": 4,
+                "sell_levels": 4,
+            },
+            assessment={
+                "symbol": "GRVTUSDT",
+                "actual_long_notional": 700.0,
+                "actual_short_notional": 700.0,
+                "frozen_total_notional": 0.0,
+                "max_long_notional": 1000.0,
+                "max_short_notional": 1000.0,
+            },
+            static_floor_notional=50.0,
+            target_pace_fraction=0.9,
+            cycle_budget_increment=5.0,
+        )
+
+        self.assertEqual(floor, 100.0)
+
+    def test_external_cycle_budget_override_invalidates_stale_recovery_baseline(self) -> None:
+        item = {
+            "guard_original_controls": {
+                "best_quote_maker_volume_cycle_budget_notional": 260.0,
+                "best_quote_maker_volume_quote_offset_ticks": 1,
+            },
+            "guard_recovery_controls": {
+                "best_quote_maker_volume_cycle_budget_notional": 265.0,
+                "best_quote_maker_volume_quote_offset_ticks": 0,
+            },
+        }
+
+        changed = _reconcile_recovery_cycle_budget_state(
+            item,
+            {"best_quote_maker_volume_cycle_budget_notional": 50.0},
+        )
+
+        self.assertTrue(changed)
+        self.assertNotIn(
+            "best_quote_maker_volume_cycle_budget_notional",
+            item["guard_original_controls"],
+        )
+        self.assertNotIn(
+            "best_quote_maker_volume_cycle_budget_notional",
+            item["guard_recovery_controls"],
+        )
+
+    def test_grvt_recovery_update_cannot_write_cycle_budget_above_100u(self) -> None:
+        now = datetime(2026, 8, 14, 9, 0, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "grvtusdt_loop_runner_control.json"
+            _write_json(
+                control_path,
+                {
+                    "symbol": "GRVTUSDT",
+                    "best_quote_maker_volume_cycle_budget_notional": 50.0,
+                },
+            )
+            restarts: list[str] = []
+
+            _apply_control_update(
+                symbol="GRVTUSDT",
+                control_path=control_path,
+                control={
+                    "symbol": "GRVTUSDT",
+                    "best_quote_maker_volume_cycle_budget_notional": 50.0,
+                },
+                updates={"best_quote_maker_volume_cycle_budget_notional": 265.0},
+                now=now,
+                dry_run=False,
+                restart_runner=restarts.append,
+            )
+
+            saved = json.loads(control_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                saved["best_quote_maker_volume_cycle_budget_notional"],
+                100.0,
+            )
+            self.assertEqual(restarts, ["GRVTUSDT"])
 
     def test_target_pace_budget_is_capped_during_bounded_loss_reduce(self) -> None:
         now = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
@@ -16085,7 +16184,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 5)
             self.assertEqual(
                 control["best_quote_maker_volume_cycle_budget_notional"],
-                276.0,
+                100.0,
             )
             self.assertEqual(restarts, ["GRVTUSDT"])
 
@@ -16262,7 +16361,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(result["action"], "restore_grvt_after_dynamic_two_sided_flow")
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertFalse(control["best_quote_maker_volume_active_pair_reduce_enabled"])
-            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 260.0)
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 100.0)
             self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 2)
             self.assertEqual(restarts, ["GRVTUSDT"])
 
