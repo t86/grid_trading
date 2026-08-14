@@ -33109,6 +33109,24 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         cooldown_seconds=getattr(effective_args, "loss_reentry_cooldown_seconds", 300.0),
         recover_buffer_steps=getattr(effective_args, "loss_reentry_cost_buffer_steps", 1.0),
     )
+    # A bounded ordinary-inventory loss trim is allowed to re-open both maker
+    # lanes once both ordinary sides are back below soft.  Keeping its
+    # price-recovery cooldown at that point turns a completed release into a
+    # one-sided, zero-volume state.  Frozen inventory is not part of this
+    # calculation.
+    grvt_reentry_below_soft_bypass = (
+        str(symbol or "").upper().strip() == "GRVTUSDT"
+        and max(_safe_float(getattr(effective_args, "pause_buy_position_notional", 0.0)), 0.0) > 0
+        and max(_safe_float(getattr(effective_args, "pause_short_position_notional", 0.0)), 0.0) > 0
+        and _safe_float(controls.get("current_long_notional", current_long_notional))
+        < _safe_float(getattr(effective_args, "pause_buy_position_notional", 0.0))
+        and _safe_float(controls.get("current_short_notional", current_short_notional))
+        < _safe_float(getattr(effective_args, "pause_short_position_notional", 0.0))
+    )
+    if grvt_reentry_below_soft_bypass and loss_reduce_reentry_guard.get("active"):
+        loss_reduce_reentry_guard["block_long_entries"] = False
+        loss_reduce_reentry_guard["block_short_entries"] = False
+        loss_reduce_reentry_guard["bypassed_below_soft_two_sided"] = True
     if loss_reduce_reentry_guard.get("block_long_entries"):
         controls["buy_paused"] = True
         controls["pause_reasons"] = list(controls.get("pause_reasons", []))
