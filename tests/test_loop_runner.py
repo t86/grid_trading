@@ -87,6 +87,7 @@ from grid_optimizer.loop_runner import (
     apply_inventory_unlock_release,
     apply_best_quote_active_pair_reduce,
     apply_grvt_ordinary_inventory_pressure_guard,
+    defer_grvt_net_guard_to_bounded_pressure_reduce,
     apply_grvt_anti_chase_balancing_bypass,
     cap_grvt_anti_chase_balancing_entries,
     _resolve_inventory_unlock_pause_notional,
@@ -12190,6 +12191,102 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"], [])
         self.assertEqual(len(plan["buy_orders"]), 1)
         self.assertLessEqual(plan["buy_orders"][0]["notional"], 100.0 + 1e-9)
+
+    def test_grvt_small_net_breach_uses_bounded_pressure_reduce_instead_of_terminal_drain(self) -> None:
+        plan = {
+            "effective_strategy_profile": "grvt_daily_80k_bq_short_freeze_5pct_v1",
+            "mid_price": 0.32685,
+            "ordinary_actual_net_notional": 1_001.02,
+            "best_quote_maker_volume": {
+                "ordinary_inventory_pressure_guard": {
+                    "active": True,
+                    "eligible_sides": ["long"],
+                    "max_reduce_notional": 100.0,
+                }
+            },
+            "buy_orders": [],
+            "sell_orders": [
+                {
+                    "role": "best_quote_reduce_long",
+                    "position_side": "LONG",
+                    "notional": 99.97,
+                    "force_reduce_only": True,
+                }
+            ],
+        }
+        stopped = loop_runner_module.RuntimeGuardResult(
+            tradable=False,
+            stop_triggered=True,
+            runtime_status="stopped",
+            primary_reason="max_actual_net_notional_hit",
+            matched_reasons=["max_actual_net_notional_hit"],
+            triggered_at="2026-08-14T02:00:00+00:00",
+            rolling_hourly_loss=0.0,
+            rolling_hourly_gross_notional=1_000.0,
+            rolling_hourly_loss_per_10k=0.0,
+            rolling_hourly_loss_per_10k_active=True,
+            cumulative_gross_notional=10_000.0,
+            actual_net_notional_abs=1_001.02,
+            synthetic_drift_notional=0.0,
+        )
+
+        result, report = defer_grvt_net_guard_to_bounded_pressure_reduce(
+            plan_report=plan,
+            runtime_guard_result=stopped,
+            max_actual_net_notional=1_000.0,
+        )
+
+        self.assertTrue(result.tradable)
+        self.assertFalse(result.stop_triggered)
+        self.assertEqual(result.matched_reasons, [])
+        self.assertTrue(report["deferred"])
+        self.assertEqual(report["pressure_side"], "long")
+
+    def test_grvt_large_net_breach_still_triggers_terminal_guard(self) -> None:
+        plan = {
+            "effective_strategy_profile": "grvt_daily_80k_bq_short_freeze_5pct_v1",
+            "ordinary_actual_net_notional": 1_150.0,
+            "best_quote_maker_volume": {
+                "ordinary_inventory_pressure_guard": {
+                    "active": True,
+                    "eligible_sides": ["long"],
+                    "max_reduce_notional": 100.0,
+                }
+            },
+            "sell_orders": [
+                {
+                    "role": "best_quote_reduce_long",
+                    "position_side": "LONG",
+                    "notional": 99.0,
+                    "force_reduce_only": True,
+                }
+            ],
+        }
+        stopped = loop_runner_module.RuntimeGuardResult(
+            tradable=False,
+            stop_triggered=True,
+            runtime_status="stopped",
+            primary_reason="max_actual_net_notional_hit",
+            matched_reasons=["max_actual_net_notional_hit"],
+            triggered_at="2026-08-14T02:00:00+00:00",
+            rolling_hourly_loss=0.0,
+            rolling_hourly_gross_notional=1_000.0,
+            rolling_hourly_loss_per_10k=0.0,
+            rolling_hourly_loss_per_10k_active=True,
+            cumulative_gross_notional=10_000.0,
+            actual_net_notional_abs=1_150.0,
+            synthetic_drift_notional=0.0,
+        )
+
+        result, report = defer_grvt_net_guard_to_bounded_pressure_reduce(
+            plan_report=plan,
+            runtime_guard_result=stopped,
+            max_actual_net_notional=1_000.0,
+        )
+
+        self.assertFalse(result.tradable)
+        self.assertFalse(report["deferred"])
+        self.assertEqual(report["reason"], "breach_exceeds_bounded_relief")
 
     def test_best_quote_active_pair_reduce_threshold_mode_does_not_reduce_below_threshold(self) -> None:
         plan = {"buy_orders": [], "sell_orders": []}

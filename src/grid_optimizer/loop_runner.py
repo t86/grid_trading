@@ -14903,6 +14903,98 @@ def _runtime_guard_exposure_inputs(
     return live[0], live_upnl, "live_position_risk"
 
 
+def defer_grvt_net_guard_to_bounded_pressure_reduce(
+    *,
+    plan_report: Mapping[str, Any],
+    runtime_guard_result: RuntimeGuardResult,
+    max_actual_net_notional: float | None,
+) -> tuple[RuntimeGuardResult, dict[str, Any]]:
+    """Let a small GRVT net-cap drift be corrected by its bounded maker reduce."""
+    report: dict[str, Any] = {
+        "enabled": False,
+        "deferred": False,
+        "reason": "not_grvt_profile",
+    }
+    profile = str(plan_report.get("effective_strategy_profile") or "").strip()
+    if profile != "grvt_daily_80k_bq_short_freeze_5pct_v1":
+        return runtime_guard_result, report
+    report["enabled"] = True
+    if runtime_guard_result.matched_reasons != ["max_actual_net_notional_hit"]:
+        report["reason"] = "additional_runtime_guard_reason"
+        return runtime_guard_result, report
+    cap = max(_safe_float(max_actual_net_notional), 0.0)
+    best_quote = plan_report.get("best_quote_maker_volume")
+    pressure_guard = (
+        best_quote.get("ordinary_inventory_pressure_guard")
+        if isinstance(best_quote, Mapping)
+        else None
+    )
+    if cap <= 0 or not isinstance(pressure_guard, Mapping) or not pressure_guard.get("active"):
+        report["reason"] = "pressure_guard_inactive"
+        return runtime_guard_result, report
+    max_reduce = max(_safe_float(pressure_guard.get("max_reduce_notional")), 0.0)
+    if max_reduce <= 0 or max_reduce > 100.0 + 1e-12:
+        report["reason"] = "unbounded_pressure_reduce"
+        return runtime_guard_result, report
+    if runtime_guard_result.actual_net_notional_abs > cap + max_reduce + 1e-12:
+        report["reason"] = "breach_exceeds_bounded_relief"
+        return runtime_guard_result, report
+
+    ordinary_net = _safe_float(_runtime_guard_plan_actual_net_notional(plan_report))
+    pressure_side = "long" if ordinary_net > 0 else "short" if ordinary_net < 0 else ""
+    eligible_sides = {
+        str(side).strip().lower()
+        for side in pressure_guard.get("eligible_sides", [])
+    }
+    if pressure_side not in eligible_sides:
+        report["reason"] = "net_side_not_pressure_eligible"
+        return runtime_guard_result, report
+    order_key = "sell_orders" if pressure_side == "long" else "buy_orders"
+    allowed_roles = {
+        f"best_quote_reduce_{pressure_side}",
+        f"best_quote_active_pair_reduce_{pressure_side}",
+        f"inventory_unlock_reduce_{pressure_side}",
+    }
+    bounded_orders = []
+    for item in plan_report.get(order_key, []):
+        if not isinstance(item, Mapping) or _order_role(item) not in allowed_roles:
+            continue
+        notional = max(
+            _safe_float(item.get("notional")),
+            _safe_float(item.get("price"))
+            * _safe_float(item.get("qty", item.get("quantity"))),
+        )
+        if 0 < notional <= max_reduce + 1e-12 and bool(item.get("force_reduce_only")):
+            bounded_orders.append(dict(item))
+    if not bounded_orders:
+        report["reason"] = "bounded_pressure_reduce_missing"
+        return runtime_guard_result, report
+
+    report.update(
+        {
+            "deferred": True,
+            "reason": "bounded_pressure_reduce_active",
+            "pressure_side": pressure_side,
+            "actual_net_notional_abs": runtime_guard_result.actual_net_notional_abs,
+            "max_actual_net_notional": cap,
+            "max_reduce_notional": max_reduce,
+            "reduce_order_count": len(bounded_orders),
+        }
+    )
+    return (
+        replace(
+            runtime_guard_result,
+            tradable=True,
+            stop_triggered=False,
+            runtime_status="running",
+            primary_reason=None,
+            matched_reasons=[],
+            triggered_at=None,
+        ),
+        report,
+    )
+
+
 TERMINAL_DRAIN_STATE_KEY = "futures_terminal_drain"
 TERMINAL_DRAIN_HISTORY_KEY = "futures_terminal_drain_history"
 TERMINAL_DRAIN_SCHEMA = "futures_terminal_drain_runtime_v1"
@@ -18914,6 +19006,13 @@ def _maybe_handle_runtime_guard(
         actual_net_notional=_safe_float(guard_actual_net_notional),
         synthetic_drift_notional=latest_synthetic_drift_notional,
         unrealized_pnl=_safe_float(guard_unrealized_pnl),
+    )
+    runtime_guard_result, _grvt_net_guard_pressure_reduce = (
+        defer_grvt_net_guard_to_bounded_pressure_reduce(
+            plan_report=latest_plan_report,
+            runtime_guard_result=runtime_guard_result,
+            max_actual_net_notional=runtime_guard_config.max_actual_net_notional,
+        )
     )
     if (
         runtime_guard_result.runtime_status == "waiting"
@@ -33013,6 +33112,14 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             best_quote_maker_volume["ordinary_inventory_pressure_guard"] = dict(
                 grvt_inventory_pressure_guard
             )
+            cap_controls["planned_buy_notional"] = sum(
+                _safe_float(item.get("notional"))
+                for item in list(plan.get("buy_orders", []))
+            )
+            cap_controls["planned_short_notional"] = sum(
+                _safe_float(item.get("notional"))
+                for item in list(plan.get("sell_orders", []))
+            )
         best_quote_active_pair_reduce = apply_best_quote_active_pair_reduce(
             plan=plan,
             state=state,
@@ -37679,6 +37786,13 @@ def main() -> None:
                         else plan_report.get("unrealized_pnl")
                     ),
                 )
+                runtime_guard_result, grvt_net_guard_pressure_reduce = (
+                    defer_grvt_net_guard_to_bounded_pressure_reduce(
+                        plan_report=plan_report,
+                        runtime_guard_result=runtime_guard_result,
+                        max_actual_net_notional=runtime_guard_config.max_actual_net_notional,
+                    )
+                )
                 runtime_loss_recovery_summary: dict[str, Any] | None = None
                 runtime_loss_only_stop = runtime_guard_result.matched_reasons in (
                     ["rolling_hourly_loss_limit_hit"],
@@ -38197,6 +38311,7 @@ def main() -> None:
                     "run_end_time": runtime_guard_config.run_end_time.isoformat() if runtime_guard_config.run_end_time else None,
                     "runtime_guard_stats_start_time": runtime_stats_start_time.isoformat() if runtime_stats_start_time else None,
                     "runtime_guard_loss_scope": runtime_guard_loss_scope,
+                    "grvt_net_guard_pressure_reduce": grvt_net_guard_pressure_reduce,
                     "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
                     "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
                     "rolling_hourly_gross_notional": runtime_guard_result.rolling_hourly_gross_notional,
