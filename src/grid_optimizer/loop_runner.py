@@ -11955,6 +11955,11 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
     same_side_entry_guard: Mapping[str, Any] | None,
     current_long_qty: float,
     current_short_qty: float,
+    current_long_notional: float | None = None,
+    current_short_notional: float | None = None,
+    long_soft_notional: float | None = None,
+    short_soft_notional: float | None = None,
+    pressure_reduce_max_notional: float | None = None,
     frozen_long_qty: float = 0.0,
     frozen_short_qty: float = 0.0,
     current_long_avg_price: float = 0.0,
@@ -11995,6 +12000,38 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
     safe_step = max(_safe_float(step_price), _safe_float(tick_size), 0.0)
     safe_profit_ratio = max(_safe_float(min_profit_ratio), 0.0)
     safe_max_order_notional = max(_safe_float(max_order_notional), 0.0)
+    safe_pressure_reduce_max_notional = max(_safe_float(pressure_reduce_max_notional), 0.0)
+    safe_long_notional = max(_safe_float(current_long_notional), 0.0)
+    safe_short_notional = max(_safe_float(current_short_notional), 0.0)
+    safe_long_soft_notional = max(_safe_float(long_soft_notional), 0.0)
+    safe_short_soft_notional = max(_safe_float(short_soft_notional), 0.0)
+    long_pressure_ratio = (
+        safe_long_notional / safe_long_soft_notional
+        if safe_long_soft_notional > 0 and safe_long_notional > safe_long_soft_notional + 1e-12
+        else 0.0
+    )
+    short_pressure_ratio = (
+        safe_short_notional / safe_short_soft_notional
+        if safe_short_soft_notional > 0 and safe_short_notional > safe_short_soft_notional + 1e-12
+        else 0.0
+    )
+    inventory_pressure_side = None
+    if long_pressure_ratio > short_pressure_ratio + 1e-12:
+        inventory_pressure_side = "long"
+    elif short_pressure_ratio > long_pressure_ratio + 1e-12:
+        inventory_pressure_side = "short"
+    elif long_pressure_ratio > 0 and short_pressure_ratio > 0:
+        inventory_pressure_side = "both"
+    report.update(
+        {
+            "inventory_pressure_side": inventory_pressure_side,
+            "current_long_notional": safe_long_notional,
+            "current_short_notional": safe_short_notional,
+            "long_soft_notional": safe_long_soft_notional,
+            "short_soft_notional": safe_short_soft_notional,
+            "pressure_reduce_max_notional": safe_pressure_reduce_max_notional,
+        }
+    )
     normal_long_qty = max(_safe_float(current_long_qty) - max(_safe_float(frozen_long_qty), 0.0), 0.0)
     normal_short_qty = max(_safe_float(current_short_qty) - max(_safe_float(frozen_short_qty), 0.0), 0.0)
     long_cost = max(_safe_float(current_long_avg_price), 0.0)
@@ -12013,23 +12050,42 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
     ]
     short_ceiling = min(short_ceiling_candidates) if short_ceiling_candidates else 0.0
 
+    blocked_long_entry = bool(guard.get("blocked_long_entry"))
+    blocked_short_entry = bool(guard.get("blocked_short_entry"))
     spec: tuple[str, str, str, str, float, float] | None = None
-    if bool(guard.get("blocked_long_entry")) and normal_long_qty > 1e-12:
+    if inventory_pressure_side == "short" and blocked_short_entry and normal_short_qty > 1e-12:
+        spec = ("best_quote_entry_long", "BUY", "SHORT", "best_quote_reduce_short", normal_short_qty, short_ceiling)
+    elif inventory_pressure_side == "long" and blocked_long_entry and normal_long_qty > 1e-12:
         spec = ("best_quote_entry_short", "SELL", "LONG", "best_quote_reduce_long", normal_long_qty, long_floor)
-    elif bool(guard.get("blocked_short_entry")) and normal_short_qty > 1e-12:
+    elif blocked_long_entry and normal_long_qty > 1e-12:
+        spec = ("best_quote_entry_short", "SELL", "LONG", "best_quote_reduce_long", normal_long_qty, long_floor)
+    elif blocked_short_entry and normal_short_qty > 1e-12:
         spec = ("best_quote_entry_long", "BUY", "SHORT", "best_quote_reduce_short", normal_short_qty, short_ceiling)
     if spec is None:
         report["reason"] = "no_blocked_ordinary_side"
         result["best_quote_actual_side_reduce"] = report
         return result
 
+    reduce_side = "long" if spec[3] == "best_quote_reduce_long" else "short"
+    if inventory_pressure_side in {"long", "short"} and reduce_side != inventory_pressure_side:
+        report["reason"] = "blocked_side_opposes_inventory_pressure"
+        result["best_quote_actual_side_reduce"] = report
+        return result
+    effective_max_order_notional = safe_max_order_notional
+    if safe_pressure_reduce_max_notional > 0 and inventory_pressure_side in {reduce_side, "both"}:
+        effective_max_order_notional = (
+            min(effective_max_order_notional, safe_pressure_reduce_max_notional)
+            if effective_max_order_notional > 0
+            else safe_pressure_reduce_max_notional
+        )
+
     source_role, side, position_side, reduce_role, available_qty, profit_bound = spec
     candidate = next((item for item in place_orders if _order_role(item) == source_role), None)
     if candidate is None:
         raw_price = max(_safe_float(fallback_price), 0.0)
         raw_notional = max(_safe_float(fallback_notional), 0.0)
-        if safe_max_order_notional > 0:
-            raw_notional = min(raw_notional, safe_max_order_notional)
+        if effective_max_order_notional > 0:
+            raw_notional = min(raw_notional, effective_max_order_notional)
         if raw_price <= 0 or raw_notional <= 0:
             report["reason"] = "missing_opposite_entry_candidate"
             result["best_quote_actual_side_reduce"] = report
@@ -12060,8 +12116,8 @@ def convert_blocked_best_quote_entry_to_actual_side_reduce(
     elif side == "BUY" and profit_bound > 0:
         price = min(price, profit_bound) if price > 0 else profit_bound
     price = _round_order_price(price, tick_size, side)
-    if safe_max_order_notional > 0 and price > 0:
-        qty = min(qty, _round_order_qty(safe_max_order_notional / price, step_size))
+    if effective_max_order_notional > 0 and price > 0:
+        qty = min(qty, _round_order_qty(effective_max_order_notional / price, step_size))
     order_notional = qty * price
     if qty <= 1e-12 or price <= 0:
         report["reason"] = "invalid_reduce_candidate"
@@ -12139,6 +12195,11 @@ def convert_blocked_best_quote_plan_entry_to_actual_side_reduce(
     plan: dict[str, Any],
     current_long_qty: float,
     current_short_qty: float,
+    current_long_notional: float | None = None,
+    current_short_notional: float | None = None,
+    long_soft_notional: float | None = None,
+    short_soft_notional: float | None = None,
+    pressure_reduce_max_notional: float | None = None,
     current_long_avg_price: float = 0.0,
     current_short_avg_price: float = 0.0,
     step_price: float = 0.0,
@@ -12175,6 +12236,11 @@ def convert_blocked_best_quote_plan_entry_to_actual_side_reduce(
         same_side_entry_guard=same_side_entry_guard if isinstance(same_side_entry_guard, Mapping) else None,
         current_long_qty=current_long_qty,
         current_short_qty=current_short_qty,
+        current_long_notional=current_long_notional,
+        current_short_notional=current_short_notional,
+        long_soft_notional=long_soft_notional,
+        short_soft_notional=short_soft_notional,
+        pressure_reduce_max_notional=pressure_reduce_max_notional,
         current_long_avg_price=current_long_avg_price,
         current_short_avg_price=current_short_avg_price,
         step_price=step_price,
@@ -31765,10 +31831,31 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                 best_quote_short_reduce_suppression["dropped_notional"] = sum(
                     _safe_float(item.get("notional")) for item in dropped_buy_orders
                 )
+        grvt_bounded_loss_recovery = (
+            str(effective_strategy_profile or "").strip()
+            == "grvt_daily_80k_bq_short_freeze_5pct_v1"
+        )
         best_quote_actual_side_reduce = convert_blocked_best_quote_plan_entry_to_actual_side_reduce(
             plan=plan,
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
+            current_long_notional=current_long_notional,
+            current_short_notional=current_short_notional,
+            long_soft_notional=(
+                max(
+                    _safe_float(getattr(effective_args, "best_quote_maker_volume_max_long_notional", 0.0)),
+                    0.0,
+                )
+                * best_quote_inventory_soft_ratio
+            ),
+            short_soft_notional=(
+                max(
+                    _safe_float(getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0)),
+                    0.0,
+                )
+                * best_quote_inventory_soft_ratio
+            ),
+            pressure_reduce_max_notional=100.0 if grvt_bounded_loss_recovery else None,
             current_long_avg_price=current_long_avg_price,
             current_short_avg_price=current_short_avg_price,
             step_price=effective_args.step_price,
@@ -32798,10 +32885,6 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         state.pop("inventory_unlock_release", None)
 
     if _is_best_quote_maker_volume_mode(strategy_mode):
-        grvt_bounded_loss_recovery = (
-            str(effective_strategy_profile or "").strip()
-            == "grvt_daily_80k_bq_short_freeze_5pct_v1"
-        )
         best_quote_active_pair_reduce = apply_best_quote_active_pair_reduce(
             plan=plan,
             state=state,

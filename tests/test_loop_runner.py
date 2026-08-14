@@ -10209,6 +10209,137 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"][0]["position_side"], "LONG")
         self.assertLessEqual(plan["sell_orders"][0]["notional"], 22.0)
 
+    def test_blocked_short_entry_does_not_reduce_short_while_long_is_over_soft_limit(self) -> None:
+        plan = {
+            "metrics": {
+                "same_side_entry_price_guard": {
+                    "blocked_long_entry": False,
+                    "blocked_short_entry": True,
+                    "report_only": False,
+                }
+            },
+            "buy_orders": [
+                {
+                    "role": "best_quote_entry_long",
+                    "side": "BUY",
+                    "position_side": "LONG",
+                    "qty": 1_533.0,
+                    "price": 0.3261,
+                    "notional": 499.9113,
+                }
+            ],
+            "sell_orders": [],
+        }
+
+        report = convert_blocked_best_quote_plan_entry_to_actual_side_reduce(
+            plan=plan,
+            current_long_qty=3_070.0,
+            current_short_qty=2_500.0,
+            current_long_avg_price=0.3269,
+            current_short_avg_price=0.3270,
+            current_long_notional=1_003.0,
+            current_short_notional=817.5,
+            long_soft_notional=900.0,
+            short_soft_notional=900.0,
+            pressure_reduce_max_notional=100.0,
+            bid_price=0.3260,
+            ask_price=0.3261,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+        )
+
+        self.assertFalse(report["applied"])
+        self.assertEqual(report["reason"], "blocked_side_opposes_inventory_pressure")
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_entry_long")
+        self.assertNotIn("best_quote_reduce_short", [order["role"] for order in plan["buy_orders"]])
+
+    def test_blocked_long_entry_reduce_is_capped_to_one_pressure_slice(self) -> None:
+        plan = {
+            "metrics": {
+                "same_side_entry_price_guard": {
+                    "blocked_long_entry": True,
+                    "blocked_short_entry": False,
+                    "report_only": False,
+                }
+            },
+            "buy_orders": [],
+            "sell_orders": [
+                {
+                    "role": "best_quote_entry_short",
+                    "side": "SELL",
+                    "position_side": "SHORT",
+                    "qty": 1_533.0,
+                    "price": 0.3261,
+                    "notional": 499.9113,
+                }
+            ],
+        }
+
+        report = convert_blocked_best_quote_plan_entry_to_actual_side_reduce(
+            plan=plan,
+            current_long_qty=3_070.0,
+            current_short_qty=2_500.0,
+            current_long_avg_price=0.3269,
+            current_short_avg_price=0.3270,
+            current_long_notional=1_003.0,
+            current_short_notional=817.5,
+            long_soft_notional=900.0,
+            short_soft_notional=900.0,
+            pressure_reduce_max_notional=100.0,
+            bid_price=0.3260,
+            ask_price=0.3261,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+        )
+
+        self.assertTrue(report["applied"])
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_reduce_long")
+        self.assertLessEqual(plan["sell_orders"][0]["notional"], 100.0 + 1e-9)
+        self.assertEqual(report["inventory_pressure_side"], "long")
+
+    def test_both_blocked_entries_reduce_only_the_dominant_short_pressure(self) -> None:
+        plan = {
+            "metrics": {
+                "same_side_entry_price_guard": {
+                    "blocked_long_entry": True,
+                    "blocked_short_entry": True,
+                    "report_only": False,
+                }
+            },
+            "buy_orders": [],
+            "sell_orders": [],
+        }
+
+        report = convert_blocked_best_quote_plan_entry_to_actual_side_reduce(
+            plan=plan,
+            current_long_qty=2_500.0,
+            current_short_qty=3_070.0,
+            current_long_avg_price=0.3269,
+            current_short_avg_price=0.3270,
+            current_long_notional=817.5,
+            current_short_notional=1_003.0,
+            long_soft_notional=900.0,
+            short_soft_notional=900.0,
+            pressure_reduce_max_notional=100.0,
+            fallback_order_notional=500.0,
+            bid_price=0.3260,
+            ask_price=0.3261,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+        )
+
+        self.assertTrue(report["applied"])
+        self.assertEqual(report["inventory_pressure_side"], "short")
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_reduce_short")
+        self.assertLessEqual(plan["buy_orders"][0]["notional"], 100.0 + 1e-9)
+        self.assertEqual(plan["sell_orders"], [])
+
     def test_soonusdt_volume_profiles_use_entry_price_cost_basis(self) -> None:
         self.assertTrue(_uses_entry_price_cost_basis("chip_low_wear_guarded_v1"))
         self.assertTrue(_uses_entry_price_cost_basis("chipusdt_competition_neutral_ping_pong_v1"))
