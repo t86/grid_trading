@@ -6177,6 +6177,19 @@ def check_symbol(
         and _safe_float(assessment.get("ordinary_short_notional"))
         <= _safe_float(assessment.get("short_soft_limit_notional"))
     )
+    # A loss-release lease must not keep entry suppressed after both ordinary
+    # sides have already returned below soft.  Waiting for entries that the
+    # lease itself prevents creates a no-order recovery deadlock.
+    grvt_dynamic_release_below_soft_without_entries = (
+        grvt_dynamic_loss_release_in_progress
+        and _safe_float(assessment.get("ordinary_long_notional"))
+        <= _safe_float(assessment.get("long_soft_limit_notional"))
+        and _safe_float(assessment.get("ordinary_short_notional"))
+        <= _safe_float(assessment.get("short_soft_limit_notional"))
+        and _safe_int(assessment.get("planned_entry_order_count")) == 0
+        and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) == 0
+        and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) == 0
+    )
 
     action_verification: str | None = None
     control_updated_at = _parse_time(control.get("recovery_control_updated_at"))
@@ -6357,7 +6370,10 @@ def check_symbol(
                 }
             )
         elif grvt_dynamic_loss_release_in_progress:
-            if grvt_dynamic_release_two_sided_flow_restored:
+            if (
+                grvt_dynamic_release_two_sided_flow_restored
+                or grvt_dynamic_release_below_soft_without_entries
+            ):
                 updates = _restore_recovery_controls(
                     item,
                     control,
@@ -6392,11 +6408,18 @@ def check_symbol(
                     dry_run=dry_run,
                     restart_runner=restart,
                 )
-                action = (
-                    "dry_run_restore_grvt_after_dynamic_two_sided_flow"
-                    if dry_run
-                    else "restore_grvt_after_dynamic_two_sided_flow"
-                )
+                if grvt_dynamic_release_below_soft_without_entries:
+                    action = (
+                        "dry_run_restore_grvt_after_dynamic_release_below_soft"
+                        if dry_run
+                        else "restore_grvt_after_dynamic_release_below_soft"
+                    )
+                else:
+                    action = (
+                        "dry_run_restore_grvt_after_dynamic_two_sided_flow"
+                        if dry_run
+                        else "restore_grvt_after_dynamic_two_sided_flow"
+                    )
                 _set_post_restore_cooldown(
                     item,
                     now=now,
