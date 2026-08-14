@@ -33114,13 +33114,33 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
     # price-recovery cooldown at that point turns a completed release into a
     # one-sided, zero-volume state.  Frozen inventory is not part of this
     # calculation.
+    best_quote_metrics = (
+        best_quote_maker_volume.get("metrics")
+        if isinstance(best_quote_maker_volume, dict)
+        else {}
+    )
+    best_quote_metrics = (
+        best_quote_metrics if isinstance(best_quote_metrics, dict) else {}
+    )
+    grvt_ordinary_long_notional = _safe_float(
+        best_quote_metrics.get(
+            "long_notional",
+            controls.get("current_long_notional", current_long_notional),
+        )
+    )
+    grvt_ordinary_short_notional = _safe_float(
+        best_quote_metrics.get(
+            "short_notional",
+            controls.get("current_short_notional", current_short_notional),
+        )
+    )
     grvt_reentry_below_soft_bypass = (
         str(symbol or "").upper().strip() == "GRVTUSDT"
         and max(_safe_float(getattr(effective_args, "pause_buy_position_notional", 0.0)), 0.0) > 0
         and max(_safe_float(getattr(effective_args, "pause_short_position_notional", 0.0)), 0.0) > 0
-        and _safe_float(controls.get("current_long_notional", current_long_notional))
+        and grvt_ordinary_long_notional
         < _safe_float(getattr(effective_args, "pause_buy_position_notional", 0.0))
-        and _safe_float(controls.get("current_short_notional", current_short_notional))
+        and grvt_ordinary_short_notional
         < _safe_float(getattr(effective_args, "pause_short_position_notional", 0.0))
     )
     if grvt_reentry_below_soft_bypass and loss_reduce_reentry_guard.get("active"):
