@@ -12829,6 +12829,52 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(report["normal_entry_suppressed"])
         self.assertEqual(plan["sell_orders"], [])
 
+    def test_threshold_mode_disable_preserves_recent_completion_cooldown(self) -> None:
+        now = datetime(2026, 8, 14, 9, 0, tzinfo=timezone.utc)
+        state = {
+            "best_quote_active_pair_reduce": {
+                "active": False,
+                "mode": "threshold_side_v1",
+                "eligible_sides": ["short"],
+                "trigger_count": 1,
+                "completed": True,
+                "completed_at": (now - timedelta(seconds=75)).isoformat(),
+            }
+        }
+
+        report = apply_best_quote_active_pair_reduce(
+            plan={"buy_orders": [], "sell_orders": []},
+            state=state,
+            enabled=False,
+            current_long_qty=2500.0,
+            current_short_qty=2800.0,
+            current_long_notional=800.0,
+            current_short_notional=880.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=100.0,
+            offset_ticks=1,
+            step_price=0.00035,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.3270,
+            ask_price=0.3271,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=900.0,
+            current_long_avg_price=0.3260,
+            current_short_avg_price=0.3280,
+            now=now,
+            rearm_cooldown_seconds=300.0,
+        )
+
+        self.assertEqual(report["reason"], "disabled_cooldown_memory_preserved")
+        self.assertIn("best_quote_active_pair_reduce", state)
+
 
     def test_threshold_mode_rearms_after_three_cycles_when_ordinary_position_rebreaches(self) -> None:
         state = {

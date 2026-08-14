@@ -23961,6 +23961,26 @@ def apply_best_quote_active_pair_reduce(
         report["completed"] = bool(completed)
         return report
 
+    if not enabled and threshold_side_mode and bool(memory.get("completed")):
+        completed_at = _parse_state_datetime(memory.get("completed_at"))
+        cooldown_remaining = (
+            max(
+                safe_rearm_cooldown
+                - (effective_now - completed_at).total_seconds(),
+                0.0,
+            )
+            if completed_at is not None and safe_rearm_cooldown > 0
+            else 0.0
+        )
+        if cooldown_remaining > 0:
+            report.update(
+                {
+                    "reason": "disabled_cooldown_memory_preserved",
+                    "completed": True,
+                    "rearm_cooldown_remaining_seconds": cooldown_remaining,
+                }
+            )
+            return report
     if not enabled:
         return _clear("disabled")
     if safe_per_order <= 0 or safe_max_reduce <= 0:
