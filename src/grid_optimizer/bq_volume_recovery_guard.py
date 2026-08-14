@@ -6208,6 +6208,17 @@ def check_symbol(
         and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) == 0
         and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) == 0
     )
+    grvt_below_soft_zero_entry_requote = (
+        normalized_symbol == "GRVTUSDT"
+        and not bool(assessment.get("volatility_entry_pause_active"))
+        and bool(assessment.get("low_volume"))
+        and target_pace_behind
+        and bool(assessment.get("ineffective_orders"))
+        and not bool(assessment.get("effective_inventory_soft_pressure"))
+        and _safe_int(assessment.get("planned_entry_order_count")) == 0
+        and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) == 0
+        and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) == 0
+    )
 
     action_verification: str | None = None
     control_updated_at = _parse_time(control.get("recovery_control_updated_at"))
@@ -6353,6 +6364,30 @@ def check_symbol(
                 "recovery_owned",
             ):
                 item.pop(key, None)
+        elif grvt_below_soft_zero_entry_requote:
+            updates = {
+                "best_quote_maker_volume_pending_entry_buffer_share": 0.0,
+                "best_quote_maker_volume_quote_offset_ticks": max(
+                    _safe_int(
+                        control.get("best_quote_maker_volume_quote_offset_ticks")
+                    ) - 1,
+                    0,
+                ),
+            }
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+            action = (
+                "dry_run_restore_grvt_below_soft_zero_entry_requote"
+                if dry_run
+                else "restore_grvt_below_soft_zero_entry_requote"
+            )
         elif (
             grvt_post_shock_soft_release_safe
             or grvt_dual_soft_dynamic_release_safe
