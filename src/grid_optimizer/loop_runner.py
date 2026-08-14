@@ -23936,6 +23936,30 @@ def apply_best_quote_active_pair_reduce(
     def _clear(reason: str, *, completed: bool = False) -> dict[str, Any]:
         if completed and threshold_side_mode:
             completion_memory = dict(memory)
+            completion_sides = {
+                str(side)
+                for side in completion_memory.get("eligible_sides", [])
+                if str(side) in {"long", "short"}
+            }
+            suppressed_entry_order_count = 0
+            for side_name, order_key, entry_role in (
+                ("long", "buy_orders", "best_quote_entry_long"),
+                ("short", "sell_orders", "best_quote_entry_short"),
+            ):
+                if side_name not in completion_sides:
+                    continue
+                kept_orders: list[dict[str, Any]] = []
+                for item in plan.get(order_key, []):
+                    if not isinstance(item, dict):
+                        continue
+                    if _order_role(item) == entry_role:
+                        suppressed_entry_order_count += 1
+                        continue
+                    kept_orders.append(dict(item))
+                plan[order_key] = kept_orders
+            if suppressed_entry_order_count:
+                report["normal_entry_suppressed"] = True
+                report["suppressed_entry_order_count"] = suppressed_entry_order_count
             completion_memory.update(
                 {
                     "active": False,
