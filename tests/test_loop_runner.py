@@ -86,6 +86,7 @@ from grid_optimizer.loop_runner import (
     apply_hard_loss_forced_reduce,
     apply_inventory_unlock_release,
     apply_best_quote_active_pair_reduce,
+    apply_grvt_ordinary_inventory_pressure_guard,
     apply_grvt_anti_chase_balancing_bypass,
     cap_grvt_anti_chase_balancing_entries,
     _resolve_inventory_unlock_pause_notional,
@@ -12144,6 +12145,50 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"], [])
         self.assertEqual(len(plan["buy_orders"]), 1)
         self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_active_pair_reduce_short")
+        self.assertLessEqual(plan["buy_orders"][0]["notional"], 100.0 + 1e-9)
+
+    def test_grvt_pressure_guard_applies_when_active_pair_reduce_is_disabled(self) -> None:
+        plan = {
+            "buy_orders": [
+                {
+                    "side": "BUY",
+                    "position_side": "SHORT",
+                    "role": "best_quote_reduce_short",
+                    "qty": 1_533.0,
+                    "price": 0.3261,
+                    "notional": 499.9113,
+                    "force_reduce_only": True,
+                }
+            ],
+            "sell_orders": [
+                {
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "role": "best_quote_reduce_long",
+                    "qty": 1_533.0,
+                    "price": 0.3261,
+                    "notional": 499.9113,
+                    "force_reduce_only": True,
+                }
+            ],
+        }
+
+        report = apply_grvt_ordinary_inventory_pressure_guard(
+            plan=plan,
+            current_long_notional=817.5,
+            current_short_notional=1_003.0,
+            long_pressure_notional=900.0,
+            short_pressure_notional=900.0,
+            max_reduce_notional=100.0,
+            step_size=1.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["eligible_sides"], ["short"])
+        self.assertEqual(report["suppressed_opposite_reduce_order_count"], 1)
+        self.assertEqual(report["capped_pressure_reduce_order_count"], 1)
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(len(plan["buy_orders"]), 1)
         self.assertLessEqual(plan["buy_orders"][0]["notional"], 100.0 + 1e-9)
 
     def test_best_quote_active_pair_reduce_threshold_mode_does_not_reduce_below_threshold(self) -> None:

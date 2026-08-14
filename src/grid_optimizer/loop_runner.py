@@ -23574,6 +23574,74 @@ def _best_quote_active_pair_reduce_default_report() -> dict[str, Any]:
     }
 
 
+def apply_grvt_ordinary_inventory_pressure_guard(
+    *,
+    plan: dict[str, Any],
+    current_long_notional: float,
+    current_short_notional: float,
+    long_pressure_notional: float,
+    short_pressure_notional: float,
+    max_reduce_notional: float,
+    step_size: float | None,
+) -> dict[str, Any]:
+    """Keep ordinary GRVT reductions on the pressured side and bound each action."""
+    safe_long_notional = max(_safe_float(current_long_notional), 0.0)
+    safe_short_notional = max(_safe_float(current_short_notional), 0.0)
+    safe_long_pressure = max(_safe_float(long_pressure_notional), 0.0)
+    safe_short_pressure = max(_safe_float(short_pressure_notional), 0.0)
+    safe_max_reduce = max(_safe_float(max_reduce_notional), 0.0)
+    eligible_sides = {
+        side
+        for side, notional, threshold in (
+            ("long", safe_long_notional, safe_long_pressure),
+            ("short", safe_short_notional, safe_short_pressure),
+        )
+        if threshold > 0 and notional > threshold + 1e-12
+    }
+    report = {
+        "enabled": True,
+        "active": bool(eligible_sides),
+        "eligible_sides": sorted(eligible_sides),
+        "long_pressure_notional": safe_long_pressure,
+        "short_pressure_notional": safe_short_pressure,
+        "max_reduce_notional": safe_max_reduce,
+        "suppressed_opposite_reduce_order_count": 0,
+        "capped_pressure_reduce_order_count": 0,
+    }
+    if not eligible_sides:
+        return report
+
+    for side_name, order_key, reduce_roles in (
+        ("long", "sell_orders", {"best_quote_reduce_long", "inventory_unlock_reduce_long"}),
+        ("short", "buy_orders", {"best_quote_reduce_short", "inventory_unlock_reduce_short"}),
+    ):
+        kept_orders: list[dict[str, Any]] = []
+        for item in plan.get(order_key, []):
+            if not isinstance(item, dict):
+                continue
+            order = dict(item)
+            if _order_role(order) not in reduce_roles:
+                kept_orders.append(order)
+                continue
+            if side_name not in eligible_sides:
+                report["suppressed_opposite_reduce_order_count"] += 1
+                continue
+            price = max(_safe_float(order.get("price")), 0.0)
+            notional = max(_safe_float(order.get("notional")), 0.0)
+            if safe_max_reduce > 0 and price > 0 and notional > safe_max_reduce + 1e-12:
+                qty = _round_order_qty(safe_max_reduce / price, step_size)
+                if qty <= 0:
+                    continue
+                order["qty"] = qty
+                if "quantity" in order:
+                    order["quantity"] = qty
+                order["notional"] = qty * price
+                report["capped_pressure_reduce_order_count"] += 1
+            kept_orders.append(order)
+        plan[order_key] = kept_orders
+    return report
+
+
 def apply_best_quote_active_pair_reduce(
     *,
     plan: dict[str, Any],
@@ -32916,6 +32984,35 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         state.pop("inventory_unlock_release", None)
 
     if _is_best_quote_maker_volume_mode(strategy_mode):
+        if grvt_bounded_loss_recovery:
+            grvt_inventory_pressure_guard = apply_grvt_ordinary_inventory_pressure_guard(
+                plan=plan,
+                current_long_notional=controls.get("current_long_notional", current_long_notional),
+                current_short_notional=controls.get("current_short_notional", current_short_notional),
+                long_pressure_notional=(
+                    max(
+                        _safe_float(
+                            getattr(effective_args, "best_quote_maker_volume_max_long_notional", 0.0)
+                        ),
+                        0.0,
+                    )
+                    * best_quote_inventory_soft_ratio
+                ),
+                short_pressure_notional=(
+                    max(
+                        _safe_float(
+                            getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0)
+                        ),
+                        0.0,
+                    )
+                    * best_quote_inventory_soft_ratio
+                ),
+                max_reduce_notional=100.0,
+                step_size=symbol_info.get("step_size"),
+            )
+            best_quote_maker_volume["ordinary_inventory_pressure_guard"] = dict(
+                grvt_inventory_pressure_guard
+            )
         best_quote_active_pair_reduce = apply_best_quote_active_pair_reduce(
             plan=plan,
             state=state,
