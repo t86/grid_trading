@@ -33546,7 +33546,11 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             current_short_avg_price=current_short_avg_price,
             max_loss_ratio=0.20 if grvt_bounded_loss_recovery else 0.005,
             min_relief_notional=100.0 if grvt_bounded_loss_recovery else 0.0,
-            suppress_all_entries_while_active=grvt_bounded_loss_recovery,
+            # During GRVT's bounded threshold-side release, keep only the
+            # opposite ordinary entry live.  The heavy side is still
+            # suppressed by the threshold-side filter, while the light side
+            # can rebalance and preserve turnover during the 100U release.
+            suppress_all_entries_while_active=False,
             suppress_noneligible_reduce_while_active=grvt_bounded_loss_recovery,
             now=plan_now,
             rearm_cooldown_seconds=300.0 if grvt_bounded_loss_recovery else 0.0,

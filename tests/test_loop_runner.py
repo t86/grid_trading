@@ -12190,7 +12190,16 @@ class LoopRunnerTests(unittest.TestCase):
 
     def test_grvt_threshold_reduce_drops_opposite_ordinary_reduce(self) -> None:
         plan = {
-            "buy_orders": [],
+            "buy_orders": [
+                {
+                    "side": "BUY",
+                    "position_side": "LONG",
+                    "role": "best_quote_entry_long",
+                    "qty": 168.0,
+                    "price": 0.3260,
+                    "notional": 54.768,
+                }
+            ],
             "sell_orders": [
                 {
                     "side": "SELL",
@@ -12239,9 +12248,15 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["eligible_sides"], ["short"])
         self.assertEqual(report["suppressed_noneligible_reduce_order_count"], 1)
         self.assertEqual(plan["sell_orders"], [])
-        self.assertEqual(len(plan["buy_orders"]), 1)
-        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_active_pair_reduce_short")
-        self.assertLessEqual(plan["buy_orders"][0]["notional"], 100.0 + 1e-9)
+        buy_roles = [item["role"] for item in plan["buy_orders"]]
+        self.assertIn("best_quote_entry_long", buy_roles)
+        self.assertIn("best_quote_active_pair_reduce_short", buy_roles)
+        reduce_order = next(
+            item
+            for item in plan["buy_orders"]
+            if item["role"] == "best_quote_active_pair_reduce_short"
+        )
+        self.assertLessEqual(reduce_order["notional"], 100.0 + 1e-9)
 
     def test_grvt_pressure_guard_applies_when_active_pair_reduce_is_disabled(self) -> None:
         plan = {
