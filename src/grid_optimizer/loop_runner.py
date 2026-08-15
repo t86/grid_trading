@@ -1605,6 +1605,7 @@ def _loss_reduce_side_from_reports(
     *,
     adverse_inventory_reduce: dict[str, Any],
     hard_loss_forced_reduce: dict[str, Any],
+    best_quote_active_pair_reduce: dict[str, Any] | None = None,
 ) -> tuple[str | None, str | None, float | None]:
     hard_side = str(hard_loss_forced_reduce.get("side") or "").upper().strip()
     if bool(hard_loss_forced_reduce.get("active")) and hard_side in {"BUY", "SELL"}:
@@ -1627,6 +1628,13 @@ def _loss_reduce_side_from_reports(
             if order_side in {"BUY", "SELL"}:
                 order_price = _safe_float(adverse_orders[0].get("price"))
                 return order_side, "adverse_reduce", order_price or None
+
+    active_pair = best_quote_active_pair_reduce or {}
+    if bool(active_pair.get("enabled")) and int(active_pair.get("order_count") or 0) > 0:
+        if _safe_float(active_pair.get("long_order_notional")) > 0:
+            return "SELL", "active_pair_reduce", None
+        if _safe_float(active_pair.get("short_order_notional")) > 0:
+            return "BUY", "active_pair_reduce", None
     return None, None, None
 
 
@@ -1641,6 +1649,7 @@ def resolve_loss_reduce_reentry_guard(
     mid_price: float,
     effective_step_price: float | None,
     now: datetime,
+    best_quote_active_pair_reduce: dict[str, Any] | None = None,
     cooldown_seconds: float = 300.0,
     recover_buffer_steps: float = 1.0,
 ) -> dict[str, Any]:
@@ -1653,6 +1662,7 @@ def resolve_loss_reduce_reentry_guard(
     trigger_side, trigger_source, trigger_price = _loss_reduce_side_from_reports(
         adverse_inventory_reduce=adverse_inventory_reduce,
         hard_loss_forced_reduce=hard_loss_forced_reduce,
+        best_quote_active_pair_reduce=best_quote_active_pair_reduce,
     )
     safe_mid = max(_safe_float(mid_price), 0.0)
     if trigger_side in {"BUY", "SELL"}:
@@ -33489,6 +33499,21 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             rearm_cooldown_seconds=300.0 if grvt_bounded_loss_recovery else 0.0,
             rearm_immediately_while_threshold_breached=grvt_bounded_loss_recovery,
         )
+        if bool(best_quote_active_pair_reduce.get("order_count")):
+            loss_reduce_reentry_guard = resolve_loss_reduce_reentry_guard(
+                state=state,
+                enabled=bool(getattr(effective_args, "loss_reentry_guard_enabled", False)),
+                adverse_inventory_reduce={"enabled": False, "placed_reduce_orders": 0},
+                hard_loss_forced_reduce={},
+                best_quote_active_pair_reduce=best_quote_active_pair_reduce,
+                current_long_notional=controls.get("current_long_notional", current_long_notional),
+                current_short_notional=controls.get("current_short_notional", current_short_notional),
+                mid_price=mid_price,
+                effective_step_price=getattr(effective_args, "step_price", None),
+                now=plan_now,
+                cooldown_seconds=getattr(effective_args, "loss_reentry_cooldown_seconds", 300.0),
+                recover_buffer_steps=getattr(effective_args, "loss_reentry_cost_buffer_steps", 1.0),
+            )
     else:
         state.pop("best_quote_active_pair_reduce", None)
 

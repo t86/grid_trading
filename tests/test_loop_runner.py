@@ -11098,6 +11098,36 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(recovered["reason"], "recovered")
         self.assertNotIn("loss_reduce_reentry_guard", state)
 
+    def test_loss_reduce_reentry_guard_blocks_long_rebuy_after_active_pair_reduce(self) -> None:
+        now = datetime(2026, 8, 15, 1, 43, tzinfo=timezone.utc)
+        state: dict[str, object] = {}
+
+        guard = resolve_loss_reduce_reentry_guard(
+            state=state,
+            enabled=True,
+            adverse_inventory_reduce={"enabled": True, "placed_reduce_orders": 0},
+            hard_loss_forced_reduce={},
+            best_quote_active_pair_reduce={
+                "enabled": True,
+                "order_count": 1,
+                "long_order_notional": 99.72,
+                "short_order_notional": 0.0,
+            },
+            current_long_notional=920.0,
+            current_short_notional=850.0,
+            mid_price=0.2968,
+            effective_step_price=0.00035,
+            now=now,
+            cooldown_seconds=300.0,
+            recover_buffer_steps=1.0,
+        )
+
+        self.assertTrue(guard["active"])
+        self.assertTrue(guard["block_long_entries"])
+        self.assertFalse(guard["block_short_entries"])
+        self.assertEqual(guard["side"], "SELL")
+        self.assertEqual(guard["source"], "active_pair_reduce")
+
     def test_loss_reduce_reentry_guard_action_filter_keeps_reducers(self) -> None:
         actions = {
             "place_orders": [
