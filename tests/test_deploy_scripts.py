@@ -330,6 +330,9 @@ def test_bq_volume_recovery_guard_oneshot_finishes_before_next_timer_round() -> 
     assert "TARGET_GATE_MAX_HEARTBEAT_AGE_SECONDS" in script
     assert "--target-gate-max-heartbeat-age-seconds" in script
     assert 'sudo systemctl enable "${WATCHDOG_UNIT_NAME}.timer"' in script
+    assert 'DRY_RUN="${DRY_RUN:-auto}"' in script
+    assert '[[ ",${SYMBOLS^^}," == *",GRVTUSDT,"* ]]' in script
+    assert "${DRY_RUN_FLAG}" in script
 
 
 def test_low_volume_monitor_installer_runs_every_ten_minutes() -> None:

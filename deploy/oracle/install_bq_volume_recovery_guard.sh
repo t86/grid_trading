@@ -43,6 +43,7 @@ WATCHDOG_MAX_HEARTBEAT_AGE_SECONDS="${WATCHDOG_MAX_HEARTBEAT_AGE_SECONDS:-150}"
 TARGET_GATE_MAX_HEARTBEAT_AGE_SECONDS="${TARGET_GATE_MAX_HEARTBEAT_AGE_SECONDS:-600}"
 WATCHDOG_ALERT_THRESHOLD="${WATCHDOG_ALERT_THRESHOLD:-2}"
 WATCHDOG_ON_UNIT_ACTIVE_SEC="${WATCHDOG_ON_UNIT_ACTIVE_SEC:-1min}"
+DRY_RUN="${DRY_RUN:-auto}"
 
 if ! command -v sudo >/dev/null 2>&1; then
   echo "sudo is required for systemd installation." >&2
@@ -81,6 +82,26 @@ else
   PAUSE_BASELINES_FLAG=""
 fi
 
+case "$DRY_RUN" in
+  true)
+    DRY_RUN_FLAG="--dry-run"
+    ;;
+  false)
+    DRY_RUN_FLAG=""
+    ;;
+  auto)
+    if [[ ",${SYMBOLS^^}," == *",GRVTUSDT,"* ]]; then
+      DRY_RUN_FLAG="--dry-run"
+    else
+      DRY_RUN_FLAG=""
+    fi
+    ;;
+  *)
+    echo "DRY_RUN must be true, false, or auto: ${DRY_RUN}" >&2
+    exit 1
+    ;;
+esac
+
 SERVICE_FILE="/etc/systemd/system/${TIMER_UNIT_NAME}.service"
 TIMER_FILE="/etc/systemd/system/${TIMER_UNIT_NAME}.timer"
 WATCHDOG_SERVICE_FILE="/etc/systemd/system/${WATCHDOG_UNIT_NAME}.service"
@@ -103,7 +124,7 @@ WorkingDirectory=${APP_DIR}
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=${PYTHONPATH_VALUE}
 EnvironmentFile=${ENV_FILE}
-ExecStart=${PYTHON_BIN} -m grid_optimizer.bq_volume_recovery_guard --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --state-path ${STATE_PATH} --runner-wrapper ${RUNNER_WRAPPER} --window-seconds ${WINDOW_SECONDS} --min-volume-notional ${MIN_VOLUME_NOTIONAL} --trigger-seconds ${TRIGGER_SECONDS} --recover-min-volume-notional ${RECOVER_MIN_VOLUME_NOTIONAL} ${DAILY_TARGETS:+--daily-targets ${DAILY_TARGETS}} --target-pace-fraction ${TARGET_PACE_FRACTION} --target-pace-max-multiplier ${TARGET_PACE_MAX_MULTIPLIER} --target-completion-buffer-seconds ${TARGET_COMPLETION_BUFFER_SECONDS} --near-cap-ratio ${NEAR_CAP_RATIO} --recover-cap-ratio ${RECOVER_CAP_RATIO} --far-ticks ${FAR_TICKS} --plan-stale-seconds ${PLAN_STALE_SECONDS} --max-recovery-seconds ${MAX_RECOVERY_SECONDS} --cooldown-seconds ${COOLDOWN_SECONDS} --inventory-bias-relief-notional-margin ${INVENTORY_BIAS_RELIEF_NOTIONAL_MARGIN} --volume-recovery-cycle-budget-increment ${VOLUME_RECOVERY_CYCLE_BUDGET_INCREMENT} --cycle-budget-floors ${CYCLE_BUDGET_FLOORS} --loss-reduce-quote-offset-extra-ticks ${LOSS_REDUCE_QUOTE_OFFSET_EXTRA_TICKS} --require-soft-pressure-for-allow-loss-symbols ${REQUIRE_SOFT_PRESSURE_FOR_ALLOW_LOSS_SYMBOLS} ${PAUSE_BASELINES_FLAG} ${COST_GATE_FLAG}
+ExecStart=${PYTHON_BIN} -m grid_optimizer.bq_volume_recovery_guard --symbols ${SYMBOLS} --output-dir ${OUTPUT_DIR} --state-path ${STATE_PATH} --runner-wrapper ${RUNNER_WRAPPER} --window-seconds ${WINDOW_SECONDS} --min-volume-notional ${MIN_VOLUME_NOTIONAL} --trigger-seconds ${TRIGGER_SECONDS} --recover-min-volume-notional ${RECOVER_MIN_VOLUME_NOTIONAL} ${DAILY_TARGETS:+--daily-targets ${DAILY_TARGETS}} --target-pace-fraction ${TARGET_PACE_FRACTION} --target-pace-max-multiplier ${TARGET_PACE_MAX_MULTIPLIER} --target-completion-buffer-seconds ${TARGET_COMPLETION_BUFFER_SECONDS} --near-cap-ratio ${NEAR_CAP_RATIO} --recover-cap-ratio ${RECOVER_CAP_RATIO} --far-ticks ${FAR_TICKS} --plan-stale-seconds ${PLAN_STALE_SECONDS} --max-recovery-seconds ${MAX_RECOVERY_SECONDS} --cooldown-seconds ${COOLDOWN_SECONDS} --inventory-bias-relief-notional-margin ${INVENTORY_BIAS_RELIEF_NOTIONAL_MARGIN} --volume-recovery-cycle-budget-increment ${VOLUME_RECOVERY_CYCLE_BUDGET_INCREMENT} --cycle-budget-floors ${CYCLE_BUDGET_FLOORS} --loss-reduce-quote-offset-extra-ticks ${LOSS_REDUCE_QUOTE_OFFSET_EXTRA_TICKS} --require-soft-pressure-for-allow-loss-symbols ${REQUIRE_SOFT_PRESSURE_FOR_ALLOW_LOSS_SYMBOLS} ${PAUSE_BASELINES_FLAG} ${COST_GATE_FLAG} ${DRY_RUN_FLAG}
 EOF
 
 sudo tee "$FAILURE_ALERT_SERVICE_FILE" >/dev/null <<EOF
