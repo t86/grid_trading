@@ -6292,6 +6292,32 @@ def check_symbol(
             and not bool(assessment.get("ineffective_orders"))
         )
     )
+    # A completed bounded loss release can dominate the fresh five-minute
+    # wear sample even after it has returned both ordinary sides below soft.
+    # Do not let that one completed release block the restored two-sided
+    # maker flow indefinitely: permit only the normal one-step pace ramp when
+    # the broader fifteen-minute sample has already recovered below GRVT's
+    # high-wear threshold.  This never re-enables loss reducing and the
+    # emergency wear threshold remains a hard stop.
+    grvt_transient_completed_loss_release_wear = (
+        normalized_symbol == "GRVTUSDT"
+        and high_recovery_wear
+        and not grvt_soft_loss_profile_active
+        and not bool(assessment.get("volatility_entry_pause_active"))
+        and not active_pair_reduce_deadlock
+        and not bool(assessment.get("effective_inventory_soft_pressure"))
+        and _safe_float(assessment.get("ordinary_long_notional"))
+        <= _safe_float(assessment.get("long_soft_limit_notional"))
+        and _safe_float(assessment.get("ordinary_short_notional"))
+        <= _safe_float(assessment.get("short_soft_limit_notional"))
+        and trailing_5m_realized_wear_per_10k < emergency_wear_threshold
+        and _safe_float(volume_summary.get("trailing_15m_gross_notional")) >= 100.0
+        and trailing_15m_realized_wear_per_10k <= loss_reduce_wear_threshold
+        and grvt_live_two_sided_entry
+    )
+    assessment["grvt_transient_completed_loss_release_wear"] = (
+        grvt_transient_completed_loss_release_wear
+    )
     # A live two-sided quote can still be far below the required daily pace.
     # In that case capacity should continue to climb gradually rather than
     # waiting for both sides to disappear completely.  This is deliberately
@@ -6304,7 +6330,10 @@ def check_symbol(
         and not active_pair_reduce_deadlock
         and recovery_low_volume
         and target_pace_behind
-        and not bool(assessment.get("high_recovery_wear"))
+        and (
+            not bool(assessment.get("high_recovery_wear"))
+            or grvt_transient_completed_loss_release_wear
+        )
         and not bool(assessment.get("effective_inventory_soft_pressure"))
         and grvt_live_two_sided_entry
     )
@@ -6525,7 +6554,11 @@ def check_symbol(
                 restart_runner=restart,
             )
             action = (
-                "dry_run_ramp_grvt_two_sided_entry_for_pace"
+                "dry_run_ramp_grvt_two_sided_entry_after_completed_loss_release"
+                if dry_run and grvt_transient_completed_loss_release_wear
+                else "ramp_grvt_two_sided_entry_after_completed_loss_release"
+                if grvt_transient_completed_loss_release_wear
+                else "dry_run_ramp_grvt_two_sided_entry_for_pace"
                 if dry_run
                 else "ramp_grvt_two_sided_entry_for_pace"
             )
