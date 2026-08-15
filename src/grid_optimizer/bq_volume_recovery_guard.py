@@ -10869,7 +10869,19 @@ def check_symbol(
                         or grvt_soft_loss_relief_override
                     )
                     and not recovery_reapply_debounced
-                    and not post_restore_budget_cooldown_active
+                    and (
+                        not post_restore_budget_cooldown_active
+                        # A restored flow can immediately become stranded again when
+                        # a GRVT ordinary leg is still above soft and its only reduce
+                        # quote has drifted away.  Let the bounded soft-loss recovery
+                        # re-arm; frozen inventory is excluded by the assessment.
+                        or (
+                            normalized_symbol == "GRVTUSDT"
+                            and target_pace_behind
+                            and effective_inventory_soft_pressure
+                            and bool(assessment.get("ineffective_orders"))
+                        )
+                    )
                     and (
                     effective_inventory_soft_pressure
                     or bool(assessment.get("volatility_inventory_reduce_deadlock"))

@@ -8665,6 +8665,58 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 control["best_quote_maker_volume_allow_loss_reduce_only"], result
             )
 
+    def test_grvt_ineffective_soft_flow_bypasses_post_restore_cooldown(self) -> None:
+        now = datetime(2026, 8, 15, 8, 47, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                symbol="GRVTUSDT",
+                control={
+                    "best_quote_maker_volume_inventory_soft_ratio": 0.9,
+                    "best_quote_maker_volume_quote_offset_ticks": 1,
+                },
+                long_notional=990.0,
+                short_notional=850.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=False,
+            )
+            state: dict[str, object] = {
+                "symbols": {
+                    "GRVTUSDT": {
+                        "status": "low_volume",
+                        "first_low_volume_at": (now - timedelta(minutes=10)).isoformat(),
+                        "post_restore_budget_cooldown_until": (
+                            now + timedelta(minutes=5)
+                        ).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="GRVTUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=180,
+                min_volume_notional=500.0,
+                trigger_seconds=120,
+                trade_rows=[],
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "grvtusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(result["assessment"]["effective_inventory_soft_pressure"])
+            self.assertTrue(result["assessment"]["ineffective_orders"])
+            self.assertEqual(result["action"], "enable_soft_inventory_loss_reduce")
+            self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
+            self.assertEqual(restarts, ["GRVTUSDT"])
+
     def test_effective_flow_disables_allow_loss_before_inventory_buffer(self) -> None:
         now = datetime(2026, 6, 26, 7, 10, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
