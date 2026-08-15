@@ -1933,7 +1933,11 @@ def _clear_completed_grvt_active_pair_reentry_memory(state: dict[str, Any]) -> N
     retained = {
         side: memory
         for side, memory in side_memories.items()
-        if str(memory.get("source") or "") != "active_pair_reduce"
+        # A filled threshold-side trim is a completed active-pair action too.
+        # It must remain a re-entry guard while ordinary inventory is elevated,
+        # but once both ordinary sides are below soft this cleanup is the
+        # explicit handoff back to two-sided entry flow.
+        if not str(memory.get("source") or "").startswith("active_pair_reduce")
     }
     if retained:
         reentry_memory["sides"] = retained
