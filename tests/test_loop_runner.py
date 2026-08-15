@@ -134,6 +134,7 @@ from grid_optimizer.loop_runner import (
     resolve_xaut_adaptive_state,
     resolve_anti_chase_entry_guard,
     resolve_loss_reduce_reentry_guard,
+    _record_loss_reduce_reentry_fill_guard,
     _allow_grvt_reentry_below_soft_bypass,
     apply_synthetic_trend_follow_guard,
     apply_entry_permission_gate,
@@ -11353,6 +11354,50 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(guard["block_short_entries"])
         self.assertIn("price_not_recovered", guard["reason"])
         self.assertIn("loss_reduce_reentry_guard", state)
+
+    def test_loss_reduce_fill_arms_durable_reentry_guard(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "best_quote_volume_order_refs": {
+                            "78501774": {
+                                "role": "best_quote_active_pair_reduce_short",
+                                "side": "BUY",
+                                "position_side": "SHORT",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            receipt = _record_loss_reduce_reentry_fill_guard(
+                symbol="GRVTUSDT",
+                state_path=state_path,
+                execution_events=[
+                    {
+                        "kind": "ORDER_FILLED",
+                        "order_id": 78501774,
+                        "side": "BUY",
+                        "transaction_time": 1786772360783,
+                        "last_filled_price": 0.3056,
+                        "realized_pnl": -0.45752351,
+                    }
+                ],
+                now=datetime(2026, 8, 15, 5, 39, 22, tzinfo=timezone.utc),
+            )
+
+            self.assertTrue(receipt["armed"])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            guard = state["loss_reduce_reentry_guard"]
+            self.assertEqual(guard["source"], "active_pair_reduce_fill")
+            self.assertEqual(
+                guard["sides"]["BUY"]["order_id"],
+                78501774,
+            )
+            self.assertFalse(_allow_grvt_reentry_below_soft_bypass(guard))
 
     def test_loss_reduce_reentry_guard_action_filter_keeps_reducers(self) -> None:
         actions = {

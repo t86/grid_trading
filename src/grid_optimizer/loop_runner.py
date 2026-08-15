@@ -1815,11 +1815,111 @@ def resolve_loss_reduce_reentry_guard(
     return report
 
 
+def _record_loss_reduce_reentry_fill_guard(
+    *,
+    symbol: str,
+    state_path: Path,
+    execution_events: Iterable[Mapping[str, Any]],
+    now: datetime,
+) -> dict[str, Any]:
+    if str(symbol or "").upper().strip() != "GRVTUSDT":
+        return {"armed": False, "reason": "symbol_not_grvt"}
+
+    armed: list[dict[str, Any]] = []
+    with exclusive_json_state_lock(state_path):
+        state = read_json(state_path) or {}
+        refs = state.get("best_quote_volume_order_refs")
+        refs = refs if isinstance(refs, dict) else {}
+        memory = state.get("loss_reduce_reentry_guard")
+        memory = dict(memory) if isinstance(memory, dict) else {}
+        raw_sides = memory.get("sides")
+        side_memories = (
+            {
+                str(side).upper(): dict(side_memory)
+                for side, side_memory in raw_sides.items()
+                if str(side).upper() in {"BUY", "SELL"}
+                and isinstance(side_memory, dict)
+            }
+            if isinstance(raw_sides, dict)
+            else {}
+        )
+        legacy_side = str(memory.get("side") or "").upper().strip()
+        if not side_memories and legacy_side in {"BUY", "SELL"}:
+            side_memories[legacy_side] = memory
+
+        safe_now = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+        for event in execution_events:
+            if str(event.get("kind") or "").upper() not in {
+                "ORDER_FILLED",
+                "ORDER_PARTIALLY_FILLED",
+            }:
+                continue
+            realized_pnl = _safe_float(event.get("realized_pnl"))
+            if realized_pnl >= 0:
+                continue
+            order_id = event.get("order_id")
+            order_ref = refs.get(str(order_id)) if order_id is not None else None
+            if not isinstance(order_ref, dict):
+                continue
+            role = str(order_ref.get("role") or "")
+            if not role.startswith("best_quote_active_pair_reduce_"):
+                continue
+            side = str(order_ref.get("side") or event.get("side") or "").upper().strip()
+            if side not in {"BUY", "SELL"}:
+                continue
+            event_time_ms = int(_safe_float(event.get("transaction_time") or event.get("event_time")))
+            started_at = (
+                datetime.fromtimestamp(event_time_ms / 1000.0, tz=timezone.utc)
+                if event_time_ms > 0
+                else safe_now
+            )
+            reference_price = max(_safe_float(event.get("last_filled_price")), 0.0)
+            side_memories[side] = {
+                "side": side,
+                "source": "active_pair_reduce_fill",
+                "started_at": _isoformat(started_at),
+                "updated_at": _isoformat(safe_now),
+                "reference_price": reference_price,
+                "order_id": order_id,
+                "realized_pnl": realized_pnl,
+            }
+            armed.append(
+                {
+                    "side": side,
+                    "role": role,
+                    "order_id": order_id,
+                    "realized_pnl": realized_pnl,
+                    "reference_price": reference_price,
+                    "started_at": _isoformat(started_at),
+                }
+            )
+
+        if not armed:
+            return {"armed": False, "reason": "no_loss_reduce_fill"}
+        primary = armed[-1]
+        state["loss_reduce_reentry_guard"] = {
+            "sides": side_memories,
+            "side": primary["side"],
+            "source": "active_pair_reduce_fill",
+            "started_at": primary["started_at"],
+            "updated_at": _isoformat(safe_now),
+            "reference_price": primary["reference_price"],
+        }
+        _write_json(state_path, state)
+
+    return {
+        "armed": True,
+        "reason": "actual_loss_reduce_fill",
+        "events": armed,
+    }
+
+
 def _allow_grvt_reentry_below_soft_bypass(loss_reduce_reentry_guard: dict[str, Any]) -> bool:
     if not bool(loss_reduce_reentry_guard.get("active")):
         return False
     return str(loss_reduce_reentry_guard.get("source") or "") not in {
         "active_pair_reduce",
+        "active_pair_reduce_fill",
         "adverse_reduce",
         "hard_loss",
     }
@@ -38214,7 +38314,8 @@ def main() -> None:
                             "payload": item,
                         },
                     )
-                for item in _drain_new_runner_execution_events(args, max_events=50):
+                execution_events = _drain_new_runner_execution_events(args, max_events=50)
+                for item in execution_events:
                     _append_jsonl(
                         audit_paths["order_audit"],
                         {
@@ -38225,6 +38326,15 @@ def main() -> None:
                             "payload": item,
                         },
                     )
+                loss_reentry_fill_guard = _record_loss_reduce_reentry_fill_guard(
+                    symbol=args.symbol,
+                    state_path=Path(str(plan_report.get("state_path", args.state_path))),
+                    execution_events=execution_events,
+                    now=cycle_started_at,
+                )
+                if loss_reentry_fill_guard.get("armed"):
+                    submit_report["loss_reduce_reentry_fill_guard"] = loss_reentry_fill_guard
+                    _write_json(submit_report_path, submit_report)
                 audit_sync = {
                     "trade_appended": 0,
                     "income_appended": 0,
