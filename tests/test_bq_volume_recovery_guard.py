@@ -14787,6 +14787,17 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 {"side": "SELL", "price": 0.5972, "qty": 16.0, "role": "best_quote_entry_short"}
             ]
             _write_json(plan_path, plan)
+            submit_path = output_dir / "grvtusdt_loop_latest_submit.json"
+            submit = json.loads(submit_path.read_text(encoding="utf-8"))
+            # A remaining reduce-only order keeps total active orders nonzero,
+            # while both ordinary entry legs are absent from the exchange.
+            submit["observed_strategy_open_order_state"].update(
+                {
+                    "ordinary_active_entry_long_order_count": 0,
+                    "ordinary_active_entry_short_order_count": 0,
+                }
+            )
+            _write_json(submit_path, submit)
             state: dict[str, object] = {
                 "symbols": {
                     "GRVTUSDT": {
