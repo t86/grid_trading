@@ -6315,7 +6315,13 @@ def check_symbol(
         and target_pace_behind
         and bool(assessment.get("ineffective_orders"))
         and not bool(assessment.get("effective_inventory_soft_pressure"))
-        and _safe_int(assessment.get("planned_entry_order_count")) == 0
+        # A one-sided plan is as stranded as a zero-entry plan: the exchange
+        # lacks balanced ordinary flow even though one nominal role remains.
+        and (
+            _safe_int(assessment.get("planned_entry_order_count")) == 0
+            or _safe_int(assessment.get("planned_entry_buy_order_count")) == 0
+            or _safe_int(assessment.get("planned_entry_sell_order_count")) == 0
+        )
         and (
             _safe_int(assessment.get("ordinary_active_entry_long_order_count")) == 0
             or _safe_int(assessment.get("ordinary_active_entry_short_order_count")) == 0
