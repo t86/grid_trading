@@ -11319,11 +11319,13 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(guard["block_long_entries"])
 
     def test_grvt_below_soft_keeps_active_pair_loss_reentry_guard(self) -> None:
-        self.assertFalse(
-            _allow_grvt_reentry_below_soft_bypass(
-                {"active": True, "source": "active_pair_reduce"}
-            )
-        )
+        for source in ("active_pair_reduce", "active_pair_reduce_fill"):
+            with self.subTest(source=source):
+                self.assertFalse(
+                    _allow_grvt_reentry_below_soft_bypass(
+                        {"active": True, "source": source}
+                    )
+                )
 
     def test_loss_reduce_reentry_guard_keeps_active_pair_memory_below_soft(self) -> None:
         now = datetime(2026, 8, 15, 5, 20, tzinfo=timezone.utc)

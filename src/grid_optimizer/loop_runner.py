@@ -33334,7 +33334,11 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             retained = {
                 side: memory
                 for side, memory in side_memories.items()
-                if str(memory.get("source") or "") != "active_pair_reduce"
+                # A submitted active-pair leg is recorded as
+                # ``active_pair_reduce_fill``. It has the same temporary
+                # re-entry semantics as its planned counterpart once both
+                # ordinary legs are back below soft.
+                if not str(memory.get("source") or "").startswith("active_pair_reduce")
             }
             if retained:
                 reentry_memory["sides"] = retained
