@@ -8703,6 +8703,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 now=now,
                 window_seconds=180,
                 min_volume_notional=500.0,
+                daily_target_notional=150_000.0,
                 trigger_seconds=120,
                 trade_rows=[],
                 restart_runner=restarts.append,
