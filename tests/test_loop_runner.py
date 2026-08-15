@@ -11182,8 +11182,8 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(guard["block_short_entries"])
         self.assertFalse(guard["block_long_entries"])
 
-    def test_grvt_below_soft_does_not_bypass_active_loss_reentry_guard(self) -> None:
-        self.assertFalse(
+    def test_grvt_below_soft_bypasses_active_loss_reentry_guard(self) -> None:
+        self.assertTrue(
             _allow_grvt_reentry_below_soft_bypass(
                 {"active": True, "source": "active_pair_reduce"}
             )
