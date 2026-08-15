@@ -11471,7 +11471,9 @@ class LoopRunnerTests(unittest.TestCase):
                 guard["sides"]["BUY"]["order_id"],
                 78501774,
             )
-            self.assertTrue(_allow_grvt_reentry_below_soft_bypass(guard))
+            # The persisted receipt has no evaluated ``active`` flag yet;
+            # planning evaluates that flag before applying the below-soft path.
+            self.assertFalse(_allow_grvt_reentry_below_soft_bypass(guard))
 
     def test_loss_reduce_trade_backfill_converts_restart_gap_fill(self) -> None:
         events = _loss_reduce_trade_rows_to_execution_events(
