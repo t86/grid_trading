@@ -1631,9 +1631,18 @@ def _loss_reduce_side_from_reports(
 
     active_pair = best_quote_active_pair_reduce or {}
     if bool(active_pair.get("enabled")) and int(active_pair.get("order_count") or 0) > 0:
-        if _safe_float(active_pair.get("long_order_notional")) > 0:
+        long_notional = _safe_float(active_pair.get("long_order_notional"))
+        short_notional = _safe_float(active_pair.get("short_order_notional"))
+        long_loss_ratio = _safe_float(active_pair.get("long_expected_loss_ratio"))
+        short_loss_ratio = _safe_float(active_pair.get("short_expected_loss_ratio"))
+        if long_loss_ratio > 0 or short_loss_ratio > 0:
+            if long_notional > 0 and long_loss_ratio >= short_loss_ratio:
+                return "SELL", "active_pair_reduce", None
+            if short_notional > 0:
+                return "BUY", "active_pair_reduce", None
+        if long_notional > 0:
             return "SELL", "active_pair_reduce", None
-        if _safe_float(active_pair.get("short_order_notional")) > 0:
+        if short_notional > 0:
             return "BUY", "active_pair_reduce", None
     return None, None, None
 
