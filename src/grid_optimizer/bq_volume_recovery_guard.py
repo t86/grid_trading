@@ -6276,6 +6276,23 @@ def check_symbol(
         and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) == 0
         and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) == 0
     )
+    # A live two-sided quote can still be far below the required daily pace.
+    # In that case capacity should continue to climb gradually rather than
+    # waiting for both sides to disappear completely.  This is deliberately
+    # bounded by the existing target floor/ceiling and does not alter any
+    # inventory, wear, or volatility threshold.
+    grvt_two_sided_entry_pace_ramp = (
+        normalized_symbol == "GRVTUSDT"
+        and not grvt_soft_loss_profile_active
+        and not bool(assessment.get("volatility_entry_pause_active"))
+        and not active_pair_reduce_deadlock
+        and bool(assessment.get("low_volume"))
+        and target_pace_behind
+        and not bool(assessment.get("high_recovery_wear"))
+        and not bool(assessment.get("effective_inventory_soft_pressure"))
+        and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) > 0
+        and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) > 0
+    )
 
     action_verification: str | None = None
     control_updated_at = _parse_time(control.get("recovery_control_updated_at"))
@@ -6463,6 +6480,39 @@ def check_symbol(
                 "dry_run_restore_grvt_below_soft_zero_entry_requote"
                 if dry_run
                 else "restore_grvt_below_soft_zero_entry_requote"
+            )
+        elif grvt_two_sided_entry_pace_ramp:
+            current_budget = _safe_float(
+                control.get("best_quote_maker_volume_cycle_budget_notional")
+            )
+            target_budget = min(
+                max(
+                    _safe_float(
+                        volume_summary.get("target_cycle_budget_floor_notional")
+                    ),
+                    float(cycle_budget_floor_notional),
+                ),
+                current_budget
+                + max(float(volume_recovery_cycle_budget_increment), 0.0),
+            )
+            updates = {
+                "best_quote_maker_volume_pending_entry_buffer_share": 0.0,
+            }
+            if target_budget > current_budget:
+                updates["best_quote_maker_volume_cycle_budget_notional"] = target_budget
+            changed, backup_path = _apply_control_update(
+                symbol=normalized_symbol,
+                control_path=control_path,
+                control=control,
+                updates=updates,
+                now=now,
+                dry_run=dry_run,
+                restart_runner=restart,
+            )
+            action = (
+                "dry_run_ramp_grvt_two_sided_entry_for_pace"
+                if dry_run
+                else "ramp_grvt_two_sided_entry_for_pace"
             )
         elif (
             grvt_post_shock_soft_release_safe
