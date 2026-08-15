@@ -784,6 +784,33 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertAlmostEqual(plan["metrics"]["effective_ladder_spacing"], 0.0005)
         self.assertEqual(plan["metrics"]["dynamic_tick"]["offset_ticks"], 7)
 
+    def test_dynamic_control_keeps_minimum_viable_cycle_when_extreme(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_entry_orders_per_side=2,
+                min_cycle_budget_notional=50.0,
+                dynamic_control_enabled=True,
+                dynamic_control_extreme_volatility_ratio=0.003,
+                dynamic_control_extreme_volatility_budget_scale=0.02,
+                dynamic_control_extreme_volatility_extra_offset_ticks=4,
+                dynamic_control_extreme_volatility_step_scale=2.0,
+            ),
+            inputs=_inputs(
+                cycle_budget_notional=240.0,
+                tick_size=0.0001,
+                min_notional=5.0,
+                entry_ladder_spacing=0.0004,
+                market_amplitude_5m=0.004,
+            ),
+        )
+
+        control = plan["metrics"]["dynamic_control"]
+        self.assertTrue(control["budget_floor_applied"])
+        self.assertAlmostEqual(plan["metrics"]["cycle_budget_notional"], 50.0)
+        self.assertTrue(plan["buy_orders"])
+        self.assertTrue(plan["sell_orders"])
+
     def test_dynamic_control_biases_budget_toward_trend_side(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(

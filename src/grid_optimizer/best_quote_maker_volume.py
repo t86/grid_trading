@@ -609,6 +609,7 @@ def build_best_quote_maker_volume_plan(
         "volatility_ratio": 0.0,
         "trend_score": 0.0,
         "budget_scale": 1.0,
+        "budget_floor_applied": False,
         "budget_max_inventory_ratio": _safe_float(
             config.dynamic_control_low_volatility_budget_max_inventory_ratio
         ),
@@ -714,6 +715,17 @@ def build_best_quote_maker_volume_plan(
         trend_threshold = max(_safe_float(config.dynamic_control_trend_return_ratio), 1e-12)
         trend_score = _clamp(((return_1m * 0.65) + (return_5m * 0.35)) / trend_threshold, -1.0, 1.0)
         cycle_budget *= budget_scale
+        # Dynamic volatility scaling is intended to reduce throughput, not
+        # make every maker order fall below the configured minimum. Preserve
+        # one viable cycle so a defensive GRVT tier cannot become a prolonged
+        # zero-entry state while the explicit volatility pause is inactive.
+        dynamic_cycle_budget_floor = min(
+            max(_safe_float(config.min_cycle_budget_notional), 0.0),
+            base_cycle_budget,
+        )
+        budget_floor_applied = cycle_budget + 1e-12 < dynamic_cycle_budget_floor
+        if budget_floor_applied:
+            cycle_budget = dynamic_cycle_budget_floor
         if extra_offset_ticks != 0:
             offset_ticks = max(int(offset_ticks) + extra_offset_ticks, 0)
         effective_ladder_spacing = base_ladder_spacing * step_scale if base_ladder_spacing > 0 else base_ladder_spacing
@@ -726,6 +738,7 @@ def build_best_quote_maker_volume_plan(
                 "volatility_ratio": volatility_ratio,
                 "trend_score": trend_score,
                 "budget_scale": budget_scale,
+                "budget_floor_applied": budget_floor_applied,
                 "step_scale": step_scale,
                 "extra_offset_ticks": extra_offset_ticks,
                 "effective_cycle_budget_notional": cycle_budget,
