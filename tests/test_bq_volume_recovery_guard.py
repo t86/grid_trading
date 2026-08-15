@@ -16355,8 +16355,9 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 },
                 long_notional=935.0,
                 short_notional=925.0,
-                open_order_count=0,
-                active_order_count=0,
+                open_order_count=2,
+                active_order_count=2,
+                orders_near_market=True,
             )
             plan_path = output_dir / "grvtusdt_loop_latest_plan.json"
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
