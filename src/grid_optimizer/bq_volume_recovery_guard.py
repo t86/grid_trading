@@ -6302,7 +6302,7 @@ def check_symbol(
         and not grvt_soft_loss_profile_active
         and not bool(assessment.get("volatility_entry_pause_active"))
         and not active_pair_reduce_deadlock
-        and bool(assessment.get("low_volume"))
+        and recovery_low_volume
         and target_pace_behind
         and not bool(assessment.get("high_recovery_wear"))
         and not bool(assessment.get("effective_inventory_soft_pressure"))

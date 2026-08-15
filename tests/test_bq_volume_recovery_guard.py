@@ -14889,7 +14889,12 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 trigger_seconds=120.0,
                 daily_target_notional=150_000.0,
                 cycle_budget_floor_notional=50.0,
-                trade_rows=[],
+                trade_rows=[
+                    {
+                        "time": int((now - timedelta(minutes=2)).timestamp() * 1000),
+                        "quoteQty": "300",
+                    }
+                ],
                 restart_runner=restarts.append,
             )
 
@@ -14899,6 +14904,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 )
             )
             self.assertEqual(result["action"], "ramp_grvt_two_sided_entry_for_pace")
+            self.assertFalse(result["assessment"]["low_volume"])
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 77.0)
             self.assertEqual(control["pause_buy_position_notional"], 900.0)
             self.assertEqual(control["pause_short_position_notional"], 900.0)
