@@ -14855,10 +14855,20 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             plan.update(
                 {
                     "buy_orders": [
-                        {"side": "BUY", "role": "best_quote_entry_long"}
+                        {
+                            "side": "BUY",
+                            "price": 0.5968,
+                            "qty": 16.0,
+                            "role": "best_quote_entry_long",
+                        }
                     ],
                     "sell_orders": [
-                        {"side": "SELL", "role": "best_quote_entry_short"}
+                        {
+                            "side": "SELL",
+                            "price": 0.5972,
+                            "qty": 16.0,
+                            "role": "best_quote_entry_short",
+                        }
                     ],
                     "volatility_entry_pause": {"active": False},
                 }
