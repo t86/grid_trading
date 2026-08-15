@@ -33207,19 +33207,35 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         and _safe_float(best_quote_metrics.get("long_inventory_ratio")) <= 1.0
         and _safe_float(best_quote_metrics.get("short_inventory_ratio")) <= 1.0
     )
-    grvt_reentry_below_soft_bypass = (
-        str(symbol or "").upper().strip() == "GRVTUSDT"
+    grvt_ordinary_below_soft = (
+        grvt_metrics_below_soft
+        or (
+            max(_safe_float(getattr(effective_args, "pause_buy_position_notional", 0.0)), 0.0) > 0
+            and max(_safe_float(getattr(effective_args, "pause_short_position_notional", 0.0)), 0.0) > 0
+            and grvt_ordinary_long_notional
+            < _safe_float(getattr(effective_args, "pause_buy_position_notional", 0.0))
+            and grvt_ordinary_short_notional
+            < _safe_float(getattr(effective_args, "pause_short_position_notional", 0.0))
+        )
+    )
+    grvt_active_pair_opposite_rebalance = (
+        str(loss_reduce_reentry_guard.get("source") or "") == "active_pair_reduce"
         and (
-            grvt_metrics_below_soft
+            (
+                str(loss_reduce_reentry_guard.get("side") or "").upper() == "BUY"
+                and _safe_float(best_quote_metrics.get("long_inventory_ratio")) > 1.0
+                and _safe_float(best_quote_metrics.get("short_inventory_ratio")) < 1.0
+            )
             or (
-                max(_safe_float(getattr(effective_args, "pause_buy_position_notional", 0.0)), 0.0) > 0
-                and max(_safe_float(getattr(effective_args, "pause_short_position_notional", 0.0)), 0.0) > 0
-                and grvt_ordinary_long_notional
-                < _safe_float(getattr(effective_args, "pause_buy_position_notional", 0.0))
-                and grvt_ordinary_short_notional
-                < _safe_float(getattr(effective_args, "pause_short_position_notional", 0.0))
+                str(loss_reduce_reentry_guard.get("side") or "").upper() == "SELL"
+                and _safe_float(best_quote_metrics.get("short_inventory_ratio")) > 1.0
+                and _safe_float(best_quote_metrics.get("long_inventory_ratio")) < 1.0
             )
         )
+    )
+    grvt_reentry_below_soft_bypass = (
+        str(symbol or "").upper().strip() == "GRVTUSDT"
+        and (grvt_ordinary_below_soft or grvt_active_pair_opposite_rebalance)
     )
     if grvt_reentry_below_soft_bypass and _allow_grvt_reentry_below_soft_bypass(
         loss_reduce_reentry_guard
