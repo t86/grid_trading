@@ -797,8 +797,13 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
                 dynamic_control_extreme_volatility_step_scale=2.0,
             ),
             inputs=_inputs(
+                bid_price=0.30,
+                ask_price=0.3001,
+                mid_price=0.30005,
                 cycle_budget_notional=240.0,
                 tick_size=0.0001,
+                step_size=1.0,
+                min_qty=1.0,
                 min_notional=5.0,
                 entry_ladder_spacing=0.0004,
                 market_amplitude_5m=0.004,
