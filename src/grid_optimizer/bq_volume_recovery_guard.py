@@ -6314,21 +6314,12 @@ def check_symbol(
         and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) == 0
         and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) == 0
     )
-    # The submit snapshot normally supplies live side counts.  During a quiet
-    # cycle it can retain only client-order IDs, however, even while the fresh
-    # plan and ordinary open-order count show both sides are live.  Treat that
-    # bounded combination as live flow so pace recovery is not short-circuited.
+    # Pace ramps require exchange-backed ordinary entry on both sides.  A
+    # planned pair plus a nonzero total order count is insufficient because
+    # the remaining live order can be a reduce-only order.
     grvt_live_two_sided_entry = (
-        (
-            _safe_int(assessment.get("ordinary_active_entry_long_order_count")) > 0
-            and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) > 0
-        )
-        or (
-            _safe_int(assessment.get("planned_entry_buy_order_count")) > 0
-            and _safe_int(assessment.get("planned_entry_sell_order_count")) > 0
-            and _active_order_count(plan, submit) > 0
-            and not bool(assessment.get("ineffective_orders"))
-        )
+        _safe_int(assessment.get("ordinary_active_entry_long_order_count")) > 0
+        and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) > 0
     )
     # A completed bounded loss release can dominate the fresh five-minute
     # wear sample even after it has returned both ordinary sides below soft.
