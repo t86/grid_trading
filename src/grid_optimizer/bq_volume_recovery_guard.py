@@ -10322,10 +10322,11 @@ def check_symbol(
                 normalized_symbol == "GRVTUSDT"
                 and target_pace_behind
                 and pace_ratio < 0.75
-                and recovery_reapply_debounced
                 # A missing ordinary entry leg must not be masked by a
                 # surviving opposite-side entry or a reduce-only order.  The
                 # pair is live only when both exchange-side legs are present.
+                # This liveness path has its own bounded restart interval, so
+                # a generic control-update cooldown must not defer it.
                 and (
                     _safe_int(assessment.get("active_order_count")) <= 0
                     or _safe_int(

@@ -14760,7 +14760,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             updates["best_quote_maker_volume_cycle_budget_notional"], 100.0
         )
 
-    def test_grvt_missing_actual_entry_leg_restarts_despite_reapply_debounce(self) -> None:
+    def test_grvt_missing_actual_entry_leg_bypasses_reapply_cooldown(self) -> None:
         now = datetime(2026, 8, 15, 1, 0, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -14803,7 +14803,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "GRVTUSDT": {
                         "status": "recovery_active",
                         "first_low_volume_at": (now - timedelta(minutes=10)).isoformat(),
-                        "last_recovery_action_at": (now - timedelta(seconds=30)).isoformat(),
+                        "last_recovery_action_at": (now - timedelta(minutes=5)).isoformat(),
                     }
                 }
             }
