@@ -16424,7 +16424,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 100.0,
             )
             self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
-            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 172.0)
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 160.0)
             self.assertEqual(restarts, ["GRVTUSDT"])
 
     def test_grvt_dynamic_extreme_allows_bounded_release_when_one_side_exceeds_soft(self) -> None:
