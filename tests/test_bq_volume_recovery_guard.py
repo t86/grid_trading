@@ -8714,7 +8714,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
             self.assertTrue(result["assessment"]["effective_inventory_soft_pressure"])
             self.assertTrue(result["assessment"]["ineffective_orders"])
-            self.assertEqual(result["action"], "enable_soft_inventory_loss_reduce")
+            self.assertEqual(result["action"], "enable_grvt_single_soft_loss_release")
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertEqual(restarts, ["GRVTUSDT"])
 
