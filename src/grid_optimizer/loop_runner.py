@@ -1922,6 +1922,7 @@ def _allow_grvt_reentry_below_soft_bypass(loss_reduce_reentry_guard: dict[str, A
         return False
     return str(loss_reduce_reentry_guard.get("source") or "") not in {
         "active_pair_reduce",
+        "active_pair_reduce_fill",
         "adverse_reduce",
         "hard_loss",
     }
