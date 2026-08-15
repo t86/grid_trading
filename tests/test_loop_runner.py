@@ -11113,6 +11113,7 @@ class LoopRunnerTests(unittest.TestCase):
                 "order_count": 1,
                 "long_order_notional": 99.72,
                 "short_order_notional": 0.0,
+                "long_expected_loss_ratio": 0.005,
             },
             current_long_notional=920.0,
             current_short_notional=850.0,
@@ -11128,6 +11129,31 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(guard["block_short_entries"])
         self.assertEqual(guard["side"], "SELL")
         self.assertEqual(guard["source"], "active_pair_reduce")
+
+    def test_loss_reduce_reentry_guard_ignores_nonloss_active_pair_reduce(self) -> None:
+        guard = resolve_loss_reduce_reentry_guard(
+            state={},
+            enabled=True,
+            adverse_inventory_reduce={"enabled": True, "placed_reduce_orders": 0},
+            hard_loss_forced_reduce={},
+            best_quote_active_pair_reduce={
+                "enabled": True,
+                "order_count": 1,
+                "long_order_notional": 99.90,
+                "short_order_notional": 0.0,
+                "long_expected_loss_ratio": 0.0,
+            },
+            current_long_notional=906.0,
+            current_short_notional=818.0,
+            mid_price=0.30085,
+            effective_step_price=0.00035,
+            now=datetime(2026, 8, 15, 2, 43, tzinfo=timezone.utc),
+            cooldown_seconds=300.0,
+            recover_buffer_steps=1.0,
+        )
+
+        self.assertFalse(guard["active"])
+        self.assertEqual(guard["reason"], "no_recent_loss_reduce")
 
     def test_loss_reduce_reentry_guard_prefers_lossy_active_pair_side(self) -> None:
         guard = resolve_loss_reduce_reentry_guard(

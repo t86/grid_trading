@@ -1635,11 +1635,17 @@ def _loss_reduce_side_from_reports(
         short_notional = _safe_float(active_pair.get("short_order_notional"))
         long_loss_ratio = _safe_float(active_pair.get("long_expected_loss_ratio"))
         short_loss_ratio = _safe_float(active_pair.get("short_expected_loss_ratio"))
-        if long_loss_ratio > 0 or short_loss_ratio > 0:
+        has_expected_loss = (
+            "long_expected_loss_ratio" in active_pair
+            or "short_expected_loss_ratio" in active_pair
+        )
+        if has_expected_loss and (long_loss_ratio > 0 or short_loss_ratio > 0):
             if long_notional > 0 and long_loss_ratio >= short_loss_ratio:
                 return "SELL", "active_pair_reduce", None
             if short_notional > 0:
                 return "BUY", "active_pair_reduce", None
+        if has_expected_loss:
+            return None, None, None
         if long_notional > 0:
             return "SELL", "active_pair_reduce", None
         if short_notional > 0:
