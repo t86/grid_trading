@@ -6395,6 +6395,19 @@ def check_symbol(
         _safe_int(assessment.get("ordinary_active_entry_long_order_count")) > 0
         and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) > 0
     )
+    # When inventory bias intentionally leaves only the light-side entry
+    # live, that order is the safe route back to a two-sided book.  It needs
+    # the same bounded dynamic floor as a normal pair; otherwise a defensive
+    # dynamic scale can leave the only balancing quote at exchange-minimum
+    # size for an extended period.
+    grvt_live_balancing_entry = (
+        bool(assessment.get("balancing_entry_only"))
+        and _safe_int(assessment.get("planned_reduce_only_order_count")) == 0
+        and (
+            _safe_int(assessment.get("ordinary_active_entry_long_order_count")) > 0
+            or _safe_int(assessment.get("ordinary_active_entry_short_order_count")) > 0
+        )
+    )
     # A completed bounded loss release can dominate the fresh five-minute
     # wear sample even after it has returned both ordinary sides below soft.
     # Do not let that one completed release block the restored two-sided
@@ -6431,7 +6444,6 @@ def check_symbol(
         and not grvt_soft_loss_profile_active
         and not bool(assessment.get("volatility_entry_pause_active"))
         and not active_pair_reduce_deadlock
-        and recovery_low_volume
         and target_pace_behind
         and (
             not bool(assessment.get("high_recovery_wear"))
@@ -6439,6 +6451,17 @@ def check_symbol(
         )
         and not bool(assessment.get("effective_inventory_soft_pressure"))
         and grvt_live_two_sided_entry
+    )
+    grvt_balancing_entry_pace_ramp = (
+        normalized_symbol == "GRVTUSDT"
+        and not grvt_soft_loss_profile_active
+        and not bool(assessment.get("volatility_entry_pause_active"))
+        and not active_pair_reduce_deadlock
+        and target_pace_behind
+        and not bool(assessment.get("high_recovery_wear"))
+        and not bool(assessment.get("effective_inventory_soft_pressure"))
+        and actual_inventory_below_soft
+        and grvt_live_balancing_entry
     )
     # A completed GRVT loss-release must restore ordinary two-sided flow
     # without dropping its budget back to a stale pre-recovery baseline while
@@ -6555,6 +6578,7 @@ def check_symbol(
                 _safe_int(assessment.get("ordinary_active_entry_long_order_count")) <= 0
                 or _safe_int(assessment.get("ordinary_active_entry_short_order_count")) <= 0
             )
+            and not grvt_live_balancing_entry
             and _grvt_missing_entry_liveness_restart_due(item, now=now)
         ):
             # Below soft, a missing exchange entry leg is a liveness failure,
@@ -6679,7 +6703,7 @@ def check_symbol(
                 else "restore_grvt_below_soft_zero_entry_requote"
             )
             item["last_grvt_no_entry_liveness_restart_at"] = now.isoformat()
-        elif grvt_two_sided_entry_pace_ramp:
+        elif grvt_two_sided_entry_pace_ramp or grvt_balancing_entry_pace_ramp:
             current_budget = _safe_float(
                 control.get("best_quote_maker_volume_cycle_budget_notional")
             )
@@ -6719,6 +6743,11 @@ def check_symbol(
                 restart_runner=restart,
             )
             action = (
+                "dry_run_ramp_grvt_balancing_entry_for_pace"
+                if dry_run and grvt_balancing_entry_pace_ramp
+                else "ramp_grvt_balancing_entry_for_pace"
+                if grvt_balancing_entry_pace_ramp
+                else
                 "dry_run_ramp_grvt_two_sided_entry_after_completed_loss_release"
                 if dry_run and grvt_transient_completed_loss_release_wear
                 else "ramp_grvt_two_sided_entry_after_completed_loss_release"
