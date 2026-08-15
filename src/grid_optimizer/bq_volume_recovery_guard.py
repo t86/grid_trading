@@ -338,7 +338,10 @@ _RECOVERY_CONTROL_KEYS = (
 # This is a recovery throughput ceiling, not an inventory threshold.  GRVT
 # remains subject to its existing 900/1000 ordinary-inventory bands; the
 # recovery guard approaches this value only in its bounded per-round steps.
-GRVT_AUTO_CYCLE_BUDGET_CEILING_NOTIONAL = 160.0
+# GRVT's extreme-volatility budget scale can reduce a 160U base budget to a
+# fill-starved 96U/round. Keep the recovery ramp bounded to 12U per round,
+# but leave enough headroom for the guard to restore two-sided throughput.
+GRVT_AUTO_CYCLE_BUDGET_CEILING_NOTIONAL = 240.0
 
 # Keep generic loss-reduction protection separate from the bounded ARX
 # catch-up mode. A few dollars per 10k of maker turnover is expected while a
