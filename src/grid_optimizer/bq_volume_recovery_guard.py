@@ -5647,6 +5647,11 @@ def check_symbol(
         required_hourly_notional > 0
         and not target_pace_ahead
     )
+    grvt_materially_behind_pace = (
+        normalized_symbol == "GRVTUSDT"
+        and required_hourly_notional > 0
+        and trailing_hourly_notional < required_hourly_notional * 0.75
+    )
     # Keep every bounded GRVT loss-release path on the same computed catch-up
     # budget. In particular, the no-fill SLA branch must not bypass this with
     # the legacy 50U lease cap.
@@ -5770,7 +5775,7 @@ def check_symbol(
     # inventory-bias trigger so the planner can restore a protected second leg.
     grvt_urgent_one_sided_pace_relief = (
         normalized_symbol == "GRVTUSDT"
-        and severe_one_sided_stall
+        and (severe_one_sided_stall or grvt_materially_behind_pace)
         and one_sided_entry_unprotected
         and target_pace_behind
         and not effective_inventory_soft_pressure

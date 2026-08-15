@@ -17534,7 +17534,10 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "GRVTUSDT": {
                         "status": "recovery_active",
                         "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
-                        "one_sided_entry_since": (now - timedelta(minutes=3)).isoformat(),
+                        # A material pace deficit must restore the missing
+                        # ordinary entry leg immediately, not after the usual
+                        # one-sided stall timer has elapsed.
+                        "one_sided_entry_since": now.isoformat(),
                         "last_recovery_action_at": (now - timedelta(seconds=10)).isoformat(),
                         "guard_original_controls": {
                             "sticky_entry_price_tolerance_steps": 8.0,
