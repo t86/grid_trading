@@ -11088,7 +11088,7 @@ class LoopRunnerTests(unittest.TestCase):
             hard_loss_forced_reduce={},
             current_long_notional=180.0,
             current_short_notional=0.0,
-            mid_price=0.5662,
+            mid_price=0.5658,
             effective_step_price=0.0001,
             now=now + timedelta(seconds=301),
             cooldown_seconds=300.0,
@@ -11129,6 +11129,114 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(guard["block_short_entries"])
         self.assertEqual(guard["side"], "SELL")
         self.assertEqual(guard["source"], "active_pair_reduce")
+
+    def test_loss_reduce_reentry_guard_keeps_both_active_pair_sides(self) -> None:
+        now = datetime(2026, 8, 15, 4, 48, tzinfo=timezone.utc)
+        state: dict[str, object] = {}
+
+        resolve_loss_reduce_reentry_guard(
+            state=state,
+            enabled=True,
+            adverse_inventory_reduce={"enabled": True, "placed_reduce_orders": 0},
+            hard_loss_forced_reduce={},
+            best_quote_active_pair_reduce={
+                "enabled": True,
+                "order_count": 1,
+                "long_order_notional": 0.0,
+                "short_order_notional": 99.84,
+                "short_expected_loss_ratio": 0.004,
+            },
+            current_long_notional=850.0,
+            current_short_notional=920.0,
+            mid_price=0.3054,
+            effective_step_price=0.00035,
+            now=now,
+            cooldown_seconds=180.0,
+            recover_buffer_steps=1.0,
+        )
+        guard = resolve_loss_reduce_reentry_guard(
+            state=state,
+            enabled=True,
+            adverse_inventory_reduce={"enabled": True, "placed_reduce_orders": 0},
+            hard_loss_forced_reduce={},
+            best_quote_active_pair_reduce={
+                "enabled": True,
+                "order_count": 1,
+                "long_order_notional": 99.97,
+                "short_order_notional": 0.0,
+                "long_expected_loss_ratio": 0.004,
+            },
+            current_long_notional=920.0,
+            current_short_notional=850.0,
+            mid_price=0.3048,
+            effective_step_price=0.00035,
+            now=now + timedelta(seconds=30),
+            cooldown_seconds=180.0,
+            recover_buffer_steps=1.0,
+        )
+
+        self.assertTrue(guard["block_long_entries"])
+        self.assertTrue(guard["block_short_entries"])
+        self.assertEqual(set(guard["active_sides"]), {"BUY", "SELL"})
+
+    def test_loss_reduce_reentry_guard_requires_favorable_short_reentry_price(self) -> None:
+        now = datetime(2026, 8, 15, 4, 54, tzinfo=timezone.utc)
+        state: dict[str, object] = {}
+
+        resolve_loss_reduce_reentry_guard(
+            state=state,
+            enabled=True,
+            adverse_inventory_reduce={"enabled": True, "placed_reduce_orders": 0},
+            hard_loss_forced_reduce={},
+            best_quote_active_pair_reduce={
+                "enabled": True,
+                "order_count": 1,
+                "long_order_notional": 0.0,
+                "short_order_notional": 99.80,
+                "short_expected_loss_ratio": 0.004,
+            },
+            current_long_notional=850.0,
+            current_short_notional=920.0,
+            mid_price=0.3054,
+            effective_step_price=0.00035,
+            now=now,
+            cooldown_seconds=180.0,
+            recover_buffer_steps=1.0,
+        )
+        worse_price = resolve_loss_reduce_reentry_guard(
+            state=state,
+            enabled=True,
+            adverse_inventory_reduce={"enabled": True, "placed_reduce_orders": 0},
+            hard_loss_forced_reduce={},
+            current_long_notional=850.0,
+            current_short_notional=820.0,
+            mid_price=0.3046,
+            effective_step_price=0.00035,
+            now=now + timedelta(seconds=181),
+            cooldown_seconds=180.0,
+            recover_buffer_steps=1.0,
+        )
+
+        self.assertTrue(worse_price["active"])
+        self.assertTrue(worse_price["block_short_entries"])
+        self.assertIn("price_not_recovered", worse_price["reason"])
+
+        favorable_price = resolve_loss_reduce_reentry_guard(
+            state=state,
+            enabled=True,
+            adverse_inventory_reduce={"enabled": True, "placed_reduce_orders": 0},
+            hard_loss_forced_reduce={},
+            current_long_notional=850.0,
+            current_short_notional=820.0,
+            mid_price=0.3058,
+            effective_step_price=0.00035,
+            now=now + timedelta(seconds=182),
+            cooldown_seconds=180.0,
+            recover_buffer_steps=1.0,
+        )
+
+        self.assertFalse(favorable_price["active"])
+        self.assertEqual(favorable_price["reason"], "recovered")
 
     def test_loss_reduce_reentry_guard_ignores_nonloss_active_pair_reduce(self) -> None:
         guard = resolve_loss_reduce_reentry_guard(

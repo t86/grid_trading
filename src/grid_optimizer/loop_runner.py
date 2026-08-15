@@ -1674,6 +1674,19 @@ def resolve_loss_reduce_reentry_guard(
 
     safe_now = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
     memory = dict(state.get("loss_reduce_reentry_guard") or {})
+    raw_side_memories = memory.get("sides")
+    side_memories = (
+        {
+            str(item_side).upper(): dict(item_memory)
+            for item_side, item_memory in raw_side_memories.items()
+            if str(item_side).upper() in {"BUY", "SELL"} and isinstance(item_memory, dict)
+        }
+        if isinstance(raw_side_memories, dict)
+        else {}
+    )
+    legacy_side = str(memory.get("side") or "").upper().strip()
+    if not side_memories and legacy_side in {"BUY", "SELL"}:
+        side_memories[legacy_side] = memory
     trigger_side, trigger_source, trigger_price = _loss_reduce_side_from_reports(
         adverse_inventory_reduce=adverse_inventory_reduce,
         hard_loss_forced_reduce=hard_loss_forced_reduce,
@@ -1682,84 +1695,113 @@ def resolve_loss_reduce_reentry_guard(
     safe_mid = max(_safe_float(mid_price), 0.0)
     if trigger_side in {"BUY", "SELL"}:
         reference_price = max(_safe_float(trigger_price), safe_mid, 0.0)
-        memory = {
+        side_memories[trigger_side] = {
             "side": trigger_side,
             "source": trigger_source or "loss_reduce",
             "started_at": _isoformat(safe_now),
             "updated_at": _isoformat(safe_now),
             "reference_price": reference_price,
         }
-        state["loss_reduce_reentry_guard"] = memory
 
-    side = str(memory.get("side") or "").upper().strip()
-    started_at = _parse_rescue_guard_time(memory.get("started_at"))
-    if side not in {"BUY", "SELL"} or started_at is None:
+    if not side_memories:
         state.pop("loss_reduce_reentry_guard", None)
         return {"enabled": True, "active": False, "reason": "no_recent_loss_reduce"}
 
-    elapsed_seconds = max((safe_now - started_at).total_seconds(), 0.0)
-    min_remaining_seconds = max(_safe_float(cooldown_seconds) - elapsed_seconds, 0.0)
     step_price = max(_safe_float(effective_step_price), 0.0)
     buffer_price = step_price * max(_safe_float(recover_buffer_steps), 0.0)
-    reference_price = max(_safe_float(memory.get("reference_price")), 0.0)
-    if reference_price <= 0:
-        reference_price = safe_mid
-        memory["reference_price"] = reference_price
+    active_guards: dict[str, dict[str, Any]] = {}
+    for side, side_memory in side_memories.items():
+        started_at = _parse_rescue_guard_time(side_memory.get("started_at"))
+        if started_at is None:
+            continue
+        elapsed_seconds = max((safe_now - started_at).total_seconds(), 0.0)
+        min_remaining_seconds = max(_safe_float(cooldown_seconds) - elapsed_seconds, 0.0)
+        reference_price = max(_safe_float(side_memory.get("reference_price")), 0.0)
+        if reference_price <= 0:
+            reference_price = safe_mid
+            side_memory["reference_price"] = reference_price
 
-    gate_price: float | None = None
-    price_recovered = True
-    if reference_price > 0 and buffer_price > 0 and safe_mid > 0:
-        if side == "SELL":
-            gate_price = reference_price + buffer_price
-            price_recovered = safe_mid >= gate_price - 1e-12
-        else:
-            gate_price = max(reference_price - buffer_price, 0.0)
-            price_recovered = safe_mid <= gate_price + 1e-12
+        gate_price: float | None = None
+        price_recovered = True
+        if reference_price > 0 and buffer_price > 0 and safe_mid > 0:
+            if side == "SELL":
+                gate_price = max(reference_price - buffer_price, 0.0)
+                price_recovered = safe_mid <= gate_price + 1e-12
+            else:
+                gate_price = reference_price + buffer_price
+                price_recovered = safe_mid >= gate_price - 1e-12
 
-    current_rescue_notional = (
-        max(_safe_float(current_short_notional), 0.0)
-        if side == "BUY"
-        else max(_safe_float(current_long_notional), 0.0)
-    )
-    should_protect = min_remaining_seconds > 0 or not price_recovered
-    if not should_protect:
+        current_rescue_notional = (
+            max(_safe_float(current_short_notional), 0.0)
+            if side == "BUY"
+            else max(_safe_float(current_long_notional), 0.0)
+        )
+        if min_remaining_seconds <= 0 and price_recovered:
+            continue
+
+        reasons: list[str] = []
+        if min_remaining_seconds > 0:
+            reasons.append(f"cooldown_remaining={math.ceil(min_remaining_seconds)}s")
+        if not price_recovered:
+            reasons.append("price_not_recovered")
+        side_memory["updated_at"] = _isoformat(safe_now)
+        active_guards[side] = {
+            "memory": side_memory,
+            "side": side,
+            "source": side_memory.get("source"),
+            "started_at": _isoformat(started_at),
+            "elapsed_seconds": elapsed_seconds,
+            "min_remaining_seconds": min_remaining_seconds,
+            "reference_price": reference_price,
+            "gate_price": gate_price,
+            "mid_price": safe_mid,
+            "current_rescue_notional": current_rescue_notional,
+            "reason": ";".join(reasons) or "loss_reduce_reentry_guard_active",
+        }
+
+    if not active_guards:
         state.pop("loss_reduce_reentry_guard", None)
         return {
             "enabled": True,
             "active": False,
             "reason": "recovered",
-            "side": side,
-            "source": memory.get("source"),
-            "elapsed_seconds": elapsed_seconds,
-            "reference_price": reference_price,
-            "gate_price": gate_price,
-            "mid_price": safe_mid,
-            "current_rescue_notional": current_rescue_notional,
         }
 
-    reasons: list[str] = []
-    if min_remaining_seconds > 0:
-        reasons.append(f"cooldown_remaining={math.ceil(min_remaining_seconds)}s")
-    if not price_recovered:
-        reasons.append("price_not_recovered")
-    memory["updated_at"] = _isoformat(safe_now)
+    primary_side = trigger_side if trigger_side in active_guards else max(
+        active_guards,
+        key=lambda item_side: active_guards[item_side]["started_at"],
+    )
+    primary_guard = active_guards[primary_side]
+    memory = {
+        "sides": {
+            side: guard["memory"]
+            for side, guard in active_guards.items()
+        },
+        "side": primary_side,
+        "source": primary_guard.get("source"),
+        "started_at": primary_guard["started_at"],
+        "updated_at": _isoformat(safe_now),
+        "reference_price": primary_guard["reference_price"],
+    }
     state["loss_reduce_reentry_guard"] = memory
-    return {
+    report = {
         "enabled": True,
         "active": True,
-        "side": side,
-        "source": memory.get("source"),
-        "block_long_entries": side == "SELL",
-        "block_short_entries": side == "BUY",
-        "started_at": _isoformat(started_at),
-        "elapsed_seconds": elapsed_seconds,
-        "min_remaining_seconds": min_remaining_seconds,
-        "reference_price": reference_price,
-        "gate_price": gate_price,
-        "mid_price": safe_mid,
-        "current_rescue_notional": current_rescue_notional,
-        "reason": ";".join(reasons) or "loss_reduce_reentry_guard_active",
+        "side": primary_side,
+        "source": primary_guard.get("source"),
+        "block_long_entries": "SELL" in active_guards,
+        "block_short_entries": "BUY" in active_guards,
+        "active_sides": sorted(active_guards),
+        "side_guards": {
+            side: {key: value for key, value in guard.items() if key != "memory"}
+            for side, guard in active_guards.items()
+        },
+        "reason": " | ".join(
+            f"{side}:{active_guards[side]['reason']}" for side in sorted(active_guards)
+        ),
     }
+    report.update({key: value for key, value in primary_guard.items() if key != "memory"})
+    return report
 
 
 def _allow_grvt_reentry_below_soft_bypass(loss_reduce_reentry_guard: dict[str, Any]) -> bool:
