@@ -5760,6 +5760,19 @@ def check_symbol(
         and one_sided_entry_seconds >= fast_sla_seconds
         and target_pace_behind
     )
+    # GRVT can remain one-sided after the sticky requote stage even when both
+    # ordinary legs are below their soft limits.  Waiting through the generic
+    # reapply debounce in that state turns a small inventory gap into a long
+    # volume outage.  Once the one-sided SLA has elapsed, relax only the
+    # inventory-bias trigger so the planner can restore a protected second leg.
+    grvt_urgent_one_sided_pace_relief = (
+        normalized_symbol == "GRVTUSDT"
+        and severe_one_sided_stall
+        and one_sided_entry_unprotected
+        and target_pace_behind
+        and actual_inventory_below_soft
+        and not high_recovery_wear
+    )
 
     pace_ratio = (
         trailing_hourly_notional / required_hourly_notional
@@ -8772,6 +8785,48 @@ def check_symbol(
                         "last_recovery_action": action,
                     }
                 )
+            elif grvt_urgent_one_sided_pace_relief:
+                current_gap = abs(
+                    _safe_float(assessment.get("current_long_notional"))
+                    - _safe_float(assessment.get("current_short_notional"))
+                )
+                configured_gap = _safe_float(
+                    control.get("best_quote_maker_volume_inventory_bias_min_notional_gap")
+                )
+                relief_gap = current_gap + max(float(inventory_bias_relief_notional_margin), 0.0)
+                if current_gap >= configured_gap and relief_gap > configured_gap:
+                    updates = {
+                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                        "best_quote_maker_volume_inventory_bias_min_notional_gap": relief_gap,
+                    }
+                    _remember_recovery_controls(item, control, tuple(updates))
+                    _remember_recovery_updates(item, updates)
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
+                    action = (
+                        "dry_run_relax_grvt_inventory_bias_for_one_sided_pace"
+                        if dry_run
+                        else "relax_grvt_inventory_bias_for_one_sided_pace"
+                    )
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "recovery_started_at": now.isoformat(),
+                            "recovery_owned": True,
+                            "last_recovery_action_at": now.isoformat(),
+                            "last_recovery_action": action,
+                        }
+                    )
+                else:
+                    action = "hold_grvt_inventory_bias_pace_relief_boundary"
+                    item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
             elif (
                 severe_one_sided_stall
                 and recovery_hold_satisfied
@@ -10263,6 +10318,52 @@ def check_symbol(
                 )
                 if not dry_run:
                     restart(normalized_symbol)
+            elif grvt_urgent_one_sided_pace_relief:
+                current_gap = abs(
+                    _safe_float(assessment.get("current_long_notional"))
+                    - _safe_float(assessment.get("current_short_notional"))
+                )
+                configured_gap = _safe_float(
+                    control.get("best_quote_maker_volume_inventory_bias_min_notional_gap")
+                )
+                relief_gap = current_gap + max(float(inventory_bias_relief_notional_margin), 0.0)
+                if current_gap >= configured_gap and relief_gap > configured_gap:
+                    _remember_recovery_controls(
+                        item,
+                        control,
+                        ("best_quote_maker_volume_inventory_bias_min_notional_gap",),
+                    )
+                    updates = {
+                        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                        "best_quote_maker_volume_inventory_bias_min_notional_gap": relief_gap,
+                    }
+                    _remember_recovery_updates(item, updates)
+                    action = (
+                        "dry_run_relax_grvt_inventory_bias_for_one_sided_pace"
+                        if dry_run
+                        else "relax_grvt_inventory_bias_for_one_sided_pace"
+                    )
+                    item.update(
+                        {
+                            "status": "recovery_active",
+                            "recovery_started_at": item.get("recovery_started_at") or now.isoformat(),
+                            "recovery_owned": True,
+                            "last_recovery_action_at": now.isoformat(),
+                            "last_recovery_action": action,
+                        }
+                    )
+                    changed, backup_path = _apply_control_update(
+                        symbol=normalized_symbol,
+                        control_path=control_path,
+                        control=control,
+                        updates=updates,
+                        now=now,
+                        dry_run=dry_run,
+                        restart_runner=restart,
+                    )
+                else:
+                    action = "hold_grvt_inventory_bias_pace_relief_boundary"
+                    item.update({"status": "low_volume", "last_recovery_check_at": now.isoformat()})
             elif (
                 recovery_reapply_debounced
                 and not effective_inventory_soft_pressure

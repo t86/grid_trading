@@ -17396,6 +17396,83 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 2)
             self.assertEqual(restarts, ["GRVTUSDT"])
 
+    def test_grvt_one_sided_pace_relief_bypasses_reapply_debounce(self) -> None:
+        now = datetime(2026, 8, 15, 2, 45, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                symbol="GRVTUSDT",
+                control={
+                    "pause_buy_position_notional": 900.0,
+                    "pause_short_position_notional": 900.0,
+                    "best_quote_maker_volume_inventory_bias_min_notional_gap": 80.0,
+                    "sticky_entry_price_tolerance_steps": 1.0,
+                },
+                long_notional=808.0,
+                short_notional=892.0,
+                open_order_count=1,
+                active_order_count=1,
+                orders_near_market=True,
+            )
+            plan_path = output_dir / "grvtusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan.update(
+                {
+                    "sell_orders": [],
+                    "buy_paused": False,
+                    "short_paused": True,
+                    "pause_reasons": ["inventory_bias"],
+                    "short_pause_reasons": ["inventory_bias"],
+                }
+            )
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "GRVTUSDT": {
+                        "status": "recovery_active",
+                        "recovery_started_at": (now - timedelta(minutes=3)).isoformat(),
+                        "one_sided_entry_since": (now - timedelta(minutes=3)).isoformat(),
+                        "last_recovery_action_at": (now - timedelta(seconds=10)).isoformat(),
+                        "guard_original_controls": {
+                            "sticky_entry_price_tolerance_steps": 8.0,
+                        },
+                        "guard_recovery_controls": {
+                            "sticky_entry_price_tolerance_steps": 1.0,
+                        },
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="GRVTUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=60,
+                min_volume_notional=100.0,
+                trigger_seconds=120.0,
+                daily_target_notional=150_000.0,
+                pause_baseline_long_notional=900.0,
+                pause_baseline_short_notional=900.0,
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "grvtusdt_loop_runner_control.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(result["action"], "relax_grvt_inventory_bias_for_one_sided_pace")
+            self.assertTrue(result["assessment"]["actual_inventory_below_soft"])
+            self.assertTrue(result["assessment"]["target_pace_behind"])
+            self.assertEqual(
+                control["best_quote_maker_volume_inventory_bias_min_notional_gap"],
+                108.0,
+            )
+            self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
+            self.assertEqual(restarts, ["GRVTUSDT"])
+
     def test_resolved_inventory_relief_switches_to_cycle_budget_recovery(self) -> None:
         now = datetime(2026, 6, 26, 10, 28, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
