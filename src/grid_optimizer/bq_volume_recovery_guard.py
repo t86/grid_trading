@@ -6260,6 +6260,23 @@ def check_symbol(
         and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) == 0
         and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) == 0
     )
+    # Once both ordinary sides are below soft, retaining the loss-release
+    # lease just because the balancing side is already live is counter-
+    # productive: the lease leaves the cycle on its reduced budget and slows
+    # the return to normal two-sided flow.  A live ordinary entry proves the
+    # runner is no longer stuck; restore the normal controls immediately.
+    grvt_dynamic_release_below_soft_with_live_entry = (
+        grvt_dynamic_loss_release_in_progress
+        and _safe_float(assessment.get("ordinary_long_notional"))
+        <= _safe_float(assessment.get("long_soft_limit_notional"))
+        and _safe_float(assessment.get("ordinary_short_notional"))
+        <= _safe_float(assessment.get("short_soft_limit_notional"))
+        and _safe_int(assessment.get("planned_entry_order_count")) > 0
+        and (
+            _safe_int(assessment.get("ordinary_active_entry_long_order_count")) > 0
+            or _safe_int(assessment.get("ordinary_active_entry_short_order_count")) > 0
+        )
+    )
     # Timeout/debounce state can clear recovery_owned while leaving the
     # loss-release controls active.  Use live controls and live entry state
     # for this escape hatch so the guard cannot retain a zero-entry profile.
@@ -6662,6 +6679,7 @@ def check_symbol(
             if (
                 grvt_dynamic_release_two_sided_flow_restored
                 or grvt_dynamic_release_below_soft_without_entries
+                or grvt_dynamic_release_below_soft_with_live_entry
             ):
                 updates = _restore_recovery_controls(
                     item,
@@ -6697,7 +6715,10 @@ def check_symbol(
                     dry_run=dry_run,
                     restart_runner=restart,
                 )
-                if grvt_dynamic_release_below_soft_without_entries:
+                if (
+                    grvt_dynamic_release_below_soft_without_entries
+                    or grvt_dynamic_release_below_soft_with_live_entry
+                ):
                     action = (
                         "dry_run_restore_grvt_after_dynamic_release_below_soft"
                         if dry_run
