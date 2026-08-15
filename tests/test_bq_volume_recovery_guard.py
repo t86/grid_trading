@@ -17030,7 +17030,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 "symbols": {
                     "GRVTUSDT": {
                         "status": "recovery_active",
-                        "first_low_volume_at": (now - timedelta(minutes=4)).isoformat(),
+                        "first_low_volume_at": (now - timedelta(minutes=1)).isoformat(),
                         "recovery_started_at": (now - timedelta(minutes=1)).isoformat(),
                         "recovery_owned": True,
                         "guard_original_controls": {
