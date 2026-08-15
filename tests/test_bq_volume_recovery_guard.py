@@ -11941,7 +11941,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
         self.assertEqual(volume_summary["trailing_60m_gross_notional"], 4000.0)
         self.assertEqual(volume_summary["target_cycle_budget_ladder_capacity"], 256.0)
 
-    def test_grvt_target_pace_cycle_floor_never_auto_raises_above_100u(self) -> None:
+    def test_grvt_target_pace_cycle_floor_ramps_by_one_increment(self) -> None:
         now = datetime(2026, 8, 14, 9, 0, tzinfo=timezone.utc)
         rows = [
             {
@@ -11976,7 +11976,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             cycle_budget_increment=5.0,
         )
 
-        self.assertEqual(floor, 100.0)
+        self.assertEqual(floor, 105.0)
 
     def test_external_cycle_budget_override_invalidates_stale_recovery_baseline(self) -> None:
         item = {
@@ -16504,7 +16504,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(result["action"], "restore_grvt_after_dynamic_two_sided_flow")
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertFalse(control["best_quote_maker_volume_active_pair_reduce_enabled"])
-            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 100.0)
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 160.0)
             self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 2)
             self.assertEqual(restarts, ["GRVTUSDT"])
 

@@ -335,7 +335,10 @@ _RECOVERY_CONTROL_KEYS = (
     "sticky_exit_price_tolerance_steps",
 )
 
-GRVT_AUTO_CYCLE_BUDGET_CEILING_NOTIONAL = 100.0
+# This is a recovery throughput ceiling, not an inventory threshold.  GRVT
+# remains subject to its existing 900/1000 ordinary-inventory bands; the
+# recovery guard approaches this value only in its bounded per-round steps.
+GRVT_AUTO_CYCLE_BUDGET_CEILING_NOTIONAL = 160.0
 
 # Keep generic loss-reduction protection separate from the bounded ARX
 # catch-up mode. A few dollars per 10k of maker turnover is expected while a
@@ -8449,6 +8452,13 @@ def check_symbol(
                 and (
                     not bool(assessment.get("budget_raise_inventory_buffer_blocked"))
                     or bool(assessment.get("balancing_budget_raise_safe"))
+                    or (
+                        normalized_symbol == "GRVTUSDT"
+                        and actual_inventory_below_soft
+                        and not bool(
+                            assessment.get("volatility_entry_pause_active")
+                        )
+                    )
                 )
             ):
                 updates["best_quote_maker_volume_cycle_budget_notional"] = target_budget
