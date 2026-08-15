@@ -13087,10 +13087,14 @@ def main(argv: list[str] | None = None) -> int:
     registered_symbols: list[str] = []
     exit_code = 0
     for symbol in _normalize_symbols(args.symbols):
+        # GRVT recovery is observation-only at the process boundary. Runtime
+        # control files can be rewritten by runner-management paths, so a JSON
+        # opt-out key alone is not a durable mutation guard for this symbol.
+        symbol_dry_run = args.dry_run or symbol == "GRVTUSDT"
         terminal_delegation = _terminal_drain_delegation(
             symbol=symbol,
             output_dir=output_dir,
-            dry_run=args.dry_run,
+            dry_run=symbol_dry_run,
         )
         if (
             terminal_delegation is not None
@@ -13120,7 +13124,7 @@ def main(argv: list[str] | None = None) -> int:
                 near_cap_ratio=args.near_cap_ratio,
                 far_ticks=args.far_ticks,
                 plan_stale_seconds=args.plan_stale_seconds,
-                dry_run=args.dry_run,
+                dry_run=symbol_dry_run,
                 runner_wrapper=args.runner_wrapper,
                 terminal_delegation=terminal_delegation,
             )
@@ -13152,7 +13156,7 @@ def main(argv: list[str] | None = None) -> int:
                 "action": "observe_target_gate_done_terminal",
                 "changed_keys": [],
                 "backup_path": None,
-                "dry_run": args.dry_run,
+                "dry_run": symbol_dry_run,
                 "restart_failed": None,
                 "target_gate_done_marker": str(target_done_marker),
             }
@@ -13169,7 +13173,7 @@ def main(argv: list[str] | None = None) -> int:
             max_backup_age_seconds=args.corrupt_state_max_backup_age_seconds,
             min_corrupt_age_seconds=args.corrupt_state_min_age_seconds,
             max_snapshot_age_seconds=args.inactive_max_snapshot_age_seconds,
-            dry_run=args.dry_run,
+            dry_run=symbol_dry_run,
         )
         if corrupt_state_result is not None:
             corruption = corrupt_state_result.get("state_corruption")
@@ -13185,7 +13189,7 @@ def main(argv: list[str] | None = None) -> int:
                 and persistent_corruption
                 and _runner_is_active(symbol)
             ):
-                if args.dry_run:
+                if symbol_dry_run:
                     corrupt_state_result["action"] = (
                         "dry_run_stop_runner_persistent_corrupt_state"
                     )
@@ -13203,7 +13207,7 @@ def main(argv: list[str] | None = None) -> int:
                         exit_code = 1
             elif (
                 bool(corrupt_state_result.get("safe_restart_after_salvage"))
-                and not args.dry_run
+                and not symbol_dry_run
                 and not _runner_is_active(symbol)
             ):
                 try:
@@ -13233,7 +13237,7 @@ def main(argv: list[str] | None = None) -> int:
                 restart_cooldown_seconds=args.inactive_restart_cooldown_seconds,
                 max_snapshot_age_seconds=args.inactive_max_snapshot_age_seconds,
                 runner_wrapper=args.runner_wrapper,
-                dry_run=args.dry_run,
+                dry_run=symbol_dry_run,
             )
             _append_jsonl(
                 output_dir / "bq_volume_recovery_guard_events.jsonl",
@@ -13249,7 +13253,7 @@ def main(argv: list[str] | None = None) -> int:
             state=state,
             now=now,
             cooldown_seconds=max(min(float(args.trigger_seconds), 90.0), 60.0),
-            dry_run=args.dry_run,
+            dry_run=symbol_dry_run,
             runner_wrapper=args.runner_wrapper,
         )
         if effective_control_drift_result is not None:
@@ -13268,7 +13272,7 @@ def main(argv: list[str] | None = None) -> int:
             state=state,
             now=now,
             cooldown_seconds=max(min(float(args.trigger_seconds), 90.0), 60.0),
-            dry_run=args.dry_run,
+            dry_run=symbol_dry_run,
             runner_wrapper=args.runner_wrapper,
         )
         if runner_error_result is not None:
@@ -13289,7 +13293,7 @@ def main(argv: list[str] | None = None) -> int:
                 "action": "defer_exchange_trade_fetch_cooldown",
                 "changed_keys": [],
                 "backup_path": None,
-                "dry_run": args.dry_run,
+                "dry_run": symbol_dry_run,
                 "restart_failed": None,
                 "retry_after_seconds": round((fetch_deferred_until - now).total_seconds(), 3),
             }
@@ -13323,7 +13327,7 @@ def main(argv: list[str] | None = None) -> int:
                     "action": "defer_exchange_trade_fetch_cooldown",
                     "changed_keys": [],
                     "backup_path": None,
-                    "dry_run": args.dry_run,
+                    "dry_run": symbol_dry_run,
                     "restart_failed": None,
                     "retry_after_seconds": retry_after_seconds,
                 }
@@ -13338,7 +13342,7 @@ def main(argv: list[str] | None = None) -> int:
                 "action": "skip_exchange_trade_fetch_failed",
                 "changed_keys": [],
                 "backup_path": None,
-                "dry_run": args.dry_run,
+                "dry_run": symbol_dry_run,
                 "restart_failed": None,
                 "exchange_trade_fetch_failed": str(exc),
             }
@@ -13370,7 +13374,7 @@ def main(argv: list[str] | None = None) -> int:
             # exchange-empty ARX book must not remain stuck for the normal
             # multi-minute recovery cooldown.
             cooldown_seconds=max(min(float(args.trigger_seconds), 90.0), 60.0),
-            dry_run=args.dry_run,
+            dry_run=symbol_dry_run,
             runner_wrapper=args.runner_wrapper,
         )
         if exchange_order_drift_result is not None:
@@ -13425,7 +13429,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
             trade_rows=trade_rows,
             volume_source="exchange_user_trades",
-            dry_run=args.dry_run,
+            dry_run=symbol_dry_run,
             runner_wrapper=args.runner_wrapper,
         )
         if result.get("restart_failed"):

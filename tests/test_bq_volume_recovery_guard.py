@@ -16756,6 +16756,82 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control_path.read_text(encoding="utf-8"), original_control)
             self.assertEqual(restarts, [])
 
+    def test_main_always_runs_grvt_recovery_as_dry_run(self) -> None:
+        now = datetime(2026, 8, 15, 17, 20, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                symbol="GRVTUSDT",
+                control={
+                    "best_quote_maker_volume_active_pair_reduce_enabled": False,
+                },
+            )
+            result = {
+                "symbol": "GRVTUSDT",
+                "action": "dry_run_noop",
+                "dry_run": True,
+                "restart_failed": None,
+            }
+
+            with (
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "_terminal_drain_delegation",
+                    return_value=None,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_corrupt_loop_state",
+                    return_value=None,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "_runner_is_active",
+                    return_value=True,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_arx_effective_control_drift",
+                    return_value=None,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_arx_runner_error_loop",
+                    return_value=None,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "_fetch_exchange_user_trades",
+                    return_value=[],
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "recover_arx_exchange_order_drift",
+                    return_value=None,
+                ),
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "check_symbol",
+                    return_value=result,
+                ) as checked,
+                redirect_stdout(StringIO()),
+            ):
+                exit_code = bq_volume_recovery_guard.main(
+                    [
+                        "--output-dir",
+                        str(output_dir),
+                        "--state-path",
+                        str(output_dir / "guard_state.json"),
+                        "--symbols",
+                        "GRVTUSDT",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(checked.call_args.kwargs["dry_run"])
+
     def test_grvt_volatility_pause_releases_owned_loss_recovery(self) -> None:
         now = datetime(2026, 8, 9, 1, 46, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
