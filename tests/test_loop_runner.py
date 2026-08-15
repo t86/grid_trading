@@ -11365,14 +11365,17 @@ class LoopRunnerTests(unittest.TestCase):
             78675939,
         )
 
-    def test_grvt_below_soft_keeps_active_pair_loss_reentry_guard(self) -> None:
-        for source in ("active_pair_reduce", "active_pair_reduce_fill"):
-            with self.subTest(source=source):
-                self.assertFalse(
-                    _allow_grvt_reentry_below_soft_bypass(
-                        {"active": True, "source": source}
-                    )
-                )
+    def test_grvt_below_soft_allows_filled_pair_guard_bypass_only(self) -> None:
+        self.assertFalse(
+            _allow_grvt_reentry_below_soft_bypass(
+                {"active": True, "source": "active_pair_reduce"}
+            )
+        )
+        self.assertTrue(
+            _allow_grvt_reentry_below_soft_bypass(
+                {"active": True, "source": "active_pair_reduce_fill"}
+            )
+        )
 
     def test_loss_reduce_reentry_guard_keeps_active_pair_memory_below_soft(self) -> None:
         now = datetime(2026, 8, 15, 5, 20, tzinfo=timezone.utc)
@@ -11468,7 +11471,7 @@ class LoopRunnerTests(unittest.TestCase):
                 guard["sides"]["BUY"]["order_id"],
                 78501774,
             )
-            self.assertFalse(_allow_grvt_reentry_below_soft_bypass(guard))
+            self.assertTrue(_allow_grvt_reentry_below_soft_bypass(guard))
 
     def test_loss_reduce_trade_backfill_converts_restart_gap_fill(self) -> None:
         events = _loss_reduce_trade_rows_to_execution_events(
