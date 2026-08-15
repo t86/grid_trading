@@ -11404,7 +11404,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertIn("price_not_recovered", guard["reason"])
         self.assertIn("loss_reduce_reentry_guard", state)
 
-    def test_completed_grvt_pair_only_clears_plan_memory_below_soft(self) -> None:
+    def test_completed_grvt_pair_clears_plan_and_fill_memory_below_soft(self) -> None:
         state = {
             "loss_reduce_reentry_guard": {
                 "sides": {
@@ -11421,7 +11421,6 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(
             state["loss_reduce_reentry_guard"]["sides"],
             {
-                "SELL": {"source": "active_pair_reduce_fill", "order_id": 78582743},
                 "OTHER": {"source": "adverse_reduce"},
             },
         )

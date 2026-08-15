@@ -1955,7 +1955,8 @@ def _clear_completed_grvt_active_pair_reentry_memory(state: dict[str, Any]) -> N
     retained = {
         side: memory
         for side, memory in side_memories.items()
-        if str(memory.get("source") or "") != "active_pair_reduce"
+        if str(memory.get("source") or "")
+        not in {"active_pair_reduce", "active_pair_reduce_fill"}
     }
     if retained:
         reentry_memory["sides"] = retained
