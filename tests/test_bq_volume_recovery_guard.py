@@ -16926,7 +16926,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             )
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertFalse(control["best_quote_maker_volume_active_pair_reduce_enabled"])
-            self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 2)
+            self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 3)
             self.assertEqual(restarts, ["GRVTUSDT"])
 
     def test_grvt_post_shock_loss_ratio_deadlock_disables_release_and_cools_down(self) -> None:

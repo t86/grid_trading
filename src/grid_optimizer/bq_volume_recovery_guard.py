@@ -6717,7 +6717,10 @@ def check_symbol(
                 )
                 if (
                     grvt_dynamic_release_below_soft_without_entries
-                    or grvt_dynamic_release_below_soft_with_live_entry
+                    or (
+                        grvt_dynamic_release_below_soft_with_live_entry
+                        and not grvt_dynamic_release_two_sided_flow_restored
+                    )
                 ):
                     action = (
                         "dry_run_restore_grvt_after_dynamic_release_below_soft"
