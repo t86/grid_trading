@@ -33201,14 +33201,25 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             controls.get("current_short_notional", current_short_notional),
         )
     )
+    grvt_metrics_below_soft = (
+        "long_inventory_ratio" in best_quote_metrics
+        and "short_inventory_ratio" in best_quote_metrics
+        and _safe_float(best_quote_metrics.get("long_inventory_ratio")) <= 1.0
+        and _safe_float(best_quote_metrics.get("short_inventory_ratio")) <= 1.0
+    )
     grvt_reentry_below_soft_bypass = (
         str(symbol or "").upper().strip() == "GRVTUSDT"
-        and max(_safe_float(getattr(effective_args, "pause_buy_position_notional", 0.0)), 0.0) > 0
-        and max(_safe_float(getattr(effective_args, "pause_short_position_notional", 0.0)), 0.0) > 0
-        and grvt_ordinary_long_notional
-        < _safe_float(getattr(effective_args, "pause_buy_position_notional", 0.0))
-        and grvt_ordinary_short_notional
-        < _safe_float(getattr(effective_args, "pause_short_position_notional", 0.0))
+        and (
+            grvt_metrics_below_soft
+            or (
+                max(_safe_float(getattr(effective_args, "pause_buy_position_notional", 0.0)), 0.0) > 0
+                and max(_safe_float(getattr(effective_args, "pause_short_position_notional", 0.0)), 0.0) > 0
+                and grvt_ordinary_long_notional
+                < _safe_float(getattr(effective_args, "pause_buy_position_notional", 0.0))
+                and grvt_ordinary_short_notional
+                < _safe_float(getattr(effective_args, "pause_short_position_notional", 0.0))
+            )
+        )
     )
     if grvt_reentry_below_soft_bypass and _allow_grvt_reentry_below_soft_bypass(
         loss_reduce_reentry_guard
@@ -33540,6 +33551,16 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                 cooldown_seconds=getattr(effective_args, "loss_reentry_cooldown_seconds", 300.0),
                 recover_buffer_steps=getattr(effective_args, "loss_reentry_cost_buffer_steps", 1.0),
             )
+            # The active-pair reducer can refresh the reentry guard after the
+            # initial below-soft bypass.  Reapply the same ordinary-inventory
+            # condition here so its completed release cannot suppress the
+            # second maker leg at submission time.
+            if grvt_reentry_below_soft_bypass and _allow_grvt_reentry_below_soft_bypass(
+                loss_reduce_reentry_guard
+            ):
+                loss_reduce_reentry_guard["block_long_entries"] = False
+                loss_reduce_reentry_guard["block_short_entries"] = False
+                loss_reduce_reentry_guard["bypassed_below_soft_two_sided"] = True
     else:
         state.pop("best_quote_active_pair_reduce", None)
 
