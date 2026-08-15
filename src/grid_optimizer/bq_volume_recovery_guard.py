@@ -6370,6 +6370,16 @@ def check_symbol(
         and not bool(assessment.get("effective_inventory_soft_pressure"))
         and grvt_live_two_sided_entry
     )
+    # A completed GRVT loss-release must restore ordinary two-sided flow
+    # without dropping its budget back to a stale pre-recovery baseline while
+    # the daily pace is still behind.  The target floor itself is one bounded
+    # recovery step above the live budget.
+    grvt_restore_cycle_budget_floor = float(cycle_budget_floor_notional)
+    if normalized_symbol == "GRVTUSDT" and target_pace_behind:
+        grvt_restore_cycle_budget_floor = max(
+            grvt_restore_cycle_budget_floor,
+            _safe_float(volume_summary.get("target_cycle_budget_floor_notional")),
+        )
 
     action_verification: str | None = None
     control_updated_at = _parse_time(control.get("recovery_control_updated_at"))
@@ -6470,7 +6480,7 @@ def check_symbol(
             updates = _restore_recovery_controls(
                 item,
                 control,
-                cycle_budget_floor_notional,
+                grvt_restore_cycle_budget_floor,
             )
             updates.update(
                 {
@@ -6618,7 +6628,7 @@ def check_symbol(
                 ),
             )
             updates = _restore_recovery_controls(
-                item, control, cycle_budget_floor_notional
+                item, control, grvt_restore_cycle_budget_floor
             )
             updates.update(loss_updates)
             item["guard_recovery_controls"] = {}
@@ -6687,7 +6697,7 @@ def check_symbol(
                 updates = _restore_recovery_controls(
                     item,
                     control,
-                    cycle_budget_floor_notional,
+                    grvt_restore_cycle_budget_floor,
                 )
                 updates.update(
                     {
