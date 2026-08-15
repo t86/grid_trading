@@ -16701,8 +16701,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "best_quote_active_pair_reduce": {
                         "enabled": True,
                         "active": False,
-                        "completed": True,
-                        "reason": "lease_completed_waiting_disable",
+                        "completed": False,
+                        "reason": "runner_omitted_completed_marker",
                         "order_count": 0,
                     },
                 }

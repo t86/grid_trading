@@ -6221,15 +6221,8 @@ def check_symbol(
         and not active_pair_reduce_deadlock
         and not recovery_timed_out
     )
-    active_pair_reduce_report = plan.get("best_quote_active_pair_reduce")
-    active_pair_reduce_report = (
-        active_pair_reduce_report
-        if isinstance(active_pair_reduce_report, dict)
-        else {}
-    )
     grvt_dynamic_release_two_sided_flow_restored = (
         grvt_dynamic_loss_release_in_progress
-        and bool(active_pair_reduce_report.get("completed"))
         and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) > 0
         and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) > 0
         and _safe_float(assessment.get("ordinary_long_notional"))
@@ -6237,6 +6230,10 @@ def check_symbol(
         and _safe_float(assessment.get("ordinary_short_notional"))
         <= _safe_float(assessment.get("short_soft_limit_notional"))
     )
+    # The runner can omit the pair-completed marker after a price move has
+    # already brought ordinary inventory below soft.  Live two-sided entries
+    # are the stronger completion proof in that state; retaining the lease
+    # would otherwise leave the recovered flow on its reduced loss budget.
     # A loss-release lease must not keep entry suppressed after both ordinary
     # sides have already returned below soft.  Waiting for entries that the
     # lease itself prevents creates a no-order recovery deadlock.
