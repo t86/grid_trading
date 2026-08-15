@@ -31,6 +31,142 @@ from grid_optimizer.semi_auto_plan import load_or_initialize_state
 
 
 class LoopRunnerResetStateTests(unittest.TestCase):
+    def test_expired_integral_exit_blocked_owner_hands_off_to_next_run(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "grvtusdt_loop_state.json"
+            old_contract = {
+                "symbol": "GRVTUSDT",
+                "strategy_profile": "grvt_daily_80k_bq_short_freeze_5pct_v1",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "run_start_time": "2026-07-15T00:00:00+00:00",
+                "runtime_guard_stats_start_time": "2026-07-15T00:00:00+00:00",
+                "run_end_time": "2026-07-16T00:00:00+00:00",
+                "max_cumulative_notional": 150_000.0,
+                "terminal_drain_exit_policy": "drain_then_preserve",
+                "terminal_drain_absolute_loss_budget": 35.0,
+                "terminal_drain_max_wait_seconds": 901.0,
+                "terminal_drain_stop_preserve_reason": "grvt_daily_complete_or_deadline",
+                "terminal_drain_max_order_notional": 30.0,
+                "terminal_drain_loss_lease_seconds": 300.0,
+                "terminal_drain_order_reprice_seconds": 120.0,
+                "terminal_drain_flat_confirm_cycles": 2,
+            }
+            new_contract = {
+                **old_contract,
+                "run_start_time": "2026-07-16T00:00:00+00:00",
+                "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+                "run_end_time": "2026-07-17T00:00:00+00:00",
+            }
+            old_snapshot = run_contract_snapshot_from_config(old_contract)
+            old_contract_id = run_contract_identity_from_config(old_snapshot)
+            old_decision_id = f"GRVTUSDT|{old_contract_id}"
+            drain_state = replace(
+                TerminalDrainState.initial("GRVTUSDT", decision_id=old_decision_id),
+                stage=DrainStage.DRAIN_NET,
+            )
+            started_at = datetime(2026, 7, 16, 0, 0, tzinfo=timezone.utc)
+            owner = {
+                "schema": "futures_terminal_drain_runtime_v1",
+                "decision_id": old_decision_id,
+                "run_contract_id": old_contract_id,
+                "run_contract_snapshot": old_snapshot,
+                "started_at": started_at.isoformat(),
+                "run_outcome": "target_unmet_deadline",
+                "exit_status": "exit_blocked",
+                "exit_contract": _terminal_drain_exit_contract_from_snapshot(
+                    old_snapshot, captured_at=started_at.isoformat()
+                ),
+                "initial_frozen_long_qty": 0.0,
+                "initial_frozen_short_qty": 1200.0,
+                "drain_state": terminal_drain_state_to_dict(drain_state),
+                "intents": [],
+                "active_intent_ids": [],
+            }
+            owner["owner_integrity_digest"] = _terminal_drain_owner_integrity_digest(owner)
+            owner["runtime_integrity_digest"] = _terminal_drain_runtime_integrity_digest(owner)
+            state = {
+                "best_quote_frozen_inventory": {
+                    "long_qty": 0.0,
+                    "short_qty": 1200.0,
+                },
+                "futures_terminal_drain": owner,
+            }
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            transitioned = _terminal_drain_owner_transition(
+                state=state,
+                state_path=state_path,
+                current_decision_id=(
+                    "GRVTUSDT|" + run_contract_identity_from_config(new_contract)
+                ),
+                now=datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc),
+            )
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(transitioned, "archived")
+        self.assertNotIn("futures_terminal_drain", persisted)
+        self.assertEqual(persisted["best_quote_frozen_inventory"]["short_qty"], 1200.0)
+        self.assertEqual(persisted["futures_terminal_drain_history"][0]["exit_status"], "exit_blocked")
+
+    def test_unexpired_exit_blocked_owner_remains_authoritative(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "grvtusdt_loop_state.json"
+            contract = {
+                "symbol": "GRVTUSDT",
+                "strategy_profile": "grvt_daily_80k_bq_short_freeze_5pct_v1",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "run_start_time": "2026-07-16T00:00:00+00:00",
+                "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+                "run_end_time": "2026-07-17T00:00:00+00:00",
+                "max_cumulative_notional": 150_000.0,
+                "terminal_drain_exit_policy": "drain_then_preserve",
+                "terminal_drain_absolute_loss_budget": 35.0,
+                "terminal_drain_max_wait_seconds": 901.0,
+                "terminal_drain_stop_preserve_reason": "grvt_daily_complete_or_deadline",
+                "terminal_drain_max_order_notional": 30.0,
+                "terminal_drain_loss_lease_seconds": 300.0,
+                "terminal_drain_order_reprice_seconds": 120.0,
+                "terminal_drain_flat_confirm_cycles": 2,
+            }
+            snapshot = run_contract_snapshot_from_config(contract)
+            contract_id = run_contract_identity_from_config(snapshot)
+            decision_id = f"GRVTUSDT|{contract_id}"
+            drain_state = replace(
+                TerminalDrainState.initial("GRVTUSDT", decision_id=decision_id),
+                stage=DrainStage.DRAIN_NET,
+            )
+            started_at = datetime(2026, 7, 16, 1, 0, tzinfo=timezone.utc)
+            owner = {
+                "schema": "futures_terminal_drain_runtime_v1",
+                "decision_id": decision_id,
+                "run_contract_id": contract_id,
+                "run_contract_snapshot": snapshot,
+                "started_at": started_at.isoformat(),
+                "run_outcome": "condition_unmet",
+                "exit_status": "exit_blocked",
+                "exit_contract": _terminal_drain_exit_contract_from_snapshot(
+                    snapshot, captured_at=started_at.isoformat()
+                ),
+                "initial_frozen_long_qty": 0.0,
+                "initial_frozen_short_qty": 0.0,
+                "drain_state": terminal_drain_state_to_dict(drain_state),
+                "intents": [],
+                "active_intent_ids": [],
+            }
+            owner["owner_integrity_digest"] = _terminal_drain_owner_integrity_digest(owner)
+            owner["runtime_integrity_digest"] = _terminal_drain_runtime_integrity_digest(owner)
+            state = {"futures_terminal_drain": owner}
+
+            transitioned = _terminal_drain_owner_transition(
+                state=state,
+                state_path=state_path,
+                current_decision_id="GRVTUSDT|different-contract",
+                now=datetime(2026, 7, 16, 1, 1, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(transitioned, "resume")
+        self.assertIn("futures_terminal_drain", state)
+
     def test_reset_preserves_authoritative_target_progress(self) -> None:
         with TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "bchusdt_loop_state.json"

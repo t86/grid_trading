@@ -15551,9 +15551,10 @@ def _terminal_drain_owner_transition(
 
     An active exit owns the symbol even when the current guard happens to be
     tradable (for example after a process restart reset local volume inputs).
-    Only an explicitly different run contract may release a *completed* owner;
-    incomplete exits are resumed first and can never be overwritten by a new
-    target.
+    A completed owner may be released by a different run contract. An integral
+    ``exit_blocked`` owner from an already-ended run may also hand off to the
+    next run: its loss lease belongs to the expired contract and must not hold
+    a fresh daily window hostage. Current or not-yet-expired exits still resume.
     """
 
     raw_envelope = state.get(TERMINAL_DRAIN_STATE_KEY)
@@ -15563,17 +15564,28 @@ def _terminal_drain_owner_transition(
     if not persisted_decision_id:
         return "none"
     exit_status = str(raw_envelope.get("exit_status") or "exiting")
-    if (
-        persisted_decision_id == current_decision_id
-        or exit_status not in TERMINAL_DRAIN_COMPLETED_EXIT_STATUSES
-    ):
+    if persisted_decision_id == current_decision_id:
         return "resume"
     symbol = current_decision_id.split("|", 1)[0]
-    if not _terminal_drain_completed_owner_is_integral(
+    completed_owner = _terminal_drain_completed_owner_is_integral(
+        raw_envelope,
+        symbol=symbol,
+        loop_state=state,
+    )
+    expired_blocked_owner = False
+    if exit_status == "exit_blocked" and _terminal_drain_runtime_owner_is_integral(
         raw_envelope,
         symbol=symbol,
         loop_state=state,
     ):
+        snapshot = raw_envelope.get("run_contract_snapshot")
+        prior_end = (
+            _parse_state_datetime(snapshot.get("run_end_time"))
+            if isinstance(snapshot, Mapping)
+            else None
+        )
+        expired_blocked_owner = prior_end is not None and prior_end <= now
+    if not completed_owner and not expired_blocked_owner:
         # A completed marker is not itself an archival receipt.  Resume the
         # owner so the normal handler can expose a durable integrity failure;
         # never release trading for one cycle on a corrupted handoff.
