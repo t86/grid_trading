@@ -355,6 +355,10 @@ EMERGENCY_WEAR_PER_10K = 80.0
 # loss-reduce print must not suppress restoring ordinary two-sided flow.
 GRVT_RECOVERY_WEAR_PER_10K = 50.0
 GRVT_EMERGENCY_WEAR_PER_10K = 200.0
+# A missing ordinary entry leg is a runner-liveness failure. While GRVT is
+# behind its daily pace, let every guard execution restart the managed wrapper
+# instead of waiting out an arbitrary reapply interval.
+GRVT_MISSING_ENTRY_LIVENESS_RESTART_COOLDOWN_SECONDS = 0.0
 RECOVERY_GUARD_HEARTBEAT_KEY = "futures_recovery_guard_heartbeat"
 RECOVERY_GUARD_HEARTBEAT_SCHEMA = "futures_recovery_guard_heartbeat_v1"
 
@@ -1244,6 +1248,18 @@ def _parse_time(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _grvt_missing_entry_liveness_restart_due(
+    item: dict[str, Any], *, now: datetime
+) -> bool:
+    """Return whether a missing ordinary GRVT entry leg may restart recovery."""
+    last_restart = _parse_time(item.get("last_grvt_no_entry_liveness_restart_at"))
+    if last_restart is None:
+        return True
+    return (now - last_restart).total_seconds() >= (
+        GRVT_MISSING_ENTRY_LIVENESS_RESTART_COOLDOWN_SECONDS
+    )
 
 
 def _exchange_trade_fetch_cooldown_seconds(exc: Exception) -> float | None:
@@ -6326,14 +6342,7 @@ def check_symbol(
             _safe_int(assessment.get("ordinary_active_entry_long_order_count")) == 0
             or _safe_int(assessment.get("ordinary_active_entry_short_order_count")) == 0
         )
-        and (
-            _parse_time(item.get("last_grvt_no_entry_liveness_restart_at")) is None
-            or (
-                now
-                - _parse_time(item.get("last_grvt_no_entry_liveness_restart_at"))
-            ).total_seconds()
-            >= 120.0
-        )
+        and _grvt_missing_entry_liveness_restart_due(item, now=now)
     )
     # Pace ramps require exchange-backed ordinary entry on both sides.  A
     # planned pair plus a nonzero total order count is insufficient because
@@ -6502,14 +6511,7 @@ def check_symbol(
                 _safe_int(assessment.get("ordinary_active_entry_long_order_count")) <= 0
                 or _safe_int(assessment.get("ordinary_active_entry_short_order_count")) <= 0
             )
-            and (
-                _parse_time(item.get("last_grvt_no_entry_liveness_restart_at")) is None
-                or (
-                    now
-                    - _parse_time(item.get("last_grvt_no_entry_liveness_restart_at"))
-                ).total_seconds()
-                >= 120.0
-            )
+            and _grvt_missing_entry_liveness_restart_due(item, now=now)
         ):
             # Below soft, a missing exchange entry leg is a liveness failure,
             # not a reason to leave the daily target unrecovered. The managed
@@ -8936,16 +8938,10 @@ def check_symbol(
                             assessment.get("ordinary_active_entry_short_order_count")
                         ) <= 0
                     )
-                    last_liveness_restart = _parse_time(
-                        item.get("last_grvt_no_entry_liveness_restart_at")
-                    )
                     can_restart_liveness = (
                         _safe_int(assessment.get("planned_entry_order_count")) > 0
                         and missing_entry_leg
-                        and (
-                            last_liveness_restart is None
-                            or (now - last_liveness_restart).total_seconds() >= 120.0
-                        )
+                        and _grvt_missing_entry_liveness_restart_due(item, now=now)
                     )
                     if can_restart_liveness:
                         action = (
@@ -10441,17 +10437,7 @@ def check_symbol(
                 )
                 and _safe_int(assessment.get("planned_entry_order_count")) > 0
                 and not bool(assessment.get("volatility_entry_pause_active"))
-                and (
-                    _parse_time(item.get("last_grvt_no_entry_liveness_restart_at"))
-                    is None
-                    or (
-                        now
-                        - _parse_time(
-                            item.get("last_grvt_no_entry_liveness_restart_at")
-                        )
-                    ).total_seconds()
-                    >= 120.0
-                )
+                and _grvt_missing_entry_liveness_restart_due(item, now=now)
             ):
                 # A fresh plan with ordinary entry but zero exchange-side
                 # ordinary orders is a runner liveness failure, not a reason
@@ -10529,16 +10515,10 @@ def check_symbol(
                             assessment.get("ordinary_active_entry_short_order_count")
                         ) <= 0
                     )
-                    last_liveness_restart = _parse_time(
-                        item.get("last_grvt_no_entry_liveness_restart_at")
-                    )
                     can_restart_liveness = (
                         _safe_int(assessment.get("planned_entry_order_count")) > 0
                         and missing_entry_leg
-                        and (
-                            last_liveness_restart is None
-                            or (now - last_liveness_restart).total_seconds() >= 120.0
-                        )
+                        and _grvt_missing_entry_liveness_restart_due(item, now=now)
                     )
                     if can_restart_liveness:
                         action = (
@@ -10569,14 +10549,7 @@ def check_symbol(
                     _safe_int(assessment.get("ordinary_active_entry_long_order_count")) <= 0
                     or _safe_int(assessment.get("ordinary_active_entry_short_order_count")) <= 0
                 )
-                and (
-                    _parse_time(item.get("last_grvt_no_entry_liveness_restart_at")) is None
-                    or (
-                        now
-                        - _parse_time(item.get("last_grvt_no_entry_liveness_restart_at"))
-                    ).total_seconds()
-                    >= 120.0
-                )
+                and _grvt_missing_entry_liveness_restart_due(item, now=now)
             ):
                 action = (
                     "dry_run_restart_grvt_no_entry_liveness"
