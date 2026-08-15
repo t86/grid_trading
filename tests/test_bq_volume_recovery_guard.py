@@ -16394,6 +16394,13 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 trigger_seconds=120,
                 daily_target_notional=150_000.0,
                 require_soft_pressure_for_allow_loss=False,
+                trade_rows=[
+                    {
+                        "id": 1,
+                        "time": int((now - timedelta(seconds=30)).timestamp() * 1000),
+                        "quoteQty": "500",
+                    }
+                ],
                 restart_runner=restarts.append,
             )
 
@@ -16403,6 +16410,8 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 )
             )
             self.assertEqual(result["action"], "enable_grvt_dual_soft_loss_release")
+            self.assertFalse(result["assessment"]["low_volume"])
+            self.assertTrue(result["assessment"]["target_pace_behind"])
             self.assertTrue(control["best_quote_maker_volume_allow_loss_reduce_only"])
             self.assertTrue(control["best_quote_maker_volume_active_pair_reduce_enabled"])
             self.assertEqual(

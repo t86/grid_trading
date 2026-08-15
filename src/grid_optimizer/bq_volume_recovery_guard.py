@@ -6161,7 +6161,7 @@ def check_symbol(
             180.0,
         )
         and _safe_int(inventory_unlock_release.get("execution_cycles")) < 3
-        and bool(assessment.get("low_volume"))
+        and recovery_low_volume
         and target_pace_behind
         and effective_inventory_soft_pressure
         and not high_recovery_wear
@@ -6172,7 +6172,10 @@ def check_symbol(
         normalized_symbol == "GRVTUSDT"
         and not bool(assessment.get("volatility_entry_pause_active"))
         and not active_pair_reduce_deadlock
-        and bool(assessment.get("low_volume"))
+        # A static window can look healthy while still trailing the daily
+        # target by an order of magnitude.  The bounded release is for
+        # restoring two-sided flow, so use the shared pace-aware signal.
+        and recovery_low_volume
         and target_pace_behind
         and _safe_int(assessment.get("planned_entry_order_count")) == 0
         and bool(assessment.get("planned_reduce_only_only"))
@@ -6190,7 +6193,7 @@ def check_symbol(
         normalized_symbol == "GRVTUSDT"
         and not bool(assessment.get("volatility_entry_pause_active"))
         and not active_pair_reduce_deadlock
-        and bool(assessment.get("low_volume"))
+        and recovery_low_volume
         and target_pace_behind
         and effective_inventory_soft_pressure
         and (
