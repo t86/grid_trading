@@ -6276,6 +6276,22 @@ def check_symbol(
         and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) == 0
         and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) == 0
     )
+    # The submit snapshot normally supplies live side counts.  During a quiet
+    # cycle it can retain only client-order IDs, however, even while the fresh
+    # plan and ordinary open-order count show both sides are live.  Treat that
+    # bounded combination as live flow so pace recovery is not short-circuited.
+    grvt_live_two_sided_entry = (
+        (
+            _safe_int(assessment.get("ordinary_active_entry_long_order_count")) > 0
+            and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) > 0
+        )
+        or (
+            _safe_int(assessment.get("planned_entry_buy_order_count")) > 0
+            and _safe_int(assessment.get("planned_entry_sell_order_count")) > 0
+            and _active_order_count(plan, submit) > 0
+            and not bool(assessment.get("ineffective_orders"))
+        )
+    )
     # A live two-sided quote can still be far below the required daily pace.
     # In that case capacity should continue to climb gradually rather than
     # waiting for both sides to disappear completely.  This is deliberately
@@ -6290,8 +6306,7 @@ def check_symbol(
         and target_pace_behind
         and not bool(assessment.get("high_recovery_wear"))
         and not bool(assessment.get("effective_inventory_soft_pressure"))
-        and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) > 0
-        and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) > 0
+        and grvt_live_two_sided_entry
     )
 
     action_verification: str | None = None

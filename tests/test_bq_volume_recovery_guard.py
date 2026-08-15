@@ -14863,15 +14863,9 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 }
             )
             _write_json(plan_path, plan)
-            submit_path = output_dir / "grvtusdt_loop_latest_submit.json"
-            submit = json.loads(submit_path.read_text(encoding="utf-8"))
-            submit["observed_strategy_open_order_state"].update(
-                {
-                    "ordinary_active_entry_long_order_count": 1,
-                    "ordinary_active_entry_short_order_count": 1,
-                }
-            )
-            _write_json(submit_path, submit)
+            # Some quiet-cycle submit snapshots retain ordinary activity but
+            # omit directional counts.  A fresh, near-market two-sided plan
+            # must still be able to advance the bounded pace budget.
             restarts: list[str] = []
 
             result = check_symbol(
