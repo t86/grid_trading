@@ -14666,6 +14666,89 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(control["best_quote_maker_volume_quote_offset_ticks"], 9)
             self.assertEqual(restarts, ["GRVTUSDT"])
 
+    def test_grvt_loss_reduce_budget_keeps_target_pace_floor(self) -> None:
+        updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
+            control={
+                "best_quote_maker_volume_allow_loss_reduce_only": True,
+                "best_quote_maker_volume_cycle_budget_notional": 250.0,
+                "best_quote_maker_volume_min_cycle_budget_notional": 50.0,
+                "per_order_notional": 55.0,
+            },
+            assessment={"symbol": "GRVTUSDT", "target_pace_behind": True},
+            parameters=bq_volume_recovery_guard.RecoveryParameters(
+                per_order_notional=55.0,
+                configured_min_cycle_budget_notional=50.0,
+                static_cycle_budget_floor_notional=50.0,
+                effective_cycle_budget_floor_notional=100.0,
+                loss_reduce_cycle_budget_cap_notional=50.0,
+                cycle_budget_increment_notional=12.0,
+            ),
+        )
+
+        self.assertEqual(
+            updates["best_quote_maker_volume_cycle_budget_notional"], 100.0
+        )
+
+    def test_grvt_zero_actual_entry_restarts_despite_reapply_debounce(self) -> None:
+        now = datetime(2026, 8, 15, 1, 0, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                symbol="GRVTUSDT",
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 100.0,
+                    "best_quote_maker_volume_min_cycle_budget_notional": 50.0,
+                    "per_order_notional": 55.0,
+                },
+                long_notional=500.0,
+                short_notional=500.0,
+                open_order_count=0,
+                active_order_count=0,
+            )
+            plan_path = output_dir / "grvtusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["buy_orders"] = [
+                {"side": "BUY", "price": 0.5968, "qty": 16.0, "role": "best_quote_entry_long"}
+            ]
+            plan["sell_orders"] = [
+                {"side": "SELL", "price": 0.5972, "qty": 16.0, "role": "best_quote_entry_short"}
+            ]
+            _write_json(plan_path, plan)
+            state: dict[str, object] = {
+                "symbols": {
+                    "GRVTUSDT": {
+                        "status": "recovery_active",
+                        "first_low_volume_at": (now - timedelta(minutes=10)).isoformat(),
+                        "last_recovery_action_at": (now - timedelta(seconds=30)).isoformat(),
+                    }
+                }
+            }
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="GRVTUSDT",
+                output_dir=output_dir,
+                state=state,
+                now=now,
+                window_seconds=300,
+                min_volume_notional=100.0,
+                trigger_seconds=120.0,
+                daily_target_notional=150_000.0,
+                trade_rows=[
+                    {
+                        "id": 1,
+                        "time": int((now - timedelta(minutes=2)).timestamp() * 1000),
+                        "quoteQty": "10",
+                    }
+                ],
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(result["action"], "restart_grvt_no_entry_liveness")
+            self.assertEqual(restarts, ["GRVTUSDT"])
+
     def test_zero_order_budget_pause_repairs_legacy_wear_backoff_state(self) -> None:
         now = datetime(2026, 7, 12, 10, 35, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

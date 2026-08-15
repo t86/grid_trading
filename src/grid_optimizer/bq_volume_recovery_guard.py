@@ -1824,6 +1824,17 @@ def _loss_reduce_recovery_updates(
     )
     per_order = resolved.per_order_notional
     loss_reduce_budget_cap = resolved.loss_reduce_cycle_budget_cap_notional
+    if (
+        str(assessment.get("symbol") or "").upper() == "GRVTUSDT"
+        and bool(assessment.get("target_pace_behind"))
+    ):
+        # A bounded GRVT loss-release lease must not shrink the ordinary
+        # maker budget below the already-computed catch-up floor.  The guard
+        # still applies its independent 100U GRVT ceiling at write time.
+        loss_reduce_budget_cap = max(
+            loss_reduce_budget_cap,
+            resolved.effective_cycle_budget_floor_notional,
+        )
     loss_reduce_budget_floor = (
         min(
             max(
@@ -8198,6 +8209,7 @@ def check_symbol(
                 quote_offset_extra_ticks=loss_reduce_quote_offset_extra_ticks,
                 pause_baseline_long_notional=pause_baseline_long_notional,
                 pause_baseline_short_notional=pause_baseline_short_notional,
+                parameters=parameters,
             )
             _remember_recovery_controls(
                 item,
@@ -10065,6 +10077,46 @@ def check_symbol(
             )
             if elapsed < max(float(trigger_seconds), 0.0):
                 action = "wait_low_volume_confirmation"
+            elif (
+                normalized_symbol == "GRVTUSDT"
+                and target_pace_behind
+                and pace_ratio < 0.75
+                and recovery_reapply_debounced
+                and _safe_int(assessment.get("active_order_count")) <= 0
+                and _safe_int(assessment.get("planned_entry_order_count")) > 0
+                and not bool(assessment.get("volatility_entry_pause_active"))
+                and (
+                    _parse_time(item.get("last_grvt_no_entry_liveness_restart_at"))
+                    is None
+                    or (
+                        now
+                        - _parse_time(
+                            item.get("last_grvt_no_entry_liveness_restart_at")
+                        )
+                    ).total_seconds()
+                    >= 120.0
+                )
+            ):
+                # A fresh plan with ordinary entry but zero exchange-side
+                # ordinary orders is a runner liveness failure, not a reason
+                # to let the generic control debounce suppress catch-up flow.
+                # Restart through the managed wrapper only; no orders are
+                # placed or cancelled by the guard itself.
+                action = (
+                    "dry_run_restart_grvt_no_entry_liveness"
+                    if dry_run
+                    else "restart_grvt_no_entry_liveness"
+                )
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_grvt_no_entry_liveness_restart_at": now.isoformat(),
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+                if not dry_run:
+                    restart(normalized_symbol)
             elif (
                 recovery_reapply_debounced
                 and not effective_inventory_soft_pressure
