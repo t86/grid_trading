@@ -5084,6 +5084,16 @@ def check_symbol(
     if normalized_symbol == "GRVTUSDT":
         require_soft_pressure_for_allow_loss = True
     output_dir = Path(output_dir)
+    control_path = _control_path(output_dir, normalized_symbol)
+    if (
+        normalized_symbol == "GRVTUSDT"
+        and bool(
+            _read_json(control_path).get(
+                "best_quote_maker_volume_recovery_guard_read_only"
+            )
+        )
+    ):
+        dry_run = True
     terminal_delegation = _terminal_drain_delegation(
         symbol=normalized_symbol,
         output_dir=output_dir,
@@ -5099,7 +5109,6 @@ def check_symbol(
             {"ts": now.isoformat(), **terminal_delegation},
         )
         return terminal_delegation
-    control_path = _control_path(output_dir, normalized_symbol)
     if _registered_recovery_envelope_present(
         control_path,
         known_registered=_recovery_guard_previously_owned_symbol(
