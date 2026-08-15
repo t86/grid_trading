@@ -1756,6 +1756,16 @@ def resolve_loss_reduce_reentry_guard(
     }
 
 
+def _allow_grvt_reentry_below_soft_bypass(loss_reduce_reentry_guard: dict[str, Any]) -> bool:
+    if not bool(loss_reduce_reentry_guard.get("active")):
+        return False
+    return str(loss_reduce_reentry_guard.get("source") or "") not in {
+        "active_pair_reduce",
+        "adverse_reduce",
+        "hard_loss",
+    }
+
+
 def resolve_hard_loss_forced_reduce_episode(
     *,
     state: dict[str, Any],
@@ -33195,7 +33205,9 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         and grvt_ordinary_short_notional
         < _safe_float(getattr(effective_args, "pause_short_position_notional", 0.0))
     )
-    if grvt_reentry_below_soft_bypass and loss_reduce_reentry_guard.get("active"):
+    if grvt_reentry_below_soft_bypass and _allow_grvt_reentry_below_soft_bypass(
+        loss_reduce_reentry_guard
+    ):
         loss_reduce_reentry_guard["block_long_entries"] = False
         loss_reduce_reentry_guard["block_short_entries"] = False
         loss_reduce_reentry_guard["bypassed_below_soft_two_sided"] = True

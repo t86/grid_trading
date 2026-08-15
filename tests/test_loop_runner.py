@@ -134,6 +134,7 @@ from grid_optimizer.loop_runner import (
     resolve_xaut_adaptive_state,
     resolve_anti_chase_entry_guard,
     resolve_loss_reduce_reentry_guard,
+    _allow_grvt_reentry_below_soft_bypass,
     apply_synthetic_trend_follow_guard,
     apply_entry_permission_gate,
     assess_unrealized_loss_entry_guard,
@@ -11154,6 +11155,13 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(guard["side"], "BUY")
         self.assertTrue(guard["block_short_entries"])
         self.assertFalse(guard["block_long_entries"])
+
+    def test_grvt_below_soft_does_not_bypass_active_loss_reentry_guard(self) -> None:
+        self.assertFalse(
+            _allow_grvt_reentry_below_soft_bypass(
+                {"active": True, "source": "active_pair_reduce"}
+            )
+        )
 
     def test_loss_reduce_reentry_guard_action_filter_keeps_reducers(self) -> None:
         actions = {
