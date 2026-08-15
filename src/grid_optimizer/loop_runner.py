@@ -33217,6 +33217,29 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
         loss_recover_ratio=0.75,
     )
+    # A completed GRVT threshold-side trim must not keep both ordinary entry
+    # lanes paused once both sides have returned below the 900U soft bands.
+    # Preserve adverse/hard guards; discard only stale active-pair memories.
+    if (
+        str(getattr(effective_args, "symbol", "")).upper() == "GRVTUSDT"
+        and not bool(volatility_entry_pause.get("active"))
+        and _safe_float(controls.get("current_long_notional", current_long_notional))
+        < _safe_float(getattr(effective_args, "pause_buy_position_notional", 0.0))
+        and _safe_float(controls.get("current_short_notional", current_short_notional))
+        < _safe_float(getattr(effective_args, "pause_short_position_notional", 0.0))
+    ):
+        reentry_memory = state.get("loss_reduce_reentry_guard")
+        side_memories = reentry_memory.get("sides") if isinstance(reentry_memory, dict) else None
+        if isinstance(side_memories, dict):
+            retained = {
+                side: memory
+                for side, memory in side_memories.items()
+                if str(memory.get("source") or "") != "active_pair_reduce"
+            }
+            if retained:
+                reentry_memory["sides"] = retained
+            else:
+                state.pop("loss_reduce_reentry_guard", None)
     loss_reduce_reentry_guard = resolve_loss_reduce_reentry_guard(
         state=state,
         enabled=bool(getattr(effective_args, "loss_reentry_guard_enabled", False)),
