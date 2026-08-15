@@ -5770,7 +5770,7 @@ def check_symbol(
         and severe_one_sided_stall
         and one_sided_entry_unprotected
         and target_pace_behind
-        and actual_inventory_below_soft
+        and not effective_inventory_soft_pressure
         and not high_recovery_wear
     )
 

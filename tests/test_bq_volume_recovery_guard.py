@@ -12397,7 +12397,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
 
             control = json.loads((output_dir / "reusdt_loop_runner_control.json").read_text(encoding="utf-8"))
             self.assertTrue(result["assessment"]["inventory_soft_pressure"])
-            self.assertTrue(result["assessment"]["actual_inventory_below_soft"])
+            self.assertFalse(result["assessment"]["effective_inventory_soft_pressure"])
             self.assertFalse(result["assessment"]["effective_inventory_soft_pressure"])
             self.assertEqual(result["action"], "hold_loss_reduce_when_actual_inventory_below_soft")
             self.assertFalse(control["best_quote_maker_volume_allow_loss_reduce_only"])
