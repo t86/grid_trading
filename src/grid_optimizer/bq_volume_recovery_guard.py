@@ -5027,6 +5027,11 @@ def check_symbol(
     restart_runner: RestartRunner | None = None,
 ) -> dict[str, Any]:
     normalized_symbol = symbol.upper().strip()
+    # GRVT's only approved loss path is a bounded release of the ordinary
+    # side that is actually over soft. Do not let an omitted CLI symbol flag
+    # turn low-volume, below-soft inventory into a loss-reduce profile.
+    if normalized_symbol == "GRVTUSDT":
+        require_soft_pressure_for_allow_loss = True
     output_dir = Path(output_dir)
     terminal_delegation = _terminal_drain_delegation(
         symbol=normalized_symbol,
