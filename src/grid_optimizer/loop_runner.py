@@ -1925,6 +1925,25 @@ def _allow_grvt_reentry_below_soft_bypass(loss_reduce_reentry_guard: dict[str, A
     }
 
 
+def _loss_reduce_trade_rows_to_execution_events(
+    trade_rows: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for row in trade_rows:
+        events.append(
+            {
+                "kind": "ORDER_FILLED",
+                "order_id": row.get("orderId"),
+                "side": str(row.get("side") or ""),
+                "transaction_time": row.get("time"),
+                "last_filled_price": _safe_float(row.get("price")),
+                "last_filled_qty": _safe_float(row.get("qty")),
+                "realized_pnl": _safe_float(row.get("realizedPnl")),
+            }
+        )
+    return events
+
+
 def _clear_completed_grvt_active_pair_reentry_memory(state: dict[str, Any]) -> None:
     reentry_memory = state.get("loss_reduce_reentry_guard")
     side_memories = reentry_memory.get("sides") if isinstance(reentry_memory, dict) else None
@@ -1933,11 +1952,7 @@ def _clear_completed_grvt_active_pair_reentry_memory(state: dict[str, Any]) -> N
     retained = {
         side: memory
         for side, memory in side_memories.items()
-        # A filled threshold-side trim is a completed active-pair action too.
-        # It must remain a re-entry guard while ordinary inventory is elevated,
-        # but once both ordinary sides are below soft this cleanup is the
-        # explicit handoff back to two-sided entry flow.
-        if not str(memory.get("source") or "").startswith("active_pair_reduce")
+        if str(memory.get("source") or "") != "active_pair_reduce"
     }
     if retained:
         reentry_memory["sides"] = retained
@@ -10913,7 +10928,12 @@ def _load_audit_state(path: Path) -> dict[str, Any]:
     return payload if payload else {}
 
 
-def _should_sync_account_audit(audit_state: dict[str, Any], *, now: datetime) -> bool:
+def _should_sync_account_audit(
+    audit_state: dict[str, Any],
+    *,
+    now: datetime,
+    force: bool = False,
+) -> bool:
     cooldown_until_raw = str((audit_state or {}).get("rate_limit_cooldown_until") or "").strip()
     if cooldown_until_raw:
         try:
@@ -10925,6 +10945,8 @@ def _should_sync_account_audit(audit_state: dict[str, Any], *, now: datetime) ->
                 cooldown_until = cooldown_until.replace(tzinfo=timezone.utc)
             if now.astimezone(timezone.utc) < cooldown_until.astimezone(timezone.utc):
                 return False
+    if force:
+        return True
     updated_at_raw = str((audit_state or {}).get("updated_at") or "").strip()
     if not updated_at_raw:
         return True
@@ -10996,6 +11018,7 @@ def _sync_account_audit(
     summary_path: Path,
     recv_window: int,
     args: argparse.Namespace | None = None,
+    force: bool = False,
 ) -> dict[str, Any]:
     credentials = load_binance_api_credentials()
     if credentials is None:
@@ -11006,7 +11029,7 @@ def _sync_account_audit(
     audit_state_path = audit_paths["audit_state"]
     audit_state = _load_audit_state(audit_state_path)
     now = datetime.now(timezone.utc)
-    if not _should_sync_account_audit(audit_state, now=now):
+    if not _should_sync_account_audit(audit_state, now=now, force=force):
         cooldown_until = str(audit_state.get("rate_limit_cooldown_until") or "").strip()
         skipped = f"throttled<{int(AUDIT_SYNC_MIN_INTERVAL_SECONDS)}s"
         if cooldown_until:
@@ -11187,6 +11210,7 @@ def _sync_account_audit(
         "audit_state_path": str(audit_state_path),
         "trade_rest_backfill_performed": trade_rest_backfill_performed,
         "database": db_status,
+        "_fresh_trade_rows": fresh_trades,
     }
 
 
@@ -38202,6 +38226,9 @@ def main() -> None:
                     "income_appended": 0,
                     "error": None,
                 }
+                startup_audit_pending = not bool(
+                    getattr(args, "_startup_account_audit_completed", False)
+                )
                 try:
                     pre_guard_audit_sync = _sync_account_audit(
                         symbol=args.symbol,
@@ -38209,9 +38236,28 @@ def main() -> None:
                         summary_path=summary_path,
                         recv_window=args.recv_window,
                         args=args,
+                        force=startup_audit_pending,
                     )
+                    if not pre_guard_audit_sync.get("skipped"):
+                        setattr(args, "_startup_account_audit_completed", True)
                 except Exception as audit_exc:
                     pre_guard_audit_sync["error"] = f"{audit_exc.__class__.__name__}: {audit_exc}"
+                backfilled_trade_rows = list(
+                    pre_guard_audit_sync.pop("_fresh_trade_rows", []) or []
+                )
+                if backfilled_trade_rows:
+                    backfilled_loss_guard = _record_loss_reduce_reentry_fill_guard(
+                        symbol=args.symbol,
+                        state_path=Path(args.state_path),
+                        execution_events=_loss_reduce_trade_rows_to_execution_events(
+                            backfilled_trade_rows
+                        ),
+                        now=cycle_started_at,
+                    )
+                    if backfilled_loss_guard.get("armed"):
+                        pre_guard_audit_sync["loss_reduce_reentry_fill_guard"] = (
+                            backfilled_loss_guard
+                        )
                 runtime_guard_summary = _maybe_handle_runtime_guard(
                     args=args,
                     cycle=cycle,

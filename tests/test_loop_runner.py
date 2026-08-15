@@ -135,6 +135,7 @@ from grid_optimizer.loop_runner import (
     resolve_anti_chase_entry_guard,
     resolve_loss_reduce_reentry_guard,
     _record_loss_reduce_reentry_fill_guard,
+    _loss_reduce_trade_rows_to_execution_events,
     _allow_grvt_reentry_below_soft_bypass,
     _clear_completed_grvt_active_pair_reentry_memory,
     apply_synthetic_trend_follow_guard,
@@ -11358,7 +11359,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertIn("price_not_recovered", guard["reason"])
         self.assertIn("loss_reduce_reentry_guard", state)
 
-    def test_completed_grvt_pair_clears_plan_and_fill_memory_below_soft(self) -> None:
+    def test_completed_grvt_pair_only_clears_plan_memory_below_soft(self) -> None:
         state = {
             "loss_reduce_reentry_guard": {
                 "sides": {
@@ -11374,7 +11375,10 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(
             state["loss_reduce_reentry_guard"]["sides"],
-            {"OTHER": {"source": "adverse_reduce"}},
+            {
+                "SELL": {"source": "active_pair_reduce_fill", "order_id": 78582743},
+                "OTHER": {"source": "adverse_reduce"},
+            },
         )
 
     def test_loss_reduce_fill_arms_durable_reentry_guard(self) -> None:
@@ -11420,6 +11424,35 @@ class LoopRunnerTests(unittest.TestCase):
                 78501774,
             )
             self.assertFalse(_allow_grvt_reentry_below_soft_bypass(guard))
+
+    def test_loss_reduce_trade_backfill_converts_restart_gap_fill(self) -> None:
+        events = _loss_reduce_trade_rows_to_execution_events(
+            [
+                {
+                    "orderId": 78606262,
+                    "side": "BUY",
+                    "time": 1786774718051,
+                    "price": "0.3072",
+                    "qty": "325",
+                    "realizedPnl": "-0.7751206",
+                }
+            ]
+        )
+
+        self.assertEqual(
+            events,
+            [
+                {
+                    "kind": "ORDER_FILLED",
+                    "order_id": 78606262,
+                    "side": "BUY",
+                    "transaction_time": 1786774718051,
+                    "last_filled_price": 0.3072,
+                    "last_filled_qty": 325.0,
+                    "realized_pnl": -0.7751206,
+                }
+            ],
+        )
 
     def test_loss_reduce_reentry_guard_action_filter_keeps_reducers(self) -> None:
         actions = {
@@ -14452,6 +14485,17 @@ class LoopRunnerTests(unittest.TestCase):
             _should_sync_account_audit(
                 {"updated_at": (now - timedelta(seconds=AUDIT_SYNC_MIN_INTERVAL_SECONDS - 1)).isoformat()},
                 now=now,
+            )
+        )
+
+    def test_should_force_account_audit_after_runner_restart(self) -> None:
+        now = datetime(2026, 8, 15, 6, 18, 38, tzinfo=timezone.utc)
+
+        self.assertTrue(
+            _should_sync_account_audit(
+                {"updated_at": (now - timedelta(seconds=5)).isoformat()},
+                now=now,
+                force=True,
             )
         )
 
