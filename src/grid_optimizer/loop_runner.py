@@ -23926,6 +23926,14 @@ def apply_best_quote_active_pair_reduce(
     safe_max_loss_ratio = max(_safe_float(max_loss_ratio), 0.0)
     safe_min_relief = max(_safe_float(min_relief_notional), 0.0)
     threshold_side_mode = safe_loss_threshold > 0
+    current_threshold_eligible_sides = {
+        side
+        for side, notional in (
+            ("long", safe_long_notional),
+            ("short", safe_short_notional),
+        )
+        if threshold_side_mode and notional > safe_loss_threshold + 1e-12
+    }
     effective_now = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
     safe_rearm_cooldown = max(_safe_float(rearm_cooldown_seconds), 0.0)
     report.update(
@@ -24008,7 +24016,11 @@ def apply_best_quote_active_pair_reduce(
             if completed_at is not None and safe_rearm_cooldown > 0
             else 0.0
         )
-        if cooldown_remaining > 0:
+        # A completed threshold-side reduction must not suppress ordinary
+        # entry after that side has already returned below its trigger.  The
+        # cooldown is only a re-arm guard for a fresh breach, not a second
+        # inventory threshold.
+        if cooldown_remaining > 0 and current_threshold_eligible_sides:
             cooldown_sides = {
                 str(side)
                 for side in memory.get("eligible_sides", [])
@@ -24068,17 +24080,18 @@ def apply_best_quote_active_pair_reduce(
         return _clear("pair_imbalance_too_large")
 
     active = bool(memory.get("active"))
-    threshold_eligible_sides = {
-        side
-        for side, notional, soft_notional in (
-            ("long", safe_long_notional, long_soft),
-            ("short", safe_short_notional, short_soft),
-        )
-        if (
-            (threshold_side_mode and notional > safe_loss_threshold + 1e-12)
-            or (not threshold_side_mode and notional >= soft_notional)
-        )
-    }
+    threshold_eligible_sides = (
+        current_threshold_eligible_sides
+        if threshold_side_mode
+        else {
+            side
+            for side, notional, soft_notional in (
+                ("long", safe_long_notional, long_soft),
+                ("short", safe_short_notional, short_soft),
+            )
+            if notional >= soft_notional
+        }
+    )
     if threshold_side_mode and bool(memory.get("completed")):
         trigger_count = max(int(memory.get("trigger_count") or 0), 0)
         completed_at = _parse_state_datetime(memory.get("completed_at"))
@@ -24096,7 +24109,7 @@ def apply_best_quote_active_pair_reduce(
             for side in memory.get("eligible_sides", [])
             if str(side) in {"long", "short"}
         }
-        if cooldown_remaining > 0 and cooldown_sides:
+        if cooldown_remaining > 0 and threshold_eligible_sides:
             suppressed_entry_order_count = 0
             for side_name, order_key, entry_role in (
                 ("long", "buy_orders", "best_quote_entry_long"),

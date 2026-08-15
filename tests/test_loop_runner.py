@@ -12829,7 +12829,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(report["normal_entry_suppressed"])
         self.assertEqual(plan["sell_orders"], [])
 
-    def test_threshold_mode_cooldown_blocks_same_side_refill_below_threshold(self) -> None:
+    def test_threshold_mode_cooldown_allows_same_side_entry_below_threshold(self) -> None:
         now = datetime(2026, 8, 14, 11, 1, 10, tzinfo=timezone.utc)
         state = {
             "best_quote_active_pair_reduce": {
@@ -12882,9 +12882,12 @@ class LoopRunnerTests(unittest.TestCase):
         )
 
         self.assertFalse(report["active"])
-        self.assertEqual(report["reason"], "rearm_cooldown_active")
-        self.assertTrue(report["normal_entry_suppressed"])
-        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(report["reason"], "lease_completed_waiting_disable")
+        self.assertFalse(report["normal_entry_suppressed"])
+        self.assertEqual(
+            [item["role"] for item in plan["sell_orders"]],
+            ["best_quote_entry_short"],
+        )
 
     def test_threshold_mode_completion_cycle_blocks_same_side_refill(self) -> None:
         state = {
@@ -12944,7 +12947,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(report["normal_entry_suppressed"])
         self.assertEqual(plan["sell_orders"], [])
 
-    def test_threshold_mode_disable_preserves_recent_completion_cooldown(self) -> None:
+    def test_threshold_mode_disable_releases_entry_below_threshold(self) -> None:
         now = datetime(2026, 8, 14, 9, 0, tzinfo=timezone.utc)
         state = {
             "best_quote_active_pair_reduce": {
@@ -12996,14 +12999,17 @@ class LoopRunnerTests(unittest.TestCase):
             rearm_cooldown_seconds=300.0,
         )
 
-        self.assertEqual(report["reason"], "disabled_cooldown_memory_preserved")
-        self.assertTrue(report["normal_entry_suppressed"])
+        self.assertEqual(report["reason"], "disabled")
+        self.assertFalse(report["normal_entry_suppressed"])
         self.assertEqual(
             [item["role"] for item in plan["buy_orders"]],
             ["best_quote_entry_long"],
         )
-        self.assertEqual(plan["sell_orders"], [])
-        self.assertIn("best_quote_active_pair_reduce", state)
+        self.assertEqual(
+            [item["role"] for item in plan["sell_orders"]],
+            ["best_quote_entry_short"],
+        )
+        self.assertNotIn("best_quote_active_pair_reduce", state)
 
 
     def test_threshold_mode_rearms_after_three_cycles_when_ordinary_position_rebreaches(self) -> None:
