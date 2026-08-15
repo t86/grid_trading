@@ -14667,6 +14667,24 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(restarts, ["GRVTUSDT"])
 
     def test_grvt_loss_reduce_budget_keeps_target_pace_floor(self) -> None:
+        self.assertEqual(
+            bq_volume_recovery_guard._loss_reduce_budget_cap_with_target_pace(
+                symbol="GRVTUSDT",
+                target_pace_behind=True,
+                loss_reduce_budget_cap_notional=50.0,
+                effective_cycle_budget_floor_notional=100.0,
+            ),
+            100.0,
+        )
+        self.assertEqual(
+            bq_volume_recovery_guard._loss_reduce_budget_cap_with_target_pace(
+                symbol="GRVTUSDT",
+                target_pace_behind=False,
+                loss_reduce_budget_cap_notional=50.0,
+                effective_cycle_budget_floor_notional=100.0,
+            ),
+            50.0,
+        )
         updates = bq_volume_recovery_guard._loss_reduce_recovery_updates(
             control={
                 "best_quote_maker_volume_allow_loss_reduce_only": True,

@@ -253,6 +253,19 @@ class RecoveryParameters:
     cycle_budget_increment_notional: float
 
 
+def _loss_reduce_budget_cap_with_target_pace(
+    *,
+    symbol: str,
+    target_pace_behind: bool,
+    loss_reduce_budget_cap_notional: float,
+    effective_cycle_budget_floor_notional: float,
+) -> float:
+    cap = max(float(loss_reduce_budget_cap_notional), 0.0)
+    if str(symbol).upper().strip() == "GRVTUSDT" and bool(target_pace_behind):
+        return max(cap, float(effective_cycle_budget_floor_notional))
+    return cap
+
+
 def _resolve_recovery_parameters(
     *,
     control: dict[str, Any],
@@ -1823,18 +1836,15 @@ def _loss_reduce_recovery_updates(
         static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
     )
     per_order = resolved.per_order_notional
-    loss_reduce_budget_cap = resolved.loss_reduce_cycle_budget_cap_notional
-    if (
-        str(assessment.get("symbol") or "").upper() == "GRVTUSDT"
-        and bool(assessment.get("target_pace_behind"))
-    ):
-        # A bounded GRVT loss-release lease must not shrink the ordinary
-        # maker budget below the already-computed catch-up floor.  The guard
-        # still applies its independent 100U GRVT ceiling at write time.
-        loss_reduce_budget_cap = max(
-            loss_reduce_budget_cap,
-            resolved.effective_cycle_budget_floor_notional,
-        )
+    # A bounded GRVT loss-release lease must not shrink the ordinary maker
+    # budget below the already-computed catch-up floor. The guard still
+    # applies its independent 100U GRVT ceiling at write time.
+    loss_reduce_budget_cap = _loss_reduce_budget_cap_with_target_pace(
+        symbol=str(assessment.get("symbol") or ""),
+        target_pace_behind=bool(assessment.get("target_pace_behind")),
+        loss_reduce_budget_cap_notional=resolved.loss_reduce_cycle_budget_cap_notional,
+        effective_cycle_budget_floor_notional=resolved.effective_cycle_budget_floor_notional,
+    )
     loss_reduce_budget_floor = (
         min(
             max(
@@ -5630,6 +5640,15 @@ def check_symbol(
     target_pace_behind = (
         required_hourly_notional > 0
         and not target_pace_ahead
+    )
+    # Keep every bounded GRVT loss-release path on the same computed catch-up
+    # budget. In particular, the no-fill SLA branch must not bypass this with
+    # the legacy 50U lease cap.
+    loss_reduce_cycle_budget_cap = _loss_reduce_budget_cap_with_target_pace(
+        symbol=normalized_symbol,
+        target_pace_behind=target_pace_behind,
+        loss_reduce_budget_cap_notional=loss_reduce_cycle_budget_cap,
+        effective_cycle_budget_floor_notional=parameters.effective_cycle_budget_floor_notional,
     )
     arx_submit_failure_recovery_bypass = should_bypass_arx_submit_failure_recovery_gate(
         symbol=normalized_symbol,
