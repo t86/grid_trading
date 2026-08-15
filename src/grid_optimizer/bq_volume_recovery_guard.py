@@ -8887,8 +8887,51 @@ def check_symbol(
                         }
                     )
                 else:
-                    action = "hold_grvt_inventory_bias_pace_relief_boundary"
-                    item.update({"status": "recovery_active", "last_recovery_check_at": now.isoformat()})
+                    # A bias boundary is not a valid terminal state when the
+                    # exchange still lacks an ordinary entry leg. Restarting
+                    # the managed runner is the bounded recovery path; it
+                    # lets the wrapper rebuild the missing side without the
+                    # guard ever placing or cancelling an order itself.
+                    missing_entry_leg = (
+                        _safe_int(
+                            assessment.get("ordinary_active_entry_long_order_count")
+                        ) <= 0
+                        or _safe_int(
+                            assessment.get("ordinary_active_entry_short_order_count")
+                        ) <= 0
+                    )
+                    last_liveness_restart = _parse_time(
+                        item.get("last_grvt_no_entry_liveness_restart_at")
+                    )
+                    can_restart_liveness = (
+                        _safe_int(assessment.get("planned_entry_order_count")) > 0
+                        and missing_entry_leg
+                        and (
+                            last_liveness_restart is None
+                            or (now - last_liveness_restart).total_seconds() >= 120.0
+                        )
+                    )
+                    if can_restart_liveness:
+                        action = (
+                            "dry_run_restart_grvt_no_entry_liveness"
+                            if dry_run
+                            else "restart_grvt_no_entry_liveness"
+                        )
+                        item.update(
+                            {
+                                "status": "recovery_active",
+                                "last_grvt_no_entry_liveness_restart_at": now.isoformat(),
+                                "last_recovery_action_at": now.isoformat(),
+                                "last_recovery_action": action,
+                            }
+                        )
+                        if not dry_run:
+                            restart(normalized_symbol)
+                    else:
+                        action = "hold_grvt_inventory_bias_pace_relief_boundary"
+                        item.update(
+                            {"status": "recovery_active", "last_recovery_check_at": now.isoformat()}
+                        )
             elif (
                 severe_one_sided_stall
                 and recovery_hold_satisfied
