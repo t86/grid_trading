@@ -1925,6 +1925,22 @@ def _allow_grvt_reentry_below_soft_bypass(loss_reduce_reentry_guard: dict[str, A
     }
 
 
+def _clear_completed_grvt_active_pair_reentry_memory(state: dict[str, Any]) -> None:
+    reentry_memory = state.get("loss_reduce_reentry_guard")
+    side_memories = reentry_memory.get("sides") if isinstance(reentry_memory, dict) else None
+    if not isinstance(side_memories, dict):
+        return
+    retained = {
+        side: memory
+        for side, memory in side_memories.items()
+        if str(memory.get("source") or "") != "active_pair_reduce"
+    }
+    if retained:
+        reentry_memory["sides"] = retained
+    else:
+        state.pop("loss_reduce_reentry_guard", None)
+
+
 def resolve_hard_loss_forced_reduce_episode(
     *,
     state: dict[str, Any],
@@ -33328,22 +33344,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         and _safe_float(controls.get("current_short_notional", current_short_notional))
         < _safe_float(getattr(effective_args, "pause_short_position_notional", 0.0))
     ):
-        reentry_memory = state.get("loss_reduce_reentry_guard")
-        side_memories = reentry_memory.get("sides") if isinstance(reentry_memory, dict) else None
-        if isinstance(side_memories, dict):
-            retained = {
-                side: memory
-                for side, memory in side_memories.items()
-                # A submitted active-pair leg is recorded as
-                # ``active_pair_reduce_fill``. It has the same temporary
-                # re-entry semantics as its planned counterpart once both
-                # ordinary legs are back below soft.
-                if not str(memory.get("source") or "").startswith("active_pair_reduce")
-            }
-            if retained:
-                reentry_memory["sides"] = retained
-            else:
-                state.pop("loss_reduce_reentry_guard", None)
+        _clear_completed_grvt_active_pair_reentry_memory(state)
     loss_reduce_reentry_guard = resolve_loss_reduce_reentry_guard(
         state=state,
         enabled=bool(getattr(effective_args, "loss_reentry_guard_enabled", False)),

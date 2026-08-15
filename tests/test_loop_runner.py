@@ -136,6 +136,7 @@ from grid_optimizer.loop_runner import (
     resolve_loss_reduce_reentry_guard,
     _record_loss_reduce_reentry_fill_guard,
     _allow_grvt_reentry_below_soft_bypass,
+    _clear_completed_grvt_active_pair_reentry_memory,
     apply_synthetic_trend_follow_guard,
     apply_entry_permission_gate,
     assess_unrealized_loss_entry_guard,
@@ -11356,6 +11357,24 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(guard["block_short_entries"])
         self.assertIn("price_not_recovered", guard["reason"])
         self.assertIn("loss_reduce_reentry_guard", state)
+
+    def test_completed_grvt_pair_only_clears_plan_memory_below_soft(self) -> None:
+        state = {
+            "loss_reduce_reentry_guard": {
+                "sides": {
+                    "BUY": {"source": "active_pair_reduce"},
+                    "SELL": {"source": "active_pair_reduce_fill", "order_id": 78582743},
+                },
+                "source": "active_pair_reduce_fill",
+            }
+        }
+
+        _clear_completed_grvt_active_pair_reentry_memory(state)
+
+        self.assertEqual(
+            state["loss_reduce_reentry_guard"]["sides"],
+            {"SELL": {"source": "active_pair_reduce_fill", "order_id": 78582743}},
+        )
 
     def test_loss_reduce_fill_arms_durable_reentry_guard(self) -> None:
         with TemporaryDirectory() as tmpdir:
