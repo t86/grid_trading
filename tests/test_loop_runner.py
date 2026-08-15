@@ -48,6 +48,7 @@ from grid_optimizer.loop_runner import (
     _read_custom_grid_trade_count,
     _resolve_custom_grid_roll,
     _resolve_best_quote_dynamic_offsets,
+    _effective_best_quote_min_cycle_budget_notional,
     _resolve_synthetic_resync_price,
     _resolve_hard_loss_reduce_target_notional,
     _best_quote_reduce_freeze_report,
@@ -1261,6 +1262,22 @@ class LoopRunnerTests(unittest.TestCase):
             self.assertTrue(controls["buy_paused"])
             self.assertTrue(controls["short_paused"])
             self.assertIsNone(pause["directional_recovery"]["bypass_side"])
+
+    def test_grvt_minimum_cycle_cannot_be_overridden_below_viable_floor(self) -> None:
+        self.assertEqual(
+            _effective_best_quote_min_cycle_budget_notional(
+                symbol="GRVTUSDT",
+                configured_minimum=4.8,
+            ),
+            50.0,
+        )
+        self.assertEqual(
+            _effective_best_quote_min_cycle_budget_notional(
+                symbol="BTCUSDT",
+                configured_minimum=4.8,
+            ),
+            4.8,
+        )
 
     def test_grvt_extreme_tier_keeps_both_sides_live_when_pause_is_off(self) -> None:
         now = datetime(2026, 8, 9, 2, 30, tzinfo=timezone.utc)

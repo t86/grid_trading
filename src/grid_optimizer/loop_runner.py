@@ -1245,6 +1245,18 @@ def resolve_volatility_entry_pause(
     return report
 
 
+def _effective_best_quote_min_cycle_budget_notional(
+    *,
+    symbol: str,
+    configured_minimum: float,
+) -> float:
+    """Keep GRVT's defensive tier large enough to form real maker orders."""
+    minimum = max(_safe_float(configured_minimum), 0.0)
+    if str(symbol or "").upper().strip() == "GRVTUSDT":
+        return max(minimum, 50.0)
+    return minimum
+
+
 def apply_volatility_entry_pause_controls(
     *,
     symbol: str = "",
@@ -31525,7 +31537,12 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                     == "grvt_daily_80k_bq_short_freeze_5pct_v1"
                     else 0.0,
                 ),
-                min_cycle_budget_notional=float(getattr(effective_args, "best_quote_maker_volume_min_cycle_budget_notional", 20.0)),
+                min_cycle_budget_notional=_effective_best_quote_min_cycle_budget_notional(
+                    symbol=str(getattr(effective_args, "symbol", "")),
+                    configured_minimum=float(
+                        getattr(effective_args, "best_quote_maker_volume_min_cycle_budget_notional", 20.0)
+                    ),
+                ),
                 dynamic_tick_enabled=bool(getattr(effective_args, "best_quote_maker_volume_dynamic_tick_enabled", False)),
                 dynamic_tick_tight_offset_ticks=int(
                     getattr(effective_args, "best_quote_maker_volume_dynamic_tick_tight_offset_ticks", 2)
