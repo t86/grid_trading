@@ -300,6 +300,41 @@ def _resolve_recovery_parameters(
     )
 
 
+def _next_grvt_dynamic_cycle_floor(
+    *,
+    control: dict[str, Any],
+    target_cycle_budget_floor_notional: float,
+    static_cycle_budget_floor_notional: float,
+    cycle_budget_increment_notional: float,
+) -> float | None:
+    """Raise GRVT's effective dynamic floor one bounded pace-recovery step.
+
+    Dynamic volatility scaling applies after the runner's base cycle budget.
+    Increasing that base budget cannot repair a 2% defensive tier once the
+    base is already at its ceiling. Move the minimum effective cycle instead,
+    without exceeding the existing pace target or one configured recovery
+    increment per guard pass.
+    """
+    configured_floor = max(
+        _safe_float(control.get("best_quote_maker_volume_min_cycle_budget_notional")),
+        0.0,
+    )
+    viable_floor = max(float(static_cycle_budget_floor_notional), 0.0)
+    current_effective_floor = max(configured_floor, viable_floor)
+    target_floor = max(
+        min(
+            max(float(target_cycle_budget_floor_notional), viable_floor),
+            GRVT_AUTO_CYCLE_BUDGET_CEILING_NOTIONAL,
+        ),
+        viable_floor,
+    )
+    increment = max(float(cycle_budget_increment_notional), 0.0)
+    if increment <= 0 or current_effective_floor >= target_floor - 1e-12:
+        return None
+    next_floor = min(target_floor, current_effective_floor + increment)
+    return next_floor if next_floor > configured_floor + 1e-12 else None
+
+
 _RECOVERY_CONTROL_KEYS = (
     "best_quote_maker_volume_allow_loss_reduce_only",
     "best_quote_maker_volume_active_pair_reduce_enabled",
@@ -6618,6 +6653,17 @@ def check_symbol(
             # can place at least one bounded near-book entry per side.
             if target_budget > current_budget:
                 updates["best_quote_maker_volume_cycle_budget_notional"] = target_budget
+            dynamic_floor = _next_grvt_dynamic_cycle_floor(
+                control=control,
+                target_cycle_budget_floor_notional=max(
+                    _safe_float(volume_summary.get("target_cycle_budget_floor_notional")),
+                    float(cycle_budget_floor_notional),
+                ),
+                static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+                cycle_budget_increment_notional=volume_recovery_cycle_budget_increment,
+            )
+            if dynamic_floor is not None:
+                updates["best_quote_maker_volume_min_cycle_budget_notional"] = dynamic_floor
             changed, backup_path = _apply_control_update(
                 symbol=normalized_symbol,
                 control_path=control_path,
@@ -6652,6 +6698,17 @@ def check_symbol(
             }
             if target_budget > current_budget:
                 updates["best_quote_maker_volume_cycle_budget_notional"] = target_budget
+            dynamic_floor = _next_grvt_dynamic_cycle_floor(
+                control=control,
+                target_cycle_budget_floor_notional=max(
+                    _safe_float(volume_summary.get("target_cycle_budget_floor_notional")),
+                    float(cycle_budget_floor_notional),
+                ),
+                static_cycle_budget_floor_notional=static_cycle_budget_floor_notional,
+                cycle_budget_increment_notional=volume_recovery_cycle_budget_increment,
+            )
+            if dynamic_floor is not None:
+                updates["best_quote_maker_volume_min_cycle_budget_notional"] = dynamic_floor
             changed, backup_path = _apply_control_update(
                 symbol=normalized_symbol,
                 control_path=control_path,

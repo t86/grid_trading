@@ -14916,7 +14916,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 symbol="GRVTUSDT",
                 control={
                     "best_quote_maker_volume_cycle_budget_notional": 65.0,
-                    "best_quote_maker_volume_min_cycle_budget_notional": 50.0,
+                    "best_quote_maker_volume_min_cycle_budget_notional": 4.8,
                     "per_order_notional": 65.0,
                     "buy_levels": 6,
                     "sell_levels": 6,
@@ -14985,6 +14985,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(result["action"], "ramp_grvt_two_sided_entry_for_pace")
             self.assertFalse(result["assessment"]["low_volume"])
             self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 77.0)
+            self.assertEqual(control["best_quote_maker_volume_min_cycle_budget_notional"], 62.0)
             self.assertEqual(control["pause_buy_position_notional"], 900.0)
             self.assertEqual(control["pause_short_position_notional"], 900.0)
             self.assertEqual(restarts, ["GRVTUSDT"])
