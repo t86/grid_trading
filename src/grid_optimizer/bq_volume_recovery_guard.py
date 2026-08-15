@@ -10462,7 +10462,14 @@ def check_symbol(
                     or grvt_soft_loss_relief_override
                 )
                 and not recovery_reapply_debounced
-                and not post_restore_budget_cooldown_active
+                and (
+                    not post_restore_budget_cooldown_active
+                    or (
+                        normalized_symbol == "GRVTUSDT"
+                        and target_pace_behind
+                        and bool(assessment.get("ineffective_orders"))
+                    )
+                )
             ):
                 updates = _loss_reduce_recovery_updates(
                     control=control,
