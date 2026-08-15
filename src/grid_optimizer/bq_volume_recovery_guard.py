@@ -6311,8 +6311,18 @@ def check_symbol(
         and bool(assessment.get("ineffective_orders"))
         and not bool(assessment.get("effective_inventory_soft_pressure"))
         and _safe_int(assessment.get("planned_entry_order_count")) == 0
-        and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) == 0
-        and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) == 0
+        and (
+            _safe_int(assessment.get("ordinary_active_entry_long_order_count")) == 0
+            or _safe_int(assessment.get("ordinary_active_entry_short_order_count")) == 0
+        )
+        and (
+            _parse_time(item.get("last_grvt_no_entry_liveness_restart_at")) is None
+            or (
+                now
+                - _parse_time(item.get("last_grvt_no_entry_liveness_restart_at"))
+            ).total_seconds()
+            >= 120.0
+        )
     )
     # Pace ramps require exchange-backed ordinary entry on both sides.  A
     # planned pair plus a nonzero total order count is insufficient because
@@ -6564,6 +6574,7 @@ def check_symbol(
                 if dry_run
                 else "restore_grvt_below_soft_zero_entry_requote"
             )
+            item["last_grvt_no_entry_liveness_restart_at"] = now.isoformat()
         elif grvt_two_sided_entry_pace_ramp:
             current_budget = _safe_float(
                 control.get("best_quote_maker_volume_cycle_budget_notional")
