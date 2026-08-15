@@ -14767,6 +14767,66 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(result["action"], "restart_grvt_no_entry_liveness")
             self.assertEqual(restarts, ["GRVTUSDT"])
 
+    def test_grvt_zero_entry_requote_ramps_budget_without_changing_inventory_limits(self) -> None:
+        now = datetime(2026, 8, 15, 1, 0, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            self._write_common_files(
+                output_dir,
+                now=now,
+                symbol="GRVTUSDT",
+                control={
+                    "best_quote_maker_volume_cycle_budget_notional": 65.0,
+                    "best_quote_maker_volume_min_cycle_budget_notional": 50.0,
+                    "per_order_notional": 65.0,
+                    "buy_levels": 6,
+                    "sell_levels": 6,
+                    "pause_buy_position_notional": 900.0,
+                    "pause_short_position_notional": 900.0,
+                },
+                long_notional=810.0,
+                short_notional=805.0,
+                open_order_count=0,
+                active_order_count=0,
+            )
+            plan_path = output_dir / "grvtusdt_loop_latest_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan.update(
+                {
+                    "buy_orders": [],
+                    "sell_orders": [],
+                    "pause_reasons": ["extreme_volatility_defensive"],
+                    "volatility_entry_pause": {"active": False},
+                }
+            )
+            _write_json(plan_path, plan)
+            restarts: list[str] = []
+
+            result = check_symbol(
+                symbol="GRVTUSDT",
+                output_dir=output_dir,
+                state={"symbols": {}},
+                now=now,
+                window_seconds=300,
+                min_volume_notional=100.0,
+                trigger_seconds=120.0,
+                daily_target_notional=150_000.0,
+                cycle_budget_floor_notional=50.0,
+                trade_rows=[],
+                restart_runner=restarts.append,
+            )
+
+            control = json.loads(
+                (output_dir / "grvtusdt_loop_runner_control.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(result["action"], "restore_grvt_below_soft_zero_entry_requote")
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 77.0)
+            self.assertEqual(control["pause_buy_position_notional"], 900.0)
+            self.assertEqual(control["pause_short_position_notional"], 900.0)
+            self.assertEqual(restarts, ["GRVTUSDT"])
+
     def test_zero_order_budget_pause_repairs_legacy_wear_backoff_state(self) -> None:
         now = datetime(2026, 7, 12, 10, 35, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:

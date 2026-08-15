@@ -6422,6 +6422,19 @@ def check_symbol(
             ):
                 item.pop(key, None)
         elif grvt_below_soft_zero_entry_requote:
+            current_budget = _safe_float(
+                control.get("best_quote_maker_volume_cycle_budget_notional")
+            )
+            target_budget = min(
+                max(
+                    _safe_float(
+                        volume_summary.get("target_cycle_budget_floor_notional")
+                    ),
+                    float(cycle_budget_floor_notional),
+                ),
+                current_budget
+                + max(float(volume_recovery_cycle_budget_increment), 0.0),
+            )
             updates = {
                 "best_quote_maker_volume_pending_entry_buffer_share": 0.0,
                 "best_quote_maker_volume_quote_offset_ticks": max(
@@ -6431,6 +6444,12 @@ def check_symbol(
                     0,
                 ),
             }
+            # A defensive volatility scale can split a valid base budget below
+            # the exchange minimum on both entry sides.  Keep the existing
+            # thresholds intact, but climb one recovery step so the next plan
+            # can place at least one bounded near-book entry per side.
+            if target_budget > current_budget:
+                updates["best_quote_maker_volume_cycle_budget_notional"] = target_budget
             changed, backup_path = _apply_control_update(
                 symbol=normalized_symbol,
                 control_path=control_path,
