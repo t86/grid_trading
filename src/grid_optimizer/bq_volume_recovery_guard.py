@@ -10323,21 +10323,19 @@ def check_symbol(
                 and target_pace_behind
                 and pace_ratio < 0.75
                 and recovery_reapply_debounced
-                # A stranded reduce-only order must not mask a missing
-                # exchange-side ordinary entry pair.  The entry counts are
-                # the liveness signal; total active orders include reduces.
+                # A missing ordinary entry leg must not be masked by a
+                # surviving opposite-side entry or a reduce-only order.  The
+                # pair is live only when both exchange-side legs are present.
                 and (
                     _safe_int(assessment.get("active_order_count")) <= 0
-                    or (
-                        _safe_int(
-                            assessment.get("ordinary_active_entry_long_order_count")
-                        )
-                        <= 0
-                        and _safe_int(
-                            assessment.get("ordinary_active_entry_short_order_count")
-                        )
-                        <= 0
+                    or _safe_int(
+                        assessment.get("ordinary_active_entry_long_order_count")
                     )
+                    <= 0
+                    or _safe_int(
+                        assessment.get("ordinary_active_entry_short_order_count")
+                    )
+                    <= 0
                 )
                 and _safe_int(assessment.get("planned_entry_order_count")) > 0
                 and not bool(assessment.get("volatility_entry_pause_active"))

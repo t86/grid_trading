@@ -14760,7 +14760,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             updates["best_quote_maker_volume_cycle_budget_notional"], 100.0
         )
 
-    def test_grvt_zero_actual_entry_restarts_despite_reapply_debounce(self) -> None:
+    def test_grvt_missing_actual_entry_leg_restarts_despite_reapply_debounce(self) -> None:
         now = datetime(2026, 8, 15, 1, 0, tzinfo=timezone.utc)
         with TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -14789,12 +14789,12 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             _write_json(plan_path, plan)
             submit_path = output_dir / "grvtusdt_loop_latest_submit.json"
             submit = json.loads(submit_path.read_text(encoding="utf-8"))
-            # A remaining reduce-only order keeps total active orders nonzero,
-            # while both ordinary entry legs are absent from the exchange.
+            # A live short entry keeps total active orders nonzero, but the
+            # missing long leg still leaves the ordinary pair unavailable.
             submit["observed_strategy_open_order_state"].update(
                 {
                     "ordinary_active_entry_long_order_count": 0,
-                    "ordinary_active_entry_short_order_count": 0,
+                    "ordinary_active_entry_short_order_count": 1,
                 }
             )
             _write_json(submit_path, submit)
