@@ -14831,13 +14831,18 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(result["action"], "restart_grvt_no_entry_liveness")
             self.assertEqual(restarts, ["GRVTUSDT"])
 
-    def test_grvt_missing_entry_liveness_restart_has_no_cooldown(self) -> None:
+    def test_grvt_missing_entry_liveness_restart_uses_short_cooldown(self) -> None:
         now = datetime(2026, 8, 15, 1, 0, tzinfo=timezone.utc)
         item = {"last_grvt_no_entry_liveness_restart_at": now.isoformat()}
 
-        self.assertTrue(
+        self.assertFalse(
             bq_volume_recovery_guard._grvt_missing_entry_liveness_restart_due(
                 item, now=now + timedelta(seconds=1)
+            )
+        )
+        self.assertTrue(
+            bq_volume_recovery_guard._grvt_missing_entry_liveness_restart_due(
+                item, now=now + timedelta(seconds=60)
             )
         )
 

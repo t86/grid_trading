@@ -355,10 +355,10 @@ EMERGENCY_WEAR_PER_10K = 80.0
 # loss-reduce print must not suppress restoring ordinary two-sided flow.
 GRVT_RECOVERY_WEAR_PER_10K = 50.0
 GRVT_EMERGENCY_WEAR_PER_10K = 200.0
-# A missing ordinary entry leg is a runner-liveness failure. While GRVT is
-# behind its daily pace, let every guard execution restart the managed wrapper
-# instead of waiting out an arbitrary reapply interval.
-GRVT_MISSING_ENTRY_LIVENESS_RESTART_COOLDOWN_SECONDS = 0.0
+# A missing ordinary entry leg is a runner-liveness failure. Keep a short
+# interval during fast GRVT moves so the managed wrapper can requote promptly
+# without being restarted continuously on every guard execution.
+GRVT_MISSING_ENTRY_LIVENESS_RESTART_COOLDOWN_SECONDS = 60.0
 RECOVERY_GUARD_HEARTBEAT_KEY = "futures_recovery_guard_heartbeat"
 RECOVERY_GUARD_HEARTBEAT_SCHEMA = "futures_recovery_guard_heartbeat_v1"
 
@@ -5128,6 +5128,14 @@ def check_symbol(
         target_window_start=target_window_start,
         target_window_end=target_window_end,
     )
+    # GRVT is paced by short maker cycles. Treat a three-tick ordinary entry
+    # drift as stale while it is behind target so the existing managed
+    # requote path can pull it back one tick at a time.
+    effective_far_ticks = (
+        min(max(int(far_ticks), 0), 3)
+        if normalized_symbol == "GRVTUSDT"
+        else far_ticks
+    )
     assessment = assess_symbol(
         symbol=normalized_symbol,
         control=control,
@@ -5137,9 +5145,10 @@ def check_symbol(
         now=now,
         min_volume_notional=effective_min_volume_notional,
         near_cap_ratio=near_cap_ratio,
-        far_ticks=far_ticks,
+        far_ticks=effective_far_ticks,
         plan_stale_seconds=plan_stale_seconds,
     )
+    assessment["effective_far_ticks"] = effective_far_ticks
     actual_inventory_below_soft = _actual_inventory_below_soft_limits(
         assessment,
         pause_baseline_long_notional=pause_baseline_long_notional,
