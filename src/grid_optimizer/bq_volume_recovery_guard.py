@@ -6264,7 +6264,19 @@ def check_symbol(
         <= _safe_float(assessment.get("long_soft_limit_notional"))
         and _safe_float(assessment.get("ordinary_short_notional"))
         <= _safe_float(assessment.get("short_soft_limit_notional"))
-        and _safe_int(assessment.get("planned_entry_order_count")) == 0
+        and (
+            _safe_int(assessment.get("planned_entry_order_count")) == 0
+            # A one-sided planned leg with no exchange-backed ordinary entry
+            # cannot prove that the post-release flow has recovered. Keeping
+            # the lease here suppresses the opposite leg indefinitely.
+            or (
+                bool(assessment.get("planned_entry_one_sided"))
+                and _safe_int(assessment.get("ordinary_active_entry_long_order_count"))
+                == 0
+                and _safe_int(assessment.get("ordinary_active_entry_short_order_count"))
+                == 0
+            )
+        )
         and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) == 0
         and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) == 0
     )
