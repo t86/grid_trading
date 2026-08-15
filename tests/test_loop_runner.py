@@ -12829,6 +12829,58 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(report["normal_entry_suppressed"])
         self.assertEqual(plan["sell_orders"], [])
 
+        expedited_plan = {"buy_orders": [], "sell_orders": []}
+        expedited_state = {
+            "best_quote_active_pair_reduce": {
+                "active": False,
+                "mode": "threshold_side_v1",
+                "eligible_sides": ["short"],
+                "trigger_count": 1,
+                "completed": True,
+                "completed_at": (now - timedelta(seconds=75)).isoformat(),
+            }
+        }
+        expedited = apply_best_quote_active_pair_reduce(
+            plan=expedited_plan,
+            state=expedited_state,
+            enabled=True,
+            current_long_qty=2500.0,
+            current_short_qty=3200.0,
+            current_long_notional=800.0,
+            current_short_notional=920.0,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=100.0,
+            offset_ticks=1,
+            step_price=0.00035,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.3270,
+            ask_price=0.3271,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=900.0,
+            current_long_avg_price=0.3260,
+            current_short_avg_price=0.3280,
+            max_loss_ratio=0.20,
+            min_relief_notional=100.0,
+            suppress_all_entries_while_active=True,
+            now=now,
+            rearm_cooldown_seconds=300.0,
+            rearm_immediately_while_threshold_breached=True,
+        )
+
+        self.assertTrue(expedited["active"])
+        self.assertTrue(expedited["rearmed_after_refill"])
+        self.assertEqual(
+            [item["role"] for item in expedited_plan["buy_orders"]],
+            ["best_quote_active_pair_reduce_short"],
+        )
+
     def test_threshold_mode_cooldown_allows_same_side_entry_below_threshold(self) -> None:
         now = datetime(2026, 8, 14, 11, 1, 10, tzinfo=timezone.utc)
         state = {

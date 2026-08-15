@@ -23907,6 +23907,7 @@ def apply_best_quote_active_pair_reduce(
     suppress_noneligible_reduce_while_active: bool = False,
     now: datetime | None = None,
     rearm_cooldown_seconds: float = 0.0,
+    rearm_immediately_while_threshold_breached: bool = False,
 ) -> dict[str, Any]:
     report = _best_quote_active_pair_reduce_default_report()
     report["enabled"] = bool(enabled)
@@ -24109,7 +24110,11 @@ def apply_best_quote_active_pair_reduce(
             for side in memory.get("eligible_sides", [])
             if str(side) in {"long", "short"}
         }
-        if cooldown_remaining > 0 and threshold_eligible_sides:
+        if (
+            cooldown_remaining > 0
+            and threshold_eligible_sides
+            and not rearm_immediately_while_threshold_breached
+        ):
             suppressed_entry_order_count = 0
             for side_name, order_key, entry_role in (
                 ("long", "buy_orders", "best_quote_entry_long"),
@@ -33482,6 +33487,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             suppress_noneligible_reduce_while_active=grvt_bounded_loss_recovery,
             now=plan_now,
             rearm_cooldown_seconds=300.0 if grvt_bounded_loss_recovery else 0.0,
+            rearm_immediately_while_threshold_breached=grvt_bounded_loss_recovery,
         )
     else:
         state.pop("best_quote_active_pair_reduce", None)
