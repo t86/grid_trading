@@ -17464,7 +17464,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 (output_dir / "grvtusdt_loop_runner_control.json").read_text(encoding="utf-8")
             )
             self.assertEqual(result["action"], "relax_grvt_inventory_bias_for_one_sided_pace")
-            self.assertTrue(result["assessment"]["actual_inventory_below_soft"])
+            self.assertFalse(result["assessment"]["effective_inventory_soft_pressure"])
             self.assertTrue(result["assessment"]["target_pace_behind"])
             self.assertEqual(
                 control["best_quote_maker_volume_inventory_bias_min_notional_gap"],
