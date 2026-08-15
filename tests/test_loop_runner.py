@@ -11324,6 +11324,36 @@ class LoopRunnerTests(unittest.TestCase):
             )
         )
 
+    def test_grvt_below_soft_clears_active_pair_reentry_memory(self) -> None:
+        now = datetime(2026, 8, 15, 5, 20, tzinfo=timezone.utc)
+        state: dict[str, object] = {
+            "loss_reduce_reentry_guard": {
+                "side": "SELL",
+                "source": "active_pair_reduce",
+                "started_at": (now - timedelta(seconds=10)).isoformat(),
+                "reference_price": 0.3045,
+            }
+        }
+
+        guard = resolve_loss_reduce_reentry_guard(
+            state=state,
+            enabled=True,
+            adverse_inventory_reduce={},
+            hard_loss_forced_reduce={},
+            current_long_notional=840.0,
+            current_short_notional=830.0,
+            mid_price=0.3070,
+            effective_step_price=0.00035,
+            now=now,
+            cooldown_seconds=120.0,
+            recover_buffer_steps=1.0,
+            clear_active_pair_guard=True,
+        )
+
+        self.assertFalse(guard["active"])
+        self.assertEqual(guard["reason"], "active_pair_below_soft_bypass")
+        self.assertNotIn("loss_reduce_reentry_guard", state)
+
     def test_loss_reduce_reentry_guard_action_filter_keeps_reducers(self) -> None:
         actions = {
             "place_orders": [

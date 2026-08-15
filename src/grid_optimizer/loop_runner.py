@@ -1667,6 +1667,7 @@ def resolve_loss_reduce_reentry_guard(
     best_quote_active_pair_reduce: dict[str, Any] | None = None,
     cooldown_seconds: float = 300.0,
     recover_buffer_steps: float = 1.0,
+    clear_active_pair_guard: bool = False,
 ) -> dict[str, Any]:
     if not enabled:
         state.pop("loss_reduce_reentry_guard", None)
@@ -1713,6 +1714,21 @@ def resolve_loss_reduce_reentry_guard(
             "updated_at": _isoformat(safe_now),
             "reference_price": reference_price,
         }
+
+    if clear_active_pair_guard:
+        side_memories = {
+            side: side_memory
+            for side, side_memory in side_memories.items()
+            if str(side_memory.get("source") or "") != "active_pair_reduce"
+        }
+        if not side_memories:
+            state.pop("loss_reduce_reentry_guard", None)
+            return {
+                "enabled": True,
+                "active": False,
+                "reason": "active_pair_below_soft_bypass",
+                "bypassed_below_soft_two_sided": True,
+            }
 
     if not side_memories:
         state.pop("loss_reduce_reentry_guard", None)
@@ -33217,6 +33233,14 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
         loss_recover_ratio=0.75,
     )
+    grvt_clear_active_pair_reentry_guard = (
+        str(symbol or "").upper().strip() == "GRVTUSDT"
+        and not bool(volatility_entry_pause.get("active"))
+        and _safe_float(controls.get("current_long_notional", current_long_notional))
+        < _safe_float(getattr(effective_args, "pause_buy_position_notional", 0.0))
+        and _safe_float(controls.get("current_short_notional", current_short_notional))
+        < _safe_float(getattr(effective_args, "pause_short_position_notional", 0.0))
+    )
     loss_reduce_reentry_guard = resolve_loss_reduce_reentry_guard(
         state=state,
         enabled=bool(getattr(effective_args, "loss_reentry_guard_enabled", False)),
@@ -33229,6 +33253,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         now=plan_now,
         cooldown_seconds=getattr(effective_args, "loss_reentry_cooldown_seconds", 300.0),
         recover_buffer_steps=getattr(effective_args, "loss_reentry_cost_buffer_steps", 1.0),
+        clear_active_pair_guard=grvt_clear_active_pair_reentry_guard,
     )
     # A bounded ordinary-inventory loss trim is allowed to re-open both maker
     # lanes once both ordinary sides are back below soft.  Keeping its
@@ -33624,6 +33649,7 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                 now=plan_now,
                 cooldown_seconds=getattr(effective_args, "loss_reentry_cooldown_seconds", 300.0),
                 recover_buffer_steps=getattr(effective_args, "loss_reentry_cost_buffer_steps", 1.0),
+                clear_active_pair_guard=grvt_clear_active_pair_reentry_guard,
             )
             # The active-pair reducer can refresh the reentry guard after the
             # initial below-soft bypass.  Reapply the same ordinary-inventory
