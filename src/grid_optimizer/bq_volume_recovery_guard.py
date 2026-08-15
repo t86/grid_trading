@@ -13087,10 +13087,7 @@ def main(argv: list[str] | None = None) -> int:
     registered_symbols: list[str] = []
     exit_code = 0
     for symbol in _normalize_symbols(args.symbols):
-        # GRVT recovery is observation-only at the process boundary. Runtime
-        # control files can be rewritten by runner-management paths, so a JSON
-        # opt-out key alone is not a durable mutation guard for this symbol.
-        symbol_dry_run = args.dry_run or symbol == "GRVTUSDT"
+        symbol_dry_run = args.dry_run
         terminal_delegation = _terminal_drain_delegation(
             symbol=symbol,
             output_dir=output_dir,
