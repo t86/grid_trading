@@ -10526,6 +10526,38 @@ def check_symbol(
                             {"status": "low_volume", "last_recovery_check_at": now.isoformat()}
                         )
             elif (
+                normalized_symbol == "GRVTUSDT"
+                and target_pace_behind
+                and not bool(assessment.get("effective_inventory_soft_pressure"))
+                and (
+                    _safe_int(assessment.get("ordinary_active_entry_long_order_count")) <= 0
+                    or _safe_int(assessment.get("ordinary_active_entry_short_order_count")) <= 0
+                )
+                and (
+                    _parse_time(item.get("last_grvt_no_entry_liveness_restart_at")) is None
+                    or (
+                        now
+                        - _parse_time(item.get("last_grvt_no_entry_liveness_restart_at"))
+                    ).total_seconds()
+                    >= 120.0
+                )
+            ):
+                action = (
+                    "dry_run_restart_grvt_no_entry_liveness"
+                    if dry_run
+                    else "restart_grvt_no_entry_liveness"
+                )
+                item.update(
+                    {
+                        "status": "recovery_active",
+                        "last_grvt_no_entry_liveness_restart_at": now.isoformat(),
+                        "last_recovery_action_at": now.isoformat(),
+                        "last_recovery_action": action,
+                    }
+                )
+                if not dry_run:
+                    restart(normalized_symbol)
+            elif (
                 recovery_reapply_debounced
                 and not effective_inventory_soft_pressure
                 and not arx_severe_volume_priority_recovery
