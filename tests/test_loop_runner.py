@@ -11320,6 +11320,51 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(guard["block_short_entries"])
         self.assertFalse(guard["block_long_entries"])
 
+    def test_loss_reduce_plan_does_not_overwrite_actual_fill_guard(self) -> None:
+        fill_at = datetime(2026, 8, 15, 6, 41, 38, tzinfo=timezone.utc)
+        state: dict[str, object] = {
+            "loss_reduce_reentry_guard": {
+                "sides": {
+                    "BUY": {
+                        "side": "BUY",
+                        "source": "active_pair_reduce_fill",
+                        "started_at": fill_at.isoformat(),
+                        "reference_price": 0.3072,
+                        "order_id": 78675939,
+                    }
+                },
+                "side": "BUY",
+                "source": "active_pair_reduce_fill",
+            }
+        }
+
+        guard = resolve_loss_reduce_reentry_guard(
+            state=state,
+            enabled=True,
+            adverse_inventory_reduce={"enabled": True, "placed_reduce_orders": 0},
+            hard_loss_forced_reduce={},
+            best_quote_active_pair_reduce={
+                "enabled": True,
+                "order_count": 1,
+                "short_order_notional": 99.84,
+                "short_expected_loss_ratio": 0.0017,
+            },
+            current_long_notional=804.0,
+            current_short_notional=914.0,
+            mid_price=0.30695,
+            effective_step_price=0.00035,
+            now=fill_at + timedelta(seconds=290),
+            cooldown_seconds=180.0,
+            recover_buffer_steps=1.0,
+        )
+
+        self.assertEqual(guard["side_guards"]["BUY"]["source"], "active_pair_reduce_fill")
+        self.assertEqual(guard["reference_price"], 0.3072)
+        self.assertEqual(
+            state["loss_reduce_reentry_guard"]["sides"]["BUY"]["order_id"],
+            78675939,
+        )
+
     def test_grvt_below_soft_keeps_active_pair_loss_reentry_guard(self) -> None:
         for source in ("active_pair_reduce", "active_pair_reduce_fill"):
             with self.subTest(source=source):

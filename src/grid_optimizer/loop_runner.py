@@ -1705,6 +1705,9 @@ def resolve_loss_reduce_reentry_guard(
         if _safe_float(active_pair.get("short_order_notional")) > 0 and short_loss_ratio > 0:
             triggers["BUY"] = ("active_pair_reduce", None)
     for current_trigger_side, (current_trigger_source, current_trigger_price) in triggers.items():
+        existing_memory = side_memories.get(current_trigger_side) or {}
+        if str(existing_memory.get("source") or "") == "active_pair_reduce_fill":
+            continue
         reference_price = max(_safe_float(current_trigger_price), safe_mid, 0.0)
         side_memories[current_trigger_side] = {
             "side": current_trigger_side,
