@@ -6631,6 +6631,13 @@ def check_symbol(
                 item, control, grvt_restore_cycle_budget_floor
             )
             updates.update(loss_updates)
+            if target_pace_behind:
+                updates["best_quote_maker_volume_cycle_budget_notional"] = max(
+                    _safe_float(
+                        updates.get("best_quote_maker_volume_cycle_budget_notional")
+                    ),
+                    grvt_restore_cycle_budget_floor,
+                )
             item["guard_recovery_controls"] = {}
             _remember_recovery_updates(item, updates)
             changed, backup_path = _apply_control_update(

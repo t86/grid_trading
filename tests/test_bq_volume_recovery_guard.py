@@ -16347,7 +16347,10 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                     "best_quote_maker_volume_active_pair_reduce_enabled": False,
                     "best_quote_maker_volume_active_pair_reduce_order_notional": 55.0,
                     "best_quote_maker_volume_active_pair_reduce_max_notional_per_side": 100.0,
-                    "best_quote_maker_volume_cycle_budget_notional": 260.0,
+                    "best_quote_maker_volume_cycle_budget_notional": 160.0,
+                    "per_order_notional": 65.0,
+                    "buy_levels": 6,
+                    "sell_levels": 6,
                     "pause_buy_position_notional": 900.0,
                     "pause_short_position_notional": 900.0,
                     "max_position_notional": 1000.0,
@@ -16394,6 +16397,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 min_volume_notional=100,
                 trigger_seconds=120,
                 daily_target_notional=150_000.0,
+                cycle_budget_floor_notional=50.0,
                 require_soft_pressure_for_allow_loss=False,
                 trade_rows=[
                     {
@@ -16420,6 +16424,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
                 100.0,
             )
             self.assertFalse(control["best_quote_maker_volume_net_loss_reduce_enabled"])
+            self.assertEqual(control["best_quote_maker_volume_cycle_budget_notional"], 172.0)
             self.assertEqual(restarts, ["GRVTUSDT"])
 
     def test_grvt_dynamic_extreme_allows_bounded_release_when_one_side_exceeds_soft(self) -> None:
