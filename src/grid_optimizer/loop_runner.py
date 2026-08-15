@@ -1693,11 +1693,22 @@ def resolve_loss_reduce_reentry_guard(
         best_quote_active_pair_reduce=best_quote_active_pair_reduce,
     )
     safe_mid = max(_safe_float(mid_price), 0.0)
+    triggers: dict[str, tuple[str, float | None]] = {}
     if trigger_side in {"BUY", "SELL"}:
-        reference_price = max(_safe_float(trigger_price), safe_mid, 0.0)
-        side_memories[trigger_side] = {
-            "side": trigger_side,
-            "source": trigger_source or "loss_reduce",
+        triggers[trigger_side] = (trigger_source or "loss_reduce", trigger_price)
+    active_pair = best_quote_active_pair_reduce or {}
+    if trigger_source == "active_pair_reduce":
+        long_loss_ratio = _safe_float(active_pair.get("long_expected_loss_ratio"))
+        short_loss_ratio = _safe_float(active_pair.get("short_expected_loss_ratio"))
+        if _safe_float(active_pair.get("long_order_notional")) > 0 and long_loss_ratio > 0:
+            triggers["SELL"] = ("active_pair_reduce", None)
+        if _safe_float(active_pair.get("short_order_notional")) > 0 and short_loss_ratio > 0:
+            triggers["BUY"] = ("active_pair_reduce", None)
+    for current_trigger_side, (current_trigger_source, current_trigger_price) in triggers.items():
+        reference_price = max(_safe_float(current_trigger_price), safe_mid, 0.0)
+        side_memories[current_trigger_side] = {
+            "side": current_trigger_side,
+            "source": current_trigger_source,
             "started_at": _isoformat(safe_now),
             "updated_at": _isoformat(safe_now),
             "reference_price": reference_price,

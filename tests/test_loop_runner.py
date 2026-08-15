@@ -11179,6 +11179,33 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(guard["block_short_entries"])
         self.assertEqual(set(guard["active_sides"]), {"BUY", "SELL"})
 
+    def test_loss_reduce_reentry_guard_arms_both_lossy_sides_from_one_plan(self) -> None:
+        guard = resolve_loss_reduce_reentry_guard(
+            state={},
+            enabled=True,
+            adverse_inventory_reduce={"enabled": True, "placed_reduce_orders": 0},
+            hard_loss_forced_reduce={},
+            best_quote_active_pair_reduce={
+                "enabled": True,
+                "order_count": 2,
+                "long_order_notional": 99.97,
+                "short_order_notional": 99.84,
+                "long_expected_loss_ratio": 0.003,
+                "short_expected_loss_ratio": 0.004,
+            },
+            current_long_notional=920.0,
+            current_short_notional=920.0,
+            mid_price=0.3048,
+            effective_step_price=0.00035,
+            now=datetime(2026, 8, 15, 5, 4, tzinfo=timezone.utc),
+            cooldown_seconds=180.0,
+            recover_buffer_steps=1.0,
+        )
+
+        self.assertTrue(guard["block_long_entries"])
+        self.assertTrue(guard["block_short_entries"])
+        self.assertEqual(set(guard["active_sides"]), {"BUY", "SELL"})
+
     def test_loss_reduce_reentry_guard_requires_favorable_short_reentry_price(self) -> None:
         now = datetime(2026, 8, 15, 4, 54, tzinfo=timezone.utc)
         state: dict[str, object] = {}
