@@ -6256,27 +6256,15 @@ def check_symbol(
     # are the stronger completion proof in that state; retaining the lease
     # would otherwise leave the recovered flow on its reduced loss budget.
     # A loss-release lease must not keep entry suppressed after both ordinary
-    # sides have already returned below soft.  Waiting for entries that the
-    # lease itself prevents creates a no-order recovery deadlock.
+    # sides have already returned below soft.  The exchange-backed ordinary
+    # entry counts are authoritative here: planned roles can be stale or
+    # unclassified while the lease itself prevents either live leg.
     grvt_dynamic_release_below_soft_without_entries = (
         grvt_dynamic_loss_release_in_progress
         and _safe_float(assessment.get("ordinary_long_notional"))
         <= _safe_float(assessment.get("long_soft_limit_notional"))
         and _safe_float(assessment.get("ordinary_short_notional"))
         <= _safe_float(assessment.get("short_soft_limit_notional"))
-        and (
-            _safe_int(assessment.get("planned_entry_order_count")) == 0
-            # A one-sided planned leg with no exchange-backed ordinary entry
-            # cannot prove that the post-release flow has recovered. Keeping
-            # the lease here suppresses the opposite leg indefinitely.
-            or (
-                bool(assessment.get("planned_entry_one_sided"))
-                and _safe_int(assessment.get("ordinary_active_entry_long_order_count"))
-                == 0
-                and _safe_int(assessment.get("ordinary_active_entry_short_order_count"))
-                == 0
-            )
-        )
         and _safe_int(assessment.get("ordinary_active_entry_long_order_count")) == 0
         and _safe_int(assessment.get("ordinary_active_entry_short_order_count")) == 0
     )
