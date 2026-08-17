@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -167,9 +168,152 @@ def test_web_active_baseline_change_is_durable_across_restart(tmp_path: Path) ->
         not in restarted_state.baseline_change.request.candidate_profile.fields
     )
     assert (
+        restarted_state.baseline_change.request.candidate_profile.fields[
+            "best_quote_maker_volume_cycle_budget_notional"
+        ]
+        == 360.0
+    )
+    assert (
         restarted_state.baseline_change.status
         is recovery.BaselineChangeStatus.DEFERRED
     )
+
+
+def test_monitor_editor_round_trip_never_captures_registered_control_overlay(
+    tmp_path: Path,
+) -> None:
+    control_path = tmp_path / "arxusdt_loop_runner_control.json"
+    store = _register(control_path)
+    _make_active(store)
+    monitor_payload = json.loads(control_path.read_text(encoding="utf-8"))
+    assert RECOVERY_STATE_KEY in monitor_payload
+    assert RECOVERY_STATE_MIRROR_KEY in monitor_payload
+    assert monitor_payload["recovery_order_side"] == "SELL"
+    monitor_payload.update(
+        {
+            "operation_id": "monitor-round-trip-op",
+            "attempt_id": "monitor-round-trip-attempt",
+            "source": "running_status_web",
+            "requested_at": NOW.isoformat(),
+            "step_price": 0.0008,
+            "autotune_symbol_enabled": False,
+            # Coordinator-owned fields shown by the monitor are never edits
+            # to the durable baseline, even if the browser posts them back.
+            "best_quote_maker_volume_allow_loss_reduce_only": True,
+            "volatility_entry_pause_enabled": False,
+        }
+    )
+
+    with patch.object(
+        web_module,
+        "_runner_control_path",
+        return_value=control_path,
+    ):
+        submitted = web_module._save_runner_config_without_start(monitor_payload)
+
+    assert submitted["request_status"] == "deferred"
+    deferred_state = JsonRecoveryStore(control_path).read("ARXUSDT")
+    assert deferred_state.baseline_change is not None
+    candidate = deferred_state.baseline_change.request.candidate_profile.fields
+    assert candidate["step_price"] == 0.0008
+    for key in (RECOVERY_STATE_KEY, RECOVERY_STATE_MIRROR_KEY):
+        assert key not in candidate
+    assert "recovery_order_side" not in candidate
+    assert "near_market_entry_max_center_distance_steps" not in candidate
+    assert {
+        key for key in candidate if web_module._is_managed_recovery_key(key)
+    } == {
+        "best_quote_maker_volume_allow_loss_reduce_only",
+        "best_quote_maker_volume_net_loss_reduce_enabled",
+        "hard_loss_forced_reduce_enabled",
+        "volatility_entry_pause_enabled",
+    }
+    for key in ("operation_id", "attempt_id", "source", "requested_at"):
+        assert key not in candidate
+
+    # Model the existing higher-priority recovery completing normally.  The
+    # next strict-STABLE coordinator round owns applying the durable request.
+    reached_stable = replace(
+        recovery.RecoveryState.initial(
+            "ARXUSDT",
+            deferred_state.baseline_profile.fields,
+            now=NOW + timedelta(seconds=1),
+        ),
+        document_revision=deferred_state.document_revision + 1,
+        generation=deferred_state.generation,
+        effect_epoch=deferred_state.effect_epoch,
+        recent_round_ids=deferred_state.recent_round_ids,
+        last_round_id=deferred_state.last_round_id,
+        baseline_changes=deferred_state.baseline_changes,
+    )
+    store.compare_and_swap(
+        "ARXUSDT",
+        expected_revision=deferred_state.document_revision,
+        next_state=reached_stable,
+    )
+
+    effects: list[recovery.EffectCommand] = []
+    coordinator = _coordinator(JsonRecoveryStore(control_path), effects=effects)
+    applied = coordinator.reconcile_symbol(
+        "ARXUSDT",
+        now=NOW + timedelta(seconds=2),
+        round_id="apply-monitor-round-trip",
+    )
+    applied_state = JsonRecoveryStore(control_path).read("ARXUSDT")
+    assert applied.action_id is recovery.ActionId.BASELINE_REBASE
+    assert applied.effect_stage is recovery.EffectStage.RUNNER_RESTART
+    assert len(effects) == 1
+    assert applied_state.baseline_profile.fields["step_price"] == 0.0008
+    assert applied_state.baseline_profile == applied_state.desired_profile
+    for profile in (applied_state.baseline_profile, applied_state.desired_profile):
+        for key in (RECOVERY_STATE_KEY, RECOVERY_STATE_MIRROR_KEY):
+            assert key not in profile.fields
+        assert "recovery_order_side" not in profile.fields
+        assert (
+            profile.fields["best_quote_maker_volume_allow_loss_reduce_only"]
+            is False
+        )
+        assert (
+            profile.fields["best_quote_maker_volume_net_loss_reduce_enabled"]
+            is False
+        )
+        assert profile.fields["hard_loss_forced_reduce_enabled"] is False
+        assert profile.fields["volatility_entry_pause_enabled"] is True
+        assert profile.execution_policy == recovery.ExecutionPolicy(
+            order_type="LIMIT",
+            time_in_force="GTX",
+            post_only=True,
+        )
+
+    receipt = recovery.EffectReceipt(
+        decision_id=str(applied_state.decision_id),
+        stage=recovery.EffectStage.RUNNER_RESTART,
+        effect_epoch=int(applied.effect_epoch),
+        observed_at=NOW + timedelta(seconds=3),
+    )
+    coordinator.snapshot_provider = lambda symbol, now, state: _snapshot(
+        symbol,
+        now,
+        state,
+        effect_receipt=receipt,
+    )
+    settled = coordinator.reconcile_symbol(
+        "ARXUSDT",
+        now=NOW + timedelta(seconds=3),
+        round_id="receipt-monitor-round-trip",
+    )
+    assert settled.next_state.phase is recovery.RecoveryPhase.STABLE
+
+    fresh_store = JsonRecoveryStore(control_path)
+    fresh_state = fresh_store.read("ARXUSDT")
+    post_receipt = _coordinator(fresh_store).reconcile_symbol(
+        "ARXUSDT",
+        now=NOW + timedelta(seconds=4),
+        round_id="post-monitor-round-trip",
+    )
+    assert post_receipt.action_id is recovery.ActionId.NOOP
+    assert post_receipt.effect_stage is recovery.EffectStage.NONE
+    assert post_receipt.next_state.baseline_profile == fresh_state.baseline_profile
 
 
 def test_stable_round_applies_baseline_once_and_restarts_once(tmp_path: Path) -> None:

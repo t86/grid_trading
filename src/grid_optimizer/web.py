@@ -11537,6 +11537,18 @@ def _defer_registered_runner_web_action(
 _BASELINE_CHANGE_REQUEST_KEYS = frozenset(
     {"operation_id", "attempt_id", "source", "requested_at"}
 )
+_REGISTERED_BASELINE_NON_USER_KEYS = _BASELINE_CHANGE_REQUEST_KEYS | frozenset(
+    {RECOVERY_STATE_KEY, RECOVERY_STATE_MIRROR_KEY}
+)
+
+
+def _registered_baseline_user_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in _REGISTERED_BASELINE_NON_USER_KEYS
+        and not _is_managed_recovery_key(str(key))
+    }
 
 
 def _baseline_change_requested_at(value: Any) -> datetime:
@@ -11569,14 +11581,16 @@ def _submit_registered_runner_baseline_change(
 ) -> dict[str, Any]:
     store = JsonRecoveryStore(control_path)
     state = store.read(symbol)
-    candidate_payload = {
-        key: value
-        for key, value in payload.items()
-        if key not in _BASELINE_CHANGE_REQUEST_KEYS
-    }
-    candidate = _resolve_runner_start_config(
-        candidate_payload,
-        inherited_config=dict(state.baseline_profile.fields),
+    inherited_baseline = _registered_baseline_user_fields(
+        dict(state.baseline_profile.fields)
+    )
+    candidate_payload = dict(inherited_baseline)
+    candidate_payload.update(_registered_baseline_user_fields(payload))
+    candidate = _registered_baseline_user_fields(
+        _resolve_runner_start_config(
+            candidate_payload,
+            inherited_config=inherited_baseline,
+        )
     )
     _validate_runner_run_contract(candidate)
     request = BaselineChange.create(
