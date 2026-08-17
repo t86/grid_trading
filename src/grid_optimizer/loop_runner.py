@@ -24647,6 +24647,8 @@ def apply_best_quote_active_pair_reduce(
             "started_at": effective_now.isoformat(),
             "long_start_notional": safe_long_notional,
             "short_start_notional": safe_short_notional,
+            "long_start_qty": safe_long_qty,
+            "short_start_qty": safe_short_qty,
             "long_target_notional": long_target,
             "short_target_notional": short_target,
             "long_authorized_reduce_notional": 0.0,
@@ -24688,16 +24690,39 @@ def apply_best_quote_active_pair_reduce(
         return _clear("target_reached", completed=True)
     minimum_actionable_notional = max(_safe_float(min_notional), 0.0)
 
+    def _can_refresh_unfilled_pressure_authorization(
+        *,
+        side_name: str,
+        current_qty: float,
+        authorized_notional: float,
+    ) -> bool:
+        if (
+            not paired_threshold_mode
+            or side_name not in threshold_eligible_sides
+            or authorized_notional <= 0
+        ):
+            return False
+        start_qty = max(_safe_float(memory.get(f"{side_name}_start_qty")), 0.0)
+        qty_tolerance = max(_safe_float(step_size) * 0.5, 1e-9)
+        return start_qty > 0 and abs(current_qty - start_qty) < qty_tolerance
+
     def _lease_authorization_exhausted(
         *,
         side_name: str,
         start_notional: float,
         target_notional: float,
         authorized_notional: float,
+        current_qty: float,
         target_reached: bool,
     ) -> bool:
         if side_name not in eligible_sides or target_reached:
             return True
+        if _can_refresh_unfilled_pressure_authorization(
+            side_name=side_name,
+            current_qty=current_qty,
+            authorized_notional=authorized_notional,
+        ):
+            return False
         lease_budget = min(
             safe_max_reduce,
             max(start_notional - target_notional, 0.0),
@@ -24710,6 +24735,7 @@ def apply_best_quote_active_pair_reduce(
         start_notional=max(_safe_float(memory.get("long_start_notional")), 0.0),
         target_notional=long_target,
         authorized_notional=long_authorized_reduce,
+        current_qty=safe_long_qty,
         target_reached=long_reached,
     )
     short_authorization_exhausted = _lease_authorization_exhausted(
@@ -24717,6 +24743,7 @@ def apply_best_quote_active_pair_reduce(
         start_notional=max(_safe_float(memory.get("short_start_notional")), 0.0),
         target_notional=short_target,
         authorized_notional=short_authorized_reduce,
+        current_qty=safe_short_qty,
         target_reached=short_reached,
     )
     if (
@@ -24857,8 +24884,15 @@ def apply_best_quote_active_pair_reduce(
             safe_max_reduce,
             max(start_notional - target_notional, 0.0),
         )
+        refresh_unfilled_pressure = _can_refresh_unfilled_pressure_authorization(
+            side_name=side_name,
+            current_qty=current_qty,
+            authorized_notional=authorized_notional,
+        )
         remaining_authorized_budget = (
-            max(lease_budget - authorized_notional, 0.0)
+            min(authorized_notional, lease_budget)
+            if refresh_unfilled_pressure
+            else max(lease_budget - authorized_notional, 0.0)
             if paired_threshold_mode
             else safe_max_reduce
         )
@@ -24923,7 +24957,7 @@ def apply_best_quote_active_pair_reduce(
         }
         plan[order_key].append(order)
         placed.append(order)
-        if paired_threshold_mode:
+        if paired_threshold_mode and not refresh_unfilled_pressure:
             memory[authorized_key] = authorized_notional + notional
         report[f"{side_name}_order_notional"] = notional
         report[authorized_key] = max(_safe_float(memory.get(authorized_key)), 0.0)

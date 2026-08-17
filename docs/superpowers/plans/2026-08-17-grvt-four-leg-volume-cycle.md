@@ -299,6 +299,7 @@ Add tests proving:
 - Below soft threshold, the planner emits four ordinary roles and no active-pair loss-reduction role.
 - At soft threshold, existing runner logic emits paired `best_quote_active_pair_reduce_long` and `best_quote_active_pair_reduce_short` orders at BBO.
 - Each side remains capped by the existing lease cap near 100U.
+- An unfilled pressure-side order may refresh at the current BBO under the same lease authorization only while its ordinary quantity is unchanged; any quantity change consumes the authorization and prevents a second loss reduction on that side.
 - After the measured side returns below soft threshold, the active-pair report becomes inactive and ordinary four-leg planning can resume.
 - Frozen quantities never increase the ordinary reduce quantity and frozen ownership tags are absent from ordinary orders.
 
@@ -328,7 +329,7 @@ Expected: new tests either pass through existing active-pair code or fail only a
 
 **Step 3: Make the minimum boundary fix if the tests fail**
 
-Keep the active-pair sizing, threshold, cooldown, audit, and cap code unchanged. The only permitted boundary fix is to ensure the active-pair result takes precedence over ordinary four-leg orders for a side at/above soft threshold, and that the four-leg helper runs again after the active-pair report is inactive.
+Keep the active-pair sizing, threshold, cooldown, audit, and cap unchanged. The permitted boundary fixes are to ensure the active-pair result takes precedence over ordinary four-leg orders for a side at/above soft threshold, refresh an entirely unfilled pressure-side order under the same authorization instead of treating placement as completion, and run the four-leg helper again after the active-pair report is inactive.
 
 **Step 4: Run the complete affected suites**
 
