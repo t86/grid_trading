@@ -118,6 +118,8 @@ class BestQuoteMakerVolumeInputs:
     current_short_qty: float | None = None
     current_long_avg_price: float = 0.0
     current_short_avg_price: float = 0.0
+    exchange_long_avg_price: float = 0.0
+    exchange_short_avg_price: float = 0.0
     position_side_mode: str = "one_way"
     market_return_1m: float = 0.0
     market_amplitude_1m: float = 0.0
@@ -1701,6 +1703,101 @@ def build_best_quote_maker_volume_plan(
                 )
             )
 
+    balanced_cost_recovery_report = {
+        "applied": False,
+        "reason": None,
+        "paired_entry_notional": 0.0,
+        "hard_long_headroom": max(long_limit - projected_long_entry_notional, 0.0),
+        "hard_short_headroom": max(short_limit - projected_short_entry_notional, 0.0),
+    }
+    balance_tolerance = max(bias_min_notional_gap, soft_entry_buffer)
+    long_avg_price = _safe_float(inputs.current_long_avg_price)
+    short_avg_price = _safe_float(inputs.current_short_avg_price)
+    exchange_long_avg_price = _safe_float(inputs.exchange_long_avg_price)
+    exchange_short_avg_price = _safe_float(inputs.exchange_short_avg_price)
+    effective_long_avg_price = max(long_avg_price, exchange_long_avg_price)
+    effective_short_avg_price = min(
+        price
+        for price in (short_avg_price, exchange_short_avg_price)
+        if price > 0
+    ) if short_avg_price > 0 or exchange_short_avg_price > 0 else 0.0
+    balanced_cost_recovery_report.update(
+        {
+            "managed_long_avg_price": long_avg_price,
+            "managed_short_avg_price": short_avg_price,
+            "exchange_long_avg_price": exchange_long_avg_price,
+            "exchange_short_avg_price": exchange_short_avg_price,
+            "effective_long_avg_price": effective_long_avg_price,
+            "effective_short_avg_price": effective_short_avg_price,
+        }
+    )
+    if (
+        hedge_position_sides
+        and not hard_loss
+        and not net_loss_reduce_report["active"]
+        and not inventory_bias_report["applied"]
+        and _safe_float(inputs.target_volume_remaining) > 0
+        and long_limit > 0
+        and short_limit > 0
+        and long_profit_reduce_trigger > 0
+        and short_profit_reduce_trigger > 0
+        and long_notional >= long_profit_reduce_trigger - 1e-12
+        and short_notional >= short_profit_reduce_trigger - 1e-12
+        and abs(long_notional - short_notional) <= balance_tolerance + 1e-12
+        and effective_long_avg_price > ask + 1e-12
+        and effective_short_avg_price + 1e-12 < bid
+    ):
+        hard_long_headroom = max(long_limit - projected_long_entry_notional, 0.0)
+        hard_short_headroom = max(short_limit - projected_short_entry_notional, 0.0)
+        paired_entry_notional = min(
+            buy_side_notional * long_entry_budget_scale,
+            sell_side_notional * short_entry_budget_scale,
+            hard_long_headroom,
+            hard_short_headroom,
+        )
+        if paired_entry_notional >= soft_entry_buffer - 1e-12:
+            buy_orders = [
+                order
+                for order in buy_orders
+                if order.get("role") != "best_quote_entry_long"
+            ]
+            sell_orders = [
+                order
+                for order in sell_orders
+                if order.get("role") != "best_quote_entry_short"
+            ]
+            long_entries = _build_entry_ladder(
+                side="BUY",
+                anchor_price=bid,
+                base_gap=0.0,
+                total_notional=paired_entry_notional,
+                slots=max_entry_orders_per_side,
+                role="best_quote_entry_long",
+                inputs=inputs,
+                position_side=long_entry_position_side,
+            )
+            short_entries = _build_entry_ladder(
+                side="SELL",
+                anchor_price=ask,
+                base_gap=0.0,
+                total_notional=paired_entry_notional,
+                slots=max_entry_orders_per_side,
+                role="best_quote_entry_short",
+                inputs=inputs,
+                position_side=short_entry_position_side,
+            )
+            if long_entries and short_entries:
+                buy_orders.extend(long_entries)
+                sell_orders.extend(short_entries)
+                reasons.append("balanced_cost_recovery")
+                balanced_cost_recovery_report.update(
+                    {
+                        "applied": True,
+                        "reason": "near_soft_underwater_target_remaining",
+                        "paired_entry_notional": paired_entry_notional,
+                    }
+                )
+
     proactive_profit_reduce_added = False
     if hedge_position_sides and not hard_loss:
         has_short_reduce = any(
@@ -1716,7 +1813,7 @@ def build_best_quote_maker_volume_plan(
                 buy_orders,
                 _build_order(
                     side="BUY",
-                    price=_price_with_gap(bid, reduce_short_gap, -1),
+                    price=bid,
                     notional=min(
                         buy_side_notional * reduce_short_budget_scale,
                         short_notional,
@@ -1742,7 +1839,7 @@ def build_best_quote_maker_volume_plan(
                 sell_orders,
                 _build_order(
                     side="SELL",
-                    price=_price_with_gap(ask, reduce_long_gap, 1),
+                    price=ask,
                     notional=min(
                         sell_side_notional * reduce_long_budget_scale,
                         long_notional,
@@ -1919,6 +2016,7 @@ def build_best_quote_maker_volume_plan(
             "frozen_v2": frozen_v2_report,
             "net_loss_reduce": net_loss_reduce_report,
             "loss_blocked_reduce_fallback": loss_blocked_reduce_fallback_report,
+            "balanced_cost_recovery": balanced_cost_recovery_report,
             "same_side_entry_price_guard": same_side_entry_price_guard_report,
             "dynamic_tick": dynamic_tick_report,
             "inventory_bias": inventory_bias_report,

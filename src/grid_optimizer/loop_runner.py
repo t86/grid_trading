@@ -1934,12 +1934,31 @@ def _record_loss_reduce_reentry_fill_guard(
 def _allow_grvt_reentry_below_soft_bypass(loss_reduce_reentry_guard: dict[str, Any]) -> bool:
     if not bool(loss_reduce_reentry_guard.get("active")):
         return False
-    return str(loss_reduce_reentry_guard.get("source") or "") not in {
-        "active_pair_reduce",
-        "active_pair_reduce_fill",
-        "adverse_reduce",
-        "hard_loss",
-    }
+    protected_sources = {"adverse_reduce", "hard_loss"}
+    active_pair_sources = {"active_pair_reduce", "active_pair_reduce_fill"}
+    source = str(loss_reduce_reentry_guard.get("source") or "")
+    if source in protected_sources:
+        return False
+    if source not in active_pair_sources:
+        return True
+
+    side_guards = loss_reduce_reentry_guard.get("side_guards")
+    if isinstance(side_guards, dict):
+        for side_guard in side_guards.values():
+            if not isinstance(side_guard, dict):
+                continue
+            if str(side_guard.get("source") or "") not in active_pair_sources:
+                continue
+            if (
+                "min_remaining_seconds" in side_guard
+                and _safe_float(side_guard.get("min_remaining_seconds")) <= 0
+            ):
+                return True
+        return False
+    return (
+        "min_remaining_seconds" in loss_reduce_reentry_guard
+        and _safe_float(loss_reduce_reentry_guard.get("min_remaining_seconds")) <= 0
+    )
 
 
 def _loss_reduce_trade_rows_to_execution_events(
@@ -24284,13 +24303,17 @@ def apply_best_quote_active_pair_reduce(
     safe_min_relief = max(_safe_float(min_relief_notional), 0.0)
     threshold_side_mode = safe_loss_threshold > 0
     paired_threshold_mode = threshold_side_mode and bool(pair_all_sides_on_threshold)
+    threshold_dust_tolerance = (
+        max(_safe_float(min_notional), 0.0) if paired_threshold_mode else 0.0
+    )
     current_threshold_eligible_sides = {
         side
         for side, notional in (
             ("long", safe_long_notional),
             ("short", safe_short_notional),
         )
-        if threshold_side_mode and notional > safe_loss_threshold + 1e-12
+        if threshold_side_mode
+        and notional > safe_loss_threshold + threshold_dust_tolerance + 1e-12
     }
     effective_now = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
     safe_rearm_cooldown = max(_safe_float(rearm_cooldown_seconds), 0.0)
@@ -24368,6 +24391,7 @@ def apply_best_quote_active_pair_reduce(
             if isinstance(item, dict) and _order_role(item) != "best_quote_active_pair_reduce_long"
         ]
         report["reason"] = reason
+        report["active"] = False
         report["completed"] = bool(completed)
         return report
 
@@ -24575,6 +24599,21 @@ def apply_best_quote_active_pair_reduce(
                     long_target = min(long_target, recovered_target)
                 if "short" in threshold_eligible_sides:
                     short_target = min(short_target, recovered_target)
+                # The recovery target must never authorize more than the
+                # per-side lease cap.  Exchange quantity rounding can leave a
+                # sub-minimum tail above the soft threshold; that tail is
+                # handled by threshold_dust_tolerance instead of a second
+                # loss order in the same lease.
+                long_target = max(
+                    long_target,
+                    safe_long_notional - safe_max_reduce,
+                    0.0,
+                )
+                short_target = max(
+                    short_target,
+                    safe_short_notional - safe_max_reduce,
+                    0.0,
+                )
             else:
                 long_target = (
                     min(
@@ -32015,6 +32054,8 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                 current_short_qty=current_short_qty,
                 current_long_avg_price=current_long_avg_price,
                 current_short_avg_price=current_short_avg_price,
+                exchange_long_avg_price=exchange_long_avg_price,
+                exchange_short_avg_price=exchange_short_avg_price,
                 position_side_mode="hedge" if hedge_best_quote else "one_way",
                 market_return_1m=_adaptive_window_metric("window_1m", "return_ratio"),
                 market_amplitude_1m=_adaptive_window_metric("window_1m", "amplitude_ratio"),

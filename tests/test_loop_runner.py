@@ -11391,14 +11391,48 @@ class LoopRunnerTests(unittest.TestCase):
             78675939,
         )
 
-    def test_grvt_below_soft_keeps_planned_and_filled_pair_guards(self) -> None:
+    def test_grvt_below_soft_keeps_pair_guards_until_cooldown_expires(self) -> None:
         for source in ("active_pair_reduce", "active_pair_reduce_fill"):
             with self.subTest(source=source):
                 self.assertFalse(
                     _allow_grvt_reentry_below_soft_bypass(
-                        {"active": True, "source": source}
+                        {
+                            "active": True,
+                            "source": source,
+                            "min_remaining_seconds": 1.0,
+                        }
                     )
                 )
+                self.assertTrue(
+                    _allow_grvt_reentry_below_soft_bypass(
+                        {
+                            "active": True,
+                            "source": source,
+                            "min_remaining_seconds": 0.0,
+                        }
+                    )
+                )
+
+    def test_grvt_below_soft_bypass_uses_expired_fill_side_when_other_pair_side_is_pending(self) -> None:
+        self.assertTrue(
+            _allow_grvt_reentry_below_soft_bypass(
+                {
+                    "active": True,
+                    "source": "active_pair_reduce",
+                    "min_remaining_seconds": 56.0,
+                    "side_guards": {
+                        "BUY": {
+                            "source": "active_pair_reduce_fill",
+                            "min_remaining_seconds": 0.0,
+                        },
+                        "SELL": {
+                            "source": "active_pair_reduce",
+                            "min_remaining_seconds": 56.0,
+                        },
+                    },
+                }
+            )
+        )
 
     def test_loss_reduce_reentry_guard_keeps_active_pair_memory_below_soft(self) -> None:
         now = datetime(2026, 8, 15, 5, 20, tzinfo=timezone.utc)
@@ -12588,7 +12622,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertLessEqual(long_reduce["qty"], 3_076.0)
         self.assertLessEqual(short_reduce["qty"], 2_507.0)
 
-    def test_paired_threshold_reduce_stays_active_until_both_sides_are_below_soft(self) -> None:
+    def test_paired_threshold_reduce_completes_within_minimum_order_dust(self) -> None:
         state: dict[str, Any] = {}
         first_plan = {"buy_orders": [], "sell_orders": []}
         common = {
@@ -12636,14 +12670,11 @@ class LoopRunnerTests(unittest.TestCase):
             current_short_notional=717.5,
             **common,
         )
-        self.assertTrue(second["active"])
-        self.assertFalse(second["completed"])
-        self.assertEqual(second["eligible_sides"], ["long", "short"])
-        self.assertEqual(second["order_count"], 1)
-        self.assertEqual(
-            [item["role"] for item in second_plan["sell_orders"]],
-            ["best_quote_active_pair_reduce_long"],
-        )
+        self.assertFalse(second["active"])
+        self.assertTrue(second["completed"])
+        self.assertEqual(second["reason"], "threshold_recovered")
+        self.assertEqual(second["order_count"], 0)
+        self.assertEqual(second_plan["sell_orders"], [])
         self.assertEqual(second_plan["buy_orders"], [])
 
         completed_plan = {
@@ -12663,7 +12694,7 @@ class LoopRunnerTests(unittest.TestCase):
             **common,
         )
         self.assertTrue(completed["completed"])
-        self.assertEqual(completed["reason"], "threshold_recovered")
+        self.assertEqual(completed["reason"], "lease_completed_waiting_disable")
         self.assertEqual(
             [item["role"] for item in completed_plan["buy_orders"]],
             ["best_quote_entry_long"],
@@ -13316,6 +13347,82 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["long_target_notional"], 800.0)
         self.assertEqual(report["order_count"], 1)
         self.assertLessEqual(report["long_order_notional"], 30.0)
+
+    def test_paired_threshold_lease_never_exceeds_per_side_reduce_cap_for_dust(self) -> None:
+        state: dict[str, Any] = {}
+        first_plan = {"buy_orders": [], "sell_orders": []}
+
+        first = apply_best_quote_active_pair_reduce(
+            plan=first_plan,
+            state=state,
+            enabled=True,
+            current_long_qty=3112.0,
+            current_short_qty=3485.0,
+            current_long_notional=893.3,
+            current_short_notional=1000.305,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=100.0,
+            offset_ticks=0,
+            step_price=0.0001,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.2870,
+            ask_price=0.2871,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=900.0,
+            current_long_avg_price=0.2913,
+            current_short_avg_price=0.2867,
+            max_loss_ratio=0.20,
+            min_relief_notional=100.0,
+            suppress_all_entries_while_active=True,
+            pair_all_sides_on_threshold=True,
+        )
+
+        self.assertEqual(first["short_target_notional"], 900.305)
+        self.assertLessEqual(first["short_order_notional"], 100.0)
+
+        second_plan = {"buy_orders": [], "sell_orders": []}
+        second = apply_best_quote_active_pair_reduce(
+            plan=second_plan,
+            state=state,
+            enabled=True,
+            current_long_qty=2764.0,
+            current_short_qty=3137.0,
+            current_long_notional=793.4,
+            current_short_notional=900.42,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=100.0,
+            offset_ticks=0,
+            step_price=0.0001,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.2873,
+            ask_price=0.2874,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=900.0,
+            current_long_avg_price=0.2913,
+            current_short_avg_price=0.2867,
+            max_loss_ratio=0.20,
+            min_relief_notional=100.0,
+            suppress_all_entries_while_active=True,
+            pair_all_sides_on_threshold=True,
+        )
+
+        self.assertTrue(second["completed"])
+        self.assertEqual(second["order_count"], 0)
+        self.assertEqual(second_plan, {"buy_orders": [], "sell_orders": []})
 
     def test_grvt_bounded_loss_recovery_clears_one_hundred_below_soft(self) -> None:
         plan = {
