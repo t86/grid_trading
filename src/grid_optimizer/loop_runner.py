@@ -22421,14 +22421,30 @@ def _best_quote_submit_allow_loss_roles(
         if "best_quote_reduce_short" in roles:
             roles.add("inventory_unlock_reduce_short")
     if bool(getattr(args, "best_quote_maker_volume_active_pair_reduce_enabled", False)):
-        roles.update(
-            role
-            for role in (
-                "best_quote_active_pair_reduce_long",
-                "best_quote_active_pair_reduce_short",
+        active_pair_report = report.get("best_quote_active_pair_reduce")
+        paired_threshold_authorized = (
+            isinstance(active_pair_report, Mapping)
+            and bool(active_pair_report.get("active"))
+            and bool(active_pair_report.get("order_count"))
+            and bool(active_pair_report.get("pair_all_sides_on_threshold"))
+            and {
+                str(side).strip().lower()
+                for side in active_pair_report.get("eligible_sides", [])
+            }
+            == {"long", "short"}
+            and (
+                _over_threshold("best_quote_active_pair_reduce_long")
+                or _over_threshold("best_quote_active_pair_reduce_short")
             )
-            if _over_threshold(role)
         )
+        active_pair_roles = {
+            "best_quote_active_pair_reduce_long",
+            "best_quote_active_pair_reduce_short",
+        }
+        if paired_threshold_authorized:
+            roles.update(active_pair_roles)
+        else:
+            roles.update(role for role in active_pair_roles if _over_threshold(role))
     return roles or None
 
 
@@ -24156,6 +24172,7 @@ def apply_best_quote_active_pair_reduce(
     now: datetime | None = None,
     rearm_cooldown_seconds: float = 0.0,
     rearm_immediately_while_threshold_breached: bool = False,
+    pair_all_sides_on_threshold: bool = False,
 ) -> dict[str, Any]:
     report = _best_quote_active_pair_reduce_default_report()
     report["enabled"] = bool(enabled)
@@ -24175,6 +24192,7 @@ def apply_best_quote_active_pair_reduce(
     safe_max_loss_ratio = max(_safe_float(max_loss_ratio), 0.0)
     safe_min_relief = max(_safe_float(min_relief_notional), 0.0)
     threshold_side_mode = safe_loss_threshold > 0
+    paired_threshold_mode = threshold_side_mode and bool(pair_all_sides_on_threshold)
     current_threshold_eligible_sides = {
         side
         for side, notional in (
@@ -24194,22 +24212,30 @@ def apply_best_quote_active_pair_reduce(
             "loss_reduce_threshold_notional": safe_loss_threshold,
             "max_loss_ratio": safe_max_loss_ratio,
             "min_relief_notional": safe_min_relief,
+            "pair_all_sides_on_threshold": paired_threshold_mode,
         }
     )
 
     existing = state.get("best_quote_active_pair_reduce")
     memory = dict(existing) if isinstance(existing, dict) else {}
-    if threshold_side_mode and memory.get("mode") != "threshold_side_v1":
+    expected_threshold_mode = (
+        "threshold_paired_v1" if paired_threshold_mode else "threshold_side_v1"
+    )
+    if threshold_side_mode and memory.get("mode") != expected_threshold_mode:
         memory = {}
 
     def _clear(reason: str, *, completed: bool = False) -> dict[str, Any]:
         if completed and threshold_side_mode:
             completion_memory = dict(memory)
-            completion_sides = {
-                str(side)
-                for side in completion_memory.get("eligible_sides", [])
-                if str(side) in {"long", "short"}
-            }
+            completion_sides = (
+                set(current_threshold_eligible_sides)
+                if paired_threshold_mode
+                else {
+                    str(side)
+                    for side in completion_memory.get("eligible_sides", [])
+                    if str(side) in {"long", "short"}
+                }
+            )
             suppressed_entry_order_count = 0
             for side_name, order_key, entry_role in (
                 ("long", "buy_orders", "best_quote_entry_long"),
@@ -24270,11 +24296,15 @@ def apply_best_quote_active_pair_reduce(
         # cooldown is only a re-arm guard for a fresh breach, not a second
         # inventory threshold.
         if cooldown_remaining > 0 and current_threshold_eligible_sides:
-            cooldown_sides = {
-                str(side)
-                for side in memory.get("eligible_sides", [])
-                if str(side) in {"long", "short"}
-            }
+            cooldown_sides = (
+                set(current_threshold_eligible_sides)
+                if paired_threshold_mode
+                else {
+                    str(side)
+                    for side in memory.get("eligible_sides", [])
+                    if str(side) in {"long", "short"}
+                }
+            )
             suppressed_entry_order_count = 0
             for side_name, order_key, entry_role in (
                 ("long", "buy_orders", "best_quote_entry_long"),
@@ -24353,11 +24383,16 @@ def apply_best_quote_active_pair_reduce(
             if completed_at is not None and safe_rearm_cooldown > 0
             else 0.0
         )
-        cooldown_sides = threshold_eligible_sides | {
-            str(side)
-            for side in memory.get("eligible_sides", [])
-            if str(side) in {"long", "short"}
-        }
+        cooldown_sides = (
+            set(threshold_eligible_sides)
+            if paired_threshold_mode
+            else threshold_eligible_sides
+            | {
+                str(side)
+                for side in memory.get("eligible_sides", [])
+                if str(side) in {"long", "short"}
+            }
+        )
         if (
             cooldown_remaining > 0
             and threshold_eligible_sides
@@ -24419,7 +24454,11 @@ def apply_best_quote_active_pair_reduce(
             )
             return report
     if threshold_side_mode:
-        eligible_sides = threshold_eligible_sides
+        eligible_sides = (
+            {"long", "short"}
+            if paired_threshold_mode and threshold_eligible_sides
+            else threshold_eligible_sides
+        )
     else:
         eligible_sides = (
             {"long", "short"}
@@ -24429,38 +24468,55 @@ def apply_best_quote_active_pair_reduce(
     touched_soft = bool(eligible_sides)
     if not active and touched_soft:
         if threshold_side_mode:
-            long_target = (
-                min(
-                    max(
-                        safe_loss_threshold,
-                        long_soft - safe_per_order,
-                        safe_long_notional - safe_max_reduce,
-                        0.0,
-                    ),
-                    max(safe_long_notional - safe_min_relief, 0.0),
+            if paired_threshold_mode:
+                minimum_actionable_notional = max(_safe_float(min_notional), 0.0)
+                paired_relief_notional = max(
+                    safe_min_relief,
+                    min(safe_per_order, safe_max_reduce),
                 )
-                if "long" in eligible_sides
-                else safe_long_notional
-            )
-            short_target = (
-                min(
-                    max(
-                        safe_loss_threshold,
-                        short_soft - safe_per_order,
-                        safe_short_notional - safe_max_reduce,
-                        0.0,
-                    ),
-                    max(safe_short_notional - safe_min_relief, 0.0),
+                recovered_target = max(
+                    safe_loss_threshold - minimum_actionable_notional,
+                    0.0,
                 )
-                if "short" in eligible_sides
-                else safe_short_notional
-            )
+                long_target = max(safe_long_notional - paired_relief_notional, 0.0)
+                short_target = max(safe_short_notional - paired_relief_notional, 0.0)
+                if "long" in threshold_eligible_sides:
+                    long_target = min(long_target, recovered_target)
+                if "short" in threshold_eligible_sides:
+                    short_target = min(short_target, recovered_target)
+            else:
+                long_target = (
+                    min(
+                        max(
+                            safe_loss_threshold,
+                            long_soft - safe_per_order,
+                            safe_long_notional - safe_max_reduce,
+                            0.0,
+                        ),
+                        max(safe_long_notional - safe_min_relief, 0.0),
+                    )
+                    if "long" in eligible_sides
+                    else safe_long_notional
+                )
+                short_target = (
+                    min(
+                        max(
+                            safe_loss_threshold,
+                            short_soft - safe_per_order,
+                            safe_short_notional - safe_max_reduce,
+                            0.0,
+                        ),
+                        max(safe_short_notional - safe_min_relief, 0.0),
+                    )
+                    if "short" in eligible_sides
+                    else safe_short_notional
+                )
         else:
             long_target = max(safe_long_notional - safe_max_reduce, 0.0)
             short_target = max(safe_short_notional - safe_max_reduce, 0.0)
         memory = {
             "active": True,
-            "mode": "threshold_side_v1" if threshold_side_mode else "paired_v1",
+            "mode": expected_threshold_mode if threshold_side_mode else "paired_v1",
             "eligible_sides": sorted(eligible_sides),
             "started_at": effective_now.isoformat(),
             "long_start_notional": safe_long_notional,
@@ -24486,6 +24542,8 @@ def apply_best_quote_active_pair_reduce(
             "short_start_notional": max(_safe_float(memory.get("short_start_notional")), 0.0),
         }
     )
+    if paired_threshold_mode and not threshold_eligible_sides:
+        return _clear("threshold_recovered", completed=True)
     long_reached = "long" not in eligible_sides or safe_long_notional <= long_target + 1e-12
     short_reached = "short" not in eligible_sides or safe_short_notional <= short_target + 1e-12
     if long_reached and short_reached:
@@ -24499,7 +24557,11 @@ def apply_best_quote_active_pair_reduce(
         )
         if side_name in eligible_sides
     ]
-    if eligible_residuals and max(eligible_residuals) < minimum_actionable_notional:
+    if (
+        eligible_residuals
+        and max(eligible_residuals) < minimum_actionable_notional
+        and not paired_threshold_mode
+    ):
         return _clear("target_reached_small_residual", completed=True)
 
     if threshold_side_mode and suppress_noneligible_reduce_while_active:
@@ -24532,13 +24594,16 @@ def apply_best_quote_active_pair_reduce(
         )
 
     suppressed_entry_order_count = 0
+    entry_suppression_sides = (
+        set(threshold_eligible_sides) if paired_threshold_mode else set(eligible_sides)
+    )
     for side_name, order_key, entry_role in (
         ("long", "buy_orders", "best_quote_entry_long"),
         ("short", "sell_orders", "best_quote_entry_short"),
     ):
         if (
             threshold_side_mode
-            and side_name not in eligible_sides
+            and side_name not in entry_suppression_sides
             and not suppress_all_entries_while_active
         ):
             continue
@@ -24557,6 +24622,15 @@ def apply_best_quote_active_pair_reduce(
 
     level_index = max(int(offset_ticks or 1), 1)
     placed: list[dict[str, Any]] = []
+    paired_remaining_notional = (
+        max(
+            max(safe_long_notional - long_target, 0.0),
+            max(safe_short_notional - short_target, 0.0),
+            minimum_actionable_notional,
+        )
+        if paired_threshold_mode and threshold_eligible_sides
+        else None
+    )
 
     def _append_reduce_order(
         *,
@@ -24603,7 +24677,11 @@ def apply_best_quote_active_pair_reduce(
             before_count - len(plan[order_key]),
             0,
         )
-        remaining_notional = max(current_notional - target_notional, 0.0)
+        remaining_notional = (
+            paired_remaining_notional
+            if paired_remaining_notional is not None
+            else max(current_notional - target_notional, 0.0)
+        )
         budget = min(safe_per_order, safe_max_reduce, remaining_notional, current_notional)
         if budget <= 0:
             return
@@ -24695,7 +24773,11 @@ def apply_best_quote_active_pair_reduce(
             else 0.0
         )
         minimum_actionable_notional = max(_safe_float(min_notional), 0.0)
-        if max(remaining_long_notional, remaining_short_notional) < minimum_actionable_notional:
+        if (
+            max(remaining_long_notional, remaining_short_notional)
+            < minimum_actionable_notional
+            and not paired_threshold_mode
+        ):
             return _clear("target_reached_small_residual", completed=True)
         report["reason"] = "no_valid_reduce_order"
         state["best_quote_active_pair_reduce"] = memory
@@ -33777,15 +33859,14 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             current_short_avg_price=current_short_avg_price,
             max_loss_ratio=0.20 if grvt_bounded_loss_recovery else 0.005,
             min_relief_notional=100.0 if grvt_bounded_loss_recovery else 0.0,
-            # During GRVT's bounded threshold-side release, keep only the
-            # opposite ordinary entry live.  The heavy side is still
-            # suppressed by the threshold-side filter, while the light side
-            # can rebalance and preserve turnover during the 100U release.
+            # Keep the light-side entry available while paired best-quote
+            # reductions push ordinary inventory back below the soft limit.
             suppress_all_entries_while_active=False,
             suppress_noneligible_reduce_while_active=grvt_bounded_loss_recovery,
             now=plan_now,
-            rearm_cooldown_seconds=300.0 if grvt_bounded_loss_recovery else 0.0,
-            rearm_immediately_while_threshold_breached=grvt_bounded_loss_recovery,
+            rearm_cooldown_seconds=60.0 if grvt_bounded_loss_recovery else 0.0,
+            rearm_immediately_while_threshold_breached=False,
+            pair_all_sides_on_threshold=grvt_bounded_loss_recovery,
         )
         if bool(best_quote_active_pair_reduce.get("order_count")):
             loss_reduce_reentry_guard = resolve_loss_reduce_reentry_guard(

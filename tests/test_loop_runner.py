@@ -12516,6 +12516,212 @@ class LoopRunnerTests(unittest.TestCase):
             [item["role"] for item in plan["buy_orders"]],
         )
 
+    def test_paired_threshold_reduce_places_both_sides_when_only_long_is_heavy(self) -> None:
+        plan = {
+            "buy_orders": [
+                {"side": "BUY", "role": "best_quote_entry_long", "notional": 55.0},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "role": "best_quote_entry_short", "notional": 55.0},
+            ],
+        }
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state={},
+            enabled=True,
+            current_long_qty=3_076.0,
+            current_short_qty=2_507.0,
+            current_long_notional=1_003.0,
+            current_short_notional=817.5,
+            max_long_notional=1_000.0,
+            max_short_notional=1_000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=100.0,
+            offset_ticks=1,
+            step_price=0.0001,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.3260,
+            ask_price=0.3261,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=900.0,
+            current_long_avg_price=0.3269,
+            current_short_avg_price=0.3250,
+            max_loss_ratio=0.20,
+            min_relief_notional=100.0,
+            pair_all_sides_on_threshold=True,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["eligible_sides"], ["long", "short"])
+        self.assertEqual(report["order_count"], 2)
+        long_reduce = next(
+            item
+            for item in plan["sell_orders"]
+            if item["role"] == "best_quote_active_pair_reduce_long"
+        )
+        short_reduce = next(
+            item
+            for item in plan["buy_orders"]
+            if item["role"] == "best_quote_active_pair_reduce_short"
+        )
+        self.assertEqual(long_reduce["price"], 0.3261)
+        self.assertEqual(short_reduce["price"], 0.3260)
+        self.assertTrue(long_reduce["force_reduce_only"])
+        self.assertTrue(short_reduce["force_reduce_only"])
+        self.assertLessEqual(long_reduce["notional"], 100.0 + 1e-9)
+        self.assertLessEqual(short_reduce["notional"], 100.0 + 1e-9)
+        self.assertLessEqual(long_reduce["qty"], 3_076.0)
+        self.assertLessEqual(short_reduce["qty"], 2_507.0)
+
+    def test_paired_threshold_reduce_stays_active_until_both_sides_are_below_soft(self) -> None:
+        state: dict[str, Any] = {}
+        first_plan = {"buy_orders": [], "sell_orders": []}
+        common = {
+            "state": state,
+            "enabled": True,
+            "max_long_notional": 1_000.0,
+            "max_short_notional": 1_000.0,
+            "soft_ratio": 0.90,
+            "min_side_notional": 0.0,
+            "per_order_notional": 100.0,
+            "max_reduce_notional_per_side": 100.0,
+            "offset_ticks": 1,
+            "step_price": 0.0001,
+            "tick_size": 0.0001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+            "bid_price": 0.3260,
+            "ask_price": 0.3261,
+            "volatility_entry_pause": {"active": False},
+            "loss_reduce_threshold_notional": 900.0,
+            "current_long_avg_price": 0.3269,
+            "current_short_avg_price": 0.3250,
+            "max_loss_ratio": 0.20,
+            "min_relief_notional": 100.0,
+            "pair_all_sides_on_threshold": True,
+        }
+
+        first = apply_best_quote_active_pair_reduce(
+            plan=first_plan,
+            current_long_qty=3_076.0,
+            current_short_qty=2_507.0,
+            current_long_notional=1_003.0,
+            current_short_notional=817.5,
+            **common,
+        )
+        self.assertTrue(first["active"])
+
+        second_plan = {"buy_orders": [], "sell_orders": []}
+        second = apply_best_quote_active_pair_reduce(
+            plan=second_plan,
+            current_long_qty=2_768.0,
+            current_short_qty=2_200.0,
+            current_long_notional=903.0,
+            current_short_notional=717.5,
+            **common,
+        )
+        self.assertTrue(second["active"])
+        self.assertFalse(second["completed"])
+        self.assertEqual(second["eligible_sides"], ["long", "short"])
+        self.assertEqual(second["order_count"], 2)
+
+        completed_plan = {
+            "buy_orders": [
+                {"side": "BUY", "role": "best_quote_entry_long", "notional": 55.0},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "role": "best_quote_entry_short", "notional": 55.0},
+            ],
+        }
+        completed = apply_best_quote_active_pair_reduce(
+            plan=completed_plan,
+            current_long_qty=2_744.0,
+            current_short_qty=2_176.0,
+            current_long_notional=895.0,
+            current_short_notional=709.5,
+            **common,
+        )
+        self.assertTrue(completed["completed"])
+        self.assertEqual(completed["reason"], "threshold_recovered")
+        self.assertEqual(
+            [item["role"] for item in completed_plan["buy_orders"]],
+            ["best_quote_entry_long"],
+        )
+        self.assertEqual(
+            [item["role"] for item in completed_plan["sell_orders"]],
+            ["best_quote_entry_short"],
+        )
+
+    def test_paired_threshold_cooldown_suppresses_only_current_heavy_entry(self) -> None:
+        now = datetime(2026, 8, 17, 1, 0, tzinfo=timezone.utc)
+        state = {
+            "best_quote_active_pair_reduce": {
+                "active": False,
+                "mode": "threshold_paired_v1",
+                "eligible_sides": ["long", "short"],
+                "trigger_count": 1,
+                "completed": True,
+                "completed_at": (now - timedelta(seconds=30)).isoformat(),
+            }
+        }
+        plan = {
+            "buy_orders": [
+                {"side": "BUY", "role": "best_quote_entry_long", "notional": 50.0},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "role": "best_quote_entry_short", "notional": 50.0},
+            ],
+        }
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=plan,
+            state=state,
+            enabled=True,
+            current_long_qty=2_450.0,
+            current_short_qty=2_820.0,
+            current_long_notional=800.0,
+            current_short_notional=920.0,
+            max_long_notional=1_000.0,
+            max_short_notional=1_000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=100.0,
+            offset_ticks=1,
+            step_price=0.0001,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.3260,
+            ask_price=0.3261,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=900.0,
+            current_long_avg_price=0.3269,
+            current_short_avg_price=0.3250,
+            max_loss_ratio=0.20,
+            min_relief_notional=100.0,
+            pair_all_sides_on_threshold=True,
+            now=now,
+            rearm_cooldown_seconds=60.0,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report["reason"], "rearm_cooldown_active")
+        self.assertEqual(report["eligible_sides"], ["short"])
+        self.assertEqual(
+            [item["role"] for item in plan["buy_orders"]],
+            ["best_quote_entry_long"],
+        )
+        self.assertEqual(plan["sell_orders"], [])
+
     def test_grvt_threshold_reduce_drops_opposite_ordinary_reduce(self) -> None:
         plan = {
             "buy_orders": [
@@ -19895,6 +20101,34 @@ class LoopRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(roles, {"best_quote_active_pair_reduce_short"})
+
+    def test_best_quote_submit_paired_threshold_authorizes_both_sides(self) -> None:
+        roles = _best_quote_submit_allow_loss_roles(
+            SimpleNamespace(
+                best_quote_maker_volume_allow_loss_reduce_only=False,
+                best_quote_maker_volume_active_pair_reduce_enabled=True,
+                threshold_position_notional=900.0,
+            ),
+            plan_report={
+                "loss_reduce_threshold_notional": 900.0,
+                "current_long_notional": 1_003.0,
+                "current_short_notional": 817.5,
+                "best_quote_active_pair_reduce": {
+                    "active": True,
+                    "order_count": 2,
+                    "eligible_sides": ["long", "short"],
+                    "pair_all_sides_on_threshold": True,
+                },
+            },
+        )
+
+        self.assertEqual(
+            roles,
+            {
+                "best_quote_active_pair_reduce_long",
+                "best_quote_active_pair_reduce_short",
+            },
+        )
 
     def test_best_quote_submit_allow_loss_roles_blocks_inventory_unlock_when_disabled(self) -> None:
         roles = _best_quote_submit_allow_loss_roles(
