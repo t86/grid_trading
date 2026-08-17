@@ -12630,7 +12630,12 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(second["active"])
         self.assertFalse(second["completed"])
         self.assertEqual(second["eligible_sides"], ["long", "short"])
-        self.assertEqual(second["order_count"], 2)
+        self.assertEqual(second["order_count"], 1)
+        self.assertEqual(
+            [item["role"] for item in second_plan["sell_orders"]],
+            ["best_quote_active_pair_reduce_long"],
+        )
+        self.assertEqual(second_plan["buy_orders"], [])
 
         completed_plan = {
             "buy_orders": [

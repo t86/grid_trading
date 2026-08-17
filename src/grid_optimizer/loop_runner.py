@@ -24659,15 +24659,6 @@ def apply_best_quote_active_pair_reduce(
 
     level_index = max(int(offset_ticks or 1), 1)
     placed: list[dict[str, Any]] = []
-    paired_remaining_notional = (
-        max(
-            max(safe_long_notional - long_target, 0.0),
-            max(safe_short_notional - short_target, 0.0),
-            minimum_actionable_notional,
-        )
-        if paired_threshold_mode and threshold_eligible_sides
-        else None
-    )
 
     def _append_reduce_order(
         *,
@@ -24714,11 +24705,7 @@ def apply_best_quote_active_pair_reduce(
             before_count - len(plan[order_key]),
             0,
         )
-        remaining_notional = (
-            paired_remaining_notional
-            if paired_remaining_notional is not None
-            else max(current_notional - target_notional, 0.0)
-        )
+        remaining_notional = max(current_notional - target_notional, 0.0)
         budget = min(safe_per_order, safe_max_reduce, remaining_notional, current_notional)
         if budget <= 0:
             return
@@ -24776,7 +24763,7 @@ def apply_best_quote_active_pair_reduce(
         placed.append(order)
         report[f"{side_name}_order_notional"] = notional
 
-    if "long" in eligible_sides:
+    if "long" in eligible_sides and not long_reached:
         _append_reduce_order(
             side_name="long",
             order_side="SELL",
@@ -24787,7 +24774,7 @@ def apply_best_quote_active_pair_reduce(
             current_notional=safe_long_notional,
             target_notional=long_target,
         )
-    if "short" in eligible_sides:
+    if "short" in eligible_sides and not short_reached:
         _append_reduce_order(
             side_name="short",
             order_side="BUY",
