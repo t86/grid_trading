@@ -20,7 +20,6 @@ from grid_optimizer.futures_run_lifecycle import (
 )
 from grid_optimizer.futures_recovery_coordinator import (
     ActionId,
-    ActionMode,
     EffectStage,
     FlowBlockerAssessment,
     FuturesRecoveryDecisionEngine,
@@ -73,8 +72,7 @@ def _write_registered_roll_fixture(
     control_path.write_text(json.dumps(control), encoding="utf-8")
     store = JsonRecoveryStore(control_path)
     baseline: dict[str, object] = {
-        "step_price": 0.0005,
-        "max_actual_net_notional": 1_000.0,
+        **control,
         "best_quote_maker_volume_cycle_budget_notional": 360.0,
         "pause_buy_position_notional": 400.0,
         "pause_short_position_notional": 400.0,
@@ -86,7 +84,25 @@ def _write_registered_roll_fixture(
         baseline,
         now=datetime(2026, 7, 14, 8, 0, tzinfo=BEIJING),
     )
-    if phase is RecoveryPhase.COOLDOWN:
+    if phase is RecoveryPhase.ACTIVE:
+        entered = FuturesRecoveryDecisionEngine().plan_round(
+            snapshot=SymbolSnapshot(
+                symbol="ARXUSDT",
+                captured_at=datetime(2026, 7, 14, 8, 1, tzinfo=BEIJING),
+                assessment=FlowBlockerAssessment(
+                    runner_faults=("runner_inactive",),
+                ),
+            ),
+            state=registered,
+            now=datetime(2026, 7, 14, 8, 1, tzinfo=BEIJING),
+            round_id="existing-runner-recovery",
+        )
+        store.compare_and_swap(
+            "ARXUSDT",
+            expected_revision=registered.document_revision,
+            next_state=entered.next_state,
+        )
+    elif phase is RecoveryPhase.COOLDOWN:
         store.compare_and_swap(
             "ARXUSDT",
             expected_revision=0,
@@ -231,30 +247,25 @@ def test_registered_stable_roll_updates_only_lifecycle_and_defers_managed_profil
 
     from deploy.oracle import roll_competition_window
 
-    writes: list[Path] = []
-    original_write = roll_competition_window.write_json_atomically
-
-    def capture_write(path: Path, payload: dict[str, object]) -> None:
-        writes.append(path)
-        original_write(path, payload)
-
     monkeypatch.setattr(
         roll_competition_window,
         "write_json_atomically",
-        capture_write,
+        lambda *_args, **_kwargs: pytest.fail(
+            "registered roll directly replaced the control document"
+        ),
     )
     roll_competition_window.main()
     status = json.loads(capsys.readouterr().out)
     saved = json.loads(paths[0].read_text(encoding="utf-8"))
-    saved_owner = saved[RUN_CONTRACT_OWNER_KEY]
     saved_recovery_state = JsonRecoveryStore(paths[0]).read("ARXUSDT")
 
-    assert status["status"] == "applied"
+    assert status["status"] == "deferred"
+    assert status["request_status"] == "deferred"
     assert status["registered_recovery_contract_roll"] is True
-    assert status["recovery_restart_scheduled"] is True
+    assert status["recovery_restart_scheduled"] is False
     assert status["recovery_managed_profile_preserved"] is True
-    assert status["recovery_phase"] == "active"
-    assert status["recovery_effect_stage"] == "runner_restart"
+    assert status["recovery_phase"] == "stable"
+    assert status["recovery_effect_stage"] == "none"
     assert status["recovery_overlay_cleared"] is False
     assert status["runtime_guard_loss_recovery_cleared"] is False
     assert status["profile_rebased"] is False
@@ -274,30 +285,15 @@ def test_registered_stable_roll_updates_only_lifecycle_and_defers_managed_profil
     assert saved_recovery_state.document_revision == (
         original_recovery_state.document_revision + 1
     )
-    assert saved_recovery_state.generation == original_recovery_state.generation + 1
-    assert saved_recovery_state.phase is RecoveryPhase.ACTIVE
-    assert saved_recovery_state.active_action is ActionId.BASELINE_REBASE
-    assert saved_recovery_state.reasons == ("baseline_change_requested",)
-    assert saved_recovery_state.pending_effect_stage is EffectStage.RUNNER_RESTART
-    assert saved_recovery_state.pending_effect_epoch == saved_recovery_state.effect_epoch
+    assert saved_recovery_state.generation == original_recovery_state.generation
+    assert saved_recovery_state.phase is RecoveryPhase.STABLE
+    assert saved_recovery_state.active_action is ActionId.NOOP
+    assert saved_recovery_state.pending_effect_stage is EffectStage.NONE
+    assert saved_recovery_state.pending_effect_epoch is None
     assert saved_recovery_state.baseline_profile == original_recovery_state.baseline_profile
     assert saved_recovery_state.desired_profile == original_recovery_state.desired_profile
-    assert saved_recovery_state.issued_at is not None
-    retry_at = saved_recovery_state.issued_at + timedelta(seconds=1)
-    retry = FuturesRecoveryDecisionEngine().plan_round(
-        snapshot=SymbolSnapshot(
-            symbol="ARXUSDT",
-            captured_at=retry_at,
-            assessment=FlowBlockerAssessment(),
-        ),
-        state=saved_recovery_state,
-        now=retry_at,
-        round_id="guard-retries-rollover-restart-without-admission",
-    )
-    assert retry.action_id is ActionId.BASELINE_REBASE
-    assert retry.mode is ActionMode.ADVANCE
-    assert retry.effect_stage is EffectStage.RUNNER_RESTART
-    assert retry.effect_epoch == saved_recovery_state.pending_effect_epoch
+    assert saved_recovery_state.baseline_change is not None
+    assert saved_recovery_state.baseline_change.status.value == "deferred"
     assert saved["step_price"] == 0.0005
     assert saved["max_actual_net_notional"] == 1_000.0
     assert saved["best_quote_maker_volume_cycle_budget_notional"] == 360.0
@@ -307,82 +303,106 @@ def test_registered_stable_roll_updates_only_lifecycle_and_defers_managed_profil
     assert saved["best_quote_maker_volume_net_loss_reduce_enabled"] is False
     assert saved["hard_loss_forced_reduce_enabled"] is False
     assert saved["volatility_entry_pause_enabled"] is True
-    assert saved["run_start_time"] != original_control["run_start_time"]
-    assert saved["run_end_time"] != original_control["run_end_time"]
-    assert saved["max_cumulative_notional"] == 40_000.0
-    assert saved["best_quote_maker_volume_target_remaining_notional"] == 40_000.0
-    assert saved_owner["generation"] == original_owner["generation"] + 1
-    assert saved_owner["handoff_from_contract_id"] == original_owner["run_contract_id"]
-    assert saved_owner["handoff_reason"] == "daily_competition_window_rollover"
-    assert writes == [paths[0]]
+    assert saved["run_start_time"] == original_control["run_start_time"]
+    assert saved["run_end_time"] == original_control["run_end_time"]
+    assert saved["max_cumulative_notional"] == 20_000.0
+    assert "best_quote_maker_volume_target_remaining_notional" not in saved
+    assert saved[RUN_CONTRACT_OWNER_KEY] == original_owner
     assert paths[2].read_bytes() == original_guard_state
     assert paths[3].read_bytes() == original_loop_state
 
 
-@pytest.mark.parametrize(
-    ("managed_key", "managed_value"),
-    (
-        ("run_start_time", "2026-07-14T08:00:00+08:00"),
-        ("runtime_guard_stats_start_time", "2026-07-14T08:00:00+08:00"),
-        ("run_end_time", "2026-07-15T08:00:00+08:00"),
-        ("max_cumulative_notional", 20_000.0),
-        ("best_quote_maker_volume_target_remaining_notional", 20_000.0),
-        (RUN_CONTRACT_OWNER_KEY, {"managed": True}),
-        ("terminal_drain_max_order_notional", 20.0),
-    ),
-)
-def test_registered_stable_roll_rejects_recovery_managed_lifecycle_fields(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    managed_key: str,
-    managed_value: object,
-) -> None:
-    paths = _write_registered_roll_fixture(
-        tmp_path,
-        extra_managed_baseline={managed_key: managed_value},
-    )
-
-    status = _invoke_registered_roll_deferred(
-        monkeypatch,
-        capsys,
-        control_path=paths[0],
-        runtime_profile_path=paths[1],
-        guard_state_path=paths[2],
-        loop_state_path=paths[3],
-    )
-
-    assert status["status"] == "deferred"
-    assert status["reason"] == "registered_recovery_manages_lifecycle_fields"
-    assert status["managed_lifecycle_fields"] == [managed_key]
-    assert status["phase"] == "stable"
-    assert status["changed"] is False
-
-
-def test_registered_nonstable_roll_defers_without_any_control_or_state_write(
+def test_registered_nonstable_roll_persists_only_deferred_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     paths = _write_registered_roll_fixture(
         tmp_path,
-        phase=RecoveryPhase.COOLDOWN,
+        phase=RecoveryPhase.ACTIVE,
     )
 
-    status = _invoke_registered_roll_deferred(
-        monkeypatch,
-        capsys,
-        control_path=paths[0],
-        runtime_profile_path=paths[1],
-        guard_state_path=paths[2],
-        loop_state_path=paths[3],
+    before = JsonRecoveryStore(paths[0]).read("ARXUSDT")
+    guard_before = paths[2].read_bytes()
+    loop_before = paths[3].read_bytes()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _registered_roll_argv(
+            control_path=paths[0],
+            runtime_profile_path=paths[1],
+            guard_state_path=paths[2],
+            loop_state_path=paths[3],
+        ),
     )
+    from deploy.oracle import roll_competition_window
+
+    monkeypatch.setattr(
+        roll_competition_window,
+        "write_json_atomically",
+        lambda *_args, **_kwargs: pytest.fail("registered roll used legacy writer"),
+    )
+    roll_competition_window.main()
+    status = json.loads(capsys.readouterr().out)
+    after = JsonRecoveryStore(paths[0]).read("ARXUSDT")
 
     assert status["status"] == "deferred"
-    assert status["reason"] == "registered_recovery_state_not_safe_to_rebase"
-    assert status["phase"] == "cooldown"
-    assert status["stable_rebase_eligible"] is False
-    assert status["changed"] is False
+    assert status["request_status"] == "deferred"
+    assert after.document_revision == before.document_revision + 1
+    assert after.generation == before.generation
+    assert after.phase == before.phase
+    assert after.active_action == before.active_action
+    assert after.desired_profile == before.desired_profile
+    assert after.pending_effect_stage == before.pending_effect_stage
+    assert after.baseline_change is not None
+    assert after.baseline_change.status.value == "deferred"
+    assert paths[2].read_bytes() == guard_before
+    assert paths[3].read_bytes() == loop_before
+
+
+def test_registered_roll_is_idempotent_and_rejects_changed_target(
+    tmp_path: Path,
+) -> None:
+    paths = _write_registered_roll_fixture(tmp_path)
+    from deploy.oracle.roll_competition_window import submit_registered_roll
+
+    now = datetime(2026, 7, 16, 8, 1, tzinfo=BEIJING)
+    store = JsonRecoveryStore(paths[0])
+    state = store.read("ARXUSDT")
+    first_submission, first = submit_registered_roll(
+        control_path=paths[0],
+        state=state,
+        now=now,
+        reset_hour=8,
+        target_notional=40_000.0,
+        handoff_reason="daily_competition_window_rollover",
+    )
+    first_state = store.read("ARXUSDT")
+    second_submission, second = submit_registered_roll(
+        control_path=paths[0],
+        state=first_state,
+        now=now + timedelta(minutes=1),
+        reset_hour=8,
+        target_notional=40_000.0,
+        handoff_reason="daily_competition_window_rollover",
+    )
+
+    assert first.status.value == second.status.value == "deferred"
+    assert first.operation_id == second.operation_id
+    assert first.attempt_id != second.attempt_id
+    assert first_submission["candidate"] == second_submission["candidate"]
+    assert store.read("ARXUSDT") == first_state
+
+    with pytest.raises(ValueError, match="operation_id.*different payload"):
+        submit_registered_roll(
+            control_path=paths[0],
+            state=first_state,
+            now=now + timedelta(minutes=2),
+            reset_hour=8,
+            target_notional=50_000.0,
+            handoff_reason="daily_competition_window_rollover",
+        )
+    assert store.read("ARXUSDT") == first_state
 
 
 def test_malformed_registered_recovery_envelope_fails_closed_without_writes(
