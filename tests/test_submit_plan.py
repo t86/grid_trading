@@ -927,7 +927,7 @@ class SubmitPlanTests(unittest.TestCase):
             1,
         )
 
-    def test_symbol_coordinator_keeps_ordinary_flow_with_frozen_pair(self) -> None:
+    def test_symbol_coordinator_defers_ordinary_flow_for_frozen_pair(self) -> None:
         frozen_pair = [
             {
                 "book": "frozen_bq",
@@ -961,11 +961,16 @@ class SubmitPlanTests(unittest.TestCase):
             "notional": 20.0,
             "time_in_force": "GTX",
         }
+        ordinary_cancel = {
+            "orderId": 101,
+            "side": "SELL",
+            "role": "best_quote_entry_short",
+        }
 
         guarded = coordinate_symbol_execution_action(
             actions={
                 "place_orders": [ordinary_entry, *frozen_pair],
-                "cancel_orders": [],
+                "cancel_orders": [ordinary_cancel],
             },
             current_actual_net_qty=0.0,
             valuation_price=200.0,
@@ -973,11 +978,23 @@ class SubmitPlanTests(unittest.TestCase):
             max_actual_net_notional=120.0,
         )
 
-        self.assertEqual(guarded["actual_net_exposure_decision"]["action"], "normal")
-        self.assertEqual(guarded["place_orders"], [ordinary_entry, *frozen_pair])
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["action"],
+            "frozen_inventory_action",
+        )
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["selected_lane"],
+            "frozen",
+        )
+        self.assertEqual(guarded["place_orders"], frozen_pair)
+        self.assertEqual(guarded["cancel_orders"], [])
         self.assertEqual(
             guarded["actual_net_exposure_decision"]["deferred_ordinary_place_count"],
-            0,
+            1,
+        )
+        self.assertEqual(
+            guarded["actual_net_exposure_decision"]["deferred_ordinary_cancel_count"],
+            1,
         )
 
     def test_symbol_coordinator_selects_only_one_frozen_request_group(self) -> None:

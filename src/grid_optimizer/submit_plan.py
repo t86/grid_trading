@@ -1934,9 +1934,10 @@ def coordinate_symbol_execution_action(
     The ordinary cap arbiter never owns frozen orders.  This outer coordinator
     first evaluates ordinary safety using only ordinary candidates.  A real
     ordinary cap action or fail-closed HOLD wins over frozen work.  When the
-    ordinary lane is normal, an authorized frozen mutation group is appended
-    instead of displacing ordinary maker flow.  A two-leg frozen pair remains
-    one logical frozen action even though it consumes two exchange requests.
+    ordinary lane is normal, one authorized frozen mutation group wins and
+    ordinary maker mutations are deferred to the next cycle.  A two-leg frozen
+    pair remains one logical frozen action even though it consumes two exchange
+    requests.
     """
 
     all_places = [
@@ -2156,37 +2157,6 @@ def coordinate_symbol_execution_action(
         )
         ordinary_result["actual_net_exposure_decision"] = ordinary_decision
         return ordinary_result
-
-    if ordinary_action == "normal" and (ordinary_places or ordinary_cancels):
-        result = dict(ordinary_result)
-        combined_places = [*ordinary_result.get("place_orders", []), *frozen_places]
-        combined_cancels = [*ordinary_result.get("cancel_orders", []), *frozen_cancels]
-        ordinary_decision.update(
-            {
-                "selected_lane": "ordinary_with_frozen",
-                "selected_frozen_request_id": selected_frozen_request_id,
-                "selected_frozen_place_count": len(frozen_places),
-                "selected_frozen_cancel_count": len(frozen_cancels),
-                "deferred_ordinary_place_count": 0,
-                "deferred_ordinary_cancel_count": 0,
-                "deferred_frozen_request_count": max(len(frozen_request_ids) - 1, 0),
-                "deferred_frozen_place_count": len(deferred_frozen_places),
-                "deferred_frozen_cancel_count": len(deferred_frozen_cancels),
-                "dropped_unauthorized_frozen_place_count": unauthorized_frozen_place_count,
-                "dropped_unauthorized_frozen_cancel_count": unauthorized_frozen_cancel_count,
-            }
-        )
-        result.update(
-            {
-                "place_orders": combined_places,
-                "place_count": len(combined_places),
-                "place_notional": sum(_order_notional(row) for row in combined_places),
-                "cancel_orders": combined_cancels,
-                "cancel_count": len(combined_cancels),
-                "actual_net_exposure_decision": ordinary_decision,
-            }
-        )
-        return result
 
     result = dict(actions)
     result.update(
