@@ -31,6 +31,7 @@ from .audit import (
     income_row_time_ms,
     read_json,
     read_jsonl,
+    read_trade_audit_rows_with_integrity,
     scan_iso_bounds,
     trade_row_key,
     trade_row_time_ms,
@@ -4294,6 +4295,8 @@ def _refresh_best_quote_frozen_inventory_quantities(frozen: dict[str, Any]) -> d
     frozen["short_lots"] = short_lots
     long_qty, long_entry = _best_quote_volume_book_from_lots(long_lots)
     short_qty, short_entry = _best_quote_volume_book_from_lots(short_lots)
+    if long_qty > 1e-12 or short_qty > 1e-12:
+        frozen["frozen_exposure_observed_at"] = _utc_now().isoformat()
     long_manual_limit_isolated_qty = min(max(_safe_float(frozen.get("long_manual_limit_isolated_qty")), 0.0), long_qty)
     short_manual_limit_isolated_qty = min(max(_safe_float(frozen.get("short_manual_limit_isolated_qty")), 0.0), short_qty)
     pair_eligible_long_qty = max(long_qty - long_manual_limit_isolated_qty, 0.0)
@@ -5919,6 +5922,8 @@ def _best_quote_reduce_freeze_report(
     short_lots = _normalized_lots("short", effective_position_short_qty, current_short_avg_price)
     long_qty = sum(_safe_float(lot.get("qty")) for lot in long_lots)
     short_qty = sum(_safe_float(lot.get("qty")) for lot in short_lots)
+    if long_qty > 1e-12 or short_qty > 1e-12:
+        ledger["frozen_exposure_observed_at"] = _utc_now().isoformat()
     long_manual_limit_isolated_qty = min(
         max(_safe_float(ledger.get("long_manual_limit_isolated_qty")), 0.0),
         long_qty,
@@ -11019,6 +11024,13 @@ def _should_sync_account_audit(
     return elapsed >= AUDIT_SYNC_MIN_INTERVAL_SECONDS
 
 
+def _target_pnl_account_audit_available(sync_result: Mapping[str, Any]) -> bool:
+    return bool(
+        not sync_result.get("error")
+        and not sync_result.get("skipped")
+    )
+
+
 def _fetch_trade_rows_since(
     *,
     symbol: str,
@@ -12782,6 +12794,39 @@ def _load_futures_runtime_guard_inputs(
         if not math.isfinite(quote_qty) or abs(quote_qty) <= 0.0:
             raise ValueError("target progress trade notional must be positive")
         exact_gross_notional += abs(quote_qty)
+    local_trade_rows, local_trade_audit_complete = read_trade_audit_rows_with_integrity(
+        build_audit_paths(summary_path)["trade_audit"]
+    )
+    local_trade_identities = {
+        (trade_row_time_ms(row), trade_row_key(row))
+        for row in local_trade_rows
+        if trade_row_time_ms(row) > 0 and trade_row_key(row)
+    }
+    authoritative_trade_evidence_complete = bool(
+        local_trade_audit_complete
+        and all(
+            trade_row_time_ms(row) > 0
+            and bool(trade_row_key(row))
+            and (trade_row_time_ms(row), trade_row_key(row))
+            in local_trade_identities
+            for row in trades
+        )
+    )
+    if not authoritative_trade_evidence_complete:
+        pnl_events.append(
+            {
+                "ts": metrics_start_time.isoformat(),
+                "net_pnl": 0.0,
+                "pnl_event_type": "audit_integrity",
+                "pnl_observation_available": False,
+                "pnl_unavailable_reason": "authoritative_trade_missing_from_audit",
+                "gross_notional": 0.0,
+                "client_order_id": "",
+                "order_id": None,
+                "side": "",
+                "position_side": "",
+            }
+        )
     return exact_gross_notional, pnl_events, metrics_start_time
 
 
@@ -13290,10 +13335,14 @@ def _runtime_guard_target_pnl_events(
     *,
     state: Mapping[str, Any] | dict[str, Any],
     pnl_events: list[dict[str, Any]],
+    start_time: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Keep the complete ordinary event ledger and reject ambiguous income."""
 
-    if not _has_best_quote_frozen_inventory_position(state):
+    if not _runtime_guard_frozen_inventory_overlaps_window(
+        state,
+        start_time=start_time,
+    ):
         return pnl_events
     target_events: list[dict[str, Any]] = []
     for event in pnl_events:
@@ -13317,6 +13366,23 @@ def _runtime_guard_target_unrealized_pnl(
     return parsed if math.isfinite(parsed) else None
 
 
+def _runtime_guard_target_exposure_observation_available(
+    *,
+    source: str,
+    frozen_long_qty: float,
+    frozen_short_qty: float,
+) -> bool:
+    if source == "stale_plan_fail_closed":
+        return False
+    return not (
+        source == "live_position_risk"
+        and (
+            max(_safe_float(frozen_long_qty), 0.0) > 1e-12
+            or max(_safe_float(frozen_short_qty), 0.0) > 1e-12
+        )
+    )
+
+
 def _summarize_runtime_guard_target_total_pnl(
     *,
     plan_report: Mapping[str, Any],
@@ -13327,7 +13393,11 @@ def _summarize_runtime_guard_target_total_pnl(
     unrealized_pnl: Any,
 ) -> float | None:
     return summarize_runtime_total_pnl(
-        _runtime_guard_target_pnl_events(state=state, pnl_events=pnl_events),
+        _runtime_guard_target_pnl_events(
+            state=state,
+            pnl_events=pnl_events,
+            start_time=start_time,
+        ),
         start_time=start_time,
         now=now,
         unrealized_pnl=_runtime_guard_target_unrealized_pnl(
@@ -13350,11 +13420,25 @@ def _evaluate_runtime_guards_with_target_pnl(
     synthetic_drift_notional: float,
     unrealized_pnl: float | None,
     target_unrealized_pnl: Any,
+    target_pnl_observation_available: bool = True,
 ) -> RuntimeGuardResult:
+    target_pnl_events = pnl_events
+    if not target_pnl_observation_available:
+        target_pnl_events = [
+            *pnl_events,
+            {
+                "ts": now.astimezone(timezone.utc).isoformat(),
+                "net_pnl": 0.0,
+                "pnl_event_type": "audit_integrity",
+                "pnl_observation_available": False,
+                "pnl_unavailable_reason": "account_audit_sync_unavailable",
+                "gross_notional": 0.0,
+            },
+        ]
     target_total_pnl = _summarize_runtime_guard_target_total_pnl(
         plan_report=plan_report,
         state=state,
-        pnl_events=pnl_events,
+        pnl_events=target_pnl_events,
         start_time=config.runtime_guard_stats_start_time,
         now=now,
         unrealized_pnl=target_unrealized_pnl,
@@ -14644,6 +14728,49 @@ def _has_best_quote_frozen_inventory_position(state: Mapping[str, Any] | dict[st
         or bool(ledger.get("long_lots"))
         or bool(ledger.get("short_lots"))
     )
+
+
+def _runtime_guard_frozen_inventory_overlaps_window(
+    state: Mapping[str, Any] | dict[str, Any],
+    *,
+    start_time: datetime | None,
+) -> bool:
+    """Return whether frozen exposure may overlap the target-PnL window."""
+
+    if _has_best_quote_frozen_inventory_position(state):
+        return True
+    ledger = state.get("best_quote_frozen_inventory") if isinstance(state, Mapping) else None
+    if not isinstance(ledger, Mapping):
+        return False
+    window_start = (
+        start_time.astimezone(timezone.utc)
+        if isinstance(start_time, datetime) and start_time.tzinfo is not None
+        else start_time
+    )
+    exposure_observed_at = _parse_state_datetime(
+        ledger.get("frozen_exposure_observed_at")
+    )
+    if exposure_observed_at is not None and (
+        window_start is None or exposure_observed_at >= window_start
+    ):
+        return True
+    budgets = ledger.get("band_budgets")
+    if not isinstance(budgets, Mapping):
+        return False
+    for raw_record in budgets.values():
+        if not isinstance(raw_record, Mapping):
+            continue
+        if _safe_float(raw_record.get("cumulative_frozen_qty")) <= 1e-12:
+            continue
+        frozen_at = _parse_state_datetime(raw_record.get("last_frozen_at"))
+        released_at = _parse_state_datetime(raw_record.get("last_released_at"))
+        if window_start is None:
+            return True
+        if frozen_at is None or released_at is None:
+            return True
+        if released_at >= window_start or frozen_at >= window_start:
+            return True
+    return False
 
 
 def _best_quote_frozen_inventory_qtys(state: Mapping[str, Any] | dict[str, Any]) -> tuple[float, float]:
@@ -19068,6 +19195,7 @@ def _maybe_handle_runtime_guard(
     cycle: int,
     cycle_started_at: datetime,
     summary_path: Path,
+    target_pnl_observation_available: bool = True,
 ) -> dict[str, Any] | None:
     state_path = Path(getattr(args, "state_path", ""))
     loaded_state = read_json(state_path)
@@ -19401,7 +19529,7 @@ def _maybe_handle_runtime_guard(
     runtime_frozen_long_qty, runtime_frozen_short_qty = (
         _best_quote_frozen_inventory_qtys(state)
     )
-    guard_actual_net_notional, guard_unrealized_pnl, _guard_exposure_source = (
+    guard_actual_net_notional, guard_unrealized_pnl, guard_exposure_source = (
         _runtime_guard_exposure_inputs(
             latest_plan_report,
             now=cycle_started_at,
@@ -19422,6 +19550,14 @@ def _maybe_handle_runtime_guard(
         synthetic_drift_notional=latest_synthetic_drift_notional,
         unrealized_pnl=_safe_float(guard_unrealized_pnl),
         target_unrealized_pnl=guard_unrealized_pnl,
+        target_pnl_observation_available=(
+            target_pnl_observation_available
+            and _runtime_guard_target_exposure_observation_available(
+                source=guard_exposure_source,
+                frozen_long_qty=runtime_frozen_long_qty,
+                frozen_short_qty=runtime_frozen_short_qty,
+            )
+        ),
     )
     runtime_guard_result, _grvt_net_guard_pressure_reduce = (
         defer_grvt_net_guard_to_bounded_pressure_reduce(
@@ -38574,6 +38710,9 @@ def main() -> None:
                         setattr(args, "_startup_account_audit_completed", True)
                 except Exception as audit_exc:
                     pre_guard_audit_sync["error"] = f"{audit_exc.__class__.__name__}: {audit_exc}"
+                target_pnl_observation_available = (
+                    _target_pnl_account_audit_available(pre_guard_audit_sync)
+                )
                 backfilled_trade_rows = list(
                     pre_guard_audit_sync.pop("_fresh_trade_rows", []) or []
                 )
@@ -38595,6 +38734,9 @@ def main() -> None:
                     cycle=cycle,
                     cycle_started_at=cycle_started_at,
                     summary_path=summary_path,
+                    target_pnl_observation_available=(
+                        target_pnl_observation_available
+                    ),
                 )
                 if runtime_guard_summary is not None:
                     runtime_guard_summary["pre_guard_trade_audit_appended"] = int(
@@ -38848,6 +38990,9 @@ def main() -> None:
                     ),
                     unrealized_pnl=runtime_strategy_unrealized_pnl,
                     target_unrealized_pnl=runtime_strategy_unrealized_pnl_raw,
+                    target_pnl_observation_available=(
+                        target_pnl_observation_available
+                    ),
                 )
                 runtime_guard_result, grvt_net_guard_pressure_reduce = (
                     defer_grvt_net_guard_to_bounded_pressure_reduce(

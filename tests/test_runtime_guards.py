@@ -83,7 +83,7 @@ class RuntimeGuardsTests(unittest.TestCase):
                     "price": "0.6500",
                     "qty": "10",
                     "quoteQty": "6.50",
-                    "realizedPnl": "0",
+                    "realizedPnl": "2",
                     "commission": "0",
                     "commissionAsset": "USDT",
                 },
@@ -93,7 +93,7 @@ class RuntimeGuardsTests(unittest.TestCase):
                     "price": "0.6500",
                     "qty": "10",
                     "quoteQty": "6.50",
-                    "realizedPnl": "0",
+                    "realizedPnl": "2",
                     "commission": "0",
                     "commissionAsset": "USDT",
                 },
@@ -102,7 +102,7 @@ class RuntimeGuardsTests(unittest.TestCase):
                     "orderId": 1002,
                     "price": "0.6400",
                     "qty": "20",
-                    "realizedPnl": "0",
+                    "realizedPnl": "-1",
                     "commission": "0",
                     "commissionAsset": "USDT",
                 },
@@ -117,7 +117,297 @@ class RuntimeGuardsTests(unittest.TestCase):
             )
 
             self.assertAlmostEqual(gross, 6.50 + 12.80)
-            self.assertEqual(len(pnl_events), 3)
+            self.assertEqual(len(pnl_events), 2)
+            self.assertEqual(
+                summarize_runtime_total_pnl(
+                    pnl_events,
+                    start_time=datetime(2026, 5, 23, 0, 0, tzinfo=timezone.utc),
+                    now=datetime(2026, 5, 23, 23, 30, tzinfo=timezone.utc),
+                    unrealized_pnl=0.0,
+                ),
+                1.0,
+            )
+
+    def test_target_pnl_proof_fails_closed_on_incomplete_audit_rows(self) -> None:
+        now = datetime(2026, 5, 23, 23, 30, tzinfo=timezone.utc)
+        start = datetime(2026, 5, 23, 0, 0, tzinfo=timezone.utc)
+        cases = {
+            "malformed_trade_json": ("trade", "{broken\n"),
+            "missing_trade_time": (
+                "trade",
+                json.dumps(
+                    {
+                        "price": "1",
+                        "qty": "1",
+                        "realizedPnl": "-100",
+                        "commission": "0",
+                        "commissionAsset": "USDT",
+                    }
+                )
+                + "\n",
+            ),
+            "missing_income_time": ("income", json.dumps({"income": "-100"}) + "\n"),
+        }
+
+        for label, (audit_kind, content) in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                summary_path = Path(tmp) / "opgusdt_events.jsonl"
+                audit_path = Path(tmp) / f"opgusdt_{audit_kind}_audit.jsonl"
+                audit_path.write_text(content, encoding="utf-8")
+
+                _, pnl_events, metrics_start = summarize_futures_runtime_guard_inputs(
+                    summary_path,
+                    runtime_guard_stats_start_time=start.isoformat(),
+                    symbol="OPGUSDT",
+                    now=now,
+                )
+
+                self.assertIsNone(
+                    summarize_runtime_total_pnl(
+                        pnl_events,
+                        start_time=metrics_start,
+                        now=now,
+                        unrealized_pnl=10.0,
+                    )
+                )
+
+    def test_target_pnl_proof_fails_closed_when_bq_book_is_unknown(self) -> None:
+        now = datetime(2026, 5, 23, 23, 30, tzinfo=timezone.utc)
+        start = datetime(2026, 5, 23, 0, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            summary_path = Path(tmp) / "opgusdt_events.jsonl"
+            trade_path = Path(tmp) / "opgusdt_trade_audit.jsonl"
+            trade_path.write_text(
+                "".join(
+                    json.dumps(row) + "\n"
+                    for row in (
+                        {
+                            "time": 1779570000000,
+                            "orderId": 1,
+                            "clientOrderId": "gx-opgu-bestquot-1-abc",
+                            "price": "1",
+                            "qty": "1",
+                            "realizedPnl": "5",
+                            "commission": "0",
+                            "commissionAsset": "USDT",
+                        },
+                        {
+                            "time": 1779570001000,
+                            "orderId": 2,
+                            "price": "1",
+                            "qty": "1",
+                            "realizedPnl": "-20",
+                            "commission": "0",
+                            "commissionAsset": "USDT",
+                        },
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            _, pnl_events, metrics_start = summarize_futures_runtime_guard_inputs(
+                summary_path,
+                runtime_guard_stats_start_time=start.isoformat(),
+                symbol="OPGUSDT",
+                now=now,
+                bq_order_refs_path=Path(tmp) / "state.json",
+                bq_book_scope="normal_bq",
+            )
+
+            self.assertIsNone(
+                summarize_runtime_total_pnl(
+                    pnl_events,
+                    start_time=metrics_start,
+                    now=now,
+                    unrealized_pnl=0.0,
+                )
+            )
+
+    def test_target_pnl_proof_fails_closed_when_trade_audit_is_missing_or_empty(self) -> None:
+        now = datetime(2026, 5, 23, 23, 30, tzinfo=timezone.utc)
+        start = datetime(2026, 5, 23, 0, 0, tzinfo=timezone.utc)
+        for label, create_empty in (("missing", False), ("empty", True)):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                if create_empty:
+                    (Path(tmp) / "opgusdt_trade_audit.jsonl").write_text(
+                        "", encoding="utf-8"
+                    )
+                _, pnl_events, metrics_start = summarize_futures_runtime_guard_inputs(
+                    Path(tmp) / "opgusdt_events.jsonl",
+                    runtime_guard_stats_start_time=start.isoformat(),
+                    symbol="OPGUSDT",
+                    now=now,
+                )
+
+                self.assertIsNone(
+                    summarize_runtime_total_pnl(
+                        pnl_events,
+                        start_time=metrics_start,
+                        now=now,
+                        unrealized_pnl=10.0,
+                    )
+                )
+
+    def test_target_pnl_proof_includes_archived_trade_losses(self) -> None:
+        now = datetime(2026, 5, 23, 23, 30, tzinfo=timezone.utc)
+        start = datetime(2026, 5, 23, 0, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "output"
+            archive_dir = output_dir / "archive_previous"
+            archive_dir.mkdir(parents=True)
+            summary_path = output_dir / "opgusdt_events.jsonl"
+            current_trade_path = output_dir / "opgusdt_trade_audit.jsonl"
+            archived_trade_path = archive_dir / "opgusdt_trade_audit.jsonl"
+            current_trade_path.write_text(
+                json.dumps(
+                    {
+                        "time": 1779570001000,
+                        "orderId": 2,
+                        "clientOrderId": "gx-opgu-bestquot-2-abc",
+                        "price": "1",
+                        "qty": "1",
+                        "realizedPnl": "5",
+                        "commission": "0",
+                        "commissionAsset": "USDT",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            archived_trade_path.write_text(
+                json.dumps(
+                    {
+                        "time": 1779570000000,
+                        "orderId": 1,
+                        "clientOrderId": "gx-opgu-bestquot-1-abc",
+                        "price": "1",
+                        "qty": "1",
+                        "realizedPnl": "-20",
+                        "commission": "0",
+                        "commissionAsset": "USDT",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            _, pnl_events, metrics_start = summarize_futures_runtime_guard_inputs(
+                summary_path,
+                runtime_guard_stats_start_time=start.isoformat(),
+                symbol="OPGUSDT",
+                now=now,
+            )
+
+            self.assertEqual(
+                summarize_runtime_total_pnl(
+                    pnl_events,
+                    start_time=metrics_start,
+                    now=now,
+                    unrealized_pnl=0.0,
+                ),
+                -15.0,
+            )
+
+    def test_target_pnl_proof_fails_closed_when_income_watermark_lost_its_audit(self) -> None:
+        now = datetime(2026, 5, 23, 23, 30, tzinfo=timezone.utc)
+        start = datetime(2026, 5, 23, 0, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            summary_path = Path(tmp) / "opgusdt_events.jsonl"
+            (Path(tmp) / "opgusdt_trade_audit.jsonl").write_text(
+                json.dumps(
+                    {
+                        "time": 1779570000000,
+                        "orderId": 1,
+                        "price": "1",
+                        "qty": "1",
+                        "realizedPnl": "0",
+                        "commission": "0",
+                        "commissionAsset": "USDT",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (Path(tmp) / "opgusdt_audit_state.json").write_text(
+                json.dumps({"income_last_time_ms": 1779570000000}),
+                encoding="utf-8",
+            )
+
+            _, pnl_events, metrics_start = summarize_futures_runtime_guard_inputs(
+                summary_path,
+                runtime_guard_stats_start_time=start.isoformat(),
+                symbol="OPGUSDT",
+                now=now,
+            )
+
+            self.assertIsNone(
+                summarize_runtime_total_pnl(
+                    pnl_events,
+                    start_time=metrics_start,
+                    now=now,
+                    unrealized_pnl=10.0,
+                )
+            )
+
+    def test_target_pnl_proof_fails_closed_when_income_archive_trails_watermark(self) -> None:
+        now = datetime(2026, 5, 23, 23, 30, tzinfo=timezone.utc)
+        start = datetime(2026, 5, 23, 0, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "archive_previous"
+            archive.mkdir()
+            summary_path = root / "opgusdt_events.jsonl"
+            (root / "opgusdt_trade_audit.jsonl").write_text(
+                json.dumps(
+                    {
+                        "time": 1779570000000,
+                        "orderId": 1,
+                        "price": "1",
+                        "qty": "1",
+                        "realizedPnl": "0",
+                        "commission": "0",
+                        "commissionAsset": "USDT",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (archive / "opgusdt_income_audit.jsonl").write_text(
+                json.dumps(
+                    {
+                        "time": 1779560000000,
+                        "tranId": 1,
+                        "income": "1",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "opgusdt_audit_state.json").write_text(
+                json.dumps(
+                    {
+                        "income_last_time_ms": 1779570000000,
+                        "income_last_keys_at_time": ["2"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            _, pnl_events, metrics_start = summarize_futures_runtime_guard_inputs(
+                summary_path,
+                runtime_guard_stats_start_time=start.isoformat(),
+                symbol="OPGUSDT",
+                now=now,
+            )
+
+            self.assertIsNone(
+                summarize_runtime_total_pnl(
+                    pnl_events,
+                    start_time=metrics_start,
+                    now=now,
+                    unrealized_pnl=10.0,
+                )
+            )
 
     def test_summarize_futures_runtime_guard_inputs_counts_only_normal_bq_book(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -180,7 +470,17 @@ class RuntimeGuardsTests(unittest.TestCase):
             )
 
             self.assertEqual(gross, 100.0)
-            self.assertEqual([event["order_id"] for event in pnl_events], [1])
+            self.assertEqual(
+                [
+                    event["order_id"]
+                    for event in pnl_events
+                    if event.get("pnl_event_type") != "audit_integrity"
+                ],
+                [1],
+            )
+            self.assertTrue(
+                any(event.get("pnl_observation_available") is False for event in pnl_events)
+            )
 
     def test_summarize_futures_runtime_guard_inputs_excludes_frozen_pair_release_pnl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

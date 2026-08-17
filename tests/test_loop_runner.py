@@ -368,6 +368,86 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(target_events[-1]["pnl_observation_available"])
         self.assertIsNone(total)
 
+    def test_target_profit_rejects_income_from_frozen_inventory_later_released(self) -> None:
+        start = datetime(2026, 8, 17, 0, 0, tzinfo=timezone.utc)
+        now = start + timedelta(hours=1)
+        state = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 0.0,
+                "short_qty": 0.0,
+                "long_lots": [],
+                "short_lots": [],
+                "band_budgets": {
+                    "long:1": {
+                        "cumulative_frozen_qty": 10.0,
+                        "active_frozen_qty": 0.0,
+                        "last_frozen_at": (start + timedelta(minutes=10)).isoformat(),
+                        "last_released_at": (start + timedelta(minutes=20)).isoformat(),
+                    }
+                },
+            }
+        }
+        events = [
+            {
+                "ts": (start + timedelta(minutes=15)).isoformat(),
+                "net_pnl": 5.0,
+                "pnl_event_type": "income",
+                "pnl_observation_available": True,
+            }
+        ]
+
+        total = loop_runner_module._summarize_runtime_guard_target_total_pnl(
+            plan_report={"strategy_unrealized_pnl_available": True},
+            state=state,
+            pnl_events=events,
+            start_time=start,
+            now=now,
+            unrealized_pnl=0.0,
+        )
+
+        self.assertIsNone(total)
+
+    def test_target_profit_rejects_income_after_no_band_frozen_exposure(self) -> None:
+        start = datetime(2026, 8, 17, 0, 0, tzinfo=timezone.utc)
+        now = start + timedelta(hours=1)
+        active = {
+            "long_lots": [{"qty": 10.0, "entry_price": 1.0}],
+            "short_lots": [],
+        }
+        with patch(
+            "grid_optimizer.loop_runner._utc_now",
+            return_value=start + timedelta(minutes=10),
+        ):
+            loop_runner_module._refresh_best_quote_frozen_inventory_quantities(active)
+        active["long_lots"] = []
+        with patch(
+            "grid_optimizer.loop_runner._utc_now",
+            return_value=start + timedelta(minutes=20),
+        ):
+            released = loop_runner_module._refresh_best_quote_frozen_inventory_quantities(active)
+
+        total = loop_runner_module._summarize_runtime_guard_target_total_pnl(
+            plan_report={"strategy_unrealized_pnl_available": True},
+            state={"best_quote_frozen_inventory": released},
+            pnl_events=[
+                {
+                    "ts": (start + timedelta(minutes=15)).isoformat(),
+                    "net_pnl": 5.0,
+                    "pnl_event_type": "income",
+                    "pnl_observation_available": True,
+                }
+            ],
+            start_time=start,
+            now=now,
+            unrealized_pnl=0.0,
+        )
+
+        self.assertEqual(
+            released["frozen_exposure_observed_at"],
+            (start + timedelta(minutes=10)).isoformat(),
+        )
+        self.assertIsNone(total)
+
     def test_target_profit_rejects_unavailable_ordinary_unrealized_pnl(self) -> None:
         self.assertIsNone(
             loop_runner_module._runtime_guard_target_unrealized_pnl(
@@ -450,6 +530,93 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertIsNone(evaluate.call_args.kwargs["target_total_pnl"])
         terminal.assert_not_called()
 
+    def test_maybe_handle_runtime_guard_rejects_stale_upnl_with_frozen_inventory(self) -> None:
+        start = datetime(2026, 8, 17, 0, 0, tzinfo=timezone.utc)
+        now = start + timedelta(hours=1)
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            plan_path = Path(tmpdir) / "plan.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "best_quote_frozen_inventory": {
+                            "long_qty": 1.0,
+                            "short_qty": 0.0,
+                            "long_lots": [{"qty": 1.0, "entry_price": 1.0}],
+                            "short_lots": [],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": (now - timedelta(minutes=10)).isoformat(),
+                        "mid_price": 1.0,
+                        "strategy_actual_net_notional": 0.0,
+                        "strategy_unrealized_pnl": 10.0,
+                        "strategy_unrealized_pnl_available": True,
+                        "frozen_long_qty": 1.0,
+                        "frozen_short_qty": 0.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = _build_parser().parse_args([])
+            args.symbol = "ARXUSDT"
+            args.strategy_profile = "arx_stale_profit_gate_test"
+            args.strategy_mode = "hedge_best_quote_maker_volume_v1"
+            args.run_start_time = start.isoformat()
+            args.runtime_guard_stats_start_time = start.isoformat()
+            args.run_end_time = (start + timedelta(hours=2)).isoformat()
+            args.max_cumulative_notional = 100.0
+            args.target_min_total_pnl = 0.5
+            args.terminal_drain_exit_policy = "drain_then_preserve"
+            args.terminal_drain_absolute_loss_budget = 5.0
+            args.terminal_drain_max_wait_seconds = 900.0
+            args.state_path = str(state_path)
+            args.plan_json = str(plan_path)
+            args.summary_jsonl = str(Path(tmpdir) / "events.jsonl")
+            control, _ = bind_run_contract_owner(vars(args), activated_at=start)
+            control_path = Path(tmpdir) / "control.json"
+            control_path.write_text(json.dumps(control), encoding="utf-8")
+            args.recovery_control_path = str(control_path)
+            pnl_events = [
+                {
+                    "ts": now.isoformat(),
+                    "net_pnl": 1.0,
+                    "pnl_observation_available": True,
+                }
+            ]
+
+            with (
+                patch(
+                    "grid_optimizer.loop_runner._load_futures_runtime_guard_inputs",
+                    return_value=(100.0, pnl_events, start),
+                ),
+                patch(
+                    "grid_optimizer.loop_runner._runtime_guard_live_exposure",
+                    return_value=(0.0, -999.0),
+                ),
+                patch(
+                    "grid_optimizer.loop_runner.evaluate_runtime_guards",
+                    wraps=loop_runner_module.evaluate_runtime_guards,
+                ) as evaluate,
+                patch("grid_optimizer.loop_runner._replace_registered_runtime_safety_source"),
+                patch("grid_optimizer.loop_runner._handle_terminal_drain_round") as terminal,
+            ):
+                summary = loop_runner_module._maybe_handle_runtime_guard(
+                    args=args,
+                    cycle=1,
+                    cycle_started_at=now,
+                    summary_path=Path(args.summary_jsonl),
+                )
+
+        self.assertIsNone(summary)
+        self.assertIsNone(evaluate.call_args.kwargs["target_total_pnl"])
+        terminal.assert_not_called()
+
     def test_shared_runtime_target_evaluator_fails_closed_on_unavailable_upnl(self) -> None:
         evaluator = getattr(
             loop_runner_module,
@@ -492,6 +659,166 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(result.target_profit_satisfied)
         self.assertTrue(result.tradable)
         self.assertFalse(result.stop_triggered)
+
+    def test_shared_runtime_target_evaluator_fails_closed_on_audit_sync_error(self) -> None:
+        now = datetime(2026, 8, 17, 1, 0, tzinfo=timezone.utc)
+        config = loop_runner_module.normalize_runtime_guard_config(
+            {
+                "max_cumulative_notional": 100.0,
+                "target_min_total_pnl": 0.5,
+            }
+        )
+        pnl_events = [
+            {
+                "ts": now.isoformat(),
+                "net_pnl": 1.0,
+                "pnl_observation_available": True,
+            }
+        ]
+
+        result = loop_runner_module._evaluate_runtime_guards_with_target_pnl(
+            config=config,
+            now=now,
+            cumulative_gross_notional=100.0,
+            pnl_events=pnl_events,
+            pnl_events_for_guard=pnl_events,
+            plan_report={"strategy_unrealized_pnl_available": True},
+            state={},
+            actual_net_notional=0.0,
+            synthetic_drift_notional=0.0,
+            unrealized_pnl=10.0,
+            target_unrealized_pnl=10.0,
+            target_pnl_observation_available=False,
+        )
+
+        self.assertIsNone(result.target_total_pnl)
+        self.assertFalse(result.target_profit_satisfied)
+        self.assertFalse(result.stop_triggered)
+
+    def test_target_pnl_requires_a_fresh_account_audit_sync(self) -> None:
+        available = loop_runner_module._target_pnl_account_audit_available
+
+        self.assertTrue(available({"trade_appended": 0, "income_appended": 0}))
+        self.assertFalse(available({"skipped": "throttled<60s"}))
+        self.assertFalse(available({"error": "income history unavailable"}))
+
+    def test_authoritative_target_progress_fails_closed_when_local_trade_is_missing(self) -> None:
+        start = datetime(2026, 8, 17, 0, 0, tzinfo=timezone.utc)
+        now = start + timedelta(hours=1)
+        with TemporaryDirectory() as tmpdir:
+            summary_path = Path(tmpdir) / "arxusdt_events.jsonl"
+            trade_path = Path(tmpdir) / "arxusdt_trade_audit.jsonl"
+            trade_path.write_text(
+                json.dumps(
+                    {
+                        "time": int((start + timedelta(minutes=1)).timestamp() * 1000),
+                        "id": 1,
+                        "orderId": 11,
+                        "side": "BUY",
+                        "price": "1",
+                        "qty": "1",
+                        "realizedPnl": "1",
+                        "commission": "0",
+                        "commissionAsset": "USDT",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            exchange_trade = {
+                "time": int((start + timedelta(minutes=2)).timestamp() * 1000),
+                "id": 2,
+                "orderId": 12,
+                "side": "SELL",
+                "price": "1",
+                "qty": "100",
+                "quoteQty": "100",
+            }
+
+            with (
+                patch(
+                    "grid_optimizer.loop_runner.load_binance_api_credentials",
+                    return_value=("key", "secret"),
+                ),
+                patch(
+                    "grid_optimizer.loop_runner._terminal_drain_fetch_user_trades_exact",
+                    return_value=[exchange_trade],
+                ),
+            ):
+                gross, pnl_events, metrics_start = (
+                    loop_runner_module._load_futures_runtime_guard_inputs(
+                        summary_path,
+                        runtime_guard_stats_start_time=start.isoformat(),
+                        symbol="ARXUSDT",
+                        now=now,
+                        run_end_time=(start + timedelta(hours=2)).isoformat(),
+                        max_cumulative_notional=100.0,
+                        authoritative_target_progress=True,
+                    )
+                )
+
+        self.assertEqual(gross, 100.0)
+        self.assertIsNone(
+            loop_runner_module.summarize_runtime_total_pnl(
+                pnl_events,
+                start_time=metrics_start,
+                now=now,
+                unrealized_pnl=10.0,
+            )
+        )
+
+    def test_authoritative_target_progress_accepts_matching_local_trade(self) -> None:
+        start = datetime(2026, 8, 17, 0, 0, tzinfo=timezone.utc)
+        now = start + timedelta(hours=1)
+        exchange_trade = {
+            "time": int((start + timedelta(minutes=2)).timestamp() * 1000),
+            "id": 2,
+            "orderId": 12,
+            "side": "SELL",
+            "price": "1",
+            "qty": "100",
+            "quoteQty": "100",
+            "realizedPnl": "2",
+            "commission": "0",
+            "commissionAsset": "USDT",
+        }
+        with TemporaryDirectory() as tmpdir:
+            summary_path = Path(tmpdir) / "arxusdt_events.jsonl"
+            trade_path = Path(tmpdir) / "arxusdt_trade_audit.jsonl"
+            trade_path.write_text(json.dumps(exchange_trade) + "\n", encoding="utf-8")
+
+            with (
+                patch(
+                    "grid_optimizer.loop_runner.load_binance_api_credentials",
+                    return_value=("key", "secret"),
+                ),
+                patch(
+                    "grid_optimizer.loop_runner._terminal_drain_fetch_user_trades_exact",
+                    return_value=[exchange_trade],
+                ),
+            ):
+                gross, pnl_events, metrics_start = (
+                    loop_runner_module._load_futures_runtime_guard_inputs(
+                        summary_path,
+                        runtime_guard_stats_start_time=start.isoformat(),
+                        symbol="ARXUSDT",
+                        now=now,
+                        run_end_time=(start + timedelta(hours=2)).isoformat(),
+                        max_cumulative_notional=100.0,
+                        authoritative_target_progress=True,
+                    )
+                )
+
+        self.assertEqual(gross, 100.0)
+        self.assertEqual(
+            loop_runner_module.summarize_runtime_total_pnl(
+                pnl_events,
+                start_time=metrics_start,
+                now=now,
+                unrealized_pnl=10.0,
+            ),
+            12.0,
+        )
 
     def test_ordinary_reduce_only_cap_cannot_consume_frozen_position_capacity(self) -> None:
         actions = {

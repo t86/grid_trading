@@ -7,7 +7,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .audit import build_audit_paths, income_row_time_ms, read_jsonl, trade_row_time_ms
+from .audit import (
+    build_audit_paths,
+    income_row_key,
+    income_row_time_ms,
+    read_jsonl,
+    read_income_audit_rows_with_integrity,
+    read_trade_audit_rows_with_integrity,
+    trade_row_time_ms,
+)
 from .competition_board import resolve_active_competition_board
 
 
@@ -234,8 +242,12 @@ def summarize_futures_runtime_guard_inputs(
     runtime_guard_stats_end_time: Any = None,
 ) -> tuple[float, list[dict[str, Any]], datetime | None]:
     audit_paths = build_audit_paths(summary_path)
-    trade_rows = read_jsonl(audit_paths["trade_audit"], limit=0)
-    income_rows = read_jsonl(audit_paths["income_audit"], limit=0)
+    trade_rows, trade_audit_complete = read_trade_audit_rows_with_integrity(
+        audit_paths["trade_audit"]
+    )
+    income_rows, income_audit_complete = read_income_audit_rows_with_integrity(
+        audit_paths["income_audit"]
+    )
     metrics_start_time = (
         _parse_datetime(
             runtime_guard_stats_start_time,
@@ -255,6 +267,41 @@ def summarize_futures_runtime_guard_inputs(
         "runtime_guard_stats_end_time",
         now=now,
     )
+    audit_state: dict[str, Any] = {}
+    if audit_paths["audit_state"].exists():
+        try:
+            raw_audit_state = json.loads(
+                audit_paths["audit_state"].read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            raw_audit_state = None
+        if isinstance(raw_audit_state, dict):
+            audit_state = raw_audit_state
+    try:
+        income_last_time_ms = int(audit_state.get("income_last_time_ms") or 0)
+    except (TypeError, ValueError):
+        income_last_time_ms = 0
+        income_audit_complete = False
+    if income_last_time_ms > 0:
+        local_income_last_time_ms = max(
+            (income_row_time_ms(row) for row in income_rows),
+            default=0,
+        )
+        expected_income_keys = {
+            str(key)
+            for key in audit_state.get("income_last_keys_at_time", [])
+            if str(key).strip()
+        }
+        local_income_keys_at_watermark = {
+            income_row_key(row)
+            for row in income_rows
+            if income_row_time_ms(row) == income_last_time_ms
+        }
+        if (
+            local_income_last_time_ms < income_last_time_ms
+            or not expected_income_keys.issubset(local_income_keys_at_watermark)
+        ):
+            income_audit_complete = False
     cumulative_gross_notional = 0.0
     pnl_events: list[dict[str, Any]] = []
     stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
@@ -334,19 +381,58 @@ def summarize_futures_runtime_guard_inputs(
             return None
         return parsed if math.isfinite(parsed) else None
 
+    proof_ts = (
+        metrics_start_time
+        or (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    ).isoformat()
+
+    def _mark_pnl_proof_unavailable(reason: str) -> None:
+        pnl_events.append(
+            {
+                "ts": proof_ts,
+                "net_pnl": 0.0,
+                "pnl_event_type": "audit_integrity",
+                "pnl_observation_available": False,
+                "pnl_unavailable_reason": reason,
+                "gross_notional": 0.0,
+                "client_order_id": "",
+                "order_id": None,
+                "side": "",
+                "position_side": "",
+            }
+        )
+
+    if not trade_audit_complete:
+        _mark_pnl_proof_unavailable("trade_audit_incomplete")
+    if not income_audit_complete:
+        _mark_pnl_proof_unavailable("income_audit_incomplete")
+
     for row in trade_rows:
         trade_time_ms = trade_row_time_ms(row)
         trade_ts: datetime | None = None
         if trade_time_ms > 0:
             trade_ts = datetime.fromtimestamp(trade_time_ms / 1000.0, tz=timezone.utc)
+        if trade_ts is None:
+            if normalized_bq_book_scope:
+                historical_book = _historical_bq_book(row)
+                if historical_book != normalized_bq_book_scope:
+                    if historical_book == "unknown":
+                        _mark_pnl_proof_unavailable("trade_book_unknown")
+                    continue
+            if not _is_frozen_pair_release_trade(row):
+                _mark_pnl_proof_unavailable("trade_time_invalid")
+            continue
         if metrics_start_time is not None:
-            if trade_ts is None or trade_ts < metrics_start_time:
+            if trade_ts < metrics_start_time:
                 continue
         if metrics_end_time is not None:
-            if trade_ts is None or trade_ts >= metrics_end_time:
+            if trade_ts >= metrics_end_time:
                 continue
         if normalized_bq_book_scope:
-            if _historical_bq_book(row) != normalized_bq_book_scope:
+            historical_book = _historical_bq_book(row)
+            if historical_book != normalized_bq_book_scope:
+                if historical_book == "unknown":
+                    _mark_pnl_proof_unavailable("trade_book_unknown")
                 continue
         price = _as_float(row.get("price"))
         qty = abs(_as_float(row.get("qty")))
@@ -358,8 +444,6 @@ def summarize_futures_runtime_guard_inputs(
                 seen_order_notional_keys.add(order_identity)
         else:
             cumulative_gross_notional += notional
-        if trade_ts is None:
-            continue
         if _is_frozen_pair_release_trade(row):
             continue
         observed_realized_pnl = _finite_float(row.get("realizedPnl"))
@@ -394,6 +478,7 @@ def summarize_futures_runtime_guard_inputs(
     for row in income_rows:
         income_time_ms = income_row_time_ms(row)
         if income_time_ms <= 0:
+            _mark_pnl_proof_unavailable("income_time_invalid")
             continue
         income_ts = datetime.fromtimestamp(income_time_ms / 1000.0, tz=timezone.utc)
         if metrics_start_time is not None and income_ts < metrics_start_time:

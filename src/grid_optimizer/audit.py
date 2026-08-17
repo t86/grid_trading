@@ -155,6 +155,33 @@ def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
         return
 
 
+def read_jsonl_with_integrity(path: Path) -> tuple[list[dict[str, Any]], bool]:
+    """Read JSONL rows and report whether every non-empty line was usable."""
+
+    if not path.exists():
+        return [], True
+    rows: list[dict[str, Any]] = []
+    complete = True
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    item = json.loads(raw)
+                except json.JSONDecodeError:
+                    complete = False
+                    continue
+                if isinstance(item, dict):
+                    rows.append(item)
+                else:
+                    complete = False
+    except OSError:
+        return [], False
+    return rows, complete
+
+
 def read_jsonl(path: Path, limit: int = 500) -> list[dict[str, Any]]:
     if limit > 0:
         rows: deque[dict[str, Any]] = deque(maxlen=limit)
@@ -267,6 +294,70 @@ def read_trade_audit_rows(
             rows.append(item)
     sorted_rows = sorted(rows, key=lambda item: (trade_row_time_ms(item), trade_row_key(item)))
     return sorted_rows[-limit:] if limit > 0 else sorted_rows
+
+
+def read_trade_audit_rows_with_integrity(
+    path: Path,
+    *,
+    include_archives: bool = True,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Read de-duplicated trade history without hiding corrupt or missing sources."""
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    complete = True
+    found_source = False
+    paths = related_trade_audit_paths(path) if include_archives else [Path(path)]
+    for audit_path in paths:
+        if not audit_path.exists():
+            continue
+        found_source = True
+        source_rows, source_complete = read_jsonl_with_integrity(audit_path)
+        complete = complete and source_complete
+        for item in source_rows:
+            ts_ms = trade_row_time_ms(item)
+            key = trade_row_key(item)
+            identity = (ts_ms, key)
+            if ts_ms > 0 and key:
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            rows.append(item)
+    return (
+        sorted(rows, key=lambda item: (trade_row_time_ms(item), trade_row_key(item))),
+        complete and found_source and bool(rows),
+    )
+
+
+def read_income_audit_rows_with_integrity(
+    path: Path,
+    *,
+    include_archives: bool = True,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Read de-duplicated income history and expose corrupt sources."""
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    complete = True
+    paths = related_trade_audit_paths(path) if include_archives else [Path(path)]
+    for audit_path in paths:
+        if not audit_path.exists():
+            continue
+        source_rows, source_complete = read_jsonl_with_integrity(audit_path)
+        complete = complete and source_complete
+        for item in source_rows:
+            ts_ms = income_row_time_ms(item)
+            key = income_row_key(item)
+            identity = (ts_ms, key)
+            if ts_ms > 0 and key:
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            rows.append(item)
+    return (
+        sorted(rows, key=lambda item: (income_row_time_ms(item), income_row_key(item))),
+        complete,
+    )
 
 
 def count_jsonl_lines(path: Path, *, max_scan_bytes: int | None = None) -> int | None:
