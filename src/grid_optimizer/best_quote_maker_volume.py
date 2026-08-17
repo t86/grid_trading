@@ -1793,7 +1793,7 @@ def build_best_quote_maker_volume_plan(
                 buy_orders,
                 _build_order(
                     side="BUY",
-                    price=_price_with_gap(bid, reduce_short_gap, -1),
+                    price=bid,
                     notional=min(
                         buy_side_notional * reduce_short_budget_scale,
                         short_notional,
@@ -1819,7 +1819,7 @@ def build_best_quote_maker_volume_plan(
                 sell_orders,
                 _build_order(
                     side="SELL",
-                    price=_price_with_gap(ask, reduce_long_gap, 1),
+                    price=ask,
                     notional=min(
                         sell_side_notional * reduce_long_budget_scale,
                         long_notional,
