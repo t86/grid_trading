@@ -23958,6 +23958,7 @@ def apply_grvt_ordinary_inventory_pressure_guard(
     short_pressure_notional: float,
     max_reduce_notional: float,
     step_size: float | None,
+    additional_eligible_reduce_roles: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Keep ordinary GRVT reductions on pressured sides and bound each side's total.
 
@@ -23970,6 +23971,11 @@ def apply_grvt_ordinary_inventory_pressure_guard(
     safe_long_pressure = max(_safe_float(long_pressure_notional), 0.0)
     safe_short_pressure = max(_safe_float(short_pressure_notional), 0.0)
     safe_max_reduce = max(_safe_float(max_reduce_notional), 0.0)
+    extra_eligible_roles = {
+        str(role).strip().lower()
+        for role in (additional_eligible_reduce_roles or [])
+        if str(role).strip()
+    }
     eligible_sides = {
         side
         for side, notional, threshold in (
@@ -23986,6 +23992,7 @@ def apply_grvt_ordinary_inventory_pressure_guard(
         "short_pressure_notional": safe_short_pressure,
         "max_reduce_notional": safe_max_reduce,
         "suppressed_opposite_reduce_order_count": 0,
+        "preserved_paired_threshold_reduce_order_count": 0,
         "capped_pressure_reduce_order_count": 0,
         "suppressed_excess_reduce_order_count": 0,
     }
@@ -24019,9 +24026,12 @@ def apply_grvt_ordinary_inventory_pressure_guard(
         if reduce_side is None:
             kept_orders.append(order)
             continue
-        if reduce_side not in eligible_sides:
+        additionally_eligible = role in extra_eligible_roles
+        if reduce_side not in eligible_sides and not additionally_eligible:
             report["suppressed_opposite_reduce_order_count"] += 1
             continue
+        if reduce_side not in eligible_sides and additionally_eligible:
+            report["preserved_paired_threshold_reduce_order_count"] += 1
         if safe_max_reduce <= 0:
             kept_orders.append(order)
             continue
@@ -24079,6 +24089,25 @@ def _apply_grvt_submit_ordinary_inventory_pressure_guard(
     )
     if not isinstance(pressure_guard, Mapping):
         return actions
+    active_pair_report = plan_report.get("best_quote_active_pair_reduce")
+    paired_threshold_roles = (
+        {
+            "best_quote_active_pair_reduce_long",
+            "best_quote_active_pair_reduce_short",
+        }
+        if (
+            isinstance(active_pair_report, Mapping)
+            and bool(active_pair_report.get("active"))
+            and int(_safe_float(active_pair_report.get("order_count"))) >= 2
+            and bool(active_pair_report.get("pair_all_sides_on_threshold"))
+            and {
+                str(side).strip().lower()
+                for side in (active_pair_report.get("eligible_sides") or [])
+            }
+            == {"long", "short"}
+        )
+        else set()
+    )
     live_mid_price = (
         (max(_safe_float(live_bid_price), 0.0) + max(_safe_float(live_ask_price), 0.0)) / 2.0
         if _safe_float(live_bid_price) > 0 and _safe_float(live_ask_price) > 0
@@ -24107,6 +24136,7 @@ def _apply_grvt_submit_ordinary_inventory_pressure_guard(
             100.0,
         ),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+        additional_eligible_reduce_roles=paired_threshold_roles,
     )
     guarded_by_identity: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for item in [*temporary_plan["buy_orders"], *temporary_plan["sell_orders"]]:

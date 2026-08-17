@@ -12967,6 +12967,73 @@ class LoopRunnerTests(unittest.TestCase):
             [item["role"] for item in guarded["place_orders"]],
         )
 
+    def test_grvt_submit_pressure_guard_preserves_authenticated_paired_reduce(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "role": "best_quote_active_pair_reduce_long",
+                    "qty": 351.0,
+                    "price": 0.2845,
+                    "notional": 99.8595,
+                    "force_reduce_only": True,
+                },
+                {
+                    "side": "BUY",
+                    "position_side": "SHORT",
+                    "role": "best_quote_active_pair_reduce_short",
+                    "qty": 351.0,
+                    "price": 0.2844,
+                    "notional": 99.8244,
+                    "force_reduce_only": True,
+                },
+            ],
+            "cancel_orders": [],
+        }
+        plan_report = {
+            "effective_strategy_profile": "grvt_daily_80k_bq_short_freeze_5pct_v1",
+            "best_quote_maker_volume": {
+                "ordinary_inventory_pressure_guard": {
+                    "active": True,
+                    "eligible_sides": ["short"],
+                    "long_pressure_notional": 900.0,
+                    "short_pressure_notional": 900.0,
+                    "max_reduce_notional": 100.0,
+                }
+            },
+            "best_quote_active_pair_reduce": {
+                "active": True,
+                "order_count": 2,
+                "eligible_sides": ["long", "short"],
+                "pair_all_sides_on_threshold": True,
+            },
+            "symbol_info": {"step_size": 1.0},
+        }
+
+        guarded = loop_runner_module._apply_grvt_submit_ordinary_inventory_pressure_guard(
+            actions=actions,
+            plan_report=plan_report,
+            current_ordinary_long_qty=2_814.0,
+            current_ordinary_short_qty=3_202.0,
+            live_bid_price=0.2844,
+            live_ask_price=0.2845,
+        )
+
+        self.assertEqual(
+            {item["role"] for item in guarded["place_orders"]},
+            {
+                "best_quote_active_pair_reduce_long",
+                "best_quote_active_pair_reduce_short",
+            },
+        )
+        self.assertEqual(
+            guarded["ordinary_inventory_pressure_guard"][
+                "preserved_paired_threshold_reduce_order_count"
+            ],
+            1,
+        )
+
     def test_grvt_small_net_breach_uses_bounded_pressure_reduce_instead_of_terminal_drain(self) -> None:
         plan = {
             "effective_strategy_profile": "grvt_daily_80k_bq_short_freeze_5pct_v1",
