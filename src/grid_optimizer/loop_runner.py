@@ -123,6 +123,7 @@ from .submit_plan import (
     cap_reduce_only_place_orders_to_position,
     estimate_mid_drift_steps,
     is_frozen_inventory_order,
+    ordinary_entry_lot_profit_guard_price,
     preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
     sort_cancel_orders_farthest_from_market_first,
@@ -22779,6 +22780,8 @@ def apply_take_profit_profit_guard(
         "relaxed_buy_orders": 0,
         "release_floor_price": None,
         "release_ceiling_price": None,
+        "ordinary_entry_lot_profit_relaxed_sell_orders": 0,
+        "ordinary_entry_lot_profit_relaxed_buy_orders": 0,
     }
 
     actual_long_avg = max(_safe_float(current_long_avg_price), 0.0)
@@ -22869,9 +22872,16 @@ def apply_take_profit_profit_guard(
             if _order_role(order) not in long_guard_roles:
                 updated_sell_orders.append(order)
                 continue
+            entry_lot_floor = ordinary_entry_lot_profit_guard_price(
+                order,
+                reduce_side="SELL",
+            )
             release_floor = max(_safe_float(order.get("take_profit_guard_release_floor")), 0.0)
             effective_floor = long_floor_price
-            if release_floor > 0:
+            if entry_lot_floor > 0:
+                effective_floor = entry_lot_floor
+                report["ordinary_entry_lot_profit_relaxed_sell_orders"] += 1
+            elif release_floor > 0:
                 effective_floor = min(effective_floor, release_floor)
                 report["relaxed_sell_orders"] += 1
                 current_release_floor = _safe_float(report.get("release_floor_price"))
@@ -22900,9 +22910,16 @@ def apply_take_profit_profit_guard(
             if _order_role(order) not in short_guard_roles:
                 updated_buy_orders.append(order)
                 continue
+            entry_lot_ceiling = ordinary_entry_lot_profit_guard_price(
+                order,
+                reduce_side="BUY",
+            )
             release_ceiling = max(_safe_float(order.get("take_profit_guard_release_ceiling")), 0.0)
             effective_ceiling = short_ceiling_price
-            if release_ceiling > 0:
+            if entry_lot_ceiling > 0:
+                effective_ceiling = entry_lot_ceiling
+                report["ordinary_entry_lot_profit_relaxed_buy_orders"] += 1
+            elif release_ceiling > 0:
                 effective_ceiling = max(effective_ceiling, release_ceiling)
                 report["relaxed_buy_orders"] += 1
                 current_release_ceiling = _safe_float(report.get("release_ceiling_price"))

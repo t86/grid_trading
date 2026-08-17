@@ -20465,6 +20465,49 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(plan["sell_orders"][0]["price"], 1.032, places=8)
         self.assertAlmostEqual(plan["sell_orders"][1]["price"], 1.032, places=8)
 
+    def test_apply_take_profit_profit_guard_keeps_valid_ordinary_entry_lot_profit_price(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [],
+            "sell_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.2811,
+                    "qty": 23.0,
+                    "notional": 6.4653,
+                    "role": "best_quote_reduce_long",
+                    "position_side": "LONG",
+                    "force_reduce_only": True,
+                    "ordinary_entry_lot_profit": True,
+                    "ordinary_entry_lot_cost_price": 0.2810,
+                    "ordinary_entry_lot_profit_boundary": 0.2811,
+                    "ordinary_entry_lot_qty_cap": 23.0,
+                },
+            ],
+        }
+
+        result = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=3160.0,
+            current_short_qty=0.0,
+            current_long_avg_price=0.2857,
+            current_short_avg_price=0.0,
+            current_long_notional=888.0,
+            current_short_notional=0.0,
+            pause_long_position_notional=900.0,
+            pause_short_position_notional=None,
+            threshold_long_position_notional=900.0,
+            min_profit_ratio=0.0003,
+            tick_size=0.0001,
+            bid_price=0.2809,
+            ask_price=0.2810,
+            extra_long_guard_roles={"best_quote_reduce_long"},
+        )
+
+        self.assertEqual(plan["sell_orders"][0]["price"], 0.2811)
+        self.assertEqual(result["ordinary_entry_lot_profit_relaxed_sell_orders"], 1)
+        self.assertEqual(result["adjusted_sell_orders"], 0)
+
     def test_apply_take_profit_profit_guard_clamps_best_quote_single_way_exit_roles(self) -> None:
         plan = {
             "bootstrap_orders": [],

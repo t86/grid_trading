@@ -360,6 +360,30 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         report = plan["metrics"]["four_leg_cycle"]["roles"]
         self.assertEqual(report["long_profit_reduce"]["position_cost"], 99.5)
         self.assertEqual(report["short_profit_reduce"]["position_cost"], 100.6)
+        long_reduce = next(
+            order
+            for order in plan["sell_orders"]
+            if order["role"] == "best_quote_reduce_long"
+        )
+        short_reduce = next(
+            order
+            for order in plan["buy_orders"]
+            if order["role"] == "best_quote_reduce_short"
+        )
+        self.assertTrue(long_reduce["ordinary_entry_lot_profit"])
+        self.assertEqual(long_reduce["ordinary_entry_lot_cost_price"], 99.5)
+        self.assertEqual(long_reduce["ordinary_entry_lot_profit_boundary"], 100.1)
+        self.assertGreaterEqual(
+            long_reduce["ordinary_entry_lot_qty_cap"],
+            long_reduce["qty"],
+        )
+        self.assertTrue(short_reduce["ordinary_entry_lot_profit"])
+        self.assertEqual(short_reduce["ordinary_entry_lot_cost_price"], 100.6)
+        self.assertEqual(short_reduce["ordinary_entry_lot_profit_boundary"], 100.0)
+        self.assertGreaterEqual(
+            short_reduce["ordinary_entry_lot_qty_cap"],
+            short_reduce["qty"],
+        )
 
     def test_four_leg_profit_reduce_does_not_repeat_without_an_unreleased_entry_lot(self) -> None:
         plan = build_best_quote_maker_volume_plan(

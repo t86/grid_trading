@@ -2228,6 +2228,15 @@ def build_best_quote_maker_volume_plan(
                     **cost_audit,
                 }
                 return
+            if paired_lot_qty is not None:
+                order.update(
+                    {
+                        "ordinary_entry_lot_profit": True,
+                        "ordinary_entry_lot_cost_price": position_cost,
+                        "ordinary_entry_lot_profit_boundary": price,
+                        "ordinary_entry_lot_qty_cap": paired_lot_qty,
+                    }
+                )
             target_bucket.append(order)
             role_report[report_name] = {
                 "status": "planned",

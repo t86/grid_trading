@@ -1867,6 +1867,60 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertFalse(guarded["reduce_only_no_loss_guard"]["enabled"])
         self.assertEqual(guarded["place_orders"][0]["role"], "best_quote_reduce_long")
 
+    def test_reduce_only_no_loss_guard_accepts_valid_ordinary_entry_lot_profit(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.2811,
+                    "qty": 23.0,
+                    "notional": 6.4653,
+                    "role": "best_quote_reduce_long",
+                    "position_side": "LONG",
+                    "force_reduce_only": True,
+                    "ordinary_entry_lot_profit": True,
+                    "ordinary_entry_lot_cost_price": 0.2810,
+                    "ordinary_entry_lot_profit_boundary": 0.2811,
+                    "ordinary_entry_lot_qty_cap": 23.0,
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+
+        guarded = apply_reduce_only_no_loss_guard_to_actions(
+            actions=actions,
+            plan_report={
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "take_profit_guard": {
+                    "enabled": True,
+                    "effective_min_profit_ratio": 0.0003,
+                    "long_floor_price": 0.2858,
+                },
+                "current_long_avg_price": 0.2857,
+            },
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            live_bid_price=0.2809,
+            live_ask_price=0.2810,
+            tick_size=0.0001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        kept = guarded["place_orders"][0]
+        self.assertEqual(
+            kept["reduce_only_no_loss_guard"],
+            "passed_ordinary_entry_lot_profit",
+        )
+        self.assertEqual(kept["reduce_only_no_loss_guard_price"], 0.2811)
+        self.assertEqual(
+            guarded["reduce_only_no_loss_guard"]["ordinary_entry_lot_profit_order_count"],
+            1,
+        )
+
     def test_reduce_only_no_loss_guard_can_bypass_only_inventory_unlock_role(self) -> None:
         actions = {
             "place_orders": [

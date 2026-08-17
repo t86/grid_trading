@@ -1109,6 +1109,67 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
     return result
 
 
+def ordinary_entry_lot_profit_guard_price(
+    order: Mapping[str, Any] | dict[str, Any],
+    *,
+    reduce_side: str,
+) -> float:
+    """Return a validated per-entry-lot profit boundary for an ordinary reduce."""
+
+    role = str((order or {}).get("role") or "").lower().strip()
+    normalized_side = str(reduce_side or "").upper().strip()
+    expected_role = (
+        "best_quote_reduce_long"
+        if normalized_side == "SELL"
+        else "best_quote_reduce_short"
+        if normalized_side == "BUY"
+        else ""
+    )
+    if role != expected_role or not _truthy(
+        (order or {}).get("ordinary_entry_lot_profit")
+    ):
+        return 0.0
+    cost_price = max(
+        _safe_float((order or {}).get("ordinary_entry_lot_cost_price")),
+        0.0,
+    )
+    boundary = max(
+        _safe_float((order or {}).get("ordinary_entry_lot_profit_boundary")),
+        0.0,
+    )
+    qty_cap = max(
+        _safe_float((order or {}).get("ordinary_entry_lot_qty_cap")),
+        0.0,
+    )
+    qty = max(
+        _safe_float(
+            (order or {}).get(
+                "qty",
+                (order or {}).get("quantity", (order or {}).get("origQty")),
+            )
+        ),
+        0.0,
+    )
+    price = max(_safe_float((order or {}).get("price")), 0.0)
+    if (
+        cost_price <= 0
+        or boundary <= 0
+        or qty_cap <= 0
+        or qty <= 0
+        or qty > qty_cap + 1e-12
+    ):
+        return 0.0
+    if normalized_side == "SELL":
+        if boundary <= cost_price + 1e-12 or price + 1e-12 < boundary:
+            return 0.0
+    elif normalized_side == "BUY":
+        if boundary + 1e-12 >= cost_price or price > boundary + 1e-12:
+            return 0.0
+    else:
+        return 0.0
+    return boundary
+
+
 def apply_reduce_only_no_loss_guard_to_actions(
     *,
     actions: dict[str, Any],
@@ -1163,6 +1224,7 @@ def apply_reduce_only_no_loss_guard_to_actions(
     allowed_loss_roles = {str(item).strip().lower() for item in (allow_loss_roles or set()) if str(item).strip()}
     kept_place_orders: list[dict[str, Any]] = []
     dropped_orders: list[dict[str, Any]] = []
+    ordinary_entry_lot_profit_order_count = 0
     for order in place_orders:
         side = str(order.get("side", "")).upper().strip()
         role = str(order.get("role", "") or "").strip().lower()
@@ -1200,13 +1262,33 @@ def apply_reduce_only_no_loss_guard_to_actions(
         )
         drop_reason = ""
         guard_price = None
+        entry_lot_guard_price = ordinary_entry_lot_profit_guard_price(
+            order,
+            reduce_side=reduce_side or side,
+        )
         if reduce_side == "BUY":
-            guard_price = short_ceiling if short_ceiling > 0 else None
-            if short_ceiling > 0 and (submitted_price <= 0 or submitted_price > short_ceiling + 1e-12):
+            effective_ceiling = (
+                entry_lot_guard_price
+                if entry_lot_guard_price > 0
+                else short_ceiling
+            )
+            guard_price = effective_ceiling if effective_ceiling > 0 else None
+            if effective_ceiling > 0 and (
+                submitted_price <= 0
+                or submitted_price > effective_ceiling + 1e-12
+            ):
                 drop_reason = "short_reduce_above_no_loss_ceiling"
         elif reduce_side == "SELL":
-            guard_price = long_floor if long_floor > 0 else None
-            if long_floor > 0 and (submitted_price <= 0 or submitted_price + 1e-12 < long_floor):
+            effective_floor = (
+                entry_lot_guard_price
+                if entry_lot_guard_price > 0
+                else long_floor
+            )
+            guard_price = effective_floor if effective_floor > 0 else None
+            if effective_floor > 0 and (
+                submitted_price <= 0
+                or submitted_price + 1e-12 < effective_floor
+            ):
                 drop_reason = "long_reduce_below_no_loss_floor"
         if drop_reason:
             if role in allowed_loss_roles:
@@ -1223,7 +1305,13 @@ def apply_reduce_only_no_loss_guard_to_actions(
                 dropped["reduce_only_no_loss_prepare_skip_reason"] = skip_reason
             dropped_orders.append(dropped)
             continue
-        order["reduce_only_no_loss_guard"] = "passed"
+        if entry_lot_guard_price > 0:
+            order["reduce_only_no_loss_guard"] = (
+                "passed_ordinary_entry_lot_profit"
+            )
+            ordinary_entry_lot_profit_order_count += 1
+        else:
+            order["reduce_only_no_loss_guard"] = "passed"
         order["reduce_only_no_loss_guard_price"] = guard_price
         order["reduce_only_no_loss_submitted_price"] = submitted_price
         kept_place_orders.append(order)
@@ -1236,6 +1324,9 @@ def apply_reduce_only_no_loss_guard_to_actions(
         "enabled": True,
         "long_floor_price": long_floor if long_floor > 0 else None,
         "short_ceiling_price": short_ceiling if short_ceiling > 0 else None,
+        "ordinary_entry_lot_profit_order_count": (
+            ordinary_entry_lot_profit_order_count
+        ),
         "dropped_order_count": len(dropped_orders),
         "dropped_orders": dropped_orders,
     }
