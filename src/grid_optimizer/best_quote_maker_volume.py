@@ -157,6 +157,33 @@ def _price_with_gap(price: float, gap: float, sign: int) -> float:
     return float(Decimal(str(price)) + Decimal(sign) * Decimal(str(gap)))
 
 
+def _four_leg_profit_price(
+    *,
+    position_side: str,
+    position_cost: float,
+    step_price: float,
+    best_bid: float,
+    best_ask: float,
+    tick_size: float | None,
+) -> float:
+    tick = max(_safe_float(tick_size), 0.0)
+    profit_gap = max(_safe_float(step_price), tick)
+    if str(position_side or "").upper() == "LONG":
+        return _round_order_price(
+            max(best_ask, position_cost + profit_gap),
+            tick_size,
+            "SELL",
+        )
+    target_price = position_cost - profit_gap
+    if target_price <= 0:
+        return 0.0
+    return _round_order_price(
+        min(best_bid, target_price),
+        tick_size,
+        "BUY",
+    )
+
+
 def _build_order(
     *,
     side: str,
@@ -1895,6 +1922,157 @@ def build_best_quote_maker_volume_plan(
                 net_loss_reduce_report["hedge_recovery_action"] = "entry_long"
                 reasons.append("net_loss_hedge_recovery")
 
+    four_leg_cycle_report: dict[str, Any] | None = None
+    if config.four_leg_cycle_enabled:
+        role_report: dict[str, dict[str, str]] = {}
+
+        def _role_present(role: str) -> bool:
+            return any(
+                order.get("role") == role
+                for order in [*buy_orders, *sell_orders]
+            )
+
+        def _record_entry_role(name: str, role: str) -> None:
+            role_report[name] = (
+                {"status": "planned", "reason": "order_present"}
+                if _role_present(role)
+                else {"status": "blocked", "reason": "missing_entry"}
+            )
+
+        def _ensure_profit_reduce(
+            *,
+            report_name: str,
+            role: str,
+            position_side: str,
+            position_notional: float,
+            position_cost: float,
+            soft_notional: float,
+            side: str,
+        ) -> None:
+            nonlocal buy_orders, sell_orders
+            if not hedge_position_sides:
+                role_report[report_name] = {
+                    "status": "not_applicable",
+                    "reason": "not_hedge_mode",
+                }
+                return
+            if position_notional <= 0:
+                role_report[report_name] = {
+                    "status": "not_applicable",
+                    "reason": "no_ordinary_position",
+                }
+                return
+            if hard_loss or net_loss_reduce_report["active"]:
+                role_report[report_name] = {
+                    "status": "blocked",
+                    "reason": "loss_control_active",
+                }
+                return
+            if soft_notional > 0 and position_notional >= soft_notional - 1e-12:
+                role_report[report_name] = {
+                    "status": "blocked",
+                    "reason": "soft_threshold_active_pair",
+                }
+                return
+            if position_cost <= 0:
+                role_report[report_name] = {
+                    "status": "blocked",
+                    "reason": "missing_position_cost",
+                }
+                return
+
+            price = _four_leg_profit_price(
+                position_side=position_side,
+                position_cost=position_cost,
+                step_price=_safe_float(inputs.entry_ladder_spacing),
+                best_bid=bid,
+                best_ask=ask,
+                tick_size=inputs.tick_size,
+            )
+            if price <= 0:
+                role_report[report_name] = {
+                    "status": "blocked",
+                    "reason": "invalid_profit_price",
+                }
+                return
+
+            target_bucket = sell_orders if side == "SELL" else buy_orders
+            existing = [order for order in target_bucket if order.get("role") == role]
+            profit_boundary = position_cost + max(
+                _safe_float(inputs.entry_ladder_spacing),
+                _safe_float(inputs.tick_size),
+            ) if position_side == "LONG" else position_cost - max(
+                _safe_float(inputs.entry_ladder_spacing),
+                _safe_float(inputs.tick_size),
+            )
+            existing_is_profitable = any(
+                _safe_float(order.get("price")) >= profit_boundary - 1e-12
+                if position_side == "LONG"
+                else _safe_float(order.get("price")) <= profit_boundary + 1e-12
+                for order in existing
+            )
+            if existing_is_profitable:
+                role_report[report_name] = {
+                    "status": "planned",
+                    "reason": "existing_profit_order",
+                }
+                return
+
+            if existing:
+                target_bucket[:] = [
+                    order for order in target_bucket if order.get("role") != role
+                ]
+            reduce_notional = min(cycle_budget * 0.5, position_notional)
+            order = _build_order(
+                side=side,
+                price=price,
+                notional=reduce_notional,
+                role=role,
+                inputs=inputs,
+                position_side=position_side,
+                force_reduce_only=True,
+            )
+            if order is None:
+                role_report[report_name] = {
+                    "status": "blocked",
+                    "reason": "reduce_below_exchange_minimum",
+                }
+                return
+            target_bucket.append(order)
+            role_report[report_name] = {
+                "status": "planned",
+                "reason": "cost_based_profit_order",
+            }
+
+        _ensure_profit_reduce(
+            report_name="long_profit_reduce",
+            role="best_quote_reduce_long",
+            position_side="LONG",
+            position_notional=long_notional,
+            position_cost=_safe_float(inputs.current_long_avg_price),
+            soft_notional=long_soft,
+            side="SELL",
+        )
+        _ensure_profit_reduce(
+            report_name="short_profit_reduce",
+            role="best_quote_reduce_short",
+            position_side="SHORT",
+            position_notional=short_notional,
+            position_cost=_safe_float(inputs.current_short_avg_price),
+            soft_notional=short_soft,
+            side="BUY",
+        )
+        _record_entry_role("long_entry", "best_quote_entry_long")
+        _record_entry_role("short_entry", "best_quote_entry_short")
+        four_leg_cycle_report = {
+            "enabled": True,
+            "roles": role_report,
+            "complete": all(
+                item["status"] in {"planned", "not_applicable"}
+                for item in role_report.values()
+            ),
+        }
+
     same_side_entry_price_guard_report = {
         "enabled": bool(config.same_side_entry_price_guard_enabled),
         "applied": False,
@@ -1981,6 +2159,38 @@ def build_best_quote_maker_volume_plan(
                 same_side_entry_price_guard_report["cluster_pruned_sell_orders"] = pruned_sell_orders
 
     planned = sum(order["notional"] for order in [*buy_orders, *sell_orders])
+    metrics = {
+        "loss_per_10k_15m": loss_per_10k,
+        "long_notional": long_notional,
+        "short_notional": short_notional,
+        "open_entry_long_notional": open_entry_long_notional,
+        "open_entry_short_notional": open_entry_short_notional,
+        "pending_entry_buffer_notional": pending_entry_buffer_notional,
+        "projected_long_entry_notional": projected_long_entry_notional,
+        "projected_short_entry_notional": projected_short_entry_notional,
+        "cycle_budget_notional": cycle_budget,
+        "base_cycle_budget_notional": base_cycle_budget,
+        "soft_recovery_min_reduce_notional": soft_recovery_min_reduce_notional,
+        "long_inventory_ratio": long_inventory_ratio,
+        "short_inventory_ratio": short_inventory_ratio,
+        "inventory_ratio": inventory_ratio,
+        "buy_side_notional": buy_side_notional,
+        "sell_side_notional": sell_side_notional,
+        "effective_ladder_spacing": _safe_float(inputs.entry_ladder_spacing),
+        "dynamic_control": dynamic_control_report,
+        "trend_entry_guard": trend_entry_guard_report,
+        "trend_inventory_guard": trend_inventory_guard_report,
+        "trend_loss_reduce_guard": trend_loss_reduce_guard_report,
+        "frozen_v2": frozen_v2_report,
+        "net_loss_reduce": net_loss_reduce_report,
+        "loss_blocked_reduce_fallback": loss_blocked_reduce_fallback_report,
+        "balanced_cost_recovery": balanced_cost_recovery_report,
+        "same_side_entry_price_guard": same_side_entry_price_guard_report,
+        "dynamic_tick": dynamic_tick_report,
+        "inventory_bias": inventory_bias_report,
+    }
+    if four_leg_cycle_report is not None:
+        metrics["four_leg_cycle"] = four_leg_cycle_report
     return {
         "enabled": True,
         "regime": regime,
@@ -1992,34 +2202,5 @@ def build_best_quote_maker_volume_plan(
         "bootstrap_qty": 0.0,
         "planned_notional": planned,
         "reasons": reasons,
-        "metrics": {
-            "loss_per_10k_15m": loss_per_10k,
-            "long_notional": long_notional,
-            "short_notional": short_notional,
-            "open_entry_long_notional": open_entry_long_notional,
-            "open_entry_short_notional": open_entry_short_notional,
-            "pending_entry_buffer_notional": pending_entry_buffer_notional,
-            "projected_long_entry_notional": projected_long_entry_notional,
-            "projected_short_entry_notional": projected_short_entry_notional,
-            "cycle_budget_notional": cycle_budget,
-            "base_cycle_budget_notional": base_cycle_budget,
-            "soft_recovery_min_reduce_notional": soft_recovery_min_reduce_notional,
-            "long_inventory_ratio": long_inventory_ratio,
-            "short_inventory_ratio": short_inventory_ratio,
-            "inventory_ratio": inventory_ratio,
-            "buy_side_notional": buy_side_notional,
-            "sell_side_notional": sell_side_notional,
-            "effective_ladder_spacing": _safe_float(inputs.entry_ladder_spacing),
-            "dynamic_control": dynamic_control_report,
-            "trend_entry_guard": trend_entry_guard_report,
-            "trend_inventory_guard": trend_inventory_guard_report,
-            "trend_loss_reduce_guard": trend_loss_reduce_guard_report,
-            "frozen_v2": frozen_v2_report,
-            "net_loss_reduce": net_loss_reduce_report,
-            "loss_blocked_reduce_fallback": loss_blocked_reduce_fallback_report,
-            "balanced_cost_recovery": balanced_cost_recovery_report,
-            "same_side_entry_price_guard": same_side_entry_price_guard_report,
-            "dynamic_tick": dynamic_tick_report,
-            "inventory_bias": inventory_bias_report,
-        },
+        "metrics": metrics,
     }

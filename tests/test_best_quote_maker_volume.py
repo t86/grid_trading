@@ -46,6 +46,89 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
 
         self.assertEqual(explicit_off_plan, default_plan)
 
+    def test_four_leg_cycle_adds_cost_based_profit_reduces_below_soft_limit(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                four_leg_cycle_enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.90,
+            ),
+            inputs=_inputs(
+                bid_price=100.0,
+                ask_price=100.1,
+                mid_price=100.05,
+                cycle_budget_notional=200.0,
+                entry_ladder_spacing=0.5,
+                tick_size=0.1,
+                step_size=0.001,
+                position_side_mode="hedge",
+                current_long_qty=3.0,
+                current_short_qty=3.0,
+                current_long_avg_price=101.0,
+                current_short_avg_price=99.0,
+            ),
+        )
+
+        orders = [*plan["buy_orders"], *plan["sell_orders"]]
+        roles = {order["role"] for order in orders}
+        self.assertTrue(
+            {
+                "best_quote_entry_long",
+                "best_quote_reduce_long",
+                "best_quote_entry_short",
+                "best_quote_reduce_short",
+            }.issubset(roles)
+        )
+        long_reduce = next(
+            order for order in orders if order["role"] == "best_quote_reduce_long"
+        )
+        short_reduce = next(
+            order for order in orders if order["role"] == "best_quote_reduce_short"
+        )
+        self.assertTrue(long_reduce["force_reduce_only"])
+        self.assertEqual(long_reduce["side"], "SELL")
+        self.assertEqual(long_reduce["position_side"], "LONG")
+        self.assertGreaterEqual(long_reduce["price"], 101.5)
+        self.assertTrue(short_reduce["force_reduce_only"])
+        self.assertEqual(short_reduce["side"], "BUY")
+        self.assertEqual(short_reduce["position_side"], "SHORT")
+        self.assertLessEqual(short_reduce["price"], 98.5)
+        self.assertTrue(plan["metrics"]["four_leg_cycle"]["complete"])
+
+    def test_four_leg_cycle_reports_missing_ordinary_cost(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                four_leg_cycle_enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.90,
+            ),
+            inputs=_inputs(
+                bid_price=100.0,
+                ask_price=100.1,
+                mid_price=100.05,
+                cycle_budget_notional=200.0,
+                entry_ladder_spacing=0.5,
+                tick_size=0.1,
+                step_size=0.001,
+                position_side_mode="hedge",
+                current_long_qty=3.0,
+                current_short_qty=3.0,
+                current_long_avg_price=0.0,
+                current_short_avg_price=99.0,
+            ),
+        )
+
+        report = plan["metrics"]["four_leg_cycle"]
+        self.assertEqual(
+            report["roles"]["long_profit_reduce"],
+            {"status": "blocked", "reason": "missing_position_cost"},
+        )
+        self.assertFalse(report["complete"])
+
     def test_flat_inventory_quotes_both_sides_near_best_quote(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(enabled=True),
