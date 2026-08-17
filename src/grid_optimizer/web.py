@@ -492,6 +492,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "synthetic_flow_sleeve_enabled": False,
             "exposure_escalation_enabled": False,
             "best_quote_maker_volume_enabled": True,
+            "best_quote_maker_volume_four_leg_cycle_enabled": False,
             "best_quote_maker_volume_take_profit_guard_enabled": True,
             "best_quote_maker_volume_cycle_budget_notional": 88.0,
             "best_quote_maker_volume_target_remaining_notional": 20_000.0,
@@ -676,6 +677,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "per_order_notional": 120.0,
             "base_position_notional": 0.0,
             "best_quote_maker_volume_enabled": True,
+            "best_quote_maker_volume_four_leg_cycle_enabled": False,
             "best_quote_maker_volume_take_profit_guard_enabled": True,
             "best_quote_maker_volume_cycle_budget_notional": 400.0,
             "best_quote_maker_volume_target_remaining_notional": 1_000_000.0,
@@ -782,6 +784,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "per_order_notional": 10.0,
             "base_position_notional": 0.0,
             "best_quote_maker_volume_enabled": True,
+            "best_quote_maker_volume_four_leg_cycle_enabled": False,
             "best_quote_maker_volume_take_profit_guard_enabled": True,
             "best_quote_maker_volume_cycle_budget_notional": 24.0,
             "best_quote_maker_volume_target_remaining_notional": 200_000.0,
@@ -4343,6 +4346,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "maker_directional_move_threshold": 0.004,
     "maker_cooldown_seconds": 30.0,
     "best_quote_maker_volume_take_profit_guard_enabled": True,
+    "best_quote_maker_volume_four_leg_cycle_enabled": False,
     "best_quote_maker_volume_max_order_notional": 0.0,
     "best_quote_maker_volume_below_soft_cost_gap_scale": 1.0,
     "best_quote_maker_volume_below_soft_adverse_threshold_scale": 1.0,
@@ -10579,6 +10583,7 @@ def _normalize_runner_control_payload(
         "adaptive_regime_router_enabled",
         "adaptive_regime_router_cancel_stale_entries_on_no_trade",
         "best_quote_maker_volume_enabled",
+        "best_quote_maker_volume_four_leg_cycle_enabled",
         "best_quote_maker_volume_take_profit_guard_enabled",
         "best_quote_maker_volume_inventory_cost_gate_enabled",
         "best_quote_maker_volume_net_loss_reduce_enabled",
@@ -11910,6 +11915,9 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         "--best-quote-maker-volume-enabled"
         if config.get("best_quote_maker_volume_enabled", False)
         else "--no-best-quote-maker-volume-enabled",
+        "--best-quote-maker-volume-four-leg-cycle-enabled"
+        if config.get("best_quote_maker_volume_four_leg_cycle_enabled", False)
+        else "--no-best-quote-maker-volume-four-leg-cycle-enabled",
         "--best-quote-maker-volume-cycle-budget-notional",
         str(config.get("best_quote_maker_volume_cycle_budget_notional", 400.0)),
         "--best-quote-maker-volume-target-remaining-notional",

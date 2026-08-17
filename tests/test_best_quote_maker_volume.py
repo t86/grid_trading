@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import unittest
 
 from grid_optimizer.best_quote_maker_volume import (
@@ -29,6 +30,22 @@ def _inputs(**overrides):
 
 
 class BestQuoteMakerVolumeTests(unittest.TestCase):
+    def test_four_leg_cycle_disabled_is_exactly_backward_compatible(self) -> None:
+        default_config = BestQuoteMakerVolumeConfig(enabled=True)
+        explicit_off_config = replace(default_config, four_leg_cycle_enabled=False)
+        inputs = _inputs()
+
+        default_plan = build_best_quote_maker_volume_plan(
+            config=default_config,
+            inputs=inputs,
+        )
+        explicit_off_plan = build_best_quote_maker_volume_plan(
+            config=explicit_off_config,
+            inputs=inputs,
+        )
+
+        self.assertEqual(explicit_off_plan, default_plan)
+
     def test_flat_inventory_quotes_both_sides_near_best_quote(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(enabled=True),

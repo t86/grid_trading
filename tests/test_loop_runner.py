@@ -14537,6 +14537,7 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(args.threshold_position_notional, 0.0)
         self.assertIsNone(args.take_profit_min_profit_ratio)
+        self.assertFalse(args.best_quote_maker_volume_four_leg_cycle_enabled)
 
     def test_build_parser_accepts_near_market_and_fast_catchup_args(self) -> None:
         parser = _build_parser()

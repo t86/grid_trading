@@ -10,6 +10,7 @@ from .dry_run import _round_order_price, _round_order_qty
 @dataclass(frozen=True)
 class BestQuoteMakerVolumeConfig:
     enabled: bool = False
+    four_leg_cycle_enabled: bool = False
     quote_offset_ticks: int = 0
     defensive_offset_ticks: int = 3
     max_entry_orders_per_side: int = 1

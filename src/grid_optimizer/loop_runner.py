@@ -31657,6 +31657,13 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
                 enabled=bool(getattr(effective_args, "best_quote_maker_volume_enabled", False)),
+                four_leg_cycle_enabled=bool(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_four_leg_cycle_enabled",
+                        False,
+                    )
+                ),
                 quote_offset_ticks=int(best_quote_dynamic_offsets["quote_offset_ticks"]),
                 defensive_offset_ticks=int(best_quote_dynamic_offsets["defensive_offset_ticks"]),
                 max_entry_orders_per_side=max(
@@ -36481,6 +36488,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--maker-directional-move-threshold", type=float, default=0.004)
     parser.add_argument("--maker-cooldown-seconds", type=float, default=30.0)
     parser.add_argument("--best-quote-maker-volume-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--best-quote-maker-volume-four-leg-cycle-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--best-quote-maker-volume-cycle-budget-notional", type=float, default=400.0)
     parser.add_argument("--best-quote-maker-volume-target-remaining-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-quote-offset-ticks", type=int, default=0)
