@@ -24066,6 +24066,28 @@ def apply_grvt_ordinary_inventory_pressure_guard(
     return report
 
 
+def _authenticated_paired_threshold_reduce_roles(
+    active_pair_report: Mapping[str, Any] | None,
+) -> set[str]:
+    if not isinstance(active_pair_report, Mapping):
+        return set()
+    if not (
+        bool(active_pair_report.get("active"))
+        and int(_safe_float(active_pair_report.get("order_count"))) >= 2
+        and bool(active_pair_report.get("pair_all_sides_on_threshold"))
+        and {
+            str(side).strip().lower()
+            for side in (active_pair_report.get("eligible_sides") or [])
+        }
+        == {"long", "short"}
+    ):
+        return set()
+    return {
+        "best_quote_active_pair_reduce_long",
+        "best_quote_active_pair_reduce_short",
+    }
+
+
 def _apply_grvt_submit_ordinary_inventory_pressure_guard(
     *,
     actions: dict[str, Any],
@@ -24090,23 +24112,8 @@ def _apply_grvt_submit_ordinary_inventory_pressure_guard(
     if not isinstance(pressure_guard, Mapping):
         return actions
     active_pair_report = plan_report.get("best_quote_active_pair_reduce")
-    paired_threshold_roles = (
-        {
-            "best_quote_active_pair_reduce_long",
-            "best_quote_active_pair_reduce_short",
-        }
-        if (
-            isinstance(active_pair_report, Mapping)
-            and bool(active_pair_report.get("active"))
-            and int(_safe_float(active_pair_report.get("order_count"))) >= 2
-            and bool(active_pair_report.get("pair_all_sides_on_threshold"))
-            and {
-                str(side).strip().lower()
-                for side in (active_pair_report.get("eligible_sides") or [])
-            }
-            == {"long", "short"}
-        )
-        else set()
+    paired_threshold_roles = _authenticated_paired_threshold_reduce_roles(
+        active_pair_report if isinstance(active_pair_report, Mapping) else None
     )
     live_mid_price = (
         (max(_safe_float(live_bid_price), 0.0) + max(_safe_float(live_ask_price), 0.0)) / 2.0
@@ -34204,6 +34211,11 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 max_reduce_notional=100.0,
                 step_size=symbol_info.get("step_size"),
+                additional_eligible_reduce_roles=(
+                    _authenticated_paired_threshold_reduce_roles(
+                        best_quote_active_pair_reduce
+                    )
+                ),
             )
             best_quote_maker_volume["ordinary_inventory_pressure_guard"] = dict(
                 grvt_inventory_pressure_guard

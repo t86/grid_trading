@@ -13034,6 +13034,62 @@ class LoopRunnerTests(unittest.TestCase):
             1,
         )
 
+    def test_grvt_plan_pressure_guard_preserves_authenticated_paired_reduce(self) -> None:
+        plan = {
+            "buy_orders": [
+                {
+                    "side": "BUY",
+                    "position_side": "SHORT",
+                    "role": "best_quote_active_pair_reduce_short",
+                    "qty": 351.0,
+                    "price": 0.2844,
+                    "notional": 99.8244,
+                    "force_reduce_only": True,
+                }
+            ],
+            "sell_orders": [
+                {
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "role": "best_quote_active_pair_reduce_long",
+                    "qty": 351.0,
+                    "price": 0.2845,
+                    "notional": 99.8595,
+                    "force_reduce_only": True,
+                }
+            ],
+        }
+        active_pair_report = {
+            "active": True,
+            "order_count": 2,
+            "eligible_sides": ["long", "short"],
+            "pair_all_sides_on_threshold": True,
+        }
+
+        report = apply_grvt_ordinary_inventory_pressure_guard(
+            plan=plan,
+            current_long_notional=886.0,
+            current_short_notional=902.0,
+            long_pressure_notional=900.0,
+            short_pressure_notional=900.0,
+            max_reduce_notional=100.0,
+            step_size=1.0,
+            additional_eligible_reduce_roles=(
+                loop_runner_module._authenticated_paired_threshold_reduce_roles(
+                    active_pair_report
+                )
+            ),
+        )
+
+        self.assertEqual(
+            {item["role"] for item in [*plan["buy_orders"], *plan["sell_orders"]]},
+            {
+                "best_quote_active_pair_reduce_long",
+                "best_quote_active_pair_reduce_short",
+            },
+        )
+        self.assertEqual(report["preserved_paired_threshold_reduce_order_count"], 1)
+
     def test_grvt_small_net_breach_uses_bounded_pressure_reduce_instead_of_terminal_drain(self) -> None:
         plan = {
             "effective_strategy_profile": "grvt_daily_80k_bq_short_freeze_5pct_v1",
