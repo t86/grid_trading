@@ -91,7 +91,11 @@ def summarize_runtime_total_pnl(
 ) -> float | None:
     """Return run-window realized/funding/fees plus current ordinary uPnL."""
 
-    if unrealized_pnl is None:
+    try:
+        safe_unrealized_pnl = float(unrealized_pnl) if unrealized_pnl is not None else None
+    except (TypeError, ValueError):
+        return None
+    if safe_unrealized_pnl is None or not math.isfinite(safe_unrealized_pnl):
         return None
 
     current = now.astimezone(timezone.utc)
@@ -102,8 +106,19 @@ def summarize_runtime_total_pnl(
             continue
         if start_time is not None and event_ts < start_time:
             continue
-        realized += _event_net_pnl(event)
-    return realized + float(unrealized_pnl)
+        if event.get("pnl_observation_available") is False:
+            return None
+        try:
+            event_pnl = _event_net_pnl(event)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(event_pnl):
+            return None
+        realized += event_pnl
+        if not math.isfinite(realized):
+            return None
+    total = realized + safe_unrealized_pnl
+    return total if math.isfinite(total) else None
 
 
 def _trade_order_identity(row: dict[str, Any]) -> str:
@@ -243,6 +258,11 @@ def summarize_futures_runtime_guard_inputs(
     cumulative_gross_notional = 0.0
     pnl_events: list[dict[str, Any]] = []
     stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
+    normalized_symbol = str(symbol or "").upper().strip()
+    quote_asset = next(
+        (asset for asset in stable_assets if normalized_symbol.endswith(asset)),
+        "",
+    )
     seen_order_notional_keys: set[str] = set()
     normalized_bq_book_scope = str(bq_book_scope or "").lower().strip()
     bq_order_books: dict[str, str] = {}
@@ -307,6 +327,13 @@ def summarize_futures_runtime_guard_inputs(
         except (TypeError, ValueError):
             return 0.0
 
+    def _finite_float(value: Any) -> float | None:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) else None
+
     for row in trade_rows:
         trade_time_ms = trade_row_time_ms(row)
         trade_ts: datetime | None = None
@@ -335,14 +362,22 @@ def summarize_futures_runtime_guard_inputs(
             continue
         if _is_frozen_pair_release_trade(row):
             continue
-        realized_pnl = _as_float(row.get("realizedPnl"))
-        commission = _as_float(row.get("commission"))
+        observed_realized_pnl = _finite_float(row.get("realizedPnl"))
+        observed_commission = _finite_float(row.get("commission"))
+        realized_pnl = observed_realized_pnl or 0.0
+        commission = observed_commission or 0.0
         commission_asset = str(row.get("commissionAsset", "")).upper().strip()
-        net_pnl = realized_pnl - (commission if commission_asset in stable_assets else 0.0)
+        pnl_observation_available = bool(
+            observed_realized_pnl is not None
+            and observed_commission is not None
+            and (commission == 0.0 or commission_asset == quote_asset)
+        )
+        net_pnl = realized_pnl - (commission if commission_asset == quote_asset else 0.0)
         pnl_events.append(
             {
                 "ts": trade_ts.isoformat(),
                 "net_pnl": net_pnl,
+                "pnl_observation_available": pnl_observation_available,
                 "gross_notional": notional,
                 "client_order_id": str(
                     row.get("clientOrderId")
@@ -365,10 +400,13 @@ def summarize_futures_runtime_guard_inputs(
             continue
         if metrics_end_time is not None and income_ts >= metrics_end_time:
             continue
+        observed_income = _finite_float(row.get("income"))
         pnl_events.append(
             {
                 "ts": income_ts.isoformat(),
-                "net_pnl": _as_float(row.get("income")),
+                "net_pnl": observed_income or 0.0,
+                "pnl_event_type": "income",
+                "pnl_observation_available": observed_income is not None,
                 "gross_notional": 0.0,
             }
         )

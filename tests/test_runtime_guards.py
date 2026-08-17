@@ -381,6 +381,111 @@ class RuntimeGuardsTests(unittest.TestCase):
         self.assertFalse(result.stop_triggered)
         self.assertFalse(result.target_profit_satisfied)
 
+    def test_target_total_pnl_fails_closed_when_event_observation_is_unavailable(self) -> None:
+        now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
+
+        total = summarize_runtime_total_pnl(
+            [
+                {
+                    "ts": now.isoformat(),
+                    "net_pnl": 1.0,
+                    "pnl_observation_available": False,
+                }
+            ],
+            start_time=None,
+            now=now,
+            unrealized_pnl=0.0,
+        )
+
+        self.assertIsNone(total)
+
+    def test_target_total_pnl_fails_closed_when_unrealized_pnl_is_invalid(self) -> None:
+        now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
+
+        for unrealized_pnl in (float("nan"), float("inf"), "invalid"):
+            with self.subTest(unrealized_pnl=unrealized_pnl):
+                total = summarize_runtime_total_pnl(
+                    [],
+                    start_time=None,
+                    now=now,
+                    unrealized_pnl=unrealized_pnl,  # type: ignore[arg-type]
+                )
+
+                self.assertIsNone(total)
+
+    def test_target_total_pnl_fails_closed_when_event_pnl_is_non_finite(self) -> None:
+        now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
+
+        total = summarize_runtime_total_pnl(
+            [{"ts": now.isoformat(), "net_pnl": float("nan")}],
+            start_time=None,
+            now=now,
+            unrealized_pnl=0.0,
+        )
+
+        self.assertIsNone(total)
+
+    def test_target_total_pnl_fails_closed_when_finite_values_overflow(self) -> None:
+        now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
+        cases = (
+            ([1e308, 1e308], 0.0),
+            ([1e308], 1e308),
+        )
+
+        for event_pnls, unrealized_pnl in cases:
+            with self.subTest(
+                event_pnls=event_pnls,
+                unrealized_pnl=unrealized_pnl,
+            ):
+                total = summarize_runtime_total_pnl(
+                    [
+                        {"ts": now.isoformat(), "net_pnl": event_pnl}
+                        for event_pnl in event_pnls
+                    ],
+                    start_time=None,
+                    now=now,
+                    unrealized_pnl=unrealized_pnl,
+                )
+
+                self.assertIsNone(total)
+
+    def test_non_quote_commission_makes_target_total_pnl_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            now = datetime(2026, 5, 23, 23, 30, tzinfo=timezone.utc)
+            summary_path = Path(tmp) / "arxusdt_events.jsonl"
+            trade_path = Path(tmp) / "arxusdt_trade_audit.jsonl"
+            trade_path.write_text(
+                json.dumps(
+                    {
+                        "time": int(now.timestamp() * 1000),
+                        "orderId": 1,
+                        "price": "1",
+                        "qty": "100",
+                        "realizedPnl": "2",
+                        "commission": "0.01",
+                        "commissionAsset": "BNB",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            _, pnl_events, _ = summarize_futures_runtime_guard_inputs(
+                summary_path,
+                runtime_guard_stats_start_time="2026-05-23T00:00:00+00:00",
+                symbol="ARXUSDT",
+                now=now,
+            )
+            total = summarize_runtime_total_pnl(
+                pnl_events,
+                start_time=None,
+                now=now,
+                unrealized_pnl=0.0,
+            )
+
+        self.assertFalse(pnl_events[0]["pnl_observation_available"])
+        self.assertIsNone(total)
+
     def test_target_profit_floor_stops_after_volume_and_profit_targets(self) -> None:
         now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
         cfg = normalize_runtime_guard_config(

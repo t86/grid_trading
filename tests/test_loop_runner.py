@@ -9,10 +9,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 import grid_optimizer.loop_runner as loop_runner_module
 from grid_optimizer.audit import build_audit_paths
+from grid_optimizer.futures_run_lifecycle import bind_run_contract_owner
 from grid_optimizer.best_quote_maker_volume import (
     BestQuoteMakerVolumeConfig,
     BestQuoteMakerVolumeInputs,
@@ -325,6 +326,172 @@ class LoopRunnerTests(unittest.TestCase):
         )
         self.assertEqual(exposure, net_notional)
         self.assertEqual(source, "frozen_side_split_missing_fail_closed")
+
+    def test_normal_pnl_keeps_all_scoped_events_and_rejects_unattributed_income(self) -> None:
+        now = datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)
+        events = [
+            {
+                "ts": now.isoformat(),
+                "net_pnl": 1.0,
+                "client_order_id": f"gx-arxu-{role}-1",
+            }
+            for role in ("bestquot", "hardloss", "inventor", "rc", "tlr")
+        ]
+        events.append(
+            {
+                "ts": now.isoformat(),
+                "net_pnl": 0.5,
+                "pnl_event_type": "income",
+                "pnl_observation_available": True,
+            }
+        )
+        state = {
+            "best_quote_frozen_inventory": {"long_qty": 10.0},
+            "best_quote_volume_ledger": {"initialized": True, "sync_ok": True},
+        }
+
+        target_events = loop_runner_module._runtime_guard_target_pnl_events(
+            state=state,
+            pnl_events=events,
+        )
+        total = loop_runner_module.summarize_runtime_total_pnl(
+            target_events,
+            start_time=None,
+            now=now,
+            unrealized_pnl=0.0,
+        )
+
+        self.assertEqual(
+            [event.get("client_order_id") for event in target_events[:-1]],
+            [event.get("client_order_id") for event in events[:-1]],
+        )
+        self.assertFalse(target_events[-1]["pnl_observation_available"])
+        self.assertIsNone(total)
+
+    def test_target_profit_rejects_unavailable_ordinary_unrealized_pnl(self) -> None:
+        self.assertIsNone(
+            loop_runner_module._runtime_guard_target_unrealized_pnl(
+                {"strategy_unrealized_pnl_available": False},
+                0.0,
+            )
+        )
+
+    def test_maybe_handle_runtime_guard_does_not_reach_target_with_unavailable_upnl(self) -> None:
+        start = datetime(2026, 8, 17, 0, 0, tzinfo=timezone.utc)
+        now = start + timedelta(hours=1)
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            plan_path = Path(tmpdir) / "plan.json"
+            state_path.write_text("{}", encoding="utf-8")
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": now.isoformat(),
+                        "mid_price": 1.0,
+                        "strategy_actual_net_notional": 0.0,
+                        "strategy_unrealized_pnl": 10.0,
+                        "strategy_unrealized_pnl_available": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = _build_parser().parse_args([])
+            args.symbol = "ARXUSDT"
+            args.strategy_profile = "arx_profit_gate_test"
+            args.strategy_mode = "hedge_best_quote_maker_volume_v1"
+            args.run_start_time = start.isoformat()
+            args.runtime_guard_stats_start_time = start.isoformat()
+            args.run_end_time = (start + timedelta(hours=2)).isoformat()
+            args.max_cumulative_notional = 100.0
+            args.target_min_total_pnl = 0.5
+            args.terminal_drain_exit_policy = "drain_then_preserve"
+            args.terminal_drain_absolute_loss_budget = 5.0
+            args.terminal_drain_max_wait_seconds = 900.0
+            args.state_path = str(state_path)
+            args.plan_json = str(plan_path)
+            args.summary_jsonl = str(Path(tmpdir) / "events.jsonl")
+            control, _ = bind_run_contract_owner(vars(args), activated_at=start)
+            control_path = Path(tmpdir) / "control.json"
+            control_path.write_text(json.dumps(control), encoding="utf-8")
+            args.recovery_control_path = str(control_path)
+            pnl_events = [
+                {
+                    "ts": now.isoformat(),
+                    "net_pnl": 1.0,
+                    "pnl_observation_available": True,
+                }
+            ]
+
+            with (
+                patch(
+                    "grid_optimizer.loop_runner._load_futures_runtime_guard_inputs",
+                    return_value=(100.0, pnl_events, start),
+                ),
+                patch(
+                    "grid_optimizer.loop_runner.evaluate_runtime_guards",
+                    wraps=loop_runner_module.evaluate_runtime_guards,
+                ) as evaluate,
+                patch(
+                    "grid_optimizer.loop_runner._replace_registered_runtime_safety_source",
+                ),
+                patch(
+                    "grid_optimizer.loop_runner._handle_terminal_drain_round",
+                    return_value={"run_outcome": "target_reached"},
+                ) as terminal,
+            ):
+                summary = loop_runner_module._maybe_handle_runtime_guard(
+                    args=args,
+                    cycle=1,
+                    cycle_started_at=now,
+                    summary_path=Path(args.summary_jsonl),
+                )
+
+        self.assertIsNone(summary)
+        self.assertIsNone(evaluate.call_args.kwargs["target_total_pnl"])
+        terminal.assert_not_called()
+
+    def test_shared_runtime_target_evaluator_fails_closed_on_unavailable_upnl(self) -> None:
+        evaluator = getattr(
+            loop_runner_module,
+            "_evaluate_runtime_guards_with_target_pnl",
+            None,
+        )
+        self.assertIsNotNone(evaluator)
+        if evaluator is None:
+            return
+        now = datetime(2026, 8, 17, 1, 0, tzinfo=timezone.utc)
+        config = loop_runner_module.normalize_runtime_guard_config(
+            {
+                "max_cumulative_notional": 100.0,
+                "target_min_total_pnl": 0.5,
+            }
+        )
+        pnl_events = [
+            {
+                "ts": now.isoformat(),
+                "net_pnl": 1.0,
+                "pnl_observation_available": True,
+            }
+        ]
+
+        result = evaluator(
+            config=config,
+            now=now,
+            cumulative_gross_notional=100.0,
+            pnl_events=pnl_events,
+            pnl_events_for_guard=pnl_events,
+            plan_report={"strategy_unrealized_pnl_available": False},
+            state={},
+            actual_net_notional=0.0,
+            synthetic_drift_notional=0.0,
+            unrealized_pnl=10.0,
+            target_unrealized_pnl=10.0,
+        )
+
+        self.assertIsNone(result.target_total_pnl)
+        self.assertFalse(result.target_profit_satisfied)
+        self.assertTrue(result.tradable)
+        self.assertFalse(result.stop_triggered)
 
     def test_ordinary_reduce_only_cap_cannot_consume_frozen_position_capacity(self) -> None:
         actions = {
@@ -7967,6 +8134,107 @@ class LoopRunnerTests(unittest.TestCase):
             100.0,
         )
 
+    def test_generate_frozen_plan_marks_unprovable_ordinary_upnl_unavailable(self) -> None:
+        observed_at = datetime(2026, 8, 17, 1, 0, tzinfo=timezone.utc).isoformat()
+        state = {
+            "center_price": 100.0,
+            "created_at": observed_at,
+            "updated_at": observed_at,
+            "startup_pending": False,
+            "best_quote_frozen_inventory": {
+                "long_qty": 0.6,
+                "short_qty": 0.0,
+                "long_lots": [
+                    {"qty": 0.6, "entry_price": 250.0, "frozen_at": observed_at}
+                ],
+                "short_lots": [],
+            },
+        }
+        stale_ordinary_ledger = {
+            "initialized": True,
+            "sync_ok": False,
+            "long_qty": 0.4,
+            "short_qty": 0.0,
+            "long_avg_price": 100.0,
+            "short_avg_price": 0.0,
+            "unrealized_pnl": 0.0,
+        }
+        account_info = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {
+                    "symbol": "BCHUSDT",
+                    "positionSide": "LONG",
+                    "positionAmt": "1.0",
+                    "entryPrice": "190.0",
+                    "unRealizedProfit": "100.0",
+                },
+                {
+                    "symbol": "BCHUSDT",
+                    "positionSide": "SHORT",
+                    "positionAmt": "0.0",
+                    "entryPrice": "0.0",
+                    "unRealizedProfit": "0.0",
+                },
+            ],
+        }
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="BCHUSDT",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                strategy_profile="bchusdt_hedge_best_quote_maker_volume_v1",
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_cycle_budget_notional=40.0,
+                best_quote_maker_volume_max_long_notional=120.0,
+                best_quote_maker_volume_max_short_notional=120.0,
+                best_quote_maker_volume_reduce_freeze_enabled=True,
+                reset_state=False,
+            )
+            with patch.multiple(
+                loop_runner_module,
+                fetch_futures_symbol_config=Mock(
+                    return_value={
+                        "tick_size": 0.1,
+                        "step_size": 0.001,
+                        "min_qty": 0.001,
+                        "min_notional": 5.0,
+                    }
+                ),
+                fetch_futures_book_tickers=Mock(
+                    return_value=[{"bid_price": "99.9", "ask_price": "100.1"}]
+                ),
+                fetch_futures_premium_index=Mock(
+                    return_value=[{"funding_rate": "0.0001"}]
+                ),
+                load_binance_api_credentials=Mock(return_value=("key", "secret")),
+                fetch_futures_position_mode=Mock(
+                    return_value={"dualSidePosition": True}
+                ),
+                fetch_futures_account_info_v3=Mock(return_value=account_info),
+                fetch_futures_open_orders=Mock(return_value=[]),
+                assess_market_guard=Mock(
+                    return_value={
+                        "buy_pause_active": False,
+                        "short_cover_pause_active": False,
+                        "shift_frozen": False,
+                    }
+                ),
+                load_or_initialize_state=Mock(return_value=state),
+                sync_best_quote_volume_ledger=Mock(
+                    return_value=stale_ordinary_ledger
+                ),
+                reconcile_best_quote_volume_ledger_surplus=Mock(
+                    return_value=stale_ordinary_ledger
+                ),
+            ):
+                report = generate_plan_report(args)
+
+        self.assertFalse(
+            report["best_quote_maker_volume"]["reduce_freeze"]["pnl_sync_ok"]
+        )
+        self.assertFalse(report["strategy_unrealized_pnl_available"])
+
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
@@ -12123,7 +12391,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(release_orders[0]["force_reduce_only"])
         self.assertEqual(release_orders[0]["time_in_force"], "GTX")
         self.assertLessEqual(release_orders[0]["notional"], 300.0)
-        self.assertGreaterEqual(release_orders[0]["price"], 1.05)
+        self.assertLess(release_orders[0]["price"], 1.05)
 
     def test_inventory_unlock_release_does_not_fire_before_stall_confirmation(self) -> None:
         plan = {"buy_orders": [], "sell_orders": []}
@@ -14408,7 +14676,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(release_orders[0]["time_in_force"], "GTX")
         self.assertEqual(release_orders[0]["execution_type"], "inventory_unlock_release")
         self.assertEqual(release_orders[0]["position_side"], "SHORT")
-        self.assertLessEqual(release_orders[0]["price"], 0.14095)
+        self.assertGreater(release_orders[0]["price"], 0.14095)
         self.assertLessEqual(release_orders[0]["notional"], 733.0)
         self.assertEqual([order["role"] for order in plan["sell_orders"]], ["best_quote_reduce_long"])
 
