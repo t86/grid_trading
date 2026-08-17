@@ -1699,6 +1699,62 @@ def build_best_quote_maker_volume_plan(
                 )
             )
 
+    proactive_profit_reduce_added = False
+    if hedge_position_sides and not hard_loss:
+        has_short_reduce = any(
+            order.get("role") == "best_quote_reduce_short" for order in buy_orders
+        )
+        if (
+            not has_short_reduce
+            and short_entry_ceiling > 0
+            and short_notional >= short_entry_ceiling - 1e-12
+        ):
+            before_count = len(buy_orders)
+            _append_order(
+                buy_orders,
+                _build_order(
+                    side="BUY",
+                    price=_price_with_gap(bid, reduce_short_gap, -1),
+                    notional=min(
+                        buy_side_notional * reduce_short_budget_scale,
+                        short_notional,
+                    ),
+                    role="best_quote_reduce_short",
+                    inputs=inputs,
+                    position_side=reduce_short_position_side,
+                    force_reduce_only=True,
+                ),
+            )
+            proactive_profit_reduce_added = len(buy_orders) > before_count
+
+        has_long_reduce = any(
+            order.get("role") == "best_quote_reduce_long" for order in sell_orders
+        )
+        if (
+            not has_long_reduce
+            and long_entry_ceiling > 0
+            and long_notional >= long_entry_ceiling - 1e-12
+        ):
+            before_count = len(sell_orders)
+            _append_order(
+                sell_orders,
+                _build_order(
+                    side="SELL",
+                    price=_price_with_gap(ask, reduce_long_gap, 1),
+                    notional=min(
+                        sell_side_notional * reduce_long_budget_scale,
+                        long_notional,
+                    ),
+                    role="best_quote_reduce_long",
+                    inputs=inputs,
+                    position_side=reduce_long_position_side,
+                    force_reduce_only=True,
+                ),
+            )
+            proactive_profit_reduce_added = proactive_profit_reduce_added or len(sell_orders) > before_count
+    if proactive_profit_reduce_added:
+        reasons.append("near_soft_profit_reduce")
+
     if net_loss_reduce_report["active"] and hedge_position_sides:
         imbalance_notional = long_notional - short_notional
         hedge_notional = min(cycle_budget, abs(imbalance_notional))
