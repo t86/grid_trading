@@ -281,19 +281,18 @@ if ! TERMINAL_STATE="$(classify_terminal_intent)"; then
 fi
 
 is_recovery_managed() {
-  python3 - "$SYMBOL" "$CONTROL_PATH" <<'PY'
+  python3 - "$CONTROL_PATH" <<'PY'
 import json
 import sys
 
-symbol, control_path = sys.argv[1:]
+control_path = sys.argv[1]
 try:
     with open(control_path, encoding="utf-8") as handle:
         control = json.load(handle)
 except (OSError, ValueError):
     control = {}
 managed = isinstance(control, dict) and (
-    symbol in {"ARXUSDT", "OUSDT"}
-    or "_futures_recovery_state" in control
+    "_futures_recovery_state" in control
     or "_futures_recovery_state_mirror" in control
     or control.get("recovery_control_owner") == "bq_volume_recovery_guard"
 )

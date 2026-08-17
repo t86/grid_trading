@@ -379,6 +379,79 @@ def test_runner_watchdog_never_revives_an_intended_stop() -> None:
     assert "recovery-managed" in script
 
 
+@pytest.mark.parametrize(
+    ("symbol", "registered", "expect_watchdog_start"),
+    [
+        ("ARXUSDT", False, True),
+        ("ARXUSDT", True, False),
+        ("BCHUSDT", True, False),
+    ],
+)
+def test_runner_watchdog_recovery_owner_depends_on_registration_not_symbol(
+    tmp_path: Path,
+    symbol: str,
+    registered: bool,
+    expect_watchdog_start: bool,
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    control = _owned_control(
+        {
+            "symbol": symbol,
+            "strategy_profile": "test_profile",
+            "strategy_mode": "hedge_best_quote_maker_volume_v1",
+            "per_order_notional": 20.0,
+            "run_start_time": "2026-07-16T00:00:00+00:00",
+            "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+            "run_end_time": "2026-07-17T00:00:00+00:00",
+            "max_cumulative_notional": 20_000.0,
+            "terminal_drain_exit_policy": "drain_then_preserve",
+            "terminal_drain_absolute_loss_budget": 2.0,
+            "terminal_drain_max_wait_seconds": 600.0,
+        }
+    )
+    if registered:
+        control = _registered_control(control)
+    (output_dir / f"{symbol.lower()}_loop_runner_control.json").write_text(
+        json.dumps(control),
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls_path = tmp_path / "systemctl.calls"
+    fake_systemctl = fake_bin / "systemctl"
+    fake_systemctl.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$*" >> "$SYSTEMCTL_CALLS"\n'
+        'if [ "$1" = "is-active" ]; then exit 3; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_systemctl.chmod(0o755)
+    (fake_bin / "python3").symlink_to(sys.executable)
+
+    completed = subprocess.run(
+        ["bash", "deploy/oracle/runner_watchdog.sh", symbol],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "APP_DIR": str(tmp_path),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "SYSTEMCTL_CALLS": str(calls_path),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    calls = calls_path.read_text(encoding="utf-8") if calls_path.exists() else ""
+    assert (f"start grid-loop@{symbol}.service" in calls) is expect_watchdog_start
+    assert (f"{symbol} is recovery-managed; skip actuator" in completed.stdout) is (
+        not expect_watchdog_start
+    )
+
+
 def test_runner_watchdog_registered_active_terminal_owner_resumes_runner(
     tmp_path: Path,
 ) -> None:
