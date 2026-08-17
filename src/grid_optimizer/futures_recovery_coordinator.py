@@ -3661,6 +3661,22 @@ class FuturesRecoveryCoordinator:
                     applied_at=record.applied_at,
                     applied_round_id=record.applied_round_id,
                 )
+            if not (
+                state.phase is RecoveryPhase.STABLE
+                and state.active_action is ActionId.NOOP
+                and state.action_lease is None
+                and state.safety_lease is None
+                and state.cleanup_obligation is None
+                and state.pending_effect_stage is EffectStage.NONE
+                and state.pending_effect_epoch is None
+            ):
+                return BaselineChangeOutcome(
+                    symbol=request.symbol,
+                    operation_id=request.operation_id,
+                    attempt_id=request.attempt_id,
+                    status=BaselineChangeStatus.DEFERRED,
+                    requested_at=request.requested_at,
+                )
             if state.baseline_profile.digest != request.expected_baseline_digest:
                 raise ValueError("baseline change expected_baseline_digest conflict")
             if any(

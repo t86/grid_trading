@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from statistics import mean
 from typing import Any, Union
 from urllib.parse import parse_qs, quote, urlparse
@@ -130,6 +130,7 @@ from .futures_inventory_boundary import (
 from .dry_run import _round_order_price, _round_order_qty
 from .futures_run_lifecycle import (
     RUN_CONTRACT_OWNER_KEY,
+    bind_run_contract_owner,
     resolve_authoritative_run_contract,
     validate_run_contract,
     validate_run_contract_owner,
@@ -7365,6 +7366,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
         setDrawerStatus(`JSON 解析失败: ${String(err)}`, true);
         return;
       }
+      delete payload.futures_run_contract_owner;
       const url = applyAfterSave ? "/api/runner/start" : "/api/runner/save";
       const actionText = applyAfterSave ? (state.drawerCard.is_running ? "保存并重启" : "启动") : "保存";
       setDrawerStatus(`正在${actionText} ${state.drawerCard.symbol}...`);
@@ -11543,8 +11545,15 @@ _REGISTERED_BASELINE_NON_USER_KEYS = _BASELINE_CHANGE_REQUEST_KEYS | frozenset(
 
 
 def _registered_baseline_user_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    def thaw(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {str(key): thaw(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [thaw(item) for item in value]
+        return value
+
     return {
-        key: value
+        key: thaw(value)
         for key, value in payload.items()
         if key not in _REGISTERED_BASELINE_NON_USER_KEYS
         and not _is_managed_recovery_key(str(key))
@@ -11579,39 +11588,22 @@ def _submit_registered_runner_baseline_change(
     payload: dict[str, Any],
     control_path: Path,
 ) -> dict[str, Any]:
-    store = JsonRecoveryStore(control_path)
-    state = store.read(symbol)
-    inherited_baseline = _registered_baseline_user_fields(
-        dict(state.baseline_profile.fields)
-    )
-    candidate_payload = dict(inherited_baseline)
-    candidate_payload.update(_registered_baseline_user_fields(payload))
-    candidate = _registered_baseline_user_fields(
-        _resolve_runner_start_config(
-            candidate_payload,
-            inherited_config=inherited_baseline,
+    if payload.get("source") == "trusted_resume":
+        raise ValueError("trusted_resume is an internal capability")
+    if RUN_CONTRACT_OWNER_KEY in payload:
+        raise ValueError(
+            f"{RUN_CONTRACT_OWNER_KEY} cannot be supplied by Web payload"
         )
+    operation_id = _baseline_change_identifier(
+        payload.get("operation_id"),
+        name="operation_id",
     )
-    _validate_runner_run_contract(candidate)
-    request = BaselineChange.create(
-        symbol=symbol,
-        operation_id=_baseline_change_identifier(
-            payload.get("operation_id"),
-            name="operation_id",
-        ),
-        attempt_id=_baseline_change_identifier(
-            payload.get("attempt_id"),
-            name="attempt_id",
-        ),
-        source=(
-            _baseline_change_identifier(payload.get("source"), name="source")
-            if "source" in payload
-            else "web_runner_config_save"
-        ),
-        requested_at=_baseline_change_requested_at(payload.get("requested_at")),
-        expected_baseline_digest=state.baseline_profile.digest,
-        candidate_baseline=candidate,
+    attempt_id = _baseline_change_identifier(
+        payload.get("attempt_id"),
+        name="attempt_id",
     )
+    requested_at = _baseline_change_requested_at(payload.get("requested_at"))
+    store = JsonRecoveryStore(control_path)
 
     def no_snapshot_for_submission(*_args: Any) -> Any:
         raise RuntimeError("baseline submission cannot collect a recovery snapshot")
@@ -11620,7 +11612,58 @@ def _submit_registered_runner_baseline_change(
         store=store,
         snapshot_provider=no_snapshot_for_submission,
     )
-    outcome = coordinator.change_baseline(request)
+    operation_conflict = "baseline change operation_id reused with different payload"
+    for submission_attempt in range(2):
+        state = store.read(symbol)
+        owner_activated_at = requested_at
+        for record in state.baseline_changes:
+            if record.request.operation_id == operation_id:
+                owner_activated_at = record.request.requested_at
+                break
+        inherited_baseline = _registered_baseline_user_fields(
+            dict(state.baseline_profile.fields)
+        )
+        candidate_payload = dict(inherited_baseline)
+        candidate_payload.update(_registered_baseline_user_fields(payload))
+        candidate = _registered_baseline_user_fields(
+            _resolve_runner_start_config(
+                candidate_payload,
+                inherited_config=inherited_baseline,
+            )
+        )
+        _validate_runner_run_contract(candidate)
+        candidate, _ = bind_run_contract_owner(
+            candidate,
+            activated_at=owner_activated_at,
+        )
+        request = BaselineChange.create(
+            symbol=symbol,
+            operation_id=operation_id,
+            attempt_id=attempt_id,
+            source=(
+                _baseline_change_identifier(payload.get("source"), name="source")
+                if "source" in payload
+                else "web_runner_config_save"
+            ),
+            requested_at=requested_at,
+            expected_baseline_digest=state.baseline_profile.digest,
+            candidate_baseline=candidate,
+        )
+        try:
+            outcome = coordinator.change_baseline(request)
+        except ValueError as exc:
+            concurrent_record = bool(
+                submission_attempt == 0
+                and str(exc) == operation_conflict
+                and any(
+                    record.request.operation_id == operation_id
+                    for record in store.read(symbol).baseline_changes
+                )
+            )
+            if concurrent_record:
+                continue
+            raise
+        break
     deferred = outcome.status is BaselineChangeStatus.DEFERRED
     return {
         "saved": not deferred,
@@ -11638,6 +11681,8 @@ def _submit_registered_runner_baseline_change(
 
 
 def _save_runner_config_without_start(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("source") == "trusted_resume":
+        raise ValueError("trusted_resume is an internal capability")
     requested_symbol = str(payload.get("symbol") or "").upper().strip()
     if requested_symbol:
         requested_control_path = _runner_control_path(requested_symbol)
@@ -29229,6 +29274,7 @@ MONITOR_PAGE = """<!doctype html>
       if (!payload.strategy_profile) {
         payload.strategy_profile = runnerFallbackProfile(selectedPreset);
       }
+      delete payload.futures_run_contract_owner;
       return payload;
     }
 
@@ -31663,6 +31709,7 @@ STRATEGY_WORKSPACE_PAGE = """<!doctype html>
         base[key] = raw === "" ? null : (Number.isFinite(Number(raw)) ? Number(raw) : raw);
       });
       base.symbol = state.selectedSymbol || base.symbol;
+      delete base.futures_run_contract_owner;
       return base;
     }
     function renderDiff() {

@@ -130,11 +130,12 @@ def _make_active(store: JsonRecoveryStore) -> recovery.RecoveryState:
     return entered.next_state
 
 
-def test_web_active_baseline_change_is_durable_across_restart(tmp_path: Path) -> None:
+def test_web_active_baseline_change_is_not_durable_across_restart(tmp_path: Path) -> None:
     control_path = tmp_path / "arxusdt_loop_runner_control.json"
     store = _register(control_path)
     active = _make_active(store)
     before_profile = active.desired_profile
+    before_bytes = control_path.read_bytes()
 
     with patch.object(
         web_module,
@@ -167,25 +168,82 @@ def test_web_active_baseline_change_is_durable_across_restart(tmp_path: Path) ->
     assert restarted_state.phase is recovery.RecoveryPhase.ACTIVE
     assert restarted_state.active_action is recovery.ActionId.INVENTORY_RECOVER
     assert restarted_state.desired_profile == before_profile
-    assert restarted_state.baseline_change is not None
-    assert restarted_state.baseline_change.request.operation_id == "web-baseline-op"
-    assert restarted_state.baseline_change.request.expected_baseline_digest == (
-        active.baseline_profile.digest
+    assert restarted_state.document_revision == active.document_revision
+    assert restarted_state.baseline_changes == ()
+    assert control_path.read_bytes() == before_bytes
+
+
+def test_baseline_change_requires_every_strict_stable_condition() -> None:
+    action_lease = recovery.ActionLease(
+        epoch=1,
+        action_id=recovery.ActionId.TEMPORARY_LOSS_RELIEF,
+        side=recovery.Side.SELL,
+        order_role=recovery.OrderRole.REDUCE_ONLY,
+        started_at=NOW,
+        hard_expires_at=NOW + timedelta(minutes=1),
     )
-    assert (
-        "recovery_order_side"
-        not in restarted_state.baseline_change.request.candidate_profile.fields
+    safety_lease = recovery.SafetyLease(
+        epoch=1,
+        started_at=NOW,
+        hard_expires_at=NOW + timedelta(minutes=1),
+        evidence_fingerprint="safety-evidence",
+        observation_seq=1,
+        observed_at=NOW,
     )
-    assert (
-        restarted_state.baseline_change.request.candidate_profile.fields[
-            "best_quote_maker_volume_cycle_budget_notional"
-        ]
-        == 360.0
+    manifest = recovery.ManagedOrderManifest(
+        symbol="ARXUSDT",
+        generation=0,
+        decision_id="strict-stable-cleanup",
+        profile_digest=BASELINE_DIGEST,
+        action_id=recovery.ActionId.INVENTORY_RECOVER,
+        side=recovery.Side.SELL,
+        order_role=recovery.OrderRole.REDUCE_ONLY,
+        issued_at=NOW,
     )
-    assert (
-        restarted_state.baseline_change.status
-        is recovery.BaselineChangeStatus.DEFERRED
+    cleanup_obligation = recovery.CleanupObligation(
+        managed_order_manifest=manifest,
+        needs_manifest_rebuild=True,
+        created_at=NOW,
+        attempt_count=0,
+        next_retry_at=NOW,
     )
+    violations = (
+        ("phase", {"phase": recovery.RecoveryPhase.CLEANING}),
+        ("active_action", {"active_action": recovery.ActionId.INVENTORY_RECOVER}),
+        ("action_lease", {"action_lease": action_lease}),
+        ("safety_lease", {"safety_lease": safety_lease}),
+        ("cleanup_obligation", {"cleanup_obligation": cleanup_obligation}),
+        (
+            "pending_effect_stage",
+            {"pending_effect_stage": recovery.EffectStage.RUNNER_RESTART},
+        ),
+        ("pending_effect_epoch", {"pending_effect_epoch": 1}),
+    )
+
+    for name, changes in violations:
+        store = recovery.InMemoryRecoveryStore()
+        initial = store.register_symbol("ARXUSDT", BASELINE, now=NOW)
+        dirty = replace(
+            initial,
+            document_revision=initial.document_revision + 1,
+            **changes,
+        )
+        store.compare_and_swap(
+            "ARXUSDT",
+            expected_revision=initial.document_revision,
+            next_state=dirty,
+        )
+        before_commits = store.commit_count("ARXUSDT")
+
+        outcome = _coordinator(store).change_baseline(
+            _request(operation_id=f"strict-stable-{name}")
+        )
+        saved = store.read("ARXUSDT")
+
+        assert outcome.status is recovery.BaselineChangeStatus.DEFERRED
+        assert saved.document_revision == dirty.document_revision
+        assert saved.baseline_changes == ()
+        assert store.commit_count("ARXUSDT") == before_commits
 
 
 def test_monitor_editor_round_trip_never_captures_registered_control_overlay(
@@ -193,11 +251,9 @@ def test_monitor_editor_round_trip_never_captures_registered_control_overlay(
 ) -> None:
     control_path = tmp_path / "arxusdt_loop_runner_control.json"
     store = _register(control_path)
-    _make_active(store)
     monitor_payload = json.loads(control_path.read_text(encoding="utf-8"))
     assert RECOVERY_STATE_KEY in monitor_payload
     assert RECOVERY_STATE_MIRROR_KEY in monitor_payload
-    assert monitor_payload["recovery_order_side"] == "SELL"
     monitor_payload.update(
         {
             "operation_id": "monitor-round-trip-op",
@@ -208,6 +264,8 @@ def test_monitor_editor_round_trip_never_captures_registered_control_overlay(
             "autotune_symbol_enabled": False,
             # Coordinator-owned fields shown by the monitor are never edits
             # to the durable baseline, even if the browser posts them back.
+            "recovery_order_side": "SELL",
+            "near_market_entry_max_center_distance_steps": 999.0,
             "best_quote_maker_volume_allow_loss_reduce_only": True,
             "volatility_entry_pause_enabled": False,
         }
@@ -239,27 +297,6 @@ def test_monitor_editor_round_trip_never_captures_registered_control_overlay(
     }
     for key in ("operation_id", "attempt_id", "source", "requested_at"):
         assert key not in candidate
-
-    # Model the existing higher-priority recovery completing normally.  The
-    # next strict-STABLE coordinator round owns applying the durable request.
-    reached_stable = replace(
-        recovery.RecoveryState.initial(
-            "ARXUSDT",
-            deferred_state.baseline_profile.fields,
-            now=NOW + timedelta(seconds=1),
-        ),
-        document_revision=deferred_state.document_revision + 1,
-        generation=deferred_state.generation,
-        effect_epoch=deferred_state.effect_epoch,
-        recent_round_ids=deferred_state.recent_round_ids,
-        last_round_id=deferred_state.last_round_id,
-        baseline_changes=deferred_state.baseline_changes,
-    )
-    store.compare_and_swap(
-        "ARXUSDT",
-        expected_revision=deferred_state.document_revision,
-        next_state=reached_stable,
-    )
 
     effects: list[recovery.EffectCommand] = []
     coordinator = _coordinator(JsonRecoveryStore(control_path), effects=effects)
@@ -625,7 +662,7 @@ def test_stale_expected_baseline_digest_rejects_without_writing(tmp_path: Path) 
     assert store.read("ARXUSDT").baseline_change is None
 
 
-def test_same_baseline_digest_allows_request_after_active_revision_advance(
+def test_active_old_window_request_is_not_saved_or_applied_after_reaching_stable(
     tmp_path: Path,
 ) -> None:
     control_path = tmp_path / "arxusdt_loop_runner_control.json"
@@ -638,9 +675,13 @@ def test_same_baseline_digest_allows_request_after_active_revision_advance(
         source="test",
         requested_at=NOW,
         expected_baseline_digest=inherited.baseline_profile.digest,
-        candidate_baseline=NEW_BASELINE,
+        candidate_baseline={
+            **NEW_BASELINE,
+            "run_end_time": (NOW - timedelta(hours=1)).isoformat(),
+        },
     )
     active = _make_active(store)
+    before_bytes = control_path.read_bytes()
 
     outcome = _coordinator(store).change_baseline(request)
     saved = store.read("ARXUSDT")
@@ -648,10 +689,36 @@ def test_same_baseline_digest_allows_request_after_active_revision_advance(
     assert outcome.status is recovery.BaselineChangeStatus.DEFERRED
     assert saved.phase is recovery.RecoveryPhase.ACTIVE
     assert saved.active_action is active.active_action
-    assert saved.baseline_change is not None
-    assert saved.baseline_change.request.expected_baseline_digest == (
-        inherited.baseline_profile.digest
+    assert saved.document_revision == active.document_revision
+    assert saved.baseline_changes == ()
+    assert control_path.read_bytes() == before_bytes
+
+    reached_stable = replace(
+        recovery.RecoveryState.initial(
+            "ARXUSDT",
+            saved.baseline_profile.fields,
+            now=NOW + timedelta(seconds=1),
+        ),
+        document_revision=saved.document_revision + 1,
+        generation=saved.generation,
+        effect_epoch=saved.effect_epoch,
     )
+    store.compare_and_swap(
+        "ARXUSDT",
+        expected_revision=saved.document_revision,
+        next_state=reached_stable,
+    )
+    effects: list[recovery.EffectCommand] = []
+    plan = _coordinator(store, effects=effects).reconcile_symbol(
+        "ARXUSDT",
+        now=NOW + timedelta(seconds=2),
+        round_id="post-active-old-window",
+    )
+
+    assert plan.action_id is recovery.ActionId.NOOP
+    assert store.read("ARXUSDT").baseline_changes == ()
+    assert effects == []
+
 
 def test_corrupt_control_is_not_overwritten_by_baseline_change(tmp_path: Path) -> None:
     control_path = tmp_path / "arxusdt_loop_runner_control.json"

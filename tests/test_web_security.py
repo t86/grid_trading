@@ -7,6 +7,7 @@ import os
 import shlex
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from pathlib import Path
@@ -239,6 +240,37 @@ class WebSecurityTests(unittest.TestCase):
         )
         self.assertIs(cleaning.next_state.phase, RecoveryPhase.CLEANING)
         return json.loads(control_path.read_text(encoding="utf-8"))
+
+    def _write_registered_bounded_recovery_control(
+        self,
+        control_path: Path,
+    ) -> dict[str, object]:
+        baseline, _ = bind_run_contract_owner(
+            {
+                "symbol": "BCHUSDT",
+                "strategy_profile": "bch-volume-v1",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "per_order_notional": 20.0,
+                "run_start_time": "2026-07-16T00:00:00+00:00",
+                "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+                "run_end_time": "2026-07-17T00:00:00+00:00",
+                "max_cumulative_notional": 20_000.0,
+                "terminal_drain_exit_policy": "drain_then_preserve",
+                "terminal_drain_absolute_loss_budget": 2.0,
+                "terminal_drain_max_wait_seconds": 600.0,
+            },
+            activated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        )
+        control_path.write_text(
+            json.dumps({"symbol": "BCHUSDT"}),
+            encoding="utf-8",
+        )
+        JsonRecoveryStore(control_path).register_symbol(
+            "BCHUSDT",
+            baseline,
+            now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        )
+        return baseline
 
     def _mock_symbol_config(self) -> dict[str, float]:
         return {
@@ -609,6 +641,29 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("source-badge", STRATEGY_WORKSPACE_PAGE)
         self.assertIn("sourceMetricHtml", STRATEGY_WORKSPACE_PAGE)
         self.assertIn("source-metrics", STRATEGY_WORKSPACE_PAGE)
+
+    def test_strategy_workspace_payload_builder_removes_run_contract_owner(self) -> None:
+        builder = STRATEGY_WORKSPACE_PAGE.split(
+            "function currentPayloadFromForm()",
+            1,
+        )[1].split("function renderDiff()", 1)[0]
+        self.assertIn(
+            "const base = {...((state.selectedCell || {}).config || {})};",
+            builder,
+        )
+        self.assertIn("delete base.futures_run_contract_owner;", builder)
+        self.assertLess(
+            builder.index("delete base.futures_run_contract_owner;"),
+            builder.index("return base;"),
+        )
+        self.assertIn(
+            'postRunner("/api/runner/save", currentPayloadFromForm())',
+            STRATEGY_WORKSPACE_PAGE,
+        )
+        self.assertIn(
+            'postRunner("/api/runner/start", currentPayloadFromForm())',
+            STRATEGY_WORKSPACE_PAGE,
+        )
 
     @patch.dict("grid_optimizer.web.os.environ", {"GRID_CONTROLLER_READ_ONLY": "1"}, clear=False)
     @patch("grid_optimizer.web.load_binance_api_credentials", return_value=("key", "secret"))
@@ -1434,6 +1489,44 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("function buildRunnerStartPayload(", MONITOR_PAGE)
         self.assertIn('? startPayload', MONITOR_PAGE)
         self.assertIn("正在按当前选中预设启动策略", MONITOR_PAGE)
+
+    def test_running_status_editor_payload_builder_removes_run_contract_owner(self) -> None:
+        page = _render_running_status_page("BCHUSDT")
+        self.assertIn(
+            "state.currentConfig = normalizeConfig(card.config || {}, card.symbol);",
+            page,
+        )
+        self.assertIn(
+            "runnerJsonEditorEl.value = JSON.stringify(state.currentConfig, null, 2);",
+            page,
+        )
+        builder = page.split(
+            "async function saveCurrentConfig(applyAfterSave = false)",
+            1,
+        )[1].split("async function stopAndFlattenCurrentRunner", 1)[0]
+        self.assertIn("delete payload.futures_run_contract_owner;", builder)
+        self.assertLess(
+            builder.index("delete payload.futures_run_contract_owner;"),
+            builder.index("const url = applyAfterSave"),
+        )
+        self.assertIn('"/api/runner/start" : "/api/runner/save"', builder)
+
+    def test_monitor_editor_payload_builder_removes_run_contract_owner(self) -> None:
+        builder = MONITOR_PAGE.split(
+            "function buildRunnerPayloadFromEditor(selectedSymbol, selectedPreset = null)",
+            1,
+        )[1].split("function populatePresetOptions", 1)[0]
+        self.assertIn("delete payload.futures_run_contract_owner;", builder)
+        self.assertLess(
+            builder.index("delete payload.futures_run_contract_owner;"),
+            builder.index("return payload;"),
+        )
+        self.assertGreaterEqual(
+            MONITOR_PAGE.count(
+                "payload = buildRunnerPayloadFromEditor(selectedSymbol, selectedPreset);"
+            ),
+            2,
+        )
 
     def test_basic_auth_header_rejects_invalid_credentials(self) -> None:
         token = base64.b64encode(b"grid:wrong-pass").decode("ascii")
@@ -5476,7 +5569,7 @@ class WebSecurityTests(unittest.TestCase):
         mock_stop_runner.assert_not_called()
         mock_save.assert_not_called()
 
-    def test_registered_recovery_control_change_is_durably_deferred(self) -> None:
+    def test_registered_recovery_control_change_is_only_durable_while_stable(self) -> None:
         for phase in (
             RecoveryPhase.STABLE,
             RecoveryPhase.ACTIVE,
@@ -5489,6 +5582,7 @@ class WebSecurityTests(unittest.TestCase):
                     phase=phase,
                 )
                 before = JsonRecoveryStore(control_path).read("ARXUSDT")
+                before_bytes = control_path.read_bytes()
                 operation_id = f"web-security-{phase.value}-baseline-op"
                 with patch.object(
                     web_module,
@@ -5531,16 +5625,468 @@ class WebSecurityTests(unittest.TestCase):
                 self.assertEqual(persisted.decision_id, before.decision_id)
                 self.assertEqual(persisted.desired_profile, before.desired_profile)
                 self.assertEqual(persisted.cleanup_obligation, before.cleanup_obligation)
+                if phase is RecoveryPhase.STABLE:
+                    self.assertEqual(
+                        persisted.document_revision,
+                        before.document_revision + 1,
+                    )
+                    self.assertIsNotNone(persisted.baseline_change)
+                    assert persisted.baseline_change is not None
+                    self.assertEqual(
+                        persisted.baseline_change.request.operation_id,
+                        operation_id,
+                    )
+                else:
+                    self.assertEqual(control_path.read_bytes(), before_bytes)
+                    self.assertEqual(
+                        persisted.document_revision,
+                        before.document_revision,
+                    )
+                    self.assertEqual(persisted.baseline_changes, before.baseline_changes)
+
+    def test_registered_recovery_control_rejects_trusted_resume_source(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "arx-control.json"
+            self._write_registered_recovery_control(
+                control_path,
+                phase=RecoveryPhase.STABLE,
+            )
+            before = control_path.read_bytes()
+
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ), patch.object(
+                web_module,
+                "_resolve_runner_start_config",
+                return_value={"symbol": "ARXUSDT"},
+            ) as mock_resolve, self.assertRaisesRegex(
+                ValueError,
+                "trusted_resume.*internal",
+            ):
+                web_module._save_runner_config_without_start(
+                    {
+                        "symbol": "ARXUSDT",
+                        "source": "trusted_resume",
+                        "operation_id": "external-trusted-resume",
+                    }
+                )
+
+            self.assertEqual(control_path.read_bytes(), before)
+            mock_resolve.assert_not_called()
+
+    def test_unregistered_control_rejects_trusted_resume_source_before_save(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "arx-control.json"
+
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ), patch.object(
+                web_module,
+                "_resolve_runner_start_config",
+                return_value={"symbol": "ARXUSDT"},
+            ) as mock_resolve, patch.object(
+                web_module,
+                "_save_runner_control_config",
+            ) as mock_save, self.assertRaisesRegex(
+                ValueError,
+                "trusted_resume.*internal",
+            ):
+                web_module._save_runner_config_without_start(
+                    {
+                        "symbol": "ARXUSDT",
+                        "source": "trusted_resume",
+                    }
+                )
+
+            mock_resolve.assert_not_called()
+            mock_save.assert_not_called()
+
+    def test_registered_recovery_control_rejects_immutable_owner_change(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "bch-control.json"
+            baseline = self._write_registered_bounded_recovery_control(control_path)
+            before = control_path.read_bytes()
+
+            def resolve_candidate(
+                payload: dict[str, object],
+                *,
+                inherited_config: dict[str, object],
+            ) -> dict[str, object]:
+                self.assertEqual(
+                    inherited_config[RUN_CONTRACT_OWNER_KEY],
+                    baseline[RUN_CONTRACT_OWNER_KEY],
+                )
+                return {
+                    **inherited_config,
+                    "max_cumulative_notional": payload["max_cumulative_notional"],
+                }
+
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ), patch.object(
+                web_module,
+                "_resolve_runner_start_config",
+                side_effect=resolve_candidate,
+            ), self.assertRaisesRegex(
+                ValueError,
+                "explicit run contract handoff",
+            ):
+                web_module._save_runner_config_without_start(
+                    {
+                        "symbol": "BCHUSDT",
+                        "max_cumulative_notional": 25_000.0,
+                        "operation_id": "immutable-contract-change",
+                        "requested_at": "2026-07-16T01:00:00+00:00",
+                    }
+                )
+
+            self.assertEqual(control_path.read_bytes(), before)
+
+            def resolve_mutable_candidate(
+                payload: dict[str, object],
+                *,
+                inherited_config: dict[str, object],
+            ) -> dict[str, object]:
+                return {
+                    **inherited_config,
+                    "step_price": payload["step_price"],
+                }
+
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ), patch.object(
+                web_module,
+                "_resolve_runner_start_config",
+                side_effect=resolve_mutable_candidate,
+            ):
+                result = web_module._save_runner_config_without_start(
+                    {
+                        "symbol": "BCHUSDT",
+                        "step_price": 0.001,
+                        "operation_id": "mutable-contract-control-change",
+                        "requested_at": "2026-07-16T01:00:00+00:00",
+                    }
+                )
+
+            self.assertEqual(result["request_status"], "deferred")
+            persisted = JsonRecoveryStore(control_path).read("BCHUSDT")
+            self.assertIsNotNone(persisted.baseline_change)
+            assert persisted.baseline_change is not None
+            candidate = persisted.baseline_change.request.candidate_profile.fields
+            self.assertEqual(candidate["step_price"], 0.001)
+            self.assertEqual(
+                candidate[RUN_CONTRACT_OWNER_KEY],
+                baseline[RUN_CONTRACT_OWNER_KEY],
+            )
+
+    def test_registered_recovery_control_rejects_replacement_owner_payload(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "bch-control.json"
+            baseline = self._write_registered_bounded_recovery_control(control_path)
+            replacement_config = dict(baseline)
+            replacement_config.pop(RUN_CONTRACT_OWNER_KEY)
+            replacement_config["max_cumulative_notional"] = 25_000.0
+            replacement, _ = bind_run_contract_owner(
+                replacement_config,
+                activated_at=datetime(2026, 7, 16, 1, tzinfo=timezone.utc),
+            )
+            before = control_path.read_bytes()
+
+            def resolve_candidate(
+                payload: dict[str, object],
+                *,
+                inherited_config: dict[str, object],
+            ) -> dict[str, object]:
+                self.assertEqual(
+                    inherited_config[RUN_CONTRACT_OWNER_KEY],
+                    baseline[RUN_CONTRACT_OWNER_KEY],
+                )
+                return dict(payload)
+
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ), patch.object(
+                web_module,
+                "_resolve_runner_start_config",
+                side_effect=resolve_candidate,
+            ) as mock_resolve, self.assertRaisesRegex(
+                ValueError,
+                "futures_run_contract_owner.*cannot be supplied",
+            ):
+                web_module._save_runner_config_without_start(
+                    {
+                        "symbol": "BCHUSDT",
+                        "max_cumulative_notional": 25_000.0,
+                        RUN_CONTRACT_OWNER_KEY: replacement[RUN_CONTRACT_OWNER_KEY],
+                        "operation_id": "replacement-owner-contract-change",
+                        "requested_at": "2026-07-16T01:00:00+00:00",
+                    }
+                )
+
+            self.assertEqual(control_path.read_bytes(), before)
+            mock_resolve.assert_not_called()
+
+    def test_registered_recovery_control_rejects_owner_only_payload(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "bch-control.json"
+            baseline = self._write_registered_bounded_recovery_control(control_path)
+            before = control_path.read_bytes()
+
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ), patch.object(
+                web_module,
+                "_resolve_runner_start_config",
+                return_value=baseline,
+            ) as mock_resolve, self.assertRaisesRegex(
+                ValueError,
+                "futures_run_contract_owner.*cannot be supplied",
+            ):
+                web_module._save_runner_config_without_start(
+                    {
+                        "symbol": "BCHUSDT",
+                        RUN_CONTRACT_OWNER_KEY: baseline[RUN_CONTRACT_OWNER_KEY],
+                        "operation_id": "owner-only-control-change",
+                    }
+                )
+
+            self.assertEqual(control_path.read_bytes(), before)
+            mock_resolve.assert_not_called()
+
+    def test_registered_recovery_control_rejects_null_owner_contract_change(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "bch-control.json"
+            self._write_registered_bounded_recovery_control(control_path)
+            before = control_path.read_bytes()
+
+            with patch.object(
+                web_module,
+                "_runner_control_path",
+                return_value=control_path,
+            ), patch.object(
+                web_module,
+                "_resolve_runner_start_config",
+                side_effect=lambda payload, **_kwargs: dict(payload),
+            ) as mock_resolve, self.assertRaisesRegex(
+                ValueError,
+                "futures_run_contract_owner.*cannot be supplied",
+            ):
+                web_module._save_runner_config_without_start(
+                    {
+                        "symbol": "BCHUSDT",
+                        "max_cumulative_notional": 25_000.0,
+                        RUN_CONTRACT_OWNER_KEY: None,
+                        "operation_id": "null-owner-contract-change",
+                        "requested_at": "2026-07-16T01:00:00+00:00",
+                    }
+                )
+
+            self.assertEqual(control_path.read_bytes(), before)
+            mock_resolve.assert_not_called()
+
+    def test_registered_bounded_first_owner_retry_reuses_operation_time(self) -> None:
+        for retry_requested_at in (None, "2026-07-16T02:00:00+00:00"):
+            with self.subTest(
+                retry_requested_at=retry_requested_at
+            ), TemporaryDirectory() as tmpdir:
+                control_path = Path(tmpdir) / "arx-control.json"
+                self._write_registered_recovery_control(
+                    control_path,
+                    phase=RecoveryPhase.STABLE,
+                )
+
+                def resolve_candidate(
+                    payload: dict[str, object],
+                    *,
+                    inherited_config: dict[str, object],
+                ) -> dict[str, object]:
+                    self.assertNotIn(RUN_CONTRACT_OWNER_KEY, inherited_config)
+                    return {
+                        **payload,
+                        "run_start_time": "2026-07-16T00:00:00+00:00",
+                        "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+                        "run_end_time": "2026-07-17T00:00:00+00:00",
+                        "terminal_drain_exit_policy": "drain_then_preserve",
+                        "terminal_drain_absolute_loss_budget": 2.0,
+                        "terminal_drain_max_wait_seconds": 600.0,
+                    }
+
+                with patch.object(
+                    web_module,
+                    "_runner_control_path",
+                    return_value=control_path,
+                ), patch.object(
+                    web_module,
+                    "_resolve_runner_start_config",
+                    side_effect=resolve_candidate,
+                ):
+                    first = web_module._save_runner_config_without_start(
+                        {
+                            "symbol": "ARXUSDT",
+                            "max_cumulative_notional": 20_000.0,
+                            "operation_id": "first-bounded-owner",
+                            "attempt_id": "attempt-1",
+                            "requested_at": "2026-07-16T01:00:00+00:00",
+                        }
+                    )
+                    before_retry = control_path.read_bytes()
+                    retry_payload = {
+                        "symbol": "ARXUSDT",
+                        "max_cumulative_notional": 20_000.0,
+                        "operation_id": "first-bounded-owner",
+                        "attempt_id": "attempt-2",
+                    }
+                    if retry_requested_at is not None:
+                        retry_payload["requested_at"] = retry_requested_at
+                    retry = web_module._save_runner_config_without_start(
+                        retry_payload
+                    )
+
+                    self.assertEqual(first["request_status"], "deferred")
+                    self.assertEqual(retry["request_status"], "deferred")
+                    self.assertEqual(retry["attempt_id"], "attempt-2")
+                    self.assertEqual(control_path.read_bytes(), before_retry)
+                    persisted = JsonRecoveryStore(control_path).read("ARXUSDT")
+                    self.assertIsNotNone(persisted.baseline_change)
+                    assert persisted.baseline_change is not None
+                    self.assertEqual(
+                        persisted.baseline_change.request.requested_at,
+                        datetime(2026, 7, 16, 1, tzinfo=timezone.utc),
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "operation_id reused with different payload",
+                    ):
+                        web_module._save_runner_config_without_start(
+                            {
+                                "symbol": "ARXUSDT",
+                                "max_cumulative_notional": 25_000.0,
+                                "operation_id": "first-bounded-owner",
+                                "attempt_id": "attempt-3",
+                                "requested_at": "2026-07-16T03:00:00+00:00",
+                            }
+                        )
+                    self.assertEqual(control_path.read_bytes(), before_retry)
+
+    def test_concurrent_first_owner_requests_retry_only_the_same_contract(self) -> None:
+        for second_contract in (20_000.0, 25_000.0):
+            with self.subTest(
+                second_contract=second_contract
+            ), TemporaryDirectory() as tmpdir:
+                control_path = Path(tmpdir) / "arx-control.json"
+                self._write_registered_recovery_control(
+                    control_path,
+                    phase=RecoveryPhase.STABLE,
+                )
+                initial = JsonRecoveryStore(control_path).read("ARXUSDT")
+                first_reads = threading.Barrier(2)
+                seen_threads: set[int] = set()
+                seen_lock = threading.Lock()
+                original_read = JsonRecoveryStore.read
+
+                def synchronize_first_read(
+                    store: JsonRecoveryStore,
+                    symbol: str,
+                ) -> object:
+                    state = original_read(store, symbol)
+                    thread_id = threading.get_ident()
+                    with seen_lock:
+                        first_for_thread = thread_id not in seen_threads
+                        seen_threads.add(thread_id)
+                    if first_for_thread:
+                        first_reads.wait(timeout=5)
+                    return state
+
+                def resolve_candidate(
+                    payload: dict[str, object],
+                    *,
+                    inherited_config: dict[str, object],
+                ) -> dict[str, object]:
+                    self.assertNotIn(RUN_CONTRACT_OWNER_KEY, inherited_config)
+                    return {
+                        **payload,
+                        "run_start_time": "2026-07-16T00:00:00+00:00",
+                        "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
+                        "run_end_time": "2026-07-17T00:00:00+00:00",
+                        "terminal_drain_exit_policy": "drain_then_preserve",
+                        "terminal_drain_absolute_loss_budget": 2.0,
+                        "terminal_drain_max_wait_seconds": 600.0,
+                    }
+
+                payloads = (
+                    {
+                        "symbol": "ARXUSDT",
+                        "max_cumulative_notional": 20_000.0,
+                        "operation_id": "concurrent-first-owner",
+                        "attempt_id": "attempt-1",
+                        "requested_at": "2026-07-16T01:00:00+00:00",
+                    },
+                    {
+                        "symbol": "ARXUSDT",
+                        "max_cumulative_notional": second_contract,
+                        "operation_id": "concurrent-first-owner",
+                        "attempt_id": "attempt-2",
+                        "requested_at": "2026-07-16T02:00:00+00:00",
+                    },
+                )
+                results: list[dict[str, object]] = []
+                errors: list[ValueError] = []
+                with patch.object(
+                    JsonRecoveryStore,
+                    "read",
+                    synchronize_first_read,
+                ), patch.object(
+                    web_module,
+                    "_resolve_runner_start_config",
+                    side_effect=resolve_candidate,
+                ), ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = [
+                        pool.submit(
+                            web_module._submit_registered_runner_baseline_change,
+                            symbol="ARXUSDT",
+                            payload=payload,
+                            control_path=control_path,
+                        )
+                        for payload in payloads
+                    ]
+                    for future in futures:
+                        try:
+                            results.append(future.result(timeout=10))
+                        except ValueError as exc:
+                            errors.append(exc)
+
+                persisted = JsonRecoveryStore(control_path).read("ARXUSDT")
                 self.assertEqual(
                     persisted.document_revision,
-                    before.document_revision + 1,
+                    initial.document_revision + 1,
                 )
-                self.assertIsNotNone(persisted.baseline_change)
-                assert persisted.baseline_change is not None
-                self.assertEqual(
-                    persisted.baseline_change.request.operation_id,
-                    operation_id,
-                )
+                self.assertEqual(len(persisted.baseline_changes), 1)
+                if second_contract == 20_000.0:
+                    self.assertEqual(errors, [])
+                    self.assertEqual(len(results), 2)
+                    self.assertEqual(
+                        {result["request_status"] for result in results},
+                        {"deferred"},
+                    )
+                else:
+                    self.assertEqual(len(results), 1)
+                    self.assertEqual(len(errors), 1)
+                    self.assertRegex(
+                        str(errors[0]),
+                        "operation_id reused with different payload",
+                    )
 
     def test_start_runner_process_rejects_invalid_bounded_contract_before_side_effects(self) -> None:
         invalid = {
