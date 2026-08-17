@@ -207,6 +207,125 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual(len(plan["buy_orders"]), 1)
         self.assertLessEqual(plan["buy_orders"][0]["notional"], 250.0)
 
+    def test_normal_entries_stop_at_soft_inventory_headroom(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_entry_orders_per_side=2,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.9,
+            ),
+            inputs=_inputs(
+                bid_price=1.0,
+                ask_price=1.01,
+                mid_price=1.0,
+                current_long_qty=850.0,
+                current_short_qty=870.0,
+                current_net_qty=0.0,
+                cycle_budget_notional=240.0,
+                tick_size=0.01,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+                position_side_mode="hedge",
+            ),
+        )
+
+        long_entry_notional = sum(
+            order["notional"]
+            for order in plan["buy_orders"]
+            if order["role"] == "best_quote_entry_long"
+        )
+        short_entry_notional = sum(
+            order["notional"]
+            for order in plan["sell_orders"]
+            if order["role"] == "best_quote_entry_short"
+        )
+        self.assertLessEqual(long_entry_notional, 45.0 + 1e-6)
+        self.assertLessEqual(short_entry_notional, 25.0 + 1e-6)
+
+    def test_inventory_bias_stops_heavy_side_and_caps_light_side_at_soft_headroom(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_entry_orders_per_side=2,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.9,
+                inventory_bias_enabled=True,
+                inventory_bias_start_ratio=0.25,
+                inventory_bias_min_notional_gap=30.0,
+                inventory_bias_reduce_share=0.0,
+                inventory_bias_opposite_entry_enabled=True,
+            ),
+            inputs=_inputs(
+                bid_price=1.0,
+                ask_price=1.01,
+                mid_price=1.0,
+                current_long_qty=850.0,
+                current_short_qty=800.0,
+                current_net_qty=0.0,
+                cycle_budget_notional=240.0,
+                tick_size=0.01,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+                position_side_mode="hedge",
+            ),
+        )
+
+        self.assertTrue(plan["metrics"]["inventory_bias"]["applied"])
+        self.assertEqual(plan["metrics"]["inventory_bias"]["side"], "long")
+        self.assertFalse(
+            any(order["role"] == "best_quote_entry_long" for order in plan["buy_orders"])
+        )
+        short_entry_notional = sum(
+            order["notional"]
+            for order in plan["sell_orders"]
+            if order["role"] == "best_quote_entry_short"
+        )
+        self.assertLessEqual(short_entry_notional, 100.0 + 1e-6)
+
+    def test_near_soft_ceiling_posts_two_sided_profit_reduce_candidates(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.9,
+            ),
+            inputs=_inputs(
+                bid_price=1.0,
+                ask_price=1.01,
+                mid_price=1.0,
+                current_long_qty=892.0,
+                current_short_qty=892.0,
+                current_long_avg_price=0.99,
+                current_short_avg_price=1.01,
+                current_net_qty=0.0,
+                cycle_budget_notional=120.0,
+                tick_size=0.01,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+                position_side_mode="hedge",
+            ),
+        )
+
+        self.assertEqual(
+            [order["role"] for order in plan["buy_orders"]],
+            ["best_quote_reduce_short"],
+        )
+        self.assertEqual(
+            [order["role"] for order in plan["sell_orders"]],
+            ["best_quote_reduce_long"],
+        )
+        self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
+        self.assertTrue(plan["sell_orders"][0]["force_reduce_only"])
+        self.assertLessEqual(plan["buy_orders"][0]["notional"], 60.0 + 1e-6)
+        self.assertLessEqual(plan["sell_orders"][0]["notional"], 60.0 + 1e-6)
+
     def test_high_loss_switches_to_defensive_and_keeps_only_reduce_side(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(enabled=True, loss_per_10k_hard=0.8),
