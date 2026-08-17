@@ -446,6 +446,19 @@ def build_best_quote_maker_volume_plan(
     soft_ratio = _clamp(_safe_float(config.inventory_soft_ratio), 0.0, 1.0)
     long_soft = long_limit * soft_ratio if long_limit > 0 else 0.0
     short_soft = short_limit * soft_ratio if short_limit > 0 else 0.0
+    long_entry_ceiling = long_soft if long_soft > 0 else long_limit
+    short_entry_ceiling = short_soft if short_soft > 0 else short_limit
+
+    def _cap_entry_to_soft_headroom(
+        requested_notional: float,
+        *,
+        ceiling_notional: float,
+        projected_notional: float,
+    ) -> float:
+        requested = max(_safe_float(requested_notional), 0.0)
+        if ceiling_notional <= 0:
+            return requested
+        return min(requested, max(ceiling_notional - projected_notional, 0.0))
     loss_per_10k = max(_safe_float(inputs.loss_per_10k_15m), 0.0)
     long_inventory_ratio = long_notional / long_soft if long_soft > 0 else 0.0
     short_inventory_ratio = short_notional / short_soft if short_soft > 0 else 0.0
@@ -1319,7 +1332,11 @@ def build_best_quote_maker_volume_plan(
                         side="BUY",
                         anchor_price=bid,
                         base_gap=same_side_gap,
-                        total_notional=same_side_notional * long_entry_budget_scale,
+                        total_notional=_cap_entry_to_soft_headroom(
+                            same_side_notional * long_entry_budget_scale,
+                            ceiling_notional=long_entry_ceiling,
+                            projected_notional=projected_long_entry_notional,
+                        ),
                         slots=max_entry_orders_per_side,
                         role="best_quote_entry_long",
                         inputs=inputs,
@@ -1332,7 +1349,11 @@ def build_best_quote_maker_volume_plan(
                         side="SELL",
                         anchor_price=ask,
                         base_gap=same_side_gap,
-                        total_notional=same_side_notional * short_entry_budget_scale,
+                        total_notional=_cap_entry_to_soft_headroom(
+                            same_side_notional * short_entry_budget_scale,
+                            ceiling_notional=short_entry_ceiling,
+                            projected_notional=projected_short_entry_notional,
+                        ),
                         slots=max_entry_orders_per_side,
                         role="best_quote_entry_short",
                         inputs=inputs,
@@ -1369,7 +1390,11 @@ def build_best_quote_maker_volume_plan(
                         side="SELL",
                         anchor_price=ask,
                         base_gap=same_side_gap,
-                        total_notional=same_side_notional * short_entry_budget_scale,
+                        total_notional=_cap_entry_to_soft_headroom(
+                            same_side_notional * short_entry_budget_scale,
+                            ceiling_notional=short_entry_ceiling,
+                            projected_notional=projected_short_entry_notional,
+                        ),
                         slots=max_entry_orders_per_side,
                         role="best_quote_entry_short",
                         inputs=inputs,
@@ -1382,7 +1407,11 @@ def build_best_quote_maker_volume_plan(
                         side="BUY",
                         anchor_price=bid,
                         base_gap=same_side_gap,
-                        total_notional=same_side_notional * long_entry_budget_scale,
+                        total_notional=_cap_entry_to_soft_headroom(
+                            same_side_notional * long_entry_budget_scale,
+                            ceiling_notional=long_entry_ceiling,
+                            projected_notional=projected_long_entry_notional,
+                        ),
                         slots=max_entry_orders_per_side,
                         role="best_quote_entry_long",
                         inputs=inputs,
@@ -1420,12 +1449,11 @@ def build_best_quote_maker_volume_plan(
             and reduce_short_price > short_avg_price + 1e-12
             and inventory_bias_report["side"] != "long"
         ):
-            long_entry_notional = buy_side_notional * long_entry_budget_scale
-            if long_limit > 0:
-                long_entry_notional = min(
-                    long_entry_notional,
-                    max(long_limit - projected_long_entry_notional, 0.0),
-                )
+            long_entry_notional = _cap_entry_to_soft_headroom(
+                buy_side_notional * long_entry_budget_scale,
+                ceiling_notional=long_entry_ceiling,
+                projected_notional=projected_long_entry_notional,
+            )
             long_entries = _build_entry_ladder(
                 side="BUY",
                 anchor_price=bid,
@@ -1455,12 +1483,11 @@ def build_best_quote_maker_volume_plan(
             and allow_entry_long
             and not loss_blocked_reduce_fallback_report["long_entry"]
         ):
-            opposite_long_notional = cycle_budget * bias_entry_share * long_entry_budget_scale
-            if long_limit > 0:
-                opposite_long_notional = min(
-                    opposite_long_notional,
-                    max(long_limit - projected_long_entry_notional, 0.0),
-                )
+            opposite_long_notional = _cap_entry_to_soft_headroom(
+                cycle_budget * bias_entry_share * long_entry_budget_scale,
+                ceiling_notional=long_entry_ceiling,
+                projected_notional=projected_long_entry_notional,
+            )
             opposite_long_entries = _build_entry_ladder(
                 side="BUY",
                 anchor_price=bid,
@@ -1475,12 +1502,11 @@ def build_best_quote_maker_volume_plan(
                 buy_orders.extend(opposite_long_entries)
                 inventory_bias_report["recover_opposite_entry_side"] = "long"
     elif not inventory_bias_report["applied"] and allow_entry_long:
-        long_entry_notional = buy_side_notional * long_entry_budget_scale
-        if long_limit > 0:
-            long_entry_notional = min(
-                long_entry_notional,
-                max(long_limit - projected_long_entry_notional, 0.0),
-            )
+        long_entry_notional = _cap_entry_to_soft_headroom(
+            buy_side_notional * long_entry_budget_scale,
+            ceiling_notional=long_entry_ceiling,
+            projected_notional=projected_long_entry_notional,
+        )
         buy_orders.extend(
             _build_entry_ladder(
                 side="BUY",
@@ -1555,12 +1581,11 @@ def build_best_quote_maker_volume_plan(
             and reduce_long_price + 1e-12 < long_avg_price
             and inventory_bias_report["side"] != "short"
         ):
-            short_entry_notional = sell_side_notional * short_entry_budget_scale
-            if short_limit > 0:
-                short_entry_notional = min(
-                    short_entry_notional,
-                    max(short_limit - projected_short_entry_notional, 0.0),
-                )
+            short_entry_notional = _cap_entry_to_soft_headroom(
+                sell_side_notional * short_entry_budget_scale,
+                ceiling_notional=short_entry_ceiling,
+                projected_notional=projected_short_entry_notional,
+            )
             short_entries = _build_entry_ladder(
                 side="SELL",
                 anchor_price=ask,
@@ -1589,12 +1614,11 @@ def build_best_quote_maker_volume_plan(
             and allow_entry_short
             and not loss_blocked_reduce_fallback_report["short_entry"]
         ):
-            opposite_short_notional = cycle_budget * bias_entry_share * short_entry_budget_scale
-            if short_limit > 0:
-                opposite_short_notional = min(
-                    opposite_short_notional,
-                    max(short_limit - projected_short_entry_notional, 0.0),
-                )
+            opposite_short_notional = _cap_entry_to_soft_headroom(
+                cycle_budget * bias_entry_share * short_entry_budget_scale,
+                ceiling_notional=short_entry_ceiling,
+                projected_notional=projected_short_entry_notional,
+            )
             opposite_short_entries = _build_entry_ladder(
                 side="SELL",
                 anchor_price=ask,
@@ -1609,12 +1633,11 @@ def build_best_quote_maker_volume_plan(
                 sell_orders.extend(opposite_short_entries)
                 inventory_bias_report["recover_opposite_entry_side"] = "short"
     elif allow_entry_short:
-        short_entry_notional = sell_side_notional * short_entry_budget_scale
-        if short_limit > 0:
-            short_entry_notional = min(
-                short_entry_notional,
-                max(short_limit - projected_short_entry_notional, 0.0),
-            )
+        short_entry_notional = _cap_entry_to_soft_headroom(
+            sell_side_notional * short_entry_budget_scale,
+            ceiling_notional=short_entry_ceiling,
+            projected_notional=projected_short_entry_notional,
+        )
         sell_orders.extend(
             _build_entry_ladder(
                 side="SELL",
