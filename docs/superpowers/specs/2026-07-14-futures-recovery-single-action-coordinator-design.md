@@ -35,6 +35,7 @@ ARX 事件暴露了这个问题，但该模块并非 ARX 专用。它适用于�
 对已显式注册到恢复协调器的合约策略，启动本身一律视为有界运行：必须有带时区的绝对 `run_end_time`；`max_cumulative_notional` 仅是可提前结束的目标，不能代替截止时间。缺少截止时间时 saved-runner 必须在创建进程、写 PID、修改控制文档或触碰订单前拒绝启动；这不是暂停，也不是允许无限追逐的默认模式。未注册的兼容/诊断策略仍可沿用旧启动路径，但不能借此取得协调器所有权。
 
 - 目标成交额、显式的 `runtime_guard_stats_start_time` 与带时区的 `run_end_time`；只设置目标而缺少任一统计边界会被拒绝，避免自然日口径混入本次运行或永远追逐不可达目标。
+- 可选的目标结束最低总盈亏 `target_min_total_pnl`；它只能与目标成交额一起配置。配置后，“达到目标”必须同时满足成交额和最低总盈亏，不能由外部目标闸门仅凭成交额提前结束。
 - 明确的退出策略。有限运行只允许 `drain_then_preserve` 或 `stop_preserve`；不允许可能永久停在 `EXIT_BLOCKED` 的无界 `drain_clean`。
 - 显式、有限的本次终止排空损耗预算。它不能从滚动损耗、未实现亏损或仓位上限自动推导。
 - 临时 `allow_loss` 若要启用，必须额外固化一对正数：`temporary_loss_window_loss_budget`（自 `runtime_guard_stats_start_time` 起、至带时区 `run_end_time` 为止的本运行窗口损耗上限）和 `temporary_loss_lease_loss_reserve`（下一次租约的最坏损耗预留）。二者缺一、非正、预留大于窗口上限或没有运行截止时间时，启动校验拒绝；它们绝不能复用终止排空预算。带窗口预算的运行因此必须有不可变 owner，不能由后续 control 改写授权。
@@ -45,18 +46,24 @@ ARX 事件暴露了这个问题，但该模块并非 ARX 专用。它适用于�
 
 本次运行的目标进度、目标闸门成交额和损耗统计统一使用半开区间 `[runtime_guard_stats_start_time, run_end_time)`；查询时的有效截止点为 `min(当前时间, run_end_time)`。不得再从 UTC/本地自然日零点、当前小时或旧的每日完成标记推导统计窗口，也不得把窗口外成交计入进度或损耗。交易所 `userTrades` 必须按成交 ID 去重；缺失 ID、分页无进展或字段无效时失败关闭，不能拿不完整结果触发终止。
 
+启用 `target_min_total_pnl` 时，总盈亏统一定义为本运行窗口内普通 `normal_bq` 的已实现盈亏、资金费和手续费净事件，加当前普通仓位未实现盈亏；冻结仓位、冻结订单和冻结释放盈亏完全排除。普通仓位未实现盈亏未知、非有限或无法证明普通/冻结归属时，总盈亏记为不可得，盈利门槛失败关闭，策略继续正常 maker 运行至真实截止时间，不能按零值猜测达标。运行器是普通仓位未实现盈亏的唯一权威，因此外部目标闸门在成交额已达标时只记录“盈利门槛委托给运行器”，不得成为第二个终止执行器。
+
+普通订单的 `orderId -> book` 分类使用独立的追加式审计账本；运行器内存/状态中的近期订单引用即使因上限只保留最后一万笔，也不能让更早的 REST `userTrades`（通常没有 `clientOrderId`）失去 `normal_bq`/`frozen_bq` 归属。缺少可证明归属的历史成交不参与盈利达标，不能因为早期亏损被错误丢弃而提前结束。
+
+成交额达到但最低总盈亏尚未达到时，运行继续；若随后在截止前同时满足两项条件，结果为 `TARGET_REACHED`。到达 `run_end_time` 仍未满足盈利门槛时，唯一截止 intent 使用 `profit_gated_deadline`，目标结果仍归类为 `TARGET_UNMET_DEADLINE`，并进入既定退出契约；不能无限续时、反复重启或把成交额达标伪装为完整目标达成。
+
 窗口内 `userTrades` 暂时不可用时，运行器保存可见错误但继续正常 maker 循环，不能用旧统计宣称达标；到达 `run_end_time` 后仍不可观测时，只能记录 `TARGET_UNMET_DEADLINE / observation_unavailable_at_deadline` 并进入冻结退出契约，不能继续无限追逐目标，也不能把它伪装成 `TARGET_REACHED`。
 
 磨损退出同样属于不可变运行契约。只有同时固化正数 `lifecycle_wear_stop_per_10k` 与 `lifecycle_wear_stop_min_gross_notional` 才启用；两者缺失时默认关闭。旧 CLI `--wear-stop` / `--first` 只做兼容解析，不能在运行中临时打开、关闭或改写磨损退出权限。intent 消费者必须从冻结快照重新计算 `-realized_pnl / gross_notional * 10000`，并验证最小成交额和阈值。
 
-未配置临时放亏窗口预算的既有运行继续规范化为 `futures_run_contract_snapshot_v3`，字段集合和摘要完全不变；只有显式配置该预算对的运行使用 `futures_run_contract_snapshot_v4`。v4 快照额外包含临时放亏窗口预算与单次预留，其余字段为交易对、策略配置/模式、运行与统计起止时间、目标、退出策略、终止排空预算、最大等待时间、保留原因、有效单笔排空上限、损耗租约、重报价时间和空仓确认轮次；`futures-run-contract-v4-<digest>` 对规范 JSON 求摘要，作为一次运行的稳定身份。有效单笔排空上限在未显式设置时固化为本次 `per_order_notional`，之后即使 control 被改写也不能改变旧退出所有者的行为。
+未配置临时放亏窗口预算和最低总盈亏的既有运行继续规范化为 `futures_run_contract_snapshot_v3`，字段集合和摘要完全不变；只显式配置临时放亏预算对的运行使用 `futures_run_contract_snapshot_v4`；配置 `target_min_total_pnl` 的运行使用 `futures_run_contract_snapshot_v5`，并把该门槛纳入规范快照和摘要。v4 快照额外包含临时放亏窗口预算与单次预留，v5 在对应完整契约上额外固化最低总盈亏；其余字段为交易对、策略配置/模式、运行与统计起止时间、目标、退出策略、终止排空预算、最大等待时间、保留原因、有效单笔排空上限、损耗租约、重报价时间和空仓确认轮次。有效单笔排空上限在未显式设置时固化为本次 `per_order_notional`，之后即使 control 被改写也不能改变旧退出所有者的行为。
 
 ```mermaid
 stateDiagram-v2
     [*] --> RUNNING: 校验并固化运行契约
     RUNNING --> RECOVERING: 进度不足或缺少有效委托
     RECOVERING --> RUNNING: 恢复成交进度
-    RUNNING --> TERMINAL_DRAIN: 目标达到或截止
+    RUNNING --> TERMINAL_DRAIN: 成交额与可选盈亏门槛同时达到，或截止
     RECOVERING --> TERMINAL_DRAIN: 截止或终止条件成立
     TERMINAL_DRAIN --> BLOCK_ENTRY: 每个交易对唯一退出所有者
     BLOCK_ENTRY --> CANCEL_OWNED_ORDER
@@ -74,7 +81,7 @@ stateDiagram-v2
 
 已注册协调轮次每轮从交易所 `userTrades` 的完整半开运行窗口重建临时放亏账本：按成交 ID 去重，强制校验 `realizedPnl`、`commission` 和 `commissionAsset`，计算实际已实现损耗加 USDT 手续费，再加下一次租约的最坏损耗预留。只有三者不超过不可变窗口预算才允许新租约；完整分页无法证明、字段缺失/非有限、预算耗尽、运行契约不匹配，或存在正数非 USDT 手续费而未提供不可变换算率时均失败关闭，普通恢复转入无 `allow_loss` 的 `BASELINE_TUNE`。已处于 `SETTLING` 或 `ACTIVE` 的临时放亏若下一轮失去此资格，立即进入已有的精确订单清理/基线恢复路径；不能依赖 episode 次数、进程重启或本地 JSONL 续租。该账本是对交易所事实的可重建审计快照，持久化的 action lease 是唯一预留所有权。
 
-终止 intent、运行器本地状态和外部 watchdog 使用同一所有权协议：外部目标闸门只原子提交 `futures_lifecycle_intent_v2` intent，不再直接停止服务、撤单或 MARKET 平仓。intent 必须同时携带对应运行的完整 v3/v4 规范快照和匹配的运行契约摘要；运行器和 watchdog 都重新规范化并复算摘要，缺字段、字段被篡改、摘要不匹配或状态未知时均以可见错误失败关闭，不执行订单或生命周期副作用。
+终止 intent、运行器本地状态和外部 watchdog 使用同一所有权协议：外部目标闸门只原子提交 `futures_lifecycle_intent_v2` intent，不再直接停止服务、撤单或 MARKET 平仓。intent 必须同时携带对应运行的完整 v3/v4/v5 规范快照和匹配的运行契约摘要；运行器和 watchdog 都重新规范化并复算摘要，缺字段、字段被篡改、摘要不匹配或状态未知时均以可见错误失败关闭，不执行订单或生命周期副作用。
 
 目标闸门不是“偶尔可运行”的辅助脚本，而是有目标运行的启动/接管门槛：交接前必须能验证存在非手工的 target-gate cron，或一个当前 `active` 且实际执行 target-gate 的 systemd timer；任一缺失、失活或无法证明时拒绝把 runner 交给受管所有权。到达 `run_end_time` 时，若运行器已明确不可用，目标闸门仍必须提交唯一的截止 intent，使最终结果为 `TARGET_UNMET_DEADLINE` 并保留已经取得的真实统计；若恰好连完整成交查询也不可用，只能提交类型化 `observation_unavailable_at_deadline` 终止 intent，明确保存观测错误和统计不可得事实，绝不能伪造零成交/零损耗为真实结果。运行器恢复后按该 intent 的终止所有者完成核验、排空或保留残仓，不允许重新打开普通刷量、默默延长窗口或让策略永久停在无主暂停。
 
@@ -84,7 +91,7 @@ stateDiagram-v2
 
 旧退出所有者归档与新运行接管之间使用显式、一次性的 `futures_terminal_handoff_v1`。归档和 `handoff=pending` 在同一次状态写入中完成；watchdog 只有在该 pending 与当前运行契约完全匹配时才越过旧 `stop_reason` 启动或重启。新运行的第一条正常循环事件先落盘，随后才把 handoff 标记为 `acknowledged`；确认以后 watchdog 恢复尊重当前 stop reason。永久 history 只用于审计，不能持续授权复活，避免新运行后续的人工停机或损耗停机被旧交接记录反复拉起。
 
-显式运行契约不使用 `<symbol>_target_gate_done_YYYYMMDD.flag` 作为权威：旧文件即使仍留在磁盘，也不能阻止当前契约统计/提交 intent，更不能授权当前契约停机；新路径不读取或创建自然日 done marker。运行身份、完成状态和是否允许复活只由对应的 v3/v4 运行契约与 v2 intent 的绑定关系决定。
+显式运行契约不使用 `<symbol>_target_gate_done_YYYYMMDD.flag` 作为权威：旧文件即使仍留在磁盘，也不能阻止当前契约统计/提交 intent，更不能授权当前契约停机；新路径不读取或创建自然日 done marker。运行身份、完成状态和是否允许复活只由对应的 v3/v4/v5 运行契约与 v2 intent 的绑定关系决定。
 
 唯一不能承诺自动成交或立即退出的边界是交易所/账户观测不可用：没有新鲜仓位和订单事实时，系统进入可见的 `EXIT_BLOCKED` 并持续重试，不能猜测性撤单或把未知订单留在交易所后宣称安全结束。交易所事实恢复后，状态机从原阶段继续，无需人工清理本地布尔状态。
 

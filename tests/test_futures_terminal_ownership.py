@@ -16,7 +16,11 @@ from grid_optimizer.futures_terminal_ownership import (
 )
 
 
-def _snapshot(*, wear_enabled: bool = False) -> dict[str, object]:
+def _snapshot(
+    *,
+    wear_enabled: bool = False,
+    profit_gate_enabled: bool = False,
+) -> dict[str, object]:
     return run_contract_snapshot_from_config(
         {
             "symbol": "BCHUSDT",
@@ -27,6 +31,7 @@ def _snapshot(*, wear_enabled: bool = False) -> dict[str, object]:
             "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
             "run_end_time": "2026-07-17T00:00:00+00:00",
             "max_cumulative_notional": 20_000.0,
+            "target_min_total_pnl": 0.5 if profit_gate_enabled else None,
             "terminal_drain_exit_policy": "drain_then_preserve",
             "terminal_drain_absolute_loss_budget": 2.0,
             "terminal_drain_max_wait_seconds": 600.0,
@@ -43,7 +48,10 @@ def _intent(
     trigger_reason: str = "target_reached",
     status: str = "pending",
 ) -> dict[str, object]:
-    snapshot = _snapshot(wear_enabled=trigger_reason == "wear_limit_breached")
+    snapshot = _snapshot(
+        wear_enabled=trigger_reason == "wear_limit_breached",
+        profit_gate_enabled=trigger_reason == "profit_gated_deadline",
+    )
     contract_id = run_contract_identity_from_config(snapshot)
     source = "competition_target_gate"
     identity = json.dumps(
@@ -76,6 +84,16 @@ def _intent(
         observed.update(
             {
                 "gross_notional": 19_999.0,
+                "query_end": snapshot["run_end_time"],
+                "runtime_guard_primary_reason": "after_end_window",
+                "runtime_guard_matched_reasons": ["after_end_window"],
+            }
+        )
+    elif trigger_reason == "profit_gated_deadline":
+        requested_at = "2026-07-17T00:00:01+00:00"
+        observed.update(
+            {
+                "gross_notional": 20_001.0,
                 "query_end": snapshot["run_end_time"],
                 "runtime_guard_primary_reason": "after_end_window",
                 "runtime_guard_matched_reasons": ["after_end_window"],
@@ -122,6 +140,7 @@ def _intent(
     (
         ("target_reached", "pending"),
         ("target_unmet_deadline", "accepted"),
+        ("profit_gated_deadline", "accepted"),
         ("observation_unavailable_at_deadline", "accepted"),
         ("wear_limit_breached", "executing"),
         ("target_reached", "stopped_clean"),

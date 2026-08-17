@@ -37,7 +37,11 @@ from grid_optimizer.loop_runner import (
 NOW = datetime(2026, 7, 16, 1, 0, tzinfo=timezone.utc)
 
 
-def _registered_bounded_args(tmp_path: Path) -> tuple[argparse.Namespace, JsonRecoveryStore]:
+def _registered_bounded_args(
+    tmp_path: Path,
+    *,
+    target_min_total_pnl: float | None = None,
+) -> tuple[argparse.Namespace, JsonRecoveryStore]:
     args = argparse.Namespace(
         symbol="BCHUSDT",
         strategy_profile="bch-volume-v1",
@@ -51,6 +55,7 @@ def _registered_bounded_args(tmp_path: Path) -> tuple[argparse.Namespace, JsonRe
         runtime_guard_stats_start_time="2026-07-16T00:00:00+00:00",
         run_end_time="2026-07-17T00:00:00+00:00",
         max_cumulative_notional=20_000.0,
+        target_min_total_pnl=target_min_total_pnl,
         terminal_drain_exit_policy="drain_then_preserve",
         terminal_drain_absolute_loss_budget=2.0,
         terminal_drain_max_wait_seconds=600.0,
@@ -278,14 +283,34 @@ def test_registered_terminal_intent_waits_for_coordinator_cleanup(tmp_path: Path
 
 
 @pytest.mark.parametrize(
-    ("trigger", "cycle_started_at", "gross_notional", "primary_reason"),
     (
-        ("target_reached", NOW, 20_001.0, "max_cumulative_notional_hit"),
+        "trigger",
+        "cycle_started_at",
+        "gross_notional",
+        "primary_reason",
+        "target_min_total_pnl",
+    ),
+    (
+        (
+            "target_reached",
+            NOW,
+            20_001.0,
+            "max_cumulative_notional_hit",
+            None,
+        ),
         (
             "target_unmet_deadline",
             datetime(2026, 7, 17, tzinfo=timezone.utc),
             10_000.0,
             "after_end_window",
+            None,
+        ),
+        (
+            "profit_gated_deadline",
+            datetime(2026, 7, 17, tzinfo=timezone.utc),
+            20_001.0,
+            "after_end_window",
+            0.5,
         ),
     ),
 )
@@ -295,8 +320,12 @@ def test_internal_terminal_condition_persists_handoff_before_drain(
     cycle_started_at: datetime,
     gross_notional: float,
     primary_reason: str,
+    target_min_total_pnl: float | None,
 ) -> None:
-    args, store = _registered_bounded_args(tmp_path)
+    args, store = _registered_bounded_args(
+        tmp_path,
+        target_min_total_pnl=target_min_total_pnl,
+    )
     cleaning = _enter_terminal_cleanup(store)
     args.recovery_generation = cleaning.generation
     args.max_actual_net_notional = 100.0
@@ -316,6 +345,9 @@ def test_internal_terminal_condition_persists_handoff_before_drain(
         actual_net_notional_abs=101.0,
         synthetic_drift_notional=0.0,
         unrealized_loss=0.0,
+        target_total_pnl=-1.0 if target_min_total_pnl is not None else None,
+        target_profit_gate_active=target_min_total_pnl is not None,
+        target_profit_satisfied=False,
     )
 
     with (
@@ -378,6 +410,68 @@ def test_internal_terminal_condition_persists_handoff_before_drain(
         )
     assert second["runtime_status"] == "handoff_pending"
     second_exchange.assert_not_called()
+
+
+def test_profit_satisfied_at_deadline_persists_target_reached_handoff(
+    tmp_path: Path,
+) -> None:
+    args, store = _registered_bounded_args(
+        tmp_path,
+        target_min_total_pnl=0.5,
+    )
+    cleaning = _enter_terminal_cleanup(store)
+    args.recovery_generation = cleaning.generation
+    cycle_started_at = datetime(2026, 7, 17, tzinfo=timezone.utc)
+    runtime_result = argparse.Namespace(
+        tradable=False,
+        runtime_status="stopped",
+        stop_triggered=True,
+        primary_reason="after_end_window",
+        matched_reasons=["after_end_window", "max_cumulative_notional_hit"],
+        triggered_at=cycle_started_at.isoformat(),
+        rolling_hourly_loss=0.0,
+        rolling_hourly_gross_notional=20_001.0,
+        rolling_hourly_loss_per_10k=0.0,
+        rolling_hourly_loss_per_10k_active=False,
+        cumulative_gross_notional=20_001.0,
+        actual_net_notional_abs=0.0,
+        synthetic_drift_notional=0.0,
+        unrealized_loss=0.0,
+        target_total_pnl=0.6,
+        target_profit_gate_active=True,
+        target_profit_satisfied=True,
+    )
+
+    with (
+        patch(
+            "grid_optimizer.loop_runner._load_futures_runtime_guard_inputs",
+            return_value=(
+                20_001.0,
+                [],
+                datetime(2026, 7, 16, tzinfo=timezone.utc),
+            ),
+        ),
+        patch(
+            "grid_optimizer.loop_runner.evaluate_runtime_guards",
+            return_value=runtime_result,
+        ),
+        patch(
+            "grid_optimizer.loop_runner._handle_terminal_drain_round",
+            side_effect=AssertionError("internal condition drained before handoff"),
+        ),
+    ):
+        summary = _maybe_handle_runtime_guard(
+            args=args,
+            cycle=1,
+            cycle_started_at=cycle_started_at,
+            summary_path=tmp_path / "events.jsonl",
+        )
+
+    intent = json.loads(
+        (tmp_path / "bchusdt_terminal_intent.json").read_text(encoding="utf-8")
+    )
+    assert summary["runtime_status"] == "handoff_pending"
+    assert intent["trigger_reason"] == "target_reached"
 
 
 def test_registered_terminal_intent_runs_after_recovery_is_stable(tmp_path: Path) -> None:

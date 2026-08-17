@@ -714,11 +714,20 @@ class LoopRunnerTests(unittest.TestCase):
             )
 
             state = json.loads(state_path.read_text(encoding="utf-8"))
+            durable_refs = [
+                json.loads(line)
+                for line in state_path.with_name(
+                    f"{state_path.stem}_order_refs.jsonl"
+                ).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
 
         ref = state["best_quote_volume_order_refs"]["41974646"]
         self.assertEqual(ref["book"], "normal_bq")
         self.assertEqual(ref["role"], "best_quote_entry_short")
         self.assertEqual(ref["position_side"], "SHORT")
+        self.assertEqual(durable_refs[-1]["order_id"], "41974646")
+        self.assertEqual(durable_refs[-1]["book"], "normal_bq")
 
     def test_update_best_quote_volume_order_refs_marks_frozen_book(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -12080,7 +12089,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(release_orders[0]["force_reduce_only"])
         self.assertEqual(release_orders[0]["time_in_force"], "GTX")
         self.assertLessEqual(release_orders[0]["notional"], 300.0)
-        self.assertLess(release_orders[0]["price"], 1.05)
+        self.assertGreaterEqual(release_orders[0]["price"], 1.05)
 
     def test_inventory_unlock_release_does_not_fire_before_stall_confirmation(self) -> None:
         plan = {"buy_orders": [], "sell_orders": []}
@@ -14292,7 +14301,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(release_orders[0]["time_in_force"], "GTX")
         self.assertEqual(release_orders[0]["execution_type"], "inventory_unlock_release")
         self.assertEqual(release_orders[0]["position_side"], "SHORT")
-        self.assertGreater(release_orders[0]["price"], 0.14095)
+        self.assertLessEqual(release_orders[0]["price"], 0.14095)
         self.assertLessEqual(release_orders[0]["notional"], 733.0)
         self.assertEqual([order["role"] for order in plan["sell_orders"]], ["best_quote_reduce_long"])
 

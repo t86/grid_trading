@@ -4426,6 +4426,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "runtime_guard_loss_recovery_enabled": True,
     "rolling_hourly_loss_limit": None,
     "max_cumulative_notional": None,
+    "target_min_total_pnl": None,
     "lifecycle_wear_stop_per_10k": None,
     "lifecycle_wear_stop_min_gross_notional": None,
     "terminal_drain_exit_policy": None,
@@ -10364,6 +10365,7 @@ def _normalize_runner_control_payload(
         "rolling_hourly_loss_per_10k_limit",
         "rolling_hourly_loss_per_10k_min_notional",
         "max_cumulative_notional",
+        "target_min_total_pnl",
         "lifecycle_wear_stop_per_10k",
         "lifecycle_wear_stop_min_gross_notional",
         "terminal_drain_absolute_loss_budget",
@@ -10804,6 +10806,7 @@ def _normalize_runner_control_payload(
         "rolling_hourly_loss_per_10k_limit",
         "rolling_hourly_loss_per_10k_min_notional",
         "max_cumulative_notional",
+        "target_min_total_pnl",
         "lifecycle_wear_stop_per_10k",
         "lifecycle_wear_stop_min_gross_notional",
         "terminal_drain_absolute_loss_budget",
@@ -11447,6 +11450,7 @@ def _validate_runner_run_contract(config: dict[str, Any]) -> None:
             wear_stop_min_gross_notional=config.get(
                 "lifecycle_wear_stop_min_gross_notional"
             ),
+            target_min_total_pnl=config.get("target_min_total_pnl"),
         )
     except ValueError as exc:
         symbol = str(config.get("symbol", "")).upper().strip() or "UNKNOWN"
@@ -13120,6 +13124,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         ])
     if config.get("max_cumulative_notional") is not None:
         command.extend(["--max-cumulative-notional", str(config["max_cumulative_notional"])])
+    if config.get("target_min_total_pnl") is not None:
+        command.extend(["--target-min-total-pnl", str(config["target_min_total_pnl"])])
     if config.get("lifecycle_wear_stop_per_10k") is not None:
         command.extend(
             [
@@ -13475,6 +13481,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "runtime_guard_loss_recovery_enabled",
             "rolling_hourly_loss_limit",
             "max_cumulative_notional",
+            "target_min_total_pnl",
             "lifecycle_wear_stop_per_10k",
             "lifecycle_wear_stop_min_gross_notional",
             "max_actual_net_notional",
@@ -23879,6 +23886,9 @@ MONITOR_PAGE = """<!doctype html>
         <label>累计成交额阈值
           <input id="monitor_max_cumulative_notional" type="number" min="0" step="0.01" />
         </label>
+        <label>目标结束最低总盈亏
+          <input id="monitor_target_min_total_pnl" type="number" min="0" step="0.01" />
+        </label>
       </div>
       <div class="toolbar runtime-guard-toolbar">
         <label>运行结束策略
@@ -24860,6 +24870,7 @@ MONITOR_PAGE = """<!doctype html>
     const monitorRuntimeGuardStatsStartTimeEl = document.getElementById("monitor_runtime_guard_stats_start_time");
     const monitorRollingHourlyLossLimitEl = document.getElementById("monitor_rolling_hourly_loss_limit");
     const monitorMaxCumulativeNotionalEl = document.getElementById("monitor_max_cumulative_notional");
+    const monitorTargetMinTotalPnlEl = document.getElementById("monitor_target_min_total_pnl");
     const monitorTerminalDrainExitPolicyEl = document.getElementById("monitor_terminal_drain_exit_policy");
     const monitorTerminalDrainAbsoluteLossBudgetEl = document.getElementById("monitor_terminal_drain_absolute_loss_budget");
     const monitorTerminalDrainMaxWaitSecondsEl = document.getElementById("monitor_terminal_drain_max_wait_seconds");
@@ -27433,7 +27444,8 @@ MONITOR_PAGE = """<!doctype html>
       run_end_time: "运行截止时间。到点后停止新增交易并进入运行结束契约，分别记录目标结果和最终退出结果。",
       runtime_guard_stats_start_time: "本次运行不可变的风控统计起点。设置累计成交额目标时必填；成交额、目标节奏和滚动亏损都只使用该起点之后的数据，不会按自然日补默认值。",
       rolling_hourly_loss_limit: "最近 60 分钟滚动亏损阈值。达到后会自动停机、撤单并清仓。",
-      max_cumulative_notional: "本次运行窗口内的累计成交额目标。达到后进入运行结束契约；设置目标时必须同时设置统计起点、截止时间和明确退出策略。",
+      max_cumulative_notional: "本次运行窗口内的累计成交额目标。未配置盈利门槛时，达到后进入运行结束契约；设置目标时必须同时设置统计起点、截止时间和明确退出策略。",
+      target_min_total_pnl: "可选的目标结束盈利门槛，按本次运行净事件加普通仓位未实现盈亏计算。成交额达标但盈亏不足时继续运行，到截止时间仍会按退出契约结束。",
       terminal_drain_exit_policy: "运行结束策略。有限运行只允许先用 GTX maker-only 排空、超时保留残仓，或停止并保留残仓。",
       terminal_drain_absolute_loss_budget: "本次结束排空可消耗的绝对损耗预算，必须显式、有限，运行中不会被其他配置改写。",
       terminal_drain_max_wait_seconds: "GTX 排空的最长等待时间；drain_then_preserve 到时仍未清空会撤本策略委托、保存残仓快照后结束。",
@@ -27957,6 +27969,9 @@ MONITOR_PAGE = """<!doctype html>
         runtime_guard_stats_start_time: fromLocalInputValue(monitorRuntimeGuardStatsStartTimeEl.value),
         rolling_hourly_loss_limit: monitorRollingHourlyLossLimitEl.value ? Number(monitorRollingHourlyLossLimitEl.value) : null,
         max_cumulative_notional: monitorMaxCumulativeNotionalEl.value ? Number(monitorMaxCumulativeNotionalEl.value) : null,
+        target_min_total_pnl: monitorTargetMinTotalPnlEl.value
+          ? Number(monitorTargetMinTotalPnlEl.value)
+          : null,
         terminal_drain_exit_policy: monitorTerminalDrainExitPolicyEl.value || null,
         terminal_drain_absolute_loss_budget: monitorTerminalDrainAbsoluteLossBudgetEl.value
           ? Number(monitorTerminalDrainAbsoluteLossBudgetEl.value)
@@ -28009,6 +28024,7 @@ MONITOR_PAGE = """<!doctype html>
       monitorRuntimeGuardStatsStartTimeEl.value = toLocalInputValue(source.runtime_guard_stats_start_time);
       monitorRollingHourlyLossLimitEl.value = source.rolling_hourly_loss_limit ?? "";
       monitorMaxCumulativeNotionalEl.value = source.max_cumulative_notional ?? "";
+      monitorTargetMinTotalPnlEl.value = source.target_min_total_pnl ?? "";
       monitorTerminalDrainExitPolicyEl.value = source.terminal_drain_exit_policy || "";
       monitorTerminalDrainAbsoluteLossBudgetEl.value = source.terminal_drain_absolute_loss_budget ?? "";
       monitorTerminalDrainMaxWaitSecondsEl.value = source.terminal_drain_max_wait_seconds ?? "";
@@ -30573,6 +30589,7 @@ MONITOR_PAGE = """<!doctype html>
       monitorRunEndTimeEl,
       monitorRollingHourlyLossLimitEl,
       monitorMaxCumulativeNotionalEl,
+      monitorTargetMinTotalPnlEl,
       monitorTerminalDrainExitPolicyEl,
       monitorTerminalDrainAbsoluteLossBudgetEl,
       monitorTerminalDrainMaxWaitSecondsEl,

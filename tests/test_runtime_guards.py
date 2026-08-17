@@ -13,6 +13,7 @@ from grid_optimizer.runtime_guards import (
     normalize_runtime_guard_config,
     normalize_runtime_guard_payload,
     resolve_runtime_guard_stats_start_time,
+    summarize_runtime_total_pnl,
     summarize_futures_runtime_guard_inputs,
 )
 
@@ -47,6 +48,15 @@ class RuntimeGuardsTests(unittest.TestCase):
                 normalize_runtime_guard_config(
                     {"max_actual_net_notional": value}
                 )
+
+    def test_normalize_runtime_guard_config_accepts_zero_target_profit_floor(self) -> None:
+        cfg = normalize_runtime_guard_config({"target_min_total_pnl": 0.0})
+
+        self.assertEqual(cfg.target_min_total_pnl, 0.0)
+
+    def test_normalize_runtime_guard_config_rejects_negative_target_profit_floor(self) -> None:
+        with self.assertRaisesRegex(ValueError, "target_min_total_pnl must be non-negative"):
+            normalize_runtime_guard_config({"target_min_total_pnl": -0.01})
 
     def test_beijing_08_daily_stats_start_resolves_to_current_window(self) -> None:
         resolved = resolve_runtime_guard_stats_start_time(
@@ -102,6 +112,7 @@ class RuntimeGuardsTests(unittest.TestCase):
             gross, pnl_events, _ = summarize_futures_runtime_guard_inputs(
                 summary_path,
                 runtime_guard_stats_start_time="2026-05-23T00:00:00+00:00",
+                symbol="OPGUSDT",
                 now=datetime(2026, 5, 23, 23, 30, tzinfo=timezone.utc),
             )
 
@@ -162,6 +173,7 @@ class RuntimeGuardsTests(unittest.TestCase):
             gross, pnl_events, _ = summarize_futures_runtime_guard_inputs(
                 summary_path,
                 runtime_guard_stats_start_time="2026-05-23T00:00:00+00:00",
+                symbol="OPGUSDT",
                 now=datetime(2026, 5, 23, 23, 30, tzinfo=timezone.utc),
                 bq_order_refs_path=refs_path,
                 bq_book_scope="normal_bq",
@@ -210,6 +222,64 @@ class RuntimeGuardsTests(unittest.TestCase):
             self.assertEqual([event["client_order_id"] for event in pnl_events], ["gx-opgu-bestquot-1-abc"])
             self.assertAlmostEqual(sum(float(event["net_pnl"]) for event in pnl_events), -3.0)
 
+    def test_bq_scope_recovers_historical_book_from_client_id_after_ref_eviction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summary_path = Path(tmp) / "opgusdt_hedge_bq_events.jsonl"
+            trade_path = Path(tmp) / "opgusdt_hedge_bq_trade_audit.jsonl"
+            rows = [
+                {
+                    "time": 1779570000000,
+                    "orderId": 1,
+                    "price": "1",
+                    "qty": "100",
+                    "quoteQty": "100",
+                    "realizedPnl": "-3",
+                    "commission": "0",
+                    "commissionAsset": "USDT",
+                },
+                {
+                    "time": 1779570001000,
+                    "orderId": 2,
+                    "price": "1",
+                    "qty": "200",
+                    "quoteQty": "200",
+                    "realizedPnl": "9",
+                    "commission": "0",
+                    "commissionAsset": "USDT",
+                },
+            ]
+            trade_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            refs_path = Path(tmp) / "state.json"
+            refs_path.write_text(
+                json.dumps({"best_quote_volume_order_refs": {}}),
+                encoding="utf-8",
+            )
+            refs_path.with_name(f"{refs_path.stem}_order_refs.jsonl").write_text(
+                "".join(
+                    (
+                        json.dumps({"order_id": "1", "book": "normal_bq"}) + "\n",
+                        json.dumps({"order_id": "2", "book": "frozen_bq"}) + "\n",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            gross, pnl_events, _ = summarize_futures_runtime_guard_inputs(
+                summary_path,
+                runtime_guard_stats_start_time="2026-05-23T00:00:00+00:00",
+                symbol="OPGUSDT",
+                now=datetime(2026, 5, 23, 23, 30, tzinfo=timezone.utc),
+                bq_order_refs_path=refs_path,
+                bq_book_scope="normal_bq",
+            )
+
+            self.assertEqual(gross, 100.0)
+            self.assertEqual([event["order_id"] for event in pnl_events], [1])
+            self.assertEqual(sum(float(event["net_pnl"]) for event in pnl_events), -3.0)
+
     def test_evaluate_runtime_guards_returns_waiting_before_start(self) -> None:
         now = datetime(2026, 3, 30, 8, 0, tzinfo=timezone.utc)
         cfg = RuntimeGuardConfig(
@@ -254,6 +324,106 @@ class RuntimeGuardsTests(unittest.TestCase):
         self.assertFalse(result.tradable)
         self.assertTrue(result.stop_triggered)
         self.assertEqual(result.primary_reason, "after_end_window")
+
+    def test_target_profit_floor_keeps_running_after_volume_target(self) -> None:
+        now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
+        cfg = normalize_runtime_guard_config(
+            {
+                "max_cumulative_notional": 20_000.0,
+                "target_min_total_pnl": 0.5,
+            }
+        )
+
+        result = evaluate_runtime_guards(
+            config=cfg,
+            now=now,
+            cumulative_gross_notional=20_100.0,
+            pnl_events=[],
+            target_total_pnl=-3.2,
+        )
+
+        self.assertTrue(result.tradable)
+        self.assertFalse(result.stop_triggered)
+        self.assertTrue(result.target_profit_gate_active)
+        self.assertFalse(result.target_profit_satisfied)
+        self.assertAlmostEqual(result.target_total_pnl or 0.0, -3.2)
+
+    def test_target_profit_floor_fails_closed_when_unrealized_pnl_is_unknown(self) -> None:
+        now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
+        total = summarize_runtime_total_pnl(
+            [
+                {
+                    "ts": (now - timedelta(minutes=1)).isoformat(),
+                    "net_pnl": 1.0,
+                }
+            ],
+            start_time=now - timedelta(hours=1),
+            now=now,
+            unrealized_pnl=None,
+        )
+        cfg = normalize_runtime_guard_config(
+            {
+                "max_cumulative_notional": 20_000.0,
+                "target_min_total_pnl": 0.5,
+            }
+        )
+
+        result = evaluate_runtime_guards(
+            config=cfg,
+            now=now,
+            cumulative_gross_notional=20_100.0,
+            pnl_events=[],
+            target_total_pnl=total,
+        )
+
+        self.assertIsNone(total)
+        self.assertTrue(result.tradable)
+        self.assertFalse(result.stop_triggered)
+        self.assertFalse(result.target_profit_satisfied)
+
+    def test_target_profit_floor_stops_after_volume_and_profit_targets(self) -> None:
+        now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
+        cfg = normalize_runtime_guard_config(
+            {
+                "max_cumulative_notional": 20_000.0,
+                "target_min_total_pnl": 0.5,
+            }
+        )
+
+        result = evaluate_runtime_guards(
+            config=cfg,
+            now=now,
+            cumulative_gross_notional=20_100.0,
+            pnl_events=[],
+            target_total_pnl=0.6,
+        )
+
+        self.assertFalse(result.tradable)
+        self.assertTrue(result.stop_triggered)
+        self.assertEqual(result.primary_reason, "max_cumulative_notional_hit")
+        self.assertTrue(result.target_profit_satisfied)
+
+    def test_deadline_still_stops_when_target_profit_floor_is_unmet(self) -> None:
+        now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
+        cfg = normalize_runtime_guard_config(
+            {
+                "run_end_time": (now - timedelta(seconds=1)).isoformat(),
+                "max_cumulative_notional": 20_000.0,
+                "target_min_total_pnl": 0.5,
+            }
+        )
+
+        result = evaluate_runtime_guards(
+            config=cfg,
+            now=now,
+            cumulative_gross_notional=20_100.0,
+            pnl_events=[],
+            target_total_pnl=-3.2,
+        )
+
+        self.assertTrue(result.stop_triggered)
+        self.assertEqual(result.primary_reason, "after_end_window")
+        self.assertNotIn("max_cumulative_notional_hit", result.matched_reasons)
 
     def test_evaluate_runtime_guards_stops_on_rolling_loss(self) -> None:
         now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)

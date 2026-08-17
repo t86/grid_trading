@@ -181,6 +181,7 @@ class RunContract:
     wear_stop_min_gross_notional: float | None
     temporary_loss_window_loss_budget: float | None
     temporary_loss_lease_loss_reserve: float | None
+    target_min_total_pnl: float | None
 
     @property
     def bounded(self) -> bool:
@@ -240,6 +241,7 @@ def validate_run_contract(
     wear_stop_min_gross_notional: Any = None,
     temporary_loss_window_loss_budget: Any = None,
     temporary_loss_lease_loss_reserve: Any = None,
+    target_min_total_pnl: Any = None,
 ) -> RunContract:
     """Validate run termination terms without reading or mutating runtime state."""
 
@@ -268,6 +270,10 @@ def validate_run_contract(
         temporary_loss_lease_loss_reserve,
         "temporary_loss_lease_loss_reserve",
     )
+    target_profit_floor = _normalize_contract_number(
+        target_min_total_pnl,
+        "target_min_total_pnl",
+    )
     policy = str(exit_policy).strip() if exit_policy is not None else ""
     normalized_policy = policy or None
     reason = str(preserve_reason).strip() if preserve_reason is not None else ""
@@ -279,6 +285,8 @@ def validate_run_contract(
         raise ValueError("target_value requires run_end_time")
     if target is not None and stats_start is None:
         raise ValueError("target_value requires runtime_guard_stats_start_time")
+    if target_profit_floor is not None and target is None:
+        raise ValueError("target_min_total_pnl requires target_value")
     if stats_start is not None and deadline is not None and stats_start >= deadline:
         raise ValueError(
             "runtime_guard_stats_start_time must be earlier than run_end_time"
@@ -366,6 +374,7 @@ def validate_run_contract(
         wear_stop_min_gross_notional=wear_min_gross,
         temporary_loss_window_loss_budget=temporary_loss_window_budget,
         temporary_loss_lease_loss_reserve=temporary_loss_lease_reserve,
+        target_min_total_pnl=target_profit_floor,
     )
 
 
@@ -391,6 +400,7 @@ def run_contract_snapshot_from_config(config: Mapping[str, Any]) -> dict[str, An
         temporary_loss_lease_loss_reserve=config.get(
             "temporary_loss_lease_loss_reserve"
         ),
+        target_min_total_pnl=config.get("target_min_total_pnl"),
     )
     explicit_max_order = _normalize_contract_number(
         config.get("terminal_drain_max_order_notional", 0.0),
@@ -414,9 +424,15 @@ def run_contract_snapshot_from_config(config: Mapping[str, Any]) -> dict[str, An
         "terminal_drain_flat_confirm_cycles",
     )
     snapshot = {
-        "schema": "futures_run_contract_snapshot_v4"
-        if contract.temporary_loss_window_loss_budget is not None
-        else "futures_run_contract_snapshot_v3",
+        "schema": (
+            "futures_run_contract_snapshot_v5"
+            if contract.target_min_total_pnl is not None
+            else (
+                "futures_run_contract_snapshot_v4"
+                if contract.temporary_loss_window_loss_budget is not None
+                else "futures_run_contract_snapshot_v3"
+            )
+        ),
         "symbol": str(config.get("symbol") or "").upper().strip(),
         "strategy_profile": str(config.get("strategy_profile") or "").strip(),
         "strategy_mode": str(config.get("strategy_mode") or "").strip(),
@@ -449,6 +465,8 @@ def run_contract_snapshot_from_config(config: Mapping[str, Any]) -> dict[str, An
             contract.wear_stop_min_gross_notional
         ),
     }
+    if contract.target_min_total_pnl is not None:
+        snapshot["target_min_total_pnl"] = contract.target_min_total_pnl
     if contract.temporary_loss_window_loss_budget is not None:
         snapshot["temporary_loss_window_loss_budget"] = (
             contract.temporary_loss_window_loss_budget
@@ -460,7 +478,7 @@ def run_contract_snapshot_from_config(config: Mapping[str, Any]) -> dict[str, An
 
 
 def run_contract_snapshot_digest(config: Mapping[str, Any]) -> str:
-    """Return the full digest of the canonical v3 snapshot."""
+    """Return the full digest of the canonical versioned snapshot."""
 
     payload = run_contract_snapshot_from_config(config)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))

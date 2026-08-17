@@ -114,6 +114,7 @@ def _validate_futures_run_contract(config: dict[str, object]) -> None:
         wear_stop_min_gross_notional=config.get(
             "lifecycle_wear_stop_min_gross_notional"
         ),
+        target_min_total_pnl=config.get("target_min_total_pnl"),
     )
 
 

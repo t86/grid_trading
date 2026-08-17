@@ -321,6 +321,7 @@ def _control(
     *,
     wear_stop: float | None = None,
     wear_first: float | None = None,
+    target_min_total_pnl: float | None = None,
 ) -> dict[str, object]:
     (workdir / "output").mkdir(parents=True, exist_ok=True)
     control = _owned_contract({
@@ -332,6 +333,7 @@ def _control(
         "runtime_guard_stats_start_time": "2026-07-16T00:00:00+00:00",
         "run_end_time": "2026-07-17T00:00:00+00:00",
         "max_cumulative_notional": max_cum,
+        "target_min_total_pnl": target_min_total_pnl,
         "terminal_drain_exit_policy": "drain_then_preserve",
         "terminal_drain_absolute_loss_budget": 5.0,
         "terminal_drain_max_wait_seconds": 900.0,
@@ -542,6 +544,57 @@ def test_gate_deadline_unmet_submits_intent_when_runner_is_unavailable(
     assert intent["observed"]["runtime_guard_matched_reasons"] == [
         "after_end_window"
     ]
+
+
+def test_gate_profit_gated_deadline_submits_intent_after_volume_target(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    control = _control(
+        tmp_path,
+        "arxusdt",
+        100_000,
+        target_min_total_pnl=0.5,
+    )
+    deadline = datetime(2026, 7, 17, 0, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(tg, "_now", lambda: deadline)
+    monkeypatch.setattr(
+        tg,
+        "daily_vol_wear",
+        lambda *a, **k: {
+            "gross_notional": 150_000.0,
+            "realized_pnl": 1.0,
+            "wear_per_10k": -0.06666666666666667,
+            "trade_count": 1,
+            "window_start": "2026-07-16T00:00:00+00:00",
+            "window_end": "2026-07-17T00:00:00+00:00",
+            "query_end": "2026-07-17T00:00:00+00:00",
+        },
+    )
+
+    _run_gate_main(
+        monkeypatch,
+        [
+            "--symbol",
+            "ARXUSDT",
+            "--service",
+            "grid-loop@ARXUSDT.service",
+            "--workdir",
+            str(tmp_path),
+            "--enforce",
+        ],
+    )
+
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["action"] == "LIFECYCLE_INTENT_SUBMITTED"
+    assert out["trigger"] == "deadline"
+    assert out["live_runner_contract"] == "unavailable_at_deadline"
+    intent = json.loads(
+        (tmp_path / "output" / "arxusdt_terminal_intent.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert intent["trigger_reason"] == "profit_gated_deadline"
+    assert intent["run_contract_id"] == tg.run_contract_identity_from_config(control)
 
 
 def test_gate_deadline_observation_failure_submits_explicit_terminal_intent(

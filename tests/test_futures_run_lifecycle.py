@@ -335,6 +335,32 @@ class FuturesRunContractTests(unittest.TestCase):
         self.assertEqual(contract.wear_stop_per_10k, 2.0)
         self.assertEqual(contract.wear_stop_min_gross_notional, 75_000.0)
 
+    def test_target_profit_floor_is_explicit_and_immutable(self) -> None:
+        contract = self._validate(target_min_total_pnl=0.5)
+
+        self.assertEqual(contract.target_min_total_pnl, 0.5)
+        snapshot = run_contract_snapshot_from_config(
+            {
+                "symbol": "GENERICUSDT",
+                "strategy_profile": "test",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "run_start_time": NOW.isoformat(),
+                "runtime_guard_stats_start_time": NOW.isoformat(),
+                "run_end_time": END.isoformat(),
+                "max_cumulative_notional": 20_000.0,
+                "target_min_total_pnl": 0.5,
+                "terminal_drain_exit_policy": "drain_then_preserve",
+                "terminal_drain_absolute_loss_budget": 5.0,
+                "terminal_drain_max_wait_seconds": 900.0,
+            }
+        )
+        self.assertEqual(snapshot["schema"], "futures_run_contract_snapshot_v5")
+        self.assertEqual(snapshot["target_min_total_pnl"], 0.5)
+
+    def test_target_profit_floor_requires_a_volume_target(self) -> None:
+        with self.assertRaisesRegex(ValueError, "target_min_total_pnl requires target_value"):
+            self._validate(target_value=None, target_min_total_pnl=0.0)
+
     def test_temporary_loss_window_terms_require_a_complete_positive_reservation(self) -> None:
         contract = self._validate(
             temporary_loss_window_loss_budget=3.0,
@@ -412,6 +438,7 @@ class FuturesRunContractTests(unittest.TestCase):
         )
 
         self.assertEqual(legacy["schema"], "futures_run_contract_snapshot_v3")
+        self.assertNotIn("target_min_total_pnl", legacy)
         self.assertNotIn("temporary_loss_window_loss_budget", legacy)
         self.assertEqual(enabled["schema"], "futures_run_contract_snapshot_v4")
         self.assertEqual(enabled["temporary_loss_window_loss_budget"], 3.0)
@@ -601,6 +628,7 @@ class FuturesRunContractOwnerTests(unittest.TestCase):
             {"runtime_guard_stats_start_time": (NOW + timedelta(minutes=1)).isoformat()},
             {"run_end_time": (END + timedelta(minutes=1)).isoformat()},
             {"max_cumulative_notional": 25_000.0},
+            {"target_min_total_pnl": 1.0},
             {"terminal_drain_absolute_loss_budget": 7.0},
             {"terminal_drain_max_order_notional": 41.0},
             {

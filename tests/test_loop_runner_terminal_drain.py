@@ -14,6 +14,7 @@ from grid_optimizer.loop_runner import (
     _handle_terminal_drain_round,
     _terminal_drain_decision_id,
     _terminal_drain_fetch_user_trades_exact,
+    _terminal_drain_outcome,
     _terminal_drain_runtime_owner_is_integral,
     _terminal_drain_runtime_integrity_digest,
     _terminal_drain_settle_loss_receipt,
@@ -30,6 +31,25 @@ NOW = datetime(2026, 7, 15, 10, 9, 15, tzinfo=timezone.utc)
 
 
 class LoopRunnerTerminalDrainTests(unittest.TestCase):
+    def test_profit_floor_deadline_reports_condition_unmet_after_volume_target(self) -> None:
+        outcome, target, achieved, shortfall = _terminal_drain_outcome(
+            runtime_guard_result=SimpleNamespace(
+                matched_reasons=["after_end_window"],
+                target_profit_gate_active=True,
+                target_profit_satisfied=False,
+            ),
+            runtime_guard_config=SimpleNamespace(
+                max_cumulative_notional=20_000.0,
+                target_min_total_pnl=0.5,
+            ),
+            cumulative_gross_notional=20_100.0,
+        )
+
+        self.assertEqual(outcome, "condition_unmet")
+        self.assertEqual(target, 20_000.0)
+        self.assertEqual(achieved, 20_100.0)
+        self.assertEqual(shortfall, 0.0)
+
     def _loss_receipt_state(self) -> TerminalDrainState:
         return replace(
             TerminalDrainState.initial("BCHUSDT", decision_id="bch:receipt"),

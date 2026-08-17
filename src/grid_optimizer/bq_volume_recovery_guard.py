@@ -489,6 +489,7 @@ def _has_explicit_target_run_contract(output_dir: Path, symbol: str) -> bool:
             wear_stop_min_gross_notional=control.get(
                 "lifecycle_wear_stop_min_gross_notional"
             ),
+            target_min_total_pnl=control.get("target_min_total_pnl"),
         )
     except ValueError:
         return False

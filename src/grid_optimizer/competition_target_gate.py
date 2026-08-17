@@ -435,6 +435,7 @@ _RUN_CONTRACT_ARG_FIELDS = {
     "--lifecycle-wear-stop-min-gross-notional": (
         "lifecycle_wear_stop_min_gross_notional"
     ),
+    "--target-min-total-pnl": "target_min_total_pnl",
     "--terminal-drain-exit-policy": "terminal_drain_exit_policy",
     "--terminal-drain-absolute-loss-budget": "terminal_drain_absolute_loss_budget",
     "--terminal-drain-max-wait-seconds": "terminal_drain_max_wait_seconds",
@@ -773,6 +774,7 @@ def main() -> None:
             wear_stop_min_gross_notional=cfg.get(
                 "lifecycle_wear_stop_min_gross_notional"
             ),
+            target_min_total_pnl=cfg.get("target_min_total_pnl"),
         )
         if (
             run_contract.runtime_guard_stats_start_time is None
@@ -858,6 +860,9 @@ def main() -> None:
         ),
         wear_stop_min_gross_notional=authoritative_snapshot.get(
             "lifecycle_wear_stop_min_gross_notional"
+        ),
+        target_min_total_pnl=authoritative_snapshot.get(
+            "target_min_total_pnl"
         ),
     )
     a.target = float(run_contract.target_value or 0.0)
@@ -986,11 +991,27 @@ def main() -> None:
         wear_first,
         wear_stop,
     )
+    raw_hit_target = hit_target
+    target_profit_delegated = bool(
+        hit_target and run_contract.target_min_total_pnl is not None
+    )
+    if target_profit_delegated:
+        # Only the live runner owns ordinary-position uPnL, so the external
+        # target gate must not terminate a profit-gated run on volume alone.
+        hit_target = False
     deadline_unmet = bool(
         run_contract.run_end_time is not None
         and now >= run_contract.run_end_time
         and a.target > 0
         and vol < a.target
+        and not hit_wear
+    )
+    profit_gated_deadline = bool(
+        run_contract.run_end_time is not None
+        and now >= run_contract.run_end_time
+        and a.target > 0
+        and raw_hit_target
+        and run_contract.target_min_total_pnl is not None
         and not hit_wear
     )
     status: dict[str, Any] = {
@@ -1003,10 +1024,12 @@ def main() -> None:
         "trade_count": int(window_stats["trade_count"]),
         "realized_pnl": float(window_stats["realized_pnl"]),
         "remaining_target": max(float(a.target) - vol, 0.0),
+        "target_min_total_pnl": run_contract.target_min_total_pnl,
+        "target_profit_delegated_to_runner": target_profit_delegated,
     }
     if not target_ok and wear_stop is None:
         status["config_error"] = "missing_config" if not config_ok else "non_positive_target"
-    if not (hit_target or hit_wear or deadline_unmet):
+    if not (hit_target or hit_wear or deadline_unmet or profit_gated_deadline):
         print(json.dumps(status))
         return
     status["trigger"] = (
@@ -1020,13 +1043,21 @@ def main() -> None:
     trigger_reason = (
         "target_reached"
         if hit_target
-        else ("wear_limit_breached" if hit_wear else "target_unmet_deadline")
+        else (
+            "wear_limit_breached"
+            if hit_wear
+            else (
+                "profit_gated_deadline"
+                if profit_gated_deadline
+                else "target_unmet_deadline"
+            )
+        )
     )
     try:
         live_contract_id = load_live_runner_contract(workdir=a.workdir, slug=slug)
     except (OSError, TypeError, ValueError) as exc:
         if (
-            trigger_reason == "target_unmet_deadline"
+            trigger_reason in {"target_unmet_deadline", "profit_gated_deadline"}
             and str(exc)
             in {"live runner pid is unavailable", "live runner command is unavailable"}
         ):
@@ -1066,7 +1097,7 @@ def main() -> None:
         "window_end": str(window_stats["window_end"]),
         "query_end": str(window_stats["query_end"]),
     }
-    if trigger_reason == "target_unmet_deadline":
+    if trigger_reason in {"target_unmet_deadline", "profit_gated_deadline"}:
         observed.update(
             {
                 "runtime_guard_primary_reason": "after_end_window",

@@ -39,6 +39,7 @@ TERMINAL_INTENT_TRIGGER_REASONS = frozenset(
     {
         "target_reached",
         "target_unmet_deadline",
+        "profit_gated_deadline",
         "observation_unavailable_at_deadline",
         "wear_limit_breached",
     }
@@ -288,7 +289,7 @@ def validate_terminal_intent(
     if trigger_reason == "target_reached":
         if observed_target <= 0 or gross_notional < observed_target:
             _invalid("terminal_intent_target_proof_invalid")
-    elif trigger_reason == "target_unmet_deadline":
+    elif trigger_reason in {"target_unmet_deadline", "profit_gated_deadline"}:
         runtime_primary = observed.get("runtime_guard_primary_reason")
         runtime_reasons = observed.get("runtime_guard_matched_reasons")
         reasons_are_valid = (
@@ -298,9 +299,17 @@ def validate_terminal_intent(
                 for reason in runtime_reasons
             )
         )
+        target_proof_invalid = (
+            gross_notional >= observed_target
+            if trigger_reason == "target_unmet_deadline"
+            else (
+                gross_notional < observed_target
+                or canonical_snapshot.get("target_min_total_pnl") is None
+            )
+        )
         if (
             observed_target <= 0
-            or gross_notional >= observed_target
+            or target_proof_invalid
             or query_end != window_end
             or requested_at < window_end
             or runtime_primary != "after_end_window"

@@ -5245,6 +5245,18 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["terminal_drain_flat_confirm_cycles"], 2)
         self.assertIsNone(payload["lifecycle_wear_stop_per_10k"])
         self.assertIsNone(payload["lifecycle_wear_stop_min_gross_notional"])
+        self.assertIsNone(payload["target_min_total_pnl"])
+
+    def test_monitor_page_exposes_target_profit_floor_control(self) -> None:
+        self.assertIn('id="monitor_target_min_total_pnl"', MONITOR_PAGE)
+        self.assertIn(
+            "target_min_total_pnl: monitorTargetMinTotalPnlEl.value",
+            MONITOR_PAGE,
+        )
+        self.assertIn(
+            "monitorTargetMinTotalPnlEl.value = source.target_min_total_pnl",
+            MONITOR_PAGE,
+        )
 
     def test_normalize_runner_control_payload_preserves_terminal_contract_fields(self) -> None:
         payload = _normalize_runner_control_payload(
@@ -5260,6 +5272,7 @@ class WebSecurityTests(unittest.TestCase):
                 "terminal_drain_flat_confirm_cycles": 3,
                 "lifecycle_wear_stop_per_10k": 2.0,
                 "lifecycle_wear_stop_min_gross_notional": 75_000.0,
+                "target_min_total_pnl": 0.5,
                 "futures_run_contract_owner": {"schema": "owner-test"},
             }
         )
@@ -5274,6 +5287,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["terminal_drain_flat_confirm_cycles"], 3)
         self.assertEqual(payload["lifecycle_wear_stop_per_10k"], 2.0)
         self.assertEqual(payload["lifecycle_wear_stop_min_gross_notional"], 75_000.0)
+        self.assertEqual(payload["target_min_total_pnl"], 0.5)
         self.assertEqual(
             payload["futures_run_contract_owner"],
             {"schema": "owner-test"},
@@ -5626,6 +5640,7 @@ class WebSecurityTests(unittest.TestCase):
                 "terminal_drain_flat_confirm_cycles": 3,
                 "lifecycle_wear_stop_per_10k": 2.0,
                 "lifecycle_wear_stop_min_gross_notional": 75_000.0,
+                "target_min_total_pnl": 0.5,
                 "runtime_guard_stats_start_time": "2026-03-31T02:00:00+00:00",
                 "rolling_hourly_loss_limit": 150.0,
                 "max_cumulative_notional": 100000.0,
@@ -5679,6 +5694,10 @@ class WebSecurityTests(unittest.TestCase):
                 command.index("--lifecycle-wear-stop-min-gross-notional") + 1
             ],
             "75000.0",
+        )
+        self.assertEqual(
+            command[command.index("--target-min-total-pnl") + 1],
+            "0.5",
         )
         self.assertIn("--runtime-guard-stats-start-time", command)
         self.assertIn("2026-03-31T02:00:00+00:00", command)

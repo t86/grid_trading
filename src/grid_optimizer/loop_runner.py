@@ -83,8 +83,10 @@ from .maker_flatten_runner import (
 )
 from .runtime_guards import (
     RuntimeGuardResult,
+    best_quote_order_ref_audit_path,
     evaluate_runtime_guards,
     normalize_runtime_guard_config,
+    summarize_runtime_total_pnl,
     summarize_futures_runtime_guard_inputs,
 )
 from .trade_database import ensure_trade_database_schema, persist_cycle_snapshot, persist_trade_rows, trade_database_enabled
@@ -10374,6 +10376,7 @@ def _update_best_quote_volume_order_refs_unlocked(
     manual_limit_updated = False
     manual_limit_updated_sides: set[str] = set()
     touched_order_ref_ids: set[str] = set()
+    durable_order_refs: list[dict[str, Any]] = []
     now_iso = _isoformat(_utc_now())
 
     for item in submit_report.get("placed_orders", []):
@@ -10468,6 +10471,19 @@ def _update_best_quote_volume_order_refs_unlocked(
             "updated_at": _isoformat(_utc_now()),
         }
         touched_order_ref_ids.add(order_ref_id)
+        durable_order_refs.append(
+            {
+                "order_id": order_ref_id,
+                "book": refs[order_ref_id]["book"],
+                "role": role,
+                "client_order_id": refs[order_ref_id]["client_order_id"],
+                "updated_at": refs[order_ref_id]["updated_at"],
+            }
+        )
+
+    durable_refs_path = best_quote_order_ref_audit_path(state_path)
+    for durable_ref in durable_order_refs:
+        _append_jsonl(durable_refs_path, durable_ref)
 
     if len(refs) > 10000:
         refs = dict(list(refs.items())[-10000:])
@@ -14852,6 +14868,14 @@ def _build_runtime_guard_stop_summary(
         "rolling_hourly_loss_per_10k_min_notional": runtime_guard_config.rolling_hourly_loss_per_10k_min_notional,
         "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
         "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
+        "target_min_total_pnl": getattr(runtime_guard_config, "target_min_total_pnl", None),
+        "target_total_pnl": getattr(runtime_guard_result, "target_total_pnl", None),
+        "target_profit_gate_active": bool(
+            getattr(runtime_guard_result, "target_profit_gate_active", False)
+        ),
+        "target_profit_satisfied": bool(
+            getattr(runtime_guard_result, "target_profit_satisfied", False)
+        ),
         "max_actual_net_notional": runtime_guard_config.max_actual_net_notional,
         "max_synthetic_drift_notional": runtime_guard_config.max_synthetic_drift_notional,
         "max_unrealized_loss": runtime_guard_config.max_unrealized_loss,
@@ -15368,9 +15392,22 @@ def _persist_registered_runtime_terminal_intent(
     primary_reason = str(
         getattr(runtime_guard_result, "primary_reason", "") or ""
     )
-    if target > 0 and gross_notional >= target:
+    after_end_window = "after_end_window" in matched_reasons
+    profit_gate_active = canonical_snapshot.get("target_min_total_pnl") is not None
+    if (
+        "max_cumulative_notional_hit" in matched_reasons
+        and target > 0
+        and gross_notional >= target
+    ):
         trigger_reason = "target_reached"
-    elif "after_end_window" in matched_reasons:
+    elif (
+        after_end_window
+        and profit_gate_active
+        and target > 0
+        and gross_notional >= target
+    ):
+        trigger_reason = "profit_gated_deadline"
+    elif after_end_window:
         trigger_reason = "target_unmet_deadline"
     else:
         return {
@@ -15390,7 +15427,7 @@ def _persist_registered_runtime_terminal_intent(
     requested_utc = requested_at.astimezone(timezone.utc)
     query_end = (
         parsed_window_end
-        if trigger_reason == "target_unmet_deadline"
+        if trigger_reason in {"target_unmet_deadline", "profit_gated_deadline"}
         else (
             min(requested_utc, parsed_window_end)
             if parsed_window_end is not None
@@ -16013,6 +16050,9 @@ def _terminal_drain_outcome(
     if "max_cumulative_notional_hit" in reasons:
         return "target_reached", target, achieved, 0.0
     if "after_end_window" in reasons:
+        profit_floor = getattr(runtime_guard_config, "target_min_total_pnl", None)
+        if profit_floor is not None and target is not None and achieved >= target:
+            return "condition_unmet", target, achieved, 0.0
         return "target_unmet_deadline", target, achieved, shortfall
     return "condition_unmet", target, achieved, shortfall
 
@@ -19230,6 +19270,11 @@ def _maybe_handle_runtime_guard(
         }
         state.pop("futures_target_progress_error", None)
         _write_json(state_path, state)
+    target_pnl_events, _target_pnl_scope = _runtime_guard_isolated_bq_pnl_events(
+        args=effective_runtime_args,
+        state=state,
+        pnl_events=pnl_events,
+    )
     pnl_events_for_guard = _filter_pnl_events_after(pnl_events, recovered_at)
     pnl_events_for_guard, runtime_guard_loss_scope = _runtime_guard_isolated_bq_pnl_events(
         args=effective_runtime_args,
@@ -19258,6 +19303,12 @@ def _maybe_handle_runtime_guard(
             frozen_short_qty=runtime_frozen_short_qty,
         )
     )
+    target_total_pnl = summarize_runtime_total_pnl(
+        target_pnl_events,
+        start_time=runtime_guard_config.runtime_guard_stats_start_time,
+        now=cycle_started_at,
+        unrealized_pnl=guard_unrealized_pnl,
+    )
     runtime_guard_result = evaluate_runtime_guards(
         config=runtime_guard_config,
         now=cycle_started_at,
@@ -19266,6 +19317,7 @@ def _maybe_handle_runtime_guard(
         actual_net_notional=_safe_float(guard_actual_net_notional),
         synthetic_drift_notional=latest_synthetic_drift_notional,
         unrealized_pnl=_safe_float(guard_unrealized_pnl),
+        target_total_pnl=target_total_pnl,
     )
     runtime_guard_result, _grvt_net_guard_pressure_reduce = (
         defer_grvt_net_guard_to_bounded_pressure_reduce(
@@ -19395,6 +19447,7 @@ def _maybe_handle_runtime_guard(
                     if trigger_reason
                     in {
                         "target_unmet_deadline",
+                        "profit_gated_deadline",
                         "observation_unavailable_at_deadline",
                     }
                     else "condition_unmet"
@@ -19459,6 +19512,7 @@ def _maybe_handle_runtime_guard(
                 if trigger_reason
                 in {
                     "target_unmet_deadline",
+                    "profit_gated_deadline",
                     "observation_unavailable_at_deadline",
                 }
                 else [f"terminal_intent_{trigger_reason}"]
@@ -25104,6 +25158,10 @@ def apply_inventory_unlock_release(
         step_price=step_price,
         tick_size=tick_size,
     )
+    if normalized_side == "long" and floor_price > 0:
+        price = max(price, floor_price)
+    elif normalized_side == "short" and ceiling_price > 0:
+        price = min(price, ceiling_price)
     if price <= 0:
         report["reason"] = "invalid_release_price"
         return report
@@ -37188,6 +37246,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--terminal-drain-stop-preserve-reason", type=str, default=None)
     parser.add_argument("--max-cumulative-notional", type=float, default=None)
+    parser.add_argument("--target-min-total-pnl", type=float, default=None)
     parser.add_argument("--lifecycle-wear-stop-per-10k", type=float, default=None)
     parser.add_argument(
         "--lifecycle-wear-stop-min-gross-notional",
@@ -37557,6 +37616,7 @@ def _validate_terminal_run_contract(args: argparse.Namespace) -> None:
                 "lifecycle_wear_stop_min_gross_notional",
                 None,
             ),
+            target_min_total_pnl=getattr(args, "target_min_total_pnl", None),
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
@@ -38614,11 +38674,32 @@ def main() -> None:
                     )
                 runtime_recovery = _runtime_guard_loss_recovery_state(state)
                 runtime_recovered_at = _parse_state_datetime(runtime_recovery.get("recovered_at"))
+                runtime_target_pnl_events, _runtime_target_pnl_scope = _runtime_guard_isolated_bq_pnl_events(
+                    args=args,
+                    state=state,
+                    pnl_events=runtime_pnl_events,
+                )
                 runtime_pnl_events_for_guard = _filter_pnl_events_after(runtime_pnl_events, runtime_recovered_at)
                 runtime_pnl_events_for_guard, runtime_guard_loss_scope = _runtime_guard_isolated_bq_pnl_events(
                     args=args,
                     state=state,
                     pnl_events=runtime_pnl_events_for_guard,
+                )
+                runtime_strategy_unrealized_pnl_raw = (
+                    plan_report.get("strategy_unrealized_pnl")
+                    if plan_report.get("strategy_unrealized_pnl") is not None
+                    else plan_report.get("unrealized_pnl")
+                )
+                runtime_strategy_unrealized_pnl = (
+                    None
+                    if runtime_strategy_unrealized_pnl_raw is None
+                    else _safe_float(runtime_strategy_unrealized_pnl_raw)
+                )
+                runtime_target_total_pnl = summarize_runtime_total_pnl(
+                    runtime_target_pnl_events,
+                    start_time=runtime_guard_config.runtime_guard_stats_start_time,
+                    now=cycle_started_at,
+                    unrealized_pnl=runtime_strategy_unrealized_pnl,
                 )
                 runtime_guard_result = evaluate_runtime_guards(
                     config=runtime_guard_config,
@@ -38632,11 +38713,8 @@ def main() -> None:
                         _safe_float(plan_report.get("mid_price")),
                         _safe_float(plan_report.get("synthetic_drift_qty")),
                     ),
-                    unrealized_pnl=_safe_float(
-                        plan_report.get("strategy_unrealized_pnl")
-                        if plan_report.get("strategy_unrealized_pnl") is not None
-                        else plan_report.get("unrealized_pnl")
-                    ),
+                    unrealized_pnl=runtime_strategy_unrealized_pnl,
+                    target_total_pnl=runtime_target_total_pnl,
                 )
                 runtime_guard_result, grvt_net_guard_pressure_reduce = (
                     defer_grvt_net_guard_to_bounded_pressure_reduce(
@@ -39173,6 +39251,14 @@ def main() -> None:
                     "rolling_hourly_loss_per_10k_min_notional": runtime_guard_config.rolling_hourly_loss_per_10k_min_notional,
                     "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
                     "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
+                    "target_min_total_pnl": getattr(runtime_guard_config, "target_min_total_pnl", None),
+                    "target_total_pnl": getattr(runtime_guard_result, "target_total_pnl", None),
+                    "target_profit_gate_active": bool(
+                        getattr(runtime_guard_result, "target_profit_gate_active", False)
+                    ),
+                    "target_profit_satisfied": bool(
+                        getattr(runtime_guard_result, "target_profit_satisfied", False)
+                    ),
                     "max_actual_net_notional": runtime_guard_config.max_actual_net_notional,
                     "max_synthetic_drift_notional": runtime_guard_config.max_synthetic_drift_notional,
                     "max_unrealized_loss": runtime_guard_config.max_unrealized_loss,
