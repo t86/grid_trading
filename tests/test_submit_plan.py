@@ -2182,6 +2182,40 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(capped["place_orders"][0]["qty"], 0.0714406923)
         self.assertEqual(capped["reduce_only_position_cap"]["resized_order_count"], 1)
 
+    def test_reduce_only_cap_hedge_counts_existing_close_order_without_reduce_only_flag(self) -> None:
+        capped = cap_reduce_only_place_orders_to_position(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "BUY",
+                        "position_side": "SHORT",
+                        "price": 2.0,
+                        "qty": 0.6,
+                        "notional": 1.2,
+                        "role": "best_quote_reduce_short",
+                        "force_reduce_only": True,
+                    }
+                ],
+                "cancel_orders": [],
+            },
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            current_actual_net_qty=0.0,
+            current_hedge_long_qty=0.0,
+            current_hedge_short_qty=1.0,
+            current_open_orders=[
+                {
+                    "side": "BUY",
+                    "positionSide": "SHORT",
+                    "origQty": "0.7",
+                    "executedQty": "0",
+                    "reduceOnly": False,
+                }
+            ],
+        )
+
+        self.assertEqual(capped["place_orders"][0]["qty"], 0.3)
+        self.assertEqual(capped["reduce_only_position_cap"]["resized_order_count"], 1)
+
     def test_loss_inventory_guard_drops_losing_short_buy_above_recovery_ceiling(self) -> None:
         actions = {
             "place_orders": [
@@ -2968,6 +3002,50 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(capped["place_orders"][0]["role"], "active_delever_short")
         self.assertEqual(capped["cancel_orders"][0]["orderId"], 1019001946)
         self.assertEqual(capped["cancel_orders"][0]["cancel_reason"], "urgent_reduce_only_displaces_take_profit")
+        self.assertEqual(capped["reduce_only_position_cap"]["dropped_order_count"], 0)
+        self.assertEqual(capped["reduce_only_position_cap"]["displaced_order_count"], 1)
+
+    def test_urgent_hedge_reduce_displaces_take_profit_without_reduce_only_flag(self) -> None:
+        capped = cap_reduce_only_place_orders_to_position(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "BUY",
+                        "position_side": "SHORT",
+                        "price": 2.382,
+                        "qty": 1.0,
+                        "notional": 2.382,
+                        "role": "active_delever_short",
+                        "force_reduce_only": True,
+                        "execution_type": "maker_timeout_release",
+                    }
+                ],
+                "cancel_orders": [],
+            },
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            current_actual_net_qty=0.0,
+            current_hedge_long_qty=0.0,
+            current_hedge_short_qty=1.0,
+            current_open_orders=[
+                {
+                    "orderId": 101,
+                    "side": "BUY",
+                    "positionSide": "SHORT",
+                    "origQty": "1.0",
+                    "executedQty": "0",
+                    "reduceOnly": False,
+                    "clientOrderId": "gx-opgu-takeprof-1-abc",
+                }
+            ],
+        )
+
+        self.assertEqual(capped["place_count"], 1)
+        self.assertEqual(capped["cancel_count"], 1)
+        self.assertEqual(capped["cancel_orders"][0]["orderId"], 101)
+        self.assertEqual(
+            capped["cancel_orders"][0]["cancel_reason"],
+            "urgent_reduce_only_displaces_take_profit",
+        )
         self.assertEqual(capped["reduce_only_position_cap"]["dropped_order_count"], 0)
         self.assertEqual(capped["reduce_only_position_cap"]["displaced_order_count"], 1)
 

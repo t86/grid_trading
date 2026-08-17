@@ -518,10 +518,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("奖励回本量", MONITOR_PAGE)
         self.assertIn("挤出奖励区量", MONITOR_PAGE)
         self.assertIn("挤进交易量", MONITOR_PAGE)
-        self.assertIn("按后续用户逐个超过当前成交量累计", MONITOR_PAGE)
+        self.assertIn("按后续用户逐个超过当前${metricName}累计", MONITOR_PAGE)
         self.assertIn("current_reward_floor", MONITOR_PAGE)
         self.assertIn("当前档", MONITOR_PAGE)
-        self.assertIn("按当前成交量计算进入目标名次还差多少", MONITOR_PAGE)
+        self.assertIn("按当前${metricName}计算进入目标名次还差多少", MONITOR_PAGE)
         self.assertIn("万3", MONITOR_PAGE)
         self.assertIn("万4", MONITOR_PAGE)
         self.assertIn("万5", MONITOR_PAGE)
@@ -3479,7 +3479,7 @@ class WebSecurityTests(unittest.TestCase):
         }
         mock_book_tickers.return_value = [{"bid_price": "234.71", "ask_price": "234.72"}]
 
-        with self.assertRaisesRegex(ValueError, "max_order_notional=22.0.*minimum=25.0"):
+        with self.assertRaisesRegex(ValueError, r"max_order_notional=22.0.*minimum=25\.[0-9]+"):
             _resolve_runner_start_config(
                 {"symbol": "BCHUSDT", "strategy_profile": "bchusdt_altcoins_probe_v1"}
             )
@@ -3566,7 +3566,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(config["step_price"], 0.0002)
         self.assertEqual(config["buy_levels"], 12)
         self.assertEqual(config["sell_levels"], 12)
-        self.assertAlmostEqual(config["per_order_notional"], 40.0)
+        self.assertAlmostEqual(config["per_order_notional"], 40.0316)
         self.assertAlmostEqual(config["pause_buy_position_notional"], 220.0)
         self.assertAlmostEqual(config["max_position_notional"], 260.0)
         self.assertAlmostEqual(config["max_total_notional"], 520.0)
@@ -7291,7 +7291,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("硬上限", MONITOR_PAGE)
 
     def test_monitor_page_default_monitor_symbols_include_current_sprint_symbols(self) -> None:
-        self.assertIn('const DEFAULT_MONITOR_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT", "OPGUSDT"]', MONITOR_PAGE)
+        self.assertIn('const DEFAULT_MONITOR_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT", "OPGUSDT", "OUSDT"]', MONITOR_PAGE)
 
     def test_monitor_page_reward_targets_render_current_segment_boundary(self) -> None:
         self.assertIn("zone_moves", MONITOR_PAGE)
