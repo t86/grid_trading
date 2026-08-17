@@ -27,6 +27,7 @@ from .futures_recovery_coordinator import (
     ManagedProfile,
     OrderRole,
     RecoveryPhase,
+    RecoveryRevisionConflictError,
     RecoveryState,
 )
 from .recovery_control_ownership import (
@@ -898,11 +899,34 @@ def _encode_state(state: RecoveryState) -> dict[str, Any]:
     return encoded
 
 
+def _normalize_baseline_change_extension(payload: Any) -> Any:
+    if not isinstance(payload, MappingABC):
+        return payload
+    compatible = dict(payload)
+    raw_changes = payload.get("baseline_changes")
+    if raw_changes is None and "baseline_changes" not in payload:
+        compatible["baseline_changes"] = []
+        return compatible
+    if not isinstance(raw_changes, (list, tuple)):
+        return compatible
+    changes: list[Any] = []
+    for raw_record in raw_changes:
+        if not isinstance(raw_record, MappingABC):
+            changes.append(raw_record)
+            continue
+        record = dict(raw_record)
+        raw_request = raw_record.get("request")
+        if isinstance(raw_request, MappingABC):
+            request = dict(raw_request)
+            request.setdefault("expected_baseline_digest", None)
+            record["request"] = request
+        changes.append(record)
+    compatible["baseline_changes"] = changes
+    return compatible
+
+
 def _decode_state(payload: Any) -> RecoveryState:
-    compatible_payload = payload
-    if isinstance(payload, MappingABC) and "baseline_changes" not in payload:
-        compatible_payload = dict(payload)
-        compatible_payload["baseline_changes"] = []
+    compatible_payload = _normalize_baseline_change_extension(payload)
     state = _decode_typed(compatible_payload, RecoveryState, path="state")
     if not isinstance(state, RecoveryState):
         raise RecoveryStateCorruptError("decoded recovery state has the wrong type")
@@ -950,8 +974,8 @@ def _canonical_comparison_envelope(envelope: Any) -> Any:
     if not isinstance(copied, dict) or copied.get("schema_version") != 1:
         return copied
     state = copied.get("state")
-    if isinstance(state, dict) and "baseline_changes" not in state:
-        state["baseline_changes"] = []
+    if isinstance(state, dict):
+        copied["state"] = _normalize_baseline_change_extension(state)
     return copied
 
 
@@ -1372,6 +1396,7 @@ class JsonRecoveryStore:
         *,
         expected_revision: int,
         next_state: RecoveryState,
+        expected_baseline_digest: str | None = None,
     ) -> None:
         normalized = _normalize_symbol(symbol)
         if type(expected_revision) is not int or expected_revision < 0:
@@ -1386,8 +1411,13 @@ class JsonRecoveryStore:
         ):
             document = self._read_document(allow_missing=False)
             current = self._decode_document_state(document, normalized)
+            if (
+                expected_baseline_digest is not None
+                and current.baseline_profile.digest != expected_baseline_digest
+            ):
+                raise ValueError("baseline change expected_baseline_digest conflict")
             if current.document_revision != expected_revision:
-                raise RuntimeError(
+                raise RecoveryRevisionConflictError(
                     f"recovery revision conflict for {normalized}: "
                     f"expected {expected_revision}, "
                     f"actual {current.document_revision}"

@@ -40,6 +40,10 @@ NEW_BASELINE = {
     "hard_loss_forced_reduce_enabled": True,
     "volatility_entry_pause_enabled": False,
 }
+BASELINE_DIGEST = recovery.materialize_profile(
+    baseline=BASELINE,
+    action_id=recovery.ActionId.NOOP,
+).digest
 
 
 def _snapshot(
@@ -64,6 +68,7 @@ def _request(
     attempt_id: str = "attempt-1",
     candidate: dict[str, object] | None = None,
     requested_at: datetime = NOW,
+    expected_baseline_digest: str = BASELINE_DIGEST,
 ) -> object:
     return recovery.BaselineChange.create(
         symbol="ARXUSDT",
@@ -71,6 +76,7 @@ def _request(
         attempt_id=attempt_id,
         source="test",
         requested_at=requested_at,
+        expected_baseline_digest=expected_baseline_digest,
         candidate_baseline=candidate or NEW_BASELINE,
     )
 
@@ -163,6 +169,9 @@ def test_web_active_baseline_change_is_durable_across_restart(tmp_path: Path) ->
     assert restarted_state.desired_profile == before_profile
     assert restarted_state.baseline_change is not None
     assert restarted_state.baseline_change.request.operation_id == "web-baseline-op"
+    assert restarted_state.baseline_change.request.expected_baseline_digest == (
+        active.baseline_profile.digest
+    )
     assert (
         "recovery_order_side"
         not in restarted_state.baseline_change.request.candidate_profile.fields
@@ -371,6 +380,17 @@ def test_stable_round_applies_baseline_once_and_restarts_once(tmp_path: Path) ->
     assert store.read("ARXUSDT") == applied_state
     assert len(effects) == 1
 
+    retry_from_applied_baseline = coordinator.change_baseline(
+        _request(
+            attempt_id="attempt-3",
+            requested_at=NOW + timedelta(seconds=2, milliseconds=1),
+            expected_baseline_digest=applied_state.baseline_profile.digest,
+        )
+    )
+    assert retry_from_applied_baseline.status is recovery.BaselineChangeStatus.APPLIED
+    assert store.read("ARXUSDT") == applied_state
+    assert len(effects) == 1
+
     receipt = recovery.EffectReceipt(
         decision_id=str(applied_state.decision_id),
         stage=recovery.EffectStage.RUNNER_RESTART,
@@ -568,6 +588,71 @@ def test_operation_id_is_idempotent_but_cannot_change_payload(tmp_path: Path) ->
     assert store.read("ARXUSDT") == first_state
 
 
+def test_stale_expected_baseline_digest_rejects_without_writing(tmp_path: Path) -> None:
+    control_path = tmp_path / "arxusdt_loop_runner_control.json"
+    store = _register(control_path)
+    inherited = store.read("ARXUSDT")
+    request = recovery.BaselineChange.create(
+        symbol="ARXUSDT",
+        operation_id="stale-baseline-op",
+        attempt_id="stale-baseline-attempt",
+        source="test",
+        requested_at=NOW,
+        expected_baseline_digest=inherited.baseline_profile.digest,
+        candidate_baseline=NEW_BASELINE,
+    )
+    replacement = recovery.materialize_profile(
+        baseline={**BASELINE, "step_price": 0.0008},
+        action_id=recovery.ActionId.NOOP,
+    )
+    store.compare_and_swap(
+        "ARXUSDT",
+        expected_revision=inherited.document_revision,
+        next_state=replace(
+            inherited,
+            document_revision=inherited.document_revision + 1,
+            generation=inherited.generation + 1,
+            baseline_profile=replacement,
+            desired_profile=replacement,
+        ),
+    )
+    before = control_path.read_bytes()
+
+    with pytest.raises(ValueError, match="expected_baseline_digest.*conflict"):
+        _coordinator(store).change_baseline(request)
+
+    assert control_path.read_bytes() == before
+    assert store.read("ARXUSDT").baseline_change is None
+
+
+def test_same_baseline_digest_allows_request_after_active_revision_advance(
+    tmp_path: Path,
+) -> None:
+    control_path = tmp_path / "arxusdt_loop_runner_control.json"
+    store = _register(control_path)
+    inherited = store.read("ARXUSDT")
+    request = recovery.BaselineChange.create(
+        symbol="ARXUSDT",
+        operation_id="active-same-baseline-op",
+        attempt_id="active-same-baseline-attempt",
+        source="test",
+        requested_at=NOW,
+        expected_baseline_digest=inherited.baseline_profile.digest,
+        candidate_baseline=NEW_BASELINE,
+    )
+    active = _make_active(store)
+
+    outcome = _coordinator(store).change_baseline(request)
+    saved = store.read("ARXUSDT")
+
+    assert outcome.status is recovery.BaselineChangeStatus.DEFERRED
+    assert saved.phase is recovery.RecoveryPhase.ACTIVE
+    assert saved.active_action is active.active_action
+    assert saved.baseline_change is not None
+    assert saved.baseline_change.request.expected_baseline_digest == (
+        inherited.baseline_profile.digest
+    )
+
 def test_corrupt_control_is_not_overwritten_by_baseline_change(tmp_path: Path) -> None:
     control_path = tmp_path / "arxusdt_loop_runner_control.json"
     control_path.write_bytes(b"{corrupt recovery control")
@@ -606,6 +691,7 @@ def test_baseline_change_rejects_non_finite_and_cross_symbol_candidates() -> Non
             attempt_id="attempt-1",
             source="test",
             requested_at=NOW,
+            expected_baseline_digest=BASELINE_DIGEST,
             candidate_baseline={**NEW_BASELINE, "symbol": "BCHUSDT"},
         )
     with pytest.raises(ValueError):
@@ -615,6 +701,7 @@ def test_baseline_change_rejects_non_finite_and_cross_symbol_candidates() -> Non
             attempt_id="attempt-1",
             source="test",
             requested_at=NOW,
+            expected_baseline_digest=BASELINE_DIGEST,
             candidate_baseline={**NEW_BASELINE, "step_price": float("nan")},
         )
 
@@ -632,3 +719,22 @@ def test_existing_schema_v1_envelope_without_baseline_change_remains_readable(
     recovered = JsonRecoveryStore(control_path).read("ARXUSDT")
 
     assert recovered.baseline_change is None
+
+
+def test_existing_schema_v1_baseline_change_without_expected_digest_is_readable(
+    tmp_path: Path,
+) -> None:
+    control_path = tmp_path / "arxusdt_loop_runner_control.json"
+    store = _register(control_path)
+    _coordinator(store).change_baseline(_request())
+    document = json.loads(control_path.read_text(encoding="utf-8"))
+    for slot in (RECOVERY_STATE_KEY, RECOVERY_STATE_MIRROR_KEY):
+        document[slot]["state"]["baseline_changes"][0]["request"].pop(
+            "expected_baseline_digest"
+        )
+    control_path.write_text(json.dumps(document), encoding="utf-8")
+
+    recovered = JsonRecoveryStore(control_path).read("ARXUSDT")
+
+    assert recovered.baseline_change is not None
+    assert recovered.baseline_change.request.expected_baseline_digest is None

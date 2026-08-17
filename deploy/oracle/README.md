@@ -429,10 +429,11 @@ the deadlock self-heal, so those become redundant once it is wired.
 ### Cron wiring (per host, run from the app dir as `ubuntu`)
 
 旧 `daily_reset`（08:00 目标/参数滚动 + 直接重启）仍可存在于各账户的 `output/ops/`，但只能用于
-未注册 symbol。对已注册 symbol，`roll_competition_window.py` 只在严格 `STABLE` 且无 lease、清理义务、
-激活/执行阶段时，在同一 symbol 锁内由 `BASELINE_REBASE` 原子更新新窗口的运行契约/所有者，并写入唯一待处理、
-受执行栅栏保护的 `RUNNER_RESTART`。滚动脚本本身不调用 systemd；守卫下一轮执行该重启并等待当前代际
-回执。非 `STABLE` 或有未完成义务时返回 `deferred` 且零写入；不清空守卫状态、租约、订单清单或成交回执。
+未注册 symbol。对已注册 symbol，`roll_competition_window.py` 把基于 durable baseline 构造的新窗口、目标和
+run-contract owner 作为 `BaselineChange` 提交给恢复协调器。非 `STABLE` 或有更高优先级动作时，只持久化
+`deferred` request；不改变 live profile、phase、action、pending effect，也不清空守卫状态、租约、订单清单
+或成交回执。后续正常协调循环在可执行时统一应用 `BASELINE_REBASE` 并调度 fenced restart；滚动脚本本身
+不调用 systemd。
 目标闸门中的旧 `--wear-stop` / `--first` 参数仅为兼容旧 cron 的弃用解析参数，不再具有授权能力。
 是否启用磨损退出只取决于运行契约同时固化的 `lifecycle_wear_stop_per_10k` 与
 `lifecycle_wear_stop_min_gross_notional`；两者缺失时磨损退出关闭，不能由进程启动参数临时打开或关闭。

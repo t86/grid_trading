@@ -105,6 +105,7 @@ _MANAGED_ORDER_ACTIONS = frozenset(
     }
 )
 _CLIENT_ORDER_ID_RE = re.compile(r"^[.A-Z:/a-z0-9_-]{1,36}$")
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,7 @@ class BaselineChange:
     attempt_id: str
     source: str
     requested_at: datetime
+    expected_baseline_digest: str | None
     candidate_profile: ManagedProfile
 
     def __post_init__(self) -> None:
@@ -155,6 +157,10 @@ class BaselineChange:
                 raise ValueError(f"baseline change {name} is invalid")
         if self.requested_at.tzinfo is None or self.requested_at.utcoffset() is None:
             raise ValueError("baseline change requested_at must be timezone-aware")
+        if self.expected_baseline_digest is not None and not _SHA256_HEX_RE.fullmatch(
+            self.expected_baseline_digest
+        ):
+            raise ValueError("baseline change expected_baseline_digest is invalid")
         if self.candidate_profile.execution_policy != ExecutionPolicy():
             raise ValueError("baseline change execution policy must be LIMIT/GTX/post-only")
         candidate_symbol = self.candidate_profile.fields.get("symbol")
@@ -170,6 +176,7 @@ class BaselineChange:
         attempt_id: str,
         source: str,
         requested_at: datetime,
+        expected_baseline_digest: str,
         candidate_baseline: Mapping[str, JsonValue],
     ) -> "BaselineChange":
         normalized = str(symbol).upper().strip()
@@ -186,6 +193,7 @@ class BaselineChange:
             attempt_id=attempt_id,
             source=source,
             requested_at=requested_at,
+            expected_baseline_digest=expected_baseline_digest,
             candidate_profile=materialize_profile(
                 baseline=candidate,
                 action_id=ActionId.NOOP,
@@ -3541,7 +3549,12 @@ class RecoveryStore(Protocol):
         *,
         expected_revision: int,
         next_state: RecoveryState,
+        expected_baseline_digest: str | None = None,
     ) -> None: ...
+
+
+class RecoveryRevisionConflictError(RuntimeError):
+    """The symbol advanced after a coordinator read but before its CAS."""
 
 
 class InMemoryRecoveryStore:
@@ -3579,11 +3592,17 @@ class InMemoryRecoveryStore:
         *,
         expected_revision: int,
         next_state: RecoveryState,
+        expected_baseline_digest: str | None = None,
     ) -> None:
         normalized = symbol.upper().strip()
         current = self.read(normalized)
+        if (
+            expected_baseline_digest is not None
+            and current.baseline_profile.digest != expected_baseline_digest
+        ):
+            raise ValueError("baseline change expected_baseline_digest conflict")
         if current.document_revision != expected_revision:
-            raise RuntimeError(
+            raise RecoveryRevisionConflictError(
                 f"recovery revision conflict for {normalized}: "
                 f"expected {expected_revision}, actual {current.document_revision}"
             )
@@ -3622,50 +3641,57 @@ class FuturesRecoveryCoordinator:
     ) -> BaselineChangeOutcome:
         if not isinstance(request, BaselineChange):
             raise TypeError("baseline change request must be typed")
-        state = self.store.read(request.symbol)
-        if state.symbol != request.symbol:
-            raise ValueError("baseline change symbol does not match registered state")
-        for record in state.baseline_changes:
-            if record.request.operation_id != request.operation_id:
-                continue
-            if record.request.payload_digest != request.payload_digest:
-                raise ValueError(
-                    "baseline change operation_id reused with different payload"
+        while True:
+            state = self.store.read(request.symbol)
+            if state.symbol != request.symbol:
+                raise ValueError("baseline change symbol does not match registered state")
+            for record in state.baseline_changes:
+                if record.request.operation_id != request.operation_id:
+                    continue
+                if record.request.payload_digest != request.payload_digest:
+                    raise ValueError(
+                        "baseline change operation_id reused with different payload"
+                    )
+                return BaselineChangeOutcome(
+                    symbol=request.symbol,
+                    operation_id=request.operation_id,
+                    attempt_id=request.attempt_id,
+                    status=record.status,
+                    requested_at=request.requested_at,
+                    applied_at=record.applied_at,
+                    applied_round_id=record.applied_round_id,
                 )
+            if state.baseline_profile.digest != request.expected_baseline_digest:
+                raise ValueError("baseline change expected_baseline_digest conflict")
+            if any(
+                record.status is BaselineChangeStatus.DEFERRED
+                for record in state.baseline_changes
+            ):
+                raise ValueError("another baseline change operation is already deferred")
+            next_state = replace(
+                state,
+                document_revision=state.document_revision + 1,
+                baseline_changes=(
+                    *state.baseline_changes,
+                    BaselineChangeRecord(request=request),
+                ),
+            )
+            try:
+                self.store.compare_and_swap(
+                    request.symbol,
+                    expected_revision=state.document_revision,
+                    next_state=next_state,
+                    expected_baseline_digest=request.expected_baseline_digest,
+                )
+            except RecoveryRevisionConflictError:
+                continue
             return BaselineChangeOutcome(
                 symbol=request.symbol,
                 operation_id=request.operation_id,
                 attempt_id=request.attempt_id,
-                status=record.status,
+                status=BaselineChangeStatus.DEFERRED,
                 requested_at=request.requested_at,
-                applied_at=record.applied_at,
-                applied_round_id=record.applied_round_id,
             )
-        if any(
-            record.status is BaselineChangeStatus.DEFERRED
-            for record in state.baseline_changes
-        ):
-            raise ValueError("another baseline change operation is already deferred")
-        next_state = replace(
-            state,
-            document_revision=state.document_revision + 1,
-            baseline_changes=(
-                *state.baseline_changes,
-                BaselineChangeRecord(request=request),
-            ),
-        )
-        self.store.compare_and_swap(
-            request.symbol,
-            expected_revision=state.document_revision,
-            next_state=next_state,
-        )
-        return BaselineChangeOutcome(
-            symbol=request.symbol,
-            operation_id=request.operation_id,
-            attempt_id=request.attempt_id,
-            status=BaselineChangeStatus.DEFERRED,
-            requested_at=request.requested_at,
-        )
 
     def reconcile_symbol(
         self,

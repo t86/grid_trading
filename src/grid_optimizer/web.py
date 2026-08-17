@@ -11609,6 +11609,7 @@ def _submit_registered_runner_baseline_change(
             else "web_runner_config_save"
         ),
         requested_at=_baseline_change_requested_at(payload.get("requested_at")),
+        expected_baseline_digest=state.baseline_profile.digest,
         candidate_baseline=candidate,
     )
 

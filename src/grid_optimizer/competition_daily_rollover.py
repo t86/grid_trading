@@ -88,6 +88,7 @@ def _submit_registered_rollover(
         attempt_id=f"competition-daily-roll-attempt:{uuid.uuid4().hex}",
         source="competition_daily_rollover",
         requested_at=now.astimezone(timezone.utc),
+        expected_baseline_digest=state.baseline_profile.digest,
         candidate_baseline=prepared,
     )
     coordinator = FuturesRecoveryCoordinator(

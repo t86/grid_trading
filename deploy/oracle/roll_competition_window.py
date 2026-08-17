@@ -187,6 +187,7 @@ def submit_registered_roll(
         attempt_id=f"competition-window-roll-attempt:{uuid.uuid4().hex}",
         source="roll_competition_window",
         requested_at=now,
+        expected_baseline_digest=state.baseline_profile.digest,
         candidate_baseline=candidate,
     )
     store = JsonRecoveryStore(control_path)

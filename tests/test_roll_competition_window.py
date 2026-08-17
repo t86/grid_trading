@@ -294,6 +294,9 @@ def test_registered_stable_roll_updates_only_lifecycle_and_defers_managed_profil
     assert saved_recovery_state.desired_profile == original_recovery_state.desired_profile
     assert saved_recovery_state.baseline_change is not None
     assert saved_recovery_state.baseline_change.status.value == "deferred"
+    assert saved_recovery_state.baseline_change.request.expected_baseline_digest == (
+        original_recovery_state.baseline_profile.digest
+    )
     assert saved["step_price"] == 0.0005
     assert saved["max_actual_net_notional"] == 1_000.0
     assert saved["best_quote_maker_volume_cycle_budget_notional"] == 360.0

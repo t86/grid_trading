@@ -98,6 +98,9 @@ def test_registered_daily_roll_submits_durable_request_without_direct_write_or_r
     assert fresh.desired_profile == before.desired_profile
     assert fresh.baseline_change is not None
     assert fresh.baseline_change.status is BaselineChangeStatus.DEFERRED
+    assert fresh.baseline_change.request.expected_baseline_digest == (
+        before.baseline_profile.digest
+    )
     assert fresh.baseline_change.request.operation_id == (
         "competition-daily-roll:ARXUSDT:2026-08-17T00:00:00+00:00"
     )
