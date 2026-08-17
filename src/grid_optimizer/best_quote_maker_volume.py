@@ -446,8 +446,13 @@ def build_best_quote_maker_volume_plan(
     soft_ratio = _clamp(_safe_float(config.inventory_soft_ratio), 0.0, 1.0)
     long_soft = long_limit * soft_ratio if long_limit > 0 else 0.0
     short_soft = short_limit * soft_ratio if short_limit > 0 else 0.0
-    long_entry_ceiling = long_soft if long_soft > 0 else long_limit
-    short_entry_ceiling = short_soft if short_soft > 0 else short_limit
+    soft_entry_buffer = max(_safe_float(inputs.min_notional), 0.0)
+    long_entry_ceiling = (
+        max(long_soft - soft_entry_buffer, 0.0) if long_soft > 0 else long_limit
+    )
+    short_entry_ceiling = (
+        max(short_soft - soft_entry_buffer, 0.0) if short_soft > 0 else short_limit
+    )
 
     def _cap_entry_to_soft_headroom(
         requested_notional: float,

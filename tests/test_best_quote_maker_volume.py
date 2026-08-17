@@ -242,8 +242,8 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
             for order in plan["sell_orders"]
             if order["role"] == "best_quote_entry_short"
         )
-        self.assertLessEqual(long_entry_notional, 50.0 + 1e-6)
-        self.assertLessEqual(short_entry_notional, 30.0 + 1e-6)
+        self.assertLessEqual(long_entry_notional, 45.0 + 1e-6)
+        self.assertLessEqual(short_entry_notional, 25.0 + 1e-6)
 
     def test_inventory_bias_stops_heavy_side_and_caps_light_side_at_soft_headroom(self) -> None:
         plan = build_best_quote_maker_volume_plan(
