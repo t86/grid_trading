@@ -11382,14 +11382,48 @@ class LoopRunnerTests(unittest.TestCase):
             78675939,
         )
 
-    def test_grvt_below_soft_keeps_planned_and_filled_pair_guards(self) -> None:
+    def test_grvt_below_soft_keeps_pair_guards_until_cooldown_expires(self) -> None:
         for source in ("active_pair_reduce", "active_pair_reduce_fill"):
             with self.subTest(source=source):
                 self.assertFalse(
                     _allow_grvt_reentry_below_soft_bypass(
-                        {"active": True, "source": source}
+                        {
+                            "active": True,
+                            "source": source,
+                            "min_remaining_seconds": 1.0,
+                        }
                     )
                 )
+                self.assertTrue(
+                    _allow_grvt_reentry_below_soft_bypass(
+                        {
+                            "active": True,
+                            "source": source,
+                            "min_remaining_seconds": 0.0,
+                        }
+                    )
+                )
+
+    def test_grvt_below_soft_bypass_uses_expired_fill_side_when_other_pair_side_is_pending(self) -> None:
+        self.assertTrue(
+            _allow_grvt_reentry_below_soft_bypass(
+                {
+                    "active": True,
+                    "source": "active_pair_reduce",
+                    "min_remaining_seconds": 56.0,
+                    "side_guards": {
+                        "BUY": {
+                            "source": "active_pair_reduce_fill",
+                            "min_remaining_seconds": 0.0,
+                        },
+                        "SELL": {
+                            "source": "active_pair_reduce",
+                            "min_remaining_seconds": 56.0,
+                        },
+                    },
+                }
+            )
+        )
 
     def test_loss_reduce_reentry_guard_keeps_active_pair_memory_below_soft(self) -> None:
         now = datetime(2026, 8, 15, 5, 20, tzinfo=timezone.utc)

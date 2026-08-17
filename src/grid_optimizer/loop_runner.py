@@ -1932,12 +1932,31 @@ def _record_loss_reduce_reentry_fill_guard(
 def _allow_grvt_reentry_below_soft_bypass(loss_reduce_reentry_guard: dict[str, Any]) -> bool:
     if not bool(loss_reduce_reentry_guard.get("active")):
         return False
-    return str(loss_reduce_reentry_guard.get("source") or "") not in {
-        "active_pair_reduce",
-        "active_pair_reduce_fill",
-        "adverse_reduce",
-        "hard_loss",
-    }
+    protected_sources = {"adverse_reduce", "hard_loss"}
+    active_pair_sources = {"active_pair_reduce", "active_pair_reduce_fill"}
+    source = str(loss_reduce_reentry_guard.get("source") or "")
+    if source in protected_sources:
+        return False
+    if source not in active_pair_sources:
+        return True
+
+    side_guards = loss_reduce_reentry_guard.get("side_guards")
+    if isinstance(side_guards, dict):
+        for side_guard in side_guards.values():
+            if not isinstance(side_guard, dict):
+                continue
+            if str(side_guard.get("source") or "") not in active_pair_sources:
+                continue
+            if (
+                "min_remaining_seconds" in side_guard
+                and _safe_float(side_guard.get("min_remaining_seconds")) <= 0
+            ):
+                return True
+        return False
+    return (
+        "min_remaining_seconds" in loss_reduce_reentry_guard
+        and _safe_float(loss_reduce_reentry_guard.get("min_remaining_seconds")) <= 0
+    )
 
 
 def _loss_reduce_trade_rows_to_execution_events(
