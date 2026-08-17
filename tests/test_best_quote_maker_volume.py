@@ -310,6 +310,53 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual(report["retained_notional"], 200.0)
         self.assertEqual(report["reducible_notional"], 195.0)
 
+    def test_four_leg_profit_reduce_prefers_nearest_profitable_entry_lot(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                four_leg_cycle_enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.90,
+                min_cycle_budget_notional=400.0,
+            ),
+            inputs=_inputs(
+                bid_price=100.0,
+                ask_price=100.1,
+                mid_price=100.0,
+                cycle_budget_notional=800.0,
+                entry_ladder_spacing=0.5,
+                tick_size=0.1,
+                step_size=0.001,
+                position_side_mode="hedge",
+                current_long_qty=5.0,
+                current_short_qty=5.0,
+                current_long_avg_price=101.0,
+                current_short_avg_price=99.0,
+                current_long_lots=[
+                    {"qty": 1.0, "price": 102.0, "role": "best_quote_entry_long"},
+                    {"qty": 1.0, "price": 99.5, "role": "best_quote_entry_long"},
+                ],
+                current_short_lots=[
+                    {"qty": 1.0, "price": 98.0, "role": "best_quote_entry_short"},
+                    {"qty": 1.0, "price": 100.5, "role": "best_quote_entry_short"},
+                ],
+            ),
+        )
+
+        orders = [*plan["buy_orders"], *plan["sell_orders"]]
+        long_reduce = next(
+            order for order in orders if order["role"] == "best_quote_reduce_long"
+        )
+        short_reduce = next(
+            order for order in orders if order["role"] == "best_quote_reduce_short"
+        )
+        self.assertEqual(long_reduce["price"], 100.1)
+        self.assertEqual(short_reduce["price"], 100.0)
+        report = plan["metrics"]["four_leg_cycle"]["roles"]
+        self.assertEqual(report["long_profit_reduce"]["position_cost"], 99.5)
+        self.assertEqual(report["short_profit_reduce"]["position_cost"], 100.5)
+
     def test_four_leg_profit_reduce_does_not_repeat_without_an_unreleased_entry_lot(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(

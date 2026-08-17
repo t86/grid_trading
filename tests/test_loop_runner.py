@@ -4299,6 +4299,12 @@ class LoopRunnerTests(unittest.TestCase):
                         "source": "trade_fill",
                         "role": "best_quote_entry_short",
                     },
+                    {
+                        "qty": 2.0,
+                        "price": 100.5,
+                        "source": "trade_fill",
+                        "role": "best_quote_entry_short",
+                    },
                 ],
                 "last_trade_time_ms": 1000,
                 "last_trade_keys_at_time": [],
@@ -4313,7 +4319,7 @@ class LoopRunnerTests(unittest.TestCase):
                 api_secret="",
                 recv_window=5000,
                 current_long_qty=0.0,
-                current_short_qty=5.0,
+                current_short_qty=7.0,
                 current_long_avg_price=0.0,
                 current_short_avg_price=99.0,
                 mid_price=100.0,
@@ -4332,15 +4338,17 @@ class LoopRunnerTests(unittest.TestCase):
             )
 
         remaining = state["best_quote_volume_ledger"]["short_lots"]
-        self.assertEqual(len(remaining), 1)
+        self.assertEqual(len(remaining), 2)
         self.assertEqual(
-            remaining[0]["source"],
-            "bootstrap_from_exchange_managed_position",
+            [(item["source"], item["price"], item["qty"]) for item in remaining],
+            [
+                ("trade_fill", 98.8, 2.0),
+                ("bootstrap_from_exchange_managed_position", 99.0, 5.0),
+            ],
         )
-        self.assertEqual(remaining[0]["qty"], 5.0)
         self.assertAlmostEqual(
             state["best_quote_volume_ledger"]["realized_pnl"],
-            1.0,
+            4.4,
         )
 
     def test_best_quote_volume_ledger_counts_hardloss_order_ref_with_unknown_book(self) -> None:

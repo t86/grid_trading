@@ -2102,6 +2102,12 @@ def build_best_quote_maker_volume_plan(
                         "target_price": None,
                     }
                     return
+                eligible_lots.sort(
+                    key=lambda lot: _safe_float(
+                        lot.get("price", lot.get("entry_price"))
+                    ),
+                    reverse=position_side == "SHORT",
+                )
                 position_cost = _safe_float(
                     eligible_lots[0].get("price", eligible_lots[0].get("entry_price"))
                 )

@@ -3516,6 +3516,10 @@ def _best_quote_volume_consume_entry_lots_first(
         for item in lots
         if str(item.get("role") or "") == entry_role
     ]
+    preferred.sort(
+        key=lambda item: max(_safe_float(item.get("price")), 0.0),
+        reverse=entry_role == "best_quote_entry_short",
+    )
     fallback = [
         dict(item)
         for item in lots
