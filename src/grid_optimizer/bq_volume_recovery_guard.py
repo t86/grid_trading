@@ -84,6 +84,7 @@ from .futures_recovery_store import (
     RECOVERY_STATE_KEY,
     RECOVERY_STATE_MIRROR_KEY,
     RecoveryStateStoreError,
+    decode_recovery_control_state,
     recovery_coordinator_registered,
 )
 from .recovery_control_ownership import (
@@ -11219,6 +11220,12 @@ def check_symbol(
 
 _REGISTERED_RUNTIME_EVIDENCE_KEY = "registered_recovery_runtime_evidence"
 _REGISTERED_RUNTIME_EVIDENCE_SCHEMA = "registered_recovery_runtime_v1"
+_REGISTERED_RUNNER_EFFECT_RECEIPT_KEY = (
+    "registered_recovery_runner_effect_receipt"
+)
+_REGISTERED_RUNNER_EFFECT_RECEIPT_SCHEMA = (
+    "registered_recovery_runner_effect_receipt_v1"
+)
 _REGISTERED_FLOW_OBSERVATION_KEY = "registered_recovery_flow_observation"
 _REGISTERED_FLOW_OBSERVATION_SCHEMA = "registered_recovery_flow_observation_v1"
 _REGISTERED_READINESS_OBSERVATION_KEY = (
@@ -11227,6 +11234,137 @@ _REGISTERED_READINESS_OBSERVATION_KEY = (
 _REGISTERED_READINESS_OBSERVATION_SCHEMA = (
     "registered_recovery_readiness_observation_v1"
 )
+
+
+@dataclass(frozen=True)
+class _RegisteredRunnerEffectReceipt:
+    symbol: str
+    generation: int
+    decision_id: str
+    stage: EffectStage
+    effect_epoch: int
+    observed_at: datetime
+
+    def effect_receipt(self) -> EffectReceipt:
+        return EffectReceipt(
+            decision_id=self.decision_id,
+            stage=self.stage,
+            effect_epoch=self.effect_epoch,
+            observed_at=self.observed_at,
+        )
+
+
+def _decode_registered_runner_effect_receipt(
+    document: Mapping[str, Any],
+    *,
+    expected_symbol: str,
+) -> _RegisteredRunnerEffectReceipt | None:
+    raw = document.get(_REGISTERED_RUNNER_EFFECT_RECEIPT_KEY)
+    if raw is None:
+        return None
+    required = {
+        "schema",
+        "symbol",
+        "generation",
+        "decision_id",
+        "stage",
+        "effect_epoch",
+        "observed_at",
+    }
+    if not isinstance(raw, Mapping) or set(raw) != required:
+        raise ValueError("registered runner effect receipt shape is invalid")
+    if raw.get("schema") != _REGISTERED_RUNNER_EFFECT_RECEIPT_SCHEMA:
+        raise ValueError("registered runner effect receipt schema is invalid")
+    symbol = raw.get("symbol")
+    if symbol != expected_symbol:
+        raise ValueError("registered runner effect receipt symbol mismatch")
+    generation = raw.get("generation")
+    if type(generation) is not int or generation < 0:
+        raise ValueError("registered runner effect receipt generation is invalid")
+    decision_id = raw.get("decision_id")
+    if (
+        not isinstance(decision_id, str)
+        or not decision_id
+        or decision_id != decision_id.strip()
+    ):
+        raise ValueError("registered runner effect receipt decision is invalid")
+    try:
+        stage = EffectStage(str(raw.get("stage")))
+    except ValueError as exc:
+        raise ValueError("registered runner effect receipt stage is invalid") from exc
+    if stage not in {EffectStage.RUNNER_RESTART, EffectStage.RUNNER_STOP}:
+        raise ValueError("registered runner effect receipt stage is invalid")
+    effect_epoch = raw.get("effect_epoch")
+    if type(effect_epoch) is not int or effect_epoch < 0:
+        raise ValueError("registered runner effect receipt epoch is invalid")
+    observed_at_raw = raw.get("observed_at")
+    if not isinstance(observed_at_raw, str):
+        raise ValueError("registered runner effect receipt time is invalid")
+    try:
+        observed_at = datetime.fromisoformat(
+            observed_at_raw.replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise ValueError("registered runner effect receipt time is invalid") from exc
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("registered runner effect receipt time is invalid")
+    return _RegisteredRunnerEffectReceipt(
+        symbol=symbol,
+        generation=generation,
+        decision_id=decision_id,
+        stage=stage,
+        effect_epoch=effect_epoch,
+        observed_at=observed_at,
+    )
+
+
+def _encode_registered_runner_effect_receipt(
+    receipt: _RegisteredRunnerEffectReceipt,
+) -> dict[str, Any]:
+    return {
+        "schema": _REGISTERED_RUNNER_EFFECT_RECEIPT_SCHEMA,
+        "symbol": receipt.symbol,
+        "generation": receipt.generation,
+        "decision_id": receipt.decision_id,
+        "stage": receipt.stage.value,
+        "effect_epoch": receipt.effect_epoch,
+        "observed_at": receipt.observed_at.isoformat(),
+    }
+
+
+def _registered_runner_receipt_for_state(
+    receipt: _RegisteredRunnerEffectReceipt | None,
+    *,
+    recovery_state: Any,
+    now: datetime,
+) -> EffectReceipt | None:
+    if receipt is None:
+        return None
+    if receipt.observed_at > now:
+        raise ValueError("registered runner effect receipt is from the future")
+    if (
+        receipt.generation != recovery_state.generation
+        or receipt.decision_id != recovery_state.decision_id
+    ):
+        return None
+    if recovery_state.pending_effect_stage not in {
+        EffectStage.RUNNER_RESTART,
+        EffectStage.RUNNER_STOP,
+    }:
+        return None
+    pending_epoch = recovery_state.pending_effect_epoch
+    if pending_epoch is None:
+        return None
+    if receipt.effect_epoch < pending_epoch:
+        return None
+    if (
+        receipt.effect_epoch > pending_epoch
+        or receipt.stage is not recovery_state.pending_effect_stage
+    ):
+        raise ValueError(
+            "registered runner effect receipt conflicts with current pending effect"
+        )
+    return receipt.effect_receipt()
 
 
 def _normal_entry_side(row: Mapping[str, Any]) -> Side | None:
@@ -12004,6 +12142,128 @@ def _store_registered_runtime_evidence(
     }
 
 
+def _execute_registered_runner_effect(
+    *,
+    control_path: Path,
+    lock_timeout_seconds: float,
+    effect_symbol: str,
+    command: Any,
+    now: datetime,
+    runtime_item: dict[str, Any],
+    restart: RestartRunner,
+    stop: RestartRunner,
+) -> None:
+    if command.stage not in {
+        EffectStage.RUNNER_RESTART,
+        EffectStage.RUNNER_STOP,
+    }:
+        raise ValueError("registered runner effect command stage is invalid")
+    with exclusive_control_lock(
+        control_path,
+        timeout_seconds=lock_timeout_seconds,
+    ):
+        document, readable = _read_json_with_readability(control_path)
+        if not readable:
+            raise RuntimeError(
+                "registered runner effect command cannot read control state"
+            )
+        current = decode_recovery_control_state(
+            document,
+            expected_symbol=effect_symbol,
+        )
+        try:
+            durable = _decode_registered_runner_effect_receipt(
+                document,
+                expected_symbol=effect_symbol,
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"registered runner effect receipt is invalid: {exc}"
+            ) from exc
+        if durable is not None and durable.observed_at > now:
+            raise RuntimeError(
+                "registered runner effect receipt is invalid: receipt is from the future"
+            )
+        expected_runner_state = (
+            "running"
+            if command.stage is EffectStage.RUNNER_RESTART
+            else "stopped"
+        )
+        mismatches = [
+            name
+            for name, actual, expected in (
+                ("generation", current.generation, command.generation),
+                ("decision_id", current.decision_id, command.decision_id),
+                (
+                    "pending_effect_stage",
+                    current.pending_effect_stage,
+                    command.stage,
+                ),
+                (
+                    "pending_effect_epoch",
+                    current.pending_effect_epoch,
+                    command.effect_epoch,
+                ),
+                (
+                    "desired_runner_state",
+                    current.desired_runner_state,
+                    expected_runner_state,
+                ),
+            )
+            if actual != expected
+        ]
+        if mismatches:
+            raise RuntimeError(
+                "registered runner effect command fence mismatch: "
+                + ", ".join(mismatches)
+            )
+        if durable is not None:
+            if (
+                durable.generation == command.generation
+                and durable.decision_id == command.decision_id
+                and durable.stage is command.stage
+                and durable.effect_epoch == command.effect_epoch
+            ):
+                _store_registered_runtime_evidence(
+                    runtime_item,
+                    recovery_state=current,
+                    effect_receipt=durable.effect_receipt(),
+                )
+                return
+            if (
+                durable.generation == current.generation
+                and durable.decision_id == current.decision_id
+                and durable.effect_epoch >= command.effect_epoch
+            ):
+                raise RuntimeError(
+                    "registered runner effect receipt conflicts with current command"
+                )
+        actuator = (
+            restart
+            if command.stage is EffectStage.RUNNER_RESTART
+            else stop
+        )
+        actuator(effect_symbol)
+        durable = _RegisteredRunnerEffectReceipt(
+            symbol=effect_symbol,
+            generation=command.generation,
+            decision_id=command.decision_id,
+            stage=command.stage,
+            effect_epoch=command.effect_epoch,
+            observed_at=now,
+        )
+        updated = dict(document)
+        updated[_REGISTERED_RUNNER_EFFECT_RECEIPT_KEY] = (
+            _encode_registered_runner_effect_receipt(durable)
+        )
+        write_control_json_atomically(control_path, updated)
+        _store_registered_runtime_evidence(
+            runtime_item,
+            recovery_state=current,
+            effect_receipt=durable.effect_receipt(),
+        )
+
+
 def run_registered_recovery_symbol_round(
     *,
     symbol: str,
@@ -12133,6 +12393,28 @@ def run_registered_recovery_symbol_round(
             "liveness_status": "blocked",
             "severity": "critical",
             "reason": "registered_flat_profile_drift",
+            "error": str(exc),
+            "changed_keys": [],
+            "effect_count": 0,
+            "control_cas_count": 0,
+            "dry_run": dry_run,
+        }
+    try:
+        durable_runner_effect_receipt = _registered_runner_receipt_for_state(
+            _decode_registered_runner_effect_receipt(
+                control,
+                expected_symbol=normalized,
+            ),
+            recovery_state=recovery_state,
+            now=now,
+        )
+    except ValueError as exc:
+        return {
+            "symbol": normalized,
+            "action": "registered_recovery_blocked",
+            "liveness_status": "blocked",
+            "severity": "critical",
+            "reason": "registered_runner_effect_receipt_invalid",
             "error": str(exc),
             "changed_keys": [],
             "effect_count": 0,
@@ -12671,6 +12953,8 @@ def run_registered_recovery_symbol_round(
             )
             if value
         )
+    if durable_runner_effect_receipt is not None:
+        effect_receipt = durable_runner_effect_receipt
 
     config_applied_evidence = RecoveryConfigAppliedEvidence(
         applied_generation=None,
@@ -12834,6 +13118,21 @@ def run_registered_recovery_symbol_round(
     )
 
     def execute_effect(effect_symbol: str, command: Any) -> None:
+        if command.stage in {
+            EffectStage.RUNNER_RESTART,
+            EffectStage.RUNNER_STOP,
+        }:
+            _execute_registered_runner_effect(
+                control_path=control_path,
+                lock_timeout_seconds=store.lock_timeout_seconds,
+                effect_symbol=effect_symbol,
+                command=command,
+                now=now,
+                runtime_item=runtime_item,
+                restart=restart,
+                stop=stop,
+            )
+            return
         current = store.read(effect_symbol)
         if (
             command.stage is EffectStage.LOCAL_STATE_REPAIR
@@ -12871,28 +13170,6 @@ def run_registered_recovery_symbol_round(
                 cleanup_proof=cleanup,
             )
             runtime_item["registered_frozen_ledger_reset_repair"] = repaired
-            return
-        if command.stage in {
-            EffectStage.RUNNER_RESTART,
-            EffectStage.RUNNER_STOP,
-        }:
-            actuator = (
-                restart
-                if command.stage is EffectStage.RUNNER_RESTART
-                else stop
-            )
-            actuator(effect_symbol)
-            receipt = EffectReceipt(
-                decision_id=command.decision_id,
-                stage=command.stage,
-                effect_epoch=command.effect_epoch,
-                observed_at=now,
-            )
-            _store_registered_runtime_evidence(
-                runtime_item,
-                recovery_state=current,
-                effect_receipt=receipt,
-            )
             return
         if command.stage not in {
             EffectStage.MANAGED_GTX_CANCEL,

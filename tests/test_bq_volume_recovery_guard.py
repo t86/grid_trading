@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event, Thread
 from unittest.mock import patch
 
 from grid_optimizer import bq_volume_recovery_guard
@@ -41,6 +42,7 @@ from grid_optimizer.loop_runner import (
     _terminal_drain_owner_integrity_digest,
     _terminal_drain_runtime_integrity_digest,
 )
+from grid_optimizer.recovery_control_ownership import exclusive_control_lock
 from grid_optimizer.futures_recovery_store import (
     RECOVERY_STATE_KEY,
     RECOVERY_STATE_MIRROR_KEY,
@@ -49,6 +51,7 @@ from grid_optimizer.futures_recovery_store import (
 from grid_optimizer.futures_recovery_coordinator import (
     ActionId,
     CleanupProof,
+    EffectCommand,
     EffectReceipt,
     EffectStage,
     ActivationReceipt,
@@ -362,6 +365,84 @@ def _write_registered_normal_reports(
                 }
             },
         },
+    )
+
+
+def _registered_test_baseline() -> dict[str, object]:
+    return {
+        "best_quote_maker_volume_allow_loss_reduce_only": False,
+        "best_quote_maker_volume_net_loss_reduce_enabled": False,
+        "hard_loss_forced_reduce_enabled": False,
+        "volatility_entry_pause_enabled": True,
+    }
+
+
+def _run_registered_test_round(
+    *,
+    symbol: str,
+    output_dir: Path,
+    guard_state: dict[str, object],
+    now: datetime,
+    runner_active: bool,
+    restart_runner=None,
+    stop_runner=None,
+) -> dict[str, object]:
+    return bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+        symbol=symbol,
+        output_dir=output_dir,
+        guard_state=guard_state,
+        now=now,
+        window_seconds=60,
+        min_volume_notional=10,
+        near_cap_ratio=0.95,
+        far_ticks=8,
+        plan_stale_seconds=300,
+        dry_run=False,
+        runner_wrapper="/unused",
+        runner_active_fetcher=lambda _symbol: runner_active,
+        restart_runner=restart_runner,
+        stop_runner=stop_runner,
+    )
+
+
+def _registered_pending_restart(
+    control_path: Path,
+    *,
+    now: datetime,
+    round_id: str,
+) -> tuple[JsonRecoveryStore, RecoveryState, EffectCommand]:
+    store = JsonRecoveryStore(control_path)
+    initial = store.register_symbol(
+        "ARXUSDT",
+        _registered_test_baseline(),
+        now=now - timedelta(minutes=1),
+    )
+    entered = FuturesRecoveryDecisionEngine().plan_round(
+        snapshot=SymbolSnapshot(
+            symbol="ARXUSDT",
+            captured_at=now,
+            assessment=FlowBlockerAssessment(
+                runner_faults=("runner_inactive",),
+            ),
+        ),
+        state=initial,
+        now=now,
+        round_id=round_id,
+    )
+    store.compare_and_swap(
+        "ARXUSDT",
+        expected_revision=initial.document_revision,
+        next_state=entered.next_state,
+    )
+    return (
+        store,
+        entered.next_state,
+        EffectCommand(
+            decision_id=str(entered.next_state.decision_id),
+            generation=entered.next_state.generation,
+            stage=EffectStage.RUNNER_RESTART,
+            effect_epoch=int(entered.effect_epoch),
+        ),
     )
 
 
@@ -1238,12 +1319,7 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             control_path = output_dir / "arxusdt_loop_runner_control.json"
             JsonRecoveryStore(control_path).register_symbol(
                 "ARXUSDT",
-                {
-                    "best_quote_maker_volume_allow_loss_reduce_only": False,
-                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
-                    "hard_loss_forced_reduce_enabled": False,
-                    "volatility_entry_pause_enabled": True,
-                },
+                _registered_test_baseline(),
                 now=datetime(2026, 7, 16, tzinfo=timezone.utc),
             )
             registered_result = {
@@ -1693,6 +1769,585 @@ class BqVolumeRecoveryGuardTests(unittest.TestCase):
             self.assertEqual(cleared["effect_count"], 0)
             self.assertEqual(cleared["control_cas_count"], 1)
             self.assertEqual(restarts, ["ARXUSDT"])
+
+    def test_registered_stale_restart_is_fenced_after_a_new_terminal_decision(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "arxusdt_loop_runner_control.json"
+            JsonRecoveryStore(control_path).register_symbol(
+                "ARXUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            now = datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc)
+            original_compare_and_swap = JsonRecoveryStore.compare_and_swap
+            advanced = False
+
+            def advance_to_terminal_after_cas(
+                target_store,
+                symbol,
+                *,
+                expected_revision,
+                next_state,
+                expected_baseline_digest=None,
+            ) -> None:
+                nonlocal advanced
+                original_compare_and_swap(
+                    target_store,
+                    symbol,
+                    expected_revision=expected_revision,
+                    next_state=next_state,
+                    expected_baseline_digest=expected_baseline_digest,
+                )
+                if advanced:
+                    return
+                advanced = True
+                current = target_store.read(symbol)
+                replacement = FuturesRecoveryDecisionEngine().plan_round(
+                    snapshot=SymbolSnapshot(
+                        symbol=symbol,
+                        captured_at=now,
+                        assessment=FlowBlockerAssessment(
+                            terminal_reason="competition_target_confirmed",
+                            terminal_clean_flat_proof=True,
+                        ),
+                    ),
+                    state=current,
+                    now=now,
+                    round_id="concurrent-terminal-decision",
+                ).next_state
+                original_compare_and_swap(
+                    target_store,
+                    symbol,
+                    expected_revision=current.document_revision,
+                    next_state=replacement,
+                )
+
+            restarts: list[str] = []
+            guard_state: dict[str, object] = {}
+            with patch.object(
+                JsonRecoveryStore,
+                "compare_and_swap",
+                new=advance_to_terminal_after_cas,
+            ):
+                result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                    symbol="ARXUSDT",
+                    output_dir=output_dir,
+                    guard_state=guard_state,
+                    now=now,
+                    window_seconds=60,
+                    min_volume_notional=10,
+                    near_cap_ratio=0.95,
+                    far_ticks=8,
+                    plan_stale_seconds=300,
+                    dry_run=False,
+                    runner_wrapper="/unused",
+                    runner_active_fetcher=lambda _symbol: False,
+                    restart_runner=restarts.append,
+                )
+
+            self.assertEqual(restarts, [])
+            self.assertIn("effect command", result["effect_error"])
+            self.assertNotIn(
+                "registered_recovery_runtime_evidence",
+                guard_state["symbols"]["ARXUSDT"],
+            )
+            persisted = JsonRecoveryStore(control_path).read("ARXUSDT")
+            self.assertEqual(persisted.decision_id, "ARXUSDT:concurrent-terminal-decision")
+            self.assertEqual(persisted.desired_runner_state, "stopped")
+
+    def test_registered_stale_stop_is_fenced_after_a_new_running_decision(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            registered = JsonRecoveryStore(control_path).register_symbol(
+                "BCHUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            now = datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc)
+            _write_registered_normal_reports(
+                output_dir=output_dir,
+                state=registered,
+                generated_at=now,
+            )
+            original_compare_and_swap = JsonRecoveryStore.compare_and_swap
+            advanced = False
+
+            def advance_to_running_after_cas(
+                target_store,
+                symbol,
+                *,
+                expected_revision,
+                next_state,
+                expected_baseline_digest=None,
+            ) -> None:
+                nonlocal advanced
+                original_compare_and_swap(
+                    target_store,
+                    symbol,
+                    expected_revision=expected_revision,
+                    next_state=next_state,
+                    expected_baseline_digest=expected_baseline_digest,
+                )
+                if advanced:
+                    return
+                advanced = True
+                current = target_store.read(symbol)
+                fresh = replace(
+                    RecoveryState.initial(
+                        symbol,
+                        current.baseline_profile.fields,
+                        now=now,
+                    ),
+                    document_revision=current.document_revision,
+                    generation=current.generation,
+                    effect_epoch=current.effect_epoch,
+                )
+                replacement = FuturesRecoveryDecisionEngine().plan_round(
+                    snapshot=SymbolSnapshot(
+                        symbol=symbol,
+                        captured_at=now,
+                        assessment=FlowBlockerAssessment(
+                            runner_faults=("concurrent_runner_fault",),
+                        ),
+                    ),
+                    state=fresh,
+                    now=now,
+                    round_id="concurrent-running-decision",
+                ).next_state
+                original_compare_and_swap(
+                    target_store,
+                    symbol,
+                    expected_revision=current.document_revision,
+                    next_state=replacement,
+                )
+
+            stops: list[str] = []
+            guard_state: dict[str, object] = {}
+            with (
+                patch.object(
+                    bq_volume_recovery_guard,
+                    "flow_blockers_from_legacy",
+                    return_value=FlowBlockerAssessment(
+                        terminal_reason="competition_target_confirmed",
+                        terminal_clean_flat_proof=True,
+                    ),
+                ),
+                patch.object(
+                    JsonRecoveryStore,
+                    "compare_and_swap",
+                    new=advance_to_running_after_cas,
+                ),
+            ):
+                result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                    symbol="BCHUSDT",
+                    output_dir=output_dir,
+                    guard_state=guard_state,
+                    now=now,
+                    window_seconds=60,
+                    min_volume_notional=10,
+                    near_cap_ratio=0.95,
+                    far_ticks=8,
+                    plan_stale_seconds=300,
+                    dry_run=False,
+                    runner_wrapper="/unused",
+                    runner_active_fetcher=lambda _symbol: True,
+                    stop_runner=stops.append,
+                )
+
+            self.assertEqual(stops, [])
+            self.assertIn("effect command", result["effect_error"])
+            self.assertNotIn(
+                "registered_recovery_runtime_evidence",
+                guard_state["symbols"]["BCHUSDT"],
+            )
+            persisted = JsonRecoveryStore(control_path).read("BCHUSDT")
+            self.assertEqual(persisted.decision_id, "BCHUSDT:concurrent-running-decision")
+            self.assertEqual(persisted.desired_runner_state, "running")
+
+    def test_registered_restart_holds_control_lock_through_actuator_and_receipt(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "arxusdt_loop_runner_control.json"
+            JsonRecoveryStore(control_path).register_symbol(
+                "ARXUSDT",
+                {
+                    "best_quote_maker_volume_allow_loss_reduce_only": False,
+                    "best_quote_maker_volume_net_loss_reduce_enabled": False,
+                    "hard_loss_forced_reduce_enabled": False,
+                    "volatility_entry_pause_enabled": True,
+                },
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            lock_attempted = Event()
+            lock_acquired = Event()
+            contenders: list[Thread] = []
+            restarts: list[str] = []
+
+            def restart_while_contending(symbol: str) -> None:
+                restarts.append(symbol)
+
+                def contend_for_control_lock() -> None:
+                    lock_attempted.set()
+                    with exclusive_control_lock(
+                        control_path,
+                        timeout_seconds=2.0,
+                    ):
+                        lock_acquired.set()
+
+                contender = Thread(target=contend_for_control_lock)
+                contenders.append(contender)
+                contender.start()
+                self.assertTrue(lock_attempted.wait(0.5))
+                self.assertFalse(lock_acquired.wait(0.1))
+
+            guard_state: dict[str, object] = {}
+            result = bq_volume_recovery_guard.run_registered_recovery_symbol_round(
+                symbol="ARXUSDT",
+                output_dir=output_dir,
+                guard_state=guard_state,
+                now=datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc),
+                window_seconds=60,
+                min_volume_notional=10,
+                near_cap_ratio=0.95,
+                far_ticks=8,
+                plan_stale_seconds=300,
+                dry_run=False,
+                runner_wrapper="/unused",
+                runner_active_fetcher=lambda _symbol: False,
+                restart_runner=restart_while_contending,
+            )
+
+            self.assertIsNone(result["effect_error"])
+            self.assertEqual(restarts, ["ARXUSDT"])
+            self.assertTrue(lock_acquired.wait(1.0))
+            self.assertEqual(len(contenders), 1)
+            contenders[0].join(timeout=1.0)
+            self.assertFalse(contenders[0].is_alive())
+            receipt = guard_state["symbols"]["ARXUSDT"][
+                "registered_recovery_runtime_evidence"
+            ]["effect_receipt"]
+            self.assertEqual(receipt["stage"], "runner_restart")
+
+    def test_registered_restart_receipt_survives_guard_state_loss(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "arxusdt_loop_runner_control.json"
+            JsonRecoveryStore(control_path).register_symbol(
+                "ARXUSDT",
+                _registered_test_baseline(),
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            now = datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc)
+            restarts: list[str] = []
+
+            first = _run_registered_test_round(
+                symbol="ARXUSDT",
+                output_dir=output_dir,
+                guard_state={},
+                now=now,
+                runner_active=False,
+                restart_runner=restarts.append,
+            )
+            second = _run_registered_test_round(
+                symbol="ARXUSDT",
+                output_dir=output_dir,
+                guard_state={},
+                now=now + timedelta(seconds=1),
+                runner_active=False,
+                restart_runner=restarts.append,
+            )
+
+            self.assertIsNone(first["effect_error"])
+            self.assertEqual(restarts, ["ARXUSDT"])
+            self.assertEqual(second["effect_count"], 0)
+            persisted = JsonRecoveryStore(control_path).read("ARXUSDT")
+            self.assertEqual(persisted.pending_effect_stage, EffectStage.NONE)
+            control = json.loads(control_path.read_text(encoding="utf-8"))
+            receipt = control["registered_recovery_runner_effect_receipt"]
+            decoded_receipt = (
+                bq_volume_recovery_guard._decode_registered_runner_effect_receipt(
+                    control,
+                    expected_symbol="ARXUSDT",
+                )
+            )
+            self.assertIsNotNone(decoded_receipt)
+            self.assertEqual(
+                receipt,
+                {
+                    "schema": "registered_recovery_runner_effect_receipt_v1",
+                    "symbol": "ARXUSDT",
+                    "generation": first["generation"],
+                    "decision_id": first["decision_id"],
+                    "stage": "runner_restart",
+                    "effect_epoch": 1,
+                    "observed_at": now.isoformat(),
+                },
+            )
+
+    def test_registered_malformed_runner_receipt_fails_closed_before_actuator(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "arxusdt_loop_runner_control.json"
+            JsonRecoveryStore(control_path).register_symbol(
+                "ARXUSDT",
+                _registered_test_baseline(),
+                now=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            )
+            control = json.loads(control_path.read_text(encoding="utf-8"))
+            control["registered_recovery_runner_effect_receipt"] = {
+                "schema": "registered_recovery_runner_effect_receipt_v1",
+                "symbol": "ARXUSDT",
+                "generation": "not-an-integer",
+            }
+            _write_json(control_path, control)
+            restarts: list[str] = []
+
+            result = _run_registered_test_round(
+                symbol="ARXUSDT",
+                output_dir=output_dir,
+                guard_state={},
+                now=datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc),
+                runner_active=False,
+                restart_runner=restarts.append,
+            )
+
+            self.assertEqual(restarts, [])
+            self.assertEqual(
+                result["reason"],
+                "registered_runner_effect_receipt_invalid",
+            )
+
+    def test_registered_stop_receipt_survives_guard_state_loss(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            control_path = output_dir / "bchusdt_loop_runner_control.json"
+            now = datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc)
+            registered = JsonRecoveryStore(control_path).register_symbol(
+                "BCHUSDT",
+                _registered_test_baseline(),
+                now=now - timedelta(minutes=1),
+            )
+            _write_registered_normal_reports(
+                output_dir=output_dir,
+                state=registered,
+                generated_at=now,
+            )
+            stops: list[str] = []
+            with patch.object(
+                bq_volume_recovery_guard,
+                "flow_blockers_from_legacy",
+                return_value=FlowBlockerAssessment(
+                    terminal_reason="competition_target_confirmed",
+                    terminal_clean_flat_proof=True,
+                ),
+            ):
+                first = _run_registered_test_round(
+                    symbol="BCHUSDT",
+                    output_dir=output_dir,
+                    guard_state={},
+                    now=now,
+                    runner_active=True,
+                    stop_runner=stops.append,
+                )
+                second = _run_registered_test_round(
+                    symbol="BCHUSDT",
+                    output_dir=output_dir,
+                    guard_state={},
+                    now=now + timedelta(seconds=1),
+                    runner_active=True,
+                    stop_runner=stops.append,
+                )
+
+            self.assertIsNone(first["effect_error"])
+            self.assertEqual(stops, ["BCHUSDT"])
+            self.assertEqual(second["effect_count"], 0)
+            persisted = JsonRecoveryStore(control_path).read("BCHUSDT")
+            self.assertEqual(persisted.phase, RecoveryPhase.STOPPED)
+
+    def test_registered_same_runner_command_replays_durable_receipt_after_lock_wait(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "arxusdt_loop_runner_control.json"
+            now = datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc)
+            store, _pending, command = _registered_pending_restart(
+                control_path,
+                now=now,
+                round_id="concurrent-restart",
+            )
+            actuator_entered = Event()
+            release_actuator = Event()
+            second_started = Event()
+            second_done = Event()
+            restarts: list[str] = []
+            errors: list[BaseException] = []
+            runtime_items = [{}, {}]
+
+            def restart(symbol: str) -> None:
+                restarts.append(symbol)
+                actuator_entered.set()
+                if not release_actuator.wait(1.0):
+                    raise AssertionError("test did not release runner actuator")
+
+            def execute(index: int) -> None:
+                try:
+                    if index == 1:
+                        second_started.set()
+                    bq_volume_recovery_guard._execute_registered_runner_effect(
+                        control_path=control_path,
+                        lock_timeout_seconds=store.lock_timeout_seconds,
+                        effect_symbol="ARXUSDT",
+                        command=command,
+                        now=now,
+                        runtime_item=runtime_items[index],
+                        restart=restart,
+                        stop=lambda _symbol: (_ for _ in ()).throw(
+                            AssertionError("restart command used stop actuator")
+                        ),
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    if index == 1:
+                        second_done.set()
+
+            first_thread = Thread(target=execute, args=(0,))
+            second_thread = Thread(target=execute, args=(1,))
+            first_thread.start()
+            self.assertTrue(actuator_entered.wait(0.5))
+            second_thread.start()
+            self.assertTrue(second_started.wait(0.5))
+            self.assertFalse(second_done.wait(0.1))
+            release_actuator.set()
+            first_thread.join(timeout=1.0)
+            second_thread.join(timeout=1.0)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(restarts, ["ARXUSDT"])
+            self.assertFalse(first_thread.is_alive())
+            self.assertFalse(second_thread.is_alive())
+            for runtime_item in runtime_items:
+                receipt = runtime_item["registered_recovery_runtime_evidence"][
+                    "effect_receipt"
+                ]
+                self.assertEqual(receipt["stage"], "runner_restart")
+
+    def test_registered_runner_effect_overwrites_older_tuple_in_same_decision(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "arxusdt_loop_runner_control.json"
+            now = datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc)
+            store, pending, command = _registered_pending_restart(
+                control_path,
+                now=now,
+                round_id="newer-restart-tuple",
+            )
+            control = json.loads(control_path.read_text(encoding="utf-8"))
+            control["registered_recovery_runner_effect_receipt"] = {
+                "schema": "registered_recovery_runner_effect_receipt_v1",
+                "symbol": "ARXUSDT",
+                "generation": pending.generation,
+                "decision_id": pending.decision_id,
+                "stage": "runner_stop",
+                "effect_epoch": 0,
+                "observed_at": (now - timedelta(seconds=1)).isoformat(),
+            }
+            _write_json(control_path, control)
+            restarts: list[str] = []
+
+            bq_volume_recovery_guard._execute_registered_runner_effect(
+                control_path=control_path,
+                lock_timeout_seconds=store.lock_timeout_seconds,
+                effect_symbol="ARXUSDT",
+                command=command,
+                now=now,
+                runtime_item={},
+                restart=restarts.append,
+                stop=lambda _symbol: (_ for _ in ()).throw(
+                    AssertionError("restart command used stop actuator")
+                ),
+            )
+
+            self.assertEqual(restarts, ["ARXUSDT"])
+            updated = json.loads(control_path.read_text(encoding="utf-8"))
+            receipt = updated["registered_recovery_runner_effect_receipt"]
+            self.assertEqual(receipt["stage"], "runner_restart")
+            self.assertEqual(receipt["effect_epoch"], command.effect_epoch)
+
+    def test_registered_runner_effect_rejects_invalid_current_receipt_without_mutation(self) -> None:
+        cases = (
+            (
+                "future_observation",
+                "runner_restart",
+                0,
+                timedelta(seconds=1),
+                "from the future",
+            ),
+            (
+                "same_epoch_stage_mismatch",
+                "runner_stop",
+                0,
+                timedelta(0),
+                "conflicts with current command",
+            ),
+            (
+                "higher_epoch",
+                "runner_restart",
+                1,
+                timedelta(0),
+                "conflicts with current command",
+            ),
+        )
+        for name, stage, epoch_delta, observed_delta, expected_error in cases:
+            with self.subTest(name=name), TemporaryDirectory() as tmpdir:
+                control_path = Path(tmpdir) / "arxusdt_loop_runner_control.json"
+                now = datetime(2026, 7, 16, 0, 1, tzinfo=timezone.utc)
+                store, pending, command = _registered_pending_restart(
+                    control_path,
+                    now=now,
+                    round_id=f"invalid-receipt-{name}",
+                )
+                control = json.loads(control_path.read_text(encoding="utf-8"))
+                control["registered_recovery_runner_effect_receipt"] = {
+                    "schema": "registered_recovery_runner_effect_receipt_v1",
+                    "symbol": "ARXUSDT",
+                    "generation": pending.generation,
+                    "decision_id": pending.decision_id,
+                    "stage": stage,
+                    "effect_epoch": command.effect_epoch + epoch_delta,
+                    "observed_at": (now + observed_delta).isoformat(),
+                }
+                _write_json(control_path, control)
+                before = control_path.read_bytes()
+                runtime_item: dict[str, object] = {}
+                restarts: list[str] = []
+                stops: list[str] = []
+
+                with self.assertRaisesRegex(RuntimeError, expected_error):
+                    bq_volume_recovery_guard._execute_registered_runner_effect(
+                        control_path=control_path,
+                        lock_timeout_seconds=store.lock_timeout_seconds,
+                        effect_symbol="ARXUSDT",
+                        command=command,
+                        now=now,
+                        runtime_item=runtime_item,
+                        restart=restarts.append,
+                        stop=stops.append,
+                    )
+
+                self.assertEqual(restarts, [])
+                self.assertEqual(stops, [])
+                self.assertEqual(control_path.read_bytes(), before)
+                self.assertEqual(runtime_item, {})
 
     def test_registered_terminal_stop_executes_one_stop_effect_with_receipt(self) -> None:
         with TemporaryDirectory() as tmpdir:

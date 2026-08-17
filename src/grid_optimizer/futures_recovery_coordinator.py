@@ -637,6 +637,7 @@ class EffectReceipt:
 @dataclass(frozen=True)
 class EffectCommand:
     decision_id: str
+    generation: int
     stage: EffectStage
     effect_epoch: int
 
@@ -3797,6 +3798,7 @@ class FuturesRecoveryCoordinator:
             raise ValueError("effect command is missing its epoch")
         command = EffectCommand(
             decision_id=decision_id,
+            generation=plan.next_state.generation,
             stage=plan.effect_stage,
             effect_epoch=plan.effect_epoch,
         )

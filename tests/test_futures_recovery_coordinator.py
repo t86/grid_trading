@@ -328,6 +328,7 @@ def test_one_symbol_selects_one_action_commits_once_and_executes_one_effect() ->
     assert store.commit_count("ARXUSDT") == 1
     assert len(effects) == 1
     assert effects[0][0] == "ARXUSDT"
+    assert effects[0][1].generation == outcome.next_state.generation
     assert effects[0][1].stage is EffectStage.RUNNER_RESTART
     assert effects[0][1].effect_epoch == outcome.effect_epoch
 
@@ -942,6 +943,11 @@ def test_failed_effect_is_retried_under_the_same_decision_next_round() -> None:
     assert store.commit_count("ARXUSDT") == 2
     assert len(calls) == 2
     assert calls[0][1].decision_id == calls[1][1].decision_id == first_decision_id
+    assert (
+        calls[0][1].generation
+        == calls[1][1].generation
+        == second.next_state.generation
+    )
     assert calls[0][1].stage is calls[1][1].stage is EffectStage.RUNNER_RESTART
     assert calls[0][1].effect_epoch == calls[1][1].effect_epoch
 

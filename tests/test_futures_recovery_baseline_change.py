@@ -544,6 +544,7 @@ def test_same_round_retries_pending_baseline_restart_after_cas_before_effect_cra
     assert retried_effects == [
         recovery.EffectCommand(
             decision_id=str(crashed_state.decision_id),
+            generation=crashed_state.generation,
             stage=recovery.EffectStage.RUNNER_RESTART,
             effect_epoch=int(crashed_state.pending_effect_epoch),
         )
