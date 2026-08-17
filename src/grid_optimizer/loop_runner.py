@@ -24230,13 +24230,17 @@ def apply_best_quote_active_pair_reduce(
     safe_min_relief = max(_safe_float(min_relief_notional), 0.0)
     threshold_side_mode = safe_loss_threshold > 0
     paired_threshold_mode = threshold_side_mode and bool(pair_all_sides_on_threshold)
+    threshold_dust_tolerance = (
+        max(_safe_float(min_notional), 0.0) if paired_threshold_mode else 0.0
+    )
     current_threshold_eligible_sides = {
         side
         for side, notional in (
             ("long", safe_long_notional),
             ("short", safe_short_notional),
         )
-        if threshold_side_mode and notional > safe_loss_threshold + 1e-12
+        if threshold_side_mode
+        and notional > safe_loss_threshold + threshold_dust_tolerance + 1e-12
     }
     effective_now = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
     safe_rearm_cooldown = max(_safe_float(rearm_cooldown_seconds), 0.0)
@@ -24314,6 +24318,7 @@ def apply_best_quote_active_pair_reduce(
             if isinstance(item, dict) and _order_role(item) != "best_quote_active_pair_reduce_long"
         ]
         report["reason"] = reason
+        report["active"] = False
         report["completed"] = bool(completed)
         return report
 
@@ -24521,6 +24526,21 @@ def apply_best_quote_active_pair_reduce(
                     long_target = min(long_target, recovered_target)
                 if "short" in threshold_eligible_sides:
                     short_target = min(short_target, recovered_target)
+                # The recovery target must never authorize more than the
+                # per-side lease cap.  Exchange quantity rounding can leave a
+                # sub-minimum tail above the soft threshold; that tail is
+                # handled by threshold_dust_tolerance instead of a second
+                # loss order in the same lease.
+                long_target = max(
+                    long_target,
+                    safe_long_notional - safe_max_reduce,
+                    0.0,
+                )
+                short_target = max(
+                    short_target,
+                    safe_short_notional - safe_max_reduce,
+                    0.0,
+                )
             else:
                 long_target = (
                     min(
