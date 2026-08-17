@@ -1933,11 +1933,72 @@ def build_best_quote_maker_volume_plan(
             )
 
         def _record_entry_role(name: str, role: str) -> None:
+            if name in role_report:
+                return
             role_report[name] = (
                 {"status": "planned", "reason": "order_present"}
                 if _role_present(role)
                 else {"status": "blocked", "reason": "missing_entry"}
             )
+
+        def _ensure_biased_heavy_entry(
+            *,
+            report_name: str,
+            role: str,
+            position_side: str,
+            projected_notional: float,
+            entry_ceiling: float,
+            side: str,
+        ) -> None:
+            target_bucket = buy_orders if side == "BUY" else sell_orders
+            if any(order.get("role") == role for order in target_bucket):
+                role_report[report_name] = {
+                    "status": "planned",
+                    "reason": "order_present",
+                }
+                return
+            if (
+                not hedge_position_sides
+                or not inventory_bias_report["applied"]
+                or inventory_bias_report["side"] != position_side.lower()
+            ):
+                return
+            headroom = max(entry_ceiling - projected_notional, 0.0)
+            entry_notional = min(cycle_budget * 0.25, headroom)
+            min_notional = max(_safe_float(inputs.min_notional), 0.0)
+            if entry_notional + 1e-12 < min_notional:
+                role_report[report_name] = {
+                    "status": "blocked",
+                    "reason": "soft_headroom_below_min_notional",
+                }
+                return
+            entry_ticks = max(
+                int(offset_ticks)
+                + max(int(config.inventory_bias_same_side_extra_ticks), 0),
+                0,
+            )
+            entry_gap = _tick_gap(inputs.tick_size, entry_ticks)
+            orders = _build_entry_ladder(
+                side=side,
+                anchor_price=bid if side == "BUY" else ask,
+                base_gap=entry_gap,
+                total_notional=entry_notional,
+                slots=1,
+                role=role,
+                inputs=inputs,
+                position_side=position_side,
+            )
+            if not orders:
+                role_report[report_name] = {
+                    "status": "blocked",
+                    "reason": "entry_below_exchange_minimum",
+                }
+                return
+            target_bucket.extend(orders)
+            role_report[report_name] = {
+                "status": "planned",
+                "reason": "bounded_heavy_side_entry",
+            }
 
         def _ensure_profit_reduce(
             *,
@@ -2062,6 +2123,22 @@ def build_best_quote_maker_volume_plan(
             soft_notional=short_soft,
             side="BUY",
         )
+        _ensure_biased_heavy_entry(
+            report_name="long_entry",
+            role="best_quote_entry_long",
+            position_side="LONG",
+            projected_notional=projected_long_entry_notional,
+            entry_ceiling=long_entry_ceiling,
+            side="BUY",
+        )
+        _ensure_biased_heavy_entry(
+            report_name="short_entry",
+            role="best_quote_entry_short",
+            position_side="SHORT",
+            projected_notional=projected_short_entry_notional,
+            entry_ceiling=short_entry_ceiling,
+            side="SELL",
+        )
         _record_entry_role("long_entry", "best_quote_entry_long")
         _record_entry_role("short_entry", "best_quote_entry_short")
         four_leg_cycle_report = {
@@ -2157,6 +2234,24 @@ def build_best_quote_maker_volume_plan(
                 same_side_entry_price_guard_report["cluster_pruning_applied"] = True
                 same_side_entry_price_guard_report["cluster_pruned_buy_orders"] = pruned_buy_orders
                 same_side_entry_price_guard_report["cluster_pruned_sell_orders"] = pruned_sell_orders
+
+    if four_leg_cycle_report is not None:
+        for report_name, role in (
+            ("long_entry", "best_quote_entry_long"),
+            ("short_entry", "best_quote_entry_short"),
+            ("long_profit_reduce", "best_quote_reduce_long"),
+            ("short_profit_reduce", "best_quote_reduce_short"),
+        ):
+            status = four_leg_cycle_report["roles"][report_name]
+            if status["status"] == "planned" and not _role_present(role):
+                four_leg_cycle_report["roles"][report_name] = {
+                    "status": "blocked",
+                    "reason": "removed_by_post_plan_guard",
+                }
+        four_leg_cycle_report["complete"] = all(
+            item["status"] in {"planned", "not_applicable"}
+            for item in four_leg_cycle_report["roles"].values()
+        )
 
     planned = sum(order["notional"] for order in [*buy_orders, *sell_orders])
     metrics = {
