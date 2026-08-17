@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
+from pathlib import Path
 import unittest
 
 from grid_optimizer.best_quote_maker_volume import (
@@ -45,6 +47,163 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         )
 
         self.assertEqual(explicit_off_plan, default_plan)
+
+    def test_four_leg_cycle_replays_sanitized_grvt_production_snapshots(self) -> None:
+        fixtures_dir = Path(__file__).parent / "fixtures"
+
+        for fixture_name in (
+            "grvt_four_leg_111_control.json",
+            "grvt_four_leg_114_canary.json",
+        ):
+            with self.subTest(fixture=fixture_name):
+                payload = json.loads((fixtures_dir / fixture_name).read_text())
+                control_config = BestQuoteMakerVolumeConfig(**payload["config"])
+                inputs = BestQuoteMakerVolumeInputs(**payload["inputs"])
+
+                control_plan = build_best_quote_maker_volume_plan(
+                    config=control_config,
+                    inputs=inputs,
+                )
+                canary_plan = build_best_quote_maker_volume_plan(
+                    config=replace(control_config, four_leg_cycle_enabled=True),
+                    inputs=inputs,
+                )
+
+                self.assertNotIn("four_leg_cycle", control_plan["metrics"])
+                self.assertGreaterEqual(
+                    canary_plan["planned_notional"],
+                    control_plan["planned_notional"],
+                )
+                canary_orders = [
+                    *canary_plan["buy_orders"],
+                    *canary_plan["sell_orders"],
+                ]
+                roles = {order["role"] for order in canary_orders}
+                self.assertTrue(
+                    {
+                        "best_quote_entry_long",
+                        "best_quote_reduce_long",
+                        "best_quote_entry_short",
+                        "best_quote_reduce_short",
+                    }.issubset(roles)
+                )
+                self.assertTrue(canary_plan["metrics"]["four_leg_cycle"]["complete"])
+
+                reduce_long = next(
+                    order
+                    for order in canary_orders
+                    if order["role"] == "best_quote_reduce_long"
+                )
+                reduce_short = next(
+                    order
+                    for order in canary_orders
+                    if order["role"] == "best_quote_reduce_short"
+                )
+                self.assertGreaterEqual(
+                    reduce_long["price"],
+                    inputs.current_long_avg_price + inputs.entry_ladder_spacing,
+                )
+                self.assertLessEqual(
+                    reduce_short["price"],
+                    inputs.current_short_avg_price - inputs.entry_ladder_spacing,
+                )
+                self.assertTrue(reduce_long["force_reduce_only"])
+                self.assertTrue(reduce_short["force_reduce_only"])
+
+                entry_long = next(
+                    order
+                    for order in canary_orders
+                    if order["role"] == "best_quote_entry_long"
+                )
+                entry_short = next(
+                    order
+                    for order in canary_orders
+                    if order["role"] == "best_quote_entry_short"
+                )
+                max_entry_gap = inputs.tick_size * (
+                    control_config.quote_offset_ticks
+                    + control_config.inventory_bias_same_side_extra_ticks
+                )
+                self.assertLessEqual(
+                    inputs.bid_price - entry_long["price"],
+                    max_entry_gap + 1e-12,
+                )
+                self.assertLessEqual(
+                    entry_short["price"] - inputs.ask_price,
+                    max_entry_gap + 1e-12,
+                )
+
+                no_frozen_plan = build_best_quote_maker_volume_plan(
+                    config=replace(control_config, four_leg_cycle_enabled=True),
+                    inputs=replace(
+                        inputs,
+                        frozen_long_notional=0.0,
+                        frozen_short_notional=0.0,
+                    ),
+                )
+                self.assertEqual(canary_plan["buy_orders"], no_frozen_plan["buy_orders"])
+                self.assertEqual(canary_plan["sell_orders"], no_frozen_plan["sell_orders"])
+
+    def test_four_leg_cycle_falls_back_to_exchange_cost_without_frozen_inventory(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                four_leg_cycle_enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.90,
+            ),
+            inputs=_inputs(
+                bid_price=100.0,
+                ask_price=100.1,
+                mid_price=100.05,
+                entry_ladder_spacing=0.5,
+                tick_size=0.1,
+                position_side_mode="hedge",
+                current_long_qty=3.0,
+                current_short_qty=3.0,
+                current_long_avg_price=0.0,
+                current_short_avg_price=0.0,
+                exchange_long_avg_price=101.0,
+                exchange_short_avg_price=99.0,
+            ),
+        )
+
+        report = plan["metrics"]["four_leg_cycle"]["roles"]
+        self.assertEqual(report["long_profit_reduce"]["cost_source"], "exchange_position")
+        self.assertEqual(report["short_profit_reduce"]["cost_source"], "exchange_position")
+        self.assertEqual(report["long_profit_reduce"]["target_price"], 101.5)
+        self.assertEqual(report["short_profit_reduce"]["target_price"], 98.5)
+
+    def test_four_leg_cycle_does_not_use_exchange_cost_when_frozen_inventory_exists(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                four_leg_cycle_enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.90,
+            ),
+            inputs=_inputs(
+                bid_price=100.0,
+                ask_price=100.1,
+                mid_price=100.05,
+                entry_ladder_spacing=0.5,
+                tick_size=0.1,
+                position_side_mode="hedge",
+                current_long_qty=3.0,
+                current_short_qty=3.0,
+                current_long_avg_price=0.0,
+                current_short_avg_price=99.0,
+                exchange_long_avg_price=101.0,
+                frozen_long_notional=10.0,
+            ),
+        )
+
+        report = plan["metrics"]["four_leg_cycle"]["roles"]["long_profit_reduce"]
+        self.assertEqual(report["status"], "blocked")
+        self.assertEqual(report["reason"], "missing_position_cost")
+        self.assertEqual(report["cost_source"], "blocked_by_frozen_isolation")
 
     def test_four_leg_cycle_adds_cost_based_profit_reduces_below_soft_limit(self) -> None:
         plan = build_best_quote_maker_volume_plan(
@@ -125,7 +284,13 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         report = plan["metrics"]["four_leg_cycle"]
         self.assertEqual(
             report["roles"]["long_profit_reduce"],
-            {"status": "blocked", "reason": "missing_position_cost"},
+            {
+                "status": "blocked",
+                "reason": "missing_position_cost",
+                "cost_source": "unavailable",
+                "position_cost": None,
+                "target_price": None,
+            },
         )
         self.assertFalse(report["complete"])
 

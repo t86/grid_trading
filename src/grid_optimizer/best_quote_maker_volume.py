@@ -2007,38 +2007,49 @@ def build_best_quote_maker_volume_plan(
             position_side: str,
             position_notional: float,
             position_cost: float,
+            cost_source: str,
             soft_notional: float,
             side: str,
         ) -> None:
             nonlocal buy_orders, sell_orders
+            cost_audit: dict[str, Any] = {
+                "cost_source": cost_source,
+                "position_cost": position_cost if position_cost > 0 else None,
+                "target_price": None,
+            }
             if not hedge_position_sides:
                 role_report[report_name] = {
                     "status": "not_applicable",
                     "reason": "not_hedge_mode",
+                    **cost_audit,
                 }
                 return
             if position_notional <= 0:
                 role_report[report_name] = {
                     "status": "not_applicable",
                     "reason": "no_ordinary_position",
+                    **cost_audit,
                 }
                 return
             if hard_loss or net_loss_reduce_report["active"]:
                 role_report[report_name] = {
                     "status": "blocked",
                     "reason": "loss_control_active",
+                    **cost_audit,
                 }
                 return
             if soft_notional > 0 and position_notional >= soft_notional - 1e-12:
                 role_report[report_name] = {
                     "status": "blocked",
                     "reason": "soft_threshold_active_pair",
+                    **cost_audit,
                 }
                 return
             if position_cost <= 0:
                 role_report[report_name] = {
                     "status": "blocked",
                     "reason": "missing_position_cost",
+                    **cost_audit,
                 }
                 return
 
@@ -2054,8 +2065,10 @@ def build_best_quote_maker_volume_plan(
                 role_report[report_name] = {
                     "status": "blocked",
                     "reason": "invalid_profit_price",
+                    **cost_audit,
                 }
                 return
+            cost_audit["target_price"] = price
 
             target_bucket = sell_orders if side == "SELL" else buy_orders
             existing = [order for order in target_bucket if order.get("role") == role]
@@ -2076,6 +2089,7 @@ def build_best_quote_maker_volume_plan(
                 role_report[report_name] = {
                     "status": "planned",
                     "reason": "existing_profit_order",
+                    **cost_audit,
                 }
                 return
 
@@ -2097,20 +2111,50 @@ def build_best_quote_maker_volume_plan(
                 role_report[report_name] = {
                     "status": "blocked",
                     "reason": "reduce_below_exchange_minimum",
+                    **cost_audit,
                 }
                 return
             target_bucket.append(order)
             role_report[report_name] = {
                 "status": "planned",
                 "reason": "cost_based_profit_order",
+                **cost_audit,
             }
+
+        def _ordinary_position_cost(
+            *,
+            managed_cost: float,
+            exchange_cost: float,
+            frozen_notional: float,
+        ) -> tuple[float, str]:
+            managed_cost = _safe_float(managed_cost)
+            if managed_cost > 0:
+                return managed_cost, "ordinary_ledger"
+            if frozen_notional > 0:
+                return 0.0, "blocked_by_frozen_isolation"
+            exchange_cost = _safe_float(exchange_cost)
+            if exchange_cost > 0:
+                return exchange_cost, "exchange_position"
+            return 0.0, "unavailable"
+
+        long_position_cost, long_cost_source = _ordinary_position_cost(
+            managed_cost=inputs.current_long_avg_price,
+            exchange_cost=inputs.exchange_long_avg_price,
+            frozen_notional=frozen_long_notional,
+        )
+        short_position_cost, short_cost_source = _ordinary_position_cost(
+            managed_cost=inputs.current_short_avg_price,
+            exchange_cost=inputs.exchange_short_avg_price,
+            frozen_notional=frozen_short_notional,
+        )
 
         _ensure_profit_reduce(
             report_name="long_profit_reduce",
             role="best_quote_reduce_long",
             position_side="LONG",
             position_notional=long_notional,
-            position_cost=_safe_float(inputs.current_long_avg_price),
+            position_cost=long_position_cost,
+            cost_source=long_cost_source,
             soft_notional=long_soft,
             side="SELL",
         )
@@ -2119,7 +2163,8 @@ def build_best_quote_maker_volume_plan(
             role="best_quote_reduce_short",
             position_side="SHORT",
             position_notional=short_notional,
-            position_cost=_safe_float(inputs.current_short_avg_price),
+            position_cost=short_position_cost,
+            cost_source=short_cost_source,
             soft_notional=short_soft,
             side="BUY",
         )
