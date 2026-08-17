@@ -118,6 +118,8 @@ class BestQuoteMakerVolumeInputs:
     current_short_qty: float | None = None
     current_long_avg_price: float = 0.0
     current_short_avg_price: float = 0.0
+    exchange_long_avg_price: float = 0.0
+    exchange_short_avg_price: float = 0.0
     position_side_mode: str = "one_way"
     market_return_1m: float = 0.0
     market_amplitude_1m: float = 0.0
@@ -1711,6 +1713,24 @@ def build_best_quote_maker_volume_plan(
     balance_tolerance = max(bias_min_notional_gap, soft_entry_buffer)
     long_avg_price = _safe_float(inputs.current_long_avg_price)
     short_avg_price = _safe_float(inputs.current_short_avg_price)
+    exchange_long_avg_price = _safe_float(inputs.exchange_long_avg_price)
+    exchange_short_avg_price = _safe_float(inputs.exchange_short_avg_price)
+    effective_long_avg_price = max(long_avg_price, exchange_long_avg_price)
+    effective_short_avg_price = min(
+        price
+        for price in (short_avg_price, exchange_short_avg_price)
+        if price > 0
+    ) if short_avg_price > 0 or exchange_short_avg_price > 0 else 0.0
+    balanced_cost_recovery_report.update(
+        {
+            "managed_long_avg_price": long_avg_price,
+            "managed_short_avg_price": short_avg_price,
+            "exchange_long_avg_price": exchange_long_avg_price,
+            "exchange_short_avg_price": exchange_short_avg_price,
+            "effective_long_avg_price": effective_long_avg_price,
+            "effective_short_avg_price": effective_short_avg_price,
+        }
+    )
     if (
         hedge_position_sides
         and not hard_loss
@@ -1724,8 +1744,8 @@ def build_best_quote_maker_volume_plan(
         and long_notional >= long_profit_reduce_trigger - 1e-12
         and short_notional >= short_profit_reduce_trigger - 1e-12
         and abs(long_notional - short_notional) <= balance_tolerance + 1e-12
-        and long_avg_price > ask + 1e-12
-        and short_avg_price + 1e-12 < bid
+        and effective_long_avg_price > ask + 1e-12
+        and effective_short_avg_price + 1e-12 < bid
     ):
         hard_long_headroom = max(long_limit - projected_long_entry_notional, 0.0)
         hard_short_headroom = max(short_limit - projected_short_entry_notional, 0.0)

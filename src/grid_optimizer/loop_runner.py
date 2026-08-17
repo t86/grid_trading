@@ -31957,6 +31957,8 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                 current_short_qty=current_short_qty,
                 current_long_avg_price=current_long_avg_price,
                 current_short_avg_price=current_short_avg_price,
+                exchange_long_avg_price=exchange_long_avg_price,
+                exchange_short_avg_price=exchange_short_avg_price,
                 position_side_mode="hedge" if hedge_best_quote else "one_way",
                 market_return_1m=_adaptive_window_metric("window_1m", "return_ratio"),
                 market_amplitude_1m=_adaptive_window_metric("window_1m", "amplitude_ratio"),

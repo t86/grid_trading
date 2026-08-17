@@ -419,6 +419,45 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         )
         self.assertIn("balanced_cost_recovery", plan["reasons"])
 
+    def test_exchange_cost_basis_prevents_false_profit_deadlock(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.9,
+            ),
+            inputs=_inputs(
+                bid_price=1.0,
+                ask_price=1.01,
+                mid_price=1.0,
+                current_long_qty=896.0,
+                current_short_qty=896.0,
+                current_long_avg_price=1.03,
+                current_short_avg_price=1.02,
+                exchange_long_avg_price=1.03,
+                exchange_short_avg_price=0.98,
+                cycle_budget_notional=120.0,
+                tick_size=0.01,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+                position_side_mode="hedge",
+            ),
+        )
+
+        self.assertIn("balanced_cost_recovery", plan["reasons"])
+        self.assertTrue(
+            any(order["role"] == "best_quote_entry_long" for order in plan["buy_orders"])
+        )
+        self.assertTrue(
+            any(order["role"] == "best_quote_entry_short" for order in plan["sell_orders"])
+        )
+        self.assertEqual(
+            plan["metrics"]["balanced_cost_recovery"]["effective_short_avg_price"],
+            0.98,
+        )
+
     def test_cost_recovery_does_not_override_inventory_bias(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
