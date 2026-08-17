@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from collections import UserDict
 from datetime import datetime, timedelta, timezone
 
 from grid_optimizer.submit_plan import (
@@ -112,6 +113,43 @@ class SubmitPlanTests(unittest.TestCase):
             "hold",
         )
         self.assertEqual(guarded["cancel_orders"], [])
+
+    def test_actual_net_decision_treats_mapping_gate_as_managed_owner(self) -> None:
+        def decide(recovery_profile_gate: dict[str, object] | UserDict) -> dict:
+            return apply_actual_net_exposure_decision_to_actions(
+                actions={
+                    "place_orders": [],
+                    "cancel_orders": [],
+                    "recovery_profile_gate": recovery_profile_gate,
+                },
+                current_actual_net_qty=0.575,
+                valuation_price=200.0,
+                current_open_orders=[
+                    {
+                        "orderId": 7,
+                        "clientOrderId": "gx-bchu-bestquot-7",
+                        "side": "BUY",
+                        "positionSide": "SHORT",
+                        "price": "200",
+                        "origQty": "0.10",
+                        "executedQty": "0",
+                    }
+                ],
+                max_actual_net_notional=120.0,
+            )
+
+        plain_result = decide({"managed": True, "authorized": False})
+        mapping_result = decide(
+            UserDict({"managed": True, "authorized": False})
+        )
+
+        self.assertEqual(
+            mapping_result["actual_net_exposure_decision"]["action"],
+            plain_result["actual_net_exposure_decision"]["action"],
+        )
+        self.assertEqual(mapping_result["cancel_orders"], plain_result["cancel_orders"])
+        self.assertEqual(mapping_result["actual_net_exposure_decision"]["action"], "hold")
+        self.assertEqual(mapping_result["cancel_orders"], [])
 
     def test_actual_net_decision_rejects_entry_role_that_can_be_bumped_after_gate(self) -> None:
         guarded = apply_actual_net_exposure_decision_to_actions(
@@ -971,6 +1009,10 @@ class SubmitPlanTests(unittest.TestCase):
             actions={
                 "place_orders": [ordinary_entry, *frozen_pair],
                 "cancel_orders": [ordinary_cancel],
+                "recovery_profile_gate": {
+                    "managed": True,
+                    "authorized": False,
+                },
             },
             current_actual_net_qty=0.0,
             valuation_price=200.0,
@@ -996,6 +1038,62 @@ class SubmitPlanTests(unittest.TestCase):
             guarded["actual_net_exposure_decision"]["deferred_ordinary_cancel_count"],
             1,
         )
+
+    def test_symbol_coordinator_combines_legacy_ordinary_flow_with_frozen_request(self) -> None:
+        ordinary_entry = {
+            "side": "BUY",
+            "position_side": "LONG",
+            "role": "best_quote_entry_long",
+            "price": 200.0,
+            "qty": 0.1,
+            "notional": 20.0,
+            "time_in_force": "GTX",
+        }
+        ordinary_cancel = {
+            "orderId": 101,
+            "side": "SELL",
+            "role": "best_quote_entry_short",
+        }
+        frozen_reduce = {
+            "book": "frozen_bq",
+            "side": "SELL",
+            "position_side": "LONG",
+            "role": "frozen_inventory_manual_reduce_long",
+            "price": 200.0,
+            "qty": 0.1,
+            "notional": 20.0,
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "post_only": True,
+            "frozen_inventory_request_id": "frozen-legacy-1",
+            "frozen_inventory_authorization_validated": True,
+        }
+
+        guarded = coordinate_symbol_execution_action(
+            actions={
+                "place_orders": [ordinary_entry, frozen_reduce],
+                "cancel_orders": [ordinary_cancel],
+                "recovery_profile_gate": {
+                    "managed": False,
+                    "authorized": False,
+                },
+            },
+            current_actual_net_qty=0.0,
+            valuation_price=200.0,
+            current_open_orders=[],
+            max_actual_net_notional=120.0,
+        )
+
+        decision = guarded["actual_net_exposure_decision"]
+        self.assertEqual(decision["selected_lane"], "ordinary_with_frozen")
+        self.assertEqual(decision["selected_frozen_request_id"], "frozen-legacy-1")
+        self.assertEqual(decision["deferred_ordinary_place_count"], 0)
+        self.assertEqual(decision["deferred_ordinary_cancel_count"], 0)
+        self.assertEqual(guarded["place_orders"], [ordinary_entry, frozen_reduce])
+        self.assertEqual(guarded["place_count"], 2)
+        self.assertEqual(guarded["place_notional"], 40.0)
+        self.assertEqual(guarded["cancel_orders"], [ordinary_cancel])
+        self.assertEqual(guarded["cancel_count"], 1)
 
     def test_symbol_coordinator_selects_only_one_frozen_request_group(self) -> None:
         first_request = {

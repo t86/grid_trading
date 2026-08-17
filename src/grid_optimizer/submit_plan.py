@@ -1466,7 +1466,7 @@ def apply_actual_net_exposure_decision_to_actions(
     ]
     recovery_profile_gate = actions.get("recovery_profile_gate")
     managed_recovery = bool(
-        isinstance(recovery_profile_gate, dict)
+        isinstance(recovery_profile_gate, Mapping)
         and recovery_profile_gate.get("managed")
     )
 
@@ -2116,6 +2116,9 @@ def coordinate_symbol_execution_action(
     ordinary_action = str(ordinary_decision.get("action") or "hold")
     ordinary_safety_wins = ordinary_action != "normal"
     recovery_gate = actions.get("recovery_profile_gate")
+    registered_recovery_owner = bool(
+        isinstance(recovery_gate, Mapping) and recovery_gate.get("managed")
+    )
     current_gate = (
         recovery_gate.get("current_gate")
         if isinstance(recovery_gate, Mapping)
@@ -2125,8 +2128,7 @@ def coordinate_symbol_execution_action(
         (current_gate or {}).get("active_action") or "noop"
     ).lower().strip()
     ordinary_recovery_wins = bool(
-        isinstance(recovery_gate, Mapping)
-        and recovery_gate.get("managed")
+        registered_recovery_owner
         and recovery_gate.get("authorized")
         and active_recovery_action not in {"", "noop"}
     )
@@ -2157,6 +2159,41 @@ def coordinate_symbol_execution_action(
         )
         ordinary_result["actual_net_exposure_decision"] = ordinary_decision
         return ordinary_result
+
+    if (
+        not registered_recovery_owner
+        and ordinary_action == "normal"
+        and (ordinary_places or ordinary_cancels)
+    ):
+        result = dict(ordinary_result)
+        combined_places = [*ordinary_result.get("place_orders", []), *frozen_places]
+        combined_cancels = [*ordinary_result.get("cancel_orders", []), *frozen_cancels]
+        ordinary_decision.update(
+            {
+                "selected_lane": "ordinary_with_frozen",
+                "selected_frozen_request_id": selected_frozen_request_id,
+                "selected_frozen_place_count": len(frozen_places),
+                "selected_frozen_cancel_count": len(frozen_cancels),
+                "deferred_ordinary_place_count": 0,
+                "deferred_ordinary_cancel_count": 0,
+                "deferred_frozen_request_count": max(len(frozen_request_ids) - 1, 0),
+                "deferred_frozen_place_count": len(deferred_frozen_places),
+                "deferred_frozen_cancel_count": len(deferred_frozen_cancels),
+                "dropped_unauthorized_frozen_place_count": unauthorized_frozen_place_count,
+                "dropped_unauthorized_frozen_cancel_count": unauthorized_frozen_cancel_count,
+            }
+        )
+        result.update(
+            {
+                "place_orders": combined_places,
+                "place_count": len(combined_places),
+                "place_notional": sum(_order_notional(row) for row in combined_places),
+                "cancel_orders": combined_cancels,
+                "cancel_count": len(combined_cancels),
+                "actual_net_exposure_decision": ordinary_decision,
+            }
+        )
+        return result
 
     result = dict(actions)
     result.update(
