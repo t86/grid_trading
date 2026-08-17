@@ -646,6 +646,44 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
             },
         )
 
+    def test_four_leg_cycle_reports_normal_side_headroom_below_minimum(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                four_leg_cycle_enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.9,
+                inventory_bias_enabled=True,
+                inventory_bias_min_notional_gap=100.0,
+            ),
+            inputs=_inputs(
+                bid_price=1.0,
+                ask_price=1.01,
+                mid_price=1.0,
+                current_long_qty=894.0,
+                current_short_qty=800.0,
+                current_long_avg_price=1.03,
+                current_short_avg_price=0.98,
+                cycle_budget_notional=240.0,
+                entry_ladder_spacing=0.01,
+                tick_size=0.01,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+                position_side_mode="hedge",
+            ),
+        )
+
+        self.assertFalse(plan["metrics"]["inventory_bias"]["applied"])
+        self.assertEqual(
+            plan["metrics"]["four_leg_cycle"]["roles"]["long_entry"],
+            {
+                "status": "blocked",
+                "reason": "soft_headroom_below_min_notional",
+            },
+        )
+
     def test_near_soft_ceiling_posts_two_sided_profit_reduce_candidates(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(

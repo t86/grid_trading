@@ -1932,14 +1932,34 @@ def build_best_quote_maker_volume_plan(
                 for order in [*buy_orders, *sell_orders]
             )
 
-        def _record_entry_role(name: str, role: str) -> None:
+        def _record_entry_role(
+            name: str,
+            role: str,
+            *,
+            position_notional: float,
+            projected_notional: float,
+            soft_notional: float,
+            entry_ceiling: float,
+        ) -> None:
             if name in role_report:
                 return
-            role_report[name] = (
-                {"status": "planned", "reason": "order_present"}
-                if _role_present(role)
-                else {"status": "blocked", "reason": "missing_entry"}
-            )
+            if _role_present(role):
+                role_report[name] = {
+                    "status": "planned",
+                    "reason": "order_present",
+                }
+                return
+            if soft_notional > 0 and position_notional >= soft_notional - 1e-12:
+                reason = "soft_threshold_active_pair"
+            elif (
+                entry_ceiling > 0
+                and entry_ceiling - projected_notional
+                < max(_safe_float(inputs.min_notional), 0.0) - 1e-12
+            ):
+                reason = "soft_headroom_below_min_notional"
+            else:
+                reason = "missing_entry"
+            role_report[name] = {"status": "blocked", "reason": reason}
 
         def _ensure_biased_heavy_entry(
             *,
@@ -2184,8 +2204,22 @@ def build_best_quote_maker_volume_plan(
             entry_ceiling=short_entry_ceiling,
             side="SELL",
         )
-        _record_entry_role("long_entry", "best_quote_entry_long")
-        _record_entry_role("short_entry", "best_quote_entry_short")
+        _record_entry_role(
+            "long_entry",
+            "best_quote_entry_long",
+            position_notional=long_notional,
+            projected_notional=projected_long_entry_notional,
+            soft_notional=long_soft,
+            entry_ceiling=long_entry_ceiling,
+        )
+        _record_entry_role(
+            "short_entry",
+            "best_quote_entry_short",
+            position_notional=short_notional,
+            projected_notional=projected_short_entry_notional,
+            soft_notional=short_soft,
+            entry_ceiling=short_entry_ceiling,
+        )
         four_leg_cycle_report = {
             "enabled": True,
             "roles": role_report,
