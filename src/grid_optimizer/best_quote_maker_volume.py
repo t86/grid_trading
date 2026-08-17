@@ -453,6 +453,8 @@ def build_best_quote_maker_volume_plan(
     short_entry_ceiling = (
         max(short_soft - soft_entry_buffer, 0.0) if short_soft > 0 else short_limit
     )
+    long_profit_reduce_trigger = max(long_entry_ceiling - soft_entry_buffer, 0.0)
+    short_profit_reduce_trigger = max(short_entry_ceiling - soft_entry_buffer, 0.0)
 
     def _cap_entry_to_soft_headroom(
         requested_notional: float,
@@ -1706,8 +1708,8 @@ def build_best_quote_maker_volume_plan(
         )
         if (
             not has_short_reduce
-            and short_entry_ceiling > 0
-            and short_notional >= short_entry_ceiling - 1e-12
+            and short_profit_reduce_trigger > 0
+            and short_notional >= short_profit_reduce_trigger - 1e-12
         ):
             before_count = len(buy_orders)
             _append_order(
@@ -1732,8 +1734,8 @@ def build_best_quote_maker_volume_plan(
         )
         if (
             not has_long_reduce
-            and long_entry_ceiling > 0
-            and long_notional >= long_entry_ceiling - 1e-12
+            and long_profit_reduce_trigger > 0
+            and long_notional >= long_profit_reduce_trigger - 1e-12
         ):
             before_count = len(sell_orders)
             _append_order(
