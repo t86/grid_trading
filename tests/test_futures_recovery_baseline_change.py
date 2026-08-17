@@ -296,6 +296,81 @@ def test_failed_restart_dispatch_retries_the_same_fenced_effect_after_restart(
     assert retried_effects[0].effect_epoch == failed.effect_epoch
 
 
+def test_same_round_retries_pending_baseline_restart_after_cas_before_effect_crash(
+    tmp_path: Path,
+) -> None:
+    control_path = tmp_path / "arxusdt_loop_runner_control.json"
+    store = _register(control_path)
+    round_id = "same-round-cas-before-effect-crash"
+    coordinator = recovery.FuturesRecoveryCoordinator(
+        store=store,
+        snapshot_provider=lambda symbol, now, state: _snapshot(symbol, now, state),
+        effect_executor=lambda _symbol, _command: (_ for _ in ()).throw(
+            SystemExit("process crashed before effect dispatch")
+        ),
+    )
+    coordinator.change_baseline(_request(operation_id="same-round-crash-op"))
+
+    with pytest.raises(SystemExit, match="before effect dispatch"):
+        coordinator.reconcile_symbol(
+            "ARXUSDT",
+            now=NOW + timedelta(seconds=1),
+            round_id=round_id,
+        )
+    crashed_state = JsonRecoveryStore(control_path).read("ARXUSDT")
+    crashed_generation = crashed_state.generation
+    crashed_revision = crashed_state.document_revision
+    assert crashed_state.decision_id == f"ARXUSDT:{round_id}"
+    assert crashed_state.pending_effect_stage is recovery.EffectStage.RUNNER_RESTART
+    assert crashed_state.pending_effect_epoch is not None
+
+    retried_effects: list[recovery.EffectCommand] = []
+    restarted = _coordinator(
+        JsonRecoveryStore(control_path),
+        effects=retried_effects,
+    )
+    replay = restarted.reconcile_symbol(
+        "ARXUSDT",
+        now=NOW + timedelta(seconds=2),
+        round_id=round_id,
+    )
+
+    assert replay.effect_stage is recovery.EffectStage.RUNNER_RESTART
+    assert replay.effect_epoch == crashed_state.pending_effect_epoch
+    assert replay.next_state.decision_id == crashed_state.decision_id
+    assert replay.next_state.generation == crashed_generation
+    assert replay.next_state.document_revision == crashed_revision
+    assert retried_effects == [
+        recovery.EffectCommand(
+            decision_id=str(crashed_state.decision_id),
+            stage=recovery.EffectStage.RUNNER_RESTART,
+            effect_epoch=int(crashed_state.pending_effect_epoch),
+        )
+    ]
+
+    receipt = recovery.EffectReceipt(
+        decision_id=str(crashed_state.decision_id),
+        stage=recovery.EffectStage.RUNNER_RESTART,
+        effect_epoch=int(crashed_state.pending_effect_epoch),
+        observed_at=NOW + timedelta(seconds=3),
+    )
+    restarted.snapshot_provider = lambda symbol, now, state: _snapshot(
+        symbol,
+        now,
+        state,
+        effect_receipt=receipt,
+    )
+    settled = restarted.reconcile_symbol(
+        "ARXUSDT",
+        now=NOW + timedelta(seconds=3),
+        round_id="same-round-crash-receipt",
+    )
+
+    assert settled.next_state.phase is recovery.RecoveryPhase.STABLE
+    assert settled.effect_stage is recovery.EffectStage.NONE
+    assert len(retried_effects) == 1
+
+
 def test_higher_priority_recovery_wins_and_baseline_stays_deferred(
     tmp_path: Path,
 ) -> None:

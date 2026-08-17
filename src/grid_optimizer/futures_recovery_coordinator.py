@@ -3680,19 +3680,38 @@ class FuturesRecoveryCoordinator:
             return self._round_outcomes[cache_key]
         state = self.store.read(normalized)
         if round_id in state.recent_round_ids or state.last_round_id == round_id:
+            replay_pending_baseline_effect = bool(
+                state.active_action is ActionId.BASELINE_REBASE
+                and _durable_baseline_change_is_active(state)
+                and state.decision_id == f"{normalized}:{round_id}"
+                and state.pending_effect_stage is EffectStage.RUNNER_RESTART
+                and state.pending_effect_epoch is not None
+            )
             replay = RoundPlan(
                 symbol=state.symbol,
                 round_id=round_id,
                 action_id=state.active_action,
-                mode=ActionMode.HOLD,
+                mode=(
+                    ActionMode.ADVANCE
+                    if replay_pending_baseline_effect
+                    else ActionMode.HOLD
+                ),
                 side=state.side,
                 order_role=state.order_role,
                 reasons=state.reasons,
                 suppressed_actions=(),
                 desired_profile=state.desired_profile,
                 desired_runner_state=state.desired_runner_state,
-                effect_stage=EffectStage.NONE,
-                effect_epoch=None,
+                effect_stage=(
+                    state.pending_effect_stage
+                    if replay_pending_baseline_effect
+                    else EffectStage.NONE
+                ),
+                effect_epoch=(
+                    state.pending_effect_epoch
+                    if replay_pending_baseline_effect
+                    else None
+                ),
                 liveness_status=(
                     "terminal"
                     if state.phase
@@ -3704,6 +3723,7 @@ class FuturesRecoveryCoordinator:
                 ),
                 next_state=state,
             )
+            replay = self._execute_plan_effect(normalized, round_id, replay)
             self._round_outcomes[cache_key] = replay
             return replay
         snapshot = self.snapshot_provider(normalized, now, state)
@@ -3718,18 +3738,28 @@ class FuturesRecoveryCoordinator:
             expected_revision=state.document_revision,
             next_state=plan.next_state,
         )
-        if plan.effect_stage is not EffectStage.NONE:
-            decision_id = plan.next_state.decision_id or f"{normalized}:{round_id}"
-            if plan.effect_epoch is None:
-                raise ValueError("effect command is missing its epoch")
-            command = EffectCommand(
-                decision_id=decision_id,
-                stage=plan.effect_stage,
-                effect_epoch=plan.effect_epoch,
-            )
-            try:
-                self.effect_executor(normalized, command)
-            except Exception as exc:
-                plan = replace(plan, effect_error=str(exc))
+        plan = self._execute_plan_effect(normalized, round_id, plan)
         self._round_outcomes[cache_key] = plan
+        return plan
+
+    def _execute_plan_effect(
+        self,
+        symbol: str,
+        round_id: str,
+        plan: RoundPlan,
+    ) -> RoundPlan:
+        if plan.effect_stage is EffectStage.NONE:
+            return plan
+        decision_id = plan.next_state.decision_id or f"{symbol}:{round_id}"
+        if plan.effect_epoch is None:
+            raise ValueError("effect command is missing its epoch")
+        command = EffectCommand(
+            decision_id=decision_id,
+            stage=plan.effect_stage,
+            effect_epoch=plan.effect_epoch,
+        )
+        try:
+            self.effect_executor(symbol, command)
+        except Exception as exc:
+            return replace(plan, effect_error=str(exc))
         return plan
