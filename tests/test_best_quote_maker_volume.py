@@ -335,11 +335,13 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
                 current_short_avg_price=99.0,
                 current_long_lots=[
                     {"qty": 1.0, "price": 102.0, "role": "best_quote_entry_long"},
+                    {"qty": 1.0, "price": 99.6, "role": "best_quote_entry_long"},
                     {"qty": 1.0, "price": 99.5, "role": "best_quote_entry_long"},
                 ],
                 current_short_lots=[
                     {"qty": 1.0, "price": 98.0, "role": "best_quote_entry_short"},
                     {"qty": 1.0, "price": 100.5, "role": "best_quote_entry_short"},
+                    {"qty": 1.0, "price": 100.6, "role": "best_quote_entry_short"},
                 ],
             ),
         )
@@ -353,9 +355,11 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         )
         self.assertEqual(long_reduce["price"], 100.1)
         self.assertEqual(short_reduce["price"], 100.0)
+        self.assertEqual(long_reduce["qty"], 2.0)
+        self.assertEqual(short_reduce["qty"], 2.0)
         report = plan["metrics"]["four_leg_cycle"]["roles"]
         self.assertEqual(report["long_profit_reduce"]["position_cost"], 99.5)
-        self.assertEqual(report["short_profit_reduce"]["position_cost"], 100.5)
+        self.assertEqual(report["short_profit_reduce"]["position_cost"], 100.6)
 
     def test_four_leg_profit_reduce_does_not_repeat_without_an_unreleased_entry_lot(self) -> None:
         plan = build_best_quote_maker_volume_plan(

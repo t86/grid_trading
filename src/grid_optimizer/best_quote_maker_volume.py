@@ -2078,6 +2078,7 @@ def build_best_quote_maker_volume_plan(
                 }
                 return
             paired_lot_qty: float | None = None
+            eligible_lots: list[dict[str, Any]] | None = None
             if position_lots is not None:
                 entry_role = (
                     "best_quote_entry_long"
@@ -2110,14 +2111,6 @@ def build_best_quote_maker_volume_plan(
                 )
                 position_cost = _safe_float(
                     eligible_lots[0].get("price", eligible_lots[0].get("entry_price"))
-                )
-                paired_lot_qty = sum(
-                    max(_safe_float(lot.get("qty")), 0.0)
-                    for lot in eligible_lots
-                    if abs(
-                        _safe_float(lot.get("price", lot.get("entry_price")))
-                        - position_cost
-                    ) <= 1e-12
                 )
                 cost_source = "ordinary_entry_lot"
                 cost_audit.update(
@@ -2165,6 +2158,25 @@ def build_best_quote_maker_volume_plan(
                 }
                 return
             cost_audit["target_price"] = price
+            if eligible_lots is not None:
+                paired_lot_qty = sum(
+                    max(_safe_float(lot.get("qty")), 0.0)
+                    for lot in eligible_lots
+                    if abs(
+                        _four_leg_profit_price(
+                            position_side=position_side,
+                            position_cost=_safe_float(
+                                lot.get("price", lot.get("entry_price"))
+                            ),
+                            step_price=_safe_float(inputs.entry_ladder_spacing),
+                            best_bid=bid,
+                            best_ask=ask,
+                            tick_size=inputs.tick_size,
+                        )
+                        - price
+                    )
+                    <= 1e-12
+                )
 
             profit_boundary = position_cost + max(
                 _safe_float(inputs.entry_ladder_spacing),
