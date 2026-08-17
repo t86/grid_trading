@@ -315,7 +315,7 @@ def test_registered_stable_roll_updates_only_lifecycle_and_defers_managed_profil
     assert paths[3].read_bytes() == original_loop_state
 
 
-def test_registered_nonstable_roll_persists_only_deferred_request(
+def test_registered_nonstable_roll_is_zero_write_and_requests_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -345,20 +345,16 @@ def test_registered_nonstable_roll_persists_only_deferred_request(
         "write_json_atomically",
         lambda *_args, **_kwargs: pytest.fail("registered roll used legacy writer"),
     )
-    roll_competition_window.main()
+    with pytest.raises(SystemExit) as raised:
+        roll_competition_window.main()
     status = json.loads(capsys.readouterr().out)
     after = JsonRecoveryStore(paths[0]).read("ARXUSDT")
 
+    assert raised.value.code == 3
     assert status["status"] == "deferred"
     assert status["request_status"] == "deferred"
-    assert after.document_revision == before.document_revision + 1
-    assert after.generation == before.generation
-    assert after.phase == before.phase
-    assert after.active_action == before.active_action
-    assert after.desired_profile == before.desired_profile
-    assert after.pending_effect_stage == before.pending_effect_stage
-    assert after.baseline_change is not None
-    assert after.baseline_change.status.value == "deferred"
+    assert status["changed"] is False
+    assert after == before
     assert paths[2].read_bytes() == guard_before
     assert paths[3].read_bytes() == loop_before
 
@@ -407,6 +403,66 @@ def test_registered_roll_is_idempotent_and_rejects_changed_target(
         )
     assert store.read("ARXUSDT") == first_state
 
+
+def test_registered_roll_race_to_active_is_not_reported_as_persisted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths = _write_registered_roll_fixture(tmp_path)
+    from deploy.oracle import roll_competition_window
+
+    original_change_baseline = (
+        roll_competition_window.FuturesRecoveryCoordinator.change_baseline
+    )
+
+    def race_to_active(self, request):
+        state = self.store.read(request.symbol)
+        entered = FuturesRecoveryDecisionEngine().plan_round(
+            snapshot=SymbolSnapshot(
+                symbol=request.symbol,
+                captured_at=datetime(2026, 7, 16, 8, 1, tzinfo=BEIJING),
+                assessment=FlowBlockerAssessment(
+                    runner_faults=("runner_inactive",),
+                ),
+            ),
+            state=state,
+            now=datetime(2026, 7, 16, 8, 1, tzinfo=BEIJING),
+            round_id="window-roll-race",
+        )
+        self.store.compare_and_swap(
+            request.symbol,
+            expected_revision=state.document_revision,
+            next_state=entered.next_state,
+        )
+        return original_change_baseline(self, request)
+
+    monkeypatch.setattr(
+        roll_competition_window.FuturesRecoveryCoordinator,
+        "change_baseline",
+        race_to_active,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _registered_roll_argv(
+            control_path=paths[0],
+            runtime_profile_path=paths[1],
+            guard_state_path=paths[2],
+            loop_state_path=paths[3],
+        ),
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        roll_competition_window.main()
+
+    status = json.loads(capsys.readouterr().out)
+    fresh = JsonRecoveryStore(paths[0]).read("ARXUSDT")
+    assert raised.value.code == 3
+    assert status["changed"] is False
+    assert status["request_status"] == "deferred"
+    assert fresh.phase is RecoveryPhase.ACTIVE
+    assert fresh.baseline_changes == ()
 
 def test_malformed_registered_recovery_envelope_fails_closed_without_writes(
     tmp_path: Path,

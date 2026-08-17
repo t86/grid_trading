@@ -198,8 +198,11 @@ def submit_registered_roll(
         ),
     )
     outcome = coordinator.change_baseline(request)
-    request_persisted = (
-        store.read(state.symbol).document_revision != state.document_revision
+    persisted_state = store.read(state.symbol)
+    request_persisted = any(
+        record.request.operation_id == request.operation_id
+        and record.request.payload_digest == request.payload_digest
+        for record in persisted_state.baseline_changes
     )
     return (
         {
@@ -482,6 +485,8 @@ def main() -> None:
                 ensure_ascii=False,
             )
         )
+        if not submission["request_persisted"]:
+            raise SystemExit(REGISTERED_RECOVERY_DEFERRED_EXIT_CODE)
         return
 
     with exclusive_control_lock(control_path):

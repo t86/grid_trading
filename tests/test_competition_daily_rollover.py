@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -11,7 +11,10 @@ from grid_optimizer.futures_recovery_coordinator import (
     ActionId,
     BaselineChangeStatus,
     EffectStage,
+    FlowBlockerAssessment,
+    FuturesRecoveryDecisionEngine,
     RecoveryPhase,
+    SymbolSnapshot,
 )
 from grid_optimizer.futures_recovery_store import JsonRecoveryStore
 from grid_optimizer.futures_recovery_store import (
@@ -104,6 +107,68 @@ def test_registered_daily_roll_submits_durable_request_without_direct_write_or_r
     assert fresh.baseline_change.request.operation_id == (
         "competition-daily-roll:ARXUSDT:2026-08-17T00:00:00+00:00"
     )
+
+
+def test_registered_daily_roll_race_to_active_requests_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    control_path = _registered_control(tmp_path)
+    from grid_optimizer import competition_daily_rollover as rollover
+
+    original_change_baseline = rollover.FuturesRecoveryCoordinator.change_baseline
+
+    def race_to_active(self, request):
+        state = self.store.read(request.symbol)
+        entered = FuturesRecoveryDecisionEngine().plan_round(
+            snapshot=SymbolSnapshot(
+                symbol=request.symbol,
+                captured_at=NOW + timedelta(minutes=1),
+                assessment=FlowBlockerAssessment(
+                    runner_faults=("runner_inactive",),
+                ),
+            ),
+            state=state,
+            now=NOW + timedelta(minutes=1),
+            round_id="daily-roll-race",
+        )
+        self.store.compare_and_swap(
+            request.symbol,
+            expected_revision=state.document_revision,
+            next_state=entered.next_state,
+        )
+        return original_change_baseline(self, request)
+
+    monkeypatch.setattr(
+        rollover.FuturesRecoveryCoordinator,
+        "change_baseline",
+        race_to_active,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "competition_daily_rollover.py",
+            "--workdir",
+            str(tmp_path),
+            "--symbols",
+            "ARXUSDT",
+            "--now",
+            NOW.isoformat(),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        rollover.main()
+
+    result = json.loads(capsys.readouterr().out)
+    fresh = JsonRecoveryStore(control_path).read("ARXUSDT")
+    assert raised.value.code == 3
+    assert result["request_status"] == "deferred"
+    assert result["request_persisted"] is False
+    assert fresh.phase is RecoveryPhase.ACTIVE
+    assert fresh.baseline_changes == ()
 
 
 def test_unregistered_daily_roll_keeps_legacy_write_and_restart(

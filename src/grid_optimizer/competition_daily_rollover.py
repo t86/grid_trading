@@ -98,6 +98,12 @@ def _submit_registered_rollover(
         ),
     )
     outcome = coordinator.change_baseline(request)
+    persisted_state = store.read(symbol)
+    request_persisted = any(
+        record.request.operation_id == request.operation_id
+        and record.request.payload_digest == request.payload_digest
+        for record in persisted_state.baseline_changes
+    )
     return {
         "symbol": symbol,
         "window_start": start.isoformat(),
@@ -112,6 +118,7 @@ def _submit_registered_rollover(
         "request_status": outcome.status.value,
         "operation_id": outcome.operation_id,
         "attempt_id": outcome.attempt_id,
+        "request_persisted": request_persisted,
         "restart_skipped": True,
     }
 
@@ -181,6 +188,8 @@ def main() -> None:
         record = rollover_symbol(workdir=Path(args.workdir), symbol=symbol, now=now)
         if record.get("recovery_coordinator_registered"):
             print(json.dumps(record, ensure_ascii=False, sort_keys=True))
+            if not record.get("request_persisted"):
+                raise SystemExit(3)
             continue
         restart = subprocess.run(
             [args.runner_wrapper, "restart", symbol],
