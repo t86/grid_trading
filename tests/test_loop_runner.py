@@ -12456,6 +12456,148 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(len(plan["buy_orders"]), 1)
         self.assertEqual(len(plan["sell_orders"]), 1)
 
+    def test_four_leg_cycle_yields_to_paired_threshold_reduce_and_resumes_below_soft(self) -> None:
+        config = BestQuoteMakerVolumeConfig(
+            enabled=True,
+            four_leg_cycle_enabled=True,
+            max_long_notional=1_000.0,
+            max_short_notional=1_000.0,
+            inventory_soft_ratio=0.90,
+        )
+        common_inputs = {
+            "bid_price": 100.0,
+            "ask_price": 100.1,
+            "mid_price": 100.05,
+            "cycle_budget_notional": 200.0,
+            "loss_per_10k_15m": 0.2,
+            "target_volume_remaining": 100_000.0,
+            "tick_size": 0.1,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+            "entry_ladder_spacing": 0.5,
+            "current_long_avg_price": 101.0,
+            "current_short_avg_price": 99.0,
+            "position_side_mode": "hedge",
+        }
+        threshold_plan = build_best_quote_maker_volume_plan(
+            config=config,
+            inputs=BestQuoteMakerVolumeInputs(
+                **common_inputs,
+                current_net_qty=1.8,
+                current_long_qty=10.0,
+                current_short_qty=8.2,
+            ),
+        )
+
+        report = apply_best_quote_active_pair_reduce(
+            plan=threshold_plan,
+            state={},
+            enabled=True,
+            current_long_qty=10.0,
+            current_short_qty=8.2,
+            current_long_notional=1_000.5,
+            current_short_notional=820.41,
+            max_long_notional=1_000.0,
+            max_short_notional=1_000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=100.0,
+            offset_ticks=0,
+            step_price=0.5,
+            tick_size=0.1,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+            bid_price=100.0,
+            ask_price=100.1,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=900.0,
+            current_long_avg_price=101.0,
+            current_short_avg_price=99.0,
+            max_loss_ratio=0.20,
+            min_relief_notional=100.0,
+            suppress_all_entries_while_active=True,
+            suppress_noneligible_reduce_while_active=True,
+            pair_all_sides_on_threshold=True,
+        )
+
+        active_orders = [
+            *threshold_plan["buy_orders"],
+            *threshold_plan["sell_orders"],
+        ]
+        self.assertTrue(report["active"])
+        self.assertEqual(
+            {order["role"] for order in active_orders},
+            {
+                "best_quote_active_pair_reduce_long",
+                "best_quote_active_pair_reduce_short",
+            },
+        )
+        self.assertTrue(all(order["force_reduce_only"] for order in active_orders))
+        self.assertTrue(all(order["notional"] <= 100.0 + 1e-9 for order in active_orders))
+        self.assertEqual(
+            next(order for order in active_orders if order["position_side"] == "LONG")["price"],
+            100.1,
+        )
+        self.assertEqual(
+            next(order for order in active_orders if order["position_side"] == "SHORT")["price"],
+            100.0,
+        )
+
+        resumed_plan = build_best_quote_maker_volume_plan(
+            config=config,
+            inputs=BestQuoteMakerVolumeInputs(
+                **common_inputs,
+                current_net_qty=0.3,
+                current_long_qty=8.5,
+                current_short_qty=8.2,
+            ),
+        )
+        resumed_report = apply_best_quote_active_pair_reduce(
+            plan=resumed_plan,
+            state={},
+            enabled=True,
+            current_long_qty=8.5,
+            current_short_qty=8.2,
+            current_long_notional=850.425,
+            current_short_notional=820.41,
+            max_long_notional=1_000.0,
+            max_short_notional=1_000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=100.0,
+            offset_ticks=0,
+            step_price=0.5,
+            tick_size=0.1,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+            bid_price=100.0,
+            ask_price=100.1,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=900.0,
+            current_long_avg_price=101.0,
+            current_short_avg_price=99.0,
+            pair_all_sides_on_threshold=True,
+        )
+        resumed_roles = {
+            order["role"]
+            for order in [*resumed_plan["buy_orders"], *resumed_plan["sell_orders"]]
+        }
+        self.assertFalse(resumed_report["active"])
+        self.assertEqual(resumed_report["reason"], "below_soft")
+        self.assertTrue(
+            {
+                "best_quote_entry_long",
+                "best_quote_reduce_long",
+                "best_quote_entry_short",
+                "best_quote_reduce_short",
+            }.issubset(resumed_roles)
+        )
+
     def test_best_quote_active_pair_reduce_keeps_normal_flow_for_large_pair_imbalance(self) -> None:
         plan = {
             "buy_orders": [
