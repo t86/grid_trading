@@ -326,6 +326,126 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertLessEqual(plan["buy_orders"][0]["notional"], 60.0 + 1e-6)
         self.assertLessEqual(plan["sell_orders"][0]["notional"], 60.0 + 1e-6)
 
+    def test_near_soft_underwater_inventory_keeps_cost_improving_paired_entries(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_entry_orders_per_side=2,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.9,
+                inventory_bias_enabled=True,
+                inventory_bias_min_notional_gap=30.0,
+            ),
+            inputs=_inputs(
+                bid_price=1.0,
+                ask_price=1.01,
+                mid_price=1.0,
+                current_long_qty=896.0,
+                current_short_qty=896.0,
+                current_long_avg_price=1.03,
+                current_short_avg_price=0.98,
+                current_net_qty=0.0,
+                cycle_budget_notional=120.0,
+                tick_size=0.01,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+                position_side_mode="hedge",
+            ),
+        )
+
+        long_entries = [
+            order for order in plan["buy_orders"]
+            if order["role"] == "best_quote_entry_long"
+        ]
+        short_entries = [
+            order for order in plan["sell_orders"]
+            if order["role"] == "best_quote_entry_short"
+        ]
+        self.assertTrue(long_entries)
+        self.assertTrue(short_entries)
+        self.assertAlmostEqual(
+            sum(order["notional"] for order in long_entries),
+            sum(order["notional"] for order in short_entries),
+            delta=1.01,
+        )
+        self.assertLessEqual(
+            896.0 + sum(order["notional"] for order in long_entries),
+            1_000.0,
+        )
+        self.assertLessEqual(
+            896.0 + sum(order["notional"] for order in short_entries),
+            1_000.0,
+        )
+        self.assertIn("balanced_cost_recovery", plan["reasons"])
+
+    def test_cost_recovery_does_not_override_inventory_bias(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.9,
+                inventory_bias_enabled=True,
+                inventory_bias_min_notional_gap=30.0,
+            ),
+            inputs=_inputs(
+                bid_price=1.0,
+                ask_price=1.01,
+                mid_price=1.0,
+                current_long_qty=896.0,
+                current_short_qty=850.0,
+                current_long_avg_price=1.03,
+                current_short_avg_price=0.98,
+                cycle_budget_notional=120.0,
+                tick_size=0.01,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+                position_side_mode="hedge",
+            ),
+        )
+
+        self.assertNotIn("balanced_cost_recovery", plan["reasons"])
+        self.assertFalse(
+            any(order["role"] == "best_quote_entry_long" for order in plan["buy_orders"])
+        )
+
+    def test_cost_recovery_stops_when_target_is_complete(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.9,
+            ),
+            inputs=_inputs(
+                bid_price=1.0,
+                ask_price=1.01,
+                mid_price=1.0,
+                current_long_qty=896.0,
+                current_short_qty=896.0,
+                current_long_avg_price=1.03,
+                current_short_avg_price=0.98,
+                cycle_budget_notional=120.0,
+                target_volume_remaining=0.0,
+                tick_size=0.01,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+                position_side_mode="hedge",
+            ),
+        )
+
+        self.assertNotIn("balanced_cost_recovery", plan["reasons"])
+        self.assertFalse(
+            any(order["role"] == "best_quote_entry_long" for order in plan["buy_orders"])
+        )
+        self.assertFalse(
+            any(order["role"] == "best_quote_entry_short" for order in plan["sell_orders"])
+        )
+
     def test_high_loss_switches_to_defensive_and_keeps_only_reduce_side(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(enabled=True, loss_per_10k_hard=0.8),
