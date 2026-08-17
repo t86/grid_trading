@@ -23952,6 +23952,8 @@ def _best_quote_active_pair_reduce_default_report() -> dict[str, Any]:
         "short_target_notional": None,
         "long_start_notional": 0.0,
         "short_start_notional": 0.0,
+        "long_authorized_reduce_notional": 0.0,
+        "short_authorized_reduce_notional": 0.0,
         "long_soft_notional": 0.0,
         "short_soft_notional": 0.0,
         "per_order_notional": 0.0,
@@ -24599,6 +24601,8 @@ def apply_best_quote_active_pair_reduce(
             "short_start_notional": safe_short_notional,
             "long_target_notional": long_target,
             "short_target_notional": short_target,
+            "long_authorized_reduce_notional": 0.0,
+            "short_authorized_reduce_notional": 0.0,
             "trigger_count": int(memory.get("trigger_count") or 0) + 1,
         }
         active = True
@@ -24608,6 +24612,14 @@ def apply_best_quote_active_pair_reduce(
 
     long_target = max(_safe_float(memory.get("long_target_notional")), 0.0)
     short_target = max(_safe_float(memory.get("short_target_notional")), 0.0)
+    long_authorized_reduce = max(
+        _safe_float(memory.get("long_authorized_reduce_notional")),
+        0.0,
+    )
+    short_authorized_reduce = max(
+        _safe_float(memory.get("short_authorized_reduce_notional")),
+        0.0,
+    )
     report.update(
         {
             "active": True,
@@ -24616,6 +24628,8 @@ def apply_best_quote_active_pair_reduce(
             "short_target_notional": short_target,
             "long_start_notional": max(_safe_float(memory.get("long_start_notional")), 0.0),
             "short_start_notional": max(_safe_float(memory.get("short_start_notional")), 0.0),
+            "long_authorized_reduce_notional": long_authorized_reduce,
+            "short_authorized_reduce_notional": short_authorized_reduce,
         }
     )
     if paired_threshold_mode and not threshold_eligible_sides:
@@ -24625,6 +24639,46 @@ def apply_best_quote_active_pair_reduce(
     if long_reached and short_reached:
         return _clear("target_reached", completed=True)
     minimum_actionable_notional = max(_safe_float(min_notional), 0.0)
+
+    def _lease_authorization_exhausted(
+        *,
+        side_name: str,
+        start_notional: float,
+        target_notional: float,
+        authorized_notional: float,
+        target_reached: bool,
+    ) -> bool:
+        if side_name not in eligible_sides or target_reached:
+            return True
+        lease_budget = min(
+            safe_max_reduce,
+            max(start_notional - target_notional, 0.0),
+        )
+        remaining_budget = max(lease_budget - authorized_notional, 0.0)
+        return remaining_budget < minimum_actionable_notional + 1e-12
+
+    long_authorization_exhausted = _lease_authorization_exhausted(
+        side_name="long",
+        start_notional=max(_safe_float(memory.get("long_start_notional")), 0.0),
+        target_notional=long_target,
+        authorized_notional=long_authorized_reduce,
+        target_reached=long_reached,
+    )
+    short_authorization_exhausted = _lease_authorization_exhausted(
+        side_name="short",
+        start_notional=max(_safe_float(memory.get("short_start_notional")), 0.0),
+        target_notional=short_target,
+        authorized_notional=short_authorized_reduce,
+        target_reached=short_reached,
+    )
+    if (
+        paired_threshold_mode
+        and long_authorization_exhausted
+        and short_authorization_exhausted
+        and not (long_reached and short_reached)
+    ):
+        return _clear("lease_budget_exhausted", completed=True)
+
     eligible_residuals = [
         max(current_notional - target_notional, 0.0)
         for side_name, current_notional, target_notional in (
@@ -24745,7 +24799,28 @@ def apply_best_quote_active_pair_reduce(
             0,
         )
         remaining_notional = max(current_notional - target_notional, 0.0)
-        budget = min(safe_per_order, safe_max_reduce, remaining_notional, current_notional)
+        authorized_key = f"{side_name}_authorized_reduce_notional"
+        authorized_notional = max(_safe_float(memory.get(authorized_key)), 0.0)
+        start_notional = max(
+            _safe_float(memory.get(f"{side_name}_start_notional")),
+            0.0,
+        )
+        lease_budget = min(
+            safe_max_reduce,
+            max(start_notional - target_notional, 0.0),
+        )
+        remaining_authorized_budget = (
+            max(lease_budget - authorized_notional, 0.0)
+            if paired_threshold_mode
+            else safe_max_reduce
+        )
+        budget = min(
+            safe_per_order,
+            safe_max_reduce,
+            remaining_authorized_budget,
+            remaining_notional,
+            current_notional,
+        )
         if budget <= 0:
             return
         price = _resolve_near_market_release_price(
@@ -24800,7 +24875,10 @@ def apply_best_quote_active_pair_reduce(
         }
         plan[order_key].append(order)
         placed.append(order)
+        if paired_threshold_mode:
+            memory[authorized_key] = authorized_notional + notional
         report[f"{side_name}_order_notional"] = notional
+        report[authorized_key] = max(_safe_float(memory.get(authorized_key)), 0.0)
 
     if "long" in eligible_sides and not long_reached:
         _append_reduce_order(

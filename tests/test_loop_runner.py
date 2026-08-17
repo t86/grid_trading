@@ -13557,6 +13557,90 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(second["order_count"], 0)
         self.assertEqual(second_plan, {"buy_orders": [], "sell_orders": []})
 
+    def test_paired_threshold_lease_does_not_restore_budget_after_late_entry_fill(self) -> None:
+        now = datetime(2026, 8, 17, 7, 1, 56, tzinfo=timezone.utc)
+        state: dict[str, Any] = {}
+        first_plan = {"buy_orders": [], "sell_orders": []}
+
+        first = apply_best_quote_active_pair_reduce(
+            plan=first_plan,
+            state=state,
+            enabled=True,
+            current_long_qty=3127.0,
+            current_short_qty=3315.0,
+            current_long_notional=893.22755,
+            current_short_notional=946.87676,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=100.0,
+            offset_ticks=1,
+            step_price=0.0001,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.2856,
+            ask_price=0.2857,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=900.0,
+            current_long_avg_price=0.285775,
+            current_short_avg_price=0.285477,
+            max_loss_ratio=0.20,
+            min_relief_notional=100.0,
+            pair_all_sides_on_threshold=True,
+            now=now,
+            rearm_cooldown_seconds=60.0,
+        )
+
+        self.assertEqual(first["order_count"], 2)
+        self.assertLessEqual(first["long_order_notional"], 100.0)
+        self.assertLessEqual(first["short_order_notional"], 100.0)
+
+        # The long reduce filled, but a pre-existing long entry filled before
+        # its cancellation.  Net inventory therefore remains above the lease
+        # target even though the lease already authorized its full 100U cap.
+        second_plan = {"buy_orders": [], "sell_orders": []}
+        second = apply_best_quote_active_pair_reduce(
+            plan=second_plan,
+            state=state,
+            enabled=True,
+            current_long_qty=2870.0,
+            current_short_qty=3315.0,
+            current_long_notional=820.1025,
+            current_short_notional=947.20824,
+            max_long_notional=1000.0,
+            max_short_notional=1000.0,
+            soft_ratio=0.90,
+            min_side_notional=0.0,
+            per_order_notional=100.0,
+            max_reduce_notional_per_side=100.0,
+            offset_ticks=1,
+            step_price=0.0001,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.2858,
+            ask_price=0.2859,
+            volatility_entry_pause={"active": False},
+            loss_reduce_threshold_notional=900.0,
+            current_long_avg_price=0.285775,
+            current_short_avg_price=0.285477,
+            max_loss_ratio=0.20,
+            min_relief_notional=100.0,
+            pair_all_sides_on_threshold=True,
+            now=now + timedelta(seconds=5),
+            rearm_cooldown_seconds=60.0,
+        )
+
+        self.assertTrue(second["completed"])
+        self.assertEqual(second["reason"], "lease_budget_exhausted")
+        self.assertEqual(second["order_count"], 0)
+        self.assertEqual(second_plan, {"buy_orders": [], "sell_orders": []})
+
     def test_grvt_bounded_loss_recovery_clears_one_hundred_below_soft(self) -> None:
         plan = {
             "buy_orders": [
