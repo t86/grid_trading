@@ -182,11 +182,12 @@ def _four_leg_profit_price(
 
 Add `_ensure_four_leg_profit_reduces(...)` after ordinary plan generation and before the existing active-pair runner guard. For each ordinary side:
 
-1. Leave an existing ordinary reduce role untouched.
-2. If no ordinary position or no valid position cost exists, record a blocked reason.
-3. Calculate the cost-based price with `_four_leg_profit_price`.
-4. Size the reduce by the smaller of ordinary position notional and the side's cycle budget; apply existing min/max quantity and min-notional checks.
-5. Build `best_quote_reduce_long` or `best_quote_reduce_short` with `reduce_only=True` and ordinary ownership metadata.
+1. Use only unconsumed `best_quote_entry_long` / `best_quote_entry_short` lots as profitable-release credit. Bootstrap, reconcile, and frozen lots are not credit.
+2. Group the oldest eligible entry-price level and calculate its exit at entry cost ± step. A reduce fill consumes these eligible lots before historical inventory, so the same cost/price level cannot be released repeatedly without a new entry fill.
+3. Retain at least `max(min_cycle_budget_notional * 0.5, exchange_min_notional)` of ordinary inventory on each side; remove an oversized pre-existing reduce instead of allowing it to bypass the floor.
+4. Size the reduce by the smallest of eligible lot quantity, remaining inventory above the retained floor, and half the cycle budget; apply existing quantity and min-notional checks.
+5. If no eligible lot exists, record `no_unreleased_entry_lot`; if the side is at the floor, record `retained_inventory_floor`.
+6. Build `best_quote_reduce_long` or `best_quote_reduce_short` with `reduce_only=True` and ordinary ownership metadata.
 
 Expose:
 

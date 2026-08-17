@@ -256,6 +256,174 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertLessEqual(short_reduce["price"], 98.5)
         self.assertTrue(plan["metrics"]["four_leg_cycle"]["complete"])
 
+    def test_four_leg_profit_reduce_uses_unreleased_entry_lot_and_retains_inventory_floor(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                four_leg_cycle_enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.90,
+                min_cycle_budget_notional=400.0,
+            ),
+            inputs=_inputs(
+                bid_price=100.0,
+                ask_price=100.1,
+                mid_price=100.0,
+                cycle_budget_notional=800.0,
+                entry_ladder_spacing=0.5,
+                tick_size=0.1,
+                step_size=0.001,
+                position_side_mode="hedge",
+                current_long_qty=3.95,
+                current_short_qty=3.95,
+                current_long_avg_price=101.0,
+                current_short_avg_price=99.0,
+                current_long_lots=[
+                    {
+                        "qty": 3.0,
+                        "price": 101.2,
+                        "source": "trade_fill",
+                        "role": "best_quote_entry_long",
+                    }
+                ],
+                current_short_lots=[
+                    {
+                        "qty": 3.0,
+                        "price": 98.8,
+                        "source": "trade_fill",
+                        "role": "best_quote_entry_short",
+                    }
+                ],
+            ),
+        )
+
+        short_reduce = next(
+            order
+            for order in plan["buy_orders"]
+            if order["role"] == "best_quote_reduce_short"
+        )
+        self.assertLessEqual(short_reduce["notional"], 195.0 + 1e-12)
+        self.assertLessEqual(short_reduce["price"], 98.3)
+        report = plan["metrics"]["four_leg_cycle"]["roles"]["short_profit_reduce"]
+        self.assertEqual(report["cost_source"], "ordinary_entry_lot")
+        self.assertEqual(report["retained_notional"], 200.0)
+        self.assertEqual(report["reducible_notional"], 195.0)
+
+    def test_four_leg_profit_reduce_does_not_repeat_without_an_unreleased_entry_lot(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                four_leg_cycle_enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.90,
+                min_cycle_budget_notional=400.0,
+            ),
+            inputs=_inputs(
+                bid_price=100.0,
+                ask_price=100.1,
+                mid_price=100.0,
+                cycle_budget_notional=800.0,
+                entry_ladder_spacing=0.5,
+                tick_size=0.1,
+                step_size=0.001,
+                position_side_mode="hedge",
+                current_long_qty=3.0,
+                current_short_qty=3.0,
+                current_long_avg_price=101.0,
+                current_short_avg_price=99.0,
+                current_long_lots=[],
+                current_short_lots=[],
+            ),
+        )
+
+        roles = {
+            order["role"]
+            for order in [*plan["buy_orders"], *plan["sell_orders"]]
+        }
+        self.assertNotIn("best_quote_reduce_long", roles)
+        self.assertNotIn("best_quote_reduce_short", roles)
+        report = plan["metrics"]["four_leg_cycle"]["roles"]
+        self.assertEqual(report["long_profit_reduce"]["reason"], "no_unreleased_entry_lot")
+        self.assertEqual(report["short_profit_reduce"]["reason"], "no_unreleased_entry_lot")
+
+    def test_four_leg_profit_reduce_stops_at_retained_inventory_floor(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                four_leg_cycle_enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.90,
+                min_cycle_budget_notional=400.0,
+            ),
+            inputs=_inputs(
+                bid_price=100.0,
+                ask_price=100.1,
+                mid_price=100.0,
+                cycle_budget_notional=800.0,
+                entry_ladder_spacing=0.5,
+                tick_size=0.1,
+                step_size=0.001,
+                position_side_mode="hedge",
+                current_long_qty=2.0,
+                current_short_qty=2.0,
+                current_long_avg_price=101.0,
+                current_short_avg_price=99.0,
+                current_long_lots=[
+                    {"qty": 2.0, "price": 101.0, "role": "best_quote_entry_long"}
+                ],
+                current_short_lots=[
+                    {"qty": 2.0, "price": 99.0, "role": "best_quote_entry_short"}
+                ],
+            ),
+        )
+
+        roles = {
+            order["role"]
+            for order in [*plan["buy_orders"], *plan["sell_orders"]]
+        }
+        self.assertNotIn("best_quote_reduce_long", roles)
+        self.assertNotIn("best_quote_reduce_short", roles)
+        report = plan["metrics"]["four_leg_cycle"]["roles"]
+        self.assertEqual(report["long_profit_reduce"]["reason"], "retained_inventory_floor")
+        self.assertEqual(report["short_profit_reduce"]["reason"], "retained_inventory_floor")
+
+    def test_four_leg_lot_guard_does_not_remove_existing_loss_control(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                four_leg_cycle_enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.90,
+            ),
+            inputs=_inputs(
+                bid_price=100.0,
+                ask_price=100.1,
+                mid_price=100.0,
+                loss_per_10k_15m=1.0,
+                position_side_mode="hedge",
+                current_long_qty=3.0,
+                current_short_qty=3.0,
+                current_long_avg_price=101.0,
+                current_short_avg_price=99.0,
+                current_long_lots=[],
+                current_short_lots=[],
+            ),
+        )
+
+        roles = {
+            order["role"]
+            for order in [*plan["buy_orders"], *plan["sell_orders"]]
+        }
+        self.assertIn("best_quote_reduce_long", roles)
+        self.assertIn("best_quote_reduce_short", roles)
+        report = plan["metrics"]["four_leg_cycle"]["roles"]
+        self.assertEqual(report["long_profit_reduce"]["reason"], "loss_control_active")
+        self.assertEqual(report["short_profit_reduce"]["reason"], "loss_control_active")
+
     def test_four_leg_cycle_reports_missing_ordinary_cost(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(

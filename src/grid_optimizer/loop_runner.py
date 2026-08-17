@@ -3505,6 +3505,42 @@ def _best_quote_volume_consume_fifo(
     return updated, consumed, realized_cost
 
 
+def _best_quote_volume_consume_entry_lots_first(
+    lots: list[dict[str, Any]],
+    qty: float,
+    *,
+    entry_role: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
+    preferred = [
+        dict(item)
+        for item in lots
+        if str(item.get("role") or "") == entry_role
+    ]
+    fallback = [
+        dict(item)
+        for item in lots
+        if str(item.get("role") or "") != entry_role
+    ]
+    preferred_remaining, preferred_consumed, preferred_cost = (
+        _best_quote_volume_consume_fifo(preferred, qty)
+    )
+    preferred_consumed_qty = sum(
+        max(_safe_float(item.get("qty")), 0.0)
+        for item in preferred_consumed
+    )
+    fallback_remaining, fallback_consumed, fallback_cost = (
+        _best_quote_volume_consume_fifo(
+            fallback,
+            max(_safe_float(qty) - preferred_consumed_qty, 0.0),
+        )
+    )
+    return (
+        [*preferred_remaining, *fallback_remaining],
+        [*preferred_consumed, *fallback_consumed],
+        preferred_cost + fallback_cost,
+    )
+
+
 def _best_quote_freeze_entry_pair_gate(
     *,
     side: str,
@@ -4231,10 +4267,18 @@ def sync_best_quote_volume_ledger(
         elif role == "best_quote_entry_short":
             short_lots.append(lot)
         elif role == "best_quote_reduce_long":
-            long_lots, _, realized_cost = _best_quote_volume_consume_fifo(long_lots, qty)
+            long_lots, _, realized_cost = _best_quote_volume_consume_entry_lots_first(
+                long_lots,
+                qty,
+                entry_role="best_quote_entry_long",
+            )
             realized_delta += qty * price - realized_cost
         elif role == "best_quote_reduce_short":
-            short_lots, _, realized_cost = _best_quote_volume_consume_fifo(short_lots, qty)
+            short_lots, _, realized_cost = _best_quote_volume_consume_entry_lots_first(
+                short_lots,
+                qty,
+                entry_role="best_quote_entry_short",
+            )
             realized_delta += realized_cost - qty * price
         applied += 1
         if fill_key:
@@ -32081,6 +32125,12 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
                 current_short_qty=current_short_qty,
                 current_long_avg_price=current_long_avg_price,
                 current_short_avg_price=current_short_avg_price,
+                current_long_lots=list(
+                    (state.get("best_quote_volume_ledger") or {}).get("long_lots") or []
+                ),
+                current_short_lots=list(
+                    (state.get("best_quote_volume_ledger") or {}).get("short_lots") or []
+                ),
                 exchange_long_avg_price=exchange_long_avg_price,
                 exchange_short_avg_price=exchange_short_avg_price,
                 position_side_mode="hedge" if hedge_best_quote else "one_way",

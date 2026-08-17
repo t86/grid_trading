@@ -119,6 +119,8 @@ class BestQuoteMakerVolumeInputs:
     current_short_qty: float | None = None
     current_long_avg_price: float = 0.0
     current_short_avg_price: float = 0.0
+    current_long_lots: list[dict[str, Any]] | None = None
+    current_short_lots: list[dict[str, Any]] | None = None
     exchange_long_avg_price: float = 0.0
     exchange_short_avg_price: float = 0.0
     position_side_mode: str = "one_way"
@@ -2028,10 +2030,20 @@ def build_best_quote_maker_volume_plan(
             position_notional: float,
             position_cost: float,
             cost_source: str,
+            position_lots: list[dict[str, Any]] | None,
             soft_notional: float,
             side: str,
         ) -> None:
             nonlocal buy_orders, sell_orders
+            target_bucket = sell_orders if side == "SELL" else buy_orders
+            existing = [order for order in target_bucket if order.get("role") == role]
+
+            def _remove_existing() -> None:
+                if existing:
+                    target_bucket[:] = [
+                        order for order in target_bucket if order.get("role") != role
+                    ]
+
             cost_audit: dict[str, Any] = {
                 "cost_source": cost_source,
                 "position_cost": position_cost if position_cost > 0 else None,
@@ -2065,10 +2077,68 @@ def build_best_quote_maker_volume_plan(
                     **cost_audit,
                 }
                 return
+            paired_lot_qty: float | None = None
+            if position_lots is not None:
+                entry_role = (
+                    "best_quote_entry_long"
+                    if position_side == "LONG"
+                    else "best_quote_entry_short"
+                )
+                eligible_lots = [
+                    lot
+                    for lot in position_lots
+                    if isinstance(lot, dict)
+                    and str(lot.get("role") or "") == entry_role
+                    and _safe_float(lot.get("qty")) > 1e-12
+                    and _safe_float(lot.get("price", lot.get("entry_price"))) > 0
+                ]
+                if not eligible_lots:
+                    _remove_existing()
+                    role_report[report_name] = {
+                        "status": "blocked",
+                        "reason": "no_unreleased_entry_lot",
+                        "cost_source": "ordinary_entry_lot",
+                        "position_cost": None,
+                        "target_price": None,
+                    }
+                    return
+                position_cost = _safe_float(
+                    eligible_lots[0].get("price", eligible_lots[0].get("entry_price"))
+                )
+                paired_lot_qty = sum(
+                    max(_safe_float(lot.get("qty")), 0.0)
+                    for lot in eligible_lots
+                    if abs(
+                        _safe_float(lot.get("price", lot.get("entry_price")))
+                        - position_cost
+                    ) <= 1e-12
+                )
+                cost_source = "ordinary_entry_lot"
+                cost_audit.update(
+                    {
+                        "cost_source": cost_source,
+                        "position_cost": position_cost,
+                    }
+                )
             if position_cost <= 0:
                 role_report[report_name] = {
                     "status": "blocked",
                     "reason": "missing_position_cost",
+                    **cost_audit,
+                }
+                return
+            retained_notional = max(
+                max(_safe_float(config.min_cycle_budget_notional), 0.0) * 0.5,
+                max(_safe_float(inputs.min_notional), 0.0),
+            )
+            reducible_notional = max(position_notional - retained_notional, 0.0)
+            cost_audit["retained_notional"] = retained_notional
+            cost_audit["reducible_notional"] = reducible_notional
+            if reducible_notional + 1e-12 < max(_safe_float(inputs.min_notional), 0.0):
+                _remove_existing()
+                role_report[report_name] = {
+                    "status": "blocked",
+                    "reason": "retained_inventory_floor",
                     **cost_audit,
                 }
                 return
@@ -2090,8 +2160,6 @@ def build_best_quote_maker_volume_plan(
                 return
             cost_audit["target_price"] = price
 
-            target_bucket = sell_orders if side == "SELL" else buy_orders
-            existing = [order for order in target_bucket if order.get("role") == role]
             profit_boundary = position_cost + max(
                 _safe_float(inputs.entry_ladder_spacing),
                 _safe_float(inputs.tick_size),
@@ -2099,13 +2167,25 @@ def build_best_quote_maker_volume_plan(
                 _safe_float(inputs.entry_ladder_spacing),
                 _safe_float(inputs.tick_size),
             )
-            existing_is_profitable = any(
-                _safe_float(order.get("price")) >= profit_boundary - 1e-12
-                if position_side == "LONG"
-                else _safe_float(order.get("price")) <= profit_boundary + 1e-12
-                for order in existing
+            position_price = max(_safe_float(inputs.mid_price), price, 1e-12)
+            reducible_qty = reducible_notional / position_price
+            reduce_qty_cap = min(
+                cycle_budget * 0.5 / price,
+                reducible_qty,
+                paired_lot_qty if paired_lot_qty is not None else float("inf"),
             )
-            if existing_is_profitable:
+            reduce_notional = reduce_qty_cap * price
+            existing_qty = sum(max(_safe_float(order.get("qty")), 0.0) for order in existing)
+            existing_is_eligible = bool(existing) and all(
+                abs(_safe_float(order.get("price")) - price) <= 1e-12
+                and (
+                    _safe_float(order.get("price")) >= profit_boundary - 1e-12
+                    if position_side == "LONG"
+                    else _safe_float(order.get("price")) <= profit_boundary + 1e-12
+                )
+                for order in existing
+            ) and existing_qty <= reduce_qty_cap + 1e-12
+            if existing_is_eligible:
                 role_report[report_name] = {
                     "status": "planned",
                     "reason": "existing_profit_order",
@@ -2113,11 +2193,7 @@ def build_best_quote_maker_volume_plan(
                 }
                 return
 
-            if existing:
-                target_bucket[:] = [
-                    order for order in target_bucket if order.get("role") != role
-                ]
-            reduce_notional = min(cycle_budget * 0.5, position_notional)
+            _remove_existing()
             order = _build_order(
                 side=side,
                 price=price,
@@ -2175,6 +2251,7 @@ def build_best_quote_maker_volume_plan(
             position_notional=long_notional,
             position_cost=long_position_cost,
             cost_source=long_cost_source,
+            position_lots=inputs.current_long_lots,
             soft_notional=long_soft,
             side="SELL",
         )
@@ -2185,6 +2262,7 @@ def build_best_quote_maker_volume_plan(
             position_notional=short_notional,
             position_cost=short_position_cost,
             cost_source=short_cost_source,
+            position_lots=inputs.current_short_lots,
             soft_notional=short_soft,
             side="BUY",
         )

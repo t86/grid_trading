@@ -4272,6 +4272,77 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(ledger["last_applied_trade_count"], 1)
         self.assertAlmostEqual(ledger["realized_pnl"], -0.0126, places=6)
 
+    def test_best_quote_volume_ledger_reduce_consumes_unreleased_entry_lot_first(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_volume_order_refs": {
+                "41046162": {
+                    "book": "normal",
+                    "role": "best_quote_reduce_short",
+                    "side": "BUY",
+                    "position_side": "SHORT",
+                    "client_order_id": "gx-grvt-bestquot-reduce-short",
+                }
+            },
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [],
+                "short_lots": [
+                    {
+                        "qty": 5.0,
+                        "price": 99.0,
+                        "source": "bootstrap_from_exchange_managed_position",
+                    },
+                    {
+                        "qty": 2.0,
+                        "price": 98.8,
+                        "source": "trade_fill",
+                        "role": "best_quote_entry_short",
+                    },
+                ],
+                "last_trade_time_ms": 1000,
+                "last_trade_keys_at_time": [],
+            },
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[]):
+            sync_best_quote_volume_ledger(
+                state=state,
+                symbol="GRVTUSDT",
+                api_key="",
+                api_secret="",
+                recv_window=5000,
+                current_long_qty=0.0,
+                current_short_qty=5.0,
+                current_long_avg_price=0.0,
+                current_short_avg_price=99.0,
+                mid_price=100.0,
+                observed_trade_rows=[
+                    {
+                        "time": 2000,
+                        "orderId": 41046162,
+                        "clientOrderId": "gx-grvt-bestquot-reduce-short",
+                        "side": "BUY",
+                        "positionSide": "SHORT",
+                        "qty": "2",
+                        "price": "98.3",
+                        "quoteQty": "196.6",
+                    }
+                ],
+            )
+
+        remaining = state["best_quote_volume_ledger"]["short_lots"]
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(
+            remaining[0]["source"],
+            "bootstrap_from_exchange_managed_position",
+        )
+        self.assertEqual(remaining[0]["qty"], 5.0)
+        self.assertAlmostEqual(
+            state["best_quote_volume_ledger"]["realized_pnl"],
+            1.0,
+        )
+
     def test_best_quote_volume_ledger_counts_hardloss_order_ref_with_unknown_book(self) -> None:
         state: dict[str, object] = {
             "best_quote_volume_order_refs": {
