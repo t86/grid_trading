@@ -137,12 +137,18 @@ from .futures_run_lifecycle import (
 from .futures_recovery_store import (
     RECOVERY_STATE_KEY,
     RECOVERY_STATE_MIRROR_KEY,
+    JsonRecoveryStore,
     RecoveryStateStoreError,
     _is_managed_recovery_key,
     decode_recovery_control_state,
     decode_recovery_desired_profile_fields,
     decode_recovery_state_slots,
     recovery_coordinator_registered,
+)
+from .futures_recovery_coordinator import (
+    BaselineChange,
+    BaselineChangeStatus,
+    FuturesRecoveryCoordinator,
 )
 from .futures_volume_safety_observation import (
     build_volume_safety_observation,
@@ -10935,9 +10941,23 @@ def _preserve_active_runner_ownership(
     return resolved
 
 
-def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
+def _resolve_runner_start_config(
+    payload: dict[str, Any],
+    *,
+    inherited_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     raw_payload = dict(payload)
-    config = _normalize_runner_control_payload(payload)
+    if inherited_config is None:
+        config = _normalize_runner_control_payload(payload)
+        inherited = config
+    else:
+        merged = dict(inherited_config)
+        merged.update(payload)
+        config = _normalize_runner_control_payload(
+            merged,
+            inherit_existing=False,
+        )
+        inherited = dict(inherited_config)
     profile = str(config.get("strategy_profile", RUNNER_DEFAULT_CONFIG["strategy_profile"])).strip() or RUNNER_DEFAULT_CONFIG["strategy_profile"]
     preset = _runner_preset_map(str(config.get("symbol", ""))).get(profile)
     if preset is None:
@@ -10965,7 +10985,7 @@ def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
                 resolved[key] = value
         return _preserve_active_runner_ownership(
             _autotune_runner_symbol_config(resolved),
-            inherited=config,
+            inherited=inherited,
             raw_payload=raw_payload,
         )
     if not preset.get("startable", True):
@@ -10986,7 +11006,7 @@ def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
             resolved[key] = value
     return _preserve_active_runner_ownership(
         _autotune_runner_symbol_config(resolved),
-        inherited=config,
+        inherited=inherited,
         raw_payload=raw_payload,
     )
 
@@ -11514,8 +11534,115 @@ def _defer_registered_runner_web_action(
     return result
 
 
+_BASELINE_CHANGE_REQUEST_KEYS = frozenset(
+    {"operation_id", "attempt_id", "source", "requested_at"}
+)
+
+
+def _baseline_change_requested_at(value: Any) -> datetime:
+    if value is None:
+        return datetime.now(timezone.utc)
+    if not isinstance(value, str):
+        raise ValueError("requested_at must be an ISO datetime string")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("requested_at must be an ISO datetime string") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("requested_at must be timezone-aware")
+    return parsed
+
+
+def _baseline_change_identifier(value: Any, *, name: str) -> str:
+    if value is None:
+        return uuid.uuid4().hex
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    return value
+
+
+def _submit_registered_runner_baseline_change(
+    *,
+    symbol: str,
+    payload: dict[str, Any],
+    control_path: Path,
+) -> dict[str, Any]:
+    store = JsonRecoveryStore(control_path)
+    state = store.read(symbol)
+    candidate_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in _BASELINE_CHANGE_REQUEST_KEYS
+    }
+    candidate = _resolve_runner_start_config(
+        candidate_payload,
+        inherited_config=dict(state.baseline_profile.fields),
+    )
+    _validate_runner_run_contract(candidate)
+    request = BaselineChange.create(
+        symbol=symbol,
+        operation_id=_baseline_change_identifier(
+            payload.get("operation_id"),
+            name="operation_id",
+        ),
+        attempt_id=_baseline_change_identifier(
+            payload.get("attempt_id"),
+            name="attempt_id",
+        ),
+        source=(
+            _baseline_change_identifier(payload.get("source"), name="source")
+            if "source" in payload
+            else "web_runner_config_save"
+        ),
+        requested_at=_baseline_change_requested_at(payload.get("requested_at")),
+        candidate_baseline=candidate,
+    )
+
+    def no_snapshot_for_submission(*_args: Any) -> Any:
+        raise RuntimeError("baseline submission cannot collect a recovery snapshot")
+
+    coordinator = FuturesRecoveryCoordinator(
+        store=store,
+        snapshot_provider=no_snapshot_for_submission,
+    )
+    outcome = coordinator.change_baseline(request)
+    deferred = outcome.status is BaselineChangeStatus.DEFERRED
+    return {
+        "saved": not deferred,
+        "symbol": symbol,
+        "recovery_coordinator_registered": True,
+        "actuation_deferred": True,
+        "deferred": deferred,
+        "reason": f"baseline_change_{outcome.status.value}",
+        "requested_action": "change_control",
+        "request_status": outcome.status.value,
+        "operation_id": outcome.operation_id,
+        "attempt_id": outcome.attempt_id,
+        "applied_round_id": outcome.applied_round_id,
+    }
+
+
 def _save_runner_config_without_start(payload: dict[str, Any]) -> dict[str, Any]:
     requested_symbol = str(payload.get("symbol") or "").upper().strip()
+    if requested_symbol:
+        requested_control_path = _runner_control_path(requested_symbol)
+        requested_existing = _read_json_dict(requested_control_path)
+        if requested_existing is None and requested_control_path.exists():
+            deferred = _defer_registered_runner_web_action(
+                symbol=requested_symbol,
+                requested_action="change_control",
+                candidate=payload,
+            )
+            assert deferred is not None
+            return deferred
+        if isinstance(requested_existing, dict) and recovery_coordinator_registered(
+            requested_existing
+        ):
+            return _submit_registered_runner_baseline_change(
+                symbol=requested_symbol,
+                payload=payload,
+                control_path=requested_control_path,
+            )
     deferred = _defer_registered_runner_web_action(
         symbol=requested_symbol,
         requested_action="change_control",
@@ -11526,6 +11653,14 @@ def _save_runner_config_without_start(payload: dict[str, Any]) -> dict[str, Any]
     config = _resolve_runner_start_config(payload)
     _validate_runner_run_contract(config)
     symbol = str(config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
+    control_path = _runner_control_path(symbol)
+    existing = _read_json_dict(control_path)
+    if isinstance(existing, dict) and recovery_coordinator_registered(existing):
+        return _submit_registered_runner_baseline_change(
+            symbol=symbol,
+            payload=payload,
+            control_path=control_path,
+        )
     deferred = _defer_registered_runner_web_action(
         symbol=symbol,
         requested_action="change_control",

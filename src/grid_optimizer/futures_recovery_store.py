@@ -21,6 +21,7 @@ from typing import Any, Mapping, Union, get_args, get_origin, get_type_hints
 
 from .futures_recovery_coordinator import (
     ActionId,
+    BaselineChangeStatus,
     EffectStage,
     ExecutionPolicy,
     ManagedProfile,
@@ -512,6 +513,29 @@ def _validate_state(state: RecoveryState) -> None:
             )
     _validate_profile(state.baseline_profile, path="state.baseline_profile")
     _validate_profile(state.desired_profile, path="state.desired_profile")
+    operation_ids: set[str] = set()
+    deferred_count = 0
+    for index, record in enumerate(state.baseline_changes):
+        operation_id = record.request.operation_id
+        if operation_id in operation_ids:
+            raise RecoveryStateCorruptError(
+                "state.baseline_changes contains duplicate operation_id"
+            )
+        operation_ids.add(operation_id)
+        if record.request.symbol != state.symbol:
+            raise RecoveryStateCorruptError(
+                "state.baseline_changes request symbol does not match state"
+            )
+        _validate_profile(
+            record.request.candidate_profile,
+            path=f"state.baseline_changes[{index}].request.candidate_profile",
+        )
+        if record.status is BaselineChangeStatus.DEFERRED:
+            deferred_count += 1
+    if deferred_count > 1:
+        raise RecoveryStateCorruptError(
+            "state.baseline_changes cannot contain multiple deferred requests"
+        )
 
     baseline = state.baseline_profile.fields
     desired = state.desired_profile.fields
@@ -875,7 +899,11 @@ def _encode_state(state: RecoveryState) -> dict[str, Any]:
 
 
 def _decode_state(payload: Any) -> RecoveryState:
-    state = _decode_typed(payload, RecoveryState, path="state")
+    compatible_payload = payload
+    if isinstance(payload, MappingABC) and "baseline_changes" not in payload:
+        compatible_payload = dict(payload)
+        compatible_payload["baseline_changes"] = []
+    state = _decode_typed(compatible_payload, RecoveryState, path="state")
     if not isinstance(state, RecoveryState):
         raise RecoveryStateCorruptError("decoded recovery state has the wrong type")
     _validate_state(state)
@@ -915,6 +943,18 @@ def _recovery_envelope(state: RecoveryState) -> dict[str, Any]:
     }
 
 
+def _canonical_comparison_envelope(envelope: Any) -> Any:
+    """Normalize only the additive schema-v1 BaselineChange extension."""
+
+    copied = _json_copy(envelope, path="recovery_envelope")
+    if not isinstance(copied, dict) or copied.get("schema_version") != 1:
+        return copied
+    state = copied.get("state")
+    if isinstance(state, dict) and "baseline_changes" not in state:
+        state["baseline_changes"] = []
+    return copied
+
+
 def _decode_matching_recovery_slots(
     document: Mapping[str, Any],
     *,
@@ -946,7 +986,7 @@ def _decode_matching_recovery_slots(
         raise RecoveryStateCorruptError("recovery state slots diverge")
     canonical = _recovery_envelope(primary)
     for key in _RECOVERY_STATE_SLOT_KEYS:
-        raw = _json_copy(document[key], path=f"control.{key}")
+        raw = _canonical_comparison_envelope(document[key])
         if raw != canonical:
             raise RecoveryStateCorruptError(
                 f"recovery state mirror repair required: {key} is not canonical"
@@ -973,7 +1013,7 @@ def _resolve_recovery_slots_for_repair(
                 expected_symbol=expected_symbol,
             )
             if (
-                _json_copy(document[key], path=f"control.{key}")
+                _canonical_comparison_envelope(document[key])
                 != _recovery_envelope(state)
             ):
                 raise RecoveryStateCorruptError("slot is not canonical")

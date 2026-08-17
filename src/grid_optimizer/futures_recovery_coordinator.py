@@ -121,6 +121,120 @@ class ManagedProfile:
     execution_policy: ExecutionPolicy = field(default_factory=ExecutionPolicy)
 
 
+class BaselineChangeStatus(str, Enum):
+    DEFERRED = "deferred"
+    APPLIED = "applied"
+
+
+@dataclass(frozen=True)
+class BaselineChange:
+    """One symbol-bound, idempotent request for a complete runner baseline."""
+
+    symbol: str
+    operation_id: str
+    attempt_id: str
+    source: str
+    requested_at: datetime
+    candidate_profile: ManagedProfile
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.symbol, str)
+            or not self.symbol
+            or self.symbol != self.symbol.upper().strip()
+        ):
+            raise ValueError("baseline change symbol is invalid")
+        for name in ("operation_id", "attempt_id", "source"):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, str)
+                or not value
+                or value != value.strip()
+                or len(value) > 160
+            ):
+                raise ValueError(f"baseline change {name} is invalid")
+        if self.requested_at.tzinfo is None or self.requested_at.utcoffset() is None:
+            raise ValueError("baseline change requested_at must be timezone-aware")
+        if self.candidate_profile.execution_policy != ExecutionPolicy():
+            raise ValueError("baseline change execution policy must be LIMIT/GTX/post-only")
+        candidate_symbol = self.candidate_profile.fields.get("symbol")
+        if candidate_symbol != self.symbol:
+            raise ValueError("baseline change candidate must be symbol-bound")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        symbol: str,
+        operation_id: str,
+        attempt_id: str,
+        source: str,
+        requested_at: datetime,
+        candidate_baseline: Mapping[str, JsonValue],
+    ) -> "BaselineChange":
+        normalized = str(symbol).upper().strip()
+        candidate_symbol = candidate_baseline.get("symbol")
+        if not isinstance(candidate_symbol, str) or (
+            candidate_symbol.upper().strip() != normalized
+        ):
+            raise ValueError("baseline change candidate must be symbol-bound")
+        candidate = dict(candidate_baseline)
+        candidate["symbol"] = normalized
+        return cls(
+            symbol=normalized,
+            operation_id=operation_id,
+            attempt_id=attempt_id,
+            source=source,
+            requested_at=requested_at,
+            candidate_profile=materialize_profile(
+                baseline=candidate,
+                action_id=ActionId.NOOP,
+            ),
+        )
+
+    @property
+    def payload_digest(self) -> str:
+        return _canonical_digest(
+            {
+                "symbol": self.symbol,
+                "source": self.source,
+                "candidate_profile_digest": self.candidate_profile.digest,
+            }
+        )
+
+
+@dataclass(frozen=True)
+class BaselineChangeRecord:
+    request: BaselineChange
+    status: BaselineChangeStatus = BaselineChangeStatus.DEFERRED
+    applied_at: datetime | None = None
+    applied_round_id: str | None = None
+
+    def __post_init__(self) -> None:
+        applied = self.status is BaselineChangeStatus.APPLIED
+        if applied != (self.applied_at is not None and self.applied_round_id is not None):
+            raise ValueError("baseline change applied metadata is inconsistent")
+        if self.applied_at is not None and (
+            self.applied_at.tzinfo is None or self.applied_at.utcoffset() is None
+        ):
+            raise ValueError("baseline change applied_at must be timezone-aware")
+        if self.applied_round_id is not None and (
+            not self.applied_round_id or self.applied_round_id != self.applied_round_id.strip()
+        ):
+            raise ValueError("baseline change applied_round_id is invalid")
+
+
+@dataclass(frozen=True)
+class BaselineChangeOutcome:
+    symbol: str
+    operation_id: str
+    attempt_id: str
+    status: BaselineChangeStatus
+    requested_at: datetime
+    applied_at: datetime | None = None
+    applied_round_id: str | None = None
+
+
 @dataclass(frozen=True, order=True)
 class ManagedOrderIdentity:
     """One exact exchange identity owned by a recovery decision."""
@@ -654,6 +768,7 @@ class RecoveryState:
     fairness_last_selected_sides: Mapping[str, Side] = field(
         default_factory=lambda: MappingProxyType({})
     )
+    baseline_changes: tuple[BaselineChangeRecord, ...] = ()
 
     @classmethod
     def initial(
@@ -703,7 +818,12 @@ class RecoveryState:
             recent_round_ids=(),
             last_round_id=None,
             fairness_last_selected_sides=MappingProxyType({}),
+            baseline_changes=(),
         )
+
+    @property
+    def baseline_change(self) -> BaselineChangeRecord | None:
+        return self.baseline_changes[-1] if self.baseline_changes else None
 
     def with_exhausted_attempt(
         self,
@@ -1000,6 +1120,15 @@ def _directional_candidate(
     )
 
 
+def _durable_baseline_change_is_active(state: RecoveryState) -> bool:
+    return any(
+        record.status is BaselineChangeStatus.APPLIED
+        and record.applied_round_id is not None
+        and state.decision_id == f"{state.symbol}:{record.applied_round_id}"
+        for record in state.baseline_changes
+    )
+
+
 def _evaluate_terminal(
     assessment: FlowBlockerAssessment,
     _state: RecoveryState,
@@ -1224,10 +1353,14 @@ def _evaluate_maker_flow(
 
 def _evaluate_baseline_rebase(
     assessment: FlowBlockerAssessment,
-    _state: RecoveryState,
+    state: RecoveryState,
     _policy: RecoveryPolicy,
 ) -> _ActionEvaluation:
-    if not assessment.baseline_rebase_requested:
+    durable_request_pending = any(
+        item.status is BaselineChangeStatus.DEFERRED
+        for item in state.baseline_changes
+    )
+    if not assessment.baseline_rebase_requested and not durable_request_pending:
         return _ActionEvaluation()
     return _ActionEvaluation(
         candidates=(
@@ -1656,6 +1789,20 @@ class FuturesRecoveryDecisionEngine:
                 suppressed=suppressed,
             )
 
+        if (
+            selected.action_id is ActionId.BASELINE_REBASE
+            and any(
+                item.status is BaselineChangeStatus.DEFERRED
+                for item in state.baseline_changes
+            )
+        ):
+            return self._apply_baseline_change(
+                state=state,
+                suppressed=suppressed,
+                now=now,
+                round_id=round_id,
+            )
+
         return self._enter_candidate(
             snapshot=snapshot,
             state=state,
@@ -1663,6 +1810,82 @@ class FuturesRecoveryDecisionEngine:
             suppressed=suppressed,
             now=now,
             round_id=round_id,
+        )
+
+    def _apply_baseline_change(
+        self,
+        *,
+        state: RecoveryState,
+        suppressed: tuple[ActionId, ...],
+        now: datetime,
+        round_id: str,
+    ) -> RoundPlan:
+        pending_indexes = tuple(
+            index
+            for index, item in enumerate(state.baseline_changes)
+            if item.status is BaselineChangeStatus.DEFERRED
+        )
+        if len(pending_indexes) != 1:
+            raise ValueError("baseline rebase requires exactly one deferred request")
+        request_index = pending_indexes[0]
+        record = state.baseline_changes[request_index]
+        profile = materialize_profile(
+            baseline=record.request.candidate_profile.fields,
+            action_id=ActionId.NOOP,
+        )
+        records = list(state.baseline_changes)
+        records[request_index] = replace(
+            record,
+            status=BaselineChangeStatus.APPLIED,
+            applied_at=now,
+            applied_round_id=round_id,
+        )
+        effect_epoch = state.effect_epoch + 1
+        next_state = replace(
+            state,
+            document_revision=state.document_revision + 1,
+            generation=state.generation + 1,
+            baseline_profile=profile,
+            desired_profile=profile,
+            desired_runner_state="running",
+            phase=RecoveryPhase.ACTIVE,
+            active_action=ActionId.BASELINE_REBASE,
+            decision_id=f"{state.symbol}:{round_id}",
+            side=None,
+            order_role=None,
+            reasons=("baseline_change_requested",),
+            issued_at=now,
+            progress_deadline_at=now + self.policy.action_progress_timeout,
+            hard_expires_at=now + self.policy.action_hard_ttl,
+            cooldown_until=None,
+            action_lease=None,
+            safety_lease=None,
+            cleanup_obligation=None,
+            active_episode_fingerprint=None,
+            cleanup_successor_action=None,
+            post_cleanup_effect_stage=EffectStage.NONE,
+            terminal_stop_confirmed=False,
+            effect_epoch=effect_epoch,
+            pending_effect_stage=EffectStage.RUNNER_RESTART,
+            pending_effect_epoch=effect_epoch,
+            last_round_id=round_id,
+            baseline_changes=tuple(records),
+        )
+        return RoundPlan(
+            symbol=state.symbol,
+            round_id=round_id,
+            action_id=ActionId.BASELINE_REBASE,
+            mode=ActionMode.ENTER,
+            side=None,
+            order_role=None,
+            reasons=("baseline_change_requested",),
+            suppressed_actions=suppressed,
+            desired_profile=profile,
+            desired_runner_state="running",
+            effect_stage=EffectStage.RUNNER_RESTART,
+            effect_epoch=effect_epoch,
+            liveness_status="recovering",
+            next_state=next_state,
         )
 
     def _rearm_ordinary_attempts_after_backoff(
@@ -2153,6 +2376,18 @@ class FuturesRecoveryDecisionEngine:
             )
             if not effect_confirmed:
                 if (
+                    state.active_action is ActionId.BASELINE_REBASE
+                    and _durable_baseline_change_is_active(state)
+                ):
+                    # Dispatch may fail after the state CAS.  Retry the one
+                    # logical restart with its original fence; never mint a
+                    # second epoch for this applied business operation.
+                    return self._retry_pending_effect(
+                        state,
+                        round_id,
+                        liveness_status="blocked" if expired else "recovering",
+                    )
+                if (
                     state.active_action is ActionId.SAFETY_CONVERGE
                     and self._active_safety_evidence_is_current(snapshot, state)
                 ):
@@ -2180,6 +2415,11 @@ class FuturesRecoveryDecisionEngine:
                 pending_effect_stage=EffectStage.NONE,
                 pending_effect_epoch=None,
             )
+        if (
+            state.active_action is ActionId.BASELINE_REBASE
+            and _durable_baseline_change_is_active(state)
+        ):
+            return self._finish_applied_baseline_change(state, round_id)
         if state.active_action is ActionId.SAFETY_CONVERGE:
             return self._plan_active_safety(snapshot, state, now, round_id)
         if (
@@ -2220,6 +2460,46 @@ class FuturesRecoveryDecisionEngine:
                 ),
             )
         return self._hold(state, round_id, liveness_status="recovering")
+
+    def _finish_applied_baseline_change(
+        self,
+        state: RecoveryState,
+        round_id: str,
+    ) -> RoundPlan:
+        next_state = replace(
+            state,
+            document_revision=state.document_revision + 1,
+            phase=RecoveryPhase.STABLE,
+            active_action=ActionId.NOOP,
+            decision_id=None,
+            side=None,
+            order_role=None,
+            reasons=(),
+            issued_at=None,
+            progress_deadline_at=None,
+            hard_expires_at=None,
+            cooldown_until=None,
+            active_episode_fingerprint=None,
+            pending_effect_stage=EffectStage.NONE,
+            pending_effect_epoch=None,
+            last_round_id=round_id,
+        )
+        return RoundPlan(
+            symbol=state.symbol,
+            round_id=round_id,
+            action_id=ActionId.BASELINE_REBASE,
+            mode=ActionMode.EXIT,
+            side=None,
+            order_role=None,
+            reasons=("baseline_change_applied",),
+            suppressed_actions=(),
+            desired_profile=next_state.desired_profile,
+            desired_runner_state="running",
+            effect_stage=EffectStage.NONE,
+            effect_epoch=None,
+            liveness_status="healthy",
+            next_state=next_state,
+        )
 
     def _plan_stop_pending(
         self,
@@ -3335,6 +3615,57 @@ class FuturesRecoveryCoordinator:
         self.effect_executor = effect_executor or (lambda _symbol, _command: None)
         self.engine = engine or FuturesRecoveryDecisionEngine()
         self._round_outcomes: dict[tuple[str, str], RoundPlan] = {}
+
+    def change_baseline(
+        self,
+        request: BaselineChange,
+    ) -> BaselineChangeOutcome:
+        if not isinstance(request, BaselineChange):
+            raise TypeError("baseline change request must be typed")
+        state = self.store.read(request.symbol)
+        if state.symbol != request.symbol:
+            raise ValueError("baseline change symbol does not match registered state")
+        for record in state.baseline_changes:
+            if record.request.operation_id != request.operation_id:
+                continue
+            if record.request.payload_digest != request.payload_digest:
+                raise ValueError(
+                    "baseline change operation_id reused with different payload"
+                )
+            return BaselineChangeOutcome(
+                symbol=request.symbol,
+                operation_id=request.operation_id,
+                attempt_id=request.attempt_id,
+                status=record.status,
+                requested_at=request.requested_at,
+                applied_at=record.applied_at,
+                applied_round_id=record.applied_round_id,
+            )
+        if any(
+            record.status is BaselineChangeStatus.DEFERRED
+            for record in state.baseline_changes
+        ):
+            raise ValueError("another baseline change operation is already deferred")
+        next_state = replace(
+            state,
+            document_revision=state.document_revision + 1,
+            baseline_changes=(
+                *state.baseline_changes,
+                BaselineChangeRecord(request=request),
+            ),
+        )
+        self.store.compare_and_swap(
+            request.symbol,
+            expected_revision=state.document_revision,
+            next_state=next_state,
+        )
+        return BaselineChangeOutcome(
+            symbol=request.symbol,
+            operation_id=request.operation_id,
+            attempt_id=request.attempt_id,
+            status=BaselineChangeStatus.DEFERRED,
+            requested_at=request.requested_at,
+        )
 
     def reconcile_symbol(
         self,

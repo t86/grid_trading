@@ -5476,43 +5476,71 @@ class WebSecurityTests(unittest.TestCase):
         mock_stop_runner.assert_not_called()
         mock_save.assert_not_called()
 
-    def test_registered_recovery_control_change_is_deferred_without_write(self) -> None:
-        with TemporaryDirectory() as tmpdir:
-            control_path = Path(tmpdir) / "arx-control.json"
-            self._write_registered_recovery_control(
-                control_path,
-                phase=RecoveryPhase.STABLE,
-            )
-            before = control_path.read_bytes()
-            with patch.object(
-                web_module,
-                "_runner_control_path",
-                return_value=control_path,
-            ), patch.object(
-                web_module,
-                "_resolve_runner_start_config",
-                return_value={"symbol": "ARXUSDT"},
-            ) as mock_resolve, patch.object(
-                web_module,
-                "_save_runner_control_config",
-            ) as mock_save, patch.object(
-                web_module,
-                "_clear_volatility_trigger_status",
-            ) as mock_clear, patch.object(
-                web_module,
-                "_read_runner_process_for_symbol",
-            ) as mock_read_runner:
-                result = web_module._save_runner_config_without_start(
-                    {"symbol": "ARXUSDT", "step_price": 999.0}
+    def test_registered_recovery_control_change_is_durably_deferred(self) -> None:
+        for phase in (
+            RecoveryPhase.STABLE,
+            RecoveryPhase.ACTIVE,
+            RecoveryPhase.CLEANING,
+        ):
+            with self.subTest(phase=phase.value), TemporaryDirectory() as tmpdir:
+                control_path = Path(tmpdir) / "arx-control.json"
+                self._write_registered_recovery_control(
+                    control_path,
+                    phase=phase,
                 )
+                before = JsonRecoveryStore(control_path).read("ARXUSDT")
+                operation_id = f"web-security-{phase.value}-baseline-op"
+                with patch.object(
+                    web_module,
+                    "_runner_control_path",
+                    return_value=control_path,
+                ), patch.object(
+                    web_module,
+                    "_resolve_runner_start_config",
+                    return_value={"symbol": "ARXUSDT"},
+                ) as mock_resolve, patch.object(
+                    web_module,
+                    "_save_runner_control_config",
+                ) as mock_save, patch.object(
+                    web_module,
+                    "_clear_volatility_trigger_status",
+                ) as mock_clear, patch.object(
+                    web_module,
+                    "_read_runner_process_for_symbol",
+                ) as mock_read_runner:
+                    result = web_module._save_runner_config_without_start(
+                        {
+                            "symbol": "ARXUSDT",
+                            "step_price": 999.0,
+                            "operation_id": operation_id,
+                            "attempt_id": "web-security-attempt-1",
+                        }
+                    )
 
-            self.assertTrue(result["actuation_deferred"])
-            self.assertEqual(result["requested_action"], "change_control")
-            mock_resolve.assert_not_called()
-            mock_save.assert_not_called()
-            mock_clear.assert_not_called()
-            mock_read_runner.assert_not_called()
-            self.assertEqual(control_path.read_bytes(), before)
+                self.assertTrue(result["actuation_deferred"])
+                self.assertEqual(result["requested_action"], "change_control")
+                self.assertEqual(result["request_status"], "deferred")
+                self.assertEqual(result["operation_id"], operation_id)
+                mock_resolve.assert_called_once()
+                mock_save.assert_not_called()
+                mock_clear.assert_not_called()
+                mock_read_runner.assert_not_called()
+                persisted = JsonRecoveryStore(control_path).read("ARXUSDT")
+                self.assertEqual(persisted.phase, before.phase)
+                self.assertEqual(persisted.active_action, before.active_action)
+                self.assertEqual(persisted.decision_id, before.decision_id)
+                self.assertEqual(persisted.desired_profile, before.desired_profile)
+                self.assertEqual(persisted.cleanup_obligation, before.cleanup_obligation)
+                self.assertEqual(
+                    persisted.document_revision,
+                    before.document_revision + 1,
+                )
+                self.assertIsNotNone(persisted.baseline_change)
+                assert persisted.baseline_change is not None
+                self.assertEqual(
+                    persisted.baseline_change.request.operation_id,
+                    operation_id,
+                )
 
     def test_start_runner_process_rejects_invalid_bounded_contract_before_side_effects(self) -> None:
         invalid = {
