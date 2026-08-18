@@ -2079,13 +2079,14 @@ def build_best_quote_maker_volume_plan(
                 return
             paired_lot_qty: float | None = None
             eligible_lots: list[dict[str, Any]] | None = None
+            selected_bucket_lots: list[dict[str, Any]] = []
             if position_lots is not None:
                 entry_role = (
                     "best_quote_entry_long"
                     if position_side == "LONG"
                     else "best_quote_entry_short"
                 )
-                eligible_lots = [
+                entry_lots = [
                     lot
                     for lot in position_lots
                     if isinstance(lot, dict)
@@ -2093,11 +2094,20 @@ def build_best_quote_maker_volume_plan(
                     and _safe_float(lot.get("qty")) > 1e-12
                     and _safe_float(lot.get("price", lot.get("entry_price"))) > 0
                 ]
+                eligible_lots = [
+                    lot
+                    for lot in entry_lots
+                    if not bool(lot.get("ordinary_profit_release_locked"))
+                ]
                 if not eligible_lots:
                     _remove_existing()
                     role_report[report_name] = {
                         "status": "blocked",
-                        "reason": "no_unreleased_entry_lot",
+                        "reason": (
+                            "no_new_entry_since_profit_release"
+                            if entry_lots
+                            else "no_unreleased_entry_lot"
+                        ),
                         "cost_source": "ordinary_entry_lot",
                         "position_cost": None,
                         "target_price": None,
@@ -2158,9 +2168,28 @@ def build_best_quote_maker_volume_plan(
                 }
                 return
             cost_audit["target_price"] = price
+            aggregate_cost = _safe_float(
+                inputs.current_long_avg_price
+                if position_side == "LONG"
+                else inputs.current_short_avg_price
+            )
+            aggregate_no_loss = (
+                price >= aggregate_cost - 1e-12
+                if position_side == "LONG"
+                else price <= aggregate_cost + 1e-12
+            )
+            if aggregate_cost > 0 and not aggregate_no_loss:
+                _remove_existing()
+                role_report[report_name] = {
+                    "status": "blocked",
+                    "reason": "aggregate_no_loss_blocked",
+                    "aggregate_cost": aggregate_cost,
+                    **cost_audit,
+                }
+                return
             if eligible_lots is not None:
-                paired_lot_qty = sum(
-                    max(_safe_float(lot.get("qty")), 0.0)
+                selected_bucket_lots = [
+                    lot
                     for lot in eligible_lots
                     if abs(
                         _four_leg_profit_price(
@@ -2176,6 +2205,10 @@ def build_best_quote_maker_volume_plan(
                         - price
                     )
                     <= 1e-12
+                ]
+                paired_lot_qty = sum(
+                    max(_safe_float(lot.get("qty")), 0.0)
+                    for lot in selected_bucket_lots
                 )
 
             profit_boundary = position_cost + max(
@@ -2229,12 +2262,34 @@ def build_best_quote_maker_volume_plan(
                 }
                 return
             if paired_lot_qty is not None:
+                entry_cutoff_at = max(
+                    (
+                        str(lot.get("opened_at") or "").strip()
+                        for lot in selected_bucket_lots
+                    ),
+                    default="",
+                )
+                bucket_price = format(Decimal(str(position_cost)).normalize(), "f")
+                lease_id = ":".join(
+                    (
+                        position_side,
+                        bucket_price,
+                        entry_cutoff_at or "legacy",
+                    )
+                )
                 order.update(
                     {
                         "ordinary_entry_lot_profit": True,
                         "ordinary_entry_lot_cost_price": position_cost,
                         "ordinary_entry_lot_profit_boundary": price,
                         "ordinary_entry_lot_qty_cap": paired_lot_qty,
+                        "ordinary_profit_release_bucket_side": position_side,
+                        "ordinary_profit_release_bucket_price": position_cost,
+                        "ordinary_profit_release_entry_cutoff_at": entry_cutoff_at,
+                        "ordinary_profit_release_lease_id": lease_id,
+                        "ordinary_profit_release_authorized_qty": _safe_float(
+                            order.get("qty")
+                        ),
                     }
                 )
             target_bucket.append(order)
