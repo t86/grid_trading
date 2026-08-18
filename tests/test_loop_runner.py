@@ -13062,6 +13062,66 @@ class LoopRunnerTests(unittest.TestCase):
                 self.assertFalse(report["added"])
                 self.assertEqual(report["reason"], expected_reason)
 
+    def test_grvt_near_soft_short_bridge_completes_the_profitable_short_cycle(self) -> None:
+        plan = {
+            "buy_orders": [
+                {
+                    "role": "best_quote_reduce_short",
+                    "side": "BUY",
+                    "position_side": "SHORT",
+                    "price": 0.2832,
+                    "qty": 40.0,
+                    "notional": 11.328,
+                }
+            ],
+            "sell_orders": [],
+        }
+        report = loop_runner_module.apply_grvt_near_soft_short_bridge_entry(
+            plan=plan,
+            enabled=True,
+            current_short_notional=895.0,
+            short_threshold_notional=900.0,
+            max_short_notional=1_000.0,
+            ask_price=0.2835,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            short_entry_reason="soft_headroom_below_min_notional",
+            short_entry_blocked_by_anti_chase=False,
+            volatility_entry_pause_active=False,
+        )
+
+        self.assertTrue(report["added"])
+        bridge = plan["sell_orders"][0]
+        self.assertEqual(bridge["role"], "best_quote_entry_short")
+        self.assertEqual(bridge["side"], "SELL")
+        self.assertTrue(bridge["near_soft_bridge_entry"])
+        self.assertGreater(895.0 + bridge["notional"], 900.0)
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_reduce_short")
+
+    def test_grvt_near_soft_short_bridge_does_not_duplicate_existing_entry(self) -> None:
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [{"role": "best_quote_entry_short"}],
+        }
+        report = loop_runner_module.apply_grvt_near_soft_short_bridge_entry(
+            plan=plan,
+            enabled=True,
+            current_short_notional=895.0,
+            short_threshold_notional=900.0,
+            max_short_notional=1_000.0,
+            ask_price=0.2835,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            short_entry_reason="soft_headroom_below_min_notional",
+            short_entry_blocked_by_anti_chase=False,
+            volatility_entry_pause_active=False,
+        )
+
+        self.assertFalse(report["added"])
+        self.assertEqual(report["reason"], "short_entry_present")
+
     def test_best_quote_active_pair_reduce_keeps_normal_flow_for_large_pair_imbalance(self) -> None:
         plan = {
             "buy_orders": [

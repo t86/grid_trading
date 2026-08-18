@@ -24507,6 +24507,114 @@ def apply_grvt_near_soft_bridge_entry(
     return report
 
 
+def apply_grvt_near_soft_short_bridge_entry(
+    *,
+    plan: dict[str, Any],
+    enabled: bool,
+    current_short_notional: float,
+    short_threshold_notional: float,
+    max_short_notional: float,
+    ask_price: float,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    short_entry_reason: str,
+    short_entry_blocked_by_anti_chase: bool,
+    volatility_entry_pause_active: bool,
+) -> dict[str, Any]:
+    """Complete a near-soft SHORT cycle with one bounded maker entry."""
+
+    report = {
+        "enabled": bool(enabled),
+        "added": False,
+        "reason": "disabled",
+        "order": None,
+    }
+    if not enabled:
+        return report
+    if short_entry_blocked_by_anti_chase:
+        report["reason"] = "anti_chase_blocked"
+        return report
+    if volatility_entry_pause_active:
+        report["reason"] = "volatility_pause"
+        return report
+    if str(short_entry_reason or "") != "soft_headroom_below_min_notional":
+        report["reason"] = "planner_not_bridge_eligible"
+        return report
+    existing_roles = {
+        _order_role(item)
+        for item in [
+            *list(plan.get("buy_orders") or []),
+            *list(plan.get("sell_orders") or []),
+        ]
+        if isinstance(item, dict)
+    }
+    if "best_quote_entry_short" in existing_roles:
+        report["reason"] = "short_entry_present"
+        return report
+    if "best_quote_active_pair_reduce_short" in existing_roles:
+        report["reason"] = "short_pressure_reduce_active"
+        return report
+    current_notional = max(_safe_float(current_short_notional), 0.0)
+    threshold = max(_safe_float(short_threshold_notional), 0.0)
+    hard_cap = max(_safe_float(max_short_notional), 0.0)
+    price = max(_safe_float(ask_price), 0.0)
+    if threshold <= 0 or current_notional >= threshold - 1e-12:
+        report["reason"] = "not_below_threshold"
+        return report
+    if price <= 0 or hard_cap <= current_notional + 1e-12:
+        report["reason"] = "no_hard_headroom"
+        return report
+    minimum_notional = max(
+        _safe_float(min_notional),
+        price * max(_safe_float(min_qty), 0.0),
+    )
+    desired_notional = min(
+        (threshold - current_notional) + minimum_notional,
+        hard_cap - current_notional,
+        100.0,
+    )
+    qty = _round_order_qty(desired_notional / price, step_size)
+    notional = qty * price
+    if (
+        qty <= 0
+        or notional + 1e-12 < minimum_notional
+        or current_notional + notional <= threshold + 1e-12
+    ):
+        report["reason"] = "bridge_below_exchange_minimum"
+        return report
+    order = {
+        "side": "SELL",
+        "price": price,
+        "qty": qty,
+        "notional": notional,
+        "role": "best_quote_entry_short",
+        "position_side": "SHORT",
+        "time_in_force": "GTX",
+        "execution_type": "maker",
+        "post_only": True,
+        "near_soft_bridge_entry": True,
+        "near_soft_bridge_threshold_notional": threshold,
+        "near_soft_bridge_target_notional": current_notional + notional,
+    }
+    plan["sell_orders"] = [
+        order,
+        *[
+            dict(item)
+            for item in plan.get("sell_orders", [])
+            if isinstance(item, dict)
+        ],
+    ]
+    report.update(
+        {
+            "added": True,
+            "reason": "near_soft_short_entry_missing",
+            "order": dict(order),
+        }
+    )
+    return report
+
+
 def apply_grvt_ordinary_inventory_pressure_guard(
     *,
     plan: dict[str, Any],
@@ -34537,6 +34645,40 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             )
             best_quote_maker_volume["near_soft_bridge_entry"] = dict(
                 grvt_near_soft_bridge_entry
+            )
+            grvt_near_soft_short_bridge_entry = (
+                apply_grvt_near_soft_short_bridge_entry(
+                    plan=plan,
+                    enabled=not bool(controls.get("short_paused")),
+                    current_short_notional=controls.get(
+                        "current_short_notional", current_short_notional
+                    ),
+                    short_threshold_notional=loss_reduce_threshold_notional,
+                    max_short_notional=getattr(
+                        effective_args,
+                        "best_quote_maker_volume_max_short_notional",
+                        0.0,
+                    ),
+                    ask_price=ask_price,
+                    step_size=symbol_info.get("step_size"),
+                    min_qty=symbol_info.get("min_qty"),
+                    min_notional=symbol_info.get("min_notional"),
+                    short_entry_reason=str(
+                        (four_leg_roles.get("short_entry") or {}).get(
+                            "reason"
+                        )
+                        or ""
+                    ),
+                    short_entry_blocked_by_anti_chase=bool(
+                        anti_chase_entry_guard.get("block_short_entries")
+                    ),
+                    volatility_entry_pause_active=bool(
+                        volatility_entry_pause.get("active")
+                    ),
+                )
+            )
+            best_quote_maker_volume["near_soft_short_bridge_entry"] = dict(
+                grvt_near_soft_short_bridge_entry
             )
             grvt_inventory_pressure_guard = apply_grvt_ordinary_inventory_pressure_guard(
                 plan=plan,
