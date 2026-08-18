@@ -24394,6 +24394,28 @@ def _best_quote_active_pair_reduce_default_report() -> dict[str, Any]:
     }
 
 
+def _grvt_near_soft_bridge_pause_allows_entry(
+    *,
+    paused: bool,
+    pause_reasons: Iterable[str],
+) -> bool:
+    if not paused:
+        return True
+    allowed_reasons = {
+        "near_soft_profit_reduce",
+        "balanced_cost_recovery",
+        "low_volatility_tighten",
+        "high_volatility_defensive",
+        "extreme_volatility_defensive",
+    }
+    reasons = {
+        str(reason).strip()
+        for reason in pause_reasons
+        if str(reason).strip()
+    }
+    return bool(reasons) and reasons.issubset(allowed_reasons)
+
+
 def apply_grvt_near_soft_bridge_entry(
     *,
     plan: dict[str, Any],
@@ -34615,7 +34637,10 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             )
             grvt_near_soft_bridge_entry = apply_grvt_near_soft_bridge_entry(
                 plan=plan,
-                enabled=not bool(controls.get("buy_paused")),
+                enabled=_grvt_near_soft_bridge_pause_allows_entry(
+                    paused=bool(controls.get("buy_paused")),
+                    pause_reasons=controls.get("pause_reasons") or [],
+                ),
                 current_long_notional=controls.get(
                     "current_long_notional", current_long_notional
                 ),
@@ -34652,7 +34677,10 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             grvt_near_soft_short_bridge_entry = (
                 apply_grvt_near_soft_short_bridge_entry(
                     plan=plan,
-                    enabled=not bool(controls.get("short_paused")),
+                    enabled=_grvt_near_soft_bridge_pause_allows_entry(
+                        paused=bool(controls.get("short_paused")),
+                        pause_reasons=controls.get("short_pause_reasons") or [],
+                    ),
                     current_short_notional=controls.get(
                         "current_short_notional", current_short_notional
                     ),

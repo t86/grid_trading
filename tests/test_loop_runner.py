@@ -13145,6 +13145,20 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(report["added"])
         self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
 
+    def test_grvt_near_soft_bridge_bypasses_only_soft_strategy_pauses(self) -> None:
+        self.assertTrue(
+            loop_runner_module._grvt_near_soft_bridge_pause_allows_entry(
+                paused=True,
+                pause_reasons=["low_volatility_tighten", "near_soft_profit_reduce"],
+            )
+        )
+        self.assertFalse(
+            loop_runner_module._grvt_near_soft_bridge_pause_allows_entry(
+                paused=True,
+                pause_reasons=["near_soft_profit_reduce", "loss_reduce_reentry_guard: active"],
+            )
+        )
+
     def test_best_quote_active_pair_reduce_keeps_normal_flow_for_large_pair_imbalance(self) -> None:
         plan = {
             "buy_orders": [
