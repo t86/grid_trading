@@ -1930,6 +1930,327 @@ def _record_loss_reduce_reentry_fill_guard(
     }
 
 
+def _lock_ordinary_profit_release_bucket(
+    *,
+    ledger: dict[str, Any],
+    order_ref: Mapping[str, Any],
+) -> int:
+    lease_id = str(
+        order_ref.get("ordinary_profit_release_lease_id") or ""
+    ).strip()
+    side = str(
+        order_ref.get("ordinary_profit_release_bucket_side") or ""
+    ).upper().strip()
+    bucket_price = max(
+        _safe_float(order_ref.get("ordinary_profit_release_bucket_price")),
+        0.0,
+    )
+    cutoff_at = str(
+        order_ref.get("ordinary_profit_release_entry_cutoff_at") or ""
+    ).strip()
+    if not lease_id or side not in {"LONG", "SHORT"} or bucket_price <= 0:
+        return 0
+    lot_key = "long_lots" if side == "LONG" else "short_lots"
+    entry_role = (
+        "best_quote_entry_long"
+        if side == "LONG"
+        else "best_quote_entry_short"
+    )
+    lots = [
+        dict(item)
+        for item in list(ledger.get(lot_key) or [])
+        if isinstance(item, Mapping)
+    ]
+    locked_lot_count = 0
+    for lot in lots:
+        if str(lot.get("role") or "") != entry_role:
+            continue
+        if abs(_safe_float(lot.get("price")) - bucket_price) > 1e-12:
+            continue
+        opened_at = str(lot.get("opened_at") or "").strip()
+        if cutoff_at and opened_at and opened_at > cutoff_at:
+            continue
+        if not bool(lot.get("ordinary_profit_release_locked")):
+            lot["ordinary_profit_release_locked"] = True
+            lot["ordinary_profit_release_locked_by"] = lease_id
+            locked_lot_count += 1
+        for key in (
+            "ordinary_profit_release_active_lease_id",
+            "ordinary_profit_release_active_lease_remaining_qty",
+            "ordinary_profit_release_active_lease_cutoff_at",
+        ):
+            lot.pop(key, None)
+    ledger[lot_key] = lots
+    return locked_lot_count
+
+
+def _mark_ordinary_profit_release_bucket_active(
+    *,
+    ledger: dict[str, Any],
+    order_ref: Mapping[str, Any],
+    remaining_qty: float,
+) -> None:
+    lease_id = str(
+        order_ref.get("ordinary_profit_release_lease_id") or ""
+    ).strip()
+    side = str(
+        order_ref.get("ordinary_profit_release_bucket_side") or ""
+    ).upper().strip()
+    bucket_price = max(
+        _safe_float(order_ref.get("ordinary_profit_release_bucket_price")),
+        0.0,
+    )
+    cutoff_at = str(
+        order_ref.get("ordinary_profit_release_entry_cutoff_at") or ""
+    ).strip()
+    safe_remaining_qty = max(_safe_float(remaining_qty), 0.0)
+    if (
+        not lease_id
+        or side not in {"LONG", "SHORT"}
+        or bucket_price <= 0
+        or safe_remaining_qty <= 1e-12
+    ):
+        return
+    lot_key = "long_lots" if side == "LONG" else "short_lots"
+    entry_role = (
+        "best_quote_entry_long"
+        if side == "LONG"
+        else "best_quote_entry_short"
+    )
+    lots = [
+        dict(item)
+        for item in list(ledger.get(lot_key) or [])
+        if isinstance(item, Mapping)
+    ]
+    for lot in lots:
+        if str(lot.get("role") or "") != entry_role:
+            continue
+        if abs(_safe_float(lot.get("price")) - bucket_price) > 1e-12:
+            continue
+        opened_at = str(lot.get("opened_at") or "").strip()
+        if cutoff_at and opened_at and opened_at > cutoff_at:
+            continue
+        lot["ordinary_profit_release_active_lease_id"] = lease_id
+        lot["ordinary_profit_release_active_lease_remaining_qty"] = (
+            safe_remaining_qty
+        )
+        lot["ordinary_profit_release_active_lease_cutoff_at"] = cutoff_at
+    ledger[lot_key] = lots
+
+
+def _record_ordinary_profit_release_trade_fill(
+    *,
+    ledger: dict[str, Any],
+    order_ref: Mapping[str, Any],
+    fill_qty: float,
+) -> int:
+    lease_id = str(
+        order_ref.get("ordinary_profit_release_lease_id") or ""
+    ).strip()
+    authorized_qty = max(
+        _safe_float(order_ref.get("ordinary_profit_release_authorized_qty")),
+        0.0,
+    )
+    safe_fill_qty = max(_safe_float(fill_qty), 0.0)
+    if not lease_id or authorized_qty <= 0 or safe_fill_qty <= 0:
+        return 0
+    settled_ids = [
+        str(item).strip()
+        for item in list(
+            ledger.get("ordinary_profit_release_settled_lease_ids") or []
+        )
+        if str(item).strip()
+    ]
+    if lease_id in settled_ids:
+        return 0
+    leases = ledger.get("ordinary_profit_release_leases")
+    leases = dict(leases) if isinstance(leases, Mapping) else {}
+    lease = dict(leases.get(lease_id) or {})
+    trade_filled_qty = max(
+        _safe_float(lease.get("trade_filled_qty")),
+        0.0,
+    ) + safe_fill_qty
+    lease.update(
+        {
+            "lease_id": lease_id,
+            "side": str(
+                order_ref.get("ordinary_profit_release_bucket_side") or ""
+            ).upper().strip(),
+            "bucket_price": max(
+                _safe_float(
+                    order_ref.get("ordinary_profit_release_bucket_price")
+                ),
+                0.0,
+            ),
+            "entry_cutoff_at": str(
+                order_ref.get("ordinary_profit_release_entry_cutoff_at") or ""
+            ).strip(),
+            "authorized_qty": authorized_qty,
+            "trade_filled_qty": trade_filled_qty,
+            "filled_qty": max(
+                _safe_float(lease.get("filled_qty")),
+                trade_filled_qty,
+            ),
+            "status": "active",
+        }
+    )
+    if _safe_float(lease.get("filled_qty")) + 1e-12 < authorized_qty:
+        leases[lease_id] = lease
+        ledger["ordinary_profit_release_leases"] = leases
+        _mark_ordinary_profit_release_bucket_active(
+            ledger=ledger,
+            order_ref=order_ref,
+            remaining_qty=authorized_qty - _safe_float(lease.get("filled_qty")),
+        )
+        return 0
+    locked_lot_count = _lock_ordinary_profit_release_bucket(
+        ledger=ledger,
+        order_ref=order_ref,
+    )
+    leases.pop(lease_id, None)
+    settled_ids.append(lease_id)
+    ledger["ordinary_profit_release_leases"] = leases
+    ledger["ordinary_profit_release_settled_lease_ids"] = settled_ids[-1000:]
+    return locked_lot_count
+
+
+def _apply_ordinary_profit_release_execution_events(
+    *,
+    state: dict[str, Any],
+    execution_events: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Settle ordinary cost-bucket release leases from exact order events."""
+
+    refs = state.get("best_quote_volume_order_refs")
+    refs = refs if isinstance(refs, Mapping) else {}
+    ledger = state.get("best_quote_volume_ledger")
+    if not isinstance(ledger, dict):
+        return {"changed": False, "settled": False, "locked_lot_count": 0}
+    leases = ledger.get("ordinary_profit_release_leases")
+    leases = dict(leases) if isinstance(leases, Mapping) else {}
+    settled_ids = {
+        str(item).strip()
+        for item in list(
+            ledger.get("ordinary_profit_release_settled_lease_ids") or []
+        )
+        if str(item).strip()
+    }
+    changed = False
+    settled = False
+    locked_lot_count = 0
+
+    for event in execution_events:
+        kind = str(event.get("kind") or "").upper().strip()
+        if kind not in {
+            "ORDER_NEW",
+            "ORDER_PARTIALLY_FILLED",
+            "ORDER_FILLED",
+            "ORDER_CANCELED",
+            "ORDER_EXPIRED",
+            "ORDER_REJECTED",
+        }:
+            continue
+        order_id = str(
+            event.get("order_id") or event.get("orderId") or ""
+        ).strip()
+        ref = refs.get(order_id)
+        if (
+            not isinstance(ref, Mapping)
+            or str(ref.get("book") or "") != BQ_BOOK_NORMAL
+        ):
+            continue
+        lease_id = str(
+            ref.get("ordinary_profit_release_lease_id") or ""
+        ).strip()
+        if not lease_id or lease_id in settled_ids:
+            continue
+        side = str(
+            ref.get("ordinary_profit_release_bucket_side") or ""
+        ).upper().strip()
+        bucket_price = max(
+            _safe_float(ref.get("ordinary_profit_release_bucket_price")),
+            0.0,
+        )
+        cutoff_at = str(
+            ref.get("ordinary_profit_release_entry_cutoff_at") or ""
+        ).strip()
+        authorized_qty = max(
+            _safe_float(ref.get("ordinary_profit_release_authorized_qty")),
+            0.0,
+        )
+        if (
+            side not in {"LONG", "SHORT"}
+            or bucket_price <= 0
+            or authorized_qty <= 0
+        ):
+            continue
+        lease = dict(leases.get(lease_id) or {})
+        lease.update(
+            {
+                "lease_id": lease_id,
+                "order_id": order_id,
+                "side": side,
+                "bucket_price": bucket_price,
+                "entry_cutoff_at": cutoff_at,
+                "authorized_qty": authorized_qty,
+            }
+        )
+        previous_filled_qty = max(_safe_float(lease.get("filled_qty")), 0.0)
+        event_filled_qty = max(
+            _safe_float(
+                event.get(
+                    "cumulative_filled_qty",
+                    event.get("cumulativeFilledQty"),
+                )
+            ),
+            0.0,
+        )
+        filled_qty = max(previous_filled_qty, event_filled_qty)
+        if kind == "ORDER_FILLED" and filled_qty <= 1e-12:
+            filled_qty = authorized_qty
+        lease["filled_qty"] = filled_qty
+
+        if kind in {"ORDER_NEW", "ORDER_PARTIALLY_FILLED"}:
+            lease["status"] = "active"
+            if leases.get(lease_id) != lease:
+                leases[lease_id] = lease
+                changed = True
+            if filled_qty > 1e-12:
+                _mark_ordinary_profit_release_bucket_active(
+                    ledger=ledger,
+                    order_ref=ref,
+                    remaining_qty=max(authorized_qty - filled_qty, 0.0),
+                )
+            continue
+        if filled_qty <= 1e-12:
+            if lease_id in leases:
+                leases.pop(lease_id, None)
+                changed = True
+            continue
+
+        newly_locked = _lock_ordinary_profit_release_bucket(
+            ledger=ledger,
+            order_ref=ref,
+        )
+        locked_lot_count += newly_locked
+        changed = changed or newly_locked > 0
+        leases.pop(lease_id, None)
+        settled_ids.add(lease_id)
+        settled = True
+        changed = True
+
+    ledger["ordinary_profit_release_leases"] = leases
+    ledger["ordinary_profit_release_settled_lease_ids"] = list(settled_ids)[
+        -1000:
+    ]
+    state["best_quote_volume_ledger"] = ledger
+    return {
+        "changed": changed,
+        "settled": settled,
+        "locked_lot_count": locked_lot_count,
+    }
+
+
 def _allow_grvt_reentry_below_soft_bypass(loss_reduce_reentry_guard: dict[str, Any]) -> bool:
     if not bool(loss_reduce_reentry_guard.get("active")):
         return False
@@ -4277,6 +4598,18 @@ def sync_best_quote_volume_ledger(
                 qty,
                 entry_role="best_quote_entry_long",
             )
+            if order_ref is not None and str(
+                order_ref.get("ordinary_profit_release_lease_id") or ""
+            ).strip():
+                ledger["long_lots"] = long_lots
+                _record_ordinary_profit_release_trade_fill(
+                    ledger=ledger,
+                    order_ref=order_ref,
+                    fill_qty=qty,
+                )
+                long_lots = _normalize_best_quote_volume_lots(
+                    ledger.get("long_lots")
+                )
             realized_delta += qty * price - realized_cost
         elif role == "best_quote_reduce_short":
             short_lots, _, realized_cost = _best_quote_volume_consume_entry_lots_first(
@@ -4284,6 +4617,18 @@ def sync_best_quote_volume_ledger(
                 qty,
                 entry_role="best_quote_entry_short",
             )
+            if order_ref is not None and str(
+                order_ref.get("ordinary_profit_release_lease_id") or ""
+            ).strip():
+                ledger["short_lots"] = short_lots
+                _record_ordinary_profit_release_trade_fill(
+                    ledger=ledger,
+                    order_ref=order_ref,
+                    fill_qty=qty,
+                )
+                short_lots = _normalize_best_quote_volume_lots(
+                    ledger.get("short_lots")
+                )
             realized_delta += realized_cost - qty * price
         applied += 1
         if fill_key:
@@ -10520,7 +10865,7 @@ def _update_best_quote_volume_order_refs_unlocked(
                 manual_reduce_updated = True
                 manual_reduce_updated_sides.add(side_key)
         order_ref_id = str(order_id)
-        refs[order_ref_id] = {
+        order_ref = {
             "book": _best_quote_order_book_from_role(request.get("role")),
             "role": role,
             "side": str(request.get("side", "")).upper().strip(),
@@ -10535,6 +10880,19 @@ def _update_best_quote_volume_order_refs_unlocked(
             "selected_lot_allocations": selected_lot_allocations,
             "updated_at": _isoformat(_utc_now()),
         }
+        if (
+            order_ref["book"] == BQ_BOOK_NORMAL
+            and str(request.get("ordinary_profit_release_lease_id") or "").strip()
+        ):
+            for key in (
+                "ordinary_profit_release_lease_id",
+                "ordinary_profit_release_bucket_side",
+                "ordinary_profit_release_bucket_price",
+                "ordinary_profit_release_entry_cutoff_at",
+                "ordinary_profit_release_authorized_qty",
+            ):
+                order_ref[key] = request.get(key)
+        refs[order_ref_id] = order_ref
         touched_order_ref_ids.add(order_ref_id)
 
     if len(refs) > 10000:
@@ -38756,6 +39114,24 @@ def main() -> None:
                 )
                 if loss_reentry_fill_guard.get("armed"):
                     submit_report["loss_reduce_reentry_fill_guard"] = loss_reentry_fill_guard
+                    _write_json(submit_report_path, submit_report)
+                profit_release_state_path = Path(
+                    str(plan_report.get("state_path", args.state_path))
+                )
+                with exclusive_json_state_lock(profit_release_state_path):
+                    profit_release_state = read_json(profit_release_state_path) or {}
+                    profit_release_lease_report = (
+                        _apply_ordinary_profit_release_execution_events(
+                            state=profit_release_state,
+                            execution_events=execution_events,
+                        )
+                    )
+                    if profit_release_lease_report.get("changed"):
+                        _write_json(profit_release_state_path, profit_release_state)
+                if profit_release_lease_report.get("changed"):
+                    submit_report["ordinary_profit_release_lease"] = (
+                        profit_release_lease_report
+                    )
                     _write_json(submit_report_path, submit_report)
                 audit_sync = {
                     "trade_appended": 0,

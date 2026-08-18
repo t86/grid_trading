@@ -720,6 +720,43 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(ref["role"], "best_quote_entry_short")
         self.assertEqual(ref["position_side"], "SHORT")
 
+    def test_update_best_quote_volume_order_refs_persists_profit_release_lease(self) -> None:
+        metadata = {
+            "ordinary_profit_release_lease_id": "LONG:99.5:cutoff-1",
+            "ordinary_profit_release_bucket_side": "LONG",
+            "ordinary_profit_release_bucket_price": 99.5,
+            "ordinary_profit_release_entry_cutoff_at": "2026-08-18T00:00:02+00:00",
+            "ordinary_profit_release_authorized_qty": 1.0,
+        }
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text("{}", encoding="utf-8")
+            update_best_quote_volume_order_refs(
+                state_path=state_path,
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                submit_report={
+                    "placed_orders": [
+                        {
+                            "request": {
+                                "role": "best_quote_reduce_long",
+                                "side": "SELL",
+                                "position_side": "LONG",
+                                **metadata,
+                            },
+                            "response": {
+                                "orderId": 41974650,
+                                "clientOrderId": "gx-grvtu-bestquot-1-87716364",
+                            },
+                        }
+                    ]
+                },
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        ref = state["best_quote_volume_order_refs"]["41974650"]
+        for key, value in metadata.items():
+            self.assertEqual(ref[key], value)
+
     def test_update_best_quote_volume_order_refs_marks_frozen_book(self) -> None:
         with TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "state.json"
@@ -4276,7 +4313,7 @@ class LoopRunnerTests(unittest.TestCase):
         state: dict[str, object] = {
             "best_quote_volume_order_refs": {
                 "41046162": {
-                    "book": "normal",
+                    "book": "normal_bq",
                     "role": "best_quote_reduce_short",
                     "side": "BUY",
                     "position_side": "SHORT",
@@ -4350,6 +4387,280 @@ class LoopRunnerTests(unittest.TestCase):
             state["best_quote_volume_ledger"]["realized_pnl"],
             4.4,
         )
+
+    def test_profit_release_fill_locks_only_entries_at_or_before_lease_cutoff(self) -> None:
+        state = {
+            "best_quote_volume_order_refs": {
+                "101": {
+                    "book": "normal_bq",
+                    "role": "best_quote_reduce_long",
+                    "ordinary_profit_release_lease_id": "LONG:99.5:cutoff-1",
+                    "ordinary_profit_release_bucket_side": "LONG",
+                    "ordinary_profit_release_bucket_price": 99.5,
+                    "ordinary_profit_release_entry_cutoff_at": "2026-08-18T00:00:02+00:00",
+                    "ordinary_profit_release_authorized_qty": 1.0,
+                }
+            },
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "long_lots": [
+                    {
+                        "qty": 1.0,
+                        "price": 99.5,
+                        "opened_at": "2026-08-18T00:00:01+00:00",
+                        "role": "best_quote_entry_long",
+                    },
+                    {
+                        "qty": 1.0,
+                        "price": 99.5,
+                        "opened_at": "2026-08-18T00:00:03+00:00",
+                        "role": "best_quote_entry_long",
+                    },
+                ],
+                "short_lots": [],
+            },
+        }
+
+        result = loop_runner_module._apply_ordinary_profit_release_execution_events(
+            state=state,
+            execution_events=[
+                {
+                    "kind": "ORDER_FILLED",
+                    "order_id": 101,
+                    "cumulative_filled_qty": 1.0,
+                }
+            ],
+        )
+
+        self.assertTrue(result["settled"])
+        lots = state["best_quote_volume_ledger"]["long_lots"]
+        self.assertTrue(lots[0]["ordinary_profit_release_locked"])
+        self.assertEqual(
+            lots[0]["ordinary_profit_release_locked_by"],
+            "LONG:99.5:cutoff-1",
+        )
+        self.assertNotIn("ordinary_profit_release_locked", lots[1])
+
+    def test_profit_release_cancel_only_locks_after_a_partial_fill(self) -> None:
+        def build_state() -> dict[str, object]:
+            return {
+                "best_quote_volume_order_refs": {
+                    "102": {
+                        "book": "normal_bq",
+                        "role": "best_quote_reduce_short",
+                        "ordinary_profit_release_lease_id": "SHORT:100.5:cutoff-2",
+                        "ordinary_profit_release_bucket_side": "SHORT",
+                        "ordinary_profit_release_bucket_price": 100.5,
+                        "ordinary_profit_release_entry_cutoff_at": "2026-08-18T00:00:02+00:00",
+                        "ordinary_profit_release_authorized_qty": 2.0,
+                    }
+                },
+                "best_quote_volume_ledger": {
+                    "initialized": True,
+                    "long_lots": [],
+                    "short_lots": [
+                        {
+                            "qty": 2.0,
+                            "price": 100.5,
+                            "opened_at": "2026-08-18T00:00:01+00:00",
+                            "role": "best_quote_entry_short",
+                        }
+                    ],
+                },
+            }
+
+        zero_fill_state = build_state()
+        zero_fill = loop_runner_module._apply_ordinary_profit_release_execution_events(
+            state=zero_fill_state,
+            execution_events=[
+                {
+                    "kind": "ORDER_CANCELED",
+                    "order_id": 102,
+                    "cumulative_filled_qty": 0.0,
+                }
+            ],
+        )
+        self.assertFalse(zero_fill["settled"])
+        self.assertNotIn(
+            "ordinary_profit_release_locked",
+            zero_fill_state["best_quote_volume_ledger"]["short_lots"][0],
+        )
+
+        partial_state = build_state()
+        active = loop_runner_module._apply_ordinary_profit_release_execution_events(
+            state=partial_state,
+            execution_events=[
+                {
+                    "kind": "ORDER_PARTIALLY_FILLED",
+                    "order_id": 102,
+                    "cumulative_filled_qty": 0.5,
+                }
+            ],
+        )
+        self.assertFalse(active["settled"])
+        self.assertEqual(
+            partial_state["best_quote_volume_ledger"]["ordinary_profit_release_leases"]
+            ["SHORT:100.5:cutoff-2"]["filled_qty"],
+            0.5,
+        )
+
+        settled = loop_runner_module._apply_ordinary_profit_release_execution_events(
+            state=partial_state,
+            execution_events=[
+                {
+                    "kind": "ORDER_CANCELED",
+                    "order_id": 102,
+                    "cumulative_filled_qty": 0.5,
+                }
+            ],
+        )
+        self.assertTrue(settled["settled"])
+        self.assertTrue(
+            partial_state["best_quote_volume_ledger"]["short_lots"][0]
+            ["ordinary_profit_release_locked"]
+        )
+
+    def test_profit_release_trade_sync_locks_remaining_pre_cutoff_bucket(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_volume_order_refs": {
+                "103": {
+                    "book": "normal_bq",
+                    "role": "best_quote_reduce_long",
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "ordinary_profit_release_lease_id": "LONG:99.5:cutoff-3",
+                    "ordinary_profit_release_bucket_side": "LONG",
+                    "ordinary_profit_release_bucket_price": 99.5,
+                    "ordinary_profit_release_entry_cutoff_at": "2026-08-18T00:00:02+00:00",
+                    "ordinary_profit_release_authorized_qty": 1.0,
+                }
+            },
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [
+                    {
+                        "qty": 1.0,
+                        "price": 99.5,
+                        "opened_at": "2026-08-18T00:00:01+00:00",
+                        "source": "trade_fill",
+                        "role": "best_quote_entry_long",
+                    },
+                    {
+                        "qty": 1.0,
+                        "price": 99.5,
+                        "opened_at": "2026-08-18T00:00:02+00:00",
+                        "source": "trade_fill",
+                        "role": "best_quote_entry_long",
+                    },
+                ],
+                "short_lots": [],
+                "last_trade_time_ms": 1000,
+                "last_trade_keys_at_time": [],
+            },
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[]):
+            sync_best_quote_volume_ledger(
+                state=state,
+                symbol="GRVTUSDT",
+                api_key="",
+                api_secret="",
+                recv_window=5000,
+                current_long_qty=1.0,
+                current_short_qty=0.0,
+                current_long_avg_price=99.5,
+                current_short_avg_price=0.0,
+                mid_price=99.6,
+                observed_trade_rows=[
+                    {
+                        "id": 9001,
+                        "time": 2000,
+                        "orderId": 103,
+                        "side": "SELL",
+                        "positionSide": "LONG",
+                        "qty": "1.0",
+                        "price": "99.6",
+                        "quoteQty": "99.6",
+                    }
+                ],
+            )
+
+        remaining = state["best_quote_volume_ledger"]["long_lots"]
+        self.assertEqual(sum(float(item["qty"]) for item in remaining), 1.0)
+        self.assertTrue(all(item["ordinary_profit_release_locked"] for item in remaining))
+
+    def test_profit_release_trade_sync_keeps_partial_lease_active(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_volume_order_refs": {
+                "104": {
+                    "book": "normal_bq",
+                    "role": "best_quote_reduce_long",
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "ordinary_profit_release_lease_id": "LONG:99.5:cutoff-4",
+                    "ordinary_profit_release_bucket_side": "LONG",
+                    "ordinary_profit_release_bucket_price": 99.5,
+                    "ordinary_profit_release_entry_cutoff_at": "2026-08-18T00:00:02+00:00",
+                    "ordinary_profit_release_authorized_qty": 1.0,
+                }
+            },
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [
+                    {
+                        "qty": 2.0,
+                        "price": 99.5,
+                        "opened_at": "2026-08-18T00:00:01+00:00",
+                        "source": "trade_fill",
+                        "role": "best_quote_entry_long",
+                    }
+                ],
+                "short_lots": [],
+                "last_trade_time_ms": 1000,
+                "last_trade_keys_at_time": [],
+            },
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[]):
+            sync_best_quote_volume_ledger(
+                state=state,
+                symbol="GRVTUSDT",
+                api_key="",
+                api_secret="",
+                recv_window=5000,
+                current_long_qty=1.5,
+                current_short_qty=0.0,
+                current_long_avg_price=99.5,
+                current_short_avg_price=0.0,
+                mid_price=99.6,
+                observed_trade_rows=[
+                    {
+                        "id": 9002,
+                        "time": 2000,
+                        "orderId": 104,
+                        "side": "SELL",
+                        "positionSide": "LONG",
+                        "qty": "0.5",
+                        "price": "99.6",
+                        "quoteQty": "49.8",
+                    }
+                ],
+            )
+
+        remaining = state["best_quote_volume_ledger"]["long_lots"]
+        self.assertFalse(any(item.get("ordinary_profit_release_locked") for item in remaining))
+        self.assertEqual(
+            remaining[0]["ordinary_profit_release_active_lease_id"],
+            "LONG:99.5:cutoff-4",
+        )
+        self.assertEqual(
+            remaining[0]["ordinary_profit_release_active_lease_remaining_qty"],
+            0.5,
+        )
+        lease = state["best_quote_volume_ledger"]["ordinary_profit_release_leases"]
+        self.assertEqual(lease["LONG:99.5:cutoff-4"]["filled_qty"], 0.5)
 
     def test_best_quote_volume_ledger_counts_hardloss_order_ref_with_unknown_book(self) -> None:
         state: dict[str, object] = {

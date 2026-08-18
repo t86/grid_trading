@@ -2080,6 +2080,9 @@ def build_best_quote_maker_volume_plan(
             paired_lot_qty: float | None = None
             eligible_lots: list[dict[str, Any]] | None = None
             selected_bucket_lots: list[dict[str, Any]] = []
+            active_lease_id = ""
+            active_lease_remaining_qty = 0.0
+            active_lease_cutoff_at = ""
             if position_lots is not None:
                 entry_role = (
                     "best_quote_entry_long"
@@ -2206,10 +2209,60 @@ def build_best_quote_maker_volume_plan(
                     )
                     <= 1e-12
                 ]
+                active_lease_lot = next(
+                    (
+                        lot
+                        for lot in selected_bucket_lots
+                        if str(
+                            lot.get(
+                                "ordinary_profit_release_active_lease_id"
+                            )
+                            or ""
+                        ).strip()
+                    ),
+                    None,
+                )
+                if active_lease_lot is not None:
+                    active_lease_id = str(
+                        active_lease_lot.get(
+                            "ordinary_profit_release_active_lease_id"
+                        )
+                        or ""
+                    ).strip()
+                    active_lease_remaining_qty = max(
+                        _safe_float(
+                            active_lease_lot.get(
+                                "ordinary_profit_release_active_lease_remaining_qty"
+                            )
+                        ),
+                        0.0,
+                    )
+                    active_lease_cutoff_at = str(
+                        active_lease_lot.get(
+                            "ordinary_profit_release_active_lease_cutoff_at"
+                        )
+                        or ""
+                    ).strip()
+                    selected_bucket_lots = [
+                        lot
+                        for lot in selected_bucket_lots
+                        if str(
+                            lot.get(
+                                "ordinary_profit_release_active_lease_id"
+                            )
+                            or ""
+                        ).strip()
+                        == active_lease_id
+                    ]
                 paired_lot_qty = sum(
                     max(_safe_float(lot.get("qty")), 0.0)
                     for lot in selected_bucket_lots
                 )
+                if active_lease_id:
+                    paired_lot_qty = min(
+                        paired_lot_qty,
+                        active_lease_remaining_qty,
+                    )
 
             profit_boundary = position_cost + max(
                 _safe_float(inputs.entry_ladder_spacing),
@@ -2270,13 +2323,11 @@ def build_best_quote_maker_volume_plan(
                     default="",
                 )
                 bucket_price = format(Decimal(str(position_cost)).normalize(), "f")
-                lease_id = ":".join(
-                    (
-                        position_side,
-                        bucket_price,
-                        entry_cutoff_at or "legacy",
-                    )
+                lease_id = active_lease_id or ":".join(
+                    (position_side, bucket_price, entry_cutoff_at or "legacy")
                 )
+                if active_lease_id:
+                    entry_cutoff_at = active_lease_cutoff_at
                 order.update(
                     {
                         "ordinary_entry_lot_profit": True,

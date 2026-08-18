@@ -510,6 +510,60 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
             "aggregate_no_loss_blocked",
         )
 
+    def test_four_leg_profit_reduce_reuses_active_lease_remaining_qty(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                four_leg_cycle_enabled=True,
+                max_long_notional=1_000.0,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.90,
+                min_cycle_budget_notional=400.0,
+            ),
+            inputs=_inputs(
+                bid_price=100.0,
+                ask_price=100.1,
+                mid_price=100.05,
+                cycle_budget_notional=800.0,
+                entry_ladder_spacing=0.1,
+                tick_size=0.1,
+                step_size=0.1,
+                position_side_mode="hedge",
+                current_long_qty=5.0,
+                current_short_qty=0.0,
+                current_long_avg_price=99.5,
+                current_long_lots=[
+                    {
+                        "qty": 1.5,
+                        "price": 99.5,
+                        "opened_at": "2026-08-18T00:00:01+00:00",
+                        "role": "best_quote_entry_long",
+                        "ordinary_profit_release_active_lease_id": "LONG:99.5:cutoff-5",
+                        "ordinary_profit_release_active_lease_remaining_qty": 0.5,
+                        "ordinary_profit_release_active_lease_cutoff_at": "2026-08-18T00:00:01+00:00",
+                    },
+                    {
+                        "qty": 1.0,
+                        "price": 99.5,
+                        "opened_at": "2026-08-18T00:00:03+00:00",
+                        "role": "best_quote_entry_long",
+                    },
+                ],
+                current_short_lots=[],
+            ),
+        )
+
+        order = next(
+            item
+            for item in plan["sell_orders"]
+            if item["role"] == "best_quote_reduce_long"
+        )
+        self.assertEqual(order["qty"], 0.5)
+        self.assertEqual(
+            order["ordinary_profit_release_lease_id"],
+            "LONG:99.5:cutoff-5",
+        )
+
     def test_four_leg_profit_reduce_stops_at_retained_inventory_floor(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
