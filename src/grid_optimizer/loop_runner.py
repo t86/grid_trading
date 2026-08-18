@@ -22879,11 +22879,7 @@ def apply_take_profit_profit_guard(
             release_floor = max(_safe_float(order.get("take_profit_guard_release_floor")), 0.0)
             effective_floor = long_floor_price
             if entry_lot_floor > 0:
-                # A profitable tracked lot is not enough on Binance hedge mode:
-                # realizedPnl is settled against the merged exchange position
-                # basis.  Keep both the entry-lot boundary and the stricter
-                # managed/exchange no-loss floor.
-                effective_floor = max(effective_floor, entry_lot_floor)
+                effective_floor = entry_lot_floor
                 report["ordinary_entry_lot_profit_relaxed_sell_orders"] += 1
             elif release_floor > 0:
                 effective_floor = min(effective_floor, release_floor)
@@ -22921,9 +22917,7 @@ def apply_take_profit_profit_guard(
             release_ceiling = max(_safe_float(order.get("take_profit_guard_release_ceiling")), 0.0)
             effective_ceiling = short_ceiling_price
             if entry_lot_ceiling > 0:
-                # See the long-side note above: the tracked-lot boundary may
-                # never weaken the exchange/managed no-loss ceiling.
-                effective_ceiling = min(effective_ceiling, entry_lot_ceiling)
+                effective_ceiling = entry_lot_ceiling
                 report["ordinary_entry_lot_profit_relaxed_buy_orders"] += 1
             elif release_ceiling > 0:
                 effective_ceiling = max(effective_ceiling, release_ceiling)
