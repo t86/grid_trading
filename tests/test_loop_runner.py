@@ -21876,6 +21876,11 @@ class LoopRunnerTests(unittest.TestCase):
                         "qty": 16.0,
                         "price": 0.5985,
                         "force_reduce_only": True,
+                        "ordinary_profit_release_lease_id": "LONG:0.5983:cutoff-1",
+                        "ordinary_profit_release_bucket_side": "LONG",
+                        "ordinary_profit_release_bucket_price": 0.5983,
+                        "ordinary_profit_release_entry_cutoff_at": "2026-08-18T01:00:00+00:00",
+                        "ordinary_profit_release_authorized_qty": 16.0,
                     },
                 ],
             },
@@ -21884,10 +21889,17 @@ class LoopRunnerTests(unittest.TestCase):
         args.plan_json = "output/pharosusdt_hedge_best_quote_maker_volume_latest_plan.json"
         plan_report["strategy_mode"] = "hedge_best_quote_maker_volume_v1"
 
-        execute_plan_report(args, plan_report)
+        report = execute_plan_report(args, plan_report)
 
         self.assertIsNone(mock_post_order.call_args.kwargs["reduce_only"])
         self.assertEqual(mock_post_order.call_args.kwargs["position_side"], "LONG")
+        request = report["placed_orders"][0]["request"]
+        self.assertEqual(
+            request["ordinary_profit_release_lease_id"],
+            "LONG:0.5983:cutoff-1",
+        )
+        self.assertEqual(request["ordinary_profit_release_bucket_price"], 0.5983)
+        self.assertEqual(request["ordinary_profit_release_authorized_qty"], 16.0)
         self.assertEqual(mock_update_synthetic_refs.call_count, 2)
         self.assertEqual(mock_update_inventory_grid_refs.call_count, 2)
 

@@ -36885,6 +36885,17 @@ def _execute_plan_report_unlocked(args: argparse.Namespace, plan_report: dict[st
                                 for item in list(order.get("selected_lot_allocations") or [])
                                 if isinstance(item, dict)
                             ],
+                            **{
+                                key: order.get(key)
+                                for key in (
+                                    "ordinary_profit_release_lease_id",
+                                    "ordinary_profit_release_bucket_side",
+                                    "ordinary_profit_release_bucket_price",
+                                    "ordinary_profit_release_entry_cutoff_at",
+                                    "ordinary_profit_release_authorized_qty",
+                                )
+                                if key in order
+                            },
                         },
                         "response": place_response,
                     }
