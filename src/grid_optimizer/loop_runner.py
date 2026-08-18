@@ -24538,7 +24538,10 @@ def apply_grvt_near_soft_short_bridge_entry(
     if volatility_entry_pause_active:
         report["reason"] = "volatility_pause"
         return report
-    if str(short_entry_reason or "") != "soft_headroom_below_min_notional":
+    if str(short_entry_reason or "") not in {
+        "soft_headroom_below_min_notional",
+        "order_present",
+    }:
         report["reason"] = "planner_not_bridge_eligible"
         return report
     existing_roles = {
