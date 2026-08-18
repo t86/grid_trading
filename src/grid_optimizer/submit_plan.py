@@ -503,8 +503,12 @@ def _place_order_template_key(order: dict[str, Any]) -> tuple[str, str, str, str
     return (side, price, qty, role, position_side, force_reduce_only, execution_type, time_in_force)
 
 
-def _is_displaceable_reduce_only_open_order(open_order: dict[str, Any]) -> bool:
-    if not _truthy(open_order.get("reduceOnly")):
+def _is_displaceable_reduce_only_open_order(
+    open_order: dict[str, Any],
+    *,
+    require_reduce_only: bool = True,
+) -> bool:
+    if require_reduce_only and not _truthy(open_order.get("reduceOnly")):
         return False
     role = _open_order_role(open_order)
     if role.startswith("take_profit"):
@@ -619,11 +623,25 @@ def cap_reduce_only_place_orders_to_position(
     for open_order in current_open_orders:
         if not isinstance(open_order, dict):
             continue
-        if not _truthy(open_order.get("reduceOnly")):
+        if not hedge_mode and not _truthy(open_order.get("reduceOnly")):
             continue
-        side = cap_side(open_order)
+        order_side = str(open_order.get("side", "")).upper().strip()
+        if hedge_mode:
+            position_side = _order_position_side(open_order)
+            side = (
+                "SELL"
+                if position_side == "LONG" and order_side == "SELL"
+                else "BUY"
+                if position_side == "SHORT" and order_side == "BUY"
+                else None
+            )
+        else:
+            side = order_side if order_side in available_qty_by_side else None
         if side in available_qty_by_side:
-            if side in urgent_sides and _is_displaceable_reduce_only_open_order(open_order):
+            if side in urgent_sides and _is_displaceable_reduce_only_open_order(
+                open_order,
+                require_reduce_only=not hedge_mode,
+            ):
                 if not any(_order_matches_cancel(open_order, existing) for existing in cancel_orders):
                     displaced = dict(open_order)
                     displaced["cancel_reason"] = "urgent_reduce_only_displaces_take_profit"

@@ -2073,6 +2073,40 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(capped["reduce_only_position_cap"]["remaining_buy_reduce_qty"], 0.0)
         self.assertEqual(capped["reduce_only_position_cap"]["dropped_order_count"], 1)
 
+    def test_reduce_only_cap_hedge_counts_existing_close_order_without_reduce_only_flag(self) -> None:
+        capped = cap_reduce_only_place_orders_to_position(
+            actions={
+                "place_orders": [
+                    {
+                        "side": "BUY",
+                        "position_side": "SHORT",
+                        "price": 2.0,
+                        "qty": 0.6,
+                        "notional": 1.2,
+                        "role": "best_quote_reduce_short",
+                        "force_reduce_only": True,
+                    }
+                ],
+                "cancel_orders": [],
+            },
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            current_actual_net_qty=0.0,
+            current_hedge_long_qty=0.0,
+            current_hedge_short_qty=1.0,
+            current_open_orders=[
+                {
+                    "side": "BUY",
+                    "positionSide": "SHORT",
+                    "origQty": "0.7",
+                    "executedQty": "0",
+                    "reduceOnly": False,
+                }
+            ],
+        )
+
+        self.assertAlmostEqual(capped["place_orders"][0]["qty"], 0.3)
+        self.assertEqual(capped["reduce_only_position_cap"]["resized_order_count"], 1)
+
     def test_reduce_only_cap_treats_flow_sleeve_short_as_reduce_only_buy(self) -> None:
         actions = {
             "place_orders": [
