@@ -343,6 +343,7 @@ BEST_QUOTE_LONG_PROFILES = {
     "ethusdc_best_quote_long_ping_pong_v1",
     "btcusdc_best_quote_long_ping_pong_v1",
 }
+GRVT_PAIR_ALL_SIDES_ON_THRESHOLD = False
 COMPETITION_RUNTIME_CACHE_KEY = "competition_inventory_grid_runtime_cache"
 COMPETITION_POSITION_QTY_EPSILON = 1e-9
 XAUT_ADAPTIVE_TRANSITION_CONFIRMATIONS = {
@@ -34479,7 +34480,10 @@ def _generate_plan_report_unlocked(args: argparse.Namespace) -> dict[str, Any]:
             now=plan_now,
             rearm_cooldown_seconds=60.0 if grvt_bounded_loss_recovery else 0.0,
             rearm_immediately_while_threshold_breached=False,
-            pair_all_sides_on_threshold=grvt_bounded_loss_recovery,
+            pair_all_sides_on_threshold=(
+                grvt_bounded_loss_recovery
+                and GRVT_PAIR_ALL_SIDES_ON_THRESHOLD
+            ),
         )
         if bool(best_quote_active_pair_reduce.get("order_count")):
             loss_reduce_reentry_guard = resolve_loss_reduce_reentry_guard(

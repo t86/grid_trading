@@ -12988,6 +12988,9 @@ class LoopRunnerTests(unittest.TestCase):
             }.issubset(resumed_roles)
         )
 
+    def test_grvt_bounded_recovery_uses_only_the_pressure_side(self) -> None:
+        self.assertFalse(loop_runner_module.GRVT_PAIR_ALL_SIDES_ON_THRESHOLD)
+
     def test_best_quote_active_pair_reduce_keeps_normal_flow_for_large_pair_imbalance(self) -> None:
         plan = {
             "buy_orders": [
