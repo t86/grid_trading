@@ -20465,7 +20465,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(plan["sell_orders"][0]["price"], 1.032, places=8)
         self.assertAlmostEqual(plan["sell_orders"][1]["price"], 1.032, places=8)
 
-    def test_apply_take_profit_profit_guard_keeps_valid_ordinary_entry_lot_profit_price(self) -> None:
+    def test_apply_take_profit_profit_guard_keeps_stricter_exchange_long_floor(self) -> None:
         plan = {
             "bootstrap_orders": [],
             "buy_orders": [],
@@ -20504,9 +20504,52 @@ class LoopRunnerTests(unittest.TestCase):
             extra_long_guard_roles={"best_quote_reduce_long"},
         )
 
-        self.assertEqual(plan["sell_orders"][0]["price"], 0.2811)
+        self.assertEqual(plan["sell_orders"][0]["price"], 0.2858)
         self.assertEqual(result["ordinary_entry_lot_profit_relaxed_sell_orders"], 1)
-        self.assertEqual(result["adjusted_sell_orders"], 0)
+        self.assertEqual(result["adjusted_sell_orders"], 1)
+
+    def test_apply_take_profit_profit_guard_keeps_stricter_exchange_short_ceiling(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.2833,
+                    "qty": 137.0,
+                    "notional": 38.8121,
+                    "role": "best_quote_reduce_short",
+                    "position_side": "SHORT",
+                    "force_reduce_only": True,
+                    "ordinary_entry_lot_profit": True,
+                    "ordinary_entry_lot_cost_price": 0.2834,
+                    "ordinary_entry_lot_profit_boundary": 0.2833,
+                    "ordinary_entry_lot_qty_cap": 137.0,
+                },
+            ],
+            "sell_orders": [],
+        }
+
+        result = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=0.0,
+            current_short_qty=2812.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.2819,
+            current_long_notional=0.0,
+            current_short_notional=796.0,
+            pause_long_position_notional=None,
+            pause_short_position_notional=900.0,
+            threshold_short_position_notional=900.0,
+            min_profit_ratio=0.0003,
+            tick_size=0.0001,
+            bid_price=0.2832,
+            ask_price=0.2833,
+            extra_short_guard_roles={"best_quote_reduce_short"},
+        )
+
+        self.assertEqual(plan["buy_orders"][0]["price"], 0.2818)
+        self.assertEqual(result["ordinary_entry_lot_profit_relaxed_buy_orders"], 1)
+        self.assertEqual(result["adjusted_buy_orders"], 1)
 
     def test_apply_take_profit_profit_guard_clamps_best_quote_single_way_exit_roles(self) -> None:
         plan = {
