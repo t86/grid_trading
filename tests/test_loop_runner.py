@@ -12991,6 +12991,77 @@ class LoopRunnerTests(unittest.TestCase):
     def test_grvt_bounded_recovery_uses_only_the_pressure_side(self) -> None:
         self.assertFalse(loop_runner_module.GRVT_PAIR_ALL_SIDES_ON_THRESHOLD)
 
+    def test_grvt_near_soft_bridge_adds_one_bounded_long_entry(self) -> None:
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {
+                    "role": "best_quote_entry_short",
+                    "side": "SELL",
+                    "position_side": "SHORT",
+                    "price": 0.2821,
+                    "qty": 20.0,
+                    "notional": 5.642,
+                }
+            ],
+        }
+        report = loop_runner_module.apply_grvt_near_soft_bridge_entry(
+            plan=plan,
+            enabled=True,
+            current_long_notional=891.0,
+            long_threshold_notional=900.0,
+            max_long_notional=1_000.0,
+            bid_price=0.2820,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            long_profit_reduce_reason="aggregate_no_loss_blocked",
+            long_entry_reason="soft_headroom_below_min_notional",
+            long_entry_blocked_by_anti_chase=False,
+            volatility_entry_pause_active=False,
+        )
+
+        self.assertTrue(report["added"])
+        self.assertEqual(report["reason"], "near_soft_long_lane_empty")
+        bridge = plan["buy_orders"][0]
+        self.assertEqual(bridge["role"], "best_quote_entry_long")
+        self.assertTrue(bridge["near_soft_bridge_entry"])
+        self.assertGreaterEqual(891.0 + bridge["notional"], 905.0 - 0.2820)
+        self.assertLessEqual(891.0 + bridge["notional"], 1_000.0)
+
+    def test_grvt_near_soft_bridge_respects_existing_long_flow_and_safety(self) -> None:
+        for plan, anti_chase, volatility_pause, expected_reason in (
+            (
+                {
+                    "buy_orders": [{"role": "best_quote_entry_long"}],
+                    "sell_orders": [],
+                },
+                False,
+                False,
+                "long_lane_present",
+            ),
+            ({"buy_orders": [], "sell_orders": []}, True, False, "anti_chase_blocked"),
+            ({"buy_orders": [], "sell_orders": []}, False, True, "volatility_pause"),
+        ):
+            with self.subTest(expected_reason=expected_reason):
+                report = loop_runner_module.apply_grvt_near_soft_bridge_entry(
+                    plan=plan,
+                    enabled=True,
+                    current_long_notional=891.0,
+                    long_threshold_notional=900.0,
+                    max_long_notional=1_000.0,
+                    bid_price=0.2820,
+                    step_size=1.0,
+                    min_qty=1.0,
+                    min_notional=5.0,
+                    long_profit_reduce_reason="aggregate_no_loss_blocked",
+                    long_entry_reason="soft_headroom_below_min_notional",
+                    long_entry_blocked_by_anti_chase=anti_chase,
+                    volatility_entry_pause_active=volatility_pause,
+                )
+                self.assertFalse(report["added"])
+                self.assertEqual(report["reason"], expected_reason)
+
     def test_best_quote_active_pair_reduce_keeps_normal_flow_for_large_pair_imbalance(self) -> None:
         plan = {
             "buy_orders": [
