@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 
 from grid_optimizer.web import (
     COMPETITION_VOLUME_PAGE,
+    MARKET_DATA_PAGE,
     MONITOR_PAGE,
     HTML_PAGE,
     STRATEGY_WORKSPACE_PAGE,
@@ -99,6 +100,12 @@ from grid_optimizer.running_status import _normalize_frozen_inventory_ledger
 
 
 class WebSecurityTests(unittest.TestCase):
+    def test_market_data_page_contains_confirmed_universe_and_portal_links(self) -> None:
+        self.assertIn("BTCUSDT", MARKET_DATA_PAGE)
+        self.assertIn("UNITREEUSDT", MARKET_DATA_PAGE)
+        self.assertIn("http://43.155.136.111:8799/", MARKET_DATA_PAGE)
+        self.assertIn("http://43.156.35.110/alpha", MARKET_DATA_PAGE)
+
     def _write_registered_recovery_control(
         self,
         control_path: Path,

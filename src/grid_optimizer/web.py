@@ -17438,15 +17438,35 @@ SERVER_HUB_PAGE = """<!doctype html>
   <main class="wrap">
     <section class="hero">
       <p class="eyebrow">Trading Hub</p>
-      <h1>三台交易界面统一入口</h1>
-      <p class="lead">这个页面只负责分发入口，不承载交易逻辑。点击下面任一服务器卡片，即可进入对应机器上的交易界面或监控页。</p>
+      <h1>交易与研究统一入口</h1>
+      <p class="lead">集中进入合约研究、赛事榜单、Alpha 页面和三台网格服务。入口页不承载交易逻辑，具体管理页面继续使用各自认证。</p>
       <div class="tips">
-        <div>进入目标页面后，浏览器会提示 Basic Auth。当前统一用户名是 <code>grid</code>。</div>
-        <div>第三台 <code>43.155.136.111</code> 目前还没有检测到运行中的 <code>wangge-web</code>，如果点不开，需要先把该机服务拉起来。</div>
+        <div>受保护页面会继续提示 Basic Auth；赛事榜单服务保持原有访问方式。</div>
+        <div>统一入口地址：<code>http://43.155.136.111:8788/portal</code></div>
       </div>
     </section>
 
     <section class="grid">
+      <article class="card">
+        <span class="badge">市场研究</span>
+        <h2>资金费率候选池</h2>
+        <div class="meta">已确认的 48 个高成交额永续合约，包含币、股票、ETF、杠杆/反向 ETF 与商品，并列出对应现货映射。</div>
+        <div class="actions">
+          <a class="btn primary" href="/market-data">打开候选池</a>
+          <a class="btn" href="/basis">打开实时基差</a>
+        </div>
+      </article>
+
+      <article class="card">
+        <span class="badge">赛事与 Alpha</span>
+        <h2>外部业务页面</h2>
+        <div class="meta">统一收纳 111 赛事榜单与 Alpha 页面；目标服务仍保持独立运行。</div>
+        <div class="actions">
+          <a class="btn primary" href="http://43.155.136.111:8799/" target="_blank" rel="noopener noreferrer">赛事榜单</a>
+          <a class="btn" href="http://43.156.35.110/alpha" target="_blank" rel="noopener noreferrer">Alpha</a>
+        </div>
+      </article>
+
       <article class="card">
         <span class="badge">主入口 A</span>
         <h2>43.131.232.150</h2>
@@ -17470,10 +17490,10 @@ SERVER_HUB_PAGE = """<!doctype html>
       <article class="card">
         <span class="badge">在线入口</span>
         <h2>43.155.136.111</h2>
-        <div class="meta">当前已确认该机通过 <code>8787</code> 对外提供交易界面，点下面按钮即可直接进入。</div>
+        <div class="meta">当前已确认该机通过 <code>8788</code> 对外提供网格交易界面。</div>
         <div class="actions">
-          <a class="btn primary" href="http://43.155.136.111:8787/" target="_blank" rel="noopener noreferrer">尝试打开交易界面</a>
-          <a class="btn" href="http://43.155.136.111:8787/monitor" target="_blank" rel="noopener noreferrer">尝试打开监控页</a>
+          <a class="btn primary" href="http://43.155.136.111:8788/" target="_blank" rel="noopener noreferrer">打开交易界面</a>
+          <a class="btn" href="http://43.155.136.111:8788/monitor" target="_blank" rel="noopener noreferrer">打开监控页</a>
         </div>
       </article>
     </section>
@@ -17485,6 +17505,63 @@ SERVER_HUB_PAGE = """<!doctype html>
 </body>
 </html>
 """
+
+
+MARKET_DATA_PAGE = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>资金费率候选池</title><style>
+:root{--bg:#f5f2eb;--panel:#fff;--text:#1d1c19;--muted:#6b675f;--line:#ded7ca;--brand:#0b6f68;--soft:#e5f4f1;--warn:#986400}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:"Avenir Next","PingFang SC",sans-serif}.wrap{max-width:1280px;margin:auto;padding:24px 16px 48px}.hero,.panel{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:20px;margin-bottom:16px}.hero h1{margin:0 0 8px}.hero p{margin:0;color:var(--muted);line-height:1.7}.links{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}.links a{text-decoration:none;color:var(--brand);border:1px solid var(--line);border-radius:999px;padding:8px 12px;font-weight:700}.filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}button{border:1px solid var(--line);background:#fff;border-radius:999px;padding:8px 12px;cursor:pointer}button.active{background:var(--brand);color:#fff;border-color:var(--brand)}.table{overflow:auto;max-height:65vh;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse;min-width:760px}th{position:sticky;top:0;background:#faf8f2;text-align:left;color:var(--muted)}th,td{padding:10px;border-bottom:1px solid var(--line)}td.num{text-align:right;font-variant-numeric:tabular-nums}.exact{color:var(--brand)}.proxy{color:var(--warn)}.pending{color:#a33}.meta{color:var(--muted);font-size:13px}@media(max-width:600px){.wrap{padding:12px}.hero,.panel{border-radius:14px;padding:14px}}
+</style></head><body><main class="wrap"><section class="hero"><h1>资金费率与现货候选池</h1><p>固定候选集：最近 30 个完整 UTC 日的日均合约成交额达到 1 亿美元。现货映射分为精确、换算、跨场所、代理和待复核。</p><div class="links"><a href="/portal">返回统一入口</a><a href="/basis">实时现货/合约基差</a><a href="http://43.155.136.111:8799/" target="_blank" rel="noopener noreferrer">赛事榜单</a><a href="http://43.156.35.110/alpha" target="_blank" rel="noopener noreferrer">Alpha</a></div></section><section class="panel"><div class="filters" id="filters"></div><div class="meta" id="summary"></div><div class="table"><table><thead><tr><th>合约</th><th>类别</th><th style="text-align:right">30日均额</th><th>对应现货/等价物</th><th>映射</th></tr></thead><tbody id="rows"></tbody></table></div></section></main><script>
+const raw=`BTCUSDT|87.36|币|BTC/USDT · Binance|精确
+ETHUSDT|67.09|币|ETH/USDT · Binance|精确
+SNDKUSDT|34.54|股票|NASDAQ:SNDK|精确
+BTCUSDC|23.04|币|BTC/USDC · Binance|精确
+SKHYNIXUSDT|17.16|股票|KRX:000660|精确
+ETHUSDC|17.07|币|ETH/USDC · Binance|精确
+SOXLUSDT|13.86|杠杆ETF|NYSE Arca:SOXL|精确
+XAUUSDT|13.40|商品|XAU/USD · GC · GLD|代理
+MUUSDT|11.47|股票|NASDAQ:MU|精确
+SOLUSDT|11.46|币|SOL/USDT · Binance|精确
+SPCXUSDT|10.60|股票|NASDAQ:SPCX|精确
+KORUUSDT|9.00|杠杆ETF|NYSE Arca:KORU|精确
+SKHYUSDT|7.55|股票|NASDAQ:SKHY ADR|精确
+CLUSDT|6.81|商品|NYMEX:CL|代理
+XAGUSDT|6.67|商品|XAG/USD · SI · SLV|代理
+XRPUSDT|5.79|币|XRP/USDT · Binance|精确
+SNXXUSDT|5.13|杠杆ETF|Cboe:SNXX|精确
+HYPEUSDT|4.74|币|HYPE现货（外部场所）|跨场所
+ZECUSDT|4.28|币|ZEC/USDT · Binance|精确
+BANKUSDT|3.45|币|BANK/USDT · Binance|精确
+BZUSDT|3.02|商品|ICE:Brent|代理
+DOGEUSDT|2.89|币|DOGE/USDT · Binance|精确
+DRAMUSDT|2.62|ETF|Cboe BZX:DRAM|精确
+BNBUSDT|2.39|币|BNB/USDT · Binance|精确
+AKEUSDT|2.35|币|AKE现货（外部场所）|跨场所
+TUTUSDT|2.15|币|TUT/USDT · Binance|精确
+SOXSUSDT|2.07|反向ETF|NYSE Arca:SOXS|精确
+SAMSUNGUSDT|1.94|股票|KRX:005930|精确
+EWYUSDT|1.84|ETF|NYSE Arca:EWY|精确
+ACEUSDT|1.81|币|ACE/USDT · Binance|精确
+SOLUSDC|1.57|币|SOL/USDC · Binance|精确
+1000PEPEUSDT|1.56|币|PEPE/USDT × 1000|换算
+ADAUSDT|1.46|币|ADA/USDT · Binance|精确
+BTWUSDT|1.39|币|BTW现货（外部场所）|跨场所
+QQQUSDT|1.36|ETF|NASDAQ:QQQ|精确
+BLESSUSDT|1.34|币|BLESS现货（外部场所）|跨场所
+INTCUSDT|1.31|股票|NASDAQ:INTC|精确
+BEATUSDT|1.23|币|BEAT现货（外部场所）|跨场所
+MUUUSDT|1.21|杠杆ETF|Direxion:MUU|精确
+CRCLUSDT|1.21|股票|NYSE:CRCL|精确
+LINKUSDT|1.18|币|LINK/USDT · Binance|精确
+ENAUSDT|1.17|币|ENA/USDT · Binance|精确
+PUMPUSDT|1.14|币|PUMP/USDT · Binance|精确
+COTIUSDT|1.13|币|COTI/USDT · Binance|精确
+WLDUSDT|1.12|币|WLD/USDT · Binance|精确
+SUIUSDT|1.06|币|SUI/USDT · Binance|精确
+UNITREEUSDT|1.06|股票|中国股票映射；仅3个完整日|待复核
+MRVLUSDT|1.04|股票|NASDAQ:MRVL|精确`;
+const data=raw.split('\n').map(x=>{const[symbol,volume,category,spot,mapping]=x.split('|');return{symbol,volume:+volume,category,spot,mapping}});const cats=['全部',...new Set(data.map(x=>x.category))];let active='全部';const fs=document.getElementById('filters'),rows=document.getElementById('rows'),summary=document.getElementById('summary');cats.forEach(c=>{const b=document.createElement('button');b.textContent=c;b.className=c===active?'active':'';b.onclick=()=>{active=c;[...fs.children].forEach(x=>x.classList.toggle('active',x===b));render()};fs.appendChild(b)});function render(){const view=data.filter(x=>active==='全部'||x.category===active);summary.textContent=`显示 ${view.length} / ${data.length} 个合约`;rows.innerHTML=view.map(x=>`<tr><td><strong>${x.symbol}</strong></td><td>${x.category}</td><td class="num">$${x.volume.toFixed(2)}亿</td><td>${x.spot}</td><td class="${x.mapping==='精确'||x.mapping==='换算'?'exact':x.mapping==='待复核'?'pending':'proxy'}">${x.mapping}</td></tr>`).join('')}render();
+</script></body></html>"""
 
 HTML_PAGE = """<!doctype html>
 <html lang="zh-CN">
@@ -39296,6 +39373,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path in {"/hub", "/hub.html", "/portal", "/portal.html"}:
             self._send_html(SERVER_HUB_PAGE, status=HTTPStatus.OK)
             return
+        if path in {"/market-data", "/market-data.html"}:
+            self._send_html(MARKET_DATA_PAGE, status=HTTPStatus.OK)
+            return
         if path in {"/", "/index.html"}:
             self._send_html(HTML_PAGE, status=HTTPStatus.OK)
             return
@@ -39716,6 +39796,12 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path in {"/hub", "/hub.html", "/portal", "/portal.html"}:
             body = SERVER_HUB_PAGE.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
+        if path in {"/market-data", "/market-data.html"}:
+            body = MARKET_DATA_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
