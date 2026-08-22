@@ -101,6 +101,7 @@ from .data import (
     fetch_futures_book_tickers,
     fetch_futures_latest_price,
     fetch_futures_premium_index,
+    fetch_futures_symbols,
     fetch_futures_symbol_config,
     post_futures_change_margin_type,
     post_futures_market_order,
@@ -17524,6 +17525,9 @@ _MARKET_DATA_FUNDING_CACHE_SECONDS = 60
 _MARKET_DATA_EARN_CACHE: tuple[float, dict[str, Any]] | None = None
 _MARKET_DATA_EARN_CACHE_LOCK = threading.Lock()
 _MARKET_DATA_EARN_CACHE_SECONDS = 300
+_MARKET_DATA_EARN_FUNDING_CACHE: tuple[float, dict[str, Any]] | None = None
+_MARKET_DATA_EARN_FUNDING_CACHE_LOCK = threading.Lock()
+_MARKET_DATA_EARN_FUNDING_CACHE_SECONDS = 300
 
 
 def _fetch_market_data_funding_history(symbol: str, limit: int = 1000) -> list[tuple[datetime, float]]:
@@ -17609,6 +17613,26 @@ def _summarize_market_data_funding(
     }
 
 
+def _build_market_data_funding_rows(symbols: tuple[str, ...], now: datetime) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    premium_by_symbol = {item["symbol"]: item for item in fetch_futures_premium_index("usdm")}
+    rows: list[dict[str, Any]] = []
+    errors: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(_fetch_market_data_funding_history, symbol): symbol
+            for symbol in symbols
+        }
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                rows.append(_summarize_market_data_funding(symbol, future.result(), premium_by_symbol.get(symbol), now))
+            except Exception as exc:
+                errors[symbol] = f"{type(exc).__name__}: {exc}"
+                rows.append(_summarize_market_data_funding(symbol, [], premium_by_symbol.get(symbol), now))
+    rows.sort(key=lambda item: symbols.index(item["symbol"]))
+    return rows, errors
+
+
 def _build_market_data_funding_payload() -> dict[str, Any]:
     global _MARKET_DATA_FUNDING_CACHE
     now_monotonic = time.monotonic()
@@ -17618,22 +17642,7 @@ def _build_market_data_funding_payload() -> dict[str, Any]:
             return cached[1]
 
     now = datetime.now(timezone.utc)
-    premium_by_symbol = {item["symbol"]: item for item in fetch_futures_premium_index("usdm")}
-    rows: list[dict[str, Any]] = []
-    errors: dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {
-            executor.submit(_fetch_market_data_funding_history, symbol): symbol
-            for symbol in MARKET_DATA_SYMBOLS
-        }
-        for future in as_completed(futures):
-            symbol = futures[future]
-            try:
-                rows.append(_summarize_market_data_funding(symbol, future.result(), premium_by_symbol.get(symbol), now))
-            except Exception as exc:
-                errors[symbol] = f"{type(exc).__name__}: {exc}"
-                rows.append(_summarize_market_data_funding(symbol, [], premium_by_symbol.get(symbol), now))
-    rows.sort(key=lambda item: MARKET_DATA_SYMBOLS.index(item["symbol"]))
+    rows, errors = _build_market_data_funding_rows(MARKET_DATA_SYMBOLS, now)
     payload = {
         "ok": True,
         "as_of": now.isoformat(),
@@ -17711,11 +17720,53 @@ def _build_market_data_simple_earn_payload() -> dict[str, Any]:
     return result
 
 
+def _build_market_data_simple_earn_funding_payload() -> dict[str, Any]:
+    global _MARKET_DATA_EARN_FUNDING_CACHE
+    now_monotonic = time.monotonic()
+    with _MARKET_DATA_EARN_FUNDING_CACHE_LOCK:
+        cached = _MARKET_DATA_EARN_FUNDING_CACHE
+        if cached is not None and now_monotonic - cached[0] < _MARKET_DATA_EARN_FUNDING_CACHE_SECONDS:
+            return cached[1]
+
+    earn = _build_market_data_simple_earn_payload()
+    futures_symbols = set(fetch_futures_symbols("usdm"))
+    matched = tuple(
+        f"{row['asset']}USDT"
+        for row in earn["rows"]
+        if f"{row['asset']}USDT" in futures_symbols
+    )
+    now = datetime.now(timezone.utc)
+    funding_rows, errors = _build_market_data_funding_rows(matched, now)
+    funding_by_symbol = {row["symbol"]: row for row in funding_rows}
+    rows = []
+    for earn_row in earn["rows"]:
+        symbol = f"{earn_row['asset']}USDT"
+        funding = funding_by_symbol.get(symbol)
+        if funding is None:
+            continue
+        rows.append({**earn_row, "futures_symbol": symbol, "funding": funding})
+    result = {
+        "ok": True,
+        "as_of": now.isoformat(),
+        "total_earn_products": len(earn["rows"]),
+        "matched_products": len(rows),
+        "threshold": earn["threshold"],
+        "earn_convention": earn["rate_convention"],
+        "funding_convention": "正值表示空永续收取资金费，多头支付；累计收益按各期复利计算。",
+        "history_convention": "最近最多 1000 期结算记录；通常约覆盖最近 333 天，实际跨度取决于资金费结算间隔。",
+        "rows": rows,
+        "errors": errors,
+    }
+    with _MARKET_DATA_EARN_FUNDING_CACHE_LOCK:
+        _MARKET_DATA_EARN_FUNDING_CACHE = (time.monotonic(), result)
+    return result
+
+
 MARKET_DATA_PAGE = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>资金费率候选池</title><style>
-:root{--bg:#f5f2eb;--panel:#fff;--text:#1d1c19;--muted:#6b675f;--line:#ded7ca;--brand:#0b6f68;--soft:#e5f4f1;--warn:#986400;--bad:#a33}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:"Avenir Next","PingFang SC",sans-serif}.wrap{max-width:1440px;margin:auto;padding:24px 16px 48px}.hero,.panel{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:20px;margin-bottom:16px}.hero h1{margin:0 0 8px}.hero p{margin:0;color:var(--muted);line-height:1.7}.links,.filters{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}.links a{text-decoration:none;color:var(--brand);border:1px solid var(--line);border-radius:999px;padding:8px 12px;font-weight:700}.filters{margin:0 0 12px}button{border:1px solid var(--line);background:#fff;border-radius:999px;padding:8px 12px;cursor:pointer}button.active{background:var(--brand);color:#fff;border-color:var(--brand)}.table{overflow:auto;max-height:65vh;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse;min-width:1280px}th{position:sticky;top:0;background:#faf8f2;text-align:left;color:var(--muted);cursor:pointer;white-space:nowrap}th.no-sort{cursor:default}th,td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}tbody tr[data-symbol]{cursor:pointer}tbody tr[data-symbol]:hover{background:#fbfaf6}td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.exact,.positive{color:var(--brand)}.proxy{color:var(--warn)}.pending,.negative{color:var(--bad)}.meta{color:var(--muted);font-size:13px;line-height:1.6}.detail{margin-top:14px;display:grid;gap:12px}.detail h2{font-size:18px;margin:0}.history{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.history section{border:1px solid var(--line);border-radius:12px;padding:12px}.history h3{font-size:14px;margin:0 0 8px}.history table{min-width:0;font-size:13px}.history th{position:static;cursor:default}.earn-table{max-height:440px}.loading{padding:16px;color:var(--muted)}@media(max-width:760px){.wrap{padding:12px}.hero,.panel{border-radius:14px;padding:14px}.history{grid-template-columns:1fr}}
-</style></head><body><main class="wrap"><section class="hero"><h1>资金费率与现货候选池</h1><p>实时费率来自 Binance 标记价格接口；历史收益按资金费率实际结算记录复利汇总。正值代表“空永续收取 / 多头支付”。点击合约可查看按月、按年收益。</p><div class="links"><a href="/portal">返回统一入口</a><a href="/basis">实时现货/合约基差</a><a href="http://43.155.136.111:8799/" target="_blank" rel="noopener noreferrer">赛事榜单</a><a href="http://43.156.35.110/alpha" target="_blank" rel="noopener noreferrer">Alpha</a></div></section><section class="panel"><h2>活期理财 APR ＞ 5%</h2><p class="meta" id="earn-summary">正在加载 Binance Simple Earn 活期产品…</p><div class="table earn-table"><table><thead><tr><th>资产</th><th style="text-align:right">当前 APR</th><th>最低申购</th><th>可赎回</th><th>与合约候选池重叠</th></tr></thead><tbody id="earn-rows"></tbody></table></div></section><section class="panel"><div class="filters" id="filters"></div><div class="meta" id="summary">正在加载资金费率…</div><div class="table"><table><thead><tr><th data-sort="symbol">合约</th><th data-sort="category">类别</th><th data-sort="volume" style="text-align:right">30日均额</th><th class="no-sort">对应现货/等价物</th><th data-sort="current_rate" style="text-align:right">实时费率</th><th data-sort="previous_rate" style="text-align:right">上一期</th><th data-sort="mtd_return" style="text-align:right">本月收益</th><th data-sort="return_30d" style="text-align:right">近30日</th><th data-sort="ytd_return" style="text-align:right">本年收益</th><th data-sort="return_365d" style="text-align:right">近365日</th><th class="no-sort">下次结算</th><th class="no-sort">映射</th></tr></thead><tbody id="rows"></tbody></table></div><div class="detail" id="detail"></div></section></main><script>
+:root{--bg:#f5f2eb;--panel:#fff;--text:#1d1c19;--muted:#6b675f;--line:#ded7ca;--brand:#0b6f68;--soft:#e5f4f1;--warn:#986400;--bad:#a33}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:"Avenir Next","PingFang SC",sans-serif}.wrap{max-width:1440px;margin:auto;padding:24px 16px 48px}.hero,.panel{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:20px;margin-bottom:16px}.hero h1{margin:0 0 8px}.hero p{margin:0;color:var(--muted);line-height:1.7}.links,.filters,.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}.links a{text-decoration:none;color:var(--brand);border:1px solid var(--line);border-radius:999px;padding:8px 12px;font-weight:700}.filters{margin:0 0 12px}.tabs{margin:0 0 18px}button{border:1px solid var(--line);background:#fff;border-radius:999px;padding:8px 12px;cursor:pointer}button.active{background:var(--brand);color:#fff;border-color:var(--brand)}.table{overflow:auto;max-height:65vh;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse;min-width:1280px}th{position:sticky;top:0;background:#faf8f2;text-align:left;color:var(--muted);cursor:pointer;white-space:nowrap}th.no-sort{cursor:default}th,td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}tbody tr[data-symbol]{cursor:pointer}tbody tr[data-symbol]:hover{background:#fbfaf6}td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.exact,.positive{color:var(--brand)}.proxy{color:var(--warn)}.pending,.negative{color:var(--bad)}.meta{color:var(--muted);font-size:13px;line-height:1.6}.detail{margin-top:14px;display:grid;gap:12px}.detail h2{font-size:18px;margin:0}.history{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.history section{border:1px solid var(--line);border-radius:12px;padding:12px}.history h3{font-size:14px;margin:0 0 8px}.history table{min-width:0;font-size:13px}.history th{position:static;cursor:default}.loading{padding:16px;color:var(--muted)}@media(max-width:760px){.wrap{padding:12px}.hero,.panel{border-radius:14px;padding:14px}.history{grid-template-columns:1fr}}
+</style></head><body><main class="wrap"><section class="hero"><h1>资金费率与现货候选池</h1><p>实时费率来自 Binance 标记价格接口；历史收益按资金费率实际结算记录复利汇总。正值代表“空永续收取 / 多头支付”。点击合约可查看按月、按年收益。</p><div class="links"><a href="/portal">返回统一入口</a><a href="/basis">实时现货/合约基差</a><a href="http://43.155.136.111:8799/" target="_blank" rel="noopener noreferrer">赛事榜单</a><a href="http://43.156.35.110/alpha" target="_blank" rel="noopener noreferrer">Alpha</a></div></section><section class="panel"><div class="tabs"><button id="funding-tab" class="active">资金费率候选池</button><button id="earn-tab">活期理财 + 对应合约</button></div><div id="funding-view"><div class="filters" id="filters"></div><div class="meta" id="summary">正在加载资金费率…</div><div class="table"><table><thead><tr><th data-sort="symbol">合约</th><th data-sort="category">类别</th><th data-sort="volume" style="text-align:right">30日均额</th><th class="no-sort">对应现货/等价物</th><th data-sort="current_rate" style="text-align:right">实时费率</th><th data-sort="previous_rate" style="text-align:right">上一期</th><th data-sort="mtd_return" style="text-align:right">本月收益</th><th data-sort="return_30d" style="text-align:right">近30日</th><th data-sort="ytd_return" style="text-align:right">本年收益</th><th data-sort="return_365d" style="text-align:right">近365日</th><th class="no-sort">下次结算</th><th class="no-sort">映射</th></tr></thead><tbody id="rows"></tbody></table></div><div class="detail" id="detail"></div></div><div id="earn-view" hidden><h2>活期理财 APR ＞ 5% 且有对应 USDⓈ-M 永续</h2><p class="meta" id="earn-summary">正在加载 Binance Simple Earn 活期产品及对应资金费率…</p><div class="table"><table><thead><tr><th data-earn-sort="asset">资产</th><th data-earn-sort="apr" style="text-align:right">当前 APR</th><th data-earn-sort="futures_symbol">对应合约</th><th data-earn-sort="current_rate" style="text-align:right">实时费率</th><th data-earn-sort="previous_rate" style="text-align:right">上一期</th><th data-earn-sort="mtd_return" style="text-align:right">本月收益</th><th data-earn-sort="return_30d" style="text-align:right">近30日</th><th data-earn-sort="ytd_return" style="text-align:right">本年收益</th><th data-earn-sort="return_365d" style="text-align:right">近365日</th><th class="no-sort">可赎回</th></tr></thead><tbody id="earn-rows"></tbody></table></div><div class="detail" id="earn-detail"></div></div></section></main><script>
 const raw=`BTCUSDT|87.36|币|BTC/USDT · Binance|精确
 ETHUSDT|67.09|币|ETH/USDT · Binance|精确
 SNDKUSDT|34.54|股票|NASDAQ:SNDK|精确
@@ -17765,8 +17816,8 @@ SUIUSDT|1.06|币|SUI/USDT · Binance|精确
 UNITREEUSDT|1.06|股票|中国股票映射；仅3个完整日|待复核
 MRVLUSDT|1.04|股票|NASDAQ:MRVL|精确`;
 const data=raw.split('\\n').map(x=>{const[symbol,volume,category,spot,mapping]=x.split('|');return{symbol,volume:+volume,category,spot,mapping}});
-let active='全部',sortKey='return_30d',descending=true,stats=new Map(),payload=null;
-const fs=document.getElementById('filters'),rows=document.getElementById('rows'),summary=document.getElementById('summary'),detail=document.getElementById('detail');
+let active='全部',sortKey='return_30d',descending=true,stats=new Map(),payload=null,earnData=[],earnSortKey='apr',earnDescending=true;
+const fs=document.getElementById('filters'),rows=document.getElementById('rows'),summary=document.getElementById('summary'),detail=document.getElementById('detail'),earnSummary=document.getElementById('earn-summary'),earnRows=document.getElementById('earn-rows'),earnDetail=document.getElementById('earn-detail');
 const esc=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 const percent=value=>value===null||value===undefined?'—':`${value>=0?'+':''}${(value*100).toFixed(4)}%`;
 const classFor=value=>value>0?'positive':value<0?'negative':'';
@@ -17775,11 +17826,18 @@ const statFor=item=>stats.get(item.symbol)||{};
 const cats=['全部',...new Set(data.map(x=>x.category))];cats.forEach(c=>{const button=document.createElement('button');button.textContent=c;button.className=c===active?'active':'';button.onclick=()=>{active=c;[...fs.children].forEach(x=>x.classList.toggle('active',x===button));render()};fs.appendChild(button)});
 function compare(a,b){const av=sortKey in a?a[sortKey]:statFor(a)[sortKey],bv=sortKey in b?b[sortKey]:statFor(b)[sortKey];const an=typeof av==='number'?av:Number.NEGATIVE_INFINITY,bn=typeof bv==='number'?bv:Number.NEGATIVE_INFINITY;const result=typeof av==='string'||typeof bv==='string'?String(av??'').localeCompare(String(bv??'')):an-bn;return descending?-result:result}
 function historyTable(title,rows){return `<section><h3>${title}</h3><table><thead><tr><th>期间</th><th style="text-align:right">空合约收款率</th><th style="text-align:right">结算次数</th></tr></thead><tbody>${rows.length?rows.map(row=>`<tr><td>${esc(row.period)}</td><td class="num ${classFor(row.short_return)}">${percent(row.short_return)}</td><td class="num">${row.settlements}</td></tr>`).join(''):'<tr><td colspan="3">暂无历史记录</td></tr>'}</tbody></table></section>`}
-function renderDetail(item){const s=statFor(item);if(!s.history_start){detail.innerHTML=`<div class="meta"><strong>${esc(item.symbol)}</strong> 暂未取得历史资金费率。</div>`;return}detail.innerHTML=`<h2>${esc(item.symbol)} 资金费率收益明细</h2><div class="meta">历史覆盖 ${time(s.history_start)} 至 ${time(s.history_end)}。${esc(payload.history_convention)}</div><div class="history">${historyTable('按月（最近18个月）',s.monthly||[])}${historyTable('按年',s.yearly||[])}</div>`}
+function renderFundingDetail(target,symbol,s,historyConvention){if(!s.history_start){target.innerHTML=`<div class="meta"><strong>${esc(symbol)}</strong> 暂未取得历史资金费率。</div>`;return}target.innerHTML=`<h2>${esc(symbol)} 资金费率收益明细</h2><div class="meta">历史覆盖 ${time(s.history_start)} 至 ${time(s.history_end)}。${esc(historyConvention)}</div><div class="history">${historyTable('按月（最近18个月）',s.monthly||[])}${historyTable('按年',s.yearly||[])}</div>`}
+function renderDetail(item){renderFundingDetail(detail,item.symbol,statFor(item),payload.history_convention)}
 function render(){const view=data.filter(x=>active==='全部'||x.category===active).sort(compare);summary.textContent=payload?`已更新：${time(payload.as_of)} · ${payload.rate_convention} · 点击列标题排序，点击合约查看月度/年度收益。`:'正在加载…';rows.innerHTML=view.map(item=>{const s=statFor(item),mapClass=item.mapping==='精确'||item.mapping==='换算'?'exact':item.mapping==='待复核'?'pending':'proxy';return `<tr data-symbol="${esc(item.symbol)}"><td><strong>${esc(item.symbol)}</strong></td><td>${esc(item.category)}</td><td class="num">$${item.volume.toFixed(2)}亿</td><td>${esc(item.spot)}</td><td class="num ${classFor(s.current_rate)}">${percent(s.current_rate)}</td><td class="num ${classFor(s.previous_rate)}">${percent(s.previous_rate)}</td><td class="num ${classFor(s.mtd_return)}">${percent(s.mtd_return)}</td><td class="num ${classFor(s.return_30d)}">${percent(s.return_30d)}</td><td class="num ${classFor(s.ytd_return)}">${percent(s.ytd_return)}</td><td class="num ${classFor(s.return_365d)}">${percent(s.return_365d)}</td><td>${time(s.next_funding_time)}</td><td class="${mapClass}">${esc(item.mapping)}</td></tr>`}).join('');[...rows.querySelectorAll('tr[data-symbol]')].forEach(row=>row.onclick=()=>renderDetail(data.find(item=>item.symbol===row.dataset.symbol)))}
 document.querySelectorAll('th[data-sort]').forEach(head=>head.onclick=()=>{const next=head.dataset.sort;if(next===sortKey)descending=!descending;else{sortKey=next;descending=true}render()});
-const earnSummary=document.getElementById('earn-summary'),earnRows=document.getElementById('earn-rows');
-fetch('/api/market-data/simple-earn').then(async response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()}).then(result=>{earnSummary.textContent=`已更新：${time(result.as_of)} · ${result.rows.length} 个可申购且未售罄的活期产品 APR 超过 5%。${result.rate_convention}`;earnRows.innerHTML=result.rows.map(row=>`<tr><td><strong>${esc(row.asset)}</strong></td><td class="num positive">${percent(row.apr)}</td><td>${esc(row.minimum_purchase_amount)}</td><td>${row.can_redeem?'是':'否'}</td><td>${row.candidate_overlap?'是':'—'}</td></tr>`).join('')}).catch(error=>{earnSummary.textContent=`活期理财加载失败：${error.message}`});
+function earnValue(row,key){return key in row?row[key]:row.funding?.[key]}
+function renderEarn(){const view=[...earnData].sort((a,b)=>{const av=earnValue(a,earnSortKey),bv=earnValue(b,earnSortKey);const result=typeof av==='string'||typeof bv==='string'?String(av??'').localeCompare(String(bv??'')):(Number(av??Number.NEGATIVE_INFINITY)-Number(bv??Number.NEGATIVE_INFINITY));return earnDescending?-result:result});earnRows.innerHTML=view.map(row=>{const s=row.funding;return `<tr data-symbol="${esc(row.futures_symbol)}"><td><strong>${esc(row.asset)}</strong></td><td class="num positive">${percent(row.apr)}</td><td><strong>${esc(row.futures_symbol)}</strong></td><td class="num ${classFor(s.current_rate)}">${percent(s.current_rate)}</td><td class="num ${classFor(s.previous_rate)}">${percent(s.previous_rate)}</td><td class="num ${classFor(s.mtd_return)}">${percent(s.mtd_return)}</td><td class="num ${classFor(s.return_30d)}">${percent(s.return_30d)}</td><td class="num ${classFor(s.ytd_return)}">${percent(s.ytd_return)}</td><td class="num ${classFor(s.return_365d)}">${percent(s.return_365d)}</td><td>${row.can_redeem?'是':'否'}</td></tr>`}).join('');[...earnRows.querySelectorAll('tr[data-symbol]')].forEach(element=>element.onclick=()=>{const row=earnData.find(item=>item.futures_symbol===element.dataset.symbol);renderFundingDetail(earnDetail,row.futures_symbol,row.funding,earnPayload.history_convention)})}
+let earnPayload=null;
+document.querySelectorAll('th[data-earn-sort]').forEach(head=>head.onclick=()=>{const next=head.dataset.earnSort;if(next===earnSortKey)earnDescending=!earnDescending;else{earnSortKey=next;earnDescending=true}renderEarn()});
+const fundingTab=document.getElementById('funding-tab'),earnTab=document.getElementById('earn-tab'),fundingView=document.getElementById('funding-view'),earnView=document.getElementById('earn-view');
+function activateTab(name){const isFunding=name==='funding';fundingView.hidden=!isFunding;earnView.hidden=isFunding;fundingTab.classList.toggle('active',isFunding);earnTab.classList.toggle('active',!isFunding)}
+fundingTab.onclick=()=>activateTab('funding');earnTab.onclick=()=>activateTab('earn');
+fetch('/api/market-data/simple-earn-funding').then(async response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()}).then(result=>{earnPayload=result;earnData=result.rows;earnSummary.textContent=`已更新：${time(result.as_of)} · ${result.total_earn_products} 个可申购且未售罄的活期产品 APR 超过 5%，其中 ${result.matched_products} 个有对应 USDⓈ-M 永续。${result.earn_convention} ${result.funding_convention}`;renderEarn()}).catch(error=>{earnSummary.textContent=`活期理财与资金费率加载失败：${error.message}`});
 fetch('/api/market-data/funding-summary').then(async response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()}).then(result=>{payload=result;stats=new Map(result.rows.map(row=>[row.symbol,row]));render()}).catch(error=>{summary.textContent=`资金费率加载失败：${error.message}`;render()});
 </script></body></html>"""
 
@@ -39666,6 +39724,12 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/market-data/simple-earn":
             try:
                 self._send_json(_build_market_data_simple_earn_payload(), status=HTTPStatus.OK)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=502)
+            return
+        if path == "/api/market-data/simple-earn-funding":
+            try:
+                self._send_json(_build_market_data_simple_earn_funding_payload(), status=HTTPStatus.OK)
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=502)
             return
