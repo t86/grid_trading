@@ -24,7 +24,7 @@ from pathlib import Path
 from collections.abc import Callable
 from statistics import mean
 from typing import Any, Union
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -17507,11 +17507,147 @@ SERVER_HUB_PAGE = """<!doctype html>
 """
 
 
+MARKET_DATA_SYMBOLS = (
+    "BTCUSDT", "ETHUSDT", "SNDKUSDT", "BTCUSDC", "SKHYNIXUSDT", "ETHUSDC",
+    "SOXLUSDT", "XAUUSDT", "MUUSDT", "SOLUSDT", "SPCXUSDT", "KORUUSDT",
+    "SKHYUSDT", "CLUSDT", "XAGUSDT", "XRPUSDT", "SNXXUSDT", "HYPEUSDT",
+    "ZECUSDT", "BANKUSDT", "BZUSDT", "DOGEUSDT", "DRAMUSDT", "BNBUSDT",
+    "AKEUSDT", "TUTUSDT", "SOXSUSDT", "SAMSUNGUSDT", "EWYUSDT", "ACEUSDT",
+    "SOLUSDC", "1000PEPEUSDT", "ADAUSDT", "BTWUSDT", "QQQUSDT", "BLESSUSDT",
+    "INTCUSDT", "BEATUSDT", "MUUUSDT", "CRCLUSDT", "LINKUSDT", "ENAUSDT",
+    "PUMPUSDT", "COTIUSDT", "WLDUSDT", "SUIUSDT", "UNITREEUSDT", "MRVLUSDT",
+)
+_MARKET_DATA_FUNDING_CACHE: tuple[float, dict[str, Any]] | None = None
+_MARKET_DATA_FUNDING_CACHE_LOCK = threading.Lock()
+_MARKET_DATA_FUNDING_CACHE_SECONDS = 60
+
+
+def _fetch_market_data_funding_history(symbol: str, limit: int = 1000) -> list[tuple[datetime, float]]:
+    query = urlencode({"symbol": symbol, "limit": str(limit)})
+    request = Request(
+        f"https://fapi.binance.com/fapi/v1/fundingRate?{query}",
+        headers={"User-Agent": "grid-web/market-data"},
+    )
+    with urlopen(request, timeout=12) as response:
+        payload = json.load(response)
+    if not isinstance(payload, list):
+        raise RuntimeError(f"unexpected funding payload for {symbol}")
+    rows: list[tuple[datetime, float]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        try:
+            timestamp = int(item["fundingTime"])
+            rate = float(item["fundingRate"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(rate):
+            rows.append((datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc), rate))
+    return sorted(rows, key=lambda item: item[0])
+
+
+def _compound_funding_return(rates: list[float]) -> float | None:
+    if not rates:
+        return None
+    value = 1.0
+    for rate in rates:
+        value *= 1.0 + rate
+    return value - 1.0
+
+
+def _summarize_market_data_funding(
+    symbol: str,
+    history: list[tuple[datetime, float]],
+    premium: dict[str, Any] | None,
+    now: datetime,
+) -> dict[str, Any]:
+    month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+    year_start = datetime(now.year, 1, 1, tzinfo=timezone.utc)
+    windows = {
+        "mtd_return": month_start,
+        "return_30d": now - timedelta(days=30),
+        "ytd_return": year_start,
+        "return_365d": now - timedelta(days=365),
+    }
+    metrics = {
+        name: _compound_funding_return([rate for timestamp, rate in history if timestamp >= start])
+        for name, start in windows.items()
+    }
+    monthly_rates: dict[str, list[float]] = {}
+    yearly_rates: dict[str, list[float]] = {}
+    for timestamp, rate in history:
+        monthly_rates.setdefault(timestamp.strftime("%Y-%m"), []).append(rate)
+        yearly_rates.setdefault(timestamp.strftime("%Y"), []).append(rate)
+    monthly = [
+        {"period": period, "short_return": _compound_funding_return(rates), "settlements": len(rates)}
+        for period, rates in sorted(monthly_rates.items(), reverse=True)[:18]
+    ]
+    yearly = [
+        {"period": period, "short_return": _compound_funding_return(rates), "settlements": len(rates)}
+        for period, rates in sorted(yearly_rates.items(), reverse=True)
+    ]
+    next_funding_time = (premium or {}).get("next_funding_time")
+    return {
+        "symbol": symbol,
+        "current_rate": (premium or {}).get("funding_rate"),
+        "previous_rate": history[-1][1] if history else None,
+        "previous_time": history[-1][0].isoformat() if history else None,
+        "next_funding_time": (
+            datetime.fromtimestamp(next_funding_time / 1000, tz=timezone.utc).isoformat()
+            if isinstance(next_funding_time, int) and next_funding_time > 0
+            else None
+        ),
+        "history_start": history[0][0].isoformat() if history else None,
+        "history_end": history[-1][0].isoformat() if history else None,
+        "monthly": monthly,
+        "yearly": yearly,
+        **metrics,
+    }
+
+
+def _build_market_data_funding_payload() -> dict[str, Any]:
+    global _MARKET_DATA_FUNDING_CACHE
+    now_monotonic = time.monotonic()
+    with _MARKET_DATA_FUNDING_CACHE_LOCK:
+        cached = _MARKET_DATA_FUNDING_CACHE
+        if cached is not None and now_monotonic - cached[0] < _MARKET_DATA_FUNDING_CACHE_SECONDS:
+            return cached[1]
+
+    now = datetime.now(timezone.utc)
+    premium_by_symbol = {item["symbol"]: item for item in fetch_futures_premium_index("usdm")}
+    rows: list[dict[str, Any]] = []
+    errors: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(_fetch_market_data_funding_history, symbol): symbol
+            for symbol in MARKET_DATA_SYMBOLS
+        }
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                rows.append(_summarize_market_data_funding(symbol, future.result(), premium_by_symbol.get(symbol), now))
+            except Exception as exc:
+                errors[symbol] = f"{type(exc).__name__}: {exc}"
+                rows.append(_summarize_market_data_funding(symbol, [], premium_by_symbol.get(symbol), now))
+    rows.sort(key=lambda item: MARKET_DATA_SYMBOLS.index(item["symbol"]))
+    payload = {
+        "ok": True,
+        "as_of": now.isoformat(),
+        "rate_convention": "short_perp_receive: 正值表示空永续收取资金费，多头支付；累计收益按各期复利计算。",
+        "history_convention": "最近最多 1000 期结算记录；通常约覆盖最近 333 天，实际跨度取决于资金费结算间隔。",
+        "rows": rows,
+        "errors": errors,
+    }
+    with _MARKET_DATA_FUNDING_CACHE_LOCK:
+        _MARKET_DATA_FUNDING_CACHE = (time.monotonic(), payload)
+    return payload
+
+
 MARKET_DATA_PAGE = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>资金费率候选池</title><style>
-:root{--bg:#f5f2eb;--panel:#fff;--text:#1d1c19;--muted:#6b675f;--line:#ded7ca;--brand:#0b6f68;--soft:#e5f4f1;--warn:#986400}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:"Avenir Next","PingFang SC",sans-serif}.wrap{max-width:1280px;margin:auto;padding:24px 16px 48px}.hero,.panel{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:20px;margin-bottom:16px}.hero h1{margin:0 0 8px}.hero p{margin:0;color:var(--muted);line-height:1.7}.links{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}.links a{text-decoration:none;color:var(--brand);border:1px solid var(--line);border-radius:999px;padding:8px 12px;font-weight:700}.filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}button{border:1px solid var(--line);background:#fff;border-radius:999px;padding:8px 12px;cursor:pointer}button.active{background:var(--brand);color:#fff;border-color:var(--brand)}.table{overflow:auto;max-height:65vh;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse;min-width:760px}th{position:sticky;top:0;background:#faf8f2;text-align:left;color:var(--muted)}th,td{padding:10px;border-bottom:1px solid var(--line)}td.num{text-align:right;font-variant-numeric:tabular-nums}.exact{color:var(--brand)}.proxy{color:var(--warn)}.pending{color:#a33}.meta{color:var(--muted);font-size:13px}@media(max-width:600px){.wrap{padding:12px}.hero,.panel{border-radius:14px;padding:14px}}
-</style></head><body><main class="wrap"><section class="hero"><h1>资金费率与现货候选池</h1><p>固定候选集：最近 30 个完整 UTC 日的日均合约成交额达到 1 亿美元。现货映射分为精确、换算、跨场所、代理和待复核。</p><div class="links"><a href="/portal">返回统一入口</a><a href="/basis">实时现货/合约基差</a><a href="http://43.155.136.111:8799/" target="_blank" rel="noopener noreferrer">赛事榜单</a><a href="http://43.156.35.110/alpha" target="_blank" rel="noopener noreferrer">Alpha</a></div></section><section class="panel"><div class="filters" id="filters"></div><div class="meta" id="summary"></div><div class="table"><table><thead><tr><th>合约</th><th>类别</th><th style="text-align:right">30日均额</th><th>对应现货/等价物</th><th>映射</th></tr></thead><tbody id="rows"></tbody></table></div></section></main><script>
+:root{--bg:#f5f2eb;--panel:#fff;--text:#1d1c19;--muted:#6b675f;--line:#ded7ca;--brand:#0b6f68;--soft:#e5f4f1;--warn:#986400;--bad:#a33}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:"Avenir Next","PingFang SC",sans-serif}.wrap{max-width:1440px;margin:auto;padding:24px 16px 48px}.hero,.panel{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:20px;margin-bottom:16px}.hero h1{margin:0 0 8px}.hero p{margin:0;color:var(--muted);line-height:1.7}.links,.filters{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}.links a{text-decoration:none;color:var(--brand);border:1px solid var(--line);border-radius:999px;padding:8px 12px;font-weight:700}.filters{margin:0 0 12px}button{border:1px solid var(--line);background:#fff;border-radius:999px;padding:8px 12px;cursor:pointer}button.active{background:var(--brand);color:#fff;border-color:var(--brand)}.table{overflow:auto;max-height:65vh;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse;min-width:1280px}th{position:sticky;top:0;background:#faf8f2;text-align:left;color:var(--muted);cursor:pointer;white-space:nowrap}th.no-sort{cursor:default}th,td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}tbody tr[data-symbol]{cursor:pointer}tbody tr[data-symbol]:hover{background:#fbfaf6}td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.exact,.positive{color:var(--brand)}.proxy{color:var(--warn)}.pending,.negative{color:var(--bad)}.meta{color:var(--muted);font-size:13px;line-height:1.6}.detail{margin-top:14px;display:grid;gap:12px}.detail h2{font-size:18px;margin:0}.history{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.history section{border:1px solid var(--line);border-radius:12px;padding:12px}.history h3{font-size:14px;margin:0 0 8px}.history table{min-width:0;font-size:13px}.history th{position:static;cursor:default}.loading{padding:16px;color:var(--muted)}@media(max-width:760px){.wrap{padding:12px}.hero,.panel{border-radius:14px;padding:14px}.history{grid-template-columns:1fr}}
+</style></head><body><main class="wrap"><section class="hero"><h1>资金费率与现货候选池</h1><p>实时费率来自 Binance 标记价格接口；历史收益按资金费率实际结算记录复利汇总。正值代表“空永续收取 / 多头支付”。点击合约可查看按月、按年收益。</p><div class="links"><a href="/portal">返回统一入口</a><a href="/basis">实时现货/合约基差</a><a href="http://43.155.136.111:8799/" target="_blank" rel="noopener noreferrer">赛事榜单</a><a href="http://43.156.35.110/alpha" target="_blank" rel="noopener noreferrer">Alpha</a></div></section><section class="panel"><div class="filters" id="filters"></div><div class="meta" id="summary">正在加载资金费率…</div><div class="table"><table><thead><tr><th data-sort="symbol">合约</th><th data-sort="category">类别</th><th data-sort="volume" style="text-align:right">30日均额</th><th class="no-sort">对应现货/等价物</th><th data-sort="current_rate" style="text-align:right">实时费率</th><th data-sort="previous_rate" style="text-align:right">上一期</th><th data-sort="mtd_return" style="text-align:right">本月收益</th><th data-sort="return_30d" style="text-align:right">近30日</th><th data-sort="ytd_return" style="text-align:right">本年收益</th><th data-sort="return_365d" style="text-align:right">近365日</th><th class="no-sort">下次结算</th><th class="no-sort">映射</th></tr></thead><tbody id="rows"></tbody></table></div><div class="detail" id="detail"></div></section></main><script>
 const raw=`BTCUSDT|87.36|币|BTC/USDT · Binance|精确
 ETHUSDT|67.09|币|ETH/USDT · Binance|精确
 SNDKUSDT|34.54|股票|NASDAQ:SNDK|精确
@@ -17560,7 +17696,21 @@ WLDUSDT|1.12|币|WLD/USDT · Binance|精确
 SUIUSDT|1.06|币|SUI/USDT · Binance|精确
 UNITREEUSDT|1.06|股票|中国股票映射；仅3个完整日|待复核
 MRVLUSDT|1.04|股票|NASDAQ:MRVL|精确`;
-const data=raw.split('\\n').map(x=>{const[symbol,volume,category,spot,mapping]=x.split('|');return{symbol,volume:+volume,category,spot,mapping}});const cats=['全部',...new Set(data.map(x=>x.category))];let active='全部';const fs=document.getElementById('filters'),rows=document.getElementById('rows'),summary=document.getElementById('summary');cats.forEach(c=>{const b=document.createElement('button');b.textContent=c;b.className=c===active?'active':'';b.onclick=()=>{active=c;[...fs.children].forEach(x=>x.classList.toggle('active',x===b));render()};fs.appendChild(b)});function render(){const view=data.filter(x=>active==='全部'||x.category===active);summary.textContent=`显示 ${view.length} / ${data.length} 个合约`;rows.innerHTML=view.map(x=>`<tr><td><strong>${x.symbol}</strong></td><td>${x.category}</td><td class="num">$${x.volume.toFixed(2)}亿</td><td>${x.spot}</td><td class="${x.mapping==='精确'||x.mapping==='换算'?'exact':x.mapping==='待复核'?'pending':'proxy'}">${x.mapping}</td></tr>`).join('')}render();
+const data=raw.split('\\n').map(x=>{const[symbol,volume,category,spot,mapping]=x.split('|');return{symbol,volume:+volume,category,spot,mapping}});
+let active='全部',sortKey='return_30d',descending=true,stats=new Map(),payload=null;
+const fs=document.getElementById('filters'),rows=document.getElementById('rows'),summary=document.getElementById('summary'),detail=document.getElementById('detail');
+const esc=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+const percent=value=>value===null||value===undefined?'—':`${value>=0?'+':''}${(value*100).toFixed(4)}%`;
+const classFor=value=>value>0?'positive':value<0?'negative':'';
+const time=value=>value?new Date(value).toLocaleString('zh-CN',{hour12:false,timeZone:'UTC'}).replaceAll('/','-')+' UTC':'—';
+const statFor=item=>stats.get(item.symbol)||{};
+const cats=['全部',...new Set(data.map(x=>x.category))];cats.forEach(c=>{const button=document.createElement('button');button.textContent=c;button.className=c===active?'active':'';button.onclick=()=>{active=c;[...fs.children].forEach(x=>x.classList.toggle('active',x===button));render()};fs.appendChild(button)});
+function compare(a,b){const av=sortKey in a?a[sortKey]:statFor(a)[sortKey],bv=sortKey in b?b[sortKey]:statFor(b)[sortKey];const an=typeof av==='number'?av:Number.NEGATIVE_INFINITY,bn=typeof bv==='number'?bv:Number.NEGATIVE_INFINITY;const result=typeof av==='string'||typeof bv==='string'?String(av??'').localeCompare(String(bv??'')):an-bn;return descending?-result:result}
+function historyTable(title,rows){return `<section><h3>${title}</h3><table><thead><tr><th>期间</th><th style="text-align:right">空合约收款率</th><th style="text-align:right">结算次数</th></tr></thead><tbody>${rows.length?rows.map(row=>`<tr><td>${esc(row.period)}</td><td class="num ${classFor(row.short_return)}">${percent(row.short_return)}</td><td class="num">${row.settlements}</td></tr>`).join(''):'<tr><td colspan="3">暂无历史记录</td></tr>'}</tbody></table></section>`}
+function renderDetail(item){const s=statFor(item);if(!s.history_start){detail.innerHTML=`<div class="meta"><strong>${esc(item.symbol)}</strong> 暂未取得历史资金费率。</div>`;return}detail.innerHTML=`<h2>${esc(item.symbol)} 资金费率收益明细</h2><div class="meta">历史覆盖 ${time(s.history_start)} 至 ${time(s.history_end)}。${esc(payload.history_convention)}</div><div class="history">${historyTable('按月（最近18个月）',s.monthly||[])}${historyTable('按年',s.yearly||[])}</div>`}
+function render(){const view=data.filter(x=>active==='全部'||x.category===active).sort(compare);summary.textContent=payload?`已更新：${time(payload.as_of)} · ${payload.rate_convention} · 点击列标题排序，点击合约查看月度/年度收益。`:'正在加载…';rows.innerHTML=view.map(item=>{const s=statFor(item),mapClass=item.mapping==='精确'||item.mapping==='换算'?'exact':item.mapping==='待复核'?'pending':'proxy';return `<tr data-symbol="${esc(item.symbol)}"><td><strong>${esc(item.symbol)}</strong></td><td>${esc(item.category)}</td><td class="num">$${item.volume.toFixed(2)}亿</td><td>${esc(item.spot)}</td><td class="num ${classFor(s.current_rate)}">${percent(s.current_rate)}</td><td class="num ${classFor(s.previous_rate)}">${percent(s.previous_rate)}</td><td class="num ${classFor(s.mtd_return)}">${percent(s.mtd_return)}</td><td class="num ${classFor(s.return_30d)}">${percent(s.return_30d)}</td><td class="num ${classFor(s.ytd_return)}">${percent(s.ytd_return)}</td><td class="num ${classFor(s.return_365d)}">${percent(s.return_365d)}</td><td>${time(s.next_funding_time)}</td><td class="${mapClass}">${esc(item.mapping)}</td></tr>`}).join('');[...rows.querySelectorAll('tr[data-symbol]')].forEach(row=>row.onclick=()=>renderDetail(data.find(item=>item.symbol===row.dataset.symbol)))}
+document.querySelectorAll('th[data-sort]').forEach(head=>head.onclick=()=>{const next=head.dataset.sort;if(next===sortKey)descending=!descending;else{sortKey=next;descending=true}render()});
+fetch('/api/market-data/funding-summary').then(async response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()}).then(result=>{payload=result;stats=new Map(result.rows.map(row=>[row.symbol,row]));render()}).catch(error=>{summary.textContent=`资金费率加载失败：${error.message}`;render()});
 </script></body></html>"""
 
 HTML_PAGE = """<!doctype html>
@@ -39436,6 +39586,12 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path in {"/strategies", "/strategies.html"}:
             self._send_html(STRATEGIES_PAGE, status=HTTPStatus.OK)
+            return
+        if path == "/api/market-data/funding-summary":
+            try:
+                self._send_json(_build_market_data_funding_payload(), status=HTTPStatus.OK)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=502)
             return
         if path == "/api/health":
             self._send_json({"ok": True}, status=HTTPStatus.OK)

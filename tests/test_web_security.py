@@ -16,12 +16,15 @@ from unittest.mock import Mock, patch
 from grid_optimizer.web import (
     COMPETITION_VOLUME_PAGE,
     MARKET_DATA_PAGE,
+    MARKET_DATA_SYMBOLS,
     MONITOR_PAGE,
     HTML_PAGE,
     STRATEGY_WORKSPACE_PAGE,
     STRATEGIES_PAGE,
     _Handler,
     _build_running_status_api_body,
+    _compound_funding_return,
+    _summarize_market_data_funding,
     _build_running_status,
     _basic_auth_header_matches,
     _build_custom_grid_runner_preset,
@@ -106,6 +109,21 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("http://43.155.136.111:8799/", MARKET_DATA_PAGE)
         self.assertIn("http://43.156.35.110/alpha", MARKET_DATA_PAGE)
         self.assertIn(r"raw.split('\n')", MARKET_DATA_PAGE)
+        self.assertIn("/api/market-data/funding-summary", MARKET_DATA_PAGE)
+        self.assertIn("近365日", MARKET_DATA_PAGE)
+
+    def test_market_data_funding_summary_compounds_short_perp_return(self) -> None:
+        now = datetime(2026, 8, 22, tzinfo=timezone.utc)
+        history = [
+            (datetime(2026, 8, 1, tzinfo=timezone.utc), 0.001),
+            (datetime(2026, 8, 2, tzinfo=timezone.utc), -0.0005),
+        ]
+        payload = _summarize_market_data_funding(
+            MARKET_DATA_SYMBOLS[0], history, {"funding_rate": 0.0002}, now
+        )
+        self.assertAlmostEqual(_compound_funding_return([0.001, -0.0005]) or 0.0, 0.0004995)
+        self.assertAlmostEqual(payload["mtd_return"] or 0.0, 0.0004995)
+        self.assertEqual(payload["monthly"][0]["period"], "2026-08")
 
     def _write_registered_recovery_control(
         self,
