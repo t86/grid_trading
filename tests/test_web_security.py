@@ -105,6 +105,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("UNITREEUSDT", MARKET_DATA_PAGE)
         self.assertIn("http://43.155.136.111:8799/", MARKET_DATA_PAGE)
         self.assertIn("http://43.156.35.110/alpha", MARKET_DATA_PAGE)
+        self.assertIn(r"raw.split('\n')", MARKET_DATA_PAGE)
 
     def _write_registered_recovery_control(
         self,
