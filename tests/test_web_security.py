@@ -110,6 +110,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("http://43.156.35.110/alpha", MARKET_DATA_PAGE)
         self.assertIn(r"raw.split('\n')", MARKET_DATA_PAGE)
         self.assertIn("/api/market-data/funding-summary", MARKET_DATA_PAGE)
+        self.assertIn("/api/market-data/simple-earn", MARKET_DATA_PAGE)
         self.assertIn("近365日", MARKET_DATA_PAGE)
 
     def test_market_data_funding_summary_compounds_short_perp_return(self) -> None:
