@@ -52,6 +52,7 @@ from .ai_scheduler import (
     update_scheduler_task,
 )
 from .ai_scheduler_worker import run_scheduler_task
+from .alpha_market import AlphaMarketClient
 from .backtest import (
     build_grid_levels,
     run_backtest,
@@ -17522,6 +17523,11 @@ MARKET_DATA_SYMBOLS = (
 _MARKET_DATA_FUNDING_CACHE: tuple[float, dict[str, Any]] | None = None
 _MARKET_DATA_FUNDING_CACHE_LOCK = threading.Lock()
 _MARKET_DATA_FUNDING_CACHE_SECONDS = 60
+_ALPHA_FUNDING_MIN_QUOTE_VOLUME_24H = float(os.environ.get("ALPHA_FUNDING_MIN_QUOTE_VOLUME_24H", "1000000"))
+_ALPHA_FUNDING_MIN_CURRENT_RATE = float(os.environ.get("ALPHA_FUNDING_MIN_CURRENT_RATE", "0.0001"))
+_ALPHA_FUNDING_MIN_POSITIVE_RATIO = float(os.environ.get("ALPHA_FUNDING_MIN_POSITIVE_RATIO", "0.70"))
+_ALPHA_FUNDING_MIN_7D_RETURN = float(os.environ.get("ALPHA_FUNDING_MIN_7D_RETURN", "0.002"))
+_ALPHA_FUNDING_ROUND_TRIP_COST = float(os.environ.get("ALPHA_FUNDING_ROUND_TRIP_COST", "0.004"))
 _MARKET_DATA_EARN_CACHE: tuple[float, dict[str, Any]] | None = None
 _MARKET_DATA_EARN_CACHE_LOCK = threading.Lock()
 _MARKET_DATA_EARN_CACHE_SECONDS = 300
@@ -17561,6 +17567,94 @@ def _compound_funding_return(rates: list[float]) -> float | None:
     for rate in rates:
         value *= 1.0 + rate
     return value - 1.0
+
+
+def _evaluate_alpha_funding_candidate(
+    *,
+    symbol: str,
+    alpha_pair: str,
+    alpha_quote_volume_24h: float,
+    current_rate: float | None,
+    history: list[tuple[datetime, float]],
+    now: datetime,
+) -> dict[str, Any] | None:
+    if current_rate is None or current_rate < _ALPHA_FUNDING_MIN_CURRENT_RATE:
+        return None
+    if alpha_quote_volume_24h < _ALPHA_FUNDING_MIN_QUOTE_VOLUME_24H:
+        return None
+    recent_7d = [rate for timestamp, rate in history if timestamp >= now - timedelta(days=7)]
+    recent_30d = [rate for timestamp, rate in history if timestamp >= now - timedelta(days=30)]
+    if len(recent_7d) < 6 or len(recent_30d) < 20:
+        return None
+    positive_ratio_30d = sum(rate > 0 for rate in recent_30d) / len(recent_30d)
+    return_7d = _compound_funding_return(recent_7d) or 0.0
+    return_30d = _compound_funding_return(recent_30d) or 0.0
+    net_return_30d = return_30d - _ALPHA_FUNDING_ROUND_TRIP_COST
+    if positive_ratio_30d < _ALPHA_FUNDING_MIN_POSITIVE_RATIO:
+        return None
+    if return_7d < _ALPHA_FUNDING_MIN_7D_RETURN or net_return_30d <= 0:
+        return None
+    return {
+        "symbol": symbol,
+        "volume": alpha_quote_volume_24h / 100_000_000.0,
+        "category": "Alpha套保",
+        "spot": f"{alpha_pair} · Binance Alpha",
+        "mapping": "Alpha精确",
+        "alpha_pair": alpha_pair,
+        "alpha_quote_volume_24h": alpha_quote_volume_24h,
+        "positive_ratio_30d": positive_ratio_30d,
+        "return_7d": return_7d,
+        "gross_return_30d": return_30d,
+        "net_return_30d": net_return_30d,
+        "estimated_round_trip_cost": _ALPHA_FUNDING_ROUND_TRIP_COST,
+    }
+
+
+def _discover_alpha_funding_candidates(now: datetime) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    errors: dict[str, str] = {}
+    try:
+        tokens = AlphaMarketClient(timeout_seconds=12).fetch_tokens()
+        futures_symbols = set(fetch_futures_symbols("usdm"))
+        premium_by_symbol = {item["symbol"]: item for item in fetch_futures_premium_index("usdm")}
+    except Exception as exc:
+        return [], {"alpha_discovery": f"{type(exc).__name__}: {exc}"}
+
+    matches = []
+    for token in tokens.values():
+        symbol = f"{token.symbol}USDT"
+        premium = premium_by_symbol.get(symbol)
+        if symbol not in futures_symbols or premium is None:
+            continue
+        current_rate = premium.get("funding_rate")
+        if current_rate is None or current_rate < _ALPHA_FUNDING_MIN_CURRENT_RATE:
+            continue
+        matches.append((symbol, token, current_rate))
+
+    candidates: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        pending = {
+            executor.submit(_fetch_market_data_funding_history, symbol): (symbol, token, current_rate)
+            for symbol, token, current_rate in matches
+        }
+        for future in as_completed(pending):
+            symbol, token, current_rate = pending[future]
+            try:
+                ticker = AlphaMarketClient(timeout_seconds=12).fetch_ticker(token.pair)
+                quote_volume = float(ticker.get("quoteVolume") or token.volume_24h or 0.0)
+                candidate = _evaluate_alpha_funding_candidate(
+                    symbol=symbol,
+                    alpha_pair=token.pair,
+                    alpha_quote_volume_24h=quote_volume,
+                    current_rate=current_rate,
+                    history=future.result(),
+                    now=now,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+            except Exception as exc:
+                errors[symbol] = f"{type(exc).__name__}: {exc}"
+    candidates.sort(key=lambda item: item["net_return_30d"], reverse=True)
+    return candidates, errors
 
 
 def _summarize_market_data_funding(
@@ -17642,13 +17736,27 @@ def _build_market_data_funding_payload() -> dict[str, Any]:
             return cached[1]
 
     now = datetime.now(timezone.utc)
-    rows, errors = _build_market_data_funding_rows(MARKET_DATA_SYMBOLS, now)
+    alpha_candidates, alpha_errors = _discover_alpha_funding_candidates(now)
+    dynamic_symbols = tuple(
+        item["symbol"] for item in alpha_candidates if item["symbol"] not in MARKET_DATA_SYMBOLS
+    )
+    symbols = MARKET_DATA_SYMBOLS + dynamic_symbols
+    rows, errors = _build_market_data_funding_rows(symbols, now)
+    errors.update(alpha_errors)
     payload = {
         "ok": True,
         "as_of": now.isoformat(),
         "rate_convention": "short_perp_receive: 正值表示空永续收取资金费，多头支付；累计收益按各期复利计算。",
         "history_convention": "最近最多 1000 期结算记录；通常约覆盖最近 333 天，实际跨度取决于资金费结算间隔。",
         "rows": rows,
+        "alpha_candidates": alpha_candidates,
+        "alpha_criteria": {
+            "min_quote_volume_24h": _ALPHA_FUNDING_MIN_QUOTE_VOLUME_24H,
+            "min_current_rate": _ALPHA_FUNDING_MIN_CURRENT_RATE,
+            "min_positive_ratio_30d": _ALPHA_FUNDING_MIN_POSITIVE_RATIO,
+            "min_return_7d": _ALPHA_FUNDING_MIN_7D_RETURN,
+            "estimated_round_trip_cost": _ALPHA_FUNDING_ROUND_TRIP_COST,
+        },
         "errors": errors,
     }
     with _MARKET_DATA_FUNDING_CACHE_LOCK:
@@ -17815,7 +17923,7 @@ WLDUSDT|1.12|币|WLD/USDT · Binance|精确
 SUIUSDT|1.06|币|SUI/USDT · Binance|精确
 UNITREEUSDT|1.06|股票|中国股票映射；仅3个完整日|待复核
 MRVLUSDT|1.04|股票|NASDAQ:MRVL|精确`;
-const data=raw.split('\\n').map(x=>{const[symbol,volume,category,spot,mapping]=x.split('|');return{symbol,volume:+volume,category,spot,mapping}});
+let data=raw.split('\\n').map(x=>{const[symbol,volume,category,spot,mapping]=x.split('|');return{symbol,volume:+volume,category,spot,mapping}});
 let active='全部',sortKey='return_30d',descending=true,stats=new Map(),payload=null,earnData=[],earnSortKey='apr',earnDescending=true;
 const fs=document.getElementById('filters'),rows=document.getElementById('rows'),summary=document.getElementById('summary'),detail=document.getElementById('detail'),earnSummary=document.getElementById('earn-summary'),earnRows=document.getElementById('earn-rows'),earnDetail=document.getElementById('earn-detail');
 const esc=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
@@ -17823,12 +17931,12 @@ const percent=value=>value===null||value===undefined?'—':`${value>=0?'+':''}${
 const classFor=value=>value>0?'positive':value<0?'negative':'';
 const time=value=>value?new Date(value).toLocaleString('zh-CN',{hour12:false,timeZone:'UTC'}).replaceAll('/','-')+' UTC':'—';
 const statFor=item=>stats.get(item.symbol)||{};
-const cats=['全部',...new Set(data.map(x=>x.category))];cats.forEach(c=>{const button=document.createElement('button');button.textContent=c;button.className=c===active?'active':'';button.onclick=()=>{active=c;[...fs.children].forEach(x=>x.classList.toggle('active',x===button));render()};fs.appendChild(button)});
+const cats=['全部',...new Set(['Alpha套保',...data.map(x=>x.category)])];cats.forEach(c=>{const button=document.createElement('button');button.textContent=c;button.className=c===active?'active':'';button.onclick=()=>{active=c;[...fs.children].forEach(x=>x.classList.toggle('active',x===button));render()};fs.appendChild(button)});
 function compare(a,b){const av=sortKey in a?a[sortKey]:statFor(a)[sortKey],bv=sortKey in b?b[sortKey]:statFor(b)[sortKey];const an=typeof av==='number'?av:Number.NEGATIVE_INFINITY,bn=typeof bv==='number'?bv:Number.NEGATIVE_INFINITY;const result=typeof av==='string'||typeof bv==='string'?String(av??'').localeCompare(String(bv??'')):an-bn;return descending?-result:result}
 function historyTable(title,rows){return `<section><h3>${title}</h3><table><thead><tr><th>期间</th><th style="text-align:right">空合约收款率</th><th style="text-align:right">结算次数</th></tr></thead><tbody>${rows.length?rows.map(row=>`<tr><td>${esc(row.period)}</td><td class="num ${classFor(row.short_return)}">${percent(row.short_return)}</td><td class="num">${row.settlements}</td></tr>`).join(''):'<tr><td colspan="3">暂无历史记录</td></tr>'}</tbody></table></section>`}
 function renderFundingDetail(target,symbol,s,historyConvention){if(!s.history_start){target.innerHTML=`<div class="meta"><strong>${esc(symbol)}</strong> 暂未取得历史资金费率。</div>`;return}target.innerHTML=`<h2>${esc(symbol)} 资金费率收益明细</h2><div class="meta">历史覆盖 ${time(s.history_start)} 至 ${time(s.history_end)}。${esc(historyConvention)}</div><div class="history">${historyTable('按月（最近18个月）',s.monthly||[])}${historyTable('按年',s.yearly||[])}</div>`}
 function renderDetail(item){renderFundingDetail(detail,item.symbol,statFor(item),payload.history_convention)}
-function render(){const view=data.filter(x=>active==='全部'||x.category===active).sort(compare);summary.textContent=payload?`已更新：${time(payload.as_of)} · ${payload.rate_convention} · 点击列标题排序，点击合约查看月度/年度收益。`:'正在加载…';rows.innerHTML=view.map(item=>{const s=statFor(item),mapClass=item.mapping==='精确'||item.mapping==='换算'?'exact':item.mapping==='待复核'?'pending':'proxy';return `<tr data-symbol="${esc(item.symbol)}"><td><strong>${esc(item.symbol)}</strong></td><td>${esc(item.category)}</td><td class="num">$${item.volume.toFixed(2)}亿</td><td>${esc(item.spot)}</td><td class="num ${classFor(s.current_rate)}">${percent(s.current_rate)}</td><td class="num ${classFor(s.previous_rate)}">${percent(s.previous_rate)}</td><td class="num ${classFor(s.mtd_return)}">${percent(s.mtd_return)}</td><td class="num ${classFor(s.return_30d)}">${percent(s.return_30d)}</td><td class="num ${classFor(s.ytd_return)}">${percent(s.ytd_return)}</td><td class="num ${classFor(s.return_365d)}">${percent(s.return_365d)}</td><td>${time(s.next_funding_time)}</td><td class="${mapClass}">${esc(item.mapping)}</td></tr>`}).join('');[...rows.querySelectorAll('tr[data-symbol]')].forEach(row=>row.onclick=()=>renderDetail(data.find(item=>item.symbol===row.dataset.symbol)))}
+function render(){const view=data.filter(x=>active==='全部'||x.category===active).sort(compare);summary.textContent=payload?`已更新：${time(payload.as_of)} · ${payload.rate_convention} · 动态 Alpha ${payload.alpha_candidates?.length||0} 个；按现货流动性、7/30日资金费持续性及扣除往返成本后的收益准入。点击列标题排序，点击合约查看月度/年度收益。`:'正在加载…';rows.innerHTML=view.map(item=>{const s=statFor(item),mapClass=['精确','换算','Alpha精确'].includes(item.mapping)?'exact':item.mapping==='待复核'?'pending':'proxy';return `<tr data-symbol="${esc(item.symbol)}"><td><strong>${esc(item.symbol)}</strong></td><td>${esc(item.category)}</td><td class="num">$${item.volume.toFixed(2)}亿</td><td>${esc(item.spot)}</td><td class="num ${classFor(s.current_rate)}">${percent(s.current_rate)}</td><td class="num ${classFor(s.previous_rate)}">${percent(s.previous_rate)}</td><td class="num ${classFor(s.mtd_return)}">${percent(s.mtd_return)}</td><td class="num ${classFor(s.return_30d)}">${percent(s.return_30d)}</td><td class="num ${classFor(s.ytd_return)}">${percent(s.ytd_return)}</td><td class="num ${classFor(s.return_365d)}">${percent(s.return_365d)}</td><td>${time(s.next_funding_time)}</td><td class="${mapClass}">${esc(item.mapping)}</td></tr>`}).join('');[...rows.querySelectorAll('tr[data-symbol]')].forEach(row=>row.onclick=()=>renderDetail(data.find(item=>item.symbol===row.dataset.symbol)))}
 document.querySelectorAll('th[data-sort]').forEach(head=>head.onclick=()=>{const next=head.dataset.sort;if(next===sortKey)descending=!descending;else{sortKey=next;descending=true}render()});
 function earnValue(row,key){return key in row?row[key]:row.funding?.[key]}
 function renderEarn(){const view=[...earnData].sort((a,b)=>{const av=earnValue(a,earnSortKey),bv=earnValue(b,earnSortKey);const result=typeof av==='string'||typeof bv==='string'?String(av??'').localeCompare(String(bv??'')):(Number(av??Number.NEGATIVE_INFINITY)-Number(bv??Number.NEGATIVE_INFINITY));return earnDescending?-result:result});earnRows.innerHTML=view.map(row=>{const s=row.funding;return `<tr data-symbol="${esc(row.futures_symbol)}"><td><strong>${esc(row.asset)}</strong></td><td class="num positive">${percent(row.apr)}</td><td><strong>${esc(row.futures_symbol)}</strong></td><td class="num ${classFor(s.current_rate)}">${percent(s.current_rate)}</td><td class="num ${classFor(s.previous_rate)}">${percent(s.previous_rate)}</td><td class="num ${classFor(s.mtd_return)}">${percent(s.mtd_return)}</td><td class="num ${classFor(s.return_30d)}">${percent(s.return_30d)}</td><td class="num ${classFor(s.ytd_return)}">${percent(s.ytd_return)}</td><td class="num ${classFor(s.return_365d)}">${percent(s.return_365d)}</td><td>${row.can_redeem?'是':'否'}</td></tr>`}).join('');[...earnRows.querySelectorAll('tr[data-symbol]')].forEach(element=>element.onclick=()=>{const row=earnData.find(item=>item.futures_symbol===element.dataset.symbol);renderFundingDetail(earnDetail,row.futures_symbol,row.funding,earnPayload.history_convention)})}
@@ -17838,7 +17946,7 @@ const fundingTab=document.getElementById('funding-tab'),earnTab=document.getElem
 function activateTab(name){const isFunding=name==='funding';fundingView.hidden=!isFunding;earnView.hidden=isFunding;fundingTab.classList.toggle('active',isFunding);earnTab.classList.toggle('active',!isFunding)}
 fundingTab.onclick=()=>activateTab('funding');earnTab.onclick=()=>activateTab('earn');
 fetch('/api/market-data/simple-earn-funding').then(async response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()}).then(result=>{earnPayload=result;earnData=result.rows;earnSummary.textContent=`已更新：${time(result.as_of)} · ${result.total_earn_products} 个可申购且未售罄的活期产品 APR 超过 5%，其中 ${result.matched_products} 个有对应 USDⓈ-M 永续。${result.earn_convention} ${result.funding_convention}`;renderEarn()}).catch(error=>{earnSummary.textContent=`活期理财与资金费率加载失败：${error.message}`});
-fetch('/api/market-data/funding-summary').then(async response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()}).then(result=>{payload=result;stats=new Map(result.rows.map(row=>[row.symbol,row]));render()}).catch(error=>{summary.textContent=`资金费率加载失败：${error.message}`;render()});
+fetch('/api/market-data/funding-summary').then(async response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()}).then(result=>{payload=result;const known=new Set(data.map(item=>item.symbol));data.push(...(result.alpha_candidates||[]).filter(item=>!known.has(item.symbol)));stats=new Map(result.rows.map(row=>[row.symbol,row]));render()}).catch(error=>{summary.textContent=`资金费率加载失败：${error.message}`;render()});
 </script></body></html>"""
 
 HTML_PAGE = """<!doctype html>
