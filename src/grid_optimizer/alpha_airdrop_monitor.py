@@ -26,6 +26,7 @@ DEFAULT_BARK_URL = "https://api.day.app"
 DEFAULT_BARK_LEVEL = "critical"
 DEFAULT_BARK_SOUND = "alarm"
 NITTER_RSS_BASE_URL = "https://nitter.net"
+STATE_META_KEY = "__meta__"
 
 _POINTS_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"at least\s+(\d{2,6})\s+binance alpha points", re.IGNORECASE),
@@ -352,6 +353,54 @@ def _save_state(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _parse_epoch_seconds(value: object) -> datetime | None:
+    try:
+        timestamp = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return None
+    try:
+        parsed = datetime.fromtimestamp(timestamp, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return parsed if parsed > datetime.fromtimestamp(0, tz=UTC) else None
+
+
+def _rate_limit_reset_from_exception(exc: Exception) -> datetime | None:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code != 429:
+        return None
+    headers = getattr(response, "headers", {}) or {}
+    return _parse_epoch_seconds(headers.get("x-rate-limit-reset") or headers.get("X-Rate-Limit-Reset"))
+
+
+def _syndication_backoff_until(state: dict[str, Any]) -> datetime | None:
+    meta = state.get(STATE_META_KEY)
+    if not isinstance(meta, dict):
+        return None
+    raw = meta.get("syndication_backoff_until")
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _store_syndication_backoff(state: dict[str, Any], reset_at: datetime, *, now: datetime) -> None:
+    meta = state.setdefault(STATE_META_KEY, {})
+    if not isinstance(meta, dict):
+        meta = {}
+        state[STATE_META_KEY] = meta
+    current = _syndication_backoff_until(state)
+    if current is None or reset_at > current:
+        meta["syndication_backoff_until"] = reset_at.astimezone(UTC).isoformat()
+    meta["syndication_backoff_updated_at"] = now.astimezone(UTC).isoformat()
+
+
 def _build_match_key(post: dict[str, Any]) -> str:
     return f"{post.get('account')}:{post.get('tweet_id')}"
 
@@ -633,9 +682,11 @@ def check_alpha_airdrop_posts(
     state_path: Path = DEFAULT_STATE_PATH,
     alert_config_path: Path | None = DEFAULT_ALERT_CONFIG_PATH,
     bark_config_path: Path | None = DEFAULT_BARK_CONFIG_PATH,
+    nitter_rss_enabled: bool = True,
 ) -> dict[str, Any]:
     current_now = now or datetime.now(UTC)
     state = _load_state(state_path)
+    backoff_until = _syndication_backoff_until(state)
     account_results: list[AccountCheckResult] = []
     matches: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -644,17 +695,25 @@ def check_alpha_airdrop_posts(
         account_errors: list[str] = []
         entries: list[dict[str, Any]] = []
         fetched = False
-        try:
-            entries = _fetch_account_entries(account)
-            fetched = True
-        except Exception as exc:
-            account_errors.append(f"syndication {type(exc).__name__}: {exc}")
-        try:
-            rss_entries = _fetch_account_entries_from_nitter_rss(account)
-            entries = _merge_entries(entries, rss_entries)
-            fetched = True
-        except Exception as exc:
-            account_errors.append(f"nitter_rss {type(exc).__name__}: {exc}")
+        if backoff_until is not None and current_now < backoff_until:
+            account_errors.append(f"syndication skipped until {backoff_until.isoformat()}")
+        else:
+            try:
+                entries = _fetch_account_entries(account)
+                fetched = True
+            except Exception as exc:
+                reset_at = _rate_limit_reset_from_exception(exc)
+                if reset_at is not None:
+                    _store_syndication_backoff(state, reset_at, now=current_now)
+                    backoff_until = reset_at
+                account_errors.append(f"syndication {type(exc).__name__}: {exc}")
+        if nitter_rss_enabled:
+            try:
+                rss_entries = _fetch_account_entries_from_nitter_rss(account)
+                entries = _merge_entries(entries, rss_entries)
+                fetched = True
+            except Exception as exc:
+                account_errors.append(f"nitter_rss {type(exc).__name__}: {exc}")
 
         account_matches = _extract_matches_for_account(
             account,
@@ -707,6 +766,8 @@ def check_alpha_airdrop_posts(
         "bark_results": bark_results,
         "errors": errors,
         "state_path": str(state_path),
+        "syndication_backoff_until": None if backoff_until is None else backoff_until.isoformat(),
+        "nitter_rss_enabled": nitter_rss_enabled,
     }
 
 
@@ -737,6 +798,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to Bark config json.",
     )
     parser.add_argument(
+        "--disable-nitter-rss",
+        action="store_true",
+        help="Disable the nitter RSS fallback.",
+    )
+    parser.add_argument(
         "--tz-offset-hours",
         type=int,
         default=DEFAULT_TZ_OFFSET_HOURS,
@@ -760,6 +826,7 @@ def main() -> None:
         state_path=Path(args.state_path),
         alert_config_path=Path(args.alert_config_path) if str(args.alert_config_path or "").strip() else None,
         bark_config_path=Path(args.bark_config_path) if str(args.bark_config_path or "").strip() else None,
+        nitter_rss_enabled=not bool(args.disable_nitter_rss),
     )
     if args.print_json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
