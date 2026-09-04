@@ -586,8 +586,8 @@ Eligible users can claim their airdrop using Binance Alpha Points on the Alpha E
                     state_path=state_path,
                     nitter_rss_enabled=False,
                 )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
 
-        state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(calls, ["binancezh"])
         self.assertEqual(result["syndication_backoff_until"], reset_at.isoformat())
         self.assertEqual(state["__meta__"]["syndication_backoff_until"], reset_at.isoformat())
