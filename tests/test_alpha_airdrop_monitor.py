@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+
+import requests
 
 from grid_optimizer.alpha_airdrop_monitor import (
     AccountCheckResult,
@@ -559,6 +561,63 @@ Eligible users can claim their airdrop using Binance Alpha Points on the Alpha E
         self.assertEqual(len(result["matches"]), 1)
         self.assertEqual(sent_subjects, ["！！！空投 xxx"])
         self.assertIn("BinanceWallet", result["matches"][0]["account"])
+
+    def test_check_alpha_airdrop_posts_stores_syndication_rate_limit_backoff(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "alpha_state.json"
+            now = datetime(2026, 9, 4, 6, 0, tzinfo=timezone.utc)
+            reset_at = now + timedelta(minutes=15)
+            calls: list[str] = []
+
+            def fake_fetch(account: str):
+                calls.append(account)
+                response = requests.Response()
+                response.status_code = 429
+                response.headers["x-rate-limit-reset"] = str(int(reset_at.timestamp()))
+                raise requests.HTTPError("429 Client Error", response=response)
+
+            with (
+                patch("grid_optimizer.alpha_airdrop_monitor._fetch_account_entries", side_effect=fake_fetch),
+                patch("grid_optimizer.alpha_airdrop_monitor._fetch_account_entries_from_nitter_rss"),
+            ):
+                result = check_alpha_airdrop_posts(
+                    accounts=("binancezh", "BinanceWallet"),
+                    now=now,
+                    state_path=state_path,
+                    nitter_rss_enabled=False,
+                )
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(calls, ["binancezh"])
+        self.assertEqual(result["syndication_backoff_until"], reset_at.isoformat())
+        self.assertEqual(state["__meta__"]["syndication_backoff_until"], reset_at.isoformat())
+        self.assertIn("skipped until", result["accounts"][1]["error"])
+
+    def test_check_alpha_airdrop_posts_honors_existing_syndication_backoff(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "alpha_state.json"
+            now = datetime(2026, 9, 4, 6, 0, tzinfo=timezone.utc)
+            reset_at = now + timedelta(minutes=15)
+            state_path.write_text(
+                json.dumps({"__meta__": {"syndication_backoff_until": reset_at.isoformat()}}),
+                encoding="utf-8",
+            )
+
+            with (
+                patch("grid_optimizer.alpha_airdrop_monitor._fetch_account_entries") as fetch_entries,
+                patch("grid_optimizer.alpha_airdrop_monitor._fetch_account_entries_from_nitter_rss") as fetch_rss,
+            ):
+                result = check_alpha_airdrop_posts(
+                    accounts=("binancezh",),
+                    now=now,
+                    state_path=state_path,
+                    nitter_rss_enabled=False,
+                )
+
+        fetch_entries.assert_not_called()
+        fetch_rss.assert_not_called()
+        self.assertFalse(result["accounts"][0]["fetched"])
+        self.assertIn("skipped until", result["accounts"][0]["error"])
 
     def test_check_alpha_airdrop_posts_records_fetch_errors(self) -> None:
         with TemporaryDirectory() as tmpdir:
