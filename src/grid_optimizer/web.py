@@ -22782,7 +22782,7 @@ BASIS_PAGE = """<!doctype html>
           <td><div class="stack"><span class="main">${escapeHtml(row.strategy)}</span><span class="sub">${escapeHtml(row.funding_side)}</span></div></td>
           <td><div class="stack"><span class="main">${escapeHtml(row.spot_symbol)}</span><span class="sub">${escapeHtml(row.spot_quote_asset)}</span></div></td>
           <td><span class="main">${escapeHtml(row.futures_symbol)}</span></td>
-          <td><div class="stack"><span class="main">${row.funding_rate > 0 ? fmtPct(row.earn_apr) : escapeHtml(row.borrow_status || "借贷待确认")}</span><span class="sub">${row.funding_rate > 0 ? (row.can_redeem ? "活期可赎回" : "无/不可赎回") : `${escapeHtml(row.borrow_source || "—")} ${fmtPct(row.borrow_annualized)}/年`}</span></div></td>
+          <td><div class="stack"><span class="main">${row.funding_rate > 0 ? fmtPct(row.earn_apr) : escapeHtml(row.borrow_status || "借贷待确认")}</span><span class="sub">${row.funding_rate > 0 ? (row.can_redeem ? "活期可赎回" : "无/不可赎回") : `${escapeHtml(row.borrow_source || "—")} ${fmtPct(row.borrow_annualized)}/年`}</span>${row.borrow_note ? `<span class="sub">${escapeHtml(row.borrow_note)}</span>` : ""}</div></td>
           <td><div class="stack"><span class="main">${fmtSignedPct(row.funding_rate, 4)}</span><span class="sub">每 ${escapeHtml(row.funding_interval_hours)}h</span></div></td>
           <td><div class="stack"><span class="main">${fmtSignedPct(row.live_combined_annualized)}</span><span class="sub">资金费毛年化 ${fmtSignedPct(row.funding_annualized)}</span></div></td>
           <td><div class="stack"><span class="main">${fmtSignedPct(row.combined_30d_annualized)}</span><span class="sub">资金费30日 ${fmtSignedPct(row.funding_30d_annualized)}</span></div></td>
@@ -36246,6 +36246,7 @@ def _assess_carry_borrow(item: dict[str, Any], refs: dict[str, Any]) -> dict[str
             "borrow_source": None,
             "borrow_annualized": None,
             "borrow_confirmed": False,
+            "borrow_note": payload.get("error") or payload.get("note") or "未取得借币利率或额度",
         }
     best = min(options, key=lambda option: option["annual_rate"])
     return {
@@ -36253,6 +36254,7 @@ def _assess_carry_borrow(item: dict[str, Any], refs: dict[str, Any]) -> dict[str
         "borrow_source": best["source"],
         "borrow_annualized": best["annual_rate"],
         "borrow_confirmed": best["confirmed"],
+        "borrow_note": payload.get("error") or payload.get("note") or "",
     }
 
 
@@ -36323,6 +36325,7 @@ def _build_arbitrage_carry_payload() -> dict[str, Any]:
                     "borrow_source": None,
                     "borrow_annualized": 0.0,
                     "borrow_confirmed": True,
+                    "borrow_note": "",
                     "live_combined_annualized": live_combined,
                     "entry_spread": row.get("spread_long_spot_short_perp"),
                 }
