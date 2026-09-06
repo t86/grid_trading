@@ -22165,9 +22165,9 @@ BASIS_PAGE = """<!doctype html>
       <div class="table-wrap" style="margin-top:12px;">
         <table>
           <thead><tr>
-            <th>状态</th><th>现货</th><th>永续</th><th>活期 APR</th><th>当前资金费</th><th>实时预估年化</th><th>近30日验证年化</th><th>入场价差</th><th>历史覆盖</th>
+            <th>状态</th><th>对冲方向</th><th>现货</th><th>永续</th><th>活期 / 借币</th><th>当前资金费</th><th>净实时预估年化</th><th>近30日验证年化</th><th>入场价差</th><th>历史覆盖</th>
           </tr></thead>
-          <tbody id="carry_tbody"><tr><td colspan="9">正在加载…</td></tr></tbody>
+          <tbody id="carry_tbody"><tr><td colspan="10">正在加载…</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -22765,25 +22765,26 @@ BASIS_PAGE = """<!doctype html>
     }
 
     function carryStatusPill(status) {
-      const cls = status === "已验证" ? "good" : status === "新币观察" ? "warn" : "neutral";
+      const cls = status === "已验证" ? "good" : status === "利息不覆盖" ? "danger" : status === "新币观察" || status === "借贷待确认" ? "warn" : "neutral";
       return `<span class="pill ${cls}">${escapeHtml(status || "观察")}</span>`;
     }
 
     function renderCarry(data) {
       const rows = Array.isArray(data.rows) ? data.rows : [];
-      carrySummaryEl.textContent = `已更新：${fmtDateTime(data.as_of)} · ${data.eligible_pairs || 0} 组 Binance 同交易对现货/永续中，${data.qualified_count || 0} 组实时预估年化超过 30%，${data.verified_count || 0} 组通过近30日验证。${data.convention || ""}`;
+      carrySummaryEl.textContent = `已更新：${fmtDateTime(data.as_of)} · ${data.eligible_pairs || 0} 组 Binance 同交易对现货/永续中，${data.qualified_count || 0} 组净实时预估年化超过 30%，${data.verified_count || 0} 组通过近30日验证。${data.convention || ""}`;
       if (!rows.length) {
-        carryTbody.innerHTML = `<tr><td colspan="9">当前没有资金费率为正且“资金费年化 + 活期 APR”超过 30% 的同交易对对冲机会。</td></tr>`;
+        carryTbody.innerHTML = `<tr><td colspan="10">当前没有资金费收入扣除活期或借币成本后超过 30% 的同交易对对冲机会。</td></tr>`;
         return;
       }
       carryTbody.innerHTML = rows.map((row) => `
         <tr>
           <td>${carryStatusPill(row.status)}<div class="sub">仅作扫描，非下单信号</div></td>
+          <td><div class="stack"><span class="main">${escapeHtml(row.strategy)}</span><span class="sub">${escapeHtml(row.funding_side)}</span></div></td>
           <td><div class="stack"><span class="main">${escapeHtml(row.spot_symbol)}</span><span class="sub">${escapeHtml(row.spot_quote_asset)}</span></div></td>
           <td><span class="main">${escapeHtml(row.futures_symbol)}</span></td>
-          <td><div class="stack"><span class="main">${fmtPct(row.earn_apr)}</span><span class="sub">${row.can_redeem ? "可赎回" : "无/不可赎回"}</span></div></td>
+          <td><div class="stack"><span class="main">${row.funding_rate > 0 ? fmtPct(row.earn_apr) : escapeHtml(row.borrow_status || "借贷待确认")}</span><span class="sub">${row.funding_rate > 0 ? (row.can_redeem ? "活期可赎回" : "无/不可赎回") : `${escapeHtml(row.borrow_source || "—")} ${fmtPct(row.borrow_annualized)}/年`}</span></div></td>
           <td><div class="stack"><span class="main">${fmtSignedPct(row.funding_rate, 4)}</span><span class="sub">每 ${escapeHtml(row.funding_interval_hours)}h</span></div></td>
-          <td><span class="main">${fmtSignedPct(row.live_combined_annualized)}</span></td>
+          <td><div class="stack"><span class="main">${fmtSignedPct(row.live_combined_annualized)}</span><span class="sub">资金费毛年化 ${fmtSignedPct(row.funding_annualized)}</span></div></td>
           <td><div class="stack"><span class="main">${fmtSignedPct(row.combined_30d_annualized)}</span><span class="sub">资金费30日 ${fmtSignedPct(row.funding_30d_annualized)}</span></div></td>
           <td>${fmtSignedPct(row.entry_spread)}</td>
           <td>${Math.floor(Number(row.history_days) || 0)} 天 / ${Number(row.settlements_30d) || 0} 期</td>
@@ -36216,6 +36217,45 @@ def _fetch_usdm_funding_interval_hours() -> dict[str, int]:
     }
 
 
+def _assess_carry_borrow(item: dict[str, Any], refs: dict[str, Any]) -> dict[str, Any]:
+    payload = _build_borrow_payload_for_item(item, refs)
+    options: list[dict[str, Any]] = []
+    for source, node in (("Cross", payload.get("cross")), ("逐仓", payload.get("isolated"))):
+        if not isinstance(node, dict) or node.get("supported") is not True or node.get("restricted"):
+            continue
+        hourly = node.get("next_hourly_interest_rate")
+        if not isinstance(hourly, (int, float)) or hourly < 0 or not math.isfinite(hourly):
+            continue
+        max_borrow = node.get("max_borrow")
+        confirmed = payload.get("mode") == "full" and isinstance(max_borrow, (int, float)) and max_borrow > 0
+        options.append(
+            {
+                "source": source,
+                "annual_rate": float(hourly) * 24 * 365,
+                "confirmed": confirmed,
+            }
+        )
+    vip = payload.get("vip")
+    if isinstance(vip, dict) and vip.get("available") is True:
+        yearly = vip.get("flexible_yearly_interest_rate")
+        if isinstance(yearly, (int, float)) and yearly >= 0 and math.isfinite(yearly):
+            options.append({"source": "VIP", "annual_rate": float(yearly), "confirmed": True})
+    if not options:
+        return {
+            "borrow_status": "借贷待确认",
+            "borrow_source": None,
+            "borrow_annualized": None,
+            "borrow_confirmed": False,
+        }
+    best = min(options, key=lambda option: option["annual_rate"])
+    return {
+        "borrow_status": "可借已确认" if best["confirmed"] else "理论可借",
+        "borrow_source": best["source"],
+        "borrow_annualized": best["annual_rate"],
+        "borrow_confirmed": best["confirmed"],
+    }
+
+
 def _build_arbitrage_carry_payload() -> dict[str, Any]:
     global CARRY_OPPORTUNITIES_CACHE
     now_monotonic = time.monotonic()
@@ -36254,6 +36294,7 @@ def _build_arbitrage_carry_payload() -> dict[str, Any]:
         and row.get("spot_quote_asset") in {"USDT", "USDC"}
     ]
     candidates: list[dict[str, Any]] = []
+    negative_funding_rows: list[dict[str, Any]] = []
     for row in exact_rows:
         symbol = str(row["futures_symbol"])
         funding_rate = float(row.get("funding_rate") or 0.0)
@@ -36261,24 +36302,72 @@ def _build_arbitrage_carry_payload() -> dict[str, Any]:
         funding_annualized = funding_rate * (24 / interval_hours) * 365
         earn = earn_by_asset.get(str(row.get("base_asset") or "").upper(), {})
         earn_apr = float(earn.get("apr") or 0.0)
-        live_combined = earn_apr + funding_annualized
-        if funding_rate <= 0 or live_combined <= 0.30:
+        if funding_rate > 0:
+            live_combined = earn_apr + funding_annualized
+            if live_combined <= 0.30:
+                continue
+            candidates.append(
+                {
+                    "asset": row["base_asset"],
+                    "spot_symbol": row["spot_symbol"],
+                    "futures_symbol": symbol,
+                    "spot_quote_asset": row["spot_quote_asset"],
+                    "strategy": "买现货 / 卖永续",
+                    "funding_side": "空永续收款",
+                    "funding_rate": funding_rate,
+                    "funding_interval_hours": interval_hours,
+                    "funding_annualized": funding_annualized,
+                    "earn_apr": earn_apr,
+                    "can_redeem": earn.get("can_redeem"),
+                    "borrow_status": "不需要借币",
+                    "borrow_source": None,
+                    "borrow_annualized": 0.0,
+                    "borrow_confirmed": True,
+                    "live_combined_annualized": live_combined,
+                    "entry_spread": row.get("spread_long_spot_short_perp"),
+                }
+            )
             continue
-        candidates.append(
-            {
-                "asset": row["base_asset"],
-                "spot_symbol": row["spot_symbol"],
-                "futures_symbol": symbol,
-                "spot_quote_asset": row["spot_quote_asset"],
-                "funding_rate": funding_rate,
-                "funding_interval_hours": interval_hours,
-                "funding_annualized": funding_annualized,
-                "earn_apr": earn_apr,
-                "can_redeem": earn.get("can_redeem"),
-                "live_combined_annualized": live_combined,
-                "entry_spread": row.get("spread_long_spot_short_perp"),
-            }
+        if funding_rate < 0 and -funding_annualized > 0.30:
+            negative_funding_rows.append(
+                {
+                    "asset": row["base_asset"],
+                    "spot_symbol": row["spot_symbol"],
+                    "futures_symbol": symbol,
+                    "spot_quote_asset": row["spot_quote_asset"],
+                    "strategy": "借币卖现货 / 买永续",
+                    "funding_side": "多永续收款",
+                    "funding_rate": funding_rate,
+                    "funding_interval_hours": interval_hours,
+                    "funding_annualized": -funding_annualized,
+                    "earn_apr": 0.0,
+                    "can_redeem": None,
+                    "entry_spread": row.get("spread_short_spot_long_perp"),
+                }
+            )
+
+    if negative_funding_rows:
+        refs = _load_borrow_reference_data(
+            [row["asset"] for row in negative_funding_rows],
+            [row["spot_symbol"] for row in negative_funding_rows],
         )
+        for row in negative_funding_rows:
+            borrow = _assess_carry_borrow(
+                {
+                    "arbitrage_side": "short_spot_long_perp",
+                    "base_asset": row["asset"],
+                    "spot_symbol": row["spot_symbol"],
+                },
+                refs,
+            )
+            row.update(borrow)
+            borrow_annualized = borrow["borrow_annualized"]
+            row["live_combined_annualized"] = (
+                row["funding_annualized"] - borrow_annualized
+                if isinstance(borrow_annualized, (int, float))
+                else None
+            )
+            candidates.append(row)
 
     errors: dict[str, str] = {}
     start = now - timedelta(days=30)
@@ -36294,10 +36383,16 @@ def _build_arbitrage_carry_payload() -> dict[str, Any]:
                 observed_start = max(start, history[0][0]) if history else now
                 coverage_days = max((now - observed_start).total_seconds() / 86400, 0.0)
                 rates = [rate for timestamp, rate in history if timestamp >= start]
-                return_30d = _compound_funding_return(rates)
+                funding_rates = rates if row["funding_rate"] > 0 else [-rate for rate in rates]
+                return_30d = _compound_funding_return(funding_rates)
                 if return_30d is not None and coverage_days >= 29:
                     funding_30d_annualized = (1 + return_30d) ** (365 / coverage_days) - 1
-                    combined_30d_annualized = row["earn_apr"] + funding_30d_annualized
+                    if row["funding_rate"] > 0:
+                        combined_30d_annualized = row["earn_apr"] + funding_30d_annualized
+                    elif isinstance(row["borrow_annualized"], (int, float)):
+                        combined_30d_annualized = funding_30d_annualized - row["borrow_annualized"]
+                    else:
+                        combined_30d_annualized = None
                 else:
                     funding_30d_annualized = None
                     combined_30d_annualized = None
@@ -36322,22 +36417,30 @@ def _build_arbitrage_carry_payload() -> dict[str, Any]:
                     }
                 )
     for row in candidates:
-        if row["combined_30d_annualized"] is not None and row["combined_30d_annualized"] > 0.30:
+        if row["funding_rate"] < 0 and row["live_combined_annualized"] is None:
+            row["status"] = "借贷待确认"
+        elif row["funding_rate"] < 0 and row["live_combined_annualized"] <= 0.30:
+            row["status"] = "利息不覆盖"
+        elif row["combined_30d_annualized"] is not None and row["combined_30d_annualized"] > 0.30:
             row["status"] = "已验证"
         elif row["history_days"] < 29:
             row["status"] = "新币观察"
         else:
             row["status"] = "瞬时观察"
-    candidates.sort(key=lambda row: row["live_combined_annualized"], reverse=True)
+    candidates.sort(key=lambda row: row["live_combined_annualized"] or float("-inf"), reverse=True)
     result = {
         "ok": True,
         "as_of": now.isoformat(),
         "eligible_pairs": len(exact_rows),
-        "qualified_count": len(candidates),
+        "qualified_count": sum(
+            isinstance(row["live_combined_annualized"], (int, float))
+            and row["live_combined_annualized"] > 0.30
+            for row in candidates
+        ),
         "verified_count": sum(row["status"] == "已验证" for row in candidates),
         "rows": candidates,
         "errors": errors,
-        "convention": "实时预估 = 当前资金费率 × 每年结算次数 + 活期 APR；30日验证使用实际结算资金费复利年化。仅含 Binance 同交易对现货与 USDⓈ-M 永续，未扣交易费、滑点、基差与容量限制。",
+        "convention": "正资金费：当前资金费率年化 + 活期 APR；负资金费：多永续资金费收入年化 − 可用借币年化利率。30日验证使用实际结算资金费复利年化。仅含 Binance 同交易对现货与 USDⓈ-M 永续，未扣交易费、滑点、基差与容量限制。",
     }
     with CARRY_OPPORTUNITIES_CACHE_LOCK:
         CARRY_OPPORTUNITIES_CACHE = (time.monotonic(), result)
