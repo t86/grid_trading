@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 
 from grid_optimizer.web import (
     COMPETITION_VOLUME_PAGE,
+    BASIS_PAGE,
     MARKET_DATA_PAGE,
     MARKET_DATA_SYMBOLS,
     _evaluate_alpha_funding_candidate,
@@ -159,6 +160,11 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("/api/market-data/funding-summary", MARKET_DATA_PAGE)
         self.assertIn("/api/market-data/simple-earn", MARKET_DATA_PAGE)
         self.assertIn("近365日", MARKET_DATA_PAGE)
+
+    def test_basis_page_contains_carry_opportunity_panel(self) -> None:
+        self.assertIn("现货 / 永续对冲收益候选", BASIS_PAGE)
+        self.assertIn("/api/arbitrage_carry", BASIS_PAGE)
+        self.assertIn("近30日验证年化", BASIS_PAGE)
 
     def test_market_data_funding_summary_compounds_short_perp_return(self) -> None:
         now = datetime(2026, 8, 22, tzinfo=timezone.utc)

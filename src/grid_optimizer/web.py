@@ -230,6 +230,9 @@ RUNNING_STATUS_API_RESPONSE_CACHE: dict[str, tuple[float, bytes]] = {}
 RUNNING_STATUS_API_RESPONSE_CACHE_LOCK = threading.Lock()
 BASIS_CACHE: dict[str, dict[str, Any]] = {}
 BASIS_CACHE_LOCK = threading.Lock()
+CARRY_OPPORTUNITIES_CACHE: tuple[float, dict[str, Any]] | None = None
+CARRY_OPPORTUNITIES_CACHE_LOCK = threading.Lock()
+CARRY_OPPORTUNITIES_CACHE_SECONDS = 300
 DETAIL_CACHE: dict[str, dict[str, Any]] = {}
 DETAIL_CACHE_LOCK = threading.Lock()
 LAST_FUNDING_CACHE: dict[str, dict[str, Any]] = {}
@@ -17531,6 +17534,9 @@ _ALPHA_FUNDING_ROUND_TRIP_COST = float(os.environ.get("ALPHA_FUNDING_ROUND_TRIP_
 _MARKET_DATA_EARN_CACHE: tuple[float, dict[str, Any]] | None = None
 _MARKET_DATA_EARN_CACHE_LOCK = threading.Lock()
 _MARKET_DATA_EARN_CACHE_SECONDS = 300
+_MARKET_DATA_EARN_PRODUCTS_CACHE: tuple[float, list[dict[str, Any]]] | None = None
+_MARKET_DATA_EARN_PRODUCTS_CACHE_LOCK = threading.Lock()
+_MARKET_DATA_EARN_PRODUCTS_CACHE_SECONDS = 300
 _MARKET_DATA_EARN_FUNDING_CACHE: tuple[float, dict[str, Any]] | None = None
 _MARKET_DATA_EARN_FUNDING_CACHE_LOCK = threading.Lock()
 _MARKET_DATA_EARN_FUNDING_CACHE_SECONDS = 300
@@ -17764,14 +17770,13 @@ def _build_market_data_funding_payload() -> dict[str, Any]:
     return payload
 
 
-def _build_market_data_simple_earn_payload() -> dict[str, Any]:
-    global _MARKET_DATA_EARN_CACHE
+def _fetch_market_data_simple_earn_products() -> list[dict[str, Any]]:
+    global _MARKET_DATA_EARN_PRODUCTS_CACHE
     now_monotonic = time.monotonic()
-    with _MARKET_DATA_EARN_CACHE_LOCK:
-        cached = _MARKET_DATA_EARN_CACHE
-        if cached is not None and now_monotonic - cached[0] < _MARKET_DATA_EARN_CACHE_SECONDS:
+    with _MARKET_DATA_EARN_PRODUCTS_CACHE_LOCK:
+        cached = _MARKET_DATA_EARN_PRODUCTS_CACHE
+        if cached is not None and now_monotonic - cached[0] < _MARKET_DATA_EARN_PRODUCTS_CACHE_SECONDS:
             return cached[1]
-
     credentials = load_binance_api_credentials()
     if credentials is None:
         raise RuntimeError("Binance API credentials are unavailable")
@@ -17793,6 +17798,21 @@ def _build_market_data_simple_earn_payload() -> dict[str, Any]:
         )
         if isinstance(payload, dict):
             product_rows.extend(item for item in payload.get("rows", []) if isinstance(item, dict))
+    with _MARKET_DATA_EARN_PRODUCTS_CACHE_LOCK:
+        _MARKET_DATA_EARN_PRODUCTS_CACHE = (time.monotonic(), product_rows)
+    return product_rows
+
+
+def _build_market_data_simple_earn_payload() -> dict[str, Any]:
+    global _MARKET_DATA_EARN_CACHE
+    now_monotonic = time.monotonic()
+    with _MARKET_DATA_EARN_CACHE_LOCK:
+        cached = _MARKET_DATA_EARN_CACHE
+        if cached is not None and now_monotonic - cached[0] < _MARKET_DATA_EARN_CACHE_SECONDS:
+            return cached[1]
+
+    product_rows = _fetch_market_data_simple_earn_products()
+    total = len(product_rows)
 
     rows: list[dict[str, Any]] = []
     for product in product_rows:
@@ -22140,6 +22160,19 @@ BASIS_PAGE = """<!doctype html>
     </section>
 
     <section class="card">
+      <h2 style="margin:0 0 6px;">现货 / 永续对冲收益候选</h2>
+      <p class="msg" id="carry_summary">正在扫描活期 APR 与资金费率…</p>
+      <div class="table-wrap" style="margin-top:12px;">
+        <table>
+          <thead><tr>
+            <th>状态</th><th>现货</th><th>永续</th><th>活期 APR</th><th>当前资金费</th><th>实时预估年化</th><th>近30日验证年化</th><th>入场价差</th><th>历史覆盖</th>
+          </tr></thead>
+          <tbody id="carry_tbody"><tr><td colspan="9">正在加载…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
       <div class="grid">
         <div class="field">
           <label>合约类型</label>
@@ -22269,6 +22302,8 @@ BASIS_PAGE = """<!doctype html>
     const statusEl = document.getElementById("status");
     const summaryEl = document.getElementById("summary");
     const tbody = document.getElementById("tbody");
+    const carrySummaryEl = document.getElementById("carry_summary");
+    const carryTbody = document.getElementById("carry_tbody");
 
     let rawRows = [];
     let autoTimer = null;
@@ -22729,6 +22764,45 @@ BASIS_PAGE = """<!doctype html>
       scheduleVisibleDetailsLoad();
     }
 
+    function carryStatusPill(status) {
+      const cls = status === "已验证" ? "good" : status === "新币观察" ? "warn" : "neutral";
+      return `<span class="pill ${cls}">${escapeHtml(status || "观察")}</span>`;
+    }
+
+    function renderCarry(data) {
+      const rows = Array.isArray(data.rows) ? data.rows : [];
+      carrySummaryEl.textContent = `已更新：${fmtDateTime(data.as_of)} · ${data.eligible_pairs || 0} 组 Binance 同交易对现货/永续中，${data.qualified_count || 0} 组实时预估年化超过 30%，${data.verified_count || 0} 组通过近30日验证。${data.convention || ""}`;
+      if (!rows.length) {
+        carryTbody.innerHTML = `<tr><td colspan="9">当前没有资金费率为正且“资金费年化 + 活期 APR”超过 30% 的同交易对对冲机会。</td></tr>`;
+        return;
+      }
+      carryTbody.innerHTML = rows.map((row) => `
+        <tr>
+          <td>${carryStatusPill(row.status)}<div class="sub">仅作扫描，非下单信号</div></td>
+          <td><div class="stack"><span class="main">${escapeHtml(row.spot_symbol)}</span><span class="sub">${escapeHtml(row.spot_quote_asset)}</span></div></td>
+          <td><span class="main">${escapeHtml(row.futures_symbol)}</span></td>
+          <td><div class="stack"><span class="main">${fmtPct(row.earn_apr)}</span><span class="sub">${row.can_redeem ? "可赎回" : "无/不可赎回"}</span></div></td>
+          <td><div class="stack"><span class="main">${fmtSignedPct(row.funding_rate, 4)}</span><span class="sub">每 ${escapeHtml(row.funding_interval_hours)}h</span></div></td>
+          <td><span class="main">${fmtSignedPct(row.live_combined_annualized)}</span></td>
+          <td><div class="stack"><span class="main">${fmtSignedPct(row.combined_30d_annualized)}</span><span class="sub">资金费30日 ${fmtSignedPct(row.funding_30d_annualized)}</span></div></td>
+          <td>${fmtSignedPct(row.entry_spread)}</td>
+          <td>${Math.floor(Number(row.history_days) || 0)} 天 / ${Number(row.settlements_30d) || 0} 期</td>
+        </tr>
+      `).join("");
+    }
+
+    async function loadCarry() {
+      try {
+        const resp = await fetch("/api/arbitrage_carry");
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `请求失败(${resp.status})`);
+        renderCarry(data);
+      } catch (err) {
+        carrySummaryEl.textContent = `对冲收益扫描失败：${err.message}`;
+        carryTbody.innerHTML = `<tr><td colspan="9">暂时无法加载，请稍后刷新页面。</td></tr>`;
+      }
+    }
+
     async function loadVisibleDetails() {
       detailLoadTimer = null;
       if (!rawRows.length) return 0;
@@ -22800,6 +22874,7 @@ BASIS_PAGE = """<!doctype html>
         clearDetailState();
         rawRows = Array.isArray(data.rows) ? data.rows : [];
         renderTable();
+        void loadCarry();
         await loadVisibleDetails();
         const source = data.meta && data.meta.stale
           ? "上次成功快照回退"
@@ -22892,6 +22967,7 @@ BASIS_PAGE = """<!doctype html>
 
     updateHeaderArrows();
     renderTable();
+    void loadCarry();
     setStatus("等待手动刷新。");
   </script>
 </body>
@@ -36124,6 +36200,150 @@ def _run_basis_monitor(params: dict[str, Any]) -> dict[str, Any]:
         raise
 
 
+def _fetch_usdm_funding_interval_hours() -> dict[str, int]:
+    request = Request(
+        "https://fapi.binance.com/fapi/v1/fundingInfo",
+        headers={"User-Agent": "grid-web/arbitrage-carry"},
+    )
+    with urlopen(request, timeout=12) as response:
+        payload = json.load(response)
+    if not isinstance(payload, list):
+        raise RuntimeError("unexpected fundingInfo payload")
+    return {
+        str(item.get("symbol") or "").upper(): int(item.get("fundingIntervalHours") or 8)
+        for item in payload
+        if isinstance(item, dict) and str(item.get("symbol") or "").strip()
+    }
+
+
+def _build_arbitrage_carry_payload() -> dict[str, Any]:
+    global CARRY_OPPORTUNITIES_CACHE
+    now_monotonic = time.monotonic()
+    with CARRY_OPPORTUNITIES_CACHE_LOCK:
+        cached = CARRY_OPPORTUNITIES_CACHE
+        if cached is not None and now_monotonic - cached[0] < CARRY_OPPORTUNITIES_CACHE_SECONDS:
+            return cached[1]
+
+    now = datetime.now(timezone.utc)
+    basis = _run_basis_monitor(
+        {
+            "contract_type": "usdm",
+            "spot_quote_mode": "major_stables",
+            "max_symbols": 0,
+            "cache_ttl_seconds": 5,
+            "refresh": False,
+        }
+    )
+    earn_by_asset: dict[str, dict[str, Any]] = {}
+    for product in _fetch_market_data_simple_earn_products():
+        if not bool(product.get("canPurchase")) or bool(product.get("isSoldOut")):
+            continue
+        try:
+            apr = float(product.get("latestAnnualPercentageRate") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        asset = str(product.get("asset") or "").upper()
+        if asset and (asset not in earn_by_asset or apr > earn_by_asset[asset]["apr"]):
+            earn_by_asset[asset] = {"apr": apr, "can_redeem": bool(product.get("canRedeem"))}
+
+    intervals = _fetch_usdm_funding_interval_hours()
+    exact_rows = [
+        row
+        for row in basis["rows"]
+        if row.get("spot_symbol") == row.get("futures_symbol")
+        and row.get("spot_quote_asset") in {"USDT", "USDC"}
+    ]
+    candidates: list[dict[str, Any]] = []
+    for row in exact_rows:
+        symbol = str(row["futures_symbol"])
+        funding_rate = float(row.get("funding_rate") or 0.0)
+        interval_hours = intervals.get(symbol, 8)
+        funding_annualized = funding_rate * (24 / interval_hours) * 365
+        earn = earn_by_asset.get(str(row.get("base_asset") or "").upper(), {})
+        earn_apr = float(earn.get("apr") or 0.0)
+        live_combined = earn_apr + funding_annualized
+        if funding_rate <= 0 or live_combined <= 0.30:
+            continue
+        candidates.append(
+            {
+                "asset": row["base_asset"],
+                "spot_symbol": row["spot_symbol"],
+                "futures_symbol": symbol,
+                "spot_quote_asset": row["spot_quote_asset"],
+                "funding_rate": funding_rate,
+                "funding_interval_hours": interval_hours,
+                "funding_annualized": funding_annualized,
+                "earn_apr": earn_apr,
+                "can_redeem": earn.get("can_redeem"),
+                "live_combined_annualized": live_combined,
+                "entry_spread": row.get("spread_long_spot_short_perp"),
+            }
+        )
+
+    errors: dict[str, str] = {}
+    start = now - timedelta(days=30)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(_fetch_market_data_funding_history, row["futures_symbol"]): row
+            for row in candidates
+        }
+        for future in as_completed(futures):
+            row = futures[future]
+            try:
+                history = future.result()
+                observed_start = max(start, history[0][0]) if history else now
+                coverage_days = max((now - observed_start).total_seconds() / 86400, 0.0)
+                rates = [rate for timestamp, rate in history if timestamp >= start]
+                return_30d = _compound_funding_return(rates)
+                if return_30d is not None and coverage_days >= 29:
+                    funding_30d_annualized = (1 + return_30d) ** (365 / coverage_days) - 1
+                    combined_30d_annualized = row["earn_apr"] + funding_30d_annualized
+                else:
+                    funding_30d_annualized = None
+                    combined_30d_annualized = None
+                row.update(
+                    {
+                        "funding_30d_return": return_30d,
+                        "funding_30d_annualized": funding_30d_annualized,
+                        "combined_30d_annualized": combined_30d_annualized,
+                        "history_days": coverage_days,
+                        "settlements_30d": len(rates),
+                    }
+                )
+            except Exception as exc:
+                errors[row["futures_symbol"]] = f"{type(exc).__name__}: {exc}"
+                row.update(
+                    {
+                        "funding_30d_return": None,
+                        "funding_30d_annualized": None,
+                        "combined_30d_annualized": None,
+                        "history_days": 0.0,
+                        "settlements_30d": 0,
+                    }
+                )
+    for row in candidates:
+        if row["combined_30d_annualized"] is not None and row["combined_30d_annualized"] > 0.30:
+            row["status"] = "已验证"
+        elif row["history_days"] < 29:
+            row["status"] = "新币观察"
+        else:
+            row["status"] = "瞬时观察"
+    candidates.sort(key=lambda row: row["live_combined_annualized"], reverse=True)
+    result = {
+        "ok": True,
+        "as_of": now.isoformat(),
+        "eligible_pairs": len(exact_rows),
+        "qualified_count": len(candidates),
+        "verified_count": sum(row["status"] == "已验证" for row in candidates),
+        "rows": candidates,
+        "errors": errors,
+        "convention": "实时预估 = 当前资金费率 × 每年结算次数 + 活期 APR；30日验证使用实际结算资金费复利年化。仅含 Binance 同交易对现货与 USDⓈ-M 永续，未扣交易费、滑点、基差与容量限制。",
+    }
+    with CARRY_OPPORTUNITIES_CACHE_LOCK:
+        CARRY_OPPORTUNITIES_CACHE = (time.monotonic(), result)
+    return result
+
+
 def _chunked(items: list[str], size: int) -> list[list[str]]:
     if size <= 0:
         raise ValueError("size must be > 0")
@@ -39838,6 +40058,12 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/market-data/simple-earn-funding":
             try:
                 self._send_json(_build_market_data_simple_earn_funding_payload(), status=HTTPStatus.OK)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=502)
+            return
+        if path == "/api/arbitrage_carry":
+            try:
+                self._send_json(_build_arbitrage_carry_payload(), status=HTTPStatus.OK)
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=502)
             return
