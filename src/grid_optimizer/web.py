@@ -67,6 +67,7 @@ from .competition_board import (
     resolve_active_competition_board,
     upsert_competition_entry,
 )
+from .carry_watchlist import bark_configured, load_watchlist, update_watchlist
 from .console_overview import _fetch_remote_json
 from .console_registry import load_console_registry
 from .master_sprint import MASTER_SPRINT_PAGE, build_master_sprint_snapshot
@@ -22162,12 +22163,13 @@ BASIS_PAGE = """<!doctype html>
     <section class="card">
       <h2 style="margin:0 0 6px;">现货 / 永续对冲收益候选</h2>
       <p class="msg" id="carry_summary">正在扫描活期 APR 与资金费率…</p>
+      <p class="msg" id="carry_watchlist">正在加载持有观察池…</p>
       <div class="table-wrap" style="margin-top:12px;">
         <table>
           <thead><tr>
-            <th>状态</th><th>对冲方向</th><th>现货</th><th>永续</th><th>活期 / 借币</th><th>当前资金费</th><th>净实时预估年化</th><th>近30日验证年化</th><th>入场价差</th><th>历史覆盖</th>
+            <th>状态</th><th>对冲方向</th><th>现货</th><th>永续</th><th>活期 / 借币</th><th>当前资金费</th><th>净实时预估年化</th><th>近30日验证年化</th><th>入场价差</th><th>历史覆盖</th><th>持有观察</th>
           </tr></thead>
-          <tbody id="carry_tbody"><tr><td colspan="10">正在加载…</td></tr></tbody>
+          <tbody id="carry_tbody"><tr><td colspan="11">正在加载…</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -22304,6 +22306,7 @@ BASIS_PAGE = """<!doctype html>
     const tbody = document.getElementById("tbody");
     const carrySummaryEl = document.getElementById("carry_summary");
     const carryTbody = document.getElementById("carry_tbody");
+    const carryWatchlistEl = document.getElementById("carry_watchlist");
 
     let rawRows = [];
     let autoTimer = null;
@@ -22313,6 +22316,9 @@ BASIS_PAGE = """<!doctype html>
     let detailLoadTimer = null;
     let loadedDetailKeys = new Set();
     let pendingDetailKeys = new Set();
+    let carryWatchlist = new Set();
+    let carryBarkConfigured = false;
+    let carryData = null;
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -22773,7 +22779,7 @@ BASIS_PAGE = """<!doctype html>
       const rows = Array.isArray(data.rows) ? data.rows : [];
       carrySummaryEl.textContent = `已更新：${fmtDateTime(data.as_of)} · ${data.eligible_pairs || 0} 组 Binance 同交易对现货/永续中，${data.qualified_count || 0} 组净实时预估年化超过 30%，${data.verified_count || 0} 组通过近30日验证。${data.convention || ""}`;
       if (!rows.length) {
-        carryTbody.innerHTML = `<tr><td colspan="10">当前没有资金费收入扣除活期或借币成本后超过 30% 的同交易对对冲机会。</td></tr>`;
+        carryTbody.innerHTML = `<tr><td colspan="11">当前没有资金费收入扣除活期或借币成本后超过 30% 的同交易对对冲机会。</td></tr>`;
         return;
       }
       carryTbody.innerHTML = rows.map((row) => `
@@ -22788,8 +22794,47 @@ BASIS_PAGE = """<!doctype html>
           <td><div class="stack"><span class="main">${fmtSignedPct(row.combined_30d_annualized)}</span><span class="sub">资金费30日 ${fmtSignedPct(row.funding_30d_annualized)}</span></div></td>
           <td>${fmtSignedPct(row.entry_spread)}</td>
           <td>${Math.floor(Number(row.history_days) || 0)} 天 / ${Number(row.settlements_30d) || 0} 期</td>
+          <td><button class="carry-watch-btn" data-symbol="${escapeHtml(row.futures_symbol)}">${carryWatchlist.has(row.futures_symbol) ? "移出观察池" : "加入观察池"}</button></td>
         </tr>
       `).join("");
+      carryTbody.querySelectorAll(".carry-watch-btn").forEach((button) => {
+        button.addEventListener("click", () => updateCarryWatchlist(button.dataset.symbol));
+      });
+    }
+
+    function renderCarryWatchlist() {
+      const symbols = [...carryWatchlist].sort();
+      const monitor = carryBarkConfigured ? "Bark 已配置；正转负时每天最多提醒一次。" : "Bark 未配置；观察池会保存，但不会发送通知。";
+      carryWatchlistEl.textContent = `${monitor} 当前持有观察：${symbols.length ? symbols.join("、") : "无"}`;
+    }
+
+    async function loadCarryWatchlist() {
+      try {
+        const response = await fetch("/api/carry-watchlist");
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) throw new Error(payload.error || `请求失败(${response.status})`);
+        carryWatchlist = new Set(payload.symbols || []);
+        carryBarkConfigured = Boolean(payload.bark_configured);
+        renderCarryWatchlist();
+        if (carryData) renderCarry(carryData);
+      } catch (error) {
+        carryWatchlistEl.textContent = `观察池加载失败：${error.message}`;
+      }
+    }
+
+    async function updateCarryWatchlist(symbol) {
+      const action = carryWatchlist.has(symbol) ? "remove" : "add";
+      try {
+        const response = await fetch("/api/carry-watchlist", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action,symbol})});
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) throw new Error(payload.error || `请求失败(${response.status})`);
+        carryWatchlist = new Set(payload.symbols || []);
+        carryBarkConfigured = Boolean(payload.bark_configured);
+        renderCarryWatchlist();
+        if (carryData) renderCarry(carryData);
+      } catch (error) {
+        carryWatchlistEl.textContent = `观察池更新失败：${error.message}`;
+      }
     }
 
     async function loadCarry() {
@@ -22797,10 +22842,11 @@ BASIS_PAGE = """<!doctype html>
         const resp = await fetch("/api/arbitrage_carry");
         const data = await resp.json();
         if (!resp.ok || !data.ok) throw new Error(data.error || `请求失败(${resp.status})`);
+        carryData = data;
         renderCarry(data);
       } catch (err) {
         carrySummaryEl.textContent = `对冲收益扫描失败：${err.message}`;
-        carryTbody.innerHTML = `<tr><td colspan="9">暂时无法加载，请稍后刷新页面。</td></tr>`;
+        carryTbody.innerHTML = `<tr><td colspan="11">暂时无法加载，请稍后刷新页面。</td></tr>`;
       }
     }
 
@@ -22968,6 +23014,7 @@ BASIS_PAGE = """<!doctype html>
 
     updateHeaderArrows();
     renderTable();
+    void loadCarryWatchlist();
     void loadCarry();
     setStatus("等待手动刷新。");
   </script>
@@ -40173,6 +40220,12 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=502)
             return
+        if path == "/api/carry-watchlist":
+            self._send_json(
+                {"ok": True, "symbols": load_watchlist(), "bark_configured": bark_configured()},
+                status=HTTPStatus.OK,
+            )
+            return
         if path == "/api/health":
             self._send_json({"ok": True}, status=HTTPStatus.OK)
             return
@@ -40705,6 +40758,31 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if not self._authorize_request():
+            return
+        if path == "/api/carry-watchlist":
+            try:
+                content_len = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._send_json({"ok": False, "error": "Invalid Content-Length"}, status=400)
+                return
+            if content_len <= 0 or content_len > 4096:
+                self._send_json({"ok": False, "error": "Invalid payload size"}, status=400)
+                return
+            try:
+                payload = json.loads(self.rfile.read(content_len).decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("JSON body must be an object")
+                action = str(payload.get("action") or "").strip().lower()
+                if action not in {"add", "remove"}:
+                    raise ValueError("action must be add or remove")
+                symbols = update_watchlist(str(payload.get("symbol") or ""), action == "add")
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json({"ok": True, "symbols": symbols, "bark_configured": bark_configured()}, status=HTTPStatus.OK)
             return
         if path == "/api/maintenance/recover_web":
             try:
