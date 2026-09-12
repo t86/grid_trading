@@ -285,6 +285,8 @@ def check_watchlist(*, watchlist_path: Path = DEFAULT_WATCHLIST_PATH, state_path
             streak = int(prev.get("streak", 0)) + 1 if matched else 0
             confirmed = matched and streak >= rule["confirmations"]
             current.update(matched=matched, streak=streak, confirmed=confirmed)
+            if not matched:
+                current["notified_for_match"] = False
             if value != 0:
                 current["last_nonzero"] = value
             due = confirmed
@@ -293,15 +295,21 @@ def check_watchlist(*, watchlist_path: Path = DEFAULT_WATCHLIST_PATH, state_path
             elif rule["frequency"] == "repeat":
                 due = due and now.timestamp() - prev.get("last_notice_ts", 0) >= rule["interval_minutes"] * 60
             else:
-                due = due and not prev.get("confirmed", False)
+                due = due and not prev.get("notified_for_match", False)
             if due:
+                if rule["channel"] == "bark" and not bark_configured():
+                    # No delivery was attempted. Configuring Bark later should
+                    # allow the next check to notify, even in daily/edge mode.
+                    current["last_notification"] = {"error": "Bark 未配置"}
+                    states[rule["id"]] = current
+                    continue
                 title = f"合约监控：{rule['symbol']}"
                 unit = "" if rule["condition"].startswith("price_") else "%"
                 body = f"{rule['market']} · {rule_label(rule)}；当前值 {value:g}{unit}。{now.astimezone(_SHANGHAI).strftime('%m-%d %H:%M')} 北京时间"
                 event = {"rule_id": rule["id"], "symbol": rule["symbol"], "time": now.isoformat(), "body": body, "channel": rule["channel"], "sent": False}
                 # Reserve the notification before the network call. A timeout or
                 # process restart cannot produce repeated posts in the interval.
-                current.update(last_notice_day=day, last_notice_ts=now.timestamp())
+                current.update(last_notice_day=day, last_notice_ts=now.timestamp(), notified_for_match=True)
                 states[rule["id"]] = current
                 _save_json(state_path, {**state, "rules": states, "events": events[-200:]})
                 if rule["channel"] in {"bark", "both"}:

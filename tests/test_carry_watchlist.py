@@ -51,6 +51,15 @@ class CarryWatchlistTests(unittest.TestCase):
         for minutes in [0, 5, 10, 15, 20, 30]: self.check(minutes=minutes)
         self.assertEqual(self.send.call_count, 3)
 
+    def test_configuring_bark_does_not_lose_pending_alert(self):
+        self.rule(frequency='edge')
+        with patch.object(monitor, 'bark_configured', return_value=False):
+            self.check()
+        self.send.assert_not_called()
+        self.check(minutes=5)
+        self.check(minutes=10)
+        self.send.assert_called_once()
+
     def test_edge_rearms_only_after_condition_clears(self):
         self.rule(frequency='edge')
         for minutes, rate in enumerate([-.001, -.002, .001, -.001]): self.check(funding=rate, minutes=minutes*5)
