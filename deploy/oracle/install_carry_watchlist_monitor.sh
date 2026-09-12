@@ -25,7 +25,7 @@ TIMER_FILE="/etc/systemd/system/${TIMER_UNIT_NAME}.timer"
 
 sudo tee "$SERVICE_FILE" >/dev/null <<EOF
 [Unit]
-Description=Monitor selected Binance carry funding rates for positive-to-negative changes
+Description=Monitor Binance futures funding and price conditions
 After=network-online.target
 Wants=network-online.target
 

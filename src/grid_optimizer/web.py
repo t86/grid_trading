@@ -67,7 +67,8 @@ from .competition_board import (
     resolve_active_competition_board,
     upsert_competition_entry,
 )
-from .carry_watchlist import bark_configured, load_watchlist, update_watchlist
+from .carry_watchlist import change_rule, save_bark_endpoint, save_rule, search_contracts, watchlist_payload
+from .carry_watchlist_ui import WATCHLIST_PANEL
 from .console_overview import _fetch_remote_json
 from .console_registry import load_console_registry
 from .master_sprint import MASTER_SPRINT_PAGE, build_master_sprint_snapshot
@@ -22163,7 +22164,7 @@ BASIS_PAGE = """<!doctype html>
     <section class="card">
       <h2 style="margin:0 0 6px;">现货 / 永续对冲收益候选</h2>
       <p class="msg" id="carry_summary">正在扫描活期 APR 与资金费率…</p>
-      <p class="msg" id="carry_watchlist">正在加载持有观察池…</p>
+      <p class="msg">合约持有观察现支持全部合约及自定义条件，见上方监控区。</p>
       <div class="table-wrap" style="margin-top:12px;">
         <table>
           <thead><tr>
@@ -22306,7 +22307,6 @@ BASIS_PAGE = """<!doctype html>
     const tbody = document.getElementById("tbody");
     const carrySummaryEl = document.getElementById("carry_summary");
     const carryTbody = document.getElementById("carry_tbody");
-    const carryWatchlistEl = document.getElementById("carry_watchlist");
 
     let rawRows = [];
     let autoTimer = null;
@@ -22317,7 +22317,6 @@ BASIS_PAGE = """<!doctype html>
     let loadedDetailKeys = new Set();
     let pendingDetailKeys = new Set();
     let carryWatchlist = new Set();
-    let carryBarkConfigured = false;
     let carryData = null;
 
     function escapeHtml(value) {
@@ -22794,7 +22793,7 @@ BASIS_PAGE = """<!doctype html>
           <td><div class="stack"><span class="main">${fmtSignedPct(row.combined_30d_annualized)}</span><span class="sub">资金费30日 ${fmtSignedPct(row.funding_30d_annualized)}</span></div></td>
           <td>${fmtSignedPct(row.entry_spread)}</td>
           <td>${Math.floor(Number(row.history_days) || 0)} 天 / ${Number(row.settlements_30d) || 0} 期</td>
-          <td><button class="carry-watch-btn" data-symbol="${escapeHtml(row.futures_symbol)}">${carryWatchlist.has(row.futures_symbol) ? "移出观察池" : "加入观察池"}</button></td>
+          <td><button class="carry-watch-btn" data-symbol="${escapeHtml(row.futures_symbol)}">${carryWatchlist.has(row.futures_symbol) ? "已观察 · 添加条件" : "加入观察池"}</button></td>
         </tr>
       `).join("");
       carryTbody.querySelectorAll(".carry-watch-btn").forEach((button) => {
@@ -22802,38 +22801,16 @@ BASIS_PAGE = """<!doctype html>
       });
     }
 
-    function renderCarryWatchlist() {
-      const symbols = [...carryWatchlist].sort();
-      const monitor = carryBarkConfigured ? "Bark 已配置；正转负时每天最多提醒一次。" : "Bark 未配置；观察池会保存，但不会发送通知。";
-      carryWatchlistEl.textContent = `${monitor} 当前持有观察：${symbols.length ? symbols.join("、") : "无"}`;
-    }
-
-    async function loadCarryWatchlist() {
-      try {
-        const response = await fetch("/api/carry-watchlist");
-        const payload = await response.json();
-        if (!response.ok || !payload.ok) throw new Error(payload.error || `请求失败(${response.status})`);
-        carryWatchlist = new Set(payload.symbols || []);
-        carryBarkConfigured = Boolean(payload.bark_configured);
-        renderCarryWatchlist();
-        if (carryData) renderCarry(carryData);
-      } catch (error) {
-        carryWatchlistEl.textContent = `观察池加载失败：${error.message}`;
-      }
-    }
+    window.addEventListener("carry-watchlist-updated", event => {
+      carryWatchlist = new Set(event.detail.symbols || []);
+      if (carryData) renderCarry(carryData);
+    });
 
     async function updateCarryWatchlist(symbol) {
-      const action = carryWatchlist.has(symbol) ? "remove" : "add";
       try {
-        const response = await fetch("/api/carry-watchlist", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action,symbol})});
-        const payload = await response.json();
-        if (!response.ok || !payload.ok) throw new Error(payload.error || `请求失败(${response.status})`);
-        carryWatchlist = new Set(payload.symbols || []);
-        carryBarkConfigured = Boolean(payload.bark_configured);
-        renderCarryWatchlist();
-        if (carryData) renderCarry(carryData);
+        await window.carryMonitor.add(symbol);
       } catch (error) {
-        carryWatchlistEl.textContent = `观察池更新失败：${error.message}`;
+        document.getElementById("cw-message").textContent = `观察池加载失败：${error.message}`;
       }
     }
 
@@ -23014,13 +22991,15 @@ BASIS_PAGE = """<!doctype html>
 
     updateHeaderArrows();
     renderTable();
-    void loadCarryWatchlist();
     void loadCarry();
     setStatus("等待手动刷新。");
   </script>
 </body>
 </html>
 """
+
+
+BASIS_PAGE = BASIS_PAGE.replace('    <section class="card">\n      <h2 style="margin:0 0 6px;">现货 / 永续对冲收益候选', WATCHLIST_PANEL + '    <section class="card">\n      <h2 style="margin:0 0 6px;">现货 / 永续对冲收益候选')
 
 
 MANUAL_TRADE_PAGE = """<!doctype html>
@@ -40220,11 +40199,14 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=502)
             return
-        if path == "/api/carry-watchlist":
-            self._send_json(
-                {"ok": True, "symbols": load_watchlist(), "bark_configured": bark_configured()},
-                status=HTTPStatus.OK,
-            )
+        if path in {"/api/carry-watchlist", "/api/carry-contracts"}:
+            try:
+                payload = watchlist_payload() if path == "/api/carry-watchlist" else search_contracts(str((query.get("q") or [""])[0]), str((query.get("market") or ["all"])[0]))
+                self._send_json(payload, status=HTTPStatus.OK)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception:
+                self._send_json({"ok": False, "error": "监控数据暂时不可用，请稍后重试"}, status=502)
             return
         if path == "/api/health":
             self._send_json({"ok": True}, status=HTTPStatus.OK)
@@ -40773,16 +40755,23 @@ class _Handler(BaseHTTPRequestHandler):
                 if not isinstance(payload, dict):
                     raise ValueError("JSON body must be an object")
                 action = str(payload.get("action") or "").strip().lower()
-                if action not in {"add", "remove"}:
-                    raise ValueError("action must be add or remove")
-                symbols = update_watchlist(str(payload.get("symbol") or ""), action == "add")
-            except (ValueError, json.JSONDecodeError) as exc:
+                if action == "save":
+                    if not isinstance(payload.get("rule"), dict):
+                        raise ValueError("请提供监控规则")
+                    save_rule(payload["rule"])
+                elif action in {"delete", "toggle"}:
+                    change_rule(str(payload.get("id") or ""), action)
+                elif action == "configure_bark":
+                    save_bark_endpoint(str(payload.get("endpoint") or ""))
+                else:
+                    raise ValueError("未知监控操作，请刷新页面")
+            except (ValueError, TypeError) as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
                 return
-            except Exception as exc:
-                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+            except Exception:
+                self._send_json({"ok": False, "error": "监控更新失败，请稍后重试"}, status=500)
                 return
-            self._send_json({"ok": True, "symbols": symbols, "bark_configured": bark_configured()}, status=HTTPStatus.OK)
+            self._send_json(watchlist_payload(), status=HTTPStatus.OK)
             return
         if path == "/api/maintenance/recover_web":
             try:
