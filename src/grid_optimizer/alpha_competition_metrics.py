@@ -360,7 +360,7 @@ def _list_article_code(item: Mapping[str, Any]) -> str:
     return value.strip()
 
 
-def _list_articles(data: Mapping[str, Any]) -> list[object]:
+def _list_articles(data: Mapping[str, Any], *, target_catalog_id: int = 93) -> list[object]:
     if "articles" in data:
         articles = data.get("articles")
         if not isinstance(articles, list) or len(articles) > 50:
@@ -381,7 +381,7 @@ def _list_articles(data: Mapping[str, Any]) -> list[object]:
             raise RuleParseError("Binance CMS article list is invalid")
         pending.extend(children)
         catalog_id = catalog.get("catalogId")
-        if isinstance(catalog_id, int) and not isinstance(catalog_id, bool) and catalog_id == 93:
+        if isinstance(catalog_id, int) and not isinstance(catalog_id, bool) and catalog_id == target_catalog_id:
             matches.append(catalog)
     if len(matches) != 1:
         raise RuleParseError("Binance CMS article list is invalid")
@@ -457,47 +457,48 @@ class BinanceCompetitionRuleProvider:
         self,
         *,
         now: datetime | None = None,
-        days: int = 60,
+        days: int = 21,
     ) -> list[CompetitionAnnouncement]:
         current = datetime.now(_UTC) if now is None else _require_utc_aware(now, "now")
         cutoff_ms = int((current - timedelta(days=days)).timestamp() * 1000)
         announcements: list[CompetitionAnnouncement] = []
         seen: dict[str, tuple[str, int]] = {}
-        for page_no in range(1, 21):
-            data = self._get_data(
-                _CMS_LIST_PATH,
-                {"type": 1, "catalogId": 93, "pageNo": page_no, "pageSize": 50},
-            )
-            raw_articles = _list_articles(data)
-            releases: list[int] = []
-            for item in raw_articles:
-                if not isinstance(item, Mapping):
-                    raise RuleParseError("Binance CMS article list is invalid")
-                code = _list_article_code(item)
-                release_ms = _article_release_ms(item)
-                releases.append(release_ms)
-                title = item.get("title")
-                if not isinstance(title, str):
-                    raise RuleParseError("Binance CMS article title is invalid")
-                title = title.strip()
-                metadata = (title, release_ms)
-                existing = seen.get(code)
-                if existing is not None:
-                    if existing != metadata:
-                        raise RuleParseError("Binance CMS article metadata conflict")
-                    continue
-                seen[code] = metadata
-                if release_ms < cutoff_ms:
-                    continue
-                announcement = _announcement_from_item(item)
-                if announcement is not None:
-                    announcements.append(announcement)
-            page_is_old = bool(raw_articles) and all(release < cutoff_ms for release in releases)
-            if not raw_articles or page_is_old:
-                break
-        return announcements
+        for catalog_id in (93, 49):
+            for page_no in range(1, 21):
+                data = self._get_data(
+                    _CMS_LIST_PATH,
+                    {"type": 1, "catalogId": catalog_id, "pageNo": page_no, "pageSize": 50},
+                )
+                raw_articles = _list_articles(data, target_catalog_id=catalog_id)
+                releases: list[int] = []
+                for item in raw_articles:
+                    if not isinstance(item, Mapping):
+                        raise RuleParseError("Binance CMS article list is invalid")
+                    code = _list_article_code(item)
+                    release_ms = _article_release_ms(item)
+                    releases.append(release_ms)
+                    title = item.get("title")
+                    if not isinstance(title, str):
+                        raise RuleParseError("Binance CMS article title is invalid")
+                    title = title.strip()
+                    metadata = (title, release_ms)
+                    existing = seen.get(code)
+                    if existing is not None:
+                        if existing != metadata:
+                            raise RuleParseError("Binance CMS article metadata conflict")
+                        continue
+                    seen[code] = metadata
+                    if release_ms < cutoff_ms:
+                        continue
+                    announcement = _announcement_from_item(item)
+                    if announcement is not None:
+                        announcements.append(announcement)
+                page_is_old = bool(raw_articles) and all(release < cutoff_ms for release in releases)
+                if not raw_articles or page_is_old:
+                    break
+        return sorted(announcements, key=lambda item: item.released_at_utc, reverse=True)
 
-    def fetch_recent_symbols(self, *, now: datetime | None = None, days: int = 60) -> list[str]:
+    def fetch_recent_symbols(self, *, now: datetime | None = None, days: int = 21) -> list[str]:
         symbols: list[str] = []
         seen: set[str] = set()
         for announcement in self.fetch_recent_announcements(now=now, days=days):
@@ -537,26 +538,29 @@ class BinanceCompetitionRuleProvider:
         current = datetime.now(_UTC) if now is None else _require_utc_aware(now, "now")
         cutoff_ms = int((current - timedelta(days=60)).timestamp() * 1000)
         candidates: list[CompetitionAnnouncement] = []
-        for page_no in range(1, 21):
-            data = self._get_data(
-                _CMS_LIST_PATH,
-                {"type": 1, "catalogId": 93, "pageNo": page_no, "pageSize": 50},
-            )
-            raw_articles = _list_articles(data)
-            articles: list[Mapping[str, Any]] = []
-            for item in raw_articles:
-                if not isinstance(item, Mapping):
-                    raise RuleParseError("Binance CMS article list is invalid")
-                announcement = _announcement_from_item(item)
-                articles.append(item)
-                if (
-                    announcement is not None
-                    and _article_release_ms(item) >= cutoff_ms
-                    and announcement.symbol == target
-                ):
-                    candidates.append(announcement)
-            page_is_old = bool(articles) and all(_article_release_ms(item) < cutoff_ms for item in articles)
-            if candidates or not articles or page_is_old:
+        for catalog_id in (93, 49):
+            for page_no in range(1, 21):
+                data = self._get_data(
+                    _CMS_LIST_PATH,
+                    {"type": 1, "catalogId": catalog_id, "pageNo": page_no, "pageSize": 50},
+                )
+                raw_articles = _list_articles(data, target_catalog_id=catalog_id)
+                articles: list[Mapping[str, Any]] = []
+                for item in raw_articles:
+                    if not isinstance(item, Mapping):
+                        raise RuleParseError("Binance CMS article list is invalid")
+                    announcement = _announcement_from_item(item)
+                    articles.append(item)
+                    if (
+                        announcement is not None
+                        and _article_release_ms(item) >= cutoff_ms
+                        and announcement.symbol == target
+                    ):
+                        candidates.append(announcement)
+                page_is_old = bool(articles) and all(_article_release_ms(item) < cutoff_ms for item in articles)
+                if candidates or not articles or page_is_old:
+                    break
+            if candidates:
                 break
         if not candidates:
             raise RuleParseError(f"no recent competition announcement for {target}")

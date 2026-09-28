@@ -52,6 +52,8 @@ class _FakeSession:
 
     def get(self, url: str, *, params: dict[str, object], timeout: float) -> _FakeResponse:
         self.calls.append((url, params, timeout))
+        if params.get("catalogId") == 49 and not self.responses:
+            return _official({"catalogs": [{"catalogId": 49, "articles": [], "catalogs": []}]})
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -450,7 +452,46 @@ def test_provider_enumerates_recent_competition_announcements_by_article_code() 
         title=FIXTURES["DOS"]["data"]["title"],
         released_at_utc=datetime.fromtimestamp(release / 1000, tz=UTC),
     )
-    assert [call[1]["pageNo"] for call in session.calls] == [1, 2]
+    assert [call[1]["pageNo"] for call in session.calls] == [1, 2, 1]
+
+
+def test_provider_finds_newest_competition_in_latest_news_catalog() -> None:
+    recent = int((DISCOVERY_NOW - timedelta(days=1)).timestamp() * 1000)
+    older = int((DISCOVERY_NOW - timedelta(days=2)).timestamp() * 1000)
+    coai = {
+        "code": "coai-article",
+        "title": "Binance Alpha Trading Competition: Trade ChainOpera AI (COAI) and Share $200K Worth of Rewards",
+        "releaseDate": recent,
+    }
+    aeon = {
+        "code": "aeon-article",
+        "title": "Binance Alpha Trading Competition: Trade AEON (AEON) and Share $200K Worth of Rewards",
+        "releaseDate": older,
+    }
+    session = _FakeSession([
+        _official({"catalogs": [{"catalogId": 93, "articles": [aeon], "catalogs": []}]}),
+        _official({"catalogs": [{"catalogId": 93, "articles": [], "catalogs": []}]}),
+        _official({"catalogs": [{"catalogId": 49, "articles": [coai], "catalogs": []}]}),
+        _official({"catalogs": [{"catalogId": 49, "articles": [], "catalogs": []}]}),
+    ])
+
+    found = metrics.BinanceCompetitionRuleProvider(session=session).fetch_recent_announcements(now=DISCOVERY_NOW)
+
+    assert [item.symbol for item in found] == ["COAI", "AEON"]
+    assert [call[1]["catalogId"] for call in session.calls] == [93, 93, 49, 49]
+
+
+def test_provider_default_discovery_window_skips_old_announcements() -> None:
+    old = _list_item(
+        FIXTURES["DOS"],
+        release_date=int((DISCOVERY_NOW - timedelta(days=22)).timestamp() * 1000),
+    )
+    session = _FakeSession([_official({"articles": [old]})])
+
+    found = metrics.BinanceCompetitionRuleProvider(session=session).fetch_recent_announcements(now=DISCOVERY_NOW)
+
+    assert found == []
+    assert [call[1]["catalogId"] for call in session.calls] == [93, 49]
 
 
 def test_provider_deduplicates_exact_announcement_metadata_by_article_code() -> None:
@@ -484,7 +525,7 @@ def test_provider_does_not_treat_a_recent_duplicate_only_page_as_old() -> None:
     )
 
     assert len(result) == 1
-    assert [call[1]["pageNo"] for call in session.calls] == [1, 2, 3]
+    assert [call[1]["pageNo"] for call in session.calls] == [1, 2, 3, 1]
 
 
 def test_provider_rejects_conflicting_announcement_metadata_for_one_article_code() -> None:
@@ -626,6 +667,7 @@ def test_provider_fetches_parenthesized_project_announcement_rule_end_to_end() -
     provider = metrics.BinanceCompetitionRuleProvider(session=_FakeSession([
         _official({"articles": [item]}),
         _official({"articles": []}),
+        _official({"catalogs": [{"catalogId": 49, "articles": [], "catalogs": []}]}),
         _official(detail),
     ]))
 
@@ -656,11 +698,11 @@ def test_provider_includes_cutoff_boundary_and_stops_on_an_entirely_old_page() -
     ])
 
     result = metrics.BinanceCompetitionRuleProvider(session=session).fetch_recent_announcements(
-        now=DISCOVERY_NOW
+        now=DISCOVERY_NOW, days=60
     )
 
     assert [item.symbol for item in result] == ["DOS", "QUID"]
-    assert [call[1]["pageNo"] for call in session.calls] == [1, 2, 3]
+    assert [call[1]["pageNo"] for call in session.calls] == [1, 2, 3, 1]
 
 
 def test_provider_fetches_rule_for_an_announcement_and_validates_identity() -> None:
@@ -761,6 +803,22 @@ def test_provider_selects_unique_catalog_93_from_current_list_envelope() -> None
     assert session.calls[-1][1] == {"articleCode": quid_data["code"]}
 
 
+def test_provider_fetches_symbol_from_latest_news_catalog() -> None:
+    detail = copy.deepcopy(FIXTURES["QUID"]["data"])
+    assert isinstance(detail, dict)
+    item = _list_item(FIXTURES["QUID"], release_date=int((NOW - timedelta(days=1)).timestamp() * 1000))
+    session = _FakeSession([
+        _official({"catalogs": [{"catalogId": 93, "articles": [], "catalogs": []}]}),
+        _official({"catalogs": [{"catalogId": 49, "articles": [item], "catalogs": []}]}),
+        _official(detail),
+    ])
+
+    rule = metrics.BinanceCompetitionRuleProvider(session=session).fetch_rule("QUID", now=NOW)
+
+    assert rule.symbol == "QUID"
+    assert [call[1].get("catalogId") for call in session.calls] == [93, 49, None]
+
+
 def test_provider_prefers_legacy_direct_articles_when_catalogs_are_also_present() -> None:
     quid_data = FIXTURES["QUID"]["data"]
     assert isinstance(quid_data, dict)
@@ -833,7 +891,7 @@ def test_provider_stops_when_page_is_older_than_sixty_days() -> None:
     with pytest.raises(RuleParseError, match="no recent.*QUID"):
         provider.fetch_rule("QUID", now=NOW)
 
-    assert len(session.calls) == 1
+    assert len(session.calls) == 2
 
 
 def test_provider_stops_after_twenty_recent_pages() -> None:
@@ -845,7 +903,7 @@ def test_provider_stops_after_twenty_recent_pages() -> None:
     with pytest.raises(RuleParseError, match="no recent.*QUID"):
         provider.fetch_rule("QUID", now=NOW)
 
-    assert len(session.calls) == 20
+    assert len(session.calls) == 21
 
 
 @pytest.mark.parametrize(
