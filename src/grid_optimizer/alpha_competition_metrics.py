@@ -25,10 +25,16 @@ _CMS_BASE_URL = "https://www.binance.com"
 _CMS_LIST_PATH = "/bapi/composite/v1/public/cms/article/list/query"
 _CMS_DETAIL_PATH = "/bapi/composite/v1/public/cms/article/detail/query"
 _PERIOD_RE = re.compile(
-    r"\b(?P<number>\d+)(?P<suffix>st|nd|rd|th)\s+(?P<symbol>[A-Za-z0-9_]+)\s+"
+    r"\b(?:(?P<number>\d+)(?P<suffix>st|nd|rd|th)\s+)?(?P<symbol>[A-Za-z0-9_]+)\s+"
     r"Trading\s+Competition\s+Promotion\s+Period\s*:\s*"
     r"(?P<start>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+\(UTC\)\s+to\s+"
     r"(?P<end>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+\(UTC\)",
+)
+_POSTPONED_ROUND_RE = re.compile(
+    r"\b(?:the\s+)?(?P<number>\d+)(?P<suffix>st|nd|rd|th)\s+"
+    r"(?P<symbol>[A-Za-z0-9_]+)\s+Trading\s+Competition\b"
+    r".*\bpostponed\s+until\s+further\s+notice\b",
+    re.IGNORECASE,
 )
 _WINNER_RE = re.compile(r"\bThe\s+top\s+([0-9][0-9,]*)\s+users\b")
 _DAY_ROW_START_RE = re.compile(r"^Day\s+(?P<day>\d+)\b(?!\s+(?:through|to)\b)", re.IGNORECASE)
@@ -252,8 +258,8 @@ def _parse_rounds(blocks: tuple[_ArticleBlock, ...]) -> tuple[CompetitionRound, 
                 period_label = label
             elif label != period_label:
                 raise RuleParseError("promotion round labels conflict")
-            number = int(match.group("number"))
-            if number <= 0 or match.group("suffix") != _ordinal_suffix(number):
+            number = int(match.group("number") or 1)
+            if number <= 0 or (match.group("number") is not None and match.group("suffix") != _ordinal_suffix(number)):
                 raise RuleParseError("promotion round number is invalid")
             round_ = CompetitionRound(number, _parse_datetime(match.group("start")), _parse_datetime(match.group("end")))
             if round_.start_utc >= round_.end_utc or round_.end_utc - round_.start_utc != timedelta(days=7):
@@ -262,6 +268,15 @@ def _parse_rounds(blocks: tuple[_ArticleBlock, ...]) -> tuple[CompetitionRound, 
             if existing is not None and existing != round_:
                 raise RuleParseError("promotion round descriptions conflict")
             rounds_by_number[number] = round_
+    for block in blocks[:first_day]:
+        for match in _POSTPONED_ROUND_RE.finditer(block.text):
+            label = match.group("symbol").upper()
+            if period_label is not None and label != period_label:
+                continue
+            number = int(match.group("number"))
+            if number <= 0 or match.group("suffix").lower() != _ordinal_suffix(number):
+                continue
+            rounds_by_number.pop(number, None)
     if not rounds_by_number:
         raise RuleParseError("at least one full promotion round is required")
     return tuple(rounds_by_number[number] for number in sorted(rounds_by_number))

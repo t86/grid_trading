@@ -421,6 +421,27 @@ def test_snapshot_preserves_multiple_sort_and_symbol_errors(fake_market: FakeMar
     assert payload["errors"] == ["MISSING: not found in Binance Alpha token list"]
 
 
+def test_existing_hourly_alert_only_fires_on_a_new_threshold_crossing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ALPHA_HOURLY_ALERT_ENABLED", "1")
+    monkeypatch.setenv("ALPHA_HOURLY_ALERT_THRESHOLD", "10000000")
+    monkeypatch.setenv("ALPHA_HOURLY_ALERT_STATE_FILE", str(tmp_path / "hourly.json"))
+    sent: list[str] = []
+    monkeypatch.setattr(
+        dashboard, "_send_hourly_volume_alert",
+        lambda row, threshold, now: sent.append(row["symbol"]) or {"sent": True},
+    )
+
+    low = {"symbol": "CAP", "latest1hQuoteVolume": 9_000_000.0}
+    high = {"symbol": "CAP", "latest1hQuoteVolume": 11_000_000.0}
+    dashboard.check_hourly_volume_breakouts([low])
+    dashboard.check_hourly_volume_breakouts([high])
+    dashboard.check_hourly_volume_breakouts([high])
+
+    assert sent == ["CAP"]
+
+
 def test_check_alert_delegates_to_versioned_alert_module() -> None:
     with patch("grid_optimizer.alpha_competition_dashboard.alert.run", return_value=0) as run:
         result = dashboard.check_alert_once()

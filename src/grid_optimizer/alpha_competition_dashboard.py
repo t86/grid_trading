@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
@@ -28,6 +28,7 @@ from .alpha_competition_metrics import (
     CompetitionRuleCache,
     CompetitionVolumeProvider,
 )
+from .volume_spike_monitor import send_bark_alert
 
 
 DEFAULT_HOST = os.environ.get("ALPHA_DASHBOARD_HOST", "0.0.0.0")
@@ -36,6 +37,8 @@ DEFAULT_SYMBOLS = ("QUID", "GRVT", "O", "PRL", "CAP")
 DEFAULT_RULE_CACHE = "/home/ubuntu/.cache/binance-alpha-volume-alert/competition_rules.json"
 DEFAULT_DISCOVERY_CACHE = "/home/ubuntu/.cache/binance-alpha-volume-alert/competition_discovery.json"
 DEFAULT_HISTORY_CACHE = str(DEFAULT_HISTORY_PATH)
+DEFAULT_HOURLY_ALERT_STATE = "/home/ubuntu/.cache/binance-alpha-volume-alert/hourly_volume_alert_state.json"
+DEFAULT_HOURLY_BARK_CONFIG = "/home/ubuntu/.config/binance-alpha-bark.json"
 
 _COMPETITION_SERVICE: CompetitionMetricsService | None = None
 _COMPETITION_SERVICE_LOCK = threading.Lock()
@@ -44,6 +47,7 @@ _DISCOVERY_SERVICE_LOCK = threading.Lock()
 _HISTORY_STORE: CompetitionHistoryStore | None = None
 _HISTORY_STORE_LOCK = threading.Lock()
 _ALERT_CHECK_LOCK = threading.Lock()
+_HOURLY_ALERT_LOCK = threading.Lock()
 _SNAPSHOT_SYMBOL_RE = re.compile(r"[A-Z0-9_]{1,32}")
 _MAX_SNAPSHOT_SYMBOLS = 32
 _ALLOWED_METHODS = {
@@ -126,6 +130,142 @@ def _finite_float(value: Any, default: float = 0.0) -> float:
 def _finite_sum(values: list[float]) -> float:
     total = sum(values)
     return total if math.isfinite(total) else 0.0
+
+
+def _hourly_alert_threshold() -> float:
+    threshold = _finite_float(os.environ.get("ALPHA_HOURLY_ALERT_THRESHOLD", "10000000"), 10000000.0)
+    return threshold if threshold > 0 else 10000000.0
+
+
+def _hourly_alert_state_path() -> Path:
+    return Path(os.environ.get("ALPHA_HOURLY_ALERT_STATE_FILE", DEFAULT_HOURLY_ALERT_STATE))
+
+
+def _hourly_alert_bark_config_path() -> Path | None:
+    raw = os.environ.get("ALPHA_HOURLY_BARK_CONFIG_PATH", DEFAULT_HOURLY_BARK_CONFIG).strip()
+    return Path(raw) if raw else None
+
+
+def _load_hourly_alert_state(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"version": 1, "symbols": {}}
+    if not isinstance(payload, dict):
+        return {"version": 1, "symbols": {}}
+    symbols = payload.get("symbols")
+    if not isinstance(symbols, dict):
+        payload["symbols"] = {}
+    payload.setdefault("version", 1)
+    return payload
+
+
+def _save_hourly_alert_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _beijing_date_key(now: datetime) -> str:
+    return now.astimezone(timezone(timedelta(hours=8))).date().isoformat()
+
+
+def _format_hourly_volume(value: float) -> str:
+    return f"{value:,.2f} USDT"
+
+
+def _format_hourly_alert_body(row: dict[str, Any], threshold: float, now: datetime) -> str:
+    return "\n".join(
+        [
+            f"{row.get('symbol', '')} 最近 1 小时成交额突破 {_format_hourly_volume(threshold)}。",
+            "",
+            f"最近1小时成交额: {_format_hourly_volume(_finite_float(row.get('latest1hQuoteVolume')))}",
+            f"最近1分钟成交额: {_format_hourly_volume(_finite_float(row.get('latest1mQuoteVolume')))}",
+            f"24小时成交额: {_format_hourly_volume(_finite_float(row.get('tickerQuoteVolume24h')))}",
+            f"最新价格: {_finite_float(row.get('lastPrice')):.10g}",
+            f"Alpha ID: {row.get('alphaId', '')}",
+            f"交易对: {row.get('pair', '')}",
+            f"检查时间UTC: {now.isoformat(timespec='seconds')}",
+        ]
+    )
+
+
+def _send_hourly_volume_alert(row: dict[str, Any], threshold: float, now: datetime) -> dict[str, Any]:
+    symbol = str(row.get("symbol") or "").upper()
+    subject = f"Alpha小时成交额突破1000万: {symbol}"
+    body = _format_hourly_alert_body(row, threshold, now)
+    result: dict[str, Any] = {"symbol": symbol, "email": {"sent": False}, "bark": {"sent": False}}
+    try:
+        alert.send_email(subject, body)
+        result["email"] = {"sent": True}
+    except Exception as exc:
+        result["email"] = {"sent": False, "error": f"{type(exc).__name__}: {exc}"}
+    try:
+        result["bark"] = send_bark_alert(title=subject, body=body, config_path=_hourly_alert_bark_config_path())
+    except Exception as exc:
+        result["bark"] = {"sent": False, "error": f"{type(exc).__name__}: {exc}"}
+    return result
+
+
+def check_hourly_volume_breakouts(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    enabled = _env_truthy("ALPHA_HOURLY_ALERT_ENABLED", "0")
+    threshold = _hourly_alert_threshold()
+    result: dict[str, Any] = {
+        "enabled": enabled,
+        "threshold": threshold,
+        "triggered": [],
+        "checked": 0,
+    }
+    if not enabled:
+        return result
+
+    now = datetime.now(timezone.utc)
+    date_key = _beijing_date_key(now)
+    state_path = _hourly_alert_state_path()
+    with _HOURLY_ALERT_LOCK:
+        state = _load_hourly_alert_state(state_path)
+        symbols_state = state.setdefault("symbols", {})
+        if not isinstance(symbols_state, dict):
+            symbols_state = {}
+            state["symbols"] = symbols_state
+
+        for row in rows:
+            symbol = str(row.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            volume = _finite_float(row.get("latest1hQuoteVolume"))
+            above = volume >= threshold
+            previous = symbols_state.get(symbol)
+            if not isinstance(previous, dict):
+                previous = {}
+            had_previous = symbol in symbols_state
+            was_above = bool(previous.get("above")) if had_previous else above
+            already_triggered_today = previous.get("lastTriggerDate") == date_key
+            send_now = had_previous and (not was_above) and above and not already_triggered_today
+            send_result = None
+            if send_now:
+                send_result = _send_hourly_volume_alert(row, threshold, now)
+                result["triggered"].append(send_result)
+            symbols_state[symbol] = {
+                **previous,
+                "above": above,
+                "lastVolume": volume,
+                "lastCheckedAtUtc": now.isoformat(timespec="seconds"),
+                "lastThreshold": threshold,
+            }
+            if send_now:
+                symbols_state[symbol]["lastTriggerDate"] = date_key
+                symbols_state[symbol]["lastTriggerAtUtc"] = now.isoformat(timespec="seconds")
+                symbols_state[symbol]["lastSendResult"] = send_result
+            result["checked"] += 1
+
+        state["updatedAtUtc"] = now.isoformat(timespec="seconds")
+        try:
+            _save_hourly_alert_state(state_path, state)
+        except OSError as exc:
+            result["stateError"] = f"{type(exc).__name__}: {exc}"
+    return result
 
 
 _LEADERBOARD_ENDPOINTS = (
@@ -495,11 +635,15 @@ def collect_snapshot(symbols: list[str], market: Any | None = None) -> dict[str,
         except Exception:
             errors.append(f"{symbol}: market data unavailable")
     rows.sort(key=lambda row: row["multiple"], reverse=True)
+    hourly_alert = check_hourly_volume_breakouts(rows)
     return {
         "generatedAtUtc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "symbols": symbols,
         "rows": rows,
         "errors": errors,
+        "alerts": {
+            "hourlyVolume": hourly_alert,
+        },
         "config": {
             "autoSymbols": _env_truthy("ALPHA_AUTO_SYMBOLS", "0"),
             "spikeMultiple": _finite_float(os.environ.get("ALPHA_SPIKE_MULTIPLE", "3"), 3.0),

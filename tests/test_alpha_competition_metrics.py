@@ -94,6 +94,14 @@ def _append_block(article: dict[str, object], text: str) -> None:
     _set_tree(article, tree)
 
 
+def _insert_block(article: dict[str, object], index: int, text: str) -> None:
+    tree = _tree(article)
+    children = tree["children"]
+    assert isinstance(children, list)
+    children.insert(index, {"node": "paragraph", "children": [{"node": "text", "text": text}]})
+    _set_tree(article, tree)
+
+
 def _replace_period_label(article: dict[str, object], *, round_number: int, label: str) -> None:
     tree = _tree(article)
     children = tree["children"]
@@ -162,6 +170,28 @@ def test_period_labels_are_compared_case_insensitively() -> None:
     _replace_period_label(article, round_number=2, label="dappos")
 
     assert [round_.number for round_ in parse_competition_rule(article, "DOS").rounds] == [1, 2]
+
+
+def test_postponed_second_round_is_excluded() -> None:
+    article = copy.deepcopy(FIXTURES["QUID"])
+    _insert_block(
+        article, 2,
+        "Note: The 2nd QUID Trading Competition, originally scheduled to start on "
+        "2026-08-12 13:00 (UTC), will be postponed until further notice.",
+    )
+
+    assert [round_.number for round_ in parse_competition_rule(article, "QUID").rounds] == [1]
+
+
+def test_unnumbered_promotion_period_is_first_round() -> None:
+    article = copy.deepcopy(FIXTURES["QUID"])
+    tree = _tree(article)
+    children = tree["children"]
+    assert isinstance(children, list)
+    children[0] = json.loads(json.dumps(children[0]).replace("1st QUID Trading Competition", "QUID Trading Competition"))
+    _set_tree(article, tree)
+
+    assert parse_competition_rule(article, "QUID").rounds[0].number == 1
 
 
 @pytest.mark.parametrize("bad_title", [
