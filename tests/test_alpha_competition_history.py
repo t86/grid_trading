@@ -85,6 +85,54 @@ def test_manual_old_round_can_be_added_edited_and_removed(tmp_path: Path) -> Non
     assert store.snapshot(now=NOW)["rows"] == []
 
 
+@pytest.mark.parametrize("pre_archived", [False, True])
+def test_official_archive_links_matching_manual_round_without_losing_cutoff(tmp_path: Path, pre_archived: bool) -> None:
+    store = CompetitionHistoryStore(tmp_path / "history.json")
+    rule = _rule()
+    if pre_archived:
+        store.archive_rules([rule], now=NOW)
+    manual = store.save_final({
+        "symbol": rule.symbol, "round": 1, "endUtc": rule.rounds[0].end_utc.isoformat(),
+        "winnerCount": rule.winner_count, "finalThreshold": 303574, "note": "verified by user",
+    }, now=NOW)
+    store.archive_rules([rule], now=NOW)
+    rows = store.snapshot(now=NOW)["rows"]
+    assert len(rows) == 2
+    assert not any(row["id"] == manual["id"] for row in rows)
+    first = next(row for row in rows if row["round"] == 1)
+    assert first["articleCode"] == rule.article_code
+    assert first["finalThreshold"] == 303574
+    assert first["note"] == "verified by user"
+    assert store.pending_reference(now=NOW) is not None
+    assert store.pending_reward(now=NOW)["id"] == first["id"]
+
+
+def test_official_archive_does_not_merge_manual_round_with_wrong_winners(tmp_path: Path) -> None:
+    store = CompetitionHistoryStore(tmp_path / "history.json")
+    rule = _rule()
+    store.save_final({
+        "symbol": rule.symbol, "round": 1, "endUtc": rule.rounds[0].end_utc.isoformat(),
+        "winnerCount": rule.winner_count + 1, "finalThreshold": 123,
+    }, now=NOW)
+    store.archive_rules([rule], now=NOW)
+    assert len(store.snapshot(now=NOW)["rows"]) == 3
+
+
+def test_official_archive_preserves_conflicting_manual_cutoffs(tmp_path: Path) -> None:
+    store = CompetitionHistoryStore(tmp_path / "history.json")
+    rule = _rule()
+    store.archive_rules([rule], now=NOW)
+    store.save_final({"id": "aeon-article:1", "finalThreshold": 111}, now=NOW)
+    manual = store.save_final({
+        "symbol": rule.symbol, "round": 1, "endUtc": rule.rounds[0].end_utc.isoformat(),
+        "winnerCount": rule.winner_count, "finalThreshold": 222,
+    }, now=NOW)
+    store.archive_rules([rule], now=NOW)
+    rows = store.snapshot(now=NOW)["rows"]
+    assert next(row for row in rows if row["id"] == manual["id"])["finalThreshold"] == 222
+    assert next(row for row in rows if row["id"] == "aeon-article:1")["finalThreshold"] == 111
+
+
 @pytest.mark.parametrize("value", [0, -1, float("nan"), "oops"])
 def test_final_cutoff_must_be_positive_finite(tmp_path: Path, value: object) -> None:
     store = CompetitionHistoryStore(tmp_path / "history.json")

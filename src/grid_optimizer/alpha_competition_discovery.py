@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import tempfile
 import threading
-from typing import Any
+from typing import Any, Callable
 
 from grid_optimizer.alpha_competition_metrics import (
     CompetitionAnnouncement,
@@ -249,6 +249,7 @@ class CompetitionDiscoveryService:
         *,
         ttl: timedelta = timedelta(minutes=5),
         rule_ttl: timedelta = timedelta(hours=6),
+        on_rule: Callable[[CompetitionRule, datetime], None] | None = None,
     ) -> None:
         if not isinstance(ttl, timedelta) or ttl <= timedelta(0):
             raise ValueError("ttl must be a positive timedelta")
@@ -260,6 +261,7 @@ class CompetitionDiscoveryService:
         self.cache = cache
         self.ttl = ttl
         self.rule_ttl = rule_ttl
+        self.on_rule = on_rule
         self._refresh_lock = threading.Lock()
         self._memory = cache.load()
         self._last_attempt_utc: datetime | None = None
@@ -399,6 +401,11 @@ class CompetitionDiscoveryService:
                 if cached is not None and not self._is_ended(cached, current):
                     refreshed_by_code[code] = cached
                 continue
+            if self.on_rule is not None:
+                try:
+                    self.on_rule(rule, current)
+                except Exception:
+                    logger.warning("competition history archive unavailable")
             if not self._is_ended(discovered, current):
                 refreshed_by_code[code] = discovered
 

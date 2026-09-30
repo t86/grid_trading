@@ -540,7 +540,7 @@ def test_background_symbols_exclude_ended_rules(monkeypatch, tmp_path, fake_mark
             self.stopped = True
     stop = Stop()
     snapshot = _discovery_snapshot(("QUID",), stale=False, errors=())
-    monkeypatch.setattr(dashboard.discovery_service(), "discover", lambda **kwargs: calls.append("discovery"))
+    monkeypatch.setattr(dashboard, "refresh_discovery_and_history", lambda: calls.append("discovery"))
     monkeypatch.setattr(dashboard.CompetitionDiscoveryCache, "load", lambda self: snapshot)
     monkeypatch.setattr(dashboard, "AlphaMarketClient", lambda **kwargs: fake_market)
     class Session:
@@ -633,7 +633,7 @@ def test_discovery_service_is_lazy_thread_safe_and_uses_official_default_cache_p
     monkeypatch.setattr(
         dashboard,
         "CompetitionDiscoveryService",
-        lambda *, provider, cache: created.append(("service", (provider, cache))) or service,
+        lambda *, provider, cache, on_rule: created.append(("service", (provider, cache))) or service,
     )
 
     with ThreadPoolExecutor(max_workers=8) as pool:

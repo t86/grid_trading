@@ -716,7 +716,7 @@ def run_volume_alert_monitor(stop: threading.Event) -> None:
                 if _env_truthy("ALPHA_AUTO_SYMBOLS", "0"):
                     # Announcement I/O must not pause the fast market-data loop.
                     if started >= discovery_refresh_at and (refresh_task is None or refresh_task.done()):
-                        refresh_task = refresh_pool.submit(lambda: discovery_service().discover(now=datetime.now(timezone.utc)))
+                        refresh_task = refresh_pool.submit(refresh_discovery_and_history)
                         discovery_refresh_at = started + 300
                     symbols = [rule.symbol for rule in cache.load().rules if any(round_.end_utc > now for round_ in rule.rounds)]
                 else:
@@ -788,6 +788,7 @@ def discovery_service() -> CompetitionDiscoveryService:
             _DISCOVERY_SERVICE = CompetitionDiscoveryService(
                 provider=BinanceCompetitionRuleProvider(),
                 cache=CompetitionDiscoveryCache(cache_path),
+                on_rule=lambda rule, now: history_store().archive_rules([rule], now=now),
             )
         return _DISCOVERY_SERVICE
 
@@ -841,6 +842,14 @@ def complete_history_reward(store: CompetitionHistoryStore, *, now: datetime) ->
             store.save_reward(pending["id"], reward, now=now)
     finally:
         _HISTORY_REWARD_LOCK.release()
+
+
+def refresh_discovery_and_history() -> None:
+    now = datetime.now(timezone.utc)
+    discovery_service().discover(now=now)
+    store = history_store()
+    complete_history_reference(store, now=now)
+    complete_history_reward(store, now=now)
 
 
 INDEX_HTML = r"""<!doctype html>

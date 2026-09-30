@@ -116,10 +116,22 @@ class CompetitionHistoryStore:
                         "rule": encode_competition_rule(rule),
                     }
                     existing = rows.get(identity, {})
+                    candidates = [key for key, row in rows.items() if key != identity
+                                  and row.get("source") == "manual" and not row.get("articleCode")
+                                  and (row.get("symbol"), row.get("round"), row.get("endUtc"), row.get("winnerCount"))
+                                  == (rule.symbol, round_.number, metadata["endUtc"], rule.winner_count)]
+                    if len(candidates) == 1:
+                        manual = rows[candidates[0]]
+                        if existing.get("finalThreshold") in (None, manual.get("finalThreshold")):
+                            existing = {**manual, **existing, "finalThreshold": manual.get("finalThreshold"),
+                                        "note": existing.get("note") or manual.get("note", ""),
+                                        "finalThresholdSource": "manual"}
+                            del rows[candidates[0]]
+                            changed = True
                     merged = {**existing, **metadata}
                     if not existing:
                         merged.update(finalThreshold=None, note="", lastObservation=None)
-                    if merged != existing:
+                    if merged != rows.get(identity):
                         rows[identity] = merged
                         changed = True
             if changed:
