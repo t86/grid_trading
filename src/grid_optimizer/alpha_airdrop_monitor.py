@@ -213,14 +213,11 @@ def _match_alpha_airdrop_post(entry: dict[str, Any], *, now: datetime, tz_offset
     if "airdrop" not in normalized and "空投" not in text:
         return None
     points_threshold = _extract_points_threshold(text)
-    if points_threshold is None and not _is_eligible_alpha_airdrop_announcement(text, normalized):
-        return None
-
     action_hit = any(
         token in normalized
         for token in ("claim", "trade", "points", "today", "get ready", "first-come", "first come")
     ) or any(token in text for token in ("领取", "交易", "积分", "今天", "准备"))
-    if not action_hit:
+    if not action_hit and not any(token in normalized for token in ("coming", "feature", "预告", "即将")):
         return None
 
     return {
@@ -533,18 +530,18 @@ def _build_bark_body(post: dict[str, Any]) -> str:
     return f"积分门槛 {post.get('points_threshold')}，第 {post.get('notification_sequence')}/3 次提醒\n{summary}"
 
 
-def _is_airdrop_time_passed(post: dict[str, Any], *, now: datetime, tz_offset_hours: int) -> bool:
+def _airdrop_scheduled_at(post: dict[str, Any], *, tz_offset_hours: int = 8) -> datetime | None:
     time_hint = str(post.get("time_hint_text") or "")
     time_match = re.search(r"(\d{1,2}):(\d{2})", time_hint)
     if time_match is None:
-        return False
+        return None
 
     try:
         created_at = datetime.fromisoformat(str(post.get("created_at") or ""))
     except ValueError:
-        return False
+        return None
     if created_at.tzinfo is None:
-        return False
+        return None
 
     offset_match = re.search(r"utc\s*([+-]\d+)?", time_hint, re.IGNORECASE)
     offset_hours = int(offset_match.group(1) or 0) if offset_match else tz_offset_hours
@@ -575,8 +572,13 @@ def _is_airdrop_time_passed(post: dict[str, Any], *, now: datetime, tz_offset_ho
             tzinfo=schedule_tz,
         )
     except (KeyError, ValueError):
-        return False
-    return now.astimezone(schedule_tz) > scheduled_at
+        return None
+    return scheduled_at.astimezone(UTC)
+
+
+def _is_airdrop_time_passed(post: dict[str, Any], *, now: datetime, tz_offset_hours: int) -> bool:
+    scheduled_at = _airdrop_scheduled_at(post, tz_offset_hours=tz_offset_hours)
+    return scheduled_at is not None and now > scheduled_at
 
 
 def send_bark_notification(
@@ -595,8 +597,8 @@ def send_bark_notification(
     base_url = _normalize_bark_base_url(bark_base_url)
     url = f"{base_url}/{key}"
     payload = {
-        "title": _build_bark_title(post),
-        "body": _build_bark_body(post),
+        "title": str(post.get("alert_title") or _build_bark_title(post)),
+        "body": str(post.get("alert_body") or _build_bark_body(post)),
         "url": str(post.get("tweet_url") or ""),
         "group": "binance-alpha-airdrop",
         "level": bark_level,
@@ -608,6 +610,14 @@ def send_bark_notification(
     try:
         response = requests.post(url, json=payload, timeout=timeout_seconds)
         response.raise_for_status()
+        try:
+            body = response.json()
+        except AttributeError:
+            body = {}
+        except ValueError:
+            return {"sent": False, "error": "bark_invalid_response", "url": url}
+        if isinstance(body, dict) and body.get("code") not in (None, 0, 200):
+            return {"sent": False, "error": "bark_rejected", "url": url}
         result["sent"] = True
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"

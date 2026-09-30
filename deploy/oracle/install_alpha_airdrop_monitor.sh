@@ -8,9 +8,8 @@ PYTHON_BIN="${PYTHON_BIN:-${APP_DIR}/.venv/bin/python}"
 PYTHONPATH_VALUE="${PYTHONPATH_VALUE:-${APP_DIR}/src}"
 TIMER_UNIT_NAME="${TIMER_UNIT_NAME:-grid-alpha-airdrop-monitor}"
 ALERT_CONFIG_PATH="${ALERT_CONFIG_PATH:-${APP_DIR}/output/alert_notifier_config.json}"
-STATE_PATH="${STATE_PATH:-${APP_DIR}/output/alpha_airdrop_monitor_state.json}"
-ACCOUNTS="${ACCOUNTS:-binancezh,BinanceWallet}"
-TZ_OFFSET_HOURS="${TZ_OFFSET_HOURS:-8}"
+STATE_PATH="${STATE_PATH:-${APP_DIR}/output/alpha_airdrop_feed.json}"
+BARK_CONFIG_PATH="${BARK_CONFIG_PATH:-${APP_DIR}/output/alpha_airdrop_monitor_bark.json}"
 
 if ! command -v sudo >/dev/null 2>&1; then
   echo "sudo is required for systemd installation." >&2
@@ -32,7 +31,7 @@ TIMER_FILE="/etc/systemd/system/${TIMER_UNIT_NAME}.timer"
 
 sudo tee "$SERVICE_FILE" >/dev/null <<EOF
 [Unit]
-Description=Monitor Binance Alpha airdrop posts on X
+Description=Monitor official Binance Alpha airdrops from Telegram and CMS
 After=network-online.target
 Wants=network-online.target
 
@@ -43,17 +42,19 @@ Group=${SERVICE_GROUP}
 WorkingDirectory=${APP_DIR}
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=${PYTHONPATH_VALUE}
-ExecStart=${PYTHON_BIN} -m grid_optimizer.alpha_airdrop_monitor --accounts ${ACCOUNTS} --state-path ${STATE_PATH} --alert-config-path ${ALERT_CONFIG_PATH}
+ExecStart=${PYTHON_BIN} -m grid_optimizer.alpha_airdrop_feed --state-path ${STATE_PATH} --alert-config-path ${ALERT_CONFIG_PATH} --bark-config-path ${BARK_CONFIG_PATH}
+TimeoutStartSec=120
+MemoryMax=180M
 EOF
 
 sudo tee "$TIMER_FILE" >/dev/null <<EOF
 [Unit]
-Description=Run Binance Alpha airdrop X monitor every 10 minutes from 14:00 to 22:50
+Description=Check official Binance Alpha airdrops every 30 seconds, 24 hours a day
 
 [Timer]
-OnCalendar=*-*-* 14..22:0/10:00
-Persistent=false
-AccuracySec=30s
+OnBootSec=30s
+OnUnitInactiveSec=30s
+AccuracySec=1s
 Unit=${TIMER_UNIT_NAME}.service
 
 [Install]
@@ -65,5 +66,5 @@ sudo systemctl enable "${TIMER_UNIT_NAME}.timer"
 sudo systemctl restart "${TIMER_UNIT_NAME}.timer"
 
 echo "Installed ${TIMER_UNIT_NAME}.service and ${TIMER_UNIT_NAME}.timer"
-sudo systemctl --no-pager --full status "${TIMER_UNIT_NAME}.service" | sed -n '1,20p'
+sudo systemctl --no-pager --full status "${TIMER_UNIT_NAME}.service" | sed -n '1,20p' || true
 sudo systemctl --no-pager --full status "${TIMER_UNIT_NAME}.timer" | sed -n '1,20p'

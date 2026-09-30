@@ -294,13 +294,13 @@ def test_output_logrotate_installer_uses_copytruncate_timer() -> None:
 def test_alpha_airdrop_monitor_installer_writes_expected_systemd_units() -> None:
     script = Path("deploy/oracle/install_alpha_airdrop_monitor.sh").read_text(encoding="utf-8")
 
-    assert 'Description=Monitor Binance Alpha airdrop posts on X' in script
-    assert 'ExecStart=${PYTHON_BIN} -m grid_optimizer.alpha_airdrop_monitor' in script
-    assert '--accounts ${ACCOUNTS}' in script
+    assert 'Description=Monitor official Binance Alpha airdrops from Telegram and CMS' in script
+    assert 'ExecStart=${PYTHON_BIN} -m grid_optimizer.alpha_airdrop_feed' in script
+    assert '--bark-config-path ${BARK_CONFIG_PATH}' in script
     assert '--state-path ${STATE_PATH}' in script
     assert '--alert-config-path ${ALERT_CONFIG_PATH}' in script
-    assert 'OnCalendar=*-*-* 14..22:0/10:00' in script
-    assert 'Persistent=false' in script
+    assert 'OnUnitInactiveSec=30s' in script
+    assert 'AccuracySec=1s' in script
     assert 'sudo systemctl restart "${TIMER_UNIT_NAME}.timer"' in script
     assert 'sudo systemctl start "${TIMER_UNIT_NAME}.service"' not in script
 

@@ -53,6 +53,8 @@ from .ai_scheduler import (
 )
 from .ai_scheduler_worker import run_scheduler_task
 from .alpha_market import AlphaMarketClient
+from .alpha_airdrop_feed import feed_payload as alpha_airdrop_feed_payload
+from .alpha_airdrop_ui import AIR_DROP_PAGE
 from .backtest import (
     build_grid_levels,
     run_backtest,
@@ -17472,6 +17474,7 @@ SERVER_HUB_PAGE = """<!doctype html>
         <div class="actions">
           <a class="btn primary" href="http://43.155.136.111:8799/" target="_blank" rel="noopener noreferrer">赛事榜单</a>
           <a class="btn" href="http://43.156.35.110/alpha" target="_blank" rel="noopener noreferrer">Alpha</a>
+          <a class="btn" href="/alpha-airdrops">Alpha 空投监控</a>
         </div>
       </article>
 
@@ -40113,6 +40116,12 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path in {"/market-data", "/market-data.html"}:
             self._send_html(MARKET_DATA_PAGE, status=HTTPStatus.OK)
+            return
+        if path == "/alpha-airdrops":
+            self._send_html(AIR_DROP_PAGE, status=HTTPStatus.OK)
+            return
+        if path == "/api/alpha-airdrops":
+            self._send_json(alpha_airdrop_feed_payload(), status=HTTPStatus.OK)
             return
         if path in {"/", "/index.html"}:
             self._send_html(HTML_PAGE, status=HTTPStatus.OK)
