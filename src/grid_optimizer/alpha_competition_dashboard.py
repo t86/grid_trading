@@ -22,6 +22,7 @@ from . import alpha_volume_alert as alert
 from .alpha_market import AlphaMarketClient
 from .alpha_competition_discovery import CompetitionDiscoveryCache, CompetitionDiscoveryService
 from .alpha_competition_history import CompetitionHistoryStore, DEFAULT_HISTORY_PATH
+from .alpha_competition_reward import fetch_ended_reward
 from .alpha_competition_metrics import (
     BinanceCompetitionRuleProvider,
     CompetitionMetricsService,
@@ -47,6 +48,7 @@ _DISCOVERY_SERVICE_LOCK = threading.Lock()
 _HISTORY_STORE: CompetitionHistoryStore | None = None
 _HISTORY_STORE_LOCK = threading.Lock()
 _HISTORY_REFERENCE_LOCK = threading.Lock()
+_HISTORY_REWARD_LOCK = threading.Lock()
 _ALERT_CHECK_LOCK = threading.Lock()
 _HOURLY_ALERT_LOCK = threading.Lock()
 _SNAPSHOT_SYMBOL_RE = re.compile(r"[A-Z0-9_]{1,32}")
@@ -741,6 +743,23 @@ def complete_history_reference(store: CompetitionHistoryStore, *, now: datetime,
         _HISTORY_REFERENCE_LOCK.release()
 
 
+def complete_history_reward(store: CompetitionHistoryStore, *, now: datetime) -> None:
+    if not _HISTORY_REWARD_LOCK.acquire(blocking=False):
+        return
+    try:
+        pending = store.pending_reward(now=now)
+        if pending is None:
+            return
+        try:
+            reward = fetch_ended_reward(pending)
+        except Exception:
+            store.mark_reward_unavailable(pending["id"], now=now)
+        else:
+            store.save_reward(pending["id"], reward, now=now)
+    finally:
+        _HISTORY_REWARD_LOCK.release()
+
+
 INDEX_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1060,7 +1079,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="section-heading">
         <div>
           <h2 id="historyTitle">已结束竞赛参照</h2>
-          <p class="section-copy">参考线 = 该轮加权总量 ÷ 获奖人数 × 0.6；奖励按单名进榜用户在结束时获得的 U 价值记录。</p>
+          <p class="section-copy">参考线 = 该轮加权总量 ÷ 获奖人数 × 0.6；奖励价值 = 每人奖励代币数 × 结束时价格。</p>
         </div>
         <div class="history-controls">
           <select id="historyRound" aria-label="筛选轮次"><option value="">全部轮次</option><option value="1">第 1 轮</option><option value="2">第 2 轮</option></select>
@@ -1132,7 +1151,6 @@ INDEX_HTML = r"""<!doctype html>
         <label>官方公告链接<input name="articleUrl" type="url" placeholder="可选，Binance 公告"></label>
       </fieldset>
       <label>最终进榜分数线（U）<input name="finalThreshold" type="number" min="0.01" step="any" required></label>
-      <label>单名进榜用户结束时奖励价值（U）<input name="rewardValueU" type="number" min="0.01" step="any" placeholder="可选"></label>
       <label>该轮最终加权交易量（U）<input name="weightedVolume" type="number" min="0.01" step="any" placeholder="可选"></label>
       <label>备注<textarea name="note" maxlength="500" placeholder="可选"></textarea></label>
       <div id="historyFormStatus" class="errors" role="alert"></div>
@@ -1398,8 +1416,8 @@ INDEX_HTML = r"""<!doctype html>
           <td data-label="最终进榜线" class="metric-primary">${escapeHtml(formatU(final))}</td>
           <td data-label="最终参考线"><div><div>${escapeHtml(formatU(reference))}</div><div class="metric-secondary">${referenceSource ? `${escapeHtml(referenceSource)} · 总量 ${escapeHtml(formatU(row.finalWeightedVolume))}` : escapeHtml(row.referenceError || '待补充轮次总量')}</div></div></td>
           <td data-label="真实 / 参考">${final !== null && reference > 0 ? `${(final / reference).toFixed(2)}x` : '—'}</td>
-          <td data-label="结束时奖励价值">${escapeHtml(formatU(reward))}</td>
-          <td data-label="进榜线 / 奖励">${final !== null && reward > 0 ? `${fmt.format(final / reward)}x` : '—'}</td>
+          <td data-label="结束时奖励价值"><div><div>${escapeHtml(formatU(reward))}</div><div class="metric-secondary">${row.rewardSource === 'official_reward_alpha_end_close' ? `${escapeHtml(fmt.format(row.rewardTokensPerWinner))} ${escapeHtml(row.symbol)} × ${escapeHtml(row.rewardEndPriceU)} U` : escapeHtml(row.rewardError || '待获取公告奖励及结束时价格')}</div></div></td>
+          <td data-label="进榜线 / 奖励">${finiteNumber(row.thresholdRewardRatio) > 0 ? `${fmt.format(row.thresholdRewardRatio)}x` : '—'}</td>
           <td data-label="公告">${articleUrl ? `<a href="${escapeHtml(articleUrl)}" target="_blank" rel="noopener noreferrer">查看公告</a>` : '—'}</td>
           <td data-label="操作"><button type="button" data-history-id="${escapeHtml(row.id)}">${final === null ? '录入' : '修改'}</button></td>
         </tr>`;
@@ -1438,7 +1456,6 @@ INDEX_HTML = r"""<!doctype html>
       document.getElementById('historyDialogContext').textContent = row
         ? `${row.symbol} · 第 ${row.round} 轮 · ${formatUtc(row.endUtc)}` : '补录已结束交易赛';
       historyForm.elements.namedItem('finalThreshold').value = row?.finalThreshold ?? '';
-      historyForm.elements.namedItem('rewardValueU').value = row?.rewardValueU ?? '';
       historyForm.elements.namedItem('weightedVolume').value = row?.referenceSource === 'manual_volume' ? row.finalWeightedVolume : '';
       historyForm.elements.namedItem('weightedVolume').placeholder = row?.finalWeightedVolume != null
         ? `已记录 ${formatU(row.finalWeightedVolume)}` : '可选';
@@ -1451,7 +1468,6 @@ INDEX_HTML = r"""<!doctype html>
       const field = name => historyForm.elements.namedItem(name).value;
       const data = action === 'delete' ? { action, id: editingHistoryId } : {
         finalThreshold: Number(field('finalThreshold')),
-        rewardValueU: field('rewardValueU') ? Number(field('rewardValueU')) : null,
         note: field('note').trim(),
       };
       if (action !== 'delete') {
@@ -1766,6 +1782,7 @@ class Handler(BaseHTTPRequestHandler):
                 current = datetime.now(timezone.utc)
                 store = self._history()
                 complete_history_reference(store, now=current, provider=getattr(self.server, "history_volume_provider", None))
+                complete_history_reward(store, now=current)
                 self._send_json(store.snapshot(now=current))
             except (Exception, SystemExit) as exc:
                 self._send_internal_error(exc)

@@ -161,3 +161,30 @@ def test_failed_reference_calculation_is_cooled_down(tmp_path: Path) -> None:
 
     assert store.pending_reference(now=NOW + timedelta(minutes=5)) is None
     assert store.pending_reference(now=NOW + timedelta(minutes=11))[0] == "aeon-article:1"
+
+
+def test_reward_is_persisted_and_ratio_follows_cutoff_edits(tmp_path: Path) -> None:
+    store = CompetitionHistoryStore(tmp_path / "history.json")
+    store.archive_rules([_rule()], now=NOW)
+    store.save_final({"id": "aeon-article:1", "finalThreshold": 180_554.0}, now=NOW)
+    assert store.pending_reward(now=NOW)["id"] == "aeon-article:1"
+    store.save_reward("aeon-article:1", {
+        "rewardValueU": 112.294,
+        "rewardTokensPerWinner": 910,
+        "rewardEndPriceU": 0.1234,
+        "rewardSource": "official_reward_alpha_end_close",
+    }, now=NOW)
+    assert store.pending_reward(now=NOW)["id"] == "aeon-article:2"
+    store.save_final({"id": "aeon-article:1", "finalThreshold": 190_000.0}, now=NOW)
+    row = next(row for row in CompetitionHistoryStore(store.path).snapshot(now=NOW)["rows"] if row["round"] == 1)
+    assert row["rewardValueU"] == 112.294
+    assert row["thresholdRewardRatio"] == pytest.approx(190_000 / 112.294)
+
+
+def test_reward_failure_is_retried_after_cooldown(tmp_path: Path) -> None:
+    store = CompetitionHistoryStore(tmp_path / "history.json")
+    store.archive_rules([_rule()], now=NOW)
+    store.mark_reward_unavailable("aeon-article:1", now=NOW)
+    store.mark_reward_unavailable("aeon-article:2", now=NOW)
+    assert store.pending_reward(now=NOW + timedelta(minutes=5)) is None
+    assert store.pending_reward(now=NOW + timedelta(minutes=11))["id"] == "aeon-article:1"

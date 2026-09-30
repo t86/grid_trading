@@ -172,7 +172,44 @@ class CompetitionHistoryStore:
                 if _parse_utc(row.get("endUtc")) <= current
             ]
         rows.sort(key=lambda row: (row["endUtc"], row["symbol"], row["round"]), reverse=True)
+        for row in rows:
+            threshold, reward = row.get("finalThreshold"), row.get("rewardValueU")
+            row["thresholdRewardRatio"] = threshold / reward if threshold and reward else None
         return {"generatedAtUtc": current.isoformat(timespec="seconds"), "rows": rows}
+
+    def pending_reward(self, *, now: datetime) -> dict[str, Any] | None:
+        current = _utc(now)
+        with self._lock:
+            for row in sorted(self._load().values(), key=lambda item: item["endUtc"]):
+                if _parse_utc(row["endUtc"]) > current or not row.get("articleCode"):
+                    continue
+                if row.get("rewardSource") == "official_reward_alpha_end_close" and row.get("rewardValueU"):
+                    continue
+                if row.get("rewardRetryAtUtc") and _parse_utc(row["rewardRetryAtUtc"]) > current:
+                    continue
+                return dict(row)
+        return None
+
+    def save_reward(self, identity: str, reward: dict[str, Any], *, now: datetime) -> None:
+        _positive_number(reward.get("rewardValueU"), "rewardValueU")
+        with self._lock:
+            rows = self._load()
+            row = rows.get(identity)
+            if row is None or _parse_utc(row["endUtc"]) > _utc(now):
+                raise ValueError("ended competition round is required")
+            row.update(reward, rewardCalculatedAtUtc=_utc(now).isoformat())
+            row.pop("rewardError", None)
+            row.pop("rewardRetryAtUtc", None)
+            self._save(rows)
+
+    def mark_reward_unavailable(self, identity: str, *, now: datetime) -> None:
+        with self._lock:
+            rows = self._load()
+            if identity not in rows:
+                return
+            rows[identity]["rewardError"] = "公告奖励数量或结束时价格暂不可用"
+            rows[identity]["rewardRetryAtUtc"] = (_utc(now) + timedelta(minutes=10)).isoformat()
+            self._save(rows)
 
     def pending_reference(self, *, now: datetime) -> tuple[str, CompetitionRule, CompetitionRound] | None:
         current = _utc(now)
