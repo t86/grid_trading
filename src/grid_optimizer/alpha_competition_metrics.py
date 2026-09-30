@@ -791,6 +791,8 @@ class CompetitionVolumeProvider:
         rule: CompetitionRule,
         round_: CompetitionRound,
         now: datetime,
+        *,
+        require_complete: bool = False,
     ) -> VolumeSnapshot:
         valid_rule = _validate_rule(rule)
         valid_round = _validate_round_window(round_)
@@ -799,6 +801,8 @@ class CompetitionVolumeProvider:
         current = _require_utc_aware(now, "now")
         if current < valid_round.start_utc:
             raise ValueError("now must not precede round start")
+        if require_complete and current < valid_round.end_utc:
+            raise ValueError("competition round has not ended")
 
         if self.official_fetcher is not None:
             official = self.official_fetcher(valid_rule, valid_round, current)
@@ -812,6 +816,8 @@ class CompetitionVolumeProvider:
                     raise ValueError("official volume snapshot is invalid") from None
                 if not valid_round.start_utc <= official_updated <= current:
                     raise ValueError("official volume snapshot is invalid")
+                if require_complete and official_updated < valid_round.end_utc:
+                    raise ValueError("final official volume snapshot is incomplete")
                 return VolumeSnapshot(official_total, "official", official_updated)
 
         tokens = self.market.fetch_tokens()
@@ -829,6 +835,13 @@ class CompetitionVolumeProvider:
             start_time_ms=int(valid_round.start_utc.timestamp() * 1000),
             end_time_ms=int(end.timestamp() * 1000),
         )
+        if require_complete:
+            start_ms = int(valid_round.start_utc.timestamp() * 1000)
+            end_ms = int(valid_round.end_utc.timestamp() * 1000)
+            expected = set(range(start_ms, end_ms, 3_600_000))
+            actual = {_kline_open_time_ms(row[0]) for row in rows if isinstance(row, list) and row}
+            if not expected.issubset(actual):
+                raise ValueError("final round kline volume is incomplete")
         return VolumeSnapshot(
             weighted_volume=weight_kline_volume(valid_round, valid_rule.multipliers, rows),
             source="alpha_kline_estimate",

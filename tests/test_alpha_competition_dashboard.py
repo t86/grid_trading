@@ -330,12 +330,15 @@ def running_server(
 
 
 @pytest.fixture(autouse=True)
-def reset_competition_service() -> Any:
+def reset_competition_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
+    monkeypatch.setenv("ALPHA_COMPETITION_HISTORY_CACHE", str(tmp_path / "history.json"))
     dashboard._COMPETITION_SERVICE = None
     dashboard._DISCOVERY_SERVICE = None
+    dashboard._HISTORY_STORE = None
     yield
     dashboard._COMPETITION_SERVICE = None
     dashboard._DISCOVERY_SERVICE = None
+    dashboard._HISTORY_STORE = None
 
 
 @pytest.fixture
@@ -601,6 +604,26 @@ def test_competition_api_archives_rules_before_they_disappear(
     ) as server:
         assert server.get("/api/competition").status_code == 200
     assert len(store._load()) == 1
+
+
+def test_history_completes_a_finished_round_reference(tmp_path: Path) -> None:
+    store = CompetitionHistoryStore(tmp_path / "history.json")
+    snapshot = _discovery_snapshot(symbols=("DOS",), stale=False, errors=())
+    now = DISCOVERED_AT + timedelta(days=10)
+    store.archive_rules(list(snapshot.rules), now=now)
+    store.save_final({"id": "dos-article:1", "finalThreshold": 180_554.0, "rewardValueU": 100.0}, now=now)
+
+    class Provider:
+        def fetch(self, rule, round_, current, *, require_complete):
+            assert require_complete is True
+            assert current >= round_.end_utc
+            return metrics.VolumeSnapshot(230_000_000.0, "alpha_kline_estimate", current)
+
+    dashboard.complete_history_reference(store, now=now, provider=Provider())
+    row = store.snapshot(now=now)["rows"][0]
+    assert row["referenceThreshold"] == 138_000.0
+    assert row["finalThreshold"] == 180_554.0
+    assert row["rewardValueU"] == 100.0
 
 
 def test_auth_fails_closed_without_credentials(monkeypatch: pytest.MonkeyPatch) -> None:

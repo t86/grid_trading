@@ -7,11 +7,14 @@ from pathlib import Path
 import re
 import tempfile
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
-from .alpha_competition_metrics import CompetitionRule
+from .alpha_competition_metrics import (
+    CompetitionRound, CompetitionRule, calculate_thresholds,
+    decode_competition_rule, encode_competition_rule,
+)
 
 
 DEFAULT_HISTORY_PATH = Path("/home/ubuntu/.local/share/binance-alpha-volume-alert/competition_history.json")
@@ -110,6 +113,7 @@ class CompetitionHistoryStore:
                         "winnerCount": rule.winner_count,
                         "articleUrl": rule.article_url,
                         "source": "official_rule",
+                        "rule": encode_competition_rule(rule),
                     }
                     existing = rows.get(identity, {})
                     merged = {**existing, **metadata}
@@ -163,11 +167,58 @@ class CompetitionHistoryStore:
         current = _utc(now)
         with self._lock:
             rows = [
-                dict(row) for row in self._load().values()
+                {key: value for key, value in row.items() if key != "rule"}
+                for row in self._load().values()
                 if _parse_utc(row.get("endUtc")) <= current
             ]
         rows.sort(key=lambda row: (row["endUtc"], row["symbol"], row["round"]), reverse=True)
         return {"generatedAtUtc": current.isoformat(timespec="seconds"), "rows": rows}
+
+    def pending_reference(self, *, now: datetime) -> tuple[str, CompetitionRule, CompetitionRound] | None:
+        current = _utc(now)
+        with self._lock:
+            for row in sorted(self._load().values(), key=lambda item: item["endUtc"]):
+                if _parse_utc(row["endUtc"]) > current or row.get("referenceThreshold") is not None:
+                    continue
+                if row.get("referenceRetryAtUtc") and _parse_utc(row["referenceRetryAtUtc"]) > current:
+                    continue
+                try:
+                    rule = decode_competition_rule(row.get("rule"))
+                    round_ = next(round_ for round_ in rule.rounds if round_.number == row["round"])
+                except (ValueError, TypeError, StopIteration):
+                    continue
+                return row["id"], rule, round_
+        return None
+
+    @staticmethod
+    def _set_reference(row: dict[str, Any], weighted_volume: float, source: str, now: datetime) -> None:
+        thresholds = calculate_thresholds(weighted_volume=weighted_volume, winner_count=row["winnerCount"])
+        row.update(
+            finalWeightedVolume=weighted_volume,
+            referenceThreshold=thresholds.reference,
+            referenceSource=source,
+            referenceCalculatedAtUtc=_utc(now).isoformat(),
+        )
+        row.pop("referenceError", None)
+        row.pop("referenceRetryAtUtc", None)
+
+    def save_reference(self, identity: str, *, weighted_volume: float, source: str, now: datetime) -> None:
+        with self._lock:
+            rows = self._load()
+            row = rows.get(identity)
+            if row is None or _parse_utc(row["endUtc"]) > _utc(now):
+                raise ValueError("ended competition round is required")
+            self._set_reference(row, weighted_volume, source, now)
+            self._save(rows)
+
+    def mark_reference_unavailable(self, identity: str, *, now: datetime) -> None:
+        with self._lock:
+            rows = self._load()
+            if identity not in rows:
+                return
+            rows[identity]["referenceError"] = "完整轮次 K 线暂不可用"
+            rows[identity]["referenceRetryAtUtc"] = (_utc(now) + timedelta(minutes=10)).isoformat()
+            self._save(rows)
 
     def save_final(self, payload: dict[str, Any], *, now: datetime) -> dict[str, Any]:
         if not isinstance(payload, dict):
@@ -219,6 +270,12 @@ class CompetitionHistoryStore:
             if len(note) > 500:
                 raise ValueError("note is too long")
             row.update(finalThreshold=threshold, note=note, updatedAtUtc=current.isoformat())
+            if "rewardValueU" in payload:
+                value = payload["rewardValueU"]
+                row["rewardValueU"] = None if value is None else _positive_number(value, "rewardValueU")
+            if payload.get("weightedVolume") is not None:
+                volume = _positive_number(payload["weightedVolume"], "weightedVolume")
+                self._set_reference(row, volume, "manual_volume", current)
             rows[identity] = row
             self._save(rows)
             return dict(row)
@@ -233,6 +290,7 @@ class CompetitionHistoryStore:
                 del rows[identity]
             else:
                 row["finalThreshold"] = None
+                row["rewardValueU"] = None
                 row["note"] = ""
                 row.pop("updatedAtUtc", None)
             self._save(rows)

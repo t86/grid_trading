@@ -1505,6 +1505,23 @@ def test_volume_provider_clamps_kline_end_to_round_end() -> None:
     assert market.calls[0]["end_time_ms"] == int(round_.end_utc.timestamp() * 1000)
 
 
+def test_final_round_volume_requires_every_hour() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    round_ = rule.rounds[0]
+    rows = [
+        _kline((round_.start_utc + timedelta(hours=hour)).strftime("%Y-%m-%d %H:%M"), quote_volume="100")
+        for hour in range(168)
+    ]
+    market = _FakeMarketClient(rows)
+    provider = metrics.CompetitionVolumeProvider(market=market)
+    result = provider.fetch(rule, round_, round_.end_utc, require_complete=True)
+    assert result.weighted_volume == pytest.approx(100 * 24 * sum(rule.multipliers))
+
+    market.rows = rows[:-1]
+    with pytest.raises(ValueError, match="incomplete"):
+        provider.fetch(rule, round_, round_.end_utc, require_complete=True)
+
+
 def test_volume_provider_counts_the_current_forming_hour_by_open_time() -> None:
     rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
     round_ = rule.rounds[0]

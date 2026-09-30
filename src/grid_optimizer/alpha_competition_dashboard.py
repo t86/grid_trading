@@ -46,6 +46,7 @@ _DISCOVERY_SERVICE: CompetitionDiscoveryService | None = None
 _DISCOVERY_SERVICE_LOCK = threading.Lock()
 _HISTORY_STORE: CompetitionHistoryStore | None = None
 _HISTORY_STORE_LOCK = threading.Lock()
+_HISTORY_REFERENCE_LOCK = threading.Lock()
 _ALERT_CHECK_LOCK = threading.Lock()
 _HOURLY_ALERT_LOCK = threading.Lock()
 _SNAPSHOT_SYMBOL_RE = re.compile(r"[A-Z0-9_]{1,32}")
@@ -721,6 +722,25 @@ def history_store() -> CompetitionHistoryStore:
         return _HISTORY_STORE
 
 
+def complete_history_reference(store: CompetitionHistoryStore, *, now: datetime, provider: Any = None) -> None:
+    if not _HISTORY_REFERENCE_LOCK.acquire(blocking=False):
+        return
+    try:
+        pending = store.pending_reference(now=now)
+        if pending is None:
+            return
+        identity, rule, round_ = pending
+        volume_provider = provider or CompetitionVolumeProvider(market=AlphaMarketClient())
+        try:
+            volume = volume_provider.fetch(rule, round_, now, require_complete=True)
+        except Exception:
+            store.mark_reference_unavailable(identity, now=now)
+        else:
+            store.save_reference(identity, weighted_volume=volume.weighted_volume, source=volume.source, now=now)
+    finally:
+        _HISTORY_REFERENCE_LOCK.release()
+
+
 INDEX_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -902,7 +922,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .history-summary { display: flex; gap: 22px; flex-wrap: wrap; margin: 10px 0 14px; font-size: 13px; }
     .history-summary strong { margin-left: 6px; font-variant-numeric: tabular-nums; }
-    .history-table { min-width: 900px; }
+    .history-table { min-width: 1100px; }
     .history-table th:first-child { min-width: 140px; }
     .history-table td:last-child, .history-table th:last-child { text-align: center; }
     .history-table button { min-height: 30px; padding: 0 9px; font-size: 12px; }
@@ -1040,7 +1060,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="section-heading">
         <div>
           <h2 id="historyTitle">已结束竞赛参照</h2>
-          <p class="section-copy">按公告和轮次记录最终进榜线；历史参考值来自已录入的实际结果。</p>
+          <p class="section-copy">参考线 = 该轮加权总量 ÷ 获奖人数 × 0.6；奖励按单名进榜用户在结束时获得的 U 价值记录。</p>
         </div>
         <div class="history-controls">
           <select id="historyRound" aria-label="筛选轮次"><option value="">全部轮次</option><option value="1">第 1 轮</option><option value="2">第 2 轮</option></select>
@@ -1051,7 +1071,7 @@ INDEX_HTML = r"""<!doctype html>
       <div id="historySummary" class="history-summary" aria-live="polite"></div>
       <div class="table-wrap competition-wrap">
         <table class="history-table">
-          <thead><tr><th>币种 / 轮次</th><th>结束时间</th><th>获奖人数</th><th>最终进榜线</th><th>最后参考线</th><th>真实 / 参考</th><th>公告</th><th>操作</th></tr></thead>
+          <thead><tr><th>币种 / 轮次</th><th>结束时间</th><th>获奖人数</th><th>最终进榜线</th><th>最终参考线</th><th>真实 / 参考</th><th>结束时奖励价值</th><th>进榜线 / 奖励</th><th>公告</th><th>操作</th></tr></thead>
           <tbody id="historyRows"></tbody>
         </table>
         <div id="historyEmpty" class="history-empty" hidden>暂无已结束竞赛。可录入旧赛的最终分数线。</div>
@@ -1112,6 +1132,8 @@ INDEX_HTML = r"""<!doctype html>
         <label>官方公告链接<input name="articleUrl" type="url" placeholder="可选，Binance 公告"></label>
       </fieldset>
       <label>最终进榜分数线（U）<input name="finalThreshold" type="number" min="0.01" step="any" required></label>
+      <label>单名进榜用户结束时奖励价值（U）<input name="rewardValueU" type="number" min="0.01" step="any" placeholder="可选"></label>
+      <label>该轮最终加权交易量（U）<input name="weightedVolume" type="number" min="0.01" step="any" placeholder="可选"></label>
       <label>备注<textarea name="note" maxlength="500" placeholder="可选"></textarea></label>
       <div id="historyFormStatus" class="errors" role="alert"></div>
       <div class="history-form-actions">
@@ -1351,26 +1373,33 @@ INDEX_HTML = r"""<!doctype html>
       const completed = filtered.filter(row => finiteNumber(row.finalThreshold) !== null);
       const cutoffs = completed.map(row => row.finalThreshold);
       const ratios = completed.map(row => {
-        const reference = finiteNumber(row.lastObservation?.referenceThreshold);
+        const reference = finiteNumber(row.referenceThreshold);
         return reference > 0 ? row.finalThreshold / reference : null;
       }).filter(value => value !== null);
+      const rewardRatios = completed.filter(row => finiteNumber(row.rewardValueU) > 0)
+        .map(row => row.finalThreshold / row.rewardValueU);
       document.getElementById('historySummary').innerHTML = [
         `已录入 <strong>${completed.length} / ${filtered.length}</strong>`,
         `中位进榜线 <strong>${escapeHtml(formatU(median(cutoffs)))}</strong>`,
         `范围 <strong>${cutoffs.length ? `${escapeHtml(formatU(Math.min(...cutoffs)))}–${escapeHtml(formatU(Math.max(...cutoffs)))}` : '—'}</strong>`,
         `真实 / 参考中位 <strong>${ratios.length ? `${median(ratios).toFixed(2)}x` : '—'}</strong>`,
+        `进榜线 / 奖励中位 <strong>${rewardRatios.length ? `${fmt.format(median(rewardRatios))}x` : '—'}</strong>`,
       ].map(value => `<span>${value}</span>`).join('');
       historyRowsEl.innerHTML = filtered.map(row => {
-        const reference = finiteNumber(row.lastObservation?.referenceThreshold);
+        const reference = finiteNumber(row.referenceThreshold);
         const final = finiteNumber(row.finalThreshold);
+        const reward = finiteNumber(row.rewardValueU);
+        const referenceSource = {alpha_kline_estimate: 'Alpha K线估算', official: '官方总量', manual_volume: '手工加权总量'}[row.referenceSource];
         const articleUrl = safeArticleUrl(row.articleUrl);
         return `<tr>
-          <td data-label="币种 / 轮次"><div><strong>${escapeHtml(row.symbol)}</strong> · 第 ${escapeHtml(row.round)} 轮</div><div class="name">${escapeHtml(row.name || '')}</div></td>
+          <td data-label="币种 / 轮次"><div><div><strong>${escapeHtml(row.symbol)}</strong> · 第 ${escapeHtml(row.round)} 轮</div><div class="name">${escapeHtml(row.name || '')}</div></div></td>
           <td data-label="结束时间">${escapeHtml(formatUtc(row.endUtc))}</td>
           <td data-label="获奖人数">${escapeHtml(formatInteger(row.winnerCount))}</td>
           <td data-label="最终进榜线" class="metric-primary">${escapeHtml(formatU(final))}</td>
-          <td data-label="最后参考线"><div>${escapeHtml(formatU(reference))}</div><div class="metric-secondary">${row.lastObservation?.observedAtUtc ? escapeHtml(formatUtc(row.lastObservation.observedAtUtc)) : ''}</div></td>
+          <td data-label="最终参考线"><div><div>${escapeHtml(formatU(reference))}</div><div class="metric-secondary">${referenceSource ? `${escapeHtml(referenceSource)} · 总量 ${escapeHtml(formatU(row.finalWeightedVolume))}` : escapeHtml(row.referenceError || '待补充轮次总量')}</div></div></td>
           <td data-label="真实 / 参考">${final !== null && reference > 0 ? `${(final / reference).toFixed(2)}x` : '—'}</td>
+          <td data-label="结束时奖励价值">${escapeHtml(formatU(reward))}</td>
+          <td data-label="进榜线 / 奖励">${final !== null && reward > 0 ? `${fmt.format(final / reward)}x` : '—'}</td>
           <td data-label="公告">${articleUrl ? `<a href="${escapeHtml(articleUrl)}" target="_blank" rel="noopener noreferrer">查看公告</a>` : '—'}</td>
           <td data-label="操作"><button type="button" data-history-id="${escapeHtml(row.id)}">${final === null ? '录入' : '修改'}</button></td>
         </tr>`;
@@ -1409,6 +1438,10 @@ INDEX_HTML = r"""<!doctype html>
       document.getElementById('historyDialogContext').textContent = row
         ? `${row.symbol} · 第 ${row.round} 轮 · ${formatUtc(row.endUtc)}` : '补录已结束交易赛';
       historyForm.elements.namedItem('finalThreshold').value = row?.finalThreshold ?? '';
+      historyForm.elements.namedItem('rewardValueU').value = row?.rewardValueU ?? '';
+      historyForm.elements.namedItem('weightedVolume').value = row?.referenceSource === 'manual_volume' ? row.finalWeightedVolume : '';
+      historyForm.elements.namedItem('weightedVolume').placeholder = row?.finalWeightedVolume != null
+        ? `已记录 ${formatU(row.finalWeightedVolume)}` : '可选';
       historyForm.elements.namedItem('note').value = row?.note || '';
       document.getElementById('historyFormStatus').textContent = '';
       historyDialog.showModal();
@@ -1418,9 +1451,11 @@ INDEX_HTML = r"""<!doctype html>
       const field = name => historyForm.elements.namedItem(name).value;
       const data = action === 'delete' ? { action, id: editingHistoryId } : {
         finalThreshold: Number(field('finalThreshold')),
+        rewardValueU: field('rewardValueU') ? Number(field('rewardValueU')) : null,
         note: field('note').trim(),
       };
       if (action !== 'delete') {
+        if (field('weightedVolume')) data.weightedVolume = Number(field('weightedVolume'));
         if (editingHistoryId) data.id = editingHistoryId;
         else Object.assign(data, {
           symbol: field('symbol').trim().toUpperCase(),
@@ -1728,7 +1763,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/history":
             try:
-                self._send_json(self._history().snapshot(now=datetime.now(timezone.utc)))
+                current = datetime.now(timezone.utc)
+                store = self._history()
+                complete_history_reference(store, now=current, provider=getattr(self.server, "history_volume_provider", None))
+                self._send_json(store.snapshot(now=current))
             except (Exception, SystemExit) as exc:
                 self._send_internal_error(exc)
             return

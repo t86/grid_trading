@@ -106,3 +106,58 @@ def test_future_round_cannot_be_marked_final(tmp_path: Path) -> None:
             },
             now=NOW,
         )
+
+
+def test_finished_rule_can_store_final_kline_reference_without_changing_cutoff(tmp_path: Path) -> None:
+    store = CompetitionHistoryStore(tmp_path / "history.json")
+    store.archive_rules([_rule()], now=NOW)
+    store.save_final({"id": "aeon-article:1", "finalThreshold": 180_554.0}, now=NOW)
+
+    pending = store.pending_reference(now=NOW)
+    assert pending is not None
+    identity, rule, round_ = pending
+    assert (identity, rule.symbol, round_.number) == ("aeon-article:1", "AEON", 1)
+
+    store.save_reference(
+        identity,
+        weighted_volume=461_489_123.52,
+        source="alpha_kline_estimate",
+        now=NOW,
+    )
+    row = next(row for row in CompetitionHistoryStore(store.path).snapshot(now=NOW)["rows"] if row["id"] == identity)
+    assert row["finalThreshold"] == 180_554.0
+    assert row["finalWeightedVolume"] == pytest.approx(461_489_123.52)
+    assert row["referenceThreshold"] == pytest.approx(461_489_123.52 / 2500 * 0.6)
+    assert row["referenceSource"] == "alpha_kline_estimate"
+    assert "rule" not in row
+
+
+def test_manual_weighted_volume_and_per_winner_reward_are_saved(tmp_path: Path) -> None:
+    store = CompetitionHistoryStore(tmp_path / "history.json")
+    row = store.save_final(
+        {
+            "symbol": "CAP",
+            "round": 1,
+            "endUtc": "2026-08-08T13:00:00+00:00",
+            "winnerCount": 2500,
+            "finalThreshold": 180_554.0,
+            "weightedVolume": 460_000_000.0,
+            "rewardValueU": 120.0,
+        },
+        now=NOW,
+    )
+
+    assert row["referenceThreshold"] == pytest.approx(460_000_000 / 2500 * 0.6)
+    assert row["referenceSource"] == "manual_volume"
+    assert row["rewardValueU"] == 120.0
+    assert row["finalThreshold"] / row["rewardValueU"] == pytest.approx(1504.6166666666666)
+
+
+def test_failed_reference_calculation_is_cooled_down(tmp_path: Path) -> None:
+    store = CompetitionHistoryStore(tmp_path / "history.json")
+    store.archive_rules([_rule()], now=NOW)
+    store.save_reference("aeon-article:2", weighted_volume=1000.0, source="alpha_kline_estimate", now=NOW)
+    store.mark_reference_unavailable("aeon-article:1", now=NOW)
+
+    assert store.pending_reference(now=NOW + timedelta(minutes=5)) is None
+    assert store.pending_reference(now=NOW + timedelta(minutes=11))[0] == "aeon-article:1"
