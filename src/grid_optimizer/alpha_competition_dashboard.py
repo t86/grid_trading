@@ -178,11 +178,24 @@ def _format_hourly_volume(value: float) -> str:
     return f"{value:,.2f} USDT"
 
 
+def _volume_alert_rules() -> tuple[tuple[int, str, float], ...]:
+    return (
+        (5, "latest5mQuoteVolume", 1_000_000.0),
+        (10, "latest10mQuoteVolume", 2_000_000.0),
+        (20, "latest20mQuoteVolume", 3_500_000.0),
+        (60, "latest1hQuoteVolume", _hourly_alert_threshold()),
+    )
+
+
 def _format_hourly_alert_body(row: dict[str, Any], threshold: float, now: datetime) -> str:
+    minutes = row.get("alertWindowMinutes", 60)
+    field = "latest1hQuoteVolume" if minutes == 60 else f"latest{minutes}mQuoteVolume"
     return "\n".join(
         [
-            f"{row.get('symbol', '')} 最近 1 小时成交额突破 {_format_hourly_volume(threshold)}。",
+            f"{row.get('symbol', '')} 最近{minutes}分钟成交额突破 {_format_hourly_volume(threshold)}。",
+            f"触发窗口成交额: {_format_hourly_volume(_finite_float(row.get(field)))}",
             "",
+            *[f"最近{n}分钟成交额: {_format_hourly_volume(_finite_float(row.get(f'latest{n}mQuoteVolume')))}" for n in (5, 10, 20)],
             f"最近1小时成交额: {_format_hourly_volume(_finite_float(row.get('latest1hQuoteVolume')))}",
             f"最近1分钟成交额: {_format_hourly_volume(_finite_float(row.get('latest1mQuoteVolume')))}",
             f"24小时成交额: {_format_hourly_volume(_finite_float(row.get('tickerQuoteVolume24h')))}",
@@ -196,18 +209,20 @@ def _format_hourly_alert_body(row: dict[str, Any], threshold: float, now: dateti
 
 def _send_hourly_volume_alert(row: dict[str, Any], threshold: float, now: datetime) -> dict[str, Any]:
     symbol = str(row.get("symbol") or "").upper()
-    subject = f"Alpha小时成交额突破1000万: {symbol}"
+    minutes = row.get("alertWindowMinutes", 60)
+    subject = f"Alpha量能预警: {symbol} {minutes}分钟突破{threshold / 10000:g}万"
     body = _format_hourly_alert_body(row, threshold, now)
-    result: dict[str, Any] = {"symbol": symbol, "email": {"sent": False}, "bark": {"sent": False}}
+    result: dict[str, Any] = {"symbol": symbol, "windowMinutes": minutes, "threshold": threshold,
+                              "email": {"sent": False}, "bark": {"sent": False}}
+    try:
+        result["bark"] = send_bark_alert(title=subject, body=body, config_path=_hourly_alert_bark_config_path())
+    except Exception as exc:
+        result["bark"] = {"sent": False, "error": f"{type(exc).__name__}: {exc}"}
     try:
         alert.send_email(subject, body)
         result["email"] = {"sent": True}
     except Exception as exc:
         result["email"] = {"sent": False, "error": f"{type(exc).__name__}: {exc}"}
-    try:
-        result["bark"] = send_bark_alert(title=subject, body=body, config_path=_hourly_alert_bark_config_path())
-    except Exception as exc:
-        result["bark"] = {"sent": False, "error": f"{type(exc).__name__}: {exc}"}
     return result
 
 
@@ -243,16 +258,31 @@ def check_hourly_volume_breakouts(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if not isinstance(previous, dict):
                 previous = {}
             had_previous = symbol in symbols_state
-            was_above = bool(previous.get("above")) if had_previous else above
             already_triggered_today = previous.get("lastTriggerDate") == date_key
-            send_now = had_previous and (not was_above) and above and not already_triggered_today
+            previous_windows = previous.get("windowsAbove", {})
+            if not isinstance(previous_windows, dict):
+                previous_windows = {}
+            windows_above = {}
+            crossing = None
+            for minutes, field, window_threshold in _volume_alert_rules():
+                window_above = _finite_float(row.get(field)) >= window_threshold
+                key = str(minutes)
+                windows_above[key] = window_above
+                was_above = previous_windows.get(key, previous.get("above", window_above) if minutes == 60 else window_above)
+                if had_previous and not was_above and window_above and crossing is None:
+                    crossing = (minutes, window_threshold)
+            send_now = crossing is not None and not already_triggered_today
             send_result = None
             if send_now:
-                send_result = _send_hourly_volume_alert(row, threshold, now)
+                minutes, window_threshold = crossing
+                send_result = _send_hourly_volume_alert({**row, "alertWindowMinutes": minutes}, window_threshold, now)
                 result["triggered"].append(send_result)
+                print(f"Alpha volume alert {symbol} window={minutes}m threshold={window_threshold:g} "
+                      f"bark={bool(send_result.get('bark', {}).get('sent'))} email={bool(send_result.get('email', {}).get('sent'))}", flush=True)
             symbols_state[symbol] = {
                 **previous,
                 "above": above,
+                "windowsAbove": windows_above,
                 "lastVolume": volume,
                 "lastCheckedAtUtc": now.isoformat(timespec="seconds"),
                 "lastThreshold": threshold,
@@ -578,13 +608,9 @@ def _ms_to_iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat(timespec="seconds")
 
 
-def _closed_1m_rows(pair: str, market: Any) -> list[list[Any]]:
-    rows = market.fetch_klines(pair, interval="1m", limit=63)
-    return rows[:-1] if len(rows) >= 2 else rows
-
-
-def _snapshot_row(token: Any, client: Any) -> dict[str, Any]:
-    closed_rows = _closed_1m_rows(token.pair, client)
+def _volume_row(token: Any, client: Any) -> dict[str, Any]:
+    live_rows = client.fetch_klines(token.pair, interval="1m", limit=63)
+    closed_rows = live_rows[:-1] if len(live_rows) >= 2 else live_rows
     latest = closed_rows[-1] if closed_rows else None
     previous = closed_rows[-2] if len(closed_rows) >= 2 else None
     baseline_rows = closed_rows[-21:-1]
@@ -599,31 +625,42 @@ def _snapshot_row(token: Any, client: Any) -> dict[str, Any]:
     latest_1m = _finite_float(latest[7]) if latest else 0.0
     previous_1m = _finite_float(previous[7]) if previous else 0.0
     delta_1m = _finite_float(latest_1m - previous_1m)
-    latest_1h = _finite_sum([_finite_float(row[7]) for row in closed_rows[-60:]])
+    latest_1h = _finite_sum([_finite_float(row[7]) for row in live_rows[-60:]])
     raw_multiple = latest_1m / baseline if baseline > 0 else (999999.0 if latest_1m > 0 else 0.0)
     multiple = _finite_float(raw_multiple, 999999.0 if latest_1m > 0 else 0.0)
-    ticker = client.fetch_ticker(token.pair)
     return {
         "symbol": token.symbol,
         "name": token.name,
         "alphaId": token.alpha_id,
         "pair": token.pair,
         "chain": token.chain_name,
-        "lastPrice": _finite_float(ticker.get("lastPrice"), _finite_float(token.price)),
+        "lastPrice": _finite_float(live_rows[-1][4], _finite_float(token.price)) if live_rows else _finite_float(token.price),
         "latest1mQuoteVolume": latest_1m,
         "previous1mQuoteVolume": previous_1m,
         "delta1mQuoteVolume": delta_1m,
         "latest1hQuoteVolume": latest_1h,
+        **{f"latest{minutes}mQuoteVolume": _finite_sum([_finite_float(row[7]) for row in live_rows[-minutes:]])
+           for minutes in (5, 10, 20)},
         "baselineQuoteVolume": baseline,
         "multiple": multiple,
         "trades": _safe_int(latest[8]) if latest else 0,
         "closedUtc": _ms_to_iso(_safe_int(latest[6]) if latest else 0),
-        "tickerQuoteVolume24h": _finite_float(ticker.get("quoteVolume"), _finite_float(token.volume_24h)),
-        "priceChangePercent24h": _finite_float(ticker.get("priceChangePercent")),
+        "tickerQuoteVolume24h": _finite_float(token.volume_24h),
     }
 
 
-def collect_snapshot(symbols: list[str], market: Any | None = None) -> dict[str, Any]:
+def _snapshot_row(token: Any, client: Any) -> dict[str, Any]:
+    row = _volume_row(token, client)
+    ticker = client.fetch_ticker(token.pair)
+    row.update(
+        lastPrice=_finite_float(ticker.get("lastPrice"), _finite_float(token.price)),
+        tickerQuoteVolume24h=_finite_float(ticker.get("quoteVolume"), _finite_float(token.volume_24h)),
+        priceChangePercent24h=_finite_float(ticker.get("priceChangePercent")),
+    )
+    return row
+
+
+def collect_snapshot(symbols: list[str], market: Any | None = None, *, notify: bool = True) -> dict[str, Any]:
     client = market or AlphaMarketClient()
     tokens = client.fetch_tokens()
     rows: list[dict[str, Any]] = []
@@ -638,7 +675,10 @@ def collect_snapshot(symbols: list[str], market: Any | None = None) -> dict[str,
         except Exception:
             errors.append(f"{symbol}: market data unavailable")
     rows.sort(key=lambda row: row["multiple"], reverse=True)
-    hourly_alert = check_hourly_volume_breakouts(rows)
+    hourly_alert = check_hourly_volume_breakouts(rows) if notify else {
+        "enabled": _env_truthy("ALPHA_HOURLY_ALERT_ENABLED", "0"), "threshold": _hourly_alert_threshold(),
+        "triggered": [], "checked": 0,
+    }
     return {
         "generatedAtUtc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "symbols": symbols,
@@ -658,6 +698,49 @@ def collect_snapshot(symbols: list[str], market: Any | None = None) -> dict[str,
             "cooldownMinutes": _safe_int(os.environ.get("ALPHA_COOLDOWN_MINUTES"), 30),
         },
     }
+
+
+def run_volume_alert_monitor(stop: threading.Event) -> None:
+    market = AlphaMarketClient(timeout_seconds=5)
+    tokens = {}
+    token_refresh_at = discovery_refresh_at = 0.0
+    cache = CompetitionDiscoveryCache(Path(os.environ.get("ALPHA_COMPETITION_DISCOVERY_CACHE", DEFAULT_DISCOVERY_CACHE)))
+    refresh_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="alpha-alert-discovery")
+    refresh_task = None
+    print("Alpha volume monitor started interval=15s windows=5m/10m/20m/60m", flush=True)
+    try:
+        while not stop.is_set():
+            started = time.monotonic()
+            now = datetime.now(timezone.utc)
+            try:
+                if _env_truthy("ALPHA_AUTO_SYMBOLS", "0"):
+                    # Announcement I/O must not pause the fast market-data loop.
+                    if started >= discovery_refresh_at and (refresh_task is None or refresh_task.done()):
+                        refresh_task = refresh_pool.submit(lambda: discovery_service().discover(now=datetime.now(timezone.utc)))
+                        discovery_refresh_at = started + 300
+                    symbols = [rule.symbol for rule in cache.load().rules if any(round_.end_utc > now for round_ in rule.rounds)]
+                else:
+                    symbols = _fallback_symbols_from_env()
+                if symbols and started >= token_refresh_at:
+                    tokens = market.fetch_tokens()
+                    token_refresh_at = started + 300
+                for symbol in symbols:
+                    if stop.is_set():
+                        break
+                    token = tokens.get(symbol)
+                    if token is None:
+                        continue
+                    try:
+                        row = _volume_row(token, market)
+                        check_hourly_volume_breakouts([row])
+                    except Exception as exc:
+                        print(f"Alpha volume monitor {symbol} failed: {type(exc).__name__}", flush=True)
+            except Exception as exc:
+                print(f"Alpha volume monitor failed: {type(exc).__name__}", flush=True)
+            stop.wait(max(1.0, 15 - (time.monotonic() - started)))
+    finally:
+        refresh_pool.shutdown(wait=False, cancel_futures=True)
+        market.session.close()
 
 
 def check_alert_once() -> dict[str, Any]:
@@ -1755,7 +1838,7 @@ class Handler(BaseHTTPRequestHandler):
                     snapshot = self._discovery(current)
                     symbols = [rule.symbol for rule in snapshot.rules]
                 market = getattr(self.server, "market", None)
-                self._send_json(collect_snapshot(symbols, market=market))
+                self._send_json(collect_snapshot(symbols, market=market, notify=False))
             except (Exception, SystemExit) as exc:
                 self._send_internal_error(exc)
             return
@@ -1871,8 +1954,15 @@ def main() -> int:
         raise SystemExit(str(exc)) from None
     args = parse_args()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    stop = threading.Event()
+    if _env_truthy("ALPHA_HOURLY_ALERT_ENABLED", "0"):
+        threading.Thread(target=run_volume_alert_monitor, args=(stop,), name="alpha-volume-alert", daemon=True).start()
     print(f"Serving Binance Alpha dashboard on http://{args.host}:{args.port}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        stop.set()
+        server.server_close()
     return 0
 
 

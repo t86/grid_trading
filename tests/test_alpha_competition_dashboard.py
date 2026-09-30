@@ -453,6 +453,106 @@ def test_check_alert_delegates_to_versioned_alert_module() -> None:
     run.assert_called_once()
 
 
+@pytest.mark.parametrize("minutes,threshold", [(5, 1_000_000), (10, 2_000_000), (20, 3_500_000), (60, 10_000_000)])
+def test_volume_alert_early_windows_share_daily_dedup(monkeypatch, tmp_path, minutes, threshold):
+    monkeypatch.setenv("ALPHA_HOURLY_ALERT_ENABLED", "1")
+    monkeypatch.setenv("ALPHA_HOURLY_ALERT_STATE_FILE", str(tmp_path / "alerts.json"))
+    sent = []
+    monkeypatch.setattr(dashboard, "_send_hourly_volume_alert", lambda row, threshold, now: sent.append((row, threshold)) or {"bark": {"sent": True}})
+    key = "latest1hQuoteVolume" if minutes == 60 else f"latest{minutes}mQuoteVolume"
+    low = {"symbol": "COAI", key: threshold - 1}
+    dashboard.check_hourly_volume_breakouts([low])
+    dashboard.check_hourly_volume_breakouts([{**low, key: threshold}])
+    dashboard.check_hourly_volume_breakouts([low])
+    dashboard.check_hourly_volume_breakouts([{**low, key: threshold, "latest1hQuoteVolume": 12_000_000}])
+    assert len(sent) == 1
+    assert sent[0][0]["alertWindowMinutes"] == minutes
+    assert sent[0][1] == threshold
+
+
+def test_early_alert_rollout_does_not_notify_existing_high_volume(monkeypatch, tmp_path):
+    path = tmp_path / "alerts.json"
+    path.write_text(json.dumps({"symbols": {"COAI": {"above": False}}}))
+    monkeypatch.setenv("ALPHA_HOURLY_ALERT_ENABLED", "1")
+    monkeypatch.setenv("ALPHA_HOURLY_ALERT_STATE_FILE", str(path))
+    sent = []
+    monkeypatch.setattr(dashboard, "_send_hourly_volume_alert", lambda *args: sent.append(args))
+    dashboard.check_hourly_volume_breakouts([{"symbol": "COAI", "latest5mQuoteVolume": 1_100_000}])
+    assert not sent
+
+
+def test_volume_windows_include_live_candle(fake_market):
+    row = dashboard.collect_snapshot(["QUID"], market=fake_market)["rows"][0]
+    expected = sum(float(kline[7]) for kline in fake_market.fetch_klines("ALPHA_1075USDC", interval="1m", limit=63)[-5:])
+    assert row["latest5mQuoteVolume"] == expected
+
+
+def test_alert_bark_is_sent_before_email(monkeypatch):
+    calls = []
+    monkeypatch.setattr(dashboard, "send_bark_alert", lambda **kwargs: calls.append(("bark", kwargs["title"], kwargs["body"])) or {"sent": True})
+    monkeypatch.setattr(dashboard.alert, "send_email", lambda subject, body: calls.append(("email", subject, body)))
+    dashboard._send_hourly_volume_alert({"symbol": "COAI", "alertWindowMinutes": 5, "latest5mQuoteVolume": 1_050_000}, 1_000_000, datetime.now(timezone.utc))
+    assert [call[0] for call in calls] == ["bark", "email"]
+    assert "5分钟" in calls[0][1]
+    assert "1,050,000" in calls[0][2]
+
+
+def test_background_monitor_detects_without_page_requests(monkeypatch, tmp_path, fake_market):
+    monkeypatch.setenv("ALPHA_HOURLY_ALERT_ENABLED", "1")
+    monkeypatch.setenv("ALPHA_AUTO_SYMBOLS", "0")
+    monkeypatch.setenv("ALPHA_SYMBOLS", "QUID")
+    monkeypatch.setenv("ALPHA_HOURLY_ALERT_STATE_FILE", str(tmp_path / "alerts.json"))
+    monkeypatch.setattr(dashboard, "AlphaMarketClient", lambda **kwargs: fake_market)
+    closed = []
+    class Session:
+        def close(self):
+            closed.append(True)
+    fake_market.session = Session()
+    rows = iter([{"symbol": "QUID", "latest5mQuoteVolume": 900_000},
+                 {"symbol": "QUID", "latest5mQuoteVolume": 1_010_000}])
+    monkeypatch.setattr(dashboard, "_volume_row", lambda *args: next(rows))
+    sent = []
+    monkeypatch.setattr(dashboard, "_send_hourly_volume_alert", lambda row, threshold, now: sent.append(row) or {"bark": {"sent": True}})
+    class Stop:
+        cycles = 0
+        def is_set(self):
+            return self.cycles >= 2
+        def wait(self, interval):
+            assert 1 <= interval <= 15
+            self.cycles += 1
+    dashboard.run_volume_alert_monitor(Stop())
+    assert len(sent) == 1
+    assert sent[0]["alertWindowMinutes"] == 5
+    assert fake_market.fetch_token_calls == 1
+    assert closed == [True]
+
+
+def test_background_symbols_exclude_ended_rules(monkeypatch, tmp_path, fake_market):
+    monkeypatch.setenv("ALPHA_AUTO_SYMBOLS", "1")
+    monkeypatch.setenv("ALPHA_HOURLY_ALERT_ENABLED", "1")
+    monkeypatch.setenv("ALPHA_COMPETITION_DISCOVERY_CACHE", str(tmp_path / "discovery.json"))
+    calls = []
+    class Stop:
+        stopped = False
+        def is_set(self):
+            return self.stopped
+        def wait(self, interval):
+            self.stopped = True
+    stop = Stop()
+    snapshot = _discovery_snapshot(("QUID",), stale=False, errors=())
+    monkeypatch.setattr(dashboard.discovery_service(), "discover", lambda **kwargs: calls.append("discovery"))
+    monkeypatch.setattr(dashboard.CompetitionDiscoveryCache, "load", lambda self: snapshot)
+    monkeypatch.setattr(dashboard, "AlphaMarketClient", lambda **kwargs: fake_market)
+    class Session:
+        def close(self):
+            pass
+    fake_market.session = Session()
+    monkeypatch.setattr(dashboard, "_volume_row", lambda *args: calls.append("volume"))
+    dashboard.run_volume_alert_monitor(stop)
+    assert fake_market.fetch_token_calls == 0
+    assert "volume" not in calls
+
+
 def test_competition_service_is_lazy_thread_safe_and_uses_configured_cache(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
