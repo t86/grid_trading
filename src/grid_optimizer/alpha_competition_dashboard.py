@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlparse
 from . import alpha_volume_alert as alert
 from .alpha_market import AlphaMarketClient
 from .alpha_competition_discovery import CompetitionDiscoveryCache, CompetitionDiscoveryService
+from .alpha_competition_history import CompetitionHistoryStore, DEFAULT_HISTORY_PATH
 from .alpha_competition_metrics import (
     BinanceCompetitionRuleProvider,
     CompetitionMetricsService,
@@ -34,11 +35,14 @@ DEFAULT_PORT = int(os.environ.get("ALPHA_DASHBOARD_PORT", "8796"))
 DEFAULT_SYMBOLS = ("QUID", "GRVT", "O", "PRL", "CAP")
 DEFAULT_RULE_CACHE = "/home/ubuntu/.cache/binance-alpha-volume-alert/competition_rules.json"
 DEFAULT_DISCOVERY_CACHE = "/home/ubuntu/.cache/binance-alpha-volume-alert/competition_discovery.json"
+DEFAULT_HISTORY_CACHE = str(DEFAULT_HISTORY_PATH)
 
 _COMPETITION_SERVICE: CompetitionMetricsService | None = None
 _COMPETITION_SERVICE_LOCK = threading.Lock()
 _DISCOVERY_SERVICE: CompetitionDiscoveryService | None = None
 _DISCOVERY_SERVICE_LOCK = threading.Lock()
+_HISTORY_STORE: CompetitionHistoryStore | None = None
+_HISTORY_STORE_LOCK = threading.Lock()
 _ALERT_CHECK_LOCK = threading.Lock()
 _SNAPSHOT_SYMBOL_RE = re.compile(r"[A-Z0-9_]{1,32}")
 _MAX_SNAPSHOT_SYMBOLS = 32
@@ -46,6 +50,7 @@ _ALLOWED_METHODS = {
     "/": "GET",
     "/api/snapshot": "GET",
     "/api/competition": "GET",
+    "/api/history": "GET, POST",
     "/api/check": "POST",
 }
 
@@ -557,6 +562,21 @@ def discovery_service() -> CompetitionDiscoveryService:
         return _DISCOVERY_SERVICE
 
 
+def history_store() -> CompetitionHistoryStore:
+    global _HISTORY_STORE
+    with _HISTORY_STORE_LOCK:
+        if _HISTORY_STORE is None:
+            path = Path(os.environ.get("ALPHA_COMPETITION_HISTORY_CACHE", DEFAULT_HISTORY_CACHE))
+            store = CompetitionHistoryStore(path)
+            cache_path = Path(os.environ.get("ALPHA_COMPETITION_DISCOVERY_CACHE", DEFAULT_DISCOVERY_CACHE))
+            try:
+                store.archive_rules(list(CompetitionDiscoveryCache(cache_path).load().rules), now=datetime.now(timezone.utc))
+            except (OSError, ValueError):
+                pass
+            _HISTORY_STORE = store
+        return _HISTORY_STORE
+
+
 INDEX_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -731,6 +751,30 @@ INDEX_HTML = r"""<!doctype html>
       line-height: 1.5;
       overflow-wrap: anywhere;
     }
+    .history-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .history-controls select, .history-form input, .history-form textarea {
+      border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--text);
+      font: inherit; font-size: 13px; min-height: 36px; padding: 7px 9px;
+    }
+    .history-summary { display: flex; gap: 22px; flex-wrap: wrap; margin: 10px 0 14px; font-size: 13px; }
+    .history-summary strong { margin-left: 6px; font-variant-numeric: tabular-nums; }
+    .history-table { min-width: 900px; }
+    .history-table th:first-child { min-width: 140px; }
+    .history-table td:last-child, .history-table th:last-child { text-align: center; }
+    .history-table button { min-height: 30px; padding: 0 9px; font-size: 12px; }
+    .history-empty { padding: 18px 11px; color: var(--muted); font-size: 13px; }
+    .history-dialog { width: min(440px, calc(100vw - 24px)); max-height: min(86vh, 750px);
+      overflow: auto; border: 1px solid var(--line); border-radius: 8px; padding: 20px; color: var(--text); }
+    .history-dialog::backdrop { background: rgba(16, 24, 40, .45); }
+    .history-dialog h2 { margin-bottom: 6px; }
+    .history-form { display: grid; gap: 12px; margin-top: 16px; }
+    .history-form label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 650; }
+    .history-form input, .history-form textarea { width: 100%; color: var(--text); font-weight: 450; }
+    .history-form textarea { min-height: 64px; resize: vertical; }
+    .history-form [hidden] { display: none; }
+    .history-form fieldset { border: 0; padding: 0; margin: 0; display: grid; gap: 12px; min-width: 0; }
+    .history-form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 3px; }
+    .history-form-actions .delete { margin-right: auto; color: var(--danger); }
     @media (max-width: 760px) {
       .shell { padding: 17px 11px 28px; }
       header { align-items: stretch; flex-direction: column; gap: 14px; margin-bottom: 20px; }
@@ -779,6 +823,19 @@ INDEX_HTML = r"""<!doctype html>
       .competition-table .cell-value { min-width: 0; text-align: right; }
       .competition-table .source-badges { justify-content: flex-end; }
       .competition-table .name { text-align: right; }
+      .history-controls { width: 100%; }
+      .history-controls select { flex: 1 1 120px; }
+      .history-controls button { flex: 1 1 120px; }
+      .history-summary { gap: 8px 18px; }
+      .history-table { min-width: 0; display: block; }
+      .history-table thead { display: none; }
+      .history-table tbody { display: grid; gap: 8px; }
+      .history-table tbody tr { display: block; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 11px; }
+      .history-table tbody td { display: grid; grid-template-columns: 98px minmax(0, 1fr); gap: 8px;
+        width: 100%; padding: 7px 0; white-space: normal; text-align: right; overflow-wrap: anywhere; }
+      .history-table tbody td::before { content: attr(data-label); text-align: left; color: var(--muted); font-size: 12px; font-weight: 700; }
+      .history-table tbody td:last-child { text-align: right; }
+      .history-table tbody td:last-child button { justify-self: end; }
     }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
@@ -835,6 +892,29 @@ INDEX_HTML = r"""<!doctype html>
       <div id="competitionErrors" class="errors" role="alert" aria-live="polite"></div>
     </section>
 
+    <section id="historySection" class="section-block" aria-labelledby="historyTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="historyTitle">已结束竞赛参照</h2>
+          <p class="section-copy">按公告和轮次记录最终进榜线；历史参考值来自已录入的实际结果。</p>
+        </div>
+        <div class="history-controls">
+          <select id="historyRound" aria-label="筛选轮次"><option value="">全部轮次</option><option value="1">第 1 轮</option><option value="2">第 2 轮</option></select>
+          <select id="historyWinners" aria-label="筛选获奖人数"><option value="">全部获奖人数</option></select>
+          <button id="addHistoryBtn" type="button">录入旧赛</button>
+        </div>
+      </div>
+      <div id="historySummary" class="history-summary" aria-live="polite"></div>
+      <div class="table-wrap competition-wrap">
+        <table class="history-table">
+          <thead><tr><th>币种 / 轮次</th><th>结束时间</th><th>获奖人数</th><th>最终进榜线</th><th>最后参考线</th><th>真实 / 参考</th><th>公告</th><th>操作</th></tr></thead>
+          <tbody id="historyRows"></tbody>
+        </table>
+        <div id="historyEmpty" class="history-empty" hidden>暂无已结束竞赛。可录入旧赛的最终分数线。</div>
+      </div>
+      <div id="historyStatus" class="errors" role="status" aria-live="polite"></div>
+    </section>
+
     <section id="marketSection" class="section-block" aria-labelledby="marketTitle">
       <div class="section-heading">
         <div>
@@ -875,6 +955,29 @@ INDEX_HTML = r"""<!doctype html>
     </section>
   </div>
 
+  <dialog id="historyDialog" class="history-dialog" aria-labelledby="historyDialogTitle">
+    <h2 id="historyDialogTitle">录入最终进榜线</h2>
+    <div id="historyDialogContext" class="sub"></div>
+    <form id="historyForm" class="history-form">
+      <fieldset id="manualHistoryFields">
+        <label>币种<input name="symbol" maxlength="32" placeholder="例如 AEON" required></label>
+        <label>项目名称<input name="name" maxlength="100" placeholder="可选"></label>
+        <label>轮次<input name="round" type="number" min="1" max="20" step="1" value="1" required></label>
+        <label>结束时间（本地时间）<input name="endUtc" type="datetime-local" required></label>
+        <label>获奖人数<input name="winnerCount" type="number" min="1" step="1" required></label>
+        <label>官方公告链接<input name="articleUrl" type="url" placeholder="可选，Binance 公告"></label>
+      </fieldset>
+      <label>最终进榜分数线（U）<input name="finalThreshold" type="number" min="0.01" step="any" required></label>
+      <label>备注<textarea name="note" maxlength="500" placeholder="可选"></textarea></label>
+      <div id="historyFormStatus" class="errors" role="alert"></div>
+      <div class="history-form-actions">
+        <button id="deleteHistoryBtn" class="delete" type="button" hidden>删除记录</button>
+        <button id="cancelHistoryBtn" type="button">取消</button>
+        <button class="primary" type="submit">保存</button>
+      </div>
+    </form>
+  </dialog>
+
   <script>
     const fmt = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 });
     const integerFmt = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
@@ -889,6 +992,11 @@ INDEX_HTML = r"""<!doctype html>
     };
     const rowsEl = document.getElementById('rows');
     const competitionRowsEl = document.getElementById('competitionRows');
+    const historyRowsEl = document.getElementById('historyRows');
+    const historyDialog = document.getElementById('historyDialog');
+    const historyForm = document.getElementById('historyForm');
+    let historyRows = [];
+    let editingHistoryId = null;
     const statusEl = document.getElementById('status');
     const alertStatusEl = document.getElementById('alertStatus');
     const errorsEl = document.getElementById('errors');
@@ -1084,6 +1192,129 @@ INDEX_HTML = r"""<!doctype html>
       competitionErrorsEl.textContent = (Array.isArray(payload.errors) ? payload.errors : []).map(String).join('\n');
     }
 
+    function median(numbers) {
+      if (!numbers.length) return null;
+      const sorted = [...numbers].sort((a, b) => a - b);
+      const middle = Math.floor(sorted.length / 2);
+      return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+    }
+
+    function renderHistory() {
+      const round = document.getElementById('historyRound').value;
+      const winners = document.getElementById('historyWinners').value;
+      const filtered = historyRows.filter(row =>
+        (!round || String(row.round) === round) && (!winners || String(row.winnerCount) === winners));
+      const completed = filtered.filter(row => finiteNumber(row.finalThreshold) !== null);
+      const cutoffs = completed.map(row => row.finalThreshold);
+      const ratios = completed.map(row => {
+        const reference = finiteNumber(row.lastObservation?.referenceThreshold);
+        return reference > 0 ? row.finalThreshold / reference : null;
+      }).filter(value => value !== null);
+      document.getElementById('historySummary').innerHTML = [
+        `已录入 <strong>${completed.length} / ${filtered.length}</strong>`,
+        `中位进榜线 <strong>${escapeHtml(formatU(median(cutoffs)))}</strong>`,
+        `范围 <strong>${cutoffs.length ? `${escapeHtml(formatU(Math.min(...cutoffs)))}–${escapeHtml(formatU(Math.max(...cutoffs)))}` : '—'}</strong>`,
+        `真实 / 参考中位 <strong>${ratios.length ? `${median(ratios).toFixed(2)}x` : '—'}</strong>`,
+      ].map(value => `<span>${value}</span>`).join('');
+      historyRowsEl.innerHTML = filtered.map(row => {
+        const reference = finiteNumber(row.lastObservation?.referenceThreshold);
+        const final = finiteNumber(row.finalThreshold);
+        const articleUrl = safeArticleUrl(row.articleUrl);
+        return `<tr>
+          <td data-label="币种 / 轮次"><div><strong>${escapeHtml(row.symbol)}</strong> · 第 ${escapeHtml(row.round)} 轮</div><div class="name">${escapeHtml(row.name || '')}</div></td>
+          <td data-label="结束时间">${escapeHtml(formatUtc(row.endUtc))}</td>
+          <td data-label="获奖人数">${escapeHtml(formatInteger(row.winnerCount))}</td>
+          <td data-label="最终进榜线" class="metric-primary">${escapeHtml(formatU(final))}</td>
+          <td data-label="最后参考线"><div>${escapeHtml(formatU(reference))}</div><div class="metric-secondary">${row.lastObservation?.observedAtUtc ? escapeHtml(formatUtc(row.lastObservation.observedAtUtc)) : ''}</div></td>
+          <td data-label="真实 / 参考">${final !== null && reference > 0 ? `${(final / reference).toFixed(2)}x` : '—'}</td>
+          <td data-label="公告">${articleUrl ? `<a href="${escapeHtml(articleUrl)}" target="_blank" rel="noopener noreferrer">查看公告</a>` : '—'}</td>
+          <td data-label="操作"><button type="button" data-history-id="${escapeHtml(row.id)}">${final === null ? '录入' : '修改'}</button></td>
+        </tr>`;
+      }).join('');
+      document.getElementById('historyEmpty').hidden = filtered.length > 0;
+    }
+
+    async function refreshHistory() {
+      try {
+        const payload = await fetchJson('api/history');
+        if (!Array.isArray(payload.rows)) throw new Error('历史数据格式无效');
+        historyRows = payload.rows;
+        const roundSelect = document.getElementById('historyRound');
+        const selectedRound = roundSelect.value;
+        const rounds = [...new Set(historyRows.map(row => row.round).filter(Number.isInteger))].sort((a, b) => a - b);
+        roundSelect.innerHTML = '<option value="">全部轮次</option>' + rounds.map(value => `<option value="${value}">第 ${value} 轮</option>`).join('');
+        roundSelect.value = rounds.some(value => String(value) === selectedRound) ? selectedRound : '';
+        const winnersSelect = document.getElementById('historyWinners');
+        const selected = winnersSelect.value;
+        const counts = [...new Set(historyRows.map(row => row.winnerCount).filter(Number.isInteger))].sort((a, b) => a - b);
+        winnersSelect.innerHTML = '<option value="">全部获奖人数</option>' + counts.map(count => `<option value="${count}">${formatInteger(count)} 人</option>`).join('');
+        winnersSelect.value = counts.some(count => String(count) === selected) ? selected : '';
+        renderHistory();
+        document.getElementById('historyStatus').textContent = '';
+      } catch (error) {
+        document.getElementById('historyStatus').textContent = `历史读取失败：${error}`;
+      }
+    }
+
+    function openHistoryDialog(row = null) {
+      editingHistoryId = row?.id || null;
+      historyForm.reset();
+      document.getElementById('manualHistoryFields').hidden = Boolean(row);
+      document.getElementById('manualHistoryFields').disabled = Boolean(row);
+      document.getElementById('deleteHistoryBtn').hidden = !row || row.finalThreshold === null;
+      document.getElementById('historyDialogContext').textContent = row
+        ? `${row.symbol} · 第 ${row.round} 轮 · ${formatUtc(row.endUtc)}` : '补录已结束交易赛';
+      historyForm.elements.namedItem('finalThreshold').value = row?.finalThreshold ?? '';
+      historyForm.elements.namedItem('note').value = row?.note || '';
+      document.getElementById('historyFormStatus').textContent = '';
+      historyDialog.showModal();
+    }
+
+    async function submitHistory(action = 'save') {
+      const field = name => historyForm.elements.namedItem(name).value;
+      const data = action === 'delete' ? { action, id: editingHistoryId } : {
+        finalThreshold: Number(field('finalThreshold')),
+        note: field('note').trim(),
+      };
+      if (action !== 'delete') {
+        if (editingHistoryId) data.id = editingHistoryId;
+        else Object.assign(data, {
+          symbol: field('symbol').trim().toUpperCase(),
+          name: field('name').trim(),
+          round: Number(field('round')),
+          endUtc: new Date(field('endUtc')).toISOString(),
+          winnerCount: Number(field('winnerCount')),
+          articleUrl: field('articleUrl').trim(),
+        });
+      }
+      const response = await fetch('api/history', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      historyDialog.close();
+      await refreshHistory();
+    }
+
+    document.getElementById('addHistoryBtn').addEventListener('click', () => openHistoryDialog());
+    document.getElementById('cancelHistoryBtn').addEventListener('click', () => historyDialog.close());
+    document.getElementById('historyRound').addEventListener('change', renderHistory);
+    document.getElementById('historyWinners').addEventListener('change', renderHistory);
+    historyRowsEl.addEventListener('click', event => {
+      const button = event.target.closest('button[data-history-id]');
+      if (button) openHistoryDialog(historyRows.find(row => row.id === button.dataset.historyId));
+    });
+    historyForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      try { await submitHistory(); }
+      catch (error) { document.getElementById('historyFormStatus').textContent = String(error); }
+    });
+    document.getElementById('deleteHistoryBtn').addEventListener('click', async () => {
+      if (!confirm('删除这条最终分数线？')) return;
+      try { await submitHistory('delete'); }
+      catch (error) { document.getElementById('historyFormStatus').textContent = String(error); }
+    });
+
     function renderMarket(data) {
       const payload = validatePayload(data, '行情');
       const rows = payload.rows;
@@ -1178,6 +1409,7 @@ INDEX_HTML = r"""<!doctype html>
         } else {
           competitionErrorsEl.textContent = `交易赛刷新失败：${competitionResult.reason}`;
         }
+        await refreshHistory();
       } finally {
         if (generation === refreshGeneration) refreshBtn.disabled = false;
       }
@@ -1208,6 +1440,9 @@ INDEX_HTML = r"""<!doctype html>
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _history(self) -> CompetitionHistoryStore:
+        return getattr(self.server, "history_store", None) or history_store()
+
     def _discovery(self, current: datetime) -> Any:
         service = getattr(self.server, "discovery_service", None) or discovery_service()
         return service.discover(now=current)
@@ -1332,11 +1567,24 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/competition":
             try:
                 current = datetime.now(timezone.utc)
+                history = self._history()
                 snapshot = self._discovery(current)
                 service = getattr(self.server, "competition_service", None) or competition_service()
                 payload = service.collect_rules(list(snapshot.rules), now=current)
                 self._add_discovery_metadata(payload, snapshot)
-                self._send_json(_apply_leaderboard_thresholds(payload))
+                payload = _apply_leaderboard_thresholds(payload)
+                try:
+                    history.archive_rules(list(snapshot.rules), now=current)
+                    history.capture_rows(payload["rows"], now=current)
+                except (OSError, ValueError) as exc:
+                    self.log_error("History capture failed: %r", exc)
+                self._send_json(payload)
+            except (Exception, SystemExit) as exc:
+                self._send_internal_error(exc)
+            return
+        if parsed.path == "/api/history":
+            try:
+                self._send_json(self._history().snapshot(now=datetime.now(timezone.utc)))
             except (Exception, SystemExit) as exc:
                 self._send_internal_error(exc)
             return
@@ -1349,6 +1597,35 @@ class Handler(BaseHTTPRequestHandler):
         if self._require_auth():
             return
         parsed = urlparse(self.path)
+        if parsed.path == "/api/history":
+            origin = self.headers.get("Origin")
+            if origin is not None:
+                parsed_origin = urlparse(origin)
+                if parsed_origin.scheme not in {"http", "https"} or parsed_origin.netloc.casefold() != self.headers.get("Host", "").casefold():
+                    self._send_json({"ok": False, "error": "cross-origin request rejected"}, HTTPStatus.FORBIDDEN)
+                    return
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip().casefold() != "application/json":
+                self._send_json({"ok": False, "error": "JSON content required"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 1 <= length <= 4096:
+                    raise ValueError("request body is too large or empty")
+                payload = json.loads(self.rfile.read(length))
+                if not isinstance(payload, dict):
+                    raise ValueError("history entry must be an object")
+                store = self._history()
+                if payload.get("action") == "delete":
+                    store.delete(payload.get("id"))
+                    self._send_json({"ok": True})
+                else:
+                    row = store.save_final(payload, now=datetime.now(timezone.utc))
+                    self._send_json({"ok": True, "row": row})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except (Exception, SystemExit) as exc:
+                self._send_internal_error(exc)
+            return
         if parsed.path == "/api/check":
             try:
                 self._send_json(check_alert_once())

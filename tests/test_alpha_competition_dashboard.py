@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ import pytest
 
 from grid_optimizer.alpha_market import AlphaToken
 from grid_optimizer import alpha_competition_dashboard as dashboard
+from grid_optimizer.alpha_competition_history import CompetitionHistoryStore
 from grid_optimizer import alpha_competition_discovery as discovery
 from grid_optimizer import alpha_competition_metrics as metrics
 
@@ -259,6 +261,8 @@ class HttpServerHarness:
         *,
         auth: bool,
         authorization: str | None = None,
+        body: dict[str, Any] | None = None,
+        origin: str | None = None,
     ) -> HttpResult:
         headers: dict[str, str] = {}
         if authorization is not None:
@@ -266,9 +270,13 @@ class HttpServerHarness:
         elif auth:
             token = base64.b64encode(b"alpha-user:alpha-password").decode("ascii")
             headers["Authorization"] = f"Basic {token}"
+        if origin is not None:
+            headers["Origin"] = origin
+        if body is not None:
+            headers["Content-Type"] = "application/json"
         request = Request(
             f"{self.base_url}{path}",
-            data=b"" if method == "POST" else None,
+            data=json.dumps(body).encode("utf-8") if body is not None else b"" if method == "POST" else None,
             headers=headers,
             method=method,
         )
@@ -298,6 +306,7 @@ def running_server(
     market: Any | None = None,
     competition_service: Any | None = None,
     discovery_service: Any | None = None,
+    history_store: CompetitionHistoryStore | None = None,
 ) -> Any:
     server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
     if market is not None:
@@ -306,6 +315,8 @@ def running_server(
         server.competition_service = competition_service  # type: ignore[attr-defined]
     if discovery_service is not None:
         server.discovery_service = discovery_service  # type: ignore[attr-defined]
+    if history_store is not None:
+        server.history_store = history_store  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, name="test-alpha-dashboard")
     thread.start()
     try:
@@ -521,10 +532,54 @@ def test_all_routes_require_basic_auth(http_server: HttpServerHarness) -> None:
         ("GET", "/api/snapshot"),
         ("GET", "/api/competition"),
         ("POST", "/api/check"),
+        ("GET", "/api/history"),
+        ("POST", "/api/history"),
     ]:
         response = http_server.request(method, path, auth=False)
         assert response.status_code == 401
-        assert response.headers["WWW-Authenticate"] == 'Basic realm="Binance Alpha Monitor"'
+    assert response.headers["WWW-Authenticate"] == 'Basic realm="Binance Alpha Monitor"'
+
+
+def test_history_api_persists_manual_entry_and_rejects_cross_origin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ALPHA_DASHBOARD_USERNAME", "alpha-user")
+    monkeypatch.setenv("ALPHA_DASHBOARD_PASSWORD", "alpha-password")
+    store = CompetitionHistoryStore(tmp_path / "history.json")
+    entry = {
+        "symbol": "CAP", "round": 1, "endUtc": "2026-08-08T13:00:00+00:00",
+        "winnerCount": 2500, "finalThreshold": 1900.0,
+    }
+    with running_server(history_store=store) as server:
+        rejected = server.request("POST", "/api/history", auth=True, body=entry, origin="https://attacker.example")
+        assert rejected.status_code == 403
+        saved = server.request("POST", "/api/history", auth=True, body=entry, origin=server.base_url)
+        assert saved.status_code == 200
+        rows = server.get("/api/history").json()["rows"]
+        assert len(rows) == 1
+        assert rows[0]["finalThreshold"] == 1900.0
+        removed = server.request(
+            "POST", "/api/history", auth=True, origin=server.base_url,
+            body={"action": "delete", "id": rows[0]["id"]},
+        )
+        assert removed.status_code == 200
+        assert server.get("/api/history").json()["rows"] == []
+
+
+def test_competition_api_archives_rules_before_they_disappear(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("ALPHA_DASHBOARD_USERNAME", "alpha-user")
+    monkeypatch.setenv("ALPHA_DASHBOARD_PASSWORD", "alpha-password")
+    store = CompetitionHistoryStore(tmp_path / "history.json")
+    snapshot = _discovery_snapshot(symbols=("DOS",), stale=False, errors=())
+    with running_server(
+        discovery_service=FakeDiscoveryService(snapshot),
+        competition_service=FakeCompetitionService(),
+        history_store=store,
+    ) as server:
+        assert server.get("/api/competition").status_code == 200
+    assert len(store._load()) == 1
 
 
 def test_auth_fails_closed_without_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
