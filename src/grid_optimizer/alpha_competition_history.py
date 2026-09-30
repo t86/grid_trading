@@ -195,7 +195,7 @@ class CompetitionHistoryStore:
             for row in sorted(self._load().values(), key=lambda item: item["endUtc"]):
                 if _parse_utc(row["endUtc"]) > current or not row.get("articleCode"):
                     continue
-                if row.get("rewardSource") == "official_reward_alpha_end_close" and row.get("rewardValueU"):
+                if row.get("rewardSource") in {"official_reward_alpha_end_close", "official_reward_spot_end_close"} and row.get("rewardValueU"):
                     continue
                 if row.get("rewardRetryAtUtc") and _parse_utc(row["rewardRetryAtUtc"]) > current:
                     continue

@@ -1508,7 +1508,7 @@ INDEX_HTML = r"""<!doctype html>
           <td data-label="最终进榜线" class="metric-primary">${escapeHtml(formatU(final))}</td>
           <td data-label="最终参考线"><div><div>${escapeHtml(formatU(reference))}</div><div class="metric-secondary">${referenceSource ? `${escapeHtml(referenceSource)} · 总量 ${escapeHtml(formatU(row.finalWeightedVolume))}` : escapeHtml(row.referenceError || '待补充轮次总量')}</div></div></td>
           <td data-label="真实 / 参考">${final !== null && reference > 0 ? `${(final / reference).toFixed(2)}x` : '—'}</td>
-          <td data-label="结束时奖励价值"><div><div>${escapeHtml(formatU(reward))}</div><div class="metric-secondary">${row.rewardSource === 'official_reward_alpha_end_close' ? `${escapeHtml(fmt.format(row.rewardTokensPerWinner))} ${escapeHtml(row.symbol)} × ${escapeHtml(row.rewardEndPriceU)} U` : escapeHtml(row.rewardError || '待获取公告奖励及结束时价格')}</div></div></td>
+          <td data-label="结束时奖励价值"><div><div>${escapeHtml(formatU(reward))}</div><div class="metric-secondary">${['official_reward_alpha_end_close', 'official_reward_spot_end_close'].includes(row.rewardSource) ? `${escapeHtml(fmt.format(row.rewardTokensPerWinner))} ${escapeHtml(row.rewardTokenSymbol || row.symbol)} × ${escapeHtml(row.rewardEndPriceU)} U` : escapeHtml(row.rewardError || '待获取公告奖励及结束时价格')}</div></div></td>
           <td data-label="进榜线 / 奖励">${finiteNumber(row.thresholdRewardRatio) > 0 ? `${fmt.format(row.thresholdRewardRatio)}x` : '—'}</td>
           <td data-label="公告">${articleUrl ? `<a href="${escapeHtml(articleUrl)}" target="_blank" rel="noopener noreferrer">查看公告</a>` : '—'}</td>
           <td data-label="操作"><button type="button" data-history-id="${escapeHtml(row.id)}">${final === null ? '录入' : '修改'}</button></td>
