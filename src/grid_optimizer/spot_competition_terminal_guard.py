@@ -14,6 +14,7 @@ from .data import (
     delete_spot_order,
     fetch_futures_open_orders,
     fetch_futures_position_risk_v3,
+    fetch_futures_symbol_config,
     fetch_spot_account_info,
     fetch_spot_book_tickers,
     fetch_spot_open_orders,
@@ -142,7 +143,7 @@ def _stop_runner(wrapper: str, symbol: str, service: str) -> None:
     raise RuntimeError(f"runner service did not stop: {service}")
 
 
-def _cancel_symbol_orders(symbol: str, api_key: str, api_secret: str) -> dict[str, int]:
+def _cancel_symbol_orders(symbol: str, api_key: str, api_secret: str, hedge_symbol: str | None = None) -> dict[str, int]:
     canceled_spot = 0
     canceled_futures = 0
     for order in fetch_spot_open_orders(symbol, api_key, api_secret):
@@ -153,9 +154,10 @@ def _cancel_symbol_orders(symbol: str, api_key: str, api_secret: str) -> dict[st
             order_id=int(order["orderId"]),
         )
         canceled_spot += 1
-    for order in fetch_futures_open_orders(symbol, api_key, api_secret, use_cache=False):
+    hedge_symbol = hedge_symbol or symbol
+    for order in fetch_futures_open_orders(hedge_symbol, api_key, api_secret, use_cache=False):
         delete_futures_order(
-            symbol=symbol,
+            symbol=hedge_symbol,
             api_key=api_key,
             api_secret=api_secret,
             order_id=int(order["orderId"]),
@@ -218,7 +220,7 @@ def _update_trade_progress(
         for row in fresh:
             gross += _safe_float(row.get("quoteQty"))
             trade_count += 1
-            if str(row.get("commissionAsset", "")).upper() == "USDT":
+            if str(row.get("commissionAsset", "")).upper() == str(state.get("quote_asset", "USDT")):
                 commission_quote += _safe_float(row.get("commission"))
             last_id = max(last_id, int(row.get("id", -1)))
             cursor_ms = max(cursor_ms, int(row.get("time", cursor_ms)))
@@ -269,7 +271,7 @@ def _run_flatteners(args: argparse.Namespace, state: dict[str, Any], events_path
             "-m",
             "grid_optimizer.maker_flatten_runner",
             "--symbol",
-            args.symbol,
+            args.hedge_symbol,
             "--client-order-prefix",
             args.futures_flatten_prefix,
             "--sleep-seconds",
@@ -295,9 +297,9 @@ def _verify_flat(
     book = fetch_spot_book_tickers(args.symbol)
     bid = _safe_float(book[0].get("bid_price")) if book else 0.0
     free, locked = _spot_inventory(api_key, api_secret, base_asset)
-    long_qty, short_qty = _futures_position_qty(args.symbol, api_key, api_secret)
+    long_qty, short_qty = _futures_position_qty(args.hedge_symbol, api_key, api_secret)
     spot_orders = fetch_spot_open_orders(args.symbol, api_key, api_secret)
-    futures_orders = fetch_futures_open_orders(args.symbol, api_key, api_secret, use_cache=False)
+    futures_orders = fetch_futures_open_orders(args.hedge_symbol, api_key, api_secret, use_cache=False)
     spot_qty = free + locked
     spot_dust = spot_qty > 0 and (bid <= 0 or spot_qty * bid < min_notional)
     flat = (
@@ -324,6 +326,11 @@ def _run(args: argparse.Namespace) -> int:
     if creds is None:
         raise RuntimeError("missing Binance API credentials")
     api_key, api_secret = creds
+    args.hedge_symbol = str(args.hedge_symbol or args.symbol).upper().strip()
+    spot_info = fetch_spot_symbol_config(args.symbol)
+    hedge_info = fetch_futures_symbol_config(args.hedge_symbol)
+    if spot_info.get("base_asset") != hedge_info.get("base_asset"):
+        raise RuntimeError("spot and hedge symbols must have the same base asset")
     state_path = Path(args.state)
     events_path = Path(args.events)
     state = _read_json(state_path)
@@ -339,6 +346,8 @@ def _run(args: argparse.Namespace) -> int:
     state.setdefault("gross_notional", 0.0)
     state.setdefault("trade_count", 0)
     state.setdefault("commission_quote", 0.0)
+    state["quote_asset"] = str(spot_info.get("quote_asset", "USDT")).upper()
+    state["hedge_symbol"] = args.hedge_symbol
     state.setdefault("start_ms", int(args.start_ms))
     state.setdefault("target_volume", float(args.target_volume))
     state.setdefault("effective_target_volume", float(args.target_volume))
@@ -404,6 +413,15 @@ def _run(args: argparse.Namespace) -> int:
             now_monotonic=time.monotonic(),
             inactive_grace_seconds=float(args.inactive_grace_seconds),
         )
+        if not reason and active and args.hedge_qty is not None:
+            long_qty, short_qty = _futures_position_qty(args.hedge_symbol, api_key, api_secret)
+            hedge_orders = fetch_futures_open_orders(args.hedge_symbol, api_key, api_secret, use_cache=False)
+            state["hedge_snapshot"] = {
+                "long_qty": long_qty, "short_qty": short_qty,
+                "expected_short_qty": args.hedge_qty, "open_orders": len(hedge_orders),
+            }
+            if long_qty > args.hedge_tolerance_qty or abs(short_qty - args.hedge_qty) > args.hedge_tolerance_qty or hedge_orders:
+                reason = "static_hedge_mismatch"
         if not reason and not bool(state.get("armed")):
             if time.time() - _safe_float(state.get("started_epoch")) >= float(args.startup_grace_seconds):
                 reason = "runner_start_timeout"
@@ -421,7 +439,7 @@ def _run(args: argparse.Namespace) -> int:
 
     if state.get("phase") in {"stopping", "flatten_spot", "flatten_futures", "verifying"}:
         _stop_runner(args.wrapper, args.symbol, args.service)
-        canceled = _cancel_symbol_orders(args.symbol, api_key, api_secret)
+        canceled = _cancel_symbol_orders(args.symbol, api_key, api_secret, args.hedge_symbol)
         _append_event(events_path, "runner_stopped_orders_canceled", canceled=canceled)
         state = _run_flatteners(args, state, events_path)
         state["phase"] = "verifying"
@@ -451,6 +469,9 @@ def _run(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Autonomous terminal guard for spot competitions with a static futures hedge.")
     parser.add_argument("--symbol", required=True)
+    parser.add_argument("--hedge-symbol", default=os.getenv("HEDGE_SYMBOL", ""))
+    parser.add_argument("--hedge-qty", type=float, default=float(os.environ["HEDGE_QTY"]) if os.getenv("HEDGE_QTY") else None)
+    parser.add_argument("--hedge-tolerance-qty", type=float, default=0.1)
     parser.add_argument("--target-volume", type=float, required=True)
     parser.add_argument("--start-ms", type=int, required=True)
     parser.add_argument("--wrapper", required=True)
@@ -495,6 +516,10 @@ def main() -> None:
         raise SystemExit("--start-ms must be > 0")
     if args.flat_confirm_cycles <= 0:
         raise SystemExit("--flat-confirm-cycles must be > 0")
+    if args.hedge_qty is not None and args.hedge_qty < 0:
+        raise SystemExit("--hedge-qty must be >= 0")
+    if args.hedge_tolerance_qty < 0:
+        raise SystemExit("--hedge-tolerance-qty must be >= 0")
     raise SystemExit(_run(args))
 
 
