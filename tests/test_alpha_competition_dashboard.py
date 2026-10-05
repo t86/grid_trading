@@ -335,6 +335,7 @@ def reset_competition_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     dashboard._COMPETITION_SERVICE = None
     dashboard._DISCOVERY_SERVICE = None
     dashboard._HISTORY_STORE = None
+    monkeypatch.setattr(dashboard._CURRENT_REWARD_REFRESHER, 'fetcher', lambda row: {'currentRewardValueU': None})
     yield
     dashboard._COMPETITION_SERVICE = None
     dashboard._DISCOVERY_SERVICE = None
@@ -451,6 +452,62 @@ def test_check_alert_delegates_to_versioned_alert_module() -> None:
 
     assert result["ok"] is True
     run.assert_called_once()
+
+
+@pytest.mark.parametrize('actual,basis,ratio', [(200, 'leaderboard', 2), (None, 'reference', 3), (float('nan'), 'reference', 3)])
+def test_current_reward_ratio_uses_real_threshold_or_labelled_reference(actual, basis, ratio):
+    class Refresher:
+        def get(self, row):
+            return {'currentRewardValueU': 100}
+    row = {'status': 'active', 'leaderboardThreshold': actual, 'referenceThreshold': 300}
+    dashboard._apply_current_reward_ratios({'rows': [row]}, refresher=Refresher())
+    assert row['thresholdRewardRatio'] == ratio
+    assert row['thresholdRewardRatioBasis'] == basis
+
+
+@pytest.mark.parametrize('status,reward', [('upcoming', 100), ('between_rounds', 100), ('active', 0), ('active', None), ('active', float('inf'))])
+def test_current_ratio_is_blank_without_active_round_or_valid_reward(status, reward):
+    class Refresher:
+        def get(self, row):
+            assert status == 'active'
+            return {'currentRewardValueU': reward}
+    row = {'status': status, 'referenceThreshold': 300}
+    dashboard._apply_current_reward_ratios({'rows': [row]}, refresher=Refresher())
+    assert row['thresholdRewardRatio'] is None
+
+
+def test_current_reward_refresh_is_nonblocking_coalesced_and_round_specific():
+    clock = [0.0]
+    submitter = DeferredSubmitter()
+    refresher = dashboard._CurrentRewardRefresher(lambda row: {'currentRewardValueU': 100}, submitter, lambda: clock[0])
+    row = {'symbol': 'AEON', 'articleUrl': 'https://www.binance.com/en/support/announcement/detail/aeon', 'round': 1, 'winnerCount': 2000}
+    assert refresher.get(row)['currentRewardValueU'] is None
+    refresher.get(row)
+    assert len(submitter.tasks) == 1
+    submitter.run_next()
+    assert refresher.get(row)['currentRewardValueU'] == 100
+    clock[0] = 25
+    assert refresher.get(row)['currentRewardValueU'] == 100
+    assert len(submitter.tasks) == 1
+    clock[0] = 31
+    assert refresher.get(row)['currentRewardValueU'] is None
+    assert len(submitter.tasks) == 1
+    assert refresher.get({**row, 'round': 2})['currentRewardValueU'] is None
+    assert len(submitter.tasks) == 2
+
+
+def test_current_reward_failure_is_cooled_down():
+    submitter = DeferredSubmitter()
+    def fail(row):
+        raise ValueError('unavailable')
+    refresher = dashboard._CurrentRewardRefresher(fail, submitter, lambda: 0)
+    row = {'symbol': 'AEON', 'round': 1}
+    refresher.get(row)
+    submitter.run_next()
+    result = refresher.get(row)
+    assert result['currentRewardValueU'] is None
+    assert result['currentRewardNote']
+    assert submitter.tasks == []
 
 
 @pytest.mark.parametrize("minutes,threshold", [(5, 1_000_000), (10, 2_000_000), (20, 3_500_000), (60, 10_000_000)])

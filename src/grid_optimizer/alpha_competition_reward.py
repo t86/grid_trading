@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+import time
 from typing import Any
 
 from .alpha_competition_metrics import (
@@ -47,21 +49,11 @@ def _usdc_end_price(end: datetime) -> float:
     return price
 
 
-def fetch_ended_reward(row: dict[str, Any], *, market: Any = None, rules: Any = None) -> dict[str, Any]:
-    provider = rules or BinanceCompetitionRuleProvider()
-    detail = provider._get_data(_CMS_DETAIL_PATH, {"articleCode": row['articleCode']})
-    if detail.get('code') != row['articleCode']:
-        raise ValueError("reward announcement identity differs")
-    rule = parse_competition_rule({"data": detail}, expected_symbol=row['symbol'])
-    end = datetime.fromisoformat(row['endUtc'])
-    if rule.winner_count != row['winnerCount'] or not any(
-        round_.number == row['round'] and round_.end_utc == end for round_ in rule.rounds
-    ):
-        raise ValueError("reward announcement round differs")
+def _reward_asset_amount(detail: dict[str, Any], symbol: str, winner_count: int) -> tuple[str, float]:
     rewards = []
-    for asset in dict.fromkeys((rule.symbol, "USDC", "USDT")):
+    for asset in dict.fromkeys((symbol, "USDC", "USDT")):
         try:
-            amount = reward_tokens_per_winner(detail, symbol=asset, winner_count=rule.winner_count)
+            amount = reward_tokens_per_winner(detail, symbol=asset, winner_count=winner_count)
         except ValueError as exc:
             if str(exc) != "unambiguous equal per-user token reward is required":
                 raise
@@ -69,7 +61,62 @@ def fetch_ended_reward(row: dict[str, Any], *, market: Any = None, rules: Any = 
             rewards.append((asset, amount))
     if len(rewards) != 1:
         raise ValueError("unambiguous reward token is required")
-    asset, amount = rewards[0]
+    return rewards[0]
+
+
+@lru_cache(maxsize=128)
+def _current_reward_terms(symbol: str, code: str, winner_count: int, cache_period: int) -> tuple[Any, str, float]:
+    return _fetch_reward_terms(symbol, code, winner_count, BinanceCompetitionRuleProvider())
+
+
+def _fetch_reward_terms(symbol: str, code: str, winner_count: int, provider: Any) -> tuple[Any, str, float]:
+    detail = provider._get_data(_CMS_DETAIL_PATH, {"articleCode": code})
+    if detail.get('code') != code:
+        raise ValueError("reward announcement identity differs")
+    rule = parse_competition_rule({"data": detail}, expected_symbol=symbol)
+    if rule.winner_count != winner_count:
+        raise ValueError("reward winner count differs from the competition")
+    asset, amount = _reward_asset_amount(detail, symbol, winner_count)
+    return rule, asset, amount
+
+
+def fetch_current_reward(row: dict[str, Any], *, market: Any = None, rules: Any = None) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    code = row['articleUrl'].rstrip('/').split('/')[-1]
+    args = (row['symbol'], code, row['winnerCount'])
+    rule, asset, amount = (_fetch_reward_terms(*args, rules) if rules is not None else
+                          _current_reward_terms(*args, int(time.time() // 21600)))
+    if not any(round_.number == row['round'] and round_.end_utc == datetime.fromisoformat(row['roundEndUtc'])
+               for round_ in rule.rounds):
+        raise ValueError("reward announcement round differs")
+    if asset == 'USDT':
+        price = 1.0
+    elif asset == 'USDC':
+        price = _usdc_end_price(now.replace(second=0, microsecond=0))
+    else:
+        client = market or AlphaMarketClient()
+        token = client.fetch_tokens().get(asset)
+        if token is None or not token.pair.endswith(('USDT', 'USDC')):
+            raise ValueError("reward price pair is unavailable")
+        price = float(client.fetch_ticker(token.pair)['lastPrice'])
+        if token.pair.endswith('USDC'):
+            price *= _usdc_end_price(now.replace(second=0, microsecond=0))
+    value = amount * price
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("current reward price is invalid")
+    return {
+        'currentRewardValueU': value, 'currentRewardTokensPerWinner': amount,
+        'currentRewardTokenSymbol': asset, 'currentRewardPriceU': price,
+        'currentRewardUpdatedAtUtc': now.isoformat(timespec='seconds'), 'currentRewardNote': None,
+    }
+
+
+def fetch_ended_reward(row: dict[str, Any], *, market: Any = None, rules: Any = None) -> dict[str, Any]:
+    provider = rules or BinanceCompetitionRuleProvider()
+    rule, asset, amount = _fetch_reward_terms(row['symbol'], row['articleCode'], row['winnerCount'], provider)
+    end = datetime.fromisoformat(row['endUtc'])
+    if not any(round_.number == row['round'] and round_.end_utc == end for round_ in rule.rounds):
+        raise ValueError("reward announcement round differs")
     if asset in {"USDC", "USDT"}:
         price = _usdc_end_price(end) if asset == "USDC" else 1.0
         return {

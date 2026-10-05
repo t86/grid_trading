@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from grid_optimizer.alpha_competition_reward import fetch_ended_reward, reward_tokens_per_winner
+from grid_optimizer.alpha_competition_reward import fetch_ended_reward, fetch_current_reward, reward_tokens_per_winner
 from grid_optimizer import alpha_competition_reward as reward_module
 
 
@@ -114,3 +114,31 @@ def test_usdc_conversion_rejects_candle_after_competition_end(monkeypatch):
         open_time=end, close_time=end+timedelta(minutes=1), close=1)])
     with pytest.raises(ValueError, match="boundary"):
         reward_module._usdc_end_price(end)
+
+
+@pytest.mark.parametrize('asset', ['CAP', 'USDC', 'USDT'])
+def test_current_reward_uses_live_ticker_and_official_quantity(monkeypatch, asset):
+    detail = copy.deepcopy(json.loads((Path(__file__).parent / 'fixtures/alpha_competition_articles.json').read_text())['CAP']['data'])
+    tree = json.loads(detail['body'])
+    tree['children'].append({'node': 'paragraph', 'children': [{'node': 'text', 'text':
+        f'The top 2,000 users will share 100,000 {asset} tokens equally (= 50 {asset} per user).'}]})
+    detail['body'] = json.dumps(tree)
+    class Rules:
+        def _get_data(self, path, params):
+            return detail
+    class Market:
+        def fetch_tokens(self):
+            return {'CAP': SimpleNamespace(pair='ALPHA_1USDT', price=999)}
+        def fetch_ticker(self, pair):
+            return {'lastPrice': '2'}
+        def fetch_klines(self, *args, **kwargs):
+            raise AssertionError('must not use historical Alpha price')
+    monkeypatch.setattr(reward_module, '_usdc_end_price', lambda end: 0.9998)
+    row = {'symbol': 'CAP', 'articleUrl': f'https://www.binance.com/en/support/announcement/detail/{detail["code"]}',
+           'round': 1, 'winnerCount': 2000, 'roundEndUtc': '2026-08-06T13:00:00+00:00'}
+    reward = fetch_current_reward(row, market=Market(), rules=Rules())
+    assert reward['currentRewardValueU'] == pytest.approx({'CAP': 100, 'USDC': 49.99, 'USDT': 50}[asset])
+    assert reward['currentRewardTokenSymbol'] == asset
+    assert 'rewardValueU' not in reward
+    with pytest.raises(ValueError, match='round differs'):
+        fetch_current_reward({**row, 'round': 9}, market=Market(), rules=Rules())

@@ -22,7 +22,7 @@ from . import alpha_volume_alert as alert
 from .alpha_market import AlphaMarketClient
 from .alpha_competition_discovery import CompetitionDiscoveryCache, CompetitionDiscoveryService
 from .alpha_competition_history import CompetitionHistoryStore, DEFAULT_HISTORY_PATH
-from .alpha_competition_reward import fetch_ended_reward
+from .alpha_competition_reward import fetch_ended_reward, fetch_current_reward
 from .alpha_competition_metrics import (
     BinanceCompetitionRuleProvider,
     CompetitionMetricsService,
@@ -595,6 +595,64 @@ def _apply_leaderboard_thresholds(
     return payload
 
 
+class _CurrentRewardRefresher:
+    def __init__(self, fetcher: Any, submitter: Any, clock: Any = time.monotonic) -> None:
+        self.fetcher, self.submitter, self.clock = fetcher, submitter, clock
+        self.lock = threading.Lock()
+        self.cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+        self.pending: set[tuple[Any, ...]] = set()
+
+    def get(self, row: dict[str, Any]) -> dict[str, Any]:
+        key = (row.get('symbol'), row.get('articleUrl'), row.get('round'), row.get('roundEndUtc'), row.get('winnerCount'))
+        waiting = {'currentRewardValueU': None, 'currentRewardNote': '奖励估值更新中'}
+        with self.lock:
+            cached = self.cache.get(key)
+            now = self.clock()
+            if cached and cached[0] > now + 10:
+                return dict(cached[1])
+            result = dict(cached[1]) if cached and cached[0] > now else waiting
+            if key in self.pending:
+                return result
+            self.pending.add(key)
+        if self.submitter.submit(lambda: self.refresh(key, dict(row))) is False:
+            with self.lock:
+                self.pending.discard(key)
+        return result
+
+    def refresh(self, key: tuple[Any, ...], row: dict[str, Any]) -> None:
+        try:
+            result = self.fetcher(row)
+        except Exception:
+            result = {'currentRewardValueU': None, 'currentRewardNote': '公告奖励或当前价格暂不可用'}
+        with self.lock:
+            self.cache[key] = (self.clock() + (30 if result.get('currentRewardValueU') else 60), result)
+            self.pending.discard(key)
+
+
+_CURRENT_REWARD_REFRESHER = _CurrentRewardRefresher(
+    fetch_current_reward, _BoundedSubmitter(max_workers=2, max_pending=8),
+)
+
+
+def _apply_current_reward_ratios(payload: dict[str, Any], *, refresher: Any = _CURRENT_REWARD_REFRESHER) -> dict[str, Any]:
+    for row in payload.get('rows', []):
+        row.update(currentRewardValueU=None, thresholdRewardRatio=None, thresholdRewardRatioBasis=None)
+        if row.get('status') != 'active':
+            continue
+        row.update(refresher.get(row))
+        reward = _finite_float(row.get('currentRewardValueU'))
+        if reward <= 0:
+            continue
+        actual = row.get('leaderboardThreshold')
+        basis = 'leaderboard' if isinstance(actual, (int, float)) and not isinstance(actual, bool) and math.isfinite(actual) and actual > 0 else 'reference'
+        threshold = row.get('leaderboardThreshold') if basis == 'leaderboard' else row.get('referenceThreshold')
+        if isinstance(threshold, (int, float)) and not isinstance(threshold, bool) and math.isfinite(threshold) and threshold >= 0:
+            ratio = threshold / reward
+            if math.isfinite(ratio):
+                row.update(thresholdRewardRatio=ratio, thresholdRewardRatioBasis=basis)
+    return payload
+
+
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         return alert._safe_int(value, default)
@@ -970,7 +1028,7 @@ INDEX_HTML = r"""<!doctype html>
     td:first-child, th:first-child { text-align: left; }
     tr:last-child td { border-bottom: 0; }
     .market-table { min-width: 1050px; }
-    .competition-table { min-width: 1280px; }
+    .competition-table { min-width: 1440px; }
     .competition-table th:nth-child(1) { min-width: 130px; }
     .competition-table th:nth-child(2) { min-width: 180px; }
     .competition-table th:last-child { min-width: 220px; }
@@ -1157,6 +1215,7 @@ INDEX_HTML = r"""<!doctype html>
               <th>平均量</th>
               <th>观察线 0.4</th>
               <th>参考线 0.6</th>
+              <th>进榜线 / 奖励</th>
               <th>安全线 1.0</th>
               <th>来源 / 更新时间 / 公告</th>
             </tr>
@@ -1424,6 +1483,7 @@ INDEX_HTML = r"""<!doctype html>
         <td data-label="平均量">${pending ? '—' : escapeHtml(formatU(row.averageVolume))}</td>
         <td data-label="观察线 0.4" class="threshold-watch">${pending ? '—' : escapeHtml(formatU(row.watchThreshold))}</td>
         <td data-label="参考线 0.6" class="threshold-reference">${pending ? '—' : escapeHtml(formatU(row.referenceThreshold))}</td>
+        <td data-label="进榜线 / 奖励"><div class="cell-value"><div class="metric-primary">${finiteNumber(row.thresholdRewardRatio) === null ? '—' : `${escapeHtml(fmt.format(row.thresholdRewardRatio))}x`}</div><div class="metric-secondary" title="${escapeHtml(row.currentRewardUpdatedAtUtc || '')}">${finiteNumber(row.thresholdRewardRatio) === null ? escapeHtml(row.currentRewardNote || '') : `${row.thresholdRewardRatioBasis === 'leaderboard' ? '实际榜单' : '参考线 0.6'} / 当前奖励 ${escapeHtml(formatU(row.currentRewardValueU))}`}</div></div></td>
         <td data-label="安全线 1.0" class="threshold-safe">${pending ? '—' : escapeHtml(formatU(row.safeThreshold))}</td>
         <td data-label="来源 / 更新时间 / 公告">${sourceContent(row)}</td>
       </tr>`;
@@ -1860,6 +1920,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = service.collect_rules(list(snapshot.rules), now=current)
                 self._add_discovery_metadata(payload, snapshot)
                 payload = _apply_leaderboard_thresholds(payload)
+                payload = _apply_current_reward_ratios(payload)
                 try:
                     history.archive_rules(list(snapshot.rules), now=current)
                     history.capture_rows(payload["rows"], now=current)
