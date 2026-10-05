@@ -454,7 +454,7 @@ def test_check_alert_delegates_to_versioned_alert_module() -> None:
     run.assert_called_once()
 
 
-@pytest.mark.parametrize('actual,basis,ratio', [(200, 'leaderboard', 2), (None, 'reference', 3), (float('nan'), 'reference', 3)])
+@pytest.mark.parametrize('actual,basis,ratio', [(200, 'leaderboard', 2), (0, 'leaderboard', 0), (None, 'reference', 3), (float('nan'), 'reference', 3)])
 def test_current_reward_ratio_uses_real_threshold_or_labelled_reference(actual, basis, ratio):
     class Refresher:
         def get(self, row):

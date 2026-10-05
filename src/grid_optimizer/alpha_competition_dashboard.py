@@ -644,7 +644,7 @@ def _apply_current_reward_ratios(payload: dict[str, Any], *, refresher: Any = _C
         if reward <= 0:
             continue
         actual = row.get('leaderboardThreshold')
-        basis = 'leaderboard' if isinstance(actual, (int, float)) and not isinstance(actual, bool) and math.isfinite(actual) and actual > 0 else 'reference'
+        basis = 'leaderboard' if isinstance(actual, (int, float)) and not isinstance(actual, bool) and math.isfinite(actual) and actual >= 0 else 'reference'
         threshold = row.get('leaderboardThreshold') if basis == 'leaderboard' else row.get('referenceThreshold')
         if isinstance(threshold, (int, float)) and not isinstance(threshold, bool) and math.isfinite(threshold) and threshold >= 0:
             ratio = threshold / reward
@@ -1031,6 +1031,7 @@ INDEX_HTML = r"""<!doctype html>
     .competition-table { min-width: 1440px; }
     .competition-table th:nth-child(1) { min-width: 130px; }
     .competition-table th:nth-child(2) { min-width: 180px; }
+    .competition-table th:nth-child(10) { min-width: 160px; }
     .competition-table th:last-child { min-width: 220px; }
     .sym { font-weight: 780; letter-spacing: .01em; }
     .name { margin-top: 3px; color: var(--muted); font-size: 12px; font-weight: 450; white-space: normal; }
@@ -1483,7 +1484,7 @@ INDEX_HTML = r"""<!doctype html>
         <td data-label="平均量">${pending ? '—' : escapeHtml(formatU(row.averageVolume))}</td>
         <td data-label="观察线 0.4" class="threshold-watch">${pending ? '—' : escapeHtml(formatU(row.watchThreshold))}</td>
         <td data-label="参考线 0.6" class="threshold-reference">${pending ? '—' : escapeHtml(formatU(row.referenceThreshold))}</td>
-        <td data-label="进榜线 / 奖励"><div class="cell-value"><div class="metric-primary">${finiteNumber(row.thresholdRewardRatio) === null ? '—' : `${escapeHtml(fmt.format(row.thresholdRewardRatio))}x`}</div><div class="metric-secondary" title="${escapeHtml(row.currentRewardUpdatedAtUtc || '')}">${finiteNumber(row.thresholdRewardRatio) === null ? escapeHtml(row.currentRewardNote || '') : `${row.thresholdRewardRatioBasis === 'leaderboard' ? '实际榜单' : '参考线 0.6'} / 当前奖励 ${escapeHtml(formatU(row.currentRewardValueU))}`}</div></div></td>
+        <td data-label="进榜线 / 奖励"><div class="cell-value"><div class="metric-primary">${finiteNumber(row.thresholdRewardRatio) === null ? '—' : `${escapeHtml(fmt.format(row.thresholdRewardRatio))}x`}</div><div class="metric-secondary" title="${escapeHtml(row.currentRewardUpdatedAtUtc || '')}">${finiteNumber(row.thresholdRewardRatio) === null ? escapeHtml(row.currentRewardNote || '') : `${row.thresholdRewardRatioBasis === 'leaderboard' ? '实际榜单' : '参考线 0.6'}<br>当前奖励 ${escapeHtml(formatU(row.currentRewardValueU))}`}</div></div></td>
         <td data-label="安全线 1.0" class="threshold-safe">${pending ? '—' : escapeHtml(formatU(row.safeThreshold))}</td>
         <td data-label="来源 / 更新时间 / 公告">${sourceContent(row)}</td>
       </tr>`;
