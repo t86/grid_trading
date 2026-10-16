@@ -278,6 +278,8 @@ class DataFetchTests(unittest.TestCase):
                 {
                     "symbol": "ENSOUSDT",
                     "status": "TRADING",
+                    "baseAsset": "ENSO",
+                    "quoteAsset": "USDT",
                     "contractType": "PERPETUAL",
                     "pricePrecision": 6,
                     "quantityPrecision": 1,
@@ -294,6 +296,8 @@ class DataFetchTests(unittest.TestCase):
         config = fetch_futures_symbol_config("ENSOUSDT")
 
         self.assertEqual(config["symbol"], "ENSOUSDT")
+        self.assertEqual(config["base_asset"], "ENSO")
+        self.assertEqual(config["quote_asset"], "USDT")
         self.assertAlmostEqual(float(config["tick_size"] or 0.0), 0.0001, places=8)
         self.assertAlmostEqual(float(config["step_size"] or 0.0), 0.1, places=8)
         self.assertAlmostEqual(float(config["min_notional"] or 0.0), 5.0, places=8)

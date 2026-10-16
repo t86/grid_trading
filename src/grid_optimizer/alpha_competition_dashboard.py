@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
@@ -21,12 +21,15 @@ from urllib.parse import parse_qs, urlparse
 from . import alpha_volume_alert as alert
 from .alpha_market import AlphaMarketClient
 from .alpha_competition_discovery import CompetitionDiscoveryCache, CompetitionDiscoveryService
+from .alpha_competition_history import CompetitionHistoryStore, DEFAULT_HISTORY_PATH
+from .alpha_competition_reward import fetch_ended_reward, fetch_current_reward
 from .alpha_competition_metrics import (
     BinanceCompetitionRuleProvider,
     CompetitionMetricsService,
     CompetitionRuleCache,
     CompetitionVolumeProvider,
 )
+from .volume_spike_monitor import send_bark_alert
 
 
 DEFAULT_HOST = os.environ.get("ALPHA_DASHBOARD_HOST", "0.0.0.0")
@@ -34,18 +37,27 @@ DEFAULT_PORT = int(os.environ.get("ALPHA_DASHBOARD_PORT", "8796"))
 DEFAULT_SYMBOLS = ("QUID", "GRVT", "O", "PRL", "CAP")
 DEFAULT_RULE_CACHE = "/home/ubuntu/.cache/binance-alpha-volume-alert/competition_rules.json"
 DEFAULT_DISCOVERY_CACHE = "/home/ubuntu/.cache/binance-alpha-volume-alert/competition_discovery.json"
+DEFAULT_HISTORY_CACHE = str(DEFAULT_HISTORY_PATH)
+DEFAULT_HOURLY_ALERT_STATE = "/home/ubuntu/.cache/binance-alpha-volume-alert/hourly_volume_alert_state.json"
+DEFAULT_HOURLY_BARK_CONFIG = "/home/ubuntu/.config/binance-alpha-bark.json"
 
 _COMPETITION_SERVICE: CompetitionMetricsService | None = None
 _COMPETITION_SERVICE_LOCK = threading.Lock()
 _DISCOVERY_SERVICE: CompetitionDiscoveryService | None = None
 _DISCOVERY_SERVICE_LOCK = threading.Lock()
+_HISTORY_STORE: CompetitionHistoryStore | None = None
+_HISTORY_STORE_LOCK = threading.Lock()
+_HISTORY_REFERENCE_LOCK = threading.Lock()
+_HISTORY_REWARD_LOCK = threading.Lock()
 _ALERT_CHECK_LOCK = threading.Lock()
+_HOURLY_ALERT_LOCK = threading.Lock()
 _SNAPSHOT_SYMBOL_RE = re.compile(r"[A-Z0-9_]{1,32}")
 _MAX_SNAPSHOT_SYMBOLS = 32
 _ALLOWED_METHODS = {
     "/": "GET",
     "/api/snapshot": "GET",
     "/api/competition": "GET",
+    "/api/history": "GET, POST",
     "/api/check": "POST",
 }
 
@@ -121,6 +133,172 @@ def _finite_float(value: Any, default: float = 0.0) -> float:
 def _finite_sum(values: list[float]) -> float:
     total = sum(values)
     return total if math.isfinite(total) else 0.0
+
+
+def _hourly_alert_threshold() -> float:
+    threshold = _finite_float(os.environ.get("ALPHA_HOURLY_ALERT_THRESHOLD", "10000000"), 10000000.0)
+    return threshold if threshold > 0 else 10000000.0
+
+
+def _hourly_alert_state_path() -> Path:
+    return Path(os.environ.get("ALPHA_HOURLY_ALERT_STATE_FILE", DEFAULT_HOURLY_ALERT_STATE))
+
+
+def _hourly_alert_bark_config_path() -> Path | None:
+    raw = os.environ.get("ALPHA_HOURLY_BARK_CONFIG_PATH", DEFAULT_HOURLY_BARK_CONFIG).strip()
+    return Path(raw) if raw else None
+
+
+def _load_hourly_alert_state(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"version": 1, "symbols": {}}
+    if not isinstance(payload, dict):
+        return {"version": 1, "symbols": {}}
+    symbols = payload.get("symbols")
+    if not isinstance(symbols, dict):
+        payload["symbols"] = {}
+    payload.setdefault("version", 1)
+    return payload
+
+
+def _save_hourly_alert_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _beijing_date_key(now: datetime) -> str:
+    return now.astimezone(timezone(timedelta(hours=8))).date().isoformat()
+
+
+def _format_hourly_volume(value: float) -> str:
+    return f"{value:,.2f} USDT"
+
+
+def _volume_alert_rules() -> tuple[tuple[int, str, float], ...]:
+    return (
+        (5, "latest5mQuoteVolume", 1_000_000.0),
+        (10, "latest10mQuoteVolume", 2_000_000.0),
+        (20, "latest20mQuoteVolume", 3_500_000.0),
+        (60, "latest1hQuoteVolume", _hourly_alert_threshold()),
+    )
+
+
+def _format_hourly_alert_body(row: dict[str, Any], threshold: float, now: datetime) -> str:
+    minutes = row.get("alertWindowMinutes", 60)
+    field = "latest1hQuoteVolume" if minutes == 60 else f"latest{minutes}mQuoteVolume"
+    return "\n".join(
+        [
+            f"{row.get('symbol', '')} 最近{minutes}分钟成交额突破 {_format_hourly_volume(threshold)}。",
+            f"触发窗口成交额: {_format_hourly_volume(_finite_float(row.get(field)))}",
+            "",
+            *[f"最近{n}分钟成交额: {_format_hourly_volume(_finite_float(row.get(f'latest{n}mQuoteVolume')))}" for n in (5, 10, 20)],
+            f"最近1小时成交额: {_format_hourly_volume(_finite_float(row.get('latest1hQuoteVolume')))}",
+            f"最近1分钟成交额: {_format_hourly_volume(_finite_float(row.get('latest1mQuoteVolume')))}",
+            f"24小时成交额: {_format_hourly_volume(_finite_float(row.get('tickerQuoteVolume24h')))}",
+            f"最新价格: {_finite_float(row.get('lastPrice')):.10g}",
+            f"Alpha ID: {row.get('alphaId', '')}",
+            f"交易对: {row.get('pair', '')}",
+            f"检查时间UTC: {now.isoformat(timespec='seconds')}",
+        ]
+    )
+
+
+def _send_hourly_volume_alert(row: dict[str, Any], threshold: float, now: datetime) -> dict[str, Any]:
+    symbol = str(row.get("symbol") or "").upper()
+    minutes = row.get("alertWindowMinutes", 60)
+    subject = f"Alpha量能预警: {symbol} {minutes}分钟突破{threshold / 10000:g}万"
+    body = _format_hourly_alert_body(row, threshold, now)
+    result: dict[str, Any] = {"symbol": symbol, "windowMinutes": minutes, "threshold": threshold,
+                              "email": {"sent": False}, "bark": {"sent": False}}
+    try:
+        result["bark"] = send_bark_alert(title=subject, body=body, config_path=_hourly_alert_bark_config_path())
+    except Exception as exc:
+        result["bark"] = {"sent": False, "error": f"{type(exc).__name__}: {exc}"}
+    try:
+        alert.send_email(subject, body)
+        result["email"] = {"sent": True}
+    except Exception as exc:
+        result["email"] = {"sent": False, "error": f"{type(exc).__name__}: {exc}"}
+    return result
+
+
+def check_hourly_volume_breakouts(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    enabled = _env_truthy("ALPHA_HOURLY_ALERT_ENABLED", "0")
+    threshold = _hourly_alert_threshold()
+    result: dict[str, Any] = {
+        "enabled": enabled,
+        "threshold": threshold,
+        "triggered": [],
+        "checked": 0,
+    }
+    if not enabled:
+        return result
+
+    now = datetime.now(timezone.utc)
+    date_key = _beijing_date_key(now)
+    state_path = _hourly_alert_state_path()
+    with _HOURLY_ALERT_LOCK:
+        state = _load_hourly_alert_state(state_path)
+        symbols_state = state.setdefault("symbols", {})
+        if not isinstance(symbols_state, dict):
+            symbols_state = {}
+            state["symbols"] = symbols_state
+
+        for row in rows:
+            symbol = str(row.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            volume = _finite_float(row.get("latest1hQuoteVolume"))
+            above = volume >= threshold
+            previous = symbols_state.get(symbol)
+            if not isinstance(previous, dict):
+                previous = {}
+            had_previous = symbol in symbols_state
+            already_triggered_today = previous.get("lastTriggerDate") == date_key
+            previous_windows = previous.get("windowsAbove", {})
+            if not isinstance(previous_windows, dict):
+                previous_windows = {}
+            windows_above = {}
+            crossing = None
+            for minutes, field, window_threshold in _volume_alert_rules():
+                window_above = _finite_float(row.get(field)) >= window_threshold
+                key = str(minutes)
+                windows_above[key] = window_above
+                was_above = previous_windows.get(key, previous.get("above", window_above) if minutes == 60 else window_above)
+                if had_previous and not was_above and window_above and crossing is None:
+                    crossing = (minutes, window_threshold)
+            send_now = crossing is not None and not already_triggered_today
+            send_result = None
+            if send_now:
+                minutes, window_threshold = crossing
+                send_result = _send_hourly_volume_alert({**row, "alertWindowMinutes": minutes}, window_threshold, now)
+                result["triggered"].append(send_result)
+                print(f"Alpha volume alert {symbol} window={minutes}m threshold={window_threshold:g} "
+                      f"bark={bool(send_result.get('bark', {}).get('sent'))} email={bool(send_result.get('email', {}).get('sent'))}", flush=True)
+            symbols_state[symbol] = {
+                **previous,
+                "above": above,
+                "windowsAbove": windows_above,
+                "lastVolume": volume,
+                "lastCheckedAtUtc": now.isoformat(timespec="seconds"),
+                "lastThreshold": threshold,
+            }
+            if send_now:
+                symbols_state[symbol]["lastTriggerDate"] = date_key
+                symbols_state[symbol]["lastTriggerAtUtc"] = now.isoformat(timespec="seconds")
+                symbols_state[symbol]["lastSendResult"] = send_result
+            result["checked"] += 1
+
+        state["updatedAtUtc"] = now.isoformat(timespec="seconds")
+        try:
+            _save_hourly_alert_state(state_path, state)
+        except OSError as exc:
+            result["stateError"] = f"{type(exc).__name__}: {exc}"
+    return result
 
 
 _LEADERBOARD_ENDPOINTS = (
@@ -417,6 +595,64 @@ def _apply_leaderboard_thresholds(
     return payload
 
 
+class _CurrentRewardRefresher:
+    def __init__(self, fetcher: Any, submitter: Any, clock: Any = time.monotonic) -> None:
+        self.fetcher, self.submitter, self.clock = fetcher, submitter, clock
+        self.lock = threading.Lock()
+        self.cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+        self.pending: set[tuple[Any, ...]] = set()
+
+    def get(self, row: dict[str, Any]) -> dict[str, Any]:
+        key = (row.get('symbol'), row.get('articleUrl'), row.get('round'), row.get('roundEndUtc'), row.get('winnerCount'))
+        waiting = {'currentRewardValueU': None, 'currentRewardNote': '奖励估值更新中'}
+        with self.lock:
+            cached = self.cache.get(key)
+            now = self.clock()
+            if cached and cached[0] > now + 10:
+                return dict(cached[1])
+            result = dict(cached[1]) if cached and cached[0] > now else waiting
+            if key in self.pending:
+                return result
+            self.pending.add(key)
+        if self.submitter.submit(lambda: self.refresh(key, dict(row))) is False:
+            with self.lock:
+                self.pending.discard(key)
+        return result
+
+    def refresh(self, key: tuple[Any, ...], row: dict[str, Any]) -> None:
+        try:
+            result = self.fetcher(row)
+        except Exception:
+            result = {'currentRewardValueU': None, 'currentRewardNote': '公告奖励或当前价格暂不可用'}
+        with self.lock:
+            self.cache[key] = (self.clock() + (30 if result.get('currentRewardValueU') else 60), result)
+            self.pending.discard(key)
+
+
+_CURRENT_REWARD_REFRESHER = _CurrentRewardRefresher(
+    fetch_current_reward, _BoundedSubmitter(max_workers=2, max_pending=8),
+)
+
+
+def _apply_current_reward_ratios(payload: dict[str, Any], *, refresher: Any = _CURRENT_REWARD_REFRESHER) -> dict[str, Any]:
+    for row in payload.get('rows', []):
+        row.update(currentRewardValueU=None, thresholdRewardRatio=None, thresholdRewardRatioBasis=None)
+        if row.get('status') != 'active':
+            continue
+        row.update(refresher.get(row))
+        reward = _finite_float(row.get('currentRewardValueU'))
+        if reward <= 0:
+            continue
+        actual = row.get('leaderboardThreshold')
+        basis = 'leaderboard' if isinstance(actual, (int, float)) and not isinstance(actual, bool) and math.isfinite(actual) and actual >= 0 else 'reference'
+        threshold = row.get('leaderboardThreshold') if basis == 'leaderboard' else row.get('referenceThreshold')
+        if isinstance(threshold, (int, float)) and not isinstance(threshold, bool) and math.isfinite(threshold) and threshold >= 0:
+            ratio = threshold / reward
+            if math.isfinite(ratio):
+                row.update(thresholdRewardRatio=ratio, thresholdRewardRatioBasis=basis)
+    return payload
+
+
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         return alert._safe_int(value, default)
@@ -430,13 +666,9 @@ def _ms_to_iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat(timespec="seconds")
 
 
-def _closed_1m_rows(pair: str, market: Any) -> list[list[Any]]:
-    rows = market.fetch_klines(pair, interval="1m", limit=63)
-    return rows[:-1] if len(rows) >= 2 else rows
-
-
-def _snapshot_row(token: Any, client: Any) -> dict[str, Any]:
-    closed_rows = _closed_1m_rows(token.pair, client)
+def _volume_row(token: Any, client: Any) -> dict[str, Any]:
+    live_rows = client.fetch_klines(token.pair, interval="1m", limit=63)
+    closed_rows = live_rows[:-1] if len(live_rows) >= 2 else live_rows
     latest = closed_rows[-1] if closed_rows else None
     previous = closed_rows[-2] if len(closed_rows) >= 2 else None
     baseline_rows = closed_rows[-21:-1]
@@ -451,31 +683,42 @@ def _snapshot_row(token: Any, client: Any) -> dict[str, Any]:
     latest_1m = _finite_float(latest[7]) if latest else 0.0
     previous_1m = _finite_float(previous[7]) if previous else 0.0
     delta_1m = _finite_float(latest_1m - previous_1m)
-    latest_1h = _finite_sum([_finite_float(row[7]) for row in closed_rows[-60:]])
+    latest_1h = _finite_sum([_finite_float(row[7]) for row in live_rows[-60:]])
     raw_multiple = latest_1m / baseline if baseline > 0 else (999999.0 if latest_1m > 0 else 0.0)
     multiple = _finite_float(raw_multiple, 999999.0 if latest_1m > 0 else 0.0)
-    ticker = client.fetch_ticker(token.pair)
     return {
         "symbol": token.symbol,
         "name": token.name,
         "alphaId": token.alpha_id,
         "pair": token.pair,
         "chain": token.chain_name,
-        "lastPrice": _finite_float(ticker.get("lastPrice"), _finite_float(token.price)),
+        "lastPrice": _finite_float(live_rows[-1][4], _finite_float(token.price)) if live_rows else _finite_float(token.price),
         "latest1mQuoteVolume": latest_1m,
         "previous1mQuoteVolume": previous_1m,
         "delta1mQuoteVolume": delta_1m,
         "latest1hQuoteVolume": latest_1h,
+        **{f"latest{minutes}mQuoteVolume": _finite_sum([_finite_float(row[7]) for row in live_rows[-minutes:]])
+           for minutes in (5, 10, 20)},
         "baselineQuoteVolume": baseline,
         "multiple": multiple,
         "trades": _safe_int(latest[8]) if latest else 0,
         "closedUtc": _ms_to_iso(_safe_int(latest[6]) if latest else 0),
-        "tickerQuoteVolume24h": _finite_float(ticker.get("quoteVolume"), _finite_float(token.volume_24h)),
-        "priceChangePercent24h": _finite_float(ticker.get("priceChangePercent")),
+        "tickerQuoteVolume24h": _finite_float(token.volume_24h),
     }
 
 
-def collect_snapshot(symbols: list[str], market: Any | None = None) -> dict[str, Any]:
+def _snapshot_row(token: Any, client: Any) -> dict[str, Any]:
+    row = _volume_row(token, client)
+    ticker = client.fetch_ticker(token.pair)
+    row.update(
+        lastPrice=_finite_float(ticker.get("lastPrice"), _finite_float(token.price)),
+        tickerQuoteVolume24h=_finite_float(ticker.get("quoteVolume"), _finite_float(token.volume_24h)),
+        priceChangePercent24h=_finite_float(ticker.get("priceChangePercent")),
+    )
+    return row
+
+
+def collect_snapshot(symbols: list[str], market: Any | None = None, *, notify: bool = True) -> dict[str, Any]:
     client = market or AlphaMarketClient()
     tokens = client.fetch_tokens()
     rows: list[dict[str, Any]] = []
@@ -490,11 +733,18 @@ def collect_snapshot(symbols: list[str], market: Any | None = None) -> dict[str,
         except Exception:
             errors.append(f"{symbol}: market data unavailable")
     rows.sort(key=lambda row: row["multiple"], reverse=True)
+    hourly_alert = check_hourly_volume_breakouts(rows) if notify else {
+        "enabled": _env_truthy("ALPHA_HOURLY_ALERT_ENABLED", "0"), "threshold": _hourly_alert_threshold(),
+        "triggered": [], "checked": 0,
+    }
     return {
         "generatedAtUtc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "symbols": symbols,
         "rows": rows,
         "errors": errors,
+        "alerts": {
+            "hourlyVolume": hourly_alert,
+        },
         "config": {
             "autoSymbols": _env_truthy("ALPHA_AUTO_SYMBOLS", "0"),
             "spikeMultiple": _finite_float(os.environ.get("ALPHA_SPIKE_MULTIPLE", "3"), 3.0),
@@ -506,6 +756,49 @@ def collect_snapshot(symbols: list[str], market: Any | None = None) -> dict[str,
             "cooldownMinutes": _safe_int(os.environ.get("ALPHA_COOLDOWN_MINUTES"), 30),
         },
     }
+
+
+def run_volume_alert_monitor(stop: threading.Event) -> None:
+    market = AlphaMarketClient(timeout_seconds=5)
+    tokens = {}
+    token_refresh_at = discovery_refresh_at = 0.0
+    cache = CompetitionDiscoveryCache(Path(os.environ.get("ALPHA_COMPETITION_DISCOVERY_CACHE", DEFAULT_DISCOVERY_CACHE)))
+    refresh_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="alpha-alert-discovery")
+    refresh_task = None
+    print("Alpha volume monitor started interval=15s windows=5m/10m/20m/60m", flush=True)
+    try:
+        while not stop.is_set():
+            started = time.monotonic()
+            now = datetime.now(timezone.utc)
+            try:
+                if _env_truthy("ALPHA_AUTO_SYMBOLS", "0"):
+                    # Announcement I/O must not pause the fast market-data loop.
+                    if started >= discovery_refresh_at and (refresh_task is None or refresh_task.done()):
+                        refresh_task = refresh_pool.submit(refresh_discovery_and_history)
+                        discovery_refresh_at = started + 300
+                    symbols = [rule.symbol for rule in cache.load().rules if any(round_.end_utc > now for round_ in rule.rounds)]
+                else:
+                    symbols = _fallback_symbols_from_env()
+                if symbols and started >= token_refresh_at:
+                    tokens = market.fetch_tokens()
+                    token_refresh_at = started + 300
+                for symbol in symbols:
+                    if stop.is_set():
+                        break
+                    token = tokens.get(symbol)
+                    if token is None:
+                        continue
+                    try:
+                        row = _volume_row(token, market)
+                        check_hourly_volume_breakouts([row])
+                    except Exception as exc:
+                        print(f"Alpha volume monitor {symbol} failed: {type(exc).__name__}", flush=True)
+            except Exception as exc:
+                print(f"Alpha volume monitor failed: {type(exc).__name__}", flush=True)
+            stop.wait(max(1.0, 15 - (time.monotonic() - started)))
+    finally:
+        refresh_pool.shutdown(wait=False, cancel_futures=True)
+        market.session.close()
 
 
 def check_alert_once() -> dict[str, Any]:
@@ -553,8 +846,68 @@ def discovery_service() -> CompetitionDiscoveryService:
             _DISCOVERY_SERVICE = CompetitionDiscoveryService(
                 provider=BinanceCompetitionRuleProvider(),
                 cache=CompetitionDiscoveryCache(cache_path),
+                on_rule=lambda rule, now: history_store().archive_rules([rule], now=now),
             )
         return _DISCOVERY_SERVICE
+
+
+def history_store() -> CompetitionHistoryStore:
+    global _HISTORY_STORE
+    with _HISTORY_STORE_LOCK:
+        if _HISTORY_STORE is None:
+            path = Path(os.environ.get("ALPHA_COMPETITION_HISTORY_CACHE", DEFAULT_HISTORY_CACHE))
+            store = CompetitionHistoryStore(path)
+            cache_path = Path(os.environ.get("ALPHA_COMPETITION_DISCOVERY_CACHE", DEFAULT_DISCOVERY_CACHE))
+            try:
+                store.archive_rules(list(CompetitionDiscoveryCache(cache_path).load().rules), now=datetime.now(timezone.utc))
+            except (OSError, ValueError):
+                pass
+            _HISTORY_STORE = store
+        return _HISTORY_STORE
+
+
+def complete_history_reference(store: CompetitionHistoryStore, *, now: datetime, provider: Any = None) -> None:
+    if not _HISTORY_REFERENCE_LOCK.acquire(blocking=False):
+        return
+    try:
+        pending = store.pending_reference(now=now)
+        if pending is None:
+            return
+        identity, rule, round_ = pending
+        volume_provider = provider or CompetitionVolumeProvider(market=AlphaMarketClient())
+        try:
+            volume = volume_provider.fetch(rule, round_, now, require_complete=True)
+        except Exception:
+            store.mark_reference_unavailable(identity, now=now)
+        else:
+            store.save_reference(identity, weighted_volume=volume.weighted_volume, source=volume.source, now=now)
+    finally:
+        _HISTORY_REFERENCE_LOCK.release()
+
+
+def complete_history_reward(store: CompetitionHistoryStore, *, now: datetime) -> None:
+    if not _HISTORY_REWARD_LOCK.acquire(blocking=False):
+        return
+    try:
+        pending = store.pending_reward(now=now)
+        if pending is None:
+            return
+        try:
+            reward = fetch_ended_reward(pending)
+        except Exception:
+            store.mark_reward_unavailable(pending["id"], now=now)
+        else:
+            store.save_reward(pending["id"], reward, now=now)
+    finally:
+        _HISTORY_REWARD_LOCK.release()
+
+
+def refresh_discovery_and_history() -> None:
+    now = datetime.now(timezone.utc)
+    discovery_service().discover(now=now)
+    store = history_store()
+    complete_history_reference(store, now=now)
+    complete_history_reward(store, now=now)
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -675,9 +1028,10 @@ INDEX_HTML = r"""<!doctype html>
     td:first-child, th:first-child { text-align: left; }
     tr:last-child td { border-bottom: 0; }
     .market-table { min-width: 1050px; }
-    .competition-table { min-width: 1280px; }
+    .competition-table { min-width: 1440px; }
     .competition-table th:nth-child(1) { min-width: 130px; }
     .competition-table th:nth-child(2) { min-width: 180px; }
+    .competition-table th:nth-child(10) { min-width: 160px; }
     .competition-table th:last-child { min-width: 220px; }
     .sym { font-weight: 780; letter-spacing: .01em; }
     .name { margin-top: 3px; color: var(--muted); font-size: 12px; font-weight: 450; white-space: normal; }
@@ -731,6 +1085,30 @@ INDEX_HTML = r"""<!doctype html>
       line-height: 1.5;
       overflow-wrap: anywhere;
     }
+    .history-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .history-controls select, .history-form input, .history-form textarea {
+      border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--text);
+      font: inherit; font-size: 13px; min-height: 36px; padding: 7px 9px;
+    }
+    .history-summary { display: flex; gap: 22px; flex-wrap: wrap; margin: 10px 0 14px; font-size: 13px; }
+    .history-summary strong { margin-left: 6px; font-variant-numeric: tabular-nums; }
+    .history-table { min-width: 1100px; }
+    .history-table th:first-child { min-width: 140px; }
+    .history-table td:last-child, .history-table th:last-child { text-align: center; }
+    .history-table button { min-height: 30px; padding: 0 9px; font-size: 12px; }
+    .history-empty { padding: 18px 11px; color: var(--muted); font-size: 13px; }
+    .history-dialog { width: min(440px, calc(100vw - 24px)); max-height: min(86vh, 750px);
+      overflow: auto; border: 1px solid var(--line); border-radius: 8px; padding: 20px; color: var(--text); }
+    .history-dialog::backdrop { background: rgba(16, 24, 40, .45); }
+    .history-dialog h2 { margin-bottom: 6px; }
+    .history-form { display: grid; gap: 12px; margin-top: 16px; }
+    .history-form label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 650; }
+    .history-form input, .history-form textarea { width: 100%; color: var(--text); font-weight: 450; }
+    .history-form textarea { min-height: 64px; resize: vertical; }
+    .history-form [hidden] { display: none; }
+    .history-form fieldset { border: 0; padding: 0; margin: 0; display: grid; gap: 12px; min-width: 0; }
+    .history-form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 3px; }
+    .history-form-actions .delete { margin-right: auto; color: var(--danger); }
     @media (max-width: 760px) {
       .shell { padding: 17px 11px 28px; }
       header { align-items: stretch; flex-direction: column; gap: 14px; margin-bottom: 20px; }
@@ -779,6 +1157,19 @@ INDEX_HTML = r"""<!doctype html>
       .competition-table .cell-value { min-width: 0; text-align: right; }
       .competition-table .source-badges { justify-content: flex-end; }
       .competition-table .name { text-align: right; }
+      .history-controls { width: 100%; }
+      .history-controls select { flex: 1 1 120px; }
+      .history-controls button { flex: 1 1 120px; }
+      .history-summary { gap: 8px 18px; }
+      .history-table { min-width: 0; display: block; }
+      .history-table thead { display: none; }
+      .history-table tbody { display: grid; gap: 8px; }
+      .history-table tbody tr { display: block; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 11px; }
+      .history-table tbody td { display: grid; grid-template-columns: 98px minmax(0, 1fr); gap: 8px;
+        width: 100%; padding: 7px 0; white-space: normal; text-align: right; overflow-wrap: anywhere; }
+      .history-table tbody td::before { content: attr(data-label); text-align: left; color: var(--muted); font-size: 12px; font-weight: 700; }
+      .history-table tbody td:last-child { text-align: right; }
+      .history-table tbody td:last-child button { justify-self: end; }
     }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
@@ -825,6 +1216,7 @@ INDEX_HTML = r"""<!doctype html>
               <th>平均量</th>
               <th>观察线 0.4</th>
               <th>参考线 0.6</th>
+              <th>进榜线 / 奖励</th>
               <th>安全线 1.0</th>
               <th>来源 / 更新时间 / 公告</th>
             </tr>
@@ -833,6 +1225,29 @@ INDEX_HTML = r"""<!doctype html>
         </table>
       </div>
       <div id="competitionErrors" class="errors" role="alert" aria-live="polite"></div>
+    </section>
+
+    <section id="historySection" class="section-block" aria-labelledby="historyTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="historyTitle">已结束竞赛参照</h2>
+          <p class="section-copy">参考线 = 该轮加权总量 ÷ 获奖人数 × 0.6；奖励价值 = 每人奖励代币数 × 结束时价格。</p>
+        </div>
+        <div class="history-controls">
+          <select id="historyRound" aria-label="筛选轮次"><option value="">全部轮次</option><option value="1">第 1 轮</option><option value="2">第 2 轮</option></select>
+          <select id="historyWinners" aria-label="筛选获奖人数"><option value="">全部获奖人数</option></select>
+          <button id="addHistoryBtn" type="button">录入旧赛</button>
+        </div>
+      </div>
+      <div id="historySummary" class="history-summary" aria-live="polite"></div>
+      <div class="table-wrap competition-wrap">
+        <table class="history-table">
+          <thead><tr><th>币种 / 轮次</th><th>结束时间</th><th>获奖人数</th><th>最终进榜线</th><th>最终参考线</th><th>真实 / 参考</th><th>结束时奖励价值</th><th>进榜线 / 奖励</th><th>公告</th><th>操作</th></tr></thead>
+          <tbody id="historyRows"></tbody>
+        </table>
+        <div id="historyEmpty" class="history-empty" hidden>暂无已结束竞赛。可录入旧赛的最终分数线。</div>
+      </div>
+      <div id="historyStatus" class="errors" role="status" aria-live="polite"></div>
     </section>
 
     <section id="marketSection" class="section-block" aria-labelledby="marketTitle">
@@ -875,6 +1290,30 @@ INDEX_HTML = r"""<!doctype html>
     </section>
   </div>
 
+  <dialog id="historyDialog" class="history-dialog" aria-labelledby="historyDialogTitle">
+    <h2 id="historyDialogTitle">录入最终进榜线</h2>
+    <div id="historyDialogContext" class="sub"></div>
+    <form id="historyForm" class="history-form">
+      <fieldset id="manualHistoryFields">
+        <label>币种<input name="symbol" maxlength="32" placeholder="例如 AEON" required></label>
+        <label>项目名称<input name="name" maxlength="100" placeholder="可选"></label>
+        <label>轮次<input name="round" type="number" min="1" max="20" step="1" value="1" required></label>
+        <label>结束时间（本地时间）<input name="endUtc" type="datetime-local" required></label>
+        <label>获奖人数<input name="winnerCount" type="number" min="1" step="1" required></label>
+        <label>官方公告链接<input name="articleUrl" type="url" placeholder="可选，Binance 公告"></label>
+      </fieldset>
+      <label>最终进榜分数线（U）<input name="finalThreshold" type="number" min="0.01" step="any" required></label>
+      <label>该轮最终加权交易量（U）<input name="weightedVolume" type="number" min="0.01" step="any" placeholder="可选"></label>
+      <label>备注<textarea name="note" maxlength="500" placeholder="可选"></textarea></label>
+      <div id="historyFormStatus" class="errors" role="alert"></div>
+      <div class="history-form-actions">
+        <button id="deleteHistoryBtn" class="delete" type="button" hidden>删除记录</button>
+        <button id="cancelHistoryBtn" type="button">取消</button>
+        <button class="primary" type="submit">保存</button>
+      </div>
+    </form>
+  </dialog>
+
   <script>
     const fmt = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 });
     const integerFmt = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
@@ -889,6 +1328,11 @@ INDEX_HTML = r"""<!doctype html>
     };
     const rowsEl = document.getElementById('rows');
     const competitionRowsEl = document.getElementById('competitionRows');
+    const historyRowsEl = document.getElementById('historyRows');
+    const historyDialog = document.getElementById('historyDialog');
+    const historyForm = document.getElementById('historyForm');
+    let historyRows = [];
+    let editingHistoryId = null;
     const statusEl = document.getElementById('status');
     const alertStatusEl = document.getElementById('alertStatus');
     const errorsEl = document.getElementById('errors');
@@ -1040,6 +1484,7 @@ INDEX_HTML = r"""<!doctype html>
         <td data-label="平均量">${pending ? '—' : escapeHtml(formatU(row.averageVolume))}</td>
         <td data-label="观察线 0.4" class="threshold-watch">${pending ? '—' : escapeHtml(formatU(row.watchThreshold))}</td>
         <td data-label="参考线 0.6" class="threshold-reference">${pending ? '—' : escapeHtml(formatU(row.referenceThreshold))}</td>
+        <td data-label="进榜线 / 奖励"><div class="cell-value"><div class="metric-primary">${finiteNumber(row.thresholdRewardRatio) === null ? '—' : `${escapeHtml(fmt.format(row.thresholdRewardRatio))}x`}</div><div class="metric-secondary" title="${escapeHtml(row.currentRewardUpdatedAtUtc || '')}">${finiteNumber(row.thresholdRewardRatio) === null ? escapeHtml(row.currentRewardNote || '') : `${row.thresholdRewardRatioBasis === 'leaderboard' ? '实际榜单' : '参考线 0.6'}<br>当前奖励 ${escapeHtml(formatU(row.currentRewardValueU))}`}</div></div></td>
         <td data-label="安全线 1.0" class="threshold-safe">${pending ? '—' : escapeHtml(formatU(row.safeThreshold))}</td>
         <td data-label="来源 / 更新时间 / 公告">${sourceContent(row)}</td>
       </tr>`;
@@ -1083,6 +1528,140 @@ INDEX_HTML = r"""<!doctype html>
       competitionRowsEl.innerHTML = rows.map(renderCompetitionRow).join('');
       competitionErrorsEl.textContent = (Array.isArray(payload.errors) ? payload.errors : []).map(String).join('\n');
     }
+
+    function median(numbers) {
+      if (!numbers.length) return null;
+      const sorted = [...numbers].sort((a, b) => a - b);
+      const middle = Math.floor(sorted.length / 2);
+      return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+    }
+
+    function renderHistory() {
+      const round = document.getElementById('historyRound').value;
+      const winners = document.getElementById('historyWinners').value;
+      const filtered = historyRows.filter(row =>
+        (!round || String(row.round) === round) && (!winners || String(row.winnerCount) === winners));
+      const completed = filtered.filter(row => finiteNumber(row.finalThreshold) !== null);
+      const cutoffs = completed.map(row => row.finalThreshold);
+      const ratios = completed.map(row => {
+        const reference = finiteNumber(row.referenceThreshold);
+        return reference > 0 ? row.finalThreshold / reference : null;
+      }).filter(value => value !== null);
+      const rewardRatios = completed.filter(row => finiteNumber(row.rewardValueU) > 0)
+        .map(row => row.finalThreshold / row.rewardValueU);
+      document.getElementById('historySummary').innerHTML = [
+        `已录入 <strong>${completed.length} / ${filtered.length}</strong>`,
+        `中位进榜线 <strong>${escapeHtml(formatU(median(cutoffs)))}</strong>`,
+        `范围 <strong>${cutoffs.length ? `${escapeHtml(formatU(Math.min(...cutoffs)))}–${escapeHtml(formatU(Math.max(...cutoffs)))}` : '—'}</strong>`,
+        `真实 / 参考中位 <strong>${ratios.length ? `${median(ratios).toFixed(2)}x` : '—'}</strong>`,
+        `进榜线 / 奖励中位 <strong>${rewardRatios.length ? `${fmt.format(median(rewardRatios))}x` : '—'}</strong>`,
+      ].map(value => `<span>${value}</span>`).join('');
+      historyRowsEl.innerHTML = filtered.map(row => {
+        const reference = finiteNumber(row.referenceThreshold);
+        const final = finiteNumber(row.finalThreshold);
+        const reward = finiteNumber(row.rewardValueU);
+        const referenceSource = {alpha_kline_estimate: 'Alpha K线估算', official: '官方总量', manual_volume: '手工加权总量'}[row.referenceSource];
+        const articleUrl = safeArticleUrl(row.articleUrl);
+        return `<tr>
+          <td data-label="币种 / 轮次"><div><div><strong>${escapeHtml(row.symbol)}</strong> · 第 ${escapeHtml(row.round)} 轮</div><div class="name">${escapeHtml(row.name || '')}</div></div></td>
+          <td data-label="结束时间">${escapeHtml(formatUtc(row.endUtc))}</td>
+          <td data-label="获奖人数">${escapeHtml(formatInteger(row.winnerCount))}</td>
+          <td data-label="最终进榜线" class="metric-primary">${escapeHtml(formatU(final))}</td>
+          <td data-label="最终参考线"><div><div>${escapeHtml(formatU(reference))}</div><div class="metric-secondary">${referenceSource ? `${escapeHtml(referenceSource)} · 总量 ${escapeHtml(formatU(row.finalWeightedVolume))}` : escapeHtml(row.referenceError || '待补充轮次总量')}</div></div></td>
+          <td data-label="真实 / 参考">${final !== null && reference > 0 ? `${(final / reference).toFixed(2)}x` : '—'}</td>
+          <td data-label="结束时奖励价值"><div><div>${escapeHtml(formatU(reward))}</div><div class="metric-secondary">${['official_reward_alpha_end_close', 'official_reward_spot_end_close'].includes(row.rewardSource) ? `${escapeHtml(fmt.format(row.rewardTokensPerWinner))} ${escapeHtml(row.rewardTokenSymbol || row.symbol)} × ${escapeHtml(row.rewardEndPriceU)} U` : escapeHtml(row.rewardError || '待获取公告奖励及结束时价格')}</div></div></td>
+          <td data-label="进榜线 / 奖励">${finiteNumber(row.thresholdRewardRatio) > 0 ? `${fmt.format(row.thresholdRewardRatio)}x` : '—'}</td>
+          <td data-label="公告">${articleUrl ? `<a href="${escapeHtml(articleUrl)}" target="_blank" rel="noopener noreferrer">查看公告</a>` : '—'}</td>
+          <td data-label="操作"><button type="button" data-history-id="${escapeHtml(row.id)}">${final === null ? '录入' : '修改'}</button></td>
+        </tr>`;
+      }).join('');
+      document.getElementById('historyEmpty').hidden = filtered.length > 0;
+    }
+
+    async function refreshHistory() {
+      try {
+        const payload = await fetchJson('api/history');
+        if (!Array.isArray(payload.rows)) throw new Error('历史数据格式无效');
+        historyRows = payload.rows;
+        const roundSelect = document.getElementById('historyRound');
+        const selectedRound = roundSelect.value;
+        const rounds = [...new Set(historyRows.map(row => row.round).filter(Number.isInteger))].sort((a, b) => a - b);
+        roundSelect.innerHTML = '<option value="">全部轮次</option>' + rounds.map(value => `<option value="${value}">第 ${value} 轮</option>`).join('');
+        roundSelect.value = rounds.some(value => String(value) === selectedRound) ? selectedRound : '';
+        const winnersSelect = document.getElementById('historyWinners');
+        const selected = winnersSelect.value;
+        const counts = [...new Set(historyRows.map(row => row.winnerCount).filter(Number.isInteger))].sort((a, b) => a - b);
+        winnersSelect.innerHTML = '<option value="">全部获奖人数</option>' + counts.map(count => `<option value="${count}">${formatInteger(count)} 人</option>`).join('');
+        winnersSelect.value = counts.some(count => String(count) === selected) ? selected : '';
+        renderHistory();
+        document.getElementById('historyStatus').textContent = '';
+      } catch (error) {
+        document.getElementById('historyStatus').textContent = `历史读取失败：${error}`;
+      }
+    }
+
+    function openHistoryDialog(row = null) {
+      editingHistoryId = row?.id || null;
+      historyForm.reset();
+      document.getElementById('manualHistoryFields').hidden = Boolean(row);
+      document.getElementById('manualHistoryFields').disabled = Boolean(row);
+      document.getElementById('deleteHistoryBtn').hidden = !row || row.finalThreshold === null;
+      document.getElementById('historyDialogContext').textContent = row
+        ? `${row.symbol} · 第 ${row.round} 轮 · ${formatUtc(row.endUtc)}` : '补录已结束交易赛';
+      historyForm.elements.namedItem('finalThreshold').value = row?.finalThreshold ?? '';
+      historyForm.elements.namedItem('weightedVolume').value = row?.referenceSource === 'manual_volume' ? row.finalWeightedVolume : '';
+      historyForm.elements.namedItem('weightedVolume').placeholder = row?.finalWeightedVolume != null
+        ? `已记录 ${formatU(row.finalWeightedVolume)}` : '可选';
+      historyForm.elements.namedItem('note').value = row?.note || '';
+      document.getElementById('historyFormStatus').textContent = '';
+      historyDialog.showModal();
+    }
+
+    async function submitHistory(action = 'save') {
+      const field = name => historyForm.elements.namedItem(name).value;
+      const data = action === 'delete' ? { action, id: editingHistoryId } : {
+        finalThreshold: Number(field('finalThreshold')),
+        note: field('note').trim(),
+      };
+      if (action !== 'delete') {
+        if (field('weightedVolume')) data.weightedVolume = Number(field('weightedVolume'));
+        if (editingHistoryId) data.id = editingHistoryId;
+        else Object.assign(data, {
+          symbol: field('symbol').trim().toUpperCase(),
+          name: field('name').trim(),
+          round: Number(field('round')),
+          endUtc: new Date(field('endUtc')).toISOString(),
+          winnerCount: Number(field('winnerCount')),
+          articleUrl: field('articleUrl').trim(),
+        });
+      }
+      const response = await fetch('api/history', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      historyDialog.close();
+      await refreshHistory();
+    }
+
+    document.getElementById('addHistoryBtn').addEventListener('click', () => openHistoryDialog());
+    document.getElementById('cancelHistoryBtn').addEventListener('click', () => historyDialog.close());
+    document.getElementById('historyRound').addEventListener('change', renderHistory);
+    document.getElementById('historyWinners').addEventListener('change', renderHistory);
+    historyRowsEl.addEventListener('click', event => {
+      const button = event.target.closest('button[data-history-id]');
+      if (button) openHistoryDialog(historyRows.find(row => row.id === button.dataset.historyId));
+    });
+    historyForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      try { await submitHistory(); }
+      catch (error) { document.getElementById('historyFormStatus').textContent = String(error); }
+    });
+    document.getElementById('deleteHistoryBtn').addEventListener('click', async () => {
+      if (!confirm('删除这条最终分数线？')) return;
+      try { await submitHistory('delete'); }
+      catch (error) { document.getElementById('historyFormStatus').textContent = String(error); }
+    });
 
     function renderMarket(data) {
       const payload = validatePayload(data, '行情');
@@ -1178,6 +1757,7 @@ INDEX_HTML = r"""<!doctype html>
         } else {
           competitionErrorsEl.textContent = `交易赛刷新失败：${competitionResult.reason}`;
         }
+        await refreshHistory();
       } finally {
         if (generation === refreshGeneration) refreshBtn.disabled = false;
       }
@@ -1208,6 +1788,9 @@ INDEX_HTML = r"""<!doctype html>
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _history(self) -> CompetitionHistoryStore:
+        return getattr(self.server, "history_store", None) or history_store()
+
     def _discovery(self, current: datetime) -> Any:
         service = getattr(self.server, "discovery_service", None) or discovery_service()
         return service.discover(now=current)
@@ -1325,18 +1908,36 @@ class Handler(BaseHTTPRequestHandler):
                     snapshot = self._discovery(current)
                     symbols = [rule.symbol for rule in snapshot.rules]
                 market = getattr(self.server, "market", None)
-                self._send_json(collect_snapshot(symbols, market=market))
+                self._send_json(collect_snapshot(symbols, market=market, notify=False))
             except (Exception, SystemExit) as exc:
                 self._send_internal_error(exc)
             return
         if parsed.path == "/api/competition":
             try:
                 current = datetime.now(timezone.utc)
+                history = self._history()
                 snapshot = self._discovery(current)
                 service = getattr(self.server, "competition_service", None) or competition_service()
                 payload = service.collect_rules(list(snapshot.rules), now=current)
                 self._add_discovery_metadata(payload, snapshot)
-                self._send_json(_apply_leaderboard_thresholds(payload))
+                payload = _apply_leaderboard_thresholds(payload)
+                payload = _apply_current_reward_ratios(payload)
+                try:
+                    history.archive_rules(list(snapshot.rules), now=current)
+                    history.capture_rows(payload["rows"], now=current)
+                except (OSError, ValueError) as exc:
+                    self.log_error("History capture failed: %r", exc)
+                self._send_json(payload)
+            except (Exception, SystemExit) as exc:
+                self._send_internal_error(exc)
+            return
+        if parsed.path == "/api/history":
+            try:
+                current = datetime.now(timezone.utc)
+                store = self._history()
+                complete_history_reference(store, now=current, provider=getattr(self.server, "history_volume_provider", None))
+                complete_history_reward(store, now=current)
+                self._send_json(store.snapshot(now=current))
             except (Exception, SystemExit) as exc:
                 self._send_internal_error(exc)
             return
@@ -1349,6 +1950,35 @@ class Handler(BaseHTTPRequestHandler):
         if self._require_auth():
             return
         parsed = urlparse(self.path)
+        if parsed.path == "/api/history":
+            origin = self.headers.get("Origin")
+            if origin is not None:
+                parsed_origin = urlparse(origin)
+                if parsed_origin.scheme not in {"http", "https"} or parsed_origin.netloc.casefold() != self.headers.get("Host", "").casefold():
+                    self._send_json({"ok": False, "error": "cross-origin request rejected"}, HTTPStatus.FORBIDDEN)
+                    return
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip().casefold() != "application/json":
+                self._send_json({"ok": False, "error": "JSON content required"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 1 <= length <= 4096:
+                    raise ValueError("request body is too large or empty")
+                payload = json.loads(self.rfile.read(length))
+                if not isinstance(payload, dict):
+                    raise ValueError("history entry must be an object")
+                store = self._history()
+                if payload.get("action") == "delete":
+                    store.delete(payload.get("id"))
+                    self._send_json({"ok": True})
+                else:
+                    row = store.save_final(payload, now=datetime.now(timezone.utc))
+                    self._send_json({"ok": True, "row": row})
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except (Exception, SystemExit) as exc:
+                self._send_internal_error(exc)
+            return
         if parsed.path == "/api/check":
             try:
                 self._send_json(check_alert_once())
@@ -1395,8 +2025,15 @@ def main() -> int:
         raise SystemExit(str(exc)) from None
     args = parse_args()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    stop = threading.Event()
+    if _env_truthy("ALPHA_HOURLY_ALERT_ENABLED", "0"):
+        threading.Thread(target=run_volume_alert_monitor, args=(stop,), name="alpha-volume-alert", daemon=True).start()
     print(f"Serving Binance Alpha dashboard on http://{args.host}:{args.port}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        stop.set()
+        server.server_close()
     return 0
 
 

@@ -31,6 +31,8 @@ printf '%s\n' \
   "PYTHON_BIN=${python_bin}" \
   "RUNNER_WRAPPER=${runner_wrapper}" \
   "RUNNER_EVENTS=${runner_events}" \
+  "HEDGE_SYMBOL=${HEDGE_SYMBOL:-${symbol}}" \
+  "HEDGE_QTY=${HEDGE_QTY:-}" \
   "LOSS_DECISION_AFTER_SECONDS=${loss_decision_after_seconds}" \
   "LOSS_THRESHOLD_PER_10K=${loss_threshold_per_10k}" \
   "LOSS_FALLBACK_TARGET_VOLUME=${loss_fallback_target_volume}" >"${tmp_env}"

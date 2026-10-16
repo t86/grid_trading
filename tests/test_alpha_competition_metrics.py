@@ -52,6 +52,8 @@ class _FakeSession:
 
     def get(self, url: str, *, params: dict[str, object], timeout: float) -> _FakeResponse:
         self.calls.append((url, params, timeout))
+        if params.get("catalogId") == 49 and not self.responses:
+            return _official({"catalogs": [{"catalogId": 49, "articles": [], "catalogs": []}]})
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -89,6 +91,14 @@ def _append_block(article: dict[str, object], text: str) -> None:
     children = tree["children"]
     assert isinstance(children, list)
     children.append({"node": "paragraph", "children": [{"node": "text", "text": text}]})
+    _set_tree(article, tree)
+
+
+def _insert_block(article: dict[str, object], index: int, text: str) -> None:
+    tree = _tree(article)
+    children = tree["children"]
+    assert isinstance(children, list)
+    children.insert(index, {"node": "paragraph", "children": [{"node": "text", "text": text}]})
     _set_tree(article, tree)
 
 
@@ -160,6 +170,28 @@ def test_period_labels_are_compared_case_insensitively() -> None:
     _replace_period_label(article, round_number=2, label="dappos")
 
     assert [round_.number for round_ in parse_competition_rule(article, "DOS").rounds] == [1, 2]
+
+
+def test_postponed_second_round_is_excluded() -> None:
+    article = copy.deepcopy(FIXTURES["QUID"])
+    _insert_block(
+        article, 2,
+        "Note: The 2nd QUID Trading Competition, originally scheduled to start on "
+        "2026-08-12 13:00 (UTC), will be postponed until further notice.",
+    )
+
+    assert [round_.number for round_ in parse_competition_rule(article, "QUID").rounds] == [1]
+
+
+def test_unnumbered_promotion_period_is_first_round() -> None:
+    article = copy.deepcopy(FIXTURES["QUID"])
+    tree = _tree(article)
+    children = tree["children"]
+    assert isinstance(children, list)
+    children[0] = json.loads(json.dumps(children[0]).replace("1st QUID Trading Competition", "QUID Trading Competition"))
+    _set_tree(article, tree)
+
+    assert parse_competition_rule(article, "QUID").rounds[0].number == 1
 
 
 @pytest.mark.parametrize("bad_title", [
@@ -450,7 +482,46 @@ def test_provider_enumerates_recent_competition_announcements_by_article_code() 
         title=FIXTURES["DOS"]["data"]["title"],
         released_at_utc=datetime.fromtimestamp(release / 1000, tz=UTC),
     )
-    assert [call[1]["pageNo"] for call in session.calls] == [1, 2]
+    assert [call[1]["pageNo"] for call in session.calls] == [1, 2, 1]
+
+
+def test_provider_finds_newest_competition_in_latest_news_catalog() -> None:
+    recent = int((DISCOVERY_NOW - timedelta(days=1)).timestamp() * 1000)
+    older = int((DISCOVERY_NOW - timedelta(days=2)).timestamp() * 1000)
+    coai = {
+        "code": "coai-article",
+        "title": "Binance Alpha Trading Competition: Trade ChainOpera AI (COAI) and Share $200K Worth of Rewards",
+        "releaseDate": recent,
+    }
+    aeon = {
+        "code": "aeon-article",
+        "title": "Binance Alpha Trading Competition: Trade AEON (AEON) and Share $200K Worth of Rewards",
+        "releaseDate": older,
+    }
+    session = _FakeSession([
+        _official({"catalogs": [{"catalogId": 93, "articles": [aeon], "catalogs": []}]}),
+        _official({"catalogs": [{"catalogId": 93, "articles": [], "catalogs": []}]}),
+        _official({"catalogs": [{"catalogId": 49, "articles": [coai], "catalogs": []}]}),
+        _official({"catalogs": [{"catalogId": 49, "articles": [], "catalogs": []}]}),
+    ])
+
+    found = metrics.BinanceCompetitionRuleProvider(session=session).fetch_recent_announcements(now=DISCOVERY_NOW)
+
+    assert [item.symbol for item in found] == ["COAI", "AEON"]
+    assert [call[1]["catalogId"] for call in session.calls] == [93, 93, 49, 49]
+
+
+def test_provider_default_discovery_window_skips_old_announcements() -> None:
+    old = _list_item(
+        FIXTURES["DOS"],
+        release_date=int((DISCOVERY_NOW - timedelta(days=22)).timestamp() * 1000),
+    )
+    session = _FakeSession([_official({"articles": [old]})])
+
+    found = metrics.BinanceCompetitionRuleProvider(session=session).fetch_recent_announcements(now=DISCOVERY_NOW)
+
+    assert found == []
+    assert [call[1]["catalogId"] for call in session.calls] == [93, 49]
 
 
 def test_provider_deduplicates_exact_announcement_metadata_by_article_code() -> None:
@@ -484,7 +555,7 @@ def test_provider_does_not_treat_a_recent_duplicate_only_page_as_old() -> None:
     )
 
     assert len(result) == 1
-    assert [call[1]["pageNo"] for call in session.calls] == [1, 2, 3]
+    assert [call[1]["pageNo"] for call in session.calls] == [1, 2, 3, 1]
 
 
 def test_provider_rejects_conflicting_announcement_metadata_for_one_article_code() -> None:
@@ -626,6 +697,7 @@ def test_provider_fetches_parenthesized_project_announcement_rule_end_to_end() -
     provider = metrics.BinanceCompetitionRuleProvider(session=_FakeSession([
         _official({"articles": [item]}),
         _official({"articles": []}),
+        _official({"catalogs": [{"catalogId": 49, "articles": [], "catalogs": []}]}),
         _official(detail),
     ]))
 
@@ -656,11 +728,11 @@ def test_provider_includes_cutoff_boundary_and_stops_on_an_entirely_old_page() -
     ])
 
     result = metrics.BinanceCompetitionRuleProvider(session=session).fetch_recent_announcements(
-        now=DISCOVERY_NOW
+        now=DISCOVERY_NOW, days=60
     )
 
     assert [item.symbol for item in result] == ["DOS", "QUID"]
-    assert [call[1]["pageNo"] for call in session.calls] == [1, 2, 3]
+    assert [call[1]["pageNo"] for call in session.calls] == [1, 2, 3, 1]
 
 
 def test_provider_fetches_rule_for_an_announcement_and_validates_identity() -> None:
@@ -761,6 +833,22 @@ def test_provider_selects_unique_catalog_93_from_current_list_envelope() -> None
     assert session.calls[-1][1] == {"articleCode": quid_data["code"]}
 
 
+def test_provider_fetches_symbol_from_latest_news_catalog() -> None:
+    detail = copy.deepcopy(FIXTURES["QUID"]["data"])
+    assert isinstance(detail, dict)
+    item = _list_item(FIXTURES["QUID"], release_date=int((NOW - timedelta(days=1)).timestamp() * 1000))
+    session = _FakeSession([
+        _official({"catalogs": [{"catalogId": 93, "articles": [], "catalogs": []}]}),
+        _official({"catalogs": [{"catalogId": 49, "articles": [item], "catalogs": []}]}),
+        _official(detail),
+    ])
+
+    rule = metrics.BinanceCompetitionRuleProvider(session=session).fetch_rule("QUID", now=NOW)
+
+    assert rule.symbol == "QUID"
+    assert [call[1].get("catalogId") for call in session.calls] == [93, 49, None]
+
+
 def test_provider_prefers_legacy_direct_articles_when_catalogs_are_also_present() -> None:
     quid_data = FIXTURES["QUID"]["data"]
     assert isinstance(quid_data, dict)
@@ -833,7 +921,7 @@ def test_provider_stops_when_page_is_older_than_sixty_days() -> None:
     with pytest.raises(RuleParseError, match="no recent.*QUID"):
         provider.fetch_rule("QUID", now=NOW)
 
-    assert len(session.calls) == 1
+    assert len(session.calls) == 2
 
 
 def test_provider_stops_after_twenty_recent_pages() -> None:
@@ -845,7 +933,7 @@ def test_provider_stops_after_twenty_recent_pages() -> None:
     with pytest.raises(RuleParseError, match="no recent.*QUID"):
         provider.fetch_rule("QUID", now=NOW)
 
-    assert len(session.calls) == 20
+    assert len(session.calls) == 21
 
 
 @pytest.mark.parametrize(
@@ -1415,6 +1503,23 @@ def test_volume_provider_clamps_kline_end_to_round_end() -> None:
     metrics.CompetitionVolumeProvider(market=market).fetch(rule, round_, round_.end_utc + timedelta(days=1))
 
     assert market.calls[0]["end_time_ms"] == int(round_.end_utc.timestamp() * 1000)
+
+
+def test_final_round_volume_requires_every_hour() -> None:
+    rule = parse_competition_rule(FIXTURES["QUID"], "QUID")
+    round_ = rule.rounds[0]
+    rows = [
+        _kline((round_.start_utc + timedelta(hours=hour)).strftime("%Y-%m-%d %H:%M"), quote_volume="100")
+        for hour in range(168)
+    ]
+    market = _FakeMarketClient(rows)
+    provider = metrics.CompetitionVolumeProvider(market=market)
+    result = provider.fetch(rule, round_, round_.end_utc, require_complete=True)
+    assert result.weighted_volume == pytest.approx(100 * 24 * sum(rule.multipliers))
+
+    market.rows = rows[:-1]
+    with pytest.raises(ValueError, match="incomplete"):
+        provider.fetch(rule, round_, round_.end_utc, require_complete=True)
 
 
 def test_volume_provider_counts_the_current_forming_hour_by_open_time() -> None:

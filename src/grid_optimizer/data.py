@@ -1100,6 +1100,8 @@ def fetch_futures_symbol_config(symbol: str, contract_type: str = "usdm") -> dic
     payload = {
         "symbol": normalized_symbol,
         "status": str(item.get("status") or item.get("contractStatus") or "").upper().strip(),
+        "base_asset": str(item.get("baseAsset", "")).upper().strip(),
+        "quote_asset": str(item.get("quoteAsset", "")).upper().strip(),
         "contract_type": str(item.get("contractType", "")).upper().strip(),
         "price_precision": int(item["pricePrecision"]) if str(item.get("pricePrecision", "")).strip() else None,
         "quantity_precision": int(item["quantityPrecision"]) if str(item.get("quantityPrecision", "")).strip() else None,

@@ -154,6 +154,31 @@ def test_discovery_shows_upcoming_and_active_but_removes_ended(tmp_path: Path) -
     assert list(payload["rules_by_article_code"]) == [dos.article_code, power.article_code]
 
 
+def test_discovery_archives_ended_rules_without_monitoring_them(tmp_path: Path) -> None:
+    ended = _announcement("PRL")
+    rule = _rule(ended, first_start=NOW - timedelta(days=8))
+    provider = _Provider([ended], {ended.article_code: rule})
+    archived = []
+    service = discovery.CompetitionDiscoveryService(
+        provider, discovery.CompetitionDiscoveryCache(tmp_path / "discovery.json"),
+        on_rule=lambda value, now: archived.append((value, now)),
+    )
+    assert service.discover(now=NOW).rules == ()
+    assert archived == [(rule, NOW)]
+
+
+def test_history_archive_failure_does_not_break_active_discovery(tmp_path: Path) -> None:
+    announcement = _announcement("PRL")
+    rule = _rule(announcement, first_start=NOW - timedelta(days=1))
+    provider = _Provider([announcement], {announcement.article_code: rule})
+    def fail_archive(rule, now):
+        raise OSError("unavailable")
+    service = discovery.CompetitionDiscoveryService(
+        provider, discovery.CompetitionDiscoveryCache(tmp_path / "discovery.json"), on_rule=fail_archive,
+    )
+    assert service.discover(now=NOW).rules == (rule,)
+
+
 @pytest.mark.parametrize(
     ("offset", "expected"),
     [

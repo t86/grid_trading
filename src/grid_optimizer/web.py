@@ -24,7 +24,7 @@ from pathlib import Path
 from collections.abc import Callable
 from statistics import mean
 from typing import Any, Union
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -52,6 +52,9 @@ from .ai_scheduler import (
     update_scheduler_task,
 )
 from .ai_scheduler_worker import run_scheduler_task
+from .alpha_market import AlphaMarketClient
+from .alpha_airdrop_feed import feed_payload as alpha_airdrop_feed_payload
+from .alpha_airdrop_ui import AIR_DROP_PAGE
 from .backtest import (
     build_grid_levels,
     run_backtest,
@@ -66,12 +69,15 @@ from .competition_board import (
     resolve_active_competition_board,
     upsert_competition_entry,
 )
+from .carry_watchlist import change_rule, save_bark_endpoint, save_rule, search_contracts, watchlist_payload
+from .carry_watchlist_ui import WATCHLIST_PANEL
 from .console_overview import _fetch_remote_json
 from .console_registry import load_console_registry
 from .master_sprint import MASTER_SPRINT_PAGE, build_master_sprint_snapshot
 from .spot_app_loss_audit import main as spot_app_loss_audit_main
 from .spot_freeze_manager import expected_short_position_now, new_ledger
 from .data import (
+    _http_signed_get_json,
     cache_file_path,
     delete_futures_order,
     delete_spot_order,
@@ -100,6 +106,7 @@ from .data import (
     fetch_futures_book_tickers,
     fetch_futures_latest_price,
     fetch_futures_premium_index,
+    fetch_futures_symbols,
     fetch_futures_symbol_config,
     post_futures_change_margin_type,
     post_futures_market_order,
@@ -227,6 +234,9 @@ RUNNING_STATUS_API_RESPONSE_CACHE: dict[str, tuple[float, bytes]] = {}
 RUNNING_STATUS_API_RESPONSE_CACHE_LOCK = threading.Lock()
 BASIS_CACHE: dict[str, dict[str, Any]] = {}
 BASIS_CACHE_LOCK = threading.Lock()
+CARRY_OPPORTUNITIES_CACHE: tuple[float, dict[str, Any]] | None = None
+CARRY_OPPORTUNITIES_CACHE_LOCK = threading.Lock()
+CARRY_OPPORTUNITIES_CACHE_SECONDS = 300
 DETAIL_CACHE: dict[str, dict[str, Any]] = {}
 DETAIL_CACHE_LOCK = threading.Lock()
 LAST_FUNDING_CACHE: dict[str, dict[str, Any]] = {}
@@ -17438,15 +17448,36 @@ SERVER_HUB_PAGE = """<!doctype html>
   <main class="wrap">
     <section class="hero">
       <p class="eyebrow">Trading Hub</p>
-      <h1>三台交易界面统一入口</h1>
-      <p class="lead">这个页面只负责分发入口，不承载交易逻辑。点击下面任一服务器卡片，即可进入对应机器上的交易界面或监控页。</p>
+      <h1>交易与研究统一入口</h1>
+      <p class="lead">集中进入合约研究、赛事榜单、Alpha 页面和三台网格服务。入口页不承载交易逻辑，具体管理页面继续使用各自认证。</p>
       <div class="tips">
-        <div>进入目标页面后，浏览器会提示 Basic Auth。当前统一用户名是 <code>grid</code>。</div>
-        <div>第三台 <code>43.155.136.111</code> 目前还没有检测到运行中的 <code>wangge-web</code>，如果点不开，需要先把该机服务拉起来。</div>
+        <div>受保护页面会继续提示 Basic Auth；赛事榜单服务保持原有访问方式。</div>
+        <div>统一入口地址：<code>http://43.155.136.111:8788/portal</code></div>
       </div>
     </section>
 
     <section class="grid">
+      <article class="card">
+        <span class="badge">市场研究</span>
+        <h2>资金费率候选池</h2>
+        <div class="meta">已确认的 48 个高成交额永续合约，包含币、股票、ETF、杠杆/反向 ETF 与商品，并列出对应现货映射。</div>
+        <div class="actions">
+          <a class="btn primary" href="/market-data">打开候选池</a>
+          <a class="btn" href="/basis">打开实时基差</a>
+        </div>
+      </article>
+
+      <article class="card">
+        <span class="badge">赛事与 Alpha</span>
+        <h2>外部业务页面</h2>
+        <div class="meta">统一收纳 111 赛事榜单与 Alpha 页面；目标服务仍保持独立运行。</div>
+        <div class="actions">
+          <a class="btn primary" href="http://43.155.136.111:8799/" target="_blank" rel="noopener noreferrer">赛事榜单</a>
+          <a class="btn" href="http://43.156.35.110/alpha" target="_blank" rel="noopener noreferrer">Alpha</a>
+          <a class="btn" href="/alpha-airdrops">Alpha 空投监控</a>
+        </div>
+      </article>
+
       <article class="card">
         <span class="badge">主入口 A</span>
         <h2>43.131.232.150</h2>
@@ -17470,10 +17501,10 @@ SERVER_HUB_PAGE = """<!doctype html>
       <article class="card">
         <span class="badge">在线入口</span>
         <h2>43.155.136.111</h2>
-        <div class="meta">当前已确认该机通过 <code>8787</code> 对外提供交易界面，点下面按钮即可直接进入。</div>
+        <div class="meta">当前已确认该机通过 <code>8788</code> 对外提供网格交易界面。</div>
         <div class="actions">
-          <a class="btn primary" href="http://43.155.136.111:8787/" target="_blank" rel="noopener noreferrer">尝试打开交易界面</a>
-          <a class="btn" href="http://43.155.136.111:8787/monitor" target="_blank" rel="noopener noreferrer">尝试打开监控页</a>
+          <a class="btn primary" href="http://43.155.136.111:8788/" target="_blank" rel="noopener noreferrer">打开交易界面</a>
+          <a class="btn" href="http://43.155.136.111:8788/monitor" target="_blank" rel="noopener noreferrer">打开监控页</a>
         </div>
       </article>
     </section>
@@ -17485,6 +17516,463 @@ SERVER_HUB_PAGE = """<!doctype html>
 </body>
 </html>
 """
+
+
+MARKET_DATA_SYMBOLS = (
+    "BTCUSDT", "ETHUSDT", "SNDKUSDT", "BTCUSDC", "SKHYNIXUSDT", "ETHUSDC",
+    "SOXLUSDT", "XAUUSDT", "MUUSDT", "SOLUSDT", "SPCXUSDT", "KORUUSDT",
+    "SKHYUSDT", "CLUSDT", "XAGUSDT", "XRPUSDT", "SNXXUSDT", "HYPEUSDT",
+    "ZECUSDT", "BANKUSDT", "BZUSDT", "DOGEUSDT", "DRAMUSDT", "BNBUSDT",
+    "AKEUSDT", "TUTUSDT", "SOXSUSDT", "SAMSUNGUSDT", "EWYUSDT", "ACEUSDT",
+    "SOLUSDC", "1000PEPEUSDT", "ADAUSDT", "BTWUSDT", "QQQUSDT", "BLESSUSDT",
+    "INTCUSDT", "BEATUSDT", "MUUUSDT", "CRCLUSDT", "LINKUSDT", "ENAUSDT",
+    "PUMPUSDT", "COTIUSDT", "WLDUSDT", "SUIUSDT", "UNITREEUSDT", "MRVLUSDT",
+)
+_MARKET_DATA_FUNDING_CACHE: tuple[float, dict[str, Any]] | None = None
+_MARKET_DATA_FUNDING_CACHE_LOCK = threading.Lock()
+_MARKET_DATA_FUNDING_CACHE_SECONDS = 60
+_ALPHA_FUNDING_MIN_QUOTE_VOLUME_24H = float(os.environ.get("ALPHA_FUNDING_MIN_QUOTE_VOLUME_24H", "1000000"))
+_ALPHA_FUNDING_MIN_CURRENT_RATE = float(os.environ.get("ALPHA_FUNDING_MIN_CURRENT_RATE", "0.0001"))
+_ALPHA_FUNDING_MIN_POSITIVE_RATIO = float(os.environ.get("ALPHA_FUNDING_MIN_POSITIVE_RATIO", "0.70"))
+_ALPHA_FUNDING_MIN_7D_RETURN = float(os.environ.get("ALPHA_FUNDING_MIN_7D_RETURN", "0.002"))
+_ALPHA_FUNDING_ROUND_TRIP_COST = float(os.environ.get("ALPHA_FUNDING_ROUND_TRIP_COST", "0.004"))
+_MARKET_DATA_EARN_CACHE: tuple[float, dict[str, Any]] | None = None
+_MARKET_DATA_EARN_CACHE_LOCK = threading.Lock()
+_MARKET_DATA_EARN_CACHE_SECONDS = 300
+_MARKET_DATA_EARN_PRODUCTS_CACHE: tuple[float, list[dict[str, Any]]] | None = None
+_MARKET_DATA_EARN_PRODUCTS_CACHE_LOCK = threading.Lock()
+_MARKET_DATA_EARN_PRODUCTS_CACHE_SECONDS = 300
+_MARKET_DATA_EARN_FUNDING_CACHE: tuple[float, dict[str, Any]] | None = None
+_MARKET_DATA_EARN_FUNDING_CACHE_LOCK = threading.Lock()
+_MARKET_DATA_EARN_FUNDING_CACHE_SECONDS = 300
+
+
+def _fetch_market_data_funding_history(symbol: str, limit: int = 1000) -> list[tuple[datetime, float]]:
+    query = urlencode({"symbol": symbol, "limit": str(limit)})
+    request = Request(
+        f"https://fapi.binance.com/fapi/v1/fundingRate?{query}",
+        headers={"User-Agent": "grid-web/market-data"},
+    )
+    with urlopen(request, timeout=12) as response:
+        payload = json.load(response)
+    if not isinstance(payload, list):
+        raise RuntimeError(f"unexpected funding payload for {symbol}")
+    rows: list[tuple[datetime, float]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        try:
+            timestamp = int(item["fundingTime"])
+            rate = float(item["fundingRate"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(rate):
+            rows.append((datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc), rate))
+    return sorted(rows, key=lambda item: item[0])
+
+
+def _compound_funding_return(rates: list[float]) -> float | None:
+    if not rates:
+        return None
+    value = 1.0
+    for rate in rates:
+        value *= 1.0 + rate
+    return value - 1.0
+
+
+def _evaluate_alpha_funding_candidate(
+    *,
+    symbol: str,
+    alpha_pair: str,
+    alpha_quote_volume_24h: float,
+    current_rate: float | None,
+    history: list[tuple[datetime, float]],
+    now: datetime,
+) -> dict[str, Any] | None:
+    if current_rate is None or current_rate < _ALPHA_FUNDING_MIN_CURRENT_RATE:
+        return None
+    if alpha_quote_volume_24h < _ALPHA_FUNDING_MIN_QUOTE_VOLUME_24H:
+        return None
+    recent_7d = [rate for timestamp, rate in history if timestamp >= now - timedelta(days=7)]
+    recent_30d = [rate for timestamp, rate in history if timestamp >= now - timedelta(days=30)]
+    if len(recent_7d) < 6 or len(recent_30d) < 20:
+        return None
+    positive_ratio_30d = sum(rate > 0 for rate in recent_30d) / len(recent_30d)
+    return_7d = _compound_funding_return(recent_7d) or 0.0
+    return_30d = _compound_funding_return(recent_30d) or 0.0
+    net_return_30d = return_30d - _ALPHA_FUNDING_ROUND_TRIP_COST
+    if positive_ratio_30d < _ALPHA_FUNDING_MIN_POSITIVE_RATIO:
+        return None
+    if return_7d < _ALPHA_FUNDING_MIN_7D_RETURN or net_return_30d <= 0:
+        return None
+    return {
+        "symbol": symbol,
+        "volume": alpha_quote_volume_24h / 100_000_000.0,
+        "category": "Alpha套保",
+        "spot": f"{alpha_pair} · Binance Alpha",
+        "mapping": "Alpha精确",
+        "alpha_pair": alpha_pair,
+        "alpha_quote_volume_24h": alpha_quote_volume_24h,
+        "positive_ratio_30d": positive_ratio_30d,
+        "return_7d": return_7d,
+        "gross_return_30d": return_30d,
+        "net_return_30d": net_return_30d,
+        "estimated_round_trip_cost": _ALPHA_FUNDING_ROUND_TRIP_COST,
+    }
+
+
+def _discover_alpha_funding_candidates(now: datetime) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    errors: dict[str, str] = {}
+    try:
+        tokens = AlphaMarketClient(timeout_seconds=12).fetch_tokens()
+        futures_symbols = set(fetch_futures_symbols("usdm"))
+        premium_by_symbol = {item["symbol"]: item for item in fetch_futures_premium_index("usdm")}
+    except Exception as exc:
+        return [], {"alpha_discovery": f"{type(exc).__name__}: {exc}"}
+
+    matches = []
+    for token in tokens.values():
+        symbol = f"{token.symbol}USDT"
+        premium = premium_by_symbol.get(symbol)
+        if symbol not in futures_symbols or premium is None:
+            continue
+        current_rate = premium.get("funding_rate")
+        if current_rate is None or current_rate < _ALPHA_FUNDING_MIN_CURRENT_RATE:
+            continue
+        matches.append((symbol, token, current_rate))
+
+    candidates: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        pending = {
+            executor.submit(_fetch_market_data_funding_history, symbol): (symbol, token, current_rate)
+            for symbol, token, current_rate in matches
+        }
+        for future in as_completed(pending):
+            symbol, token, current_rate = pending[future]
+            try:
+                ticker = AlphaMarketClient(timeout_seconds=12).fetch_ticker(token.pair)
+                quote_volume = float(ticker.get("quoteVolume") or token.volume_24h or 0.0)
+                candidate = _evaluate_alpha_funding_candidate(
+                    symbol=symbol,
+                    alpha_pair=token.pair,
+                    alpha_quote_volume_24h=quote_volume,
+                    current_rate=current_rate,
+                    history=future.result(),
+                    now=now,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+            except Exception as exc:
+                errors[symbol] = f"{type(exc).__name__}: {exc}"
+    candidates.sort(key=lambda item: item["net_return_30d"], reverse=True)
+    return candidates, errors
+
+
+def _summarize_market_data_funding(
+    symbol: str,
+    history: list[tuple[datetime, float]],
+    premium: dict[str, Any] | None,
+    now: datetime,
+) -> dict[str, Any]:
+    month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+    year_start = datetime(now.year, 1, 1, tzinfo=timezone.utc)
+    windows = {
+        "mtd_return": month_start,
+        "return_30d": now - timedelta(days=30),
+        "ytd_return": year_start,
+        "return_365d": now - timedelta(days=365),
+    }
+    metrics = {
+        name: _compound_funding_return([rate for timestamp, rate in history if timestamp >= start])
+        for name, start in windows.items()
+    }
+    monthly_rates: dict[str, list[float]] = {}
+    yearly_rates: dict[str, list[float]] = {}
+    for timestamp, rate in history:
+        monthly_rates.setdefault(timestamp.strftime("%Y-%m"), []).append(rate)
+        yearly_rates.setdefault(timestamp.strftime("%Y"), []).append(rate)
+    monthly = [
+        {"period": period, "short_return": _compound_funding_return(rates), "settlements": len(rates)}
+        for period, rates in sorted(monthly_rates.items(), reverse=True)[:18]
+    ]
+    yearly = [
+        {"period": period, "short_return": _compound_funding_return(rates), "settlements": len(rates)}
+        for period, rates in sorted(yearly_rates.items(), reverse=True)
+    ]
+    next_funding_time = (premium or {}).get("next_funding_time")
+    return {
+        "symbol": symbol,
+        "current_rate": (premium or {}).get("funding_rate"),
+        "previous_rate": history[-1][1] if history else None,
+        "previous_time": history[-1][0].isoformat() if history else None,
+        "next_funding_time": (
+            datetime.fromtimestamp(next_funding_time / 1000, tz=timezone.utc).isoformat()
+            if isinstance(next_funding_time, int) and next_funding_time > 0
+            else None
+        ),
+        "history_start": history[0][0].isoformat() if history else None,
+        "history_end": history[-1][0].isoformat() if history else None,
+        "monthly": monthly,
+        "yearly": yearly,
+        **metrics,
+    }
+
+
+def _build_market_data_funding_rows(symbols: tuple[str, ...], now: datetime) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    premium_by_symbol = {item["symbol"]: item for item in fetch_futures_premium_index("usdm")}
+    rows: list[dict[str, Any]] = []
+    errors: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(_fetch_market_data_funding_history, symbol): symbol
+            for symbol in symbols
+        }
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                rows.append(_summarize_market_data_funding(symbol, future.result(), premium_by_symbol.get(symbol), now))
+            except Exception as exc:
+                errors[symbol] = f"{type(exc).__name__}: {exc}"
+                rows.append(_summarize_market_data_funding(symbol, [], premium_by_symbol.get(symbol), now))
+    rows.sort(key=lambda item: symbols.index(item["symbol"]))
+    return rows, errors
+
+
+def _build_market_data_funding_payload() -> dict[str, Any]:
+    global _MARKET_DATA_FUNDING_CACHE
+    now_monotonic = time.monotonic()
+    with _MARKET_DATA_FUNDING_CACHE_LOCK:
+        cached = _MARKET_DATA_FUNDING_CACHE
+        if cached is not None and now_monotonic - cached[0] < _MARKET_DATA_FUNDING_CACHE_SECONDS:
+            return cached[1]
+
+    now = datetime.now(timezone.utc)
+    alpha_candidates, alpha_errors = _discover_alpha_funding_candidates(now)
+    dynamic_symbols = tuple(
+        item["symbol"] for item in alpha_candidates if item["symbol"] not in MARKET_DATA_SYMBOLS
+    )
+    symbols = MARKET_DATA_SYMBOLS + dynamic_symbols
+    rows, errors = _build_market_data_funding_rows(symbols, now)
+    errors.update(alpha_errors)
+    payload = {
+        "ok": True,
+        "as_of": now.isoformat(),
+        "rate_convention": "short_perp_receive: 正值表示空永续收取资金费，多头支付；累计收益按各期复利计算。",
+        "history_convention": "最近最多 1000 期结算记录；通常约覆盖最近 333 天，实际跨度取决于资金费结算间隔。",
+        "rows": rows,
+        "alpha_candidates": alpha_candidates,
+        "alpha_criteria": {
+            "min_quote_volume_24h": _ALPHA_FUNDING_MIN_QUOTE_VOLUME_24H,
+            "min_current_rate": _ALPHA_FUNDING_MIN_CURRENT_RATE,
+            "min_positive_ratio_30d": _ALPHA_FUNDING_MIN_POSITIVE_RATIO,
+            "min_return_7d": _ALPHA_FUNDING_MIN_7D_RETURN,
+            "estimated_round_trip_cost": _ALPHA_FUNDING_ROUND_TRIP_COST,
+        },
+        "errors": errors,
+    }
+    with _MARKET_DATA_FUNDING_CACHE_LOCK:
+        _MARKET_DATA_FUNDING_CACHE = (time.monotonic(), payload)
+    return payload
+
+
+def _fetch_market_data_simple_earn_products() -> list[dict[str, Any]]:
+    global _MARKET_DATA_EARN_PRODUCTS_CACHE
+    now_monotonic = time.monotonic()
+    with _MARKET_DATA_EARN_PRODUCTS_CACHE_LOCK:
+        cached = _MARKET_DATA_EARN_PRODUCTS_CACHE
+        if cached is not None and now_monotonic - cached[0] < _MARKET_DATA_EARN_PRODUCTS_CACHE_SECONDS:
+            return cached[1]
+    credentials = load_binance_api_credentials()
+    if credentials is None:
+        raise RuntimeError("Binance API credentials are unavailable")
+    first_page = _http_signed_get_json(
+        "https://api.binance.com/sapi/v1/simple-earn/flexible/list",
+        {"current": 1, "size": 100},
+        *credentials,
+    )
+    if not isinstance(first_page, dict):
+        raise RuntimeError("unexpected Simple Earn product list payload")
+    total = int(first_page.get("total") or 0)
+    page_count = max(1, math.ceil(total / 100))
+    product_rows: list[dict[str, Any]] = []
+    for page in range(1, page_count + 1):
+        payload = first_page if page == 1 else _http_signed_get_json(
+            "https://api.binance.com/sapi/v1/simple-earn/flexible/list",
+            {"current": page, "size": 100},
+            *credentials,
+        )
+        if isinstance(payload, dict):
+            product_rows.extend(item for item in payload.get("rows", []) if isinstance(item, dict))
+    with _MARKET_DATA_EARN_PRODUCTS_CACHE_LOCK:
+        _MARKET_DATA_EARN_PRODUCTS_CACHE = (time.monotonic(), product_rows)
+    return product_rows
+
+
+def _build_market_data_simple_earn_payload() -> dict[str, Any]:
+    global _MARKET_DATA_EARN_CACHE
+    now_monotonic = time.monotonic()
+    with _MARKET_DATA_EARN_CACHE_LOCK:
+        cached = _MARKET_DATA_EARN_CACHE
+        if cached is not None and now_monotonic - cached[0] < _MARKET_DATA_EARN_CACHE_SECONDS:
+            return cached[1]
+
+    product_rows = _fetch_market_data_simple_earn_products()
+    total = len(product_rows)
+
+    rows: list[dict[str, Any]] = []
+    for product in product_rows:
+        try:
+            apr = float(product.get("latestAnnualPercentageRate") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if apr <= 0.05 or not bool(product.get("canPurchase")) or bool(product.get("isSoldOut")):
+            continue
+        rows.append(
+            {
+                "asset": str(product.get("asset") or "").upper(),
+                "apr": apr,
+                "minimum_purchase_amount": str(product.get("minPurchaseAmount") or ""),
+                "product_id": str(product.get("productId") or ""),
+                "can_redeem": bool(product.get("canRedeem")),
+                "tier_apr": product.get("tierAnnualPercentageRate"),
+                "bonus_apr": product.get("airDropPercentageRate"),
+                "candidate_overlap": f"{str(product.get('asset') or '').upper()}USDT" in MARKET_DATA_SYMBOLS,
+            }
+        )
+    rows.sort(key=lambda item: item["apr"], reverse=True)
+    result = {
+        "ok": True,
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "total_products": total,
+        "threshold": 0.05,
+        "rate_convention": "Binance Simple Earn Flexible 的 latestAnnualPercentageRate；活期 APR 浮动，可能随时变化。",
+        "rows": rows,
+    }
+    with _MARKET_DATA_EARN_CACHE_LOCK:
+        _MARKET_DATA_EARN_CACHE = (time.monotonic(), result)
+    return result
+
+
+def _build_market_data_simple_earn_funding_payload() -> dict[str, Any]:
+    global _MARKET_DATA_EARN_FUNDING_CACHE
+    now_monotonic = time.monotonic()
+    with _MARKET_DATA_EARN_FUNDING_CACHE_LOCK:
+        cached = _MARKET_DATA_EARN_FUNDING_CACHE
+        if cached is not None and now_monotonic - cached[0] < _MARKET_DATA_EARN_FUNDING_CACHE_SECONDS:
+            return cached[1]
+
+    earn = _build_market_data_simple_earn_payload()
+    futures_symbols = set(fetch_futures_symbols("usdm"))
+    matched = tuple(
+        f"{row['asset']}USDT"
+        for row in earn["rows"]
+        if f"{row['asset']}USDT" in futures_symbols
+    )
+    now = datetime.now(timezone.utc)
+    funding_rows, errors = _build_market_data_funding_rows(matched, now)
+    funding_by_symbol = {row["symbol"]: row for row in funding_rows}
+    rows = []
+    for earn_row in earn["rows"]:
+        symbol = f"{earn_row['asset']}USDT"
+        funding = funding_by_symbol.get(symbol)
+        if funding is None:
+            continue
+        rows.append({**earn_row, "futures_symbol": symbol, "funding": funding})
+    result = {
+        "ok": True,
+        "as_of": now.isoformat(),
+        "total_earn_products": len(earn["rows"]),
+        "matched_products": len(rows),
+        "threshold": earn["threshold"],
+        "earn_convention": earn["rate_convention"],
+        "funding_convention": "正值表示空永续收取资金费，多头支付；累计收益按各期复利计算。",
+        "history_convention": "最近最多 1000 期结算记录；通常约覆盖最近 333 天，实际跨度取决于资金费结算间隔。",
+        "rows": rows,
+        "errors": errors,
+    }
+    with _MARKET_DATA_EARN_FUNDING_CACHE_LOCK:
+        _MARKET_DATA_EARN_FUNDING_CACHE = (time.monotonic(), result)
+    return result
+
+
+MARKET_DATA_PAGE = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>资金费率候选池</title><style>
+:root{--bg:#f5f2eb;--panel:#fff;--text:#1d1c19;--muted:#6b675f;--line:#ded7ca;--brand:#0b6f68;--soft:#e5f4f1;--warn:#986400;--bad:#a33}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:"Avenir Next","PingFang SC",sans-serif}.wrap{max-width:1440px;margin:auto;padding:24px 16px 48px}.hero,.panel{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:20px;margin-bottom:16px}.hero h1{margin:0 0 8px}.hero p{margin:0;color:var(--muted);line-height:1.7}.links,.filters,.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}.links a{text-decoration:none;color:var(--brand);border:1px solid var(--line);border-radius:999px;padding:8px 12px;font-weight:700}.filters{margin:0 0 12px}.tabs{margin:0 0 18px}button{border:1px solid var(--line);background:#fff;border-radius:999px;padding:8px 12px;cursor:pointer}button.active{background:var(--brand);color:#fff;border-color:var(--brand)}.table{overflow:auto;max-height:65vh;border:1px solid var(--line);border-radius:14px}table{width:100%;border-collapse:collapse;min-width:1280px}th{position:sticky;top:0;background:#faf8f2;text-align:left;color:var(--muted);cursor:pointer;white-space:nowrap}th.no-sort{cursor:default}th,td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}tbody tr[data-symbol]{cursor:pointer}tbody tr[data-symbol]:hover{background:#fbfaf6}td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.exact,.positive{color:var(--brand)}.proxy{color:var(--warn)}.pending,.negative{color:var(--bad)}.meta{color:var(--muted);font-size:13px;line-height:1.6}.detail{margin-top:14px;display:grid;gap:12px}.detail h2{font-size:18px;margin:0}.history{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.history section{border:1px solid var(--line);border-radius:12px;padding:12px}.history h3{font-size:14px;margin:0 0 8px}.history table{min-width:0;font-size:13px}.history th{position:static;cursor:default}.loading{padding:16px;color:var(--muted)}@media(max-width:760px){.wrap{padding:12px}.hero,.panel{border-radius:14px;padding:14px}.history{grid-template-columns:1fr}}
+</style></head><body><main class="wrap"><section class="hero"><h1>资金费率与现货候选池</h1><p>实时费率来自 Binance 标记价格接口；历史收益按资金费率实际结算记录复利汇总。正值代表“空永续收取 / 多头支付”。点击合约可查看按月、按年收益。</p><div class="links"><a href="/portal">返回统一入口</a><a href="/basis">实时现货/合约基差</a><a href="http://43.155.136.111:8799/" target="_blank" rel="noopener noreferrer">赛事榜单</a><a href="http://43.156.35.110/alpha" target="_blank" rel="noopener noreferrer">Alpha</a></div></section><section class="panel"><div class="tabs"><button id="funding-tab" class="active">资金费率候选池</button><button id="earn-tab">活期理财 + 对应合约</button></div><div id="funding-view"><div class="filters" id="filters"></div><div class="meta" id="summary">正在加载资金费率…</div><div class="table"><table><thead><tr><th data-sort="symbol">合约</th><th data-sort="category">类别</th><th data-sort="volume" style="text-align:right">30日均额</th><th class="no-sort">对应现货/等价物</th><th data-sort="current_rate" style="text-align:right">实时费率</th><th data-sort="previous_rate" style="text-align:right">上一期</th><th data-sort="mtd_return" style="text-align:right">本月收益</th><th data-sort="return_30d" style="text-align:right">近30日</th><th data-sort="ytd_return" style="text-align:right">本年收益</th><th data-sort="return_365d" style="text-align:right">近365日</th><th class="no-sort">下次结算</th><th class="no-sort">映射</th></tr></thead><tbody id="rows"></tbody></table></div><div class="detail" id="detail"></div></div><div id="earn-view" hidden><h2>活期理财 APR ＞ 5% 且有对应 USDⓈ-M 永续</h2><p class="meta" id="earn-summary">正在加载 Binance Simple Earn 活期产品及对应资金费率…</p><div class="table"><table><thead><tr><th data-earn-sort="asset">资产</th><th data-earn-sort="apr" style="text-align:right">当前 APR</th><th data-earn-sort="futures_symbol">对应合约</th><th data-earn-sort="current_rate" style="text-align:right">实时费率</th><th data-earn-sort="previous_rate" style="text-align:right">上一期</th><th data-earn-sort="mtd_return" style="text-align:right">本月收益</th><th data-earn-sort="return_30d" style="text-align:right">近30日</th><th data-earn-sort="ytd_return" style="text-align:right">本年收益</th><th data-earn-sort="return_365d" style="text-align:right">近365日</th><th class="no-sort">可赎回</th></tr></thead><tbody id="earn-rows"></tbody></table></div><div class="detail" id="earn-detail"></div></div></section></main><script>
+const raw=`BTCUSDT|87.36|币|BTC/USDT · Binance|精确
+ETHUSDT|67.09|币|ETH/USDT · Binance|精确
+SNDKUSDT|34.54|股票|NASDAQ:SNDK|精确
+BTCUSDC|23.04|币|BTC/USDC · Binance|精确
+SKHYNIXUSDT|17.16|股票|KRX:000660|精确
+ETHUSDC|17.07|币|ETH/USDC · Binance|精确
+SOXLUSDT|13.86|杠杆ETF|NYSE Arca:SOXL|精确
+XAUUSDT|13.40|商品|XAU/USD · GC · GLD|代理
+MUUSDT|11.47|股票|NASDAQ:MU|精确
+SOLUSDT|11.46|币|SOL/USDT · Binance|精确
+SPCXUSDT|10.60|股票|NASDAQ:SPCX|精确
+KORUUSDT|9.00|杠杆ETF|NYSE Arca:KORU|精确
+SKHYUSDT|7.55|股票|NASDAQ:SKHY ADR|精确
+CLUSDT|6.81|商品|NYMEX:CL|代理
+XAGUSDT|6.67|商品|XAG/USD · SI · SLV|代理
+XRPUSDT|5.79|币|XRP/USDT · Binance|精确
+SNXXUSDT|5.13|杠杆ETF|Cboe:SNXX|精确
+HYPEUSDT|4.74|币|HYPE现货（外部场所）|跨场所
+ZECUSDT|4.28|币|ZEC/USDT · Binance|精确
+BANKUSDT|3.45|币|BANK/USDT · Binance|精确
+BZUSDT|3.02|商品|ICE:Brent|代理
+DOGEUSDT|2.89|币|DOGE/USDT · Binance|精确
+DRAMUSDT|2.62|ETF|Cboe BZX:DRAM|精确
+BNBUSDT|2.39|币|BNB/USDT · Binance|精确
+AKEUSDT|2.35|币|AKE现货（外部场所）|跨场所
+TUTUSDT|2.15|币|TUT/USDT · Binance|精确
+SOXSUSDT|2.07|反向ETF|NYSE Arca:SOXS|精确
+SAMSUNGUSDT|1.94|股票|KRX:005930|精确
+EWYUSDT|1.84|ETF|NYSE Arca:EWY|精确
+ACEUSDT|1.81|币|ACE/USDT · Binance|精确
+SOLUSDC|1.57|币|SOL/USDC · Binance|精确
+1000PEPEUSDT|1.56|币|PEPE/USDT × 1000|换算
+ADAUSDT|1.46|币|ADA/USDT · Binance|精确
+BTWUSDT|1.39|币|BTW现货（外部场所）|跨场所
+QQQUSDT|1.36|ETF|NASDAQ:QQQ|精确
+BLESSUSDT|1.34|币|BLESS现货（外部场所）|跨场所
+INTCUSDT|1.31|股票|NASDAQ:INTC|精确
+BEATUSDT|1.23|币|BEAT现货（外部场所）|跨场所
+MUUUSDT|1.21|杠杆ETF|Direxion:MUU|精确
+CRCLUSDT|1.21|股票|NYSE:CRCL|精确
+LINKUSDT|1.18|币|LINK/USDT · Binance|精确
+ENAUSDT|1.17|币|ENA/USDT · Binance|精确
+PUMPUSDT|1.14|币|PUMP/USDT · Binance|精确
+COTIUSDT|1.13|币|COTI/USDT · Binance|精确
+WLDUSDT|1.12|币|WLD/USDT · Binance|精确
+SUIUSDT|1.06|币|SUI/USDT · Binance|精确
+UNITREEUSDT|1.06|股票|中国股票映射；仅3个完整日|待复核
+MRVLUSDT|1.04|股票|NASDAQ:MRVL|精确`;
+let data=raw.split('\\n').map(x=>{const[symbol,volume,category,spot,mapping]=x.split('|');return{symbol,volume:+volume,category,spot,mapping}});
+let active='全部',sortKey='return_30d',descending=true,stats=new Map(),payload=null,earnData=[],earnSortKey='apr',earnDescending=true;
+const fs=document.getElementById('filters'),rows=document.getElementById('rows'),summary=document.getElementById('summary'),detail=document.getElementById('detail'),earnSummary=document.getElementById('earn-summary'),earnRows=document.getElementById('earn-rows'),earnDetail=document.getElementById('earn-detail');
+const esc=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+const percent=value=>value===null||value===undefined?'—':`${value>=0?'+':''}${(value*100).toFixed(4)}%`;
+const classFor=value=>value>0?'positive':value<0?'negative':'';
+const time=value=>value?new Date(value).toLocaleString('zh-CN',{hour12:false,timeZone:'UTC'}).replaceAll('/','-')+' UTC':'—';
+const statFor=item=>stats.get(item.symbol)||{};
+const cats=['全部',...new Set(['Alpha套保',...data.map(x=>x.category)])];cats.forEach(c=>{const button=document.createElement('button');button.textContent=c;button.className=c===active?'active':'';button.onclick=()=>{active=c;[...fs.children].forEach(x=>x.classList.toggle('active',x===button));render()};fs.appendChild(button)});
+function compare(a,b){const av=sortKey in a?a[sortKey]:statFor(a)[sortKey],bv=sortKey in b?b[sortKey]:statFor(b)[sortKey];const an=typeof av==='number'?av:Number.NEGATIVE_INFINITY,bn=typeof bv==='number'?bv:Number.NEGATIVE_INFINITY;const result=typeof av==='string'||typeof bv==='string'?String(av??'').localeCompare(String(bv??'')):an-bn;return descending?-result:result}
+function historyTable(title,rows){return `<section><h3>${title}</h3><table><thead><tr><th>期间</th><th style="text-align:right">空合约收款率</th><th style="text-align:right">结算次数</th></tr></thead><tbody>${rows.length?rows.map(row=>`<tr><td>${esc(row.period)}</td><td class="num ${classFor(row.short_return)}">${percent(row.short_return)}</td><td class="num">${row.settlements}</td></tr>`).join(''):'<tr><td colspan="3">暂无历史记录</td></tr>'}</tbody></table></section>`}
+function renderFundingDetail(target,symbol,s,historyConvention){if(!s.history_start){target.innerHTML=`<div class="meta"><strong>${esc(symbol)}</strong> 暂未取得历史资金费率。</div>`;return}target.innerHTML=`<h2>${esc(symbol)} 资金费率收益明细</h2><div class="meta">历史覆盖 ${time(s.history_start)} 至 ${time(s.history_end)}。${esc(historyConvention)}</div><div class="history">${historyTable('按月（最近18个月）',s.monthly||[])}${historyTable('按年',s.yearly||[])}</div>`}
+function renderDetail(item){renderFundingDetail(detail,item.symbol,statFor(item),payload.history_convention)}
+function render(){const view=data.filter(x=>active==='全部'||x.category===active).sort(compare);summary.textContent=payload?`已更新：${time(payload.as_of)} · ${payload.rate_convention} · 动态 Alpha ${payload.alpha_candidates?.length||0} 个；按现货流动性、7/30日资金费持续性及扣除往返成本后的收益准入。点击列标题排序，点击合约查看月度/年度收益。`:'正在加载…';rows.innerHTML=view.map(item=>{const s=statFor(item),mapClass=['精确','换算','Alpha精确'].includes(item.mapping)?'exact':item.mapping==='待复核'?'pending':'proxy';return `<tr data-symbol="${esc(item.symbol)}"><td><strong>${esc(item.symbol)}</strong></td><td>${esc(item.category)}</td><td class="num">$${item.volume.toFixed(2)}亿</td><td>${esc(item.spot)}</td><td class="num ${classFor(s.current_rate)}">${percent(s.current_rate)}</td><td class="num ${classFor(s.previous_rate)}">${percent(s.previous_rate)}</td><td class="num ${classFor(s.mtd_return)}">${percent(s.mtd_return)}</td><td class="num ${classFor(s.return_30d)}">${percent(s.return_30d)}</td><td class="num ${classFor(s.ytd_return)}">${percent(s.ytd_return)}</td><td class="num ${classFor(s.return_365d)}">${percent(s.return_365d)}</td><td>${time(s.next_funding_time)}</td><td class="${mapClass}">${esc(item.mapping)}</td></tr>`}).join('');[...rows.querySelectorAll('tr[data-symbol]')].forEach(row=>row.onclick=()=>renderDetail(data.find(item=>item.symbol===row.dataset.symbol)))}
+document.querySelectorAll('th[data-sort]').forEach(head=>head.onclick=()=>{const next=head.dataset.sort;if(next===sortKey)descending=!descending;else{sortKey=next;descending=true}render()});
+function earnValue(row,key){return key in row?row[key]:row.funding?.[key]}
+function renderEarn(){const view=[...earnData].sort((a,b)=>{const av=earnValue(a,earnSortKey),bv=earnValue(b,earnSortKey);const result=typeof av==='string'||typeof bv==='string'?String(av??'').localeCompare(String(bv??'')):(Number(av??Number.NEGATIVE_INFINITY)-Number(bv??Number.NEGATIVE_INFINITY));return earnDescending?-result:result});earnRows.innerHTML=view.map(row=>{const s=row.funding;return `<tr data-symbol="${esc(row.futures_symbol)}"><td><strong>${esc(row.asset)}</strong></td><td class="num positive">${percent(row.apr)}</td><td><strong>${esc(row.futures_symbol)}</strong></td><td class="num ${classFor(s.current_rate)}">${percent(s.current_rate)}</td><td class="num ${classFor(s.previous_rate)}">${percent(s.previous_rate)}</td><td class="num ${classFor(s.mtd_return)}">${percent(s.mtd_return)}</td><td class="num ${classFor(s.return_30d)}">${percent(s.return_30d)}</td><td class="num ${classFor(s.ytd_return)}">${percent(s.ytd_return)}</td><td class="num ${classFor(s.return_365d)}">${percent(s.return_365d)}</td><td>${row.can_redeem?'是':'否'}</td></tr>`}).join('');[...earnRows.querySelectorAll('tr[data-symbol]')].forEach(element=>element.onclick=()=>{const row=earnData.find(item=>item.futures_symbol===element.dataset.symbol);renderFundingDetail(earnDetail,row.futures_symbol,row.funding,earnPayload.history_convention)})}
+let earnPayload=null;
+document.querySelectorAll('th[data-earn-sort]').forEach(head=>head.onclick=()=>{const next=head.dataset.earnSort;if(next===earnSortKey)earnDescending=!earnDescending;else{earnSortKey=next;earnDescending=true}renderEarn()});
+const fundingTab=document.getElementById('funding-tab'),earnTab=document.getElementById('earn-tab'),fundingView=document.getElementById('funding-view'),earnView=document.getElementById('earn-view');
+function activateTab(name){const isFunding=name==='funding';fundingView.hidden=!isFunding;earnView.hidden=isFunding;fundingTab.classList.toggle('active',isFunding);earnTab.classList.toggle('active',!isFunding)}
+fundingTab.onclick=()=>activateTab('funding');earnTab.onclick=()=>activateTab('earn');
+fetch('/api/market-data/simple-earn-funding').then(async response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()}).then(result=>{earnPayload=result;earnData=result.rows;earnSummary.textContent=`已更新：${time(result.as_of)} · ${result.total_earn_products} 个可申购且未售罄的活期产品 APR 超过 5%，其中 ${result.matched_products} 个有对应 USDⓈ-M 永续。${result.earn_convention} ${result.funding_convention}`;renderEarn()}).catch(error=>{earnSummary.textContent=`活期理财与资金费率加载失败：${error.message}`});
+fetch('/api/market-data/funding-summary').then(async response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()}).then(result=>{payload=result;const known=new Set(data.map(item=>item.symbol));data.push(...(result.alpha_candidates||[]).filter(item=>!known.has(item.symbol)));stats=new Map(result.rows.map(row=>[row.symbol,row]));render()}).catch(error=>{summary.textContent=`资金费率加载失败：${error.message}`;render()});
+</script></body></html>"""
 
 HTML_PAGE = """<!doctype html>
 <html lang="zh-CN">
@@ -21677,6 +22165,20 @@ BASIS_PAGE = """<!doctype html>
     </section>
 
     <section class="card">
+      <h2 style="margin:0 0 6px;">现货 / 永续对冲收益候选</h2>
+      <p class="msg" id="carry_summary">正在扫描活期 APR 与资金费率…</p>
+      <p class="msg">合约持有观察现支持全部合约及自定义条件，见上方监控区。</p>
+      <div class="table-wrap" style="margin-top:12px;">
+        <table>
+          <thead><tr>
+            <th>状态</th><th>对冲方向</th><th>现货</th><th>永续</th><th>活期 / 借币</th><th>当前资金费</th><th>净实时预估年化</th><th>近30日验证年化</th><th>入场价差</th><th>历史覆盖</th><th>持有观察</th>
+          </tr></thead>
+          <tbody id="carry_tbody"><tr><td colspan="11">正在加载…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
       <div class="grid">
         <div class="field">
           <label>合约类型</label>
@@ -21806,6 +22308,8 @@ BASIS_PAGE = """<!doctype html>
     const statusEl = document.getElementById("status");
     const summaryEl = document.getElementById("summary");
     const tbody = document.getElementById("tbody");
+    const carrySummaryEl = document.getElementById("carry_summary");
+    const carryTbody = document.getElementById("carry_tbody");
 
     let rawRows = [];
     let autoTimer = null;
@@ -21815,6 +22319,8 @@ BASIS_PAGE = """<!doctype html>
     let detailLoadTimer = null;
     let loadedDetailKeys = new Set();
     let pendingDetailKeys = new Set();
+    let carryWatchlist = new Set();
+    let carryData = null;
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -22266,6 +22772,64 @@ BASIS_PAGE = """<!doctype html>
       scheduleVisibleDetailsLoad();
     }
 
+    function carryStatusPill(status) {
+      const cls = status === "已验证" ? "good" : status === "利息不覆盖" ? "danger" : status === "新币观察" || status === "借贷待确认" ? "warn" : "neutral";
+      return `<span class="pill ${cls}">${escapeHtml(status || "观察")}</span>`;
+    }
+
+    function renderCarry(data) {
+      const rows = Array.isArray(data.rows) ? data.rows : [];
+      carrySummaryEl.textContent = `已更新：${fmtDateTime(data.as_of)} · ${data.eligible_pairs || 0} 组 Binance 同交易对现货/永续中，${data.qualified_count || 0} 组净实时预估年化超过 30%，${data.verified_count || 0} 组通过近30日验证。${data.convention || ""}`;
+      if (!rows.length) {
+        carryTbody.innerHTML = `<tr><td colspan="11">当前没有资金费收入扣除活期或借币成本后超过 30% 的同交易对对冲机会。</td></tr>`;
+        return;
+      }
+      carryTbody.innerHTML = rows.map((row) => `
+        <tr>
+          <td>${carryStatusPill(row.status)}<div class="sub">仅作扫描，非下单信号</div></td>
+          <td><div class="stack"><span class="main">${escapeHtml(row.strategy)}</span><span class="sub">${escapeHtml(row.funding_side)}</span></div></td>
+          <td><div class="stack"><span class="main">${escapeHtml(row.spot_symbol)}</span><span class="sub">${escapeHtml(row.spot_quote_asset)}</span></div></td>
+          <td><span class="main">${escapeHtml(row.futures_symbol)}</span></td>
+          <td><div class="stack"><span class="main">${row.funding_rate > 0 ? fmtPct(row.earn_apr) : escapeHtml(row.borrow_status || "借贷待确认")}</span><span class="sub">${row.funding_rate > 0 ? (row.can_redeem ? "活期可赎回" : "无/不可赎回") : `${escapeHtml(row.borrow_source || "—")} ${fmtPct(row.borrow_annualized)}/年`}</span>${row.borrow_note ? `<span class="sub">${escapeHtml(row.borrow_note)}</span>` : ""}</div></td>
+          <td><div class="stack"><span class="main">${fmtSignedPct(row.funding_rate, 4)}</span><span class="sub">每 ${escapeHtml(row.funding_interval_hours)}h</span></div></td>
+          <td><div class="stack"><span class="main">${fmtSignedPct(row.live_combined_annualized)}</span><span class="sub">资金费毛年化 ${fmtSignedPct(row.funding_annualized)}</span></div></td>
+          <td><div class="stack"><span class="main">${fmtSignedPct(row.combined_30d_annualized)}</span><span class="sub">资金费30日 ${fmtSignedPct(row.funding_30d_annualized)}</span></div></td>
+          <td>${fmtSignedPct(row.entry_spread)}</td>
+          <td>${Math.floor(Number(row.history_days) || 0)} 天 / ${Number(row.settlements_30d) || 0} 期</td>
+          <td><button class="carry-watch-btn" data-symbol="${escapeHtml(row.futures_symbol)}">${carryWatchlist.has(row.futures_symbol) ? "已观察 · 添加条件" : "加入观察池"}</button></td>
+        </tr>
+      `).join("");
+      carryTbody.querySelectorAll(".carry-watch-btn").forEach((button) => {
+        button.addEventListener("click", () => updateCarryWatchlist(button.dataset.symbol));
+      });
+    }
+
+    window.addEventListener("carry-watchlist-updated", event => {
+      carryWatchlist = new Set(event.detail.symbols || []);
+      if (carryData) renderCarry(carryData);
+    });
+
+    async function updateCarryWatchlist(symbol) {
+      try {
+        await window.carryMonitor.add(symbol);
+      } catch (error) {
+        document.getElementById("cw-message").textContent = `观察池加载失败：${error.message}`;
+      }
+    }
+
+    async function loadCarry() {
+      try {
+        const resp = await fetch("/api/arbitrage_carry");
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `请求失败(${resp.status})`);
+        carryData = data;
+        renderCarry(data);
+      } catch (err) {
+        carrySummaryEl.textContent = `对冲收益扫描失败：${err.message}`;
+        carryTbody.innerHTML = `<tr><td colspan="11">暂时无法加载，请稍后刷新页面。</td></tr>`;
+      }
+    }
+
     async function loadVisibleDetails() {
       detailLoadTimer = null;
       if (!rawRows.length) return 0;
@@ -22337,6 +22901,7 @@ BASIS_PAGE = """<!doctype html>
         clearDetailState();
         rawRows = Array.isArray(data.rows) ? data.rows : [];
         renderTable();
+        void loadCarry();
         await loadVisibleDetails();
         const source = data.meta && data.meta.stale
           ? "上次成功快照回退"
@@ -22429,11 +22994,15 @@ BASIS_PAGE = """<!doctype html>
 
     updateHeaderArrows();
     renderTable();
+    void loadCarry();
     setStatus("等待手动刷新。");
   </script>
 </body>
 </html>
 """
+
+
+BASIS_PAGE = BASIS_PAGE.replace('    <section class="card">\n      <h2 style="margin:0 0 6px;">现货 / 永续对冲收益候选', WATCHLIST_PANEL + '    <section class="card">\n      <h2 style="margin:0 0 6px;">现货 / 永续对冲收益候选')
 
 
 MANUAL_TRADE_PAGE = """<!doctype html>
@@ -35661,6 +36230,255 @@ def _run_basis_monitor(params: dict[str, Any]) -> dict[str, Any]:
         raise
 
 
+def _fetch_usdm_funding_interval_hours() -> dict[str, int]:
+    request = Request(
+        "https://fapi.binance.com/fapi/v1/fundingInfo",
+        headers={"User-Agent": "grid-web/arbitrage-carry"},
+    )
+    with urlopen(request, timeout=12) as response:
+        payload = json.load(response)
+    if not isinstance(payload, list):
+        raise RuntimeError("unexpected fundingInfo payload")
+    return {
+        str(item.get("symbol") or "").upper(): int(item.get("fundingIntervalHours") or 8)
+        for item in payload
+        if isinstance(item, dict) and str(item.get("symbol") or "").strip()
+    }
+
+
+def _assess_carry_borrow(item: dict[str, Any], refs: dict[str, Any]) -> dict[str, Any]:
+    payload = _build_borrow_payload_for_item(item, refs)
+    options: list[dict[str, Any]] = []
+    for source, node in (("Cross", payload.get("cross")), ("逐仓", payload.get("isolated"))):
+        if not isinstance(node, dict) or node.get("supported") is not True or node.get("restricted"):
+            continue
+        hourly = node.get("next_hourly_interest_rate")
+        if not isinstance(hourly, (int, float)) or hourly < 0 or not math.isfinite(hourly):
+            continue
+        max_borrow = node.get("max_borrow")
+        confirmed = payload.get("mode") == "full" and isinstance(max_borrow, (int, float)) and max_borrow > 0
+        options.append(
+            {
+                "source": source,
+                "annual_rate": float(hourly) * 24 * 365,
+                "confirmed": confirmed,
+            }
+        )
+    vip = payload.get("vip")
+    if isinstance(vip, dict) and vip.get("available") is True:
+        yearly = vip.get("flexible_yearly_interest_rate")
+        if isinstance(yearly, (int, float)) and yearly >= 0 and math.isfinite(yearly):
+            options.append({"source": "VIP", "annual_rate": float(yearly), "confirmed": True})
+    if not options:
+        return {
+            "borrow_status": "借贷待确认",
+            "borrow_source": None,
+            "borrow_annualized": None,
+            "borrow_confirmed": False,
+            "borrow_note": payload.get("error") or payload.get("note") or "未取得借币利率或额度",
+        }
+    best = min(options, key=lambda option: option["annual_rate"])
+    return {
+        "borrow_status": "可借已确认" if best["confirmed"] else "理论可借",
+        "borrow_source": best["source"],
+        "borrow_annualized": best["annual_rate"],
+        "borrow_confirmed": best["confirmed"],
+        "borrow_note": payload.get("error") or payload.get("note") or "",
+    }
+
+
+def _build_arbitrage_carry_payload() -> dict[str, Any]:
+    global CARRY_OPPORTUNITIES_CACHE
+    now_monotonic = time.monotonic()
+    with CARRY_OPPORTUNITIES_CACHE_LOCK:
+        cached = CARRY_OPPORTUNITIES_CACHE
+        if cached is not None and now_monotonic - cached[0] < CARRY_OPPORTUNITIES_CACHE_SECONDS:
+            return cached[1]
+
+    now = datetime.now(timezone.utc)
+    basis = _run_basis_monitor(
+        {
+            "contract_type": "usdm",
+            "spot_quote_mode": "major_stables",
+            "max_symbols": 0,
+            "cache_ttl_seconds": 5,
+            "refresh": False,
+        }
+    )
+    earn_by_asset: dict[str, dict[str, Any]] = {}
+    for product in _fetch_market_data_simple_earn_products():
+        if not bool(product.get("canPurchase")) or bool(product.get("isSoldOut")):
+            continue
+        try:
+            apr = float(product.get("latestAnnualPercentageRate") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        asset = str(product.get("asset") or "").upper()
+        if asset and (asset not in earn_by_asset or apr > earn_by_asset[asset]["apr"]):
+            earn_by_asset[asset] = {"apr": apr, "can_redeem": bool(product.get("canRedeem"))}
+
+    intervals = _fetch_usdm_funding_interval_hours()
+    exact_rows = [
+        row
+        for row in basis["rows"]
+        if row.get("spot_symbol") == row.get("futures_symbol")
+        and row.get("spot_quote_asset") in {"USDT", "USDC"}
+    ]
+    candidates: list[dict[str, Any]] = []
+    negative_funding_rows: list[dict[str, Any]] = []
+    for row in exact_rows:
+        symbol = str(row["futures_symbol"])
+        funding_rate = float(row.get("funding_rate") or 0.0)
+        interval_hours = intervals.get(symbol, 8)
+        funding_annualized = funding_rate * (24 / interval_hours) * 365
+        earn = earn_by_asset.get(str(row.get("base_asset") or "").upper(), {})
+        earn_apr = float(earn.get("apr") or 0.0)
+        if funding_rate > 0:
+            live_combined = earn_apr + funding_annualized
+            if live_combined <= 0.30:
+                continue
+            candidates.append(
+                {
+                    "asset": row["base_asset"],
+                    "spot_symbol": row["spot_symbol"],
+                    "futures_symbol": symbol,
+                    "spot_quote_asset": row["spot_quote_asset"],
+                    "strategy": "买现货 / 卖永续",
+                    "funding_side": "空永续收款",
+                    "funding_rate": funding_rate,
+                    "funding_interval_hours": interval_hours,
+                    "funding_annualized": funding_annualized,
+                    "earn_apr": earn_apr,
+                    "can_redeem": earn.get("can_redeem"),
+                    "borrow_status": "不需要借币",
+                    "borrow_source": None,
+                    "borrow_annualized": 0.0,
+                    "borrow_confirmed": True,
+                    "borrow_note": "",
+                    "live_combined_annualized": live_combined,
+                    "entry_spread": row.get("spread_long_spot_short_perp"),
+                }
+            )
+            continue
+        if funding_rate < 0 and -funding_annualized > 0.30:
+            negative_funding_rows.append(
+                {
+                    "asset": row["base_asset"],
+                    "spot_symbol": row["spot_symbol"],
+                    "futures_symbol": symbol,
+                    "spot_quote_asset": row["spot_quote_asset"],
+                    "strategy": "借币卖现货 / 买永续",
+                    "funding_side": "多永续收款",
+                    "funding_rate": funding_rate,
+                    "funding_interval_hours": interval_hours,
+                    "funding_annualized": -funding_annualized,
+                    "earn_apr": 0.0,
+                    "can_redeem": None,
+                    "entry_spread": row.get("spread_short_spot_long_perp"),
+                }
+            )
+
+    if negative_funding_rows:
+        refs = _load_borrow_reference_data(
+            [row["asset"] for row in negative_funding_rows],
+            [row["spot_symbol"] for row in negative_funding_rows],
+        )
+        for row in negative_funding_rows:
+            borrow = _assess_carry_borrow(
+                {
+                    "arbitrage_side": "short_spot_long_perp",
+                    "base_asset": row["asset"],
+                    "spot_symbol": row["spot_symbol"],
+                },
+                refs,
+            )
+            row.update(borrow)
+            borrow_annualized = borrow["borrow_annualized"]
+            row["live_combined_annualized"] = (
+                row["funding_annualized"] - borrow_annualized
+                if isinstance(borrow_annualized, (int, float))
+                else None
+            )
+            candidates.append(row)
+
+    errors: dict[str, str] = {}
+    start = now - timedelta(days=30)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(_fetch_market_data_funding_history, row["futures_symbol"]): row
+            for row in candidates
+        }
+        for future in as_completed(futures):
+            row = futures[future]
+            try:
+                history = future.result()
+                observed_start = max(start, history[0][0]) if history else now
+                coverage_days = max((now - observed_start).total_seconds() / 86400, 0.0)
+                rates = [rate for timestamp, rate in history if timestamp >= start]
+                funding_rates = rates if row["funding_rate"] > 0 else [-rate for rate in rates]
+                return_30d = _compound_funding_return(funding_rates)
+                if return_30d is not None and coverage_days >= 29:
+                    funding_30d_annualized = (1 + return_30d) ** (365 / coverage_days) - 1
+                    if row["funding_rate"] > 0:
+                        combined_30d_annualized = row["earn_apr"] + funding_30d_annualized
+                    elif isinstance(row["borrow_annualized"], (int, float)):
+                        combined_30d_annualized = funding_30d_annualized - row["borrow_annualized"]
+                    else:
+                        combined_30d_annualized = None
+                else:
+                    funding_30d_annualized = None
+                    combined_30d_annualized = None
+                row.update(
+                    {
+                        "funding_30d_return": return_30d,
+                        "funding_30d_annualized": funding_30d_annualized,
+                        "combined_30d_annualized": combined_30d_annualized,
+                        "history_days": coverage_days,
+                        "settlements_30d": len(rates),
+                    }
+                )
+            except Exception as exc:
+                errors[row["futures_symbol"]] = f"{type(exc).__name__}: {exc}"
+                row.update(
+                    {
+                        "funding_30d_return": None,
+                        "funding_30d_annualized": None,
+                        "combined_30d_annualized": None,
+                        "history_days": 0.0,
+                        "settlements_30d": 0,
+                    }
+                )
+    for row in candidates:
+        if row["funding_rate"] < 0 and row["live_combined_annualized"] is None:
+            row["status"] = "借贷待确认"
+        elif row["funding_rate"] < 0 and row["live_combined_annualized"] <= 0.30:
+            row["status"] = "利息不覆盖"
+        elif row["combined_30d_annualized"] is not None and row["combined_30d_annualized"] > 0.30:
+            row["status"] = "已验证"
+        elif row["history_days"] < 29:
+            row["status"] = "新币观察"
+        else:
+            row["status"] = "瞬时观察"
+    candidates.sort(key=lambda row: row["live_combined_annualized"] or float("-inf"), reverse=True)
+    result = {
+        "ok": True,
+        "as_of": now.isoformat(),
+        "eligible_pairs": len(exact_rows),
+        "qualified_count": sum(
+            isinstance(row["live_combined_annualized"], (int, float))
+            and row["live_combined_annualized"] > 0.30
+            for row in candidates
+        ),
+        "verified_count": sum(row["status"] == "已验证" for row in candidates),
+        "rows": candidates,
+        "errors": errors,
+        "convention": "正资金费：当前资金费率年化 + 活期 APR；负资金费：多永续资金费收入年化 − 可用借币年化利率。30日验证使用实际结算资金费复利年化。仅含 Binance 同交易对现货与 USDⓈ-M 永续，未扣交易费、滑点、基差与容量限制。",
+    }
+    with CARRY_OPPORTUNITIES_CACHE_LOCK:
+        CARRY_OPPORTUNITIES_CACHE = (time.monotonic(), result)
+    return result
+
+
 def _chunked(items: list[str], size: int) -> list[list[str]]:
     if size <= 0:
         raise ValueError("size must be > 0")
@@ -39296,6 +40114,15 @@ class _Handler(BaseHTTPRequestHandler):
         if path in {"/hub", "/hub.html", "/portal", "/portal.html"}:
             self._send_html(SERVER_HUB_PAGE, status=HTTPStatus.OK)
             return
+        if path in {"/market-data", "/market-data.html"}:
+            self._send_html(MARKET_DATA_PAGE, status=HTTPStatus.OK)
+            return
+        if path == "/alpha-airdrops":
+            self._send_html(AIR_DROP_PAGE, status=HTTPStatus.OK)
+            return
+        if path == "/api/alpha-airdrops":
+            self._send_json(alpha_airdrop_feed_payload(), status=HTTPStatus.OK)
+            return
         if path in {"/", "/index.html"}:
             self._send_html(HTML_PAGE, status=HTTPStatus.OK)
             return
@@ -39356,6 +40183,39 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path in {"/strategies", "/strategies.html"}:
             self._send_html(STRATEGIES_PAGE, status=HTTPStatus.OK)
+            return
+        if path == "/api/market-data/funding-summary":
+            try:
+                self._send_json(_build_market_data_funding_payload(), status=HTTPStatus.OK)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=502)
+            return
+        if path == "/api/market-data/simple-earn":
+            try:
+                self._send_json(_build_market_data_simple_earn_payload(), status=HTTPStatus.OK)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=502)
+            return
+        if path == "/api/market-data/simple-earn-funding":
+            try:
+                self._send_json(_build_market_data_simple_earn_funding_payload(), status=HTTPStatus.OK)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=502)
+            return
+        if path == "/api/arbitrage_carry":
+            try:
+                self._send_json(_build_arbitrage_carry_payload(), status=HTTPStatus.OK)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=502)
+            return
+        if path in {"/api/carry-watchlist", "/api/carry-contracts"}:
+            try:
+                payload = watchlist_payload() if path == "/api/carry-watchlist" else search_contracts(str((query.get("q") or [""])[0]), str((query.get("market") or ["all"])[0]))
+                self._send_json(payload, status=HTTPStatus.OK)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception:
+                self._send_json({"ok": False, "error": "监控数据暂时不可用，请稍后重试"}, status=502)
             return
         if path == "/api/health":
             self._send_json({"ok": True}, status=HTTPStatus.OK)
@@ -39720,6 +40580,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
             return
+        if path in {"/market-data", "/market-data.html"}:
+            body = MARKET_DATA_PAGE.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
         if path in {"/", "/index.html"}:
             body = HTML_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -39883,6 +40749,38 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if not self._authorize_request():
+            return
+        if path == "/api/carry-watchlist":
+            try:
+                content_len = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._send_json({"ok": False, "error": "Invalid Content-Length"}, status=400)
+                return
+            if content_len <= 0 or content_len > 4096:
+                self._send_json({"ok": False, "error": "Invalid payload size"}, status=400)
+                return
+            try:
+                payload = json.loads(self.rfile.read(content_len).decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("JSON body must be an object")
+                action = str(payload.get("action") or "").strip().lower()
+                if action == "save":
+                    if not isinstance(payload.get("rule"), dict):
+                        raise ValueError("请提供监控规则")
+                    save_rule(payload["rule"])
+                elif action in {"delete", "toggle"}:
+                    change_rule(str(payload.get("id") or ""), action)
+                elif action == "configure_bark":
+                    save_bark_endpoint(str(payload.get("endpoint") or ""))
+                else:
+                    raise ValueError("未知监控操作，请刷新页面")
+            except (ValueError, TypeError) as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception:
+                self._send_json({"ok": False, "error": "监控更新失败，请稍后重试"}, status=500)
+                return
+            self._send_json(watchlist_payload(), status=HTTPStatus.OK)
             return
         if path == "/api/maintenance/recover_web":
             try:

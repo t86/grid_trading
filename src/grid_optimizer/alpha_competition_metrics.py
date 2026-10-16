@@ -25,10 +25,16 @@ _CMS_BASE_URL = "https://www.binance.com"
 _CMS_LIST_PATH = "/bapi/composite/v1/public/cms/article/list/query"
 _CMS_DETAIL_PATH = "/bapi/composite/v1/public/cms/article/detail/query"
 _PERIOD_RE = re.compile(
-    r"\b(?P<number>\d+)(?P<suffix>st|nd|rd|th)\s+(?P<symbol>[A-Za-z0-9_]+)\s+"
+    r"\b(?:(?P<number>\d+)(?P<suffix>st|nd|rd|th)\s+)?(?P<symbol>[A-Za-z0-9_]+)\s+"
     r"Trading\s+Competition\s+Promotion\s+Period\s*:\s*"
     r"(?P<start>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+\(UTC\)\s+to\s+"
     r"(?P<end>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+\(UTC\)",
+)
+_POSTPONED_ROUND_RE = re.compile(
+    r"\b(?:the\s+)?(?P<number>\d+)(?P<suffix>st|nd|rd|th)\s+"
+    r"(?P<symbol>[A-Za-z0-9_]+)\s+Trading\s+Competition\b"
+    r".*\bpostponed\s+until\s+further\s+notice\b",
+    re.IGNORECASE,
 )
 _WINNER_RE = re.compile(r"\bThe\s+top\s+([0-9][0-9,]*)\s+users\b")
 _DAY_ROW_START_RE = re.compile(r"^Day\s+(?P<day>\d+)\b(?!\s+(?:through|to)\b)", re.IGNORECASE)
@@ -252,8 +258,8 @@ def _parse_rounds(blocks: tuple[_ArticleBlock, ...]) -> tuple[CompetitionRound, 
                 period_label = label
             elif label != period_label:
                 raise RuleParseError("promotion round labels conflict")
-            number = int(match.group("number"))
-            if number <= 0 or match.group("suffix") != _ordinal_suffix(number):
+            number = int(match.group("number") or 1)
+            if number <= 0 or (match.group("number") is not None and match.group("suffix") != _ordinal_suffix(number)):
                 raise RuleParseError("promotion round number is invalid")
             round_ = CompetitionRound(number, _parse_datetime(match.group("start")), _parse_datetime(match.group("end")))
             if round_.start_utc >= round_.end_utc or round_.end_utc - round_.start_utc != timedelta(days=7):
@@ -262,6 +268,15 @@ def _parse_rounds(blocks: tuple[_ArticleBlock, ...]) -> tuple[CompetitionRound, 
             if existing is not None and existing != round_:
                 raise RuleParseError("promotion round descriptions conflict")
             rounds_by_number[number] = round_
+    for block in blocks[:first_day]:
+        for match in _POSTPONED_ROUND_RE.finditer(block.text):
+            label = match.group("symbol").upper()
+            if period_label is not None and label != period_label:
+                continue
+            number = int(match.group("number"))
+            if number <= 0 or match.group("suffix").lower() != _ordinal_suffix(number):
+                continue
+            rounds_by_number.pop(number, None)
     if not rounds_by_number:
         raise RuleParseError("at least one full promotion round is required")
     return tuple(rounds_by_number[number] for number in sorted(rounds_by_number))
@@ -360,7 +375,7 @@ def _list_article_code(item: Mapping[str, Any]) -> str:
     return value.strip()
 
 
-def _list_articles(data: Mapping[str, Any]) -> list[object]:
+def _list_articles(data: Mapping[str, Any], *, target_catalog_id: int = 93) -> list[object]:
     if "articles" in data:
         articles = data.get("articles")
         if not isinstance(articles, list) or len(articles) > 50:
@@ -381,7 +396,7 @@ def _list_articles(data: Mapping[str, Any]) -> list[object]:
             raise RuleParseError("Binance CMS article list is invalid")
         pending.extend(children)
         catalog_id = catalog.get("catalogId")
-        if isinstance(catalog_id, int) and not isinstance(catalog_id, bool) and catalog_id == 93:
+        if isinstance(catalog_id, int) and not isinstance(catalog_id, bool) and catalog_id == target_catalog_id:
             matches.append(catalog)
     if len(matches) != 1:
         raise RuleParseError("Binance CMS article list is invalid")
@@ -457,47 +472,48 @@ class BinanceCompetitionRuleProvider:
         self,
         *,
         now: datetime | None = None,
-        days: int = 60,
+        days: int = 21,
     ) -> list[CompetitionAnnouncement]:
         current = datetime.now(_UTC) if now is None else _require_utc_aware(now, "now")
         cutoff_ms = int((current - timedelta(days=days)).timestamp() * 1000)
         announcements: list[CompetitionAnnouncement] = []
         seen: dict[str, tuple[str, int]] = {}
-        for page_no in range(1, 21):
-            data = self._get_data(
-                _CMS_LIST_PATH,
-                {"type": 1, "catalogId": 93, "pageNo": page_no, "pageSize": 50},
-            )
-            raw_articles = _list_articles(data)
-            releases: list[int] = []
-            for item in raw_articles:
-                if not isinstance(item, Mapping):
-                    raise RuleParseError("Binance CMS article list is invalid")
-                code = _list_article_code(item)
-                release_ms = _article_release_ms(item)
-                releases.append(release_ms)
-                title = item.get("title")
-                if not isinstance(title, str):
-                    raise RuleParseError("Binance CMS article title is invalid")
-                title = title.strip()
-                metadata = (title, release_ms)
-                existing = seen.get(code)
-                if existing is not None:
-                    if existing != metadata:
-                        raise RuleParseError("Binance CMS article metadata conflict")
-                    continue
-                seen[code] = metadata
-                if release_ms < cutoff_ms:
-                    continue
-                announcement = _announcement_from_item(item)
-                if announcement is not None:
-                    announcements.append(announcement)
-            page_is_old = bool(raw_articles) and all(release < cutoff_ms for release in releases)
-            if not raw_articles or page_is_old:
-                break
-        return announcements
+        for catalog_id in (93, 49):
+            for page_no in range(1, 21):
+                data = self._get_data(
+                    _CMS_LIST_PATH,
+                    {"type": 1, "catalogId": catalog_id, "pageNo": page_no, "pageSize": 50},
+                )
+                raw_articles = _list_articles(data, target_catalog_id=catalog_id)
+                releases: list[int] = []
+                for item in raw_articles:
+                    if not isinstance(item, Mapping):
+                        raise RuleParseError("Binance CMS article list is invalid")
+                    code = _list_article_code(item)
+                    release_ms = _article_release_ms(item)
+                    releases.append(release_ms)
+                    title = item.get("title")
+                    if not isinstance(title, str):
+                        raise RuleParseError("Binance CMS article title is invalid")
+                    title = title.strip()
+                    metadata = (title, release_ms)
+                    existing = seen.get(code)
+                    if existing is not None:
+                        if existing != metadata:
+                            raise RuleParseError("Binance CMS article metadata conflict")
+                        continue
+                    seen[code] = metadata
+                    if release_ms < cutoff_ms:
+                        continue
+                    announcement = _announcement_from_item(item)
+                    if announcement is not None:
+                        announcements.append(announcement)
+                page_is_old = bool(raw_articles) and all(release < cutoff_ms for release in releases)
+                if not raw_articles or page_is_old:
+                    break
+        return sorted(announcements, key=lambda item: item.released_at_utc, reverse=True)
 
-    def fetch_recent_symbols(self, *, now: datetime | None = None, days: int = 60) -> list[str]:
+    def fetch_recent_symbols(self, *, now: datetime | None = None, days: int = 21) -> list[str]:
         symbols: list[str] = []
         seen: set[str] = set()
         for announcement in self.fetch_recent_announcements(now=now, days=days):
@@ -537,26 +553,29 @@ class BinanceCompetitionRuleProvider:
         current = datetime.now(_UTC) if now is None else _require_utc_aware(now, "now")
         cutoff_ms = int((current - timedelta(days=60)).timestamp() * 1000)
         candidates: list[CompetitionAnnouncement] = []
-        for page_no in range(1, 21):
-            data = self._get_data(
-                _CMS_LIST_PATH,
-                {"type": 1, "catalogId": 93, "pageNo": page_no, "pageSize": 50},
-            )
-            raw_articles = _list_articles(data)
-            articles: list[Mapping[str, Any]] = []
-            for item in raw_articles:
-                if not isinstance(item, Mapping):
-                    raise RuleParseError("Binance CMS article list is invalid")
-                announcement = _announcement_from_item(item)
-                articles.append(item)
-                if (
-                    announcement is not None
-                    and _article_release_ms(item) >= cutoff_ms
-                    and announcement.symbol == target
-                ):
-                    candidates.append(announcement)
-            page_is_old = bool(articles) and all(_article_release_ms(item) < cutoff_ms for item in articles)
-            if candidates or not articles or page_is_old:
+        for catalog_id in (93, 49):
+            for page_no in range(1, 21):
+                data = self._get_data(
+                    _CMS_LIST_PATH,
+                    {"type": 1, "catalogId": catalog_id, "pageNo": page_no, "pageSize": 50},
+                )
+                raw_articles = _list_articles(data, target_catalog_id=catalog_id)
+                articles: list[Mapping[str, Any]] = []
+                for item in raw_articles:
+                    if not isinstance(item, Mapping):
+                        raise RuleParseError("Binance CMS article list is invalid")
+                    announcement = _announcement_from_item(item)
+                    articles.append(item)
+                    if (
+                        announcement is not None
+                        and _article_release_ms(item) >= cutoff_ms
+                        and announcement.symbol == target
+                    ):
+                        candidates.append(announcement)
+                page_is_old = bool(articles) and all(_article_release_ms(item) < cutoff_ms for item in articles)
+                if candidates or not articles or page_is_old:
+                    break
+            if candidates:
                 break
         if not candidates:
             raise RuleParseError(f"no recent competition announcement for {target}")
@@ -772,6 +791,8 @@ class CompetitionVolumeProvider:
         rule: CompetitionRule,
         round_: CompetitionRound,
         now: datetime,
+        *,
+        require_complete: bool = False,
     ) -> VolumeSnapshot:
         valid_rule = _validate_rule(rule)
         valid_round = _validate_round_window(round_)
@@ -780,6 +801,8 @@ class CompetitionVolumeProvider:
         current = _require_utc_aware(now, "now")
         if current < valid_round.start_utc:
             raise ValueError("now must not precede round start")
+        if require_complete and current < valid_round.end_utc:
+            raise ValueError("competition round has not ended")
 
         if self.official_fetcher is not None:
             official = self.official_fetcher(valid_rule, valid_round, current)
@@ -793,6 +816,8 @@ class CompetitionVolumeProvider:
                     raise ValueError("official volume snapshot is invalid") from None
                 if not valid_round.start_utc <= official_updated <= current:
                     raise ValueError("official volume snapshot is invalid")
+                if require_complete and official_updated < valid_round.end_utc:
+                    raise ValueError("final official volume snapshot is incomplete")
                 return VolumeSnapshot(official_total, "official", official_updated)
 
         tokens = self.market.fetch_tokens()
@@ -810,6 +835,13 @@ class CompetitionVolumeProvider:
             start_time_ms=int(valid_round.start_utc.timestamp() * 1000),
             end_time_ms=int(end.timestamp() * 1000),
         )
+        if require_complete:
+            start_ms = int(valid_round.start_utc.timestamp() * 1000)
+            end_ms = int(valid_round.end_utc.timestamp() * 1000)
+            expected = set(range(start_ms, end_ms, 3_600_000))
+            actual = {_kline_open_time_ms(row[0]) for row in rows if isinstance(row, list) and row}
+            if not expected.issubset(actual):
+                raise ValueError("final round kline volume is incomplete")
         return VolumeSnapshot(
             weighted_volume=weight_kline_volume(valid_round, valid_rule.multipliers, rows),
             source="alpha_kline_estimate",

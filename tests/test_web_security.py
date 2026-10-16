@@ -15,12 +15,18 @@ from unittest.mock import Mock, patch
 
 from grid_optimizer.web import (
     COMPETITION_VOLUME_PAGE,
+    BASIS_PAGE,
+    MARKET_DATA_PAGE,
+    MARKET_DATA_SYMBOLS,
+    _evaluate_alpha_funding_candidate,
     MONITOR_PAGE,
     HTML_PAGE,
     STRATEGY_WORKSPACE_PAGE,
     STRATEGIES_PAGE,
     _Handler,
     _build_running_status_api_body,
+    _compound_funding_return,
+    _summarize_market_data_funding,
     _build_running_status,
     _basic_auth_header_matches,
     _build_custom_grid_runner_preset,
@@ -99,6 +105,82 @@ from grid_optimizer.running_status import _normalize_frozen_inventory_ledger
 
 
 class WebSecurityTests(unittest.TestCase):
+    def test_alpha_funding_candidate_requires_persistent_net_positive_carry(self) -> None:
+        now = datetime(2026, 8, 30, tzinfo=timezone.utc)
+        history = [
+            (now - timedelta(hours=8 * offset), 0.0004)
+            for offset in range(1, 91)
+        ]
+        candidate = _evaluate_alpha_funding_candidate(
+            symbol="BTRUSDT",
+            alpha_pair="ALPHA_123USDT",
+            alpha_quote_volume_24h=2_000_000.0,
+            current_rate=0.0004,
+            history=history,
+            now=now,
+        )
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate["symbol"], "BTRUSDT")
+        self.assertEqual(candidate["category"], "Alpha套保")
+        self.assertGreater(candidate["net_return_30d"], 0)
+
+    def test_alpha_funding_candidate_rejects_spiky_or_illiquid_market(self) -> None:
+        now = datetime(2026, 8, 30, tzinfo=timezone.utc)
+        mostly_negative = [
+            (now - timedelta(hours=8 * offset), 0.002 if offset == 1 else -0.0001)
+            for offset in range(1, 91)
+        ]
+        self.assertIsNone(
+            _evaluate_alpha_funding_candidate(
+                symbol="SPIKEUSDT",
+                alpha_pair="ALPHA_9USDT",
+                alpha_quote_volume_24h=20_000_000.0,
+                current_rate=0.002,
+                history=mostly_negative,
+                now=now,
+            )
+        )
+        self.assertIsNone(
+            _evaluate_alpha_funding_candidate(
+                symbol="THINUSDT",
+                alpha_pair="ALPHA_10USDT",
+                alpha_quote_volume_24h=10_000.0,
+                current_rate=0.0004,
+                history=[(now - timedelta(hours=8 * offset), 0.0004) for offset in range(1, 91)],
+                now=now,
+            )
+        )
+
+    def test_market_data_page_contains_confirmed_universe_and_portal_links(self) -> None:
+        self.assertIn("BTCUSDT", MARKET_DATA_PAGE)
+        self.assertIn("UNITREEUSDT", MARKET_DATA_PAGE)
+        self.assertIn("http://43.155.136.111:8799/", MARKET_DATA_PAGE)
+        self.assertIn("http://43.156.35.110/alpha", MARKET_DATA_PAGE)
+        self.assertIn(r"raw.split('\n')", MARKET_DATA_PAGE)
+        self.assertIn("/api/market-data/funding-summary", MARKET_DATA_PAGE)
+        self.assertIn("/api/market-data/simple-earn", MARKET_DATA_PAGE)
+        self.assertIn("近365日", MARKET_DATA_PAGE)
+
+    def test_basis_page_contains_carry_opportunity_panel(self) -> None:
+        self.assertIn("现货 / 永续对冲收益候选", BASIS_PAGE)
+        self.assertIn("/api/arbitrage_carry", BASIS_PAGE)
+        self.assertIn("近30日验证年化", BASIS_PAGE)
+        self.assertIn("/api/carry-watchlist", BASIS_PAGE)
+        self.assertIn("加入观察池", BASIS_PAGE)
+
+    def test_market_data_funding_summary_compounds_short_perp_return(self) -> None:
+        now = datetime(2026, 8, 22, tzinfo=timezone.utc)
+        history = [
+            (datetime(2026, 8, 1, tzinfo=timezone.utc), 0.001),
+            (datetime(2026, 8, 2, tzinfo=timezone.utc), -0.0005),
+        ]
+        payload = _summarize_market_data_funding(
+            MARKET_DATA_SYMBOLS[0], history, {"funding_rate": 0.0002}, now
+        )
+        self.assertAlmostEqual(_compound_funding_return([0.001, -0.0005]) or 0.0, 0.0004995)
+        self.assertAlmostEqual(payload["mtd_return"] or 0.0, 0.0004995)
+        self.assertEqual(payload["monthly"][0]["period"], "2026-08")
+
     def _write_registered_recovery_control(
         self,
         control_path: Path,
