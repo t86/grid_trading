@@ -18,7 +18,7 @@ import argparse
 import json
 import time
 from datetime import datetime, timezone
-from decimal import ROUND_DOWN, ROUND_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +53,14 @@ def fetch_book(symbol: str) -> dict[str, Any]:
         "bid": bid, "ask": ask, "mid": mid, "spread_bps": spread_bps,
         "top_bid_notional": bid * bid_qty, "top_ask_notional": ask * ask_qty,
     }
+
+
+def is_one_tick_spread(book: dict[str, Any], tick_size: float) -> bool:
+    try:
+        bid, ask, tick = (Decimal(str(value)) for value in (book.get("bid"), book.get("ask"), tick_size))
+        return all(value.is_finite() for value in (bid, ask, tick)) and bid > 0 and tick > 0 and ask - bid == tick
+    except (InvalidOperation, ValueError):
+        return False
 
 
 def _quantize(value: float, increment: float, *, up: bool = False) -> float:
@@ -299,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--abnormal-spread-bps", type=float, default=40.0, help="仅防极端异常价差的短暂重试，不是效率闸门")
     parser.add_argument("--max-take-spread-bps", type=float, default=0.0,
                         help="紧价差护栏：只在价差≤此值时take，宽于此等收窄。0=不限(XAUT)；薄盘/变宽价差币(NIGHT)设1-2tick对应bps控成本")
+    parser.add_argument("--require-one-tick-spread", action="store_true", help="仅在当前买卖价差严格等于交易对1 tick时回转")
     parser.add_argument("--order-type", choices=["market", "ioc"], default="market",
                         help="market(默认,推荐)=市价两腿保证成交不留单边；ioc=限价有价格上限但价格跑超缓冲会留残留")
     parser.add_argument("--taker-fee-bps", type=float, default=7.5, help="taker 费率，仅用于磨损监控上报")
@@ -411,6 +420,10 @@ def main(argv: list[str] | None = None) -> int:
         if action["action"] in {"stop", "disabled"}:
             emit(action["reason"], {"exit_flatten": exit_flatten()})
             return 0
+        if action["action"] == "roundtrip" and args.require_one_tick_spread and not is_one_tick_spread(book, tick_size):
+            emit("spread_not_one_tick")
+            time.sleep(max(args.sleep_seconds, 1.0))
+            continue
         if action["action"] == "pause":
             emit(action["reason"])
             time.sleep(max(args.sleep_seconds, 1.0))  # 极端价差/深度薄/无价：等待重试，不放弃
