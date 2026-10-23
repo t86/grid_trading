@@ -709,6 +709,37 @@ def test_provider_fetches_parenthesized_project_announcement_rule_end_to_end() -
     )
 
 
+@pytest.mark.parametrize("name", ["Acurast", "Project Labs"])
+def test_rule_parser_accepts_symbol_before_project_name(name: str) -> None:
+    article = copy.deepcopy(FIXTURES["DOS"])
+    article["data"]["title"] = f"Binance Alpha Trading Competition: Trade ACU ({name}) and Share $100K Worth of Rewards (2026-10-16)"
+
+    rule = parse_competition_rule(article, "ACU")
+
+    assert (rule.symbol, rule.name) == ("ACU", name)
+    with pytest.raises(RuleParseError, match="title"):
+        parse_competition_rule(article, "OTHER")
+
+
+def test_provider_discovers_and_fetches_symbol_first_announcement() -> None:
+    detail = copy.deepcopy(FIXTURES["DOS"]["data"])
+    detail["code"] = "9ed4e714ad6045bb8fbe7a0f9f1ebe55"
+    detail["title"] = "Binance Alpha Trading Competition: Trade ACU (Acurast) and Share $100K Worth of Rewards (2026-10-16)"
+    item = _list_item({"data": detail}, release_date=int(DISCOVERY_NOW.timestamp() * 1000))
+    provider = metrics.BinanceCompetitionRuleProvider(session=_FakeSession([
+        _official({"articles": [item]}),
+        _official({"articles": []}),
+        _official({"catalogs": [{"catalogId": 49, "articles": [], "catalogs": []}]}),
+        _official(detail),
+    ]))
+
+    announcements = provider.fetch_recent_announcements(now=DISCOVERY_NOW)
+
+    assert [(a.symbol, a.article_code) for a in announcements] == [("ACU", detail["code"])]
+    rule = provider.fetch_announcement_rule(announcements[0])
+    assert (rule.symbol, rule.name, rule.article_code) == ("ACU", "Acurast", detail["code"])
+
+
 def test_provider_includes_cutoff_boundary_and_stops_on_an_entirely_old_page() -> None:
     cutoff = DISCOVERY_NOW - timedelta(days=60)
     page_one = [

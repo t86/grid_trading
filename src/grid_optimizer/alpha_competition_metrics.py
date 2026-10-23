@@ -21,6 +21,10 @@ _COMPETITION_TITLE_SYMBOL_RE = re.compile(
     r"^Binance Alpha Trading Competition: Trade (?P<name>\s*?\S.*?) "
     r"\((?P<symbol>[A-Z0-9_]{1,32})\) and\b",
 )
+_COMPETITION_TITLE_SYMBOL_FIRST_RE = re.compile(
+    r"^Binance Alpha Trading Competition: Trade (?P<symbol>[A-Z0-9_]{1,32}) "
+    r"\((?P<name>[^()\r\n]+)\) and\b",
+)
 _CMS_BASE_URL = "https://www.binance.com"
 _CMS_LIST_PATH = "/bapi/composite/v1/public/cms/article/list/query"
 _CMS_DETAIL_PATH = "/bapi/composite/v1/public/cms/article/detail/query"
@@ -202,8 +206,9 @@ def _body_blocks(data: Mapping[str, Any]) -> tuple[_ArticleBlock, ...]:
 
 
 def _competition_title_identity(title: str) -> tuple[str, str] | None:
-    match = _COMPETITION_TITLE_SYMBOL_RE.match(title.strip())
-    if match is None:
+    title = title.strip()
+    match = _COMPETITION_TITLE_SYMBOL_RE.match(title) or _COMPETITION_TITLE_SYMBOL_FIRST_RE.match(title)
+    if match is None or not match.group("name").strip():
         return None
     return match.group("name").strip(), match.group("symbol")
 
